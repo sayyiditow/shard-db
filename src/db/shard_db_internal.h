@@ -517,32 +517,87 @@ void shard_db_destroy_after_storage(ShardDb *db);
    Pool workers and the log thread bind their thread-local g_db to this. */
 extern ShardDb *g_shard_db_instance;
 
+/* ── Durable abort evidence (indexed-write atomicity) ── */
+
+/* Fixed on-disk abort sidecar header (24 B, no trailing bytes). There is one
+   sidecar per commit-intent marker: kind distinguishes the single-record
+   %03x_marker_abort.dat from the batch %03x_batch_%u_abort.dat producer.
+   A sidecar is the durable, ordered decision that its paired marker must be
+   ABORTED (index inverse diff applied, speculative segment tombstoned where
+   one exists) rather than forward-replayed. */
+enum { KF_ABORT_MAGIC = 0x4b464142u, KF_ABORT_VERSION = 1 };
+enum { KF_ABORT_SINGLE = 1, KF_ABORT_BATCH = 2 };
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t kind;
+    uint32_t kf_shard;
+    uint32_t batch_id;       /* 0 for KF_ABORT_SINGLE */
+    uint32_t marker_count;   /* exactly 1 for KF_ABORT_SINGLE */
+    uint32_t checksum;       /* XXH32 through marker_count */
+} KfAbortHeader;
+
+_Static_assert(sizeof(KfAbortHeader) == 24,
+               "abort sidecar header is a fixed on-disk format");
+
 /* ── Marker file (durability write-ordering) ── */
 
 #define KF_MARKER_MAGIC 0x4B464D31u /* "KFM1" */
 
+enum KfMarkerOp {
+    KF_MARKER_OP_LEGACY_UPSERT = 0, /* v1 marker writer; recover as UPSERT */
+    KF_MARKER_OP_UPSERT = 1,
+    KF_MARKER_OP_DELETE = 2,
+};
+
 typedef struct {
     uint32_t magic;        /* KF_MARKER_MAGIC */
-    uint32_t kf_slot;     /* update: existing slot; insert: UINT32_MAX */
+    uint32_t kf_slot;      /* UPDATE/DELETE: existing slot; INSERT: UINT32_MAX */
     uint32_t old_offset;
     uint32_t new_offset;
     uint16_t old_file_id;
     uint16_t new_file_id;
     uint8_t  old_stream_id;
     uint8_t  new_stream_id;
-    uint8_t  has_old;      /* 0=insert, 1=update */
-    uint8_t  reserved[5];
+    uint8_t  has_old;      /* UPSERT: 0=insert, 1=update; DELETE: always 1 */
+    uint8_t  op;           /* enum KfMarkerOp */
+    uint8_t  reserved[4];  /* must be zero */
     uint32_t checksum;     /* XXH32 over [0, offsetof(checksum)) */
 } KfMarkerSlot;
 
 _Static_assert(sizeof(KfMarkerSlot) == 32,
                "KfMarkerSlot must stay 32 bytes");
 
+static inline int kf_marker_op_valid(const KfMarkerSlot *marker) {
+    if (!marker) return 0;
+    if (marker->op != KF_MARKER_OP_LEGACY_UPSERT &&
+        marker->op != KF_MARKER_OP_UPSERT &&
+        marker->op != KF_MARKER_OP_DELETE)
+        return 0;
+    if (marker->reserved[0] || marker->reserved[1] ||
+        marker->reserved[2] || marker->reserved[3])
+        return 0;
+    if (marker->op == KF_MARKER_OP_DELETE)
+        return marker->has_old == 1 && marker->kf_slot != UINT32_MAX &&
+               marker->new_offset == 0 && marker->new_file_id == 0 &&
+               marker->new_stream_id == 0;
+    return marker->has_old <= 1;
+}
+
 /* Marker I/O — non-static for test access (TEST_BUILD). */
 int kf_marker_write(const char *data_dir, int kf_shard,
                     const KfMarkerSlot *slot);
 int kf_marker_clear(const char *data_dir, int kf_shard);
 int kf_marker_read(const char *data_dir, int kf_shard, KfMarkerSlot *out);
+
+/* Abort-sidecar I/O — non-static for test access (TEST_BUILD). */
+int kf_abort_write_sidecar(const char *data_dir, uint16_t kind, int kf_shard,
+                           uint32_t batch_id, uint32_t marker_count);
+int kf_abort_read_exact(const char *path, uint16_t want_kind,
+                        uint32_t want_shard, uint32_t want_batch,
+                        uint32_t want_count, KfAbortHeader *out);
+int kf_abort_clear_after_marker(const char *abort_path, const char *kf_dir);
 
 /* Marker recovery — replays a marker's intent when kf writer lock is held.
    eff_root/object identify the object for index-diff reconciliation

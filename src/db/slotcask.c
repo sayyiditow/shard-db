@@ -680,6 +680,217 @@ static void commit_sync_us_record(uint64_t t0) {
     if (g_db) __atomic_add_fetch(&g_commit_sync_us_total, now_us() - t0, __ATOMIC_RELAXED);
 }
 
+/* ── Abort sidecars (durable abort decision paired with a marker) ──
+ *
+ * A sidecar is the durable, ordered decision that its paired commit-intent
+ * marker must be ABORTED (inverse index diff applied, speculative NEW
+ * segment tombstoned where one exists) instead of forward-replayed. The
+ * write-time gates and the startup recovery sweep pair a marker with its
+ * sidecar before choosing a direction: no sidecar → forward replay; valid
+ * sidecar → abort; corrupt/short/extra evidence → kf_marker_fail_closed. */
+
+static void kf_abort_path(char *buf, size_t cap, const char *data_dir,
+                          uint16_t kind, int kf_shard, uint32_t batch_id) {
+    if (kind == KF_ABORT_BATCH)
+        snprintf(buf, cap, "%s/data/kf/%03x_batch_%u_abort.dat",
+                 data_dir, (unsigned)kf_shard, batch_id);
+    else
+        snprintf(buf, cap, "%s/data/kf/%03x_marker_abort.dat",
+                 data_dir, (unsigned)kf_shard);
+}
+
+/* Create one abort sidecar with O_EXCL: one complete pwrite, fsync(fd),
+   close(fd), fsync_dir(data/kf). A pre-existing sidecar (O_EXCL → EEXIST)
+   is never silently overwritten: the caller validates it via
+   kf_abort_read_exact first (idempotent redo) and fails closed on any
+   mismatch. */
+static int kf_abort_write_sidecar_impl(const char *data_dir, uint16_t kind,
+                                       int kf_shard, uint32_t batch_id,
+                                       uint32_t marker_count) {
+    char path[PATH_MAX], dpath[PATH_MAX];
+    KfAbortHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic = KF_ABORT_MAGIC;
+    hdr.version = KF_ABORT_VERSION;
+    hdr.kind = kind;
+    hdr.kf_shard = (uint32_t)kf_shard;
+    hdr.batch_id = kind == KF_ABORT_BATCH ? batch_id : 0;
+    hdr.marker_count = marker_count;
+    hdr.checksum = XXH32(&hdr, offsetof(KfAbortHeader, checksum), 0);
+    kf_abort_path(path, sizeof(path), data_dir, kind, kf_shard, batch_id);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "abort-sidecar: open(%s) failed shard=%03x kind=%u "
+                  "batch=%u errno=%d (%s)", path, kf_shard, kind, batch_id,
+                  errno, strerror(errno));
+        return -1;
+    }
+    ssize_t n = pwrite(fd, &hdr, sizeof(hdr), 0);
+    if (n != (ssize_t)sizeof(hdr)) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "abort-sidecar: pwrite failed shard=%03x kind=%u "
+                  "batch=%u errno=%d (%s)", kf_shard, kind, batch_id,
+                  errno, strerror(errno));
+        close(fd); return -1;
+    }
+    if (fsync(fd) != 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "abort-sidecar: fsync failed shard=%03x kind=%u "
+                  "batch=%u errno=%d (%s)", kf_shard, kind, batch_id,
+                  errno, strerror(errno));
+        close(fd); return -1;
+    }
+    close(fd);
+    kf_marker_dir_path(dpath, sizeof(dpath), data_dir);
+    if (fsync_dir(dpath) != 0) return -1;
+    durability_test_pause(data_dir, "abort-sidecar-after-fsync");
+    return 0;
+}
+
+int kf_abort_write_sidecar(const char *data_dir, uint16_t kind, int kf_shard,
+                           uint32_t batch_id, uint32_t marker_count) {
+    uint64_t t0 = now_us();
+    int rc = kf_abort_write_sidecar_impl(data_dir, kind, kf_shard, batch_id,
+                                         marker_count);
+    commit_sync_us_record(t0);
+    return rc;
+}
+
+/* Parse one sidecar exactly: the file must be exactly sizeof(KfAbortHeader),
+   every header field must match the requested (kind, shard, batch, count),
+   and the checksum must verify over [0, offsetof(checksum)). Returns 0 on a
+   valid match, 1 when the file is absent, -1 (errno set; EILSEQ for corrupt
+   evidence) on anything else. Never modifies or unlinks the file. */
+int kf_abort_read_exact(const char *path, uint16_t want_kind,
+                        uint32_t want_shard, uint32_t want_batch,
+                        uint32_t want_count, KfAbortHeader *out) {
+    struct stat st;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? 1 : -1;
+    if (fstat(fd, &st) != 0) {
+        /* fstat() itself failed — errno is reliably set by the failing
+           syscall, never stale. Genuine transient I/O. */
+        int saved = errno; close(fd); errno = saved; return -1;
+    }
+    if (st.st_size != (off_t)sizeof(*out)) {
+        /* fstat() succeeded (doesn't touch errno on success) but the file
+           is the wrong size — that's corrupt/truncated evidence, not an
+           I/O error, regardless of whatever stale errno an earlier,
+           unrelated syscall left lying around. Must not fall through to
+           "errno ? errno : EILSEQ", which would misreport this as
+           transient if errno happened to be nonzero from something else. */
+        close(fd); errno = EILSEQ; return -1;
+    }
+    ssize_t n = pread(fd, out, sizeof(*out), 0);
+    int saved = errno;
+    close(fd);
+    if (n != (ssize_t)sizeof(*out)) { errno = n < 0 ? saved : EILSEQ; return -1; }
+    if (out->magic != KF_ABORT_MAGIC || out->version != KF_ABORT_VERSION ||
+        out->kind != want_kind || out->kf_shard != want_shard ||
+        out->batch_id != want_batch || out->marker_count != want_count ||
+        out->checksum != XXH32(out, offsetof(KfAbortHeader, checksum), 0)) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "abort-sidecar: corrupt evidence at %s "
+                  "(magic=%x ver=%u kind=%u shard=%u batch=%u count=%u "
+                  "want_kind=%u want_shard=%u want_batch=%u want_count=%u)",
+                  path, out->magic, out->version, out->kind,
+                  out->kf_shard, out->batch_id, out->marker_count,
+                  want_kind, want_shard, want_batch, want_count);
+        errno = EILSEQ;
+        return -1;
+    }
+    return 0;
+}
+
+/* Parse a sidecar header only (orphan-sidecar revalidation: the marker that
+   would pin marker_count is already gone, so only the self-consistent fixed
+   fields can be checked). Returns 0 valid, 1 absent, -1 corrupt/I-O. */
+static int kf_abort_read_header(const char *path, KfAbortHeader *out) {
+    struct stat st;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? 1 : -1;
+    if (fstat(fd, &st) != 0) {
+        /* fstat() itself failed — errno is reliably set by the failing
+           syscall, never stale. Genuine transient I/O. */
+        int saved = errno; close(fd); errno = saved; return -1;
+    }
+    if (st.st_size != (off_t)sizeof(*out)) {
+        /* fstat() succeeded (doesn't touch errno on success) but the file
+           is the wrong size — that's corrupt/truncated evidence, not an
+           I/O error, regardless of whatever stale errno an earlier,
+           unrelated syscall left lying around. Must not fall through to
+           "errno ? errno : EILSEQ", which would misreport this as
+           transient if errno happened to be nonzero from something else. */
+        close(fd); errno = EILSEQ; return -1;
+    }
+    ssize_t n = pread(fd, out, sizeof(*out), 0);
+    int saved = errno;
+    close(fd);
+    if (n != (ssize_t)sizeof(*out)) { errno = n < 0 ? saved : EILSEQ; return -1; }
+    if (out->magic != KF_ABORT_MAGIC || out->version != KF_ABORT_VERSION ||
+        out->checksum != XXH32(out, offsetof(KfAbortHeader, checksum), 0)) {
+        errno = EILSEQ;
+        return -1;
+    }
+    return 0;
+}
+
+/* Cleanup step 3 of the binding order: unlink the sidecar and fsync
+   data/kf. Only reachable after the forward marker was already unlinked and
+   synced (step 2) — the crash-window pair "no marker + valid sidecar" is
+   exactly this completed-abort state. */
+int kf_abort_clear_after_marker(const char *abort_path, const char *kf_dir) {
+    if (unlink(abort_path) != 0 && errno != ENOENT) {
+        LOG_WARN(LOG_SUB_SLOTCASK,
+                 "abort-sidecar: unlink(%s) failed errno=%d (%s)",
+                 abort_path, errno, strerror(errno));
+        return -1;
+    }
+    if (fsync_dir(kf_dir) != 0) {
+        LOG_WARN(LOG_SUB_SLOTCASK,
+                 "abort-sidecar: fsync_dir(%s) failed errno=%d (%s)",
+                 kf_dir, errno, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* Create-or-validate one abort sidecar against the requested parameters.
+   An existing sidecar is only acceptable when every header field matches
+   (idempotent redo of an earlier abort attempt); anything else is corrupt
+   evidence and fails closed. Returns 0 on a valid, durable sidecar. */
+static int kf_abort_sidecar_ensure(const char *data_dir, uint16_t kind,
+        int kf_shard, uint32_t batch_id, uint32_t marker_count) {
+    char abort_path[PATH_MAX];
+    KfAbortHeader hdr;
+    kf_abort_path(abort_path, sizeof(abort_path), data_dir, kind, kf_shard,
+                  batch_id);
+    int rc = kf_abort_read_exact(abort_path, kind, (uint32_t)kf_shard,
+                                 batch_id, marker_count, &hdr);
+    if (rc == 0) return 0;   /* already present and valid (redo) */
+    if (rc == -1) return -1; /* corrupt or mismatched evidence */
+    if (kf_abort_write_sidecar(data_dir, kind, kf_shard, batch_id,
+                               marker_count) != 0) {
+        /* Raced with a concurrent abort of the same pair: revalidate
+           instead of treating our own create as the only winner. */
+        rc = kf_abort_read_exact(abort_path, kind, (uint32_t)kf_shard,
+                                 batch_id, marker_count, &hdr);
+        return rc == 0 ? 0 : -1;
+    }
+    return 0;
+}
+
+/* Forward declarations for the recovery helpers defined after the marker
+   replay block; the write-time gates run earlier in this file. */
+static void kf_marker_fail_closed(const char *data_dir, int kf_shard,
+                                  const char *why);
+static int kf_marker_apply_abort_diff(const char *eff_root,
+        const char *object, const char *data_dir, int kf_shard,
+        uint32_t kf_slot, const KfMarkerSlot *marker);
+static int seg_write_marker_new_tombstone_durable(const char *data_dir,
+        const KfMarkerSlot *marker);
+
 static int kf_marker_write_impl(const char *data_dir, int kf_shard,
                     const KfMarkerSlot *slot) {
     char path[PATH_MAX], dpath[PATH_MAX];
@@ -734,7 +945,8 @@ int kf_marker_read(const char *data_dir, int kf_shard, KfMarkerSlot *out) {
     close(fd);
     if (n != (ssize_t)sizeof(*out)) { errno = n < 0 ? saved : EILSEQ; return -1; }
     if (out->magic != KF_MARKER_MAGIC ||
-        out->checksum != XXH32(out, offsetof(KfMarkerSlot, checksum), 0)) {
+        out->checksum != XXH32(out, offsetof(KfMarkerSlot, checksum), 0) ||
+        !kf_marker_op_valid(out)) {
         errno = EILSEQ;
         return -1;
     }
@@ -791,6 +1003,66 @@ static void split_data_dir(const char *data_dir, char *eff_root, size_t eff_root
     snprintf(object, object_len, "%s", slash + 1);
 }
 
+/* Apply a pinned single-record abort while the kf writer lock is held:
+   inverse index diff, speculative NEW segment tombstone (upserts only),
+   then the binding cleanup order — unlink the forward marker and fsync,
+   then unlink the abort sidecar and fsync. */
+static int kf_marker_abort_single_locked(const char *eff_root,
+        const char *object, const char *data_dir, int kf_shard,
+        SlotcaskKfHandle *kh, const KfAbortHeader *hdr,
+        const char *marker_path, const char *abort_path) {
+    char kf_dir[PATH_MAX];
+    KfMarkerSlot marker;
+
+    snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+    if ((hdr && hdr->marker_count != 1) ||
+        kf_marker_read(data_dir, kf_shard, &marker) != 0) {
+        kf_marker_fail_closed(data_dir, kf_shard,
+                              "abort sidecar without its marker");
+        return -1;
+    }
+    if (kf_marker_apply_abort_diff(eff_root, object, data_dir, kf_shard,
+                                   marker.kf_slot, &marker) != 0 ||
+        (marker.op != KF_MARKER_OP_DELETE &&
+         seg_write_marker_new_tombstone_durable(data_dir, &marker) != 0)) {
+        kf_marker_fail_closed(data_dir, kf_shard, "abort recovery");
+        return -1;
+    }
+    if (unlink(marker_path) != 0 || fsync_dir(kf_dir) != 0) {
+        kf_marker_fail_closed(data_dir, kf_shard, "marker unlink after abort");
+        return -1;
+    }
+    if (kf_abort_clear_after_marker(abort_path, kf_dir) != 0) {
+        kf_marker_fail_closed(data_dir, kf_shard, "sidecar unlink after abort");
+        return -1;
+    }
+    return 0;
+}
+
+/* Write-time single-record abort: ensure the abort sidecar is durable
+   (create or revalidate), then apply the inverse diff, tombstone the
+   speculative NEW segment record, and clear marker + sidecar while the kf
+   writer lock is held. Called by an insert/update producer whose indexed
+   apply failed after the commit-intent marker was fsynced. On any abort
+   failure the marker and sidecar are retained and the process aborts via
+   kf_marker_fail_closed, so startup recovery re-runs the same inverse. */
+static int kf_marker_abort_single_current_locked(const char *data_dir,
+        int kf_shard, const KfMarkerSlot *marker) {
+    char eff_root[PATH_MAX], object[256];
+    char marker_path[PATH_MAX], abort_path[PATH_MAX];
+
+    if (kf_abort_sidecar_ensure(data_dir, KF_ABORT_SINGLE, kf_shard, 0, 1) != 0) {
+        kf_marker_fail_closed(data_dir, kf_shard, "abort sidecar write");
+        return -1;
+    }
+    split_data_dir(data_dir, eff_root, sizeof(eff_root), object, sizeof(object));
+    kf_marker_path(marker_path, sizeof(marker_path), data_dir, kf_shard);
+    kf_abort_path(abort_path, sizeof(abort_path), data_dir, KF_ABORT_SINGLE,
+                  kf_shard, 0);
+    return kf_marker_abort_single_locked(eff_root, object, data_dir, kf_shard,
+                                         NULL, NULL, marker_path, abort_path);
+}
+
 /* Retained-marker gate: check for existing marker before allowing a new write.
    Must be called while kf writer lock is held, before any marker is created.
    Returns 0 to proceed with new write, -1 to fail and abort.
@@ -798,28 +1070,99 @@ static void split_data_dir(const char *data_dir, char *eff_root, size_t eff_root
 static int kf_marker_gate(int kf_shard, SlotcaskKfHandle *kh,
                            const char *data_dir) {
     KfMarkerSlot marker;
+    KfAbortHeader hdr;
+    char abort_path[PATH_MAX];
     int rc = kf_marker_read(data_dir, kf_shard, &marker);
-    if (rc == 1) {
-        /* No marker present (common case) — proceed. */
-        return 0;
+
+    if (rc != 0) {
+        /* No (1), torn (2), or corrupt (-1) marker. A sidecar here only
+           means completed cleanup when the marker file is fully gone; a
+           torn or corrupt marker beside a sidecar is corrupt evidence. */
+        kf_abort_path(abort_path, sizeof(abort_path), data_dir,
+                      KF_ABORT_SINGLE, kf_shard, 0);
+        int arc = kf_abort_read_exact(abort_path, KF_ABORT_SINGLE,
+                                      (uint32_t)kf_shard, 0, 1, &hdr);
+        if (arc == 0) {
+            if (rc == 1) {
+                /* Orphan sidecar: the abort completed and the forward
+                   marker was already unlinked (cleanup step 2 before 3).
+                   Revalidate-and-clear is the only allowed removal. */
+                char kf_dir[PATH_MAX];
+                snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+                if (kf_abort_clear_after_marker(abort_path, kf_dir) != 0)
+                    return -1;
+                return 0;
+            }
+            kf_marker_fail_closed(data_dir, kf_shard,
+                                  "torn/corrupt marker with abort sidecar");
+            return -1;
+        }
+        if (arc == -1) {
+            if (errno != EILSEQ) {
+                /* Transient I/O (EIO, EMFILE, EACCES, ...) reading the
+                   sidecar — not evidence of corruption. Fail only this
+                   gate check so the caller's write fails cleanly and a
+                   later retry can re-read once the condition clears;
+                   terminating the daemon over a momentary I/O hiccup on
+                   every write's gate check would turn a transient error
+                   into a full outage. */
+                LOG_WARN(LOG_SUB_SLOTCASK,
+                        "abort-sidecar: transient I/O reading %s errno=%d (%s); "
+                        "failing this write, not terminating", abort_path,
+                        errno, strerror(errno));
+                return -1;
+            }
+            kf_marker_fail_closed(data_dir, kf_shard,
+                                  "corrupt abort sidecar");
+            return -1;
+        }
+        if (rc == 1) {
+            /* No marker present (common case) — proceed. */
+            return 0;
+        }
+        if (rc == 2) {
+            /* Zero-byte torn create (crash before fsync) — safe to unlink. */
+            return kf_marker_clear(data_dir, kf_shard);
+        }
+        /* rc == -1: corrupt marker, no sidecar. Leave it untouched and
+           fail closed — this signals an operator-visible issue that must
+           be investigated. */
+        return -1;
     }
-    if (rc == 2) {
-        /* Zero-byte torn create (crash before fsync) — safe to unlink. */
-        return kf_marker_clear(data_dir, kf_shard);
-    }
-    if (rc == 0) {
-        /* Valid marker present — replay it to completion. */
+
+    /* Valid marker present — decide direction from its paired sidecar. */
+    kf_abort_path(abort_path, sizeof(abort_path), data_dir, KF_ABORT_SINGLE,
+                  kf_shard, 0);
+    int arc = kf_abort_read_exact(abort_path, KF_ABORT_SINGLE,
+                                  (uint32_t)kf_shard, 0, 1, &hdr);
+    if (arc == 0) {
         char eff_root[PATH_MAX], object[256];
-        split_data_dir(data_dir, eff_root, sizeof(eff_root), object, sizeof(object));
-        int replay_rc = kf_marker_replay_locked(eff_root, object, data_dir, kf_shard, kh, &marker);
-        if (replay_rc != 0) return -1;
-        /* Replay succeeded and cleared marker. */
-        return 0;
+        char marker_path[PATH_MAX];
+        split_data_dir(data_dir, eff_root, sizeof(eff_root), object,
+                       sizeof(object));
+        kf_marker_path(marker_path, sizeof(marker_path), data_dir, kf_shard);
+        return kf_marker_abort_single_locked(eff_root, object, data_dir,
+                                             kf_shard, kh, &hdr,
+                                             marker_path, abort_path);
     }
-    /* rc == -1: corrupt marker (bad size/magic/checksum) or I/O error.
-       Leave it untouched and fail closed — this signals an operator-visible
-       issue that must be investigated. */
-    return -1;
+    if (arc == -1) {
+        if (errno != EILSEQ) {
+            LOG_WARN(LOG_SUB_SLOTCASK,
+                    "abort-sidecar: transient I/O reading %s errno=%d (%s); "
+                    "failing this write, not terminating", abort_path,
+                    errno, strerror(errno));
+            return -1;
+        }
+        kf_marker_fail_closed(data_dir, kf_shard, "corrupt abort sidecar");
+        return -1;
+    }
+    /* No sidecar — the marker predates any abort decision; forward replay. */
+    char eff_root[PATH_MAX], object[256];
+    split_data_dir(data_dir, eff_root, sizeof(eff_root), object, sizeof(object));
+    int replay_rc = kf_marker_replay_locked(eff_root, object, data_dir, kf_shard, kh, &marker);
+    if (replay_rc != 0) return -1;
+    /* Replay succeeded and cleared marker. */
+    return 0;
 }
 
 /* A marker is the durable commit-intent point: once its fsync has returned,
@@ -2140,59 +2483,296 @@ static inline void kf_repoint_at_slot(SlotcaskKfHandle *kh, size_t slot,
                      __ATOMIC_RELEASE);
 }
 
+/* Direct tombstone at a known slot — see kf_repoint_at_slot rationale.
+   Bumps the header's deleted counter; total is unchanged (the slot was
+   already counted as non-empty when it was inserted). */
+static inline void kf_tombstone_at_slot(SlotcaskKfHandle *kh, size_t slot) {
+    kh->map[slot].flag = 2;
+    if (kh->hdr) kh->hdr->deleted++;
+}
+
+/* ── Marker record readers (shared by forward and abort recovery) ── */
+
+static int seg_write_flag_durable(const char *data_dir, uint8_t stream_id,
+                                  uint16_t file_id, uint32_t offset,
+                                  uint8_t flag);
+
+static int kf_marker_replay_upsert_entry_locked(const char *eff_root,
+        const char *object, const char *data_dir, int kf_shard,
+        void *kh_opaque, const KfMarkerSlot *marker);
+
+typedef struct {
+    SlotcaskSegHandle handle;
+    const uint8_t *key;
+    const uint8_t *value;
+    uint8_t hash[16];
+    uint16_t klen;
+    uint32_t vlen;
+    int open;
+} MarkerRecord;
+
+static void marker_record_destroy(MarkerRecord *record) {
+    if (record && record->open) segcache_release(&record->handle);
+    if (record) memset(record, 0, sizeof(*record));
+}
+
+static int marker_record_read_live(const char *data_dir, uint8_t stream_id,
+        uint16_t file_id, uint32_t offset, MarkerRecord *out) {
+    char path[PATH_MAX];
+    const uint8_t *record;
+
+    if (!data_dir || !out) { errno = EINVAL; return -1; }
+    memset(out, 0, sizeof(*out));
+    seg_path_for(path, data_dir, stream_id, file_id);
+    if (segcache_acquire(&out->handle, path, 0, 0, 0) != 0) return -1;
+    out->open = 1;
+    record = out->handle.map + offset;
+    if (__atomic_load_n(&record[18], __ATOMIC_ACQUIRE) != 1) {
+        errno = EILSEQ;
+        marker_record_destroy(out);
+        return -1;
+    }
+    memcpy(out->hash, record, sizeof(out->hash));
+    out->klen = seg_rec_klen(record);
+    out->vlen = seg_rec_vlen(record);
+    out->key = record + 24;
+    out->value = out->key + out->klen;
+    return 0;
+}
+
+static int read_marker_old_live(const char *data_dir,
+        const KfMarkerSlot *marker, MarkerRecord *out) {
+    if (!marker || !marker->has_old) { errno = EILSEQ; return -1; }
+    return marker_record_read_live(data_dir, marker->old_stream_id,
+                                   marker->old_file_id, marker->old_offset,
+                                   out);
+}
+
+static int read_marker_new_live(const char *data_dir,
+        const KfMarkerSlot *marker, MarkerRecord *out) {
+    if (!marker || marker->op == KF_MARKER_OP_DELETE) {
+        errno = EILSEQ;
+        return -1;
+    }
+    return marker_record_read_live(data_dir, marker->new_stream_id,
+                                   marker->new_file_id, marker->new_offset,
+                                   out);
+}
+
+/* Probe a segment record's flag byte without requiring it to be live.
+   Returns 1 if tombstoned (flag==2), 0 if live (flag==1), -1 on I/O error
+   or a flag value that means the record was never fully written. Used by
+   the idempotent-redo paths: an abort redo or delete forward-replay redo
+   can find the segment state already advanced by a prior partial run. */
+static int marker_record_tombstoned(const char *data_dir, uint8_t stream_id,
+                                    uint16_t file_id, uint32_t offset) {
+    char path[PATH_MAX];
+    SlotcaskSegHandle h;
+    int rc;
+
+    seg_path_for(path, data_dir, stream_id, file_id);
+    if (segcache_acquire(&h, path, 0, 0, 0) != 0) return -1;
+    rc = (int)__atomic_load_n(&h.map[offset + 18], __ATOMIC_ACQUIRE);
+    segcache_release(&h);
+    return rc == 2 ? 1 : (rc == 1 ? 0 : -1);
+}
+
+/* Reconcile one index entry to match the durable record state. Pass
+   exactly one of OLD/NEW for a forward insert (new only) or forward
+   delete (old only); both for a forward update; both, swapped, for an
+   abort of an update; new only for an abort of an insert. A NULL record
+   is never passed to build_index_key_from_record_into. */
+static int kf_marker_apply_recovery_diff(const char *eff_root,
+        const char *object, int kf_shard, uint32_t kf_slot,
+        const MarkerRecord *old_record, const MarkerRecord *new_record) {
+    char err_buf[256] = {0};
+    const MarkerRecord *identity = new_record ? new_record : old_record;
+
+    if (!identity) { errno = EINVAL; return -1; }
+    if (!g_recovery_index_diff_fn) return 0;
+    return g_recovery_index_diff_fn(eff_root, object, kf_shard, kf_slot,
+        identity->hash,
+        old_record ? old_record->value : NULL,
+        old_record ? old_record->vlen : 0,
+        new_record ? new_record->value : NULL,
+        new_record ? new_record->vlen : 0, err_buf, sizeof(err_buf));
+}
+
+/* The kf slot named by a delete marker must still hold the exact OLD
+   record the marker describes. Anything else — slot reuse by another key,
+   a different record at the slot, a tombstone — is corrupt evidence and
+   fails closed (Gap B: only a live exact-match record passes here). */
+static int kf_marker_verify_kf_old_at_slot(SlotcaskKfHandle *kh,
+        size_t expected_slot, const MarkerRecord *old_record,
+        const KfMarkerSlot *marker, const char *data_dir) {
+    uint8_t flag, stream_id;
+    uint16_t file_id;
+    uint32_t offset;
+    size_t found_slot;
+
+    if (!kh || !old_record || !marker ||
+        kf_lookup_with_slot(kh, old_record->hash, old_record->key,
+                            old_record->klen, data_dir, &flag, &stream_id,
+                            &file_id, &offset, &found_slot) != 0 ||
+        found_slot != expected_slot || flag != 1 ||
+        stream_id != marker->old_stream_id || file_id != marker->old_file_id ||
+        offset != marker->old_offset) {
+        errno = EILSEQ;
+        return -1;
+    }
+    return 0;
+}
+
+static int seg_write_marker_new_tombstone_durable(const char *data_dir,
+        const KfMarkerSlot *marker) {
+    if (!marker || marker->op == KF_MARKER_OP_DELETE) {
+        errno = EILSEQ;
+        return -1;
+    }
+    return seg_write_flag_durable(data_dir, marker->new_stream_id,
+                                  marker->new_file_id, marker->new_offset, 2);
+}
+
+/* Inverse index diff pinned by the abort sidecar: forward delete
+   (old=NULL,new=OLD), update undo (new=NEW,old=OLD), insert undo
+   (new=NEW,old=NULL). The direction comes from the sidecar, never from
+   current index state. */
+static int kf_marker_apply_abort_diff(const char *eff_root,
+        const char *object, const char *data_dir, int kf_shard,
+        uint32_t kf_slot, const KfMarkerSlot *marker) {
+    MarkerRecord old_record = {0}, new_record = {0};
+    int rc;
+
+    if (!kf_marker_op_valid(marker)) { errno = EILSEQ; return -1; }
+    if (marker->op == KF_MARKER_OP_DELETE) {
+        rc = read_marker_old_live(data_dir, marker, &old_record) == 0
+            ? kf_marker_apply_recovery_diff(eff_root, object, kf_shard,
+                                            kf_slot, NULL, &old_record)
+            : -1;
+        marker_record_destroy(&old_record);
+        return rc;
+    }
+    if (read_marker_new_live(data_dir, marker, &new_record) != 0) {
+        /* Gap A (approved): an abort redo after cleanup step 1 already
+           tombstoned the speculative NEW segment — the inverse diff was
+           already applied in the prior partial run. Treat as applied and
+           let the caller proceed to marker/sidecar unlink. Genuine I/O
+           errors and never-written records still fail closed. */
+        int tomb = marker_record_tombstoned(data_dir, marker->new_stream_id,
+                                            marker->new_file_id,
+                                            marker->new_offset);
+        return tomb == 1 ? 0 : -1;
+    }
+    if (marker->has_old && read_marker_old_live(data_dir, marker,
+                                                &old_record) != 0) {
+        marker_record_destroy(&new_record);
+        return -1;
+    }
+    rc = kf_marker_apply_recovery_diff(eff_root, object, kf_shard, kf_slot,
+                                       &new_record,
+                                       marker->has_old ? &old_record : NULL);
+    marker_record_destroy(&old_record);
+    marker_record_destroy(&new_record);
+    return rc;
+}
+
+/* Forward delete replay: remove OLD from the indexes, verify then
+   durably tombstone its kf slot, durably tombstone the OLD segment
+   record, clear the marker. Every step is idempotent, so a crash
+   mid-replay can restart safely (Gap B, approved: a prior partial run
+   that already tombstoned the kf slot or the segment completes as 0). */
+static int kf_marker_replay_delete_entry_locked(const char *eff_root,
+        const char *object, const char *data_dir, int kf_shard,
+        SlotcaskKfHandle *kh, const KfMarkerSlot *marker) {
+    MarkerRecord old_rec = {0};
+    int rc = -1;
+
+    if (!kf_marker_op_valid(marker) || marker->op != KF_MARKER_OP_DELETE)
+        goto out;
+    if (read_marker_old_live(data_dir, marker, &old_rec) != 0) {
+        /* Segment already tombstoned by a prior partial replay: complete
+           only if the kf slot is tombstoned too — the forward delete then
+           fully committed and only the marker clear remains. */
+        int tomb = marker_record_tombstoned(data_dir, marker->old_stream_id,
+                                            marker->old_file_id,
+                                            marker->old_offset);
+        if (tomb == 1 && marker->kf_slot < kh->capacity &&
+            kh->map[marker->kf_slot].flag == 2)
+            rc = 0;
+        goto out;
+    }
+    if (kf_marker_apply_recovery_diff(eff_root, object, kf_shard,
+                                      marker->kf_slot, &old_rec, NULL) != 0)
+        goto out;
+    if (kf_marker_verify_kf_old_at_slot(kh, marker->kf_slot, &old_rec,
+                                        marker, data_dir) != 0) {
+        /* Gap B (approved): verify failed because a prior partial replay
+           already tombstoned the kf slot. Complete the pending segment
+           tombstone, then clear. A different live record at the slot
+           (slot reuse) or genuine I/O errors still fail closed. */
+        if (marker->kf_slot < kh->capacity &&
+            kh->map[marker->kf_slot].flag == 2) {
+            if (seg_write_flag_durable(data_dir, marker->old_stream_id,
+                                       marker->old_file_id,
+                                       marker->old_offset, 2) != 0)
+                goto out;
+            rc = 0;
+        }
+        goto out;
+    }
+    size_t slot = marker->kf_slot;
+    kf_tombstone_at_slot(kh, slot);
+    if (kfcache_sync_slots_locked(kh, &slot, 1, 1) != 0 ||
+        seg_write_flag_durable(data_dir, marker->old_stream_id,
+                               marker->old_file_id, marker->old_offset, 2) != 0)
+        goto out;
+    rc = 0;
+out:
+    marker_record_destroy(&old_rec);
+    return rc;
+}
+
 /* Reconcile one marker entry while the shard writer lock is held.  Clearing
    is deliberately owned by the caller: a batch marker contains many entries
    and must never remove the unrelated single-marker filename. */
-static int kf_marker_replay_entry_locked(const char *eff_root, const char *object,
+static int kf_marker_replay_entry_locked(const char *eff_root,
+        const char *object, const char *data_dir, int kf_shard,
+        void *kh_opaque, const KfMarkerSlot *marker) {
+    SlotcaskKfHandle *kh = (SlotcaskKfHandle *)kh_opaque;
+
+    if (!kh || !kh->writer || !kf_marker_op_valid(marker)) {
+        errno = EILSEQ;
+        return -1;
+    }
+    if (marker->op == KF_MARKER_OP_DELETE)
+        return kf_marker_replay_delete_entry_locked(eff_root, object,
+                                                     data_dir, kf_shard, kh,
+                                                     marker);
+    return kf_marker_replay_upsert_entry_locked(eff_root, object, data_dir,
+                                                 kf_shard, kh, marker);
+}
+static int kf_marker_replay_upsert_entry_locked(const char *eff_root, const char *object,
                                          const char *data_dir, int kf_shard,
                                          void *kh_opaque, const KfMarkerSlot *marker) {
     SlotcaskKfHandle *kh = (SlotcaskKfHandle *)kh_opaque;
+    MarkerRecord new_rec = {0}, old_rec = {0};
+    int rc = -1;
 
-    if (!kh || !kh->writer || !marker || !data_dir) {
-        errno = EINVAL;
+    if (!kh || !kh->writer || !marker || marker->op == KF_MARKER_OP_DELETE ||
+        !data_dir) {
+        errno = EILSEQ;
         return -1;
     }
 
-    /* Step 1: read new record from segment. */
-    char seg_path[PATH_MAX];
-    seg_path_for(seg_path, data_dir, marker->new_stream_id, marker->new_file_id);
-    SlotcaskSegHandle h;
-    if (segcache_acquire(&h, seg_path, 0, 0, 0) != 0) return -1;
-
-    const uint8_t *new_rec = h.map + marker->new_offset;
-    uint16_t new_klen = seg_rec_klen(new_rec);
-    uint32_t new_vlen = seg_rec_vlen(new_rec);
-    const uint8_t *new_key = new_rec + 24;
-    const uint8_t *new_value = new_key + new_klen;
-    uint8_t hash[16];
-    memcpy(hash, new_rec, 16);
-    (void)new_key; (void)new_klen;
-
-    /* Verify live flag */
-    if (__atomic_load_n(&new_rec[18], __ATOMIC_ACQUIRE) != 1) {
-        segcache_release(&h);
-        return -1;
-    }
+    /* Step 1: read new record from segment (verifies the live flag). */
+    if (read_marker_new_live(data_dir, marker, &new_rec) != 0) return -1;
 
     /* Step 2: if update, read old record. Keep the segcache handle open —
        old_value must stay valid through the index-diff call in steps 4-5
        below, which reads raw bytes directly out of the mmap'd segment. */
-    SlotcaskSegHandle oh;
-    int oh_open = 0;
-    const uint8_t *old_value = NULL;
-    uint32_t old_vlen = 0;
-    if (marker->has_old) {
-        char old_seg_path[PATH_MAX];
-        seg_path_for(old_seg_path, data_dir, marker->old_stream_id, marker->old_file_id);
-        if (segcache_acquire(&oh, old_seg_path, 0, 0, 0) != 0) {
-            segcache_release(&h);
-            return -1;
-        }
-        oh_open = 1;
-        const uint8_t *old_rec = oh.map + marker->old_offset;
-        old_vlen = seg_rec_vlen(old_rec);
-        old_value = old_rec + 24 + seg_rec_klen(old_rec);
-    }
+    if (marker->has_old && read_marker_old_live(data_dir, marker,
+                                                &old_rec) != 0)
+        goto out;
 
     /* Step 3: establish/sync kf mapping. resolved_kf_slot is the physical
        slot the record now lives at — for updates this is marker->kf_slot
@@ -2216,99 +2796,84 @@ static int kf_marker_replay_entry_locked(const char *eff_root, const char *objec
            record itself rather than trusting a stale kf_slot hint, since
            a resplit between the original write and this replay can move
            slots. */
-        char seg_path2[PATH_MAX];
-        seg_path_for(seg_path2, data_dir, marker->new_stream_id, marker->new_file_id);
-        SlotcaskSegHandle h2;
-        if (segcache_acquire(&h2, seg_path2, 0, 0, 0) != 0) {
-            step3_rc = -1;
-        } else {
-            const uint8_t *rec2 = h2.map + marker->new_offset;
-            uint16_t klen2 = seg_rec_klen(rec2);
-            const uint8_t *key2 = rec2 + 24;
+        uint16_t klen2 = new_rec.klen;
+        const uint8_t *key2 = new_rec.key;
 
-            uint8_t flag_out; uint8_t stream_out; uint16_t file_out;
-            uint32_t off_out; size_t existing_slot;
-            int found = (kf_lookup_with_slot(kh, hash, key2, klen2, data_dir,
-                                             &flag_out, &stream_out, &file_out,
-                                             &off_out, &existing_slot) == 0);
+        uint8_t flag_out; uint8_t stream_out; uint16_t file_out;
+        uint32_t off_out; size_t existing_slot;
+        int found = (kf_lookup_with_slot(kh, new_rec.hash, key2, klen2, data_dir,
+                                         &flag_out, &stream_out, &file_out,
+                                         &off_out, &existing_slot) == 0);
 
-            if (!found) {
-                size_t used_delta = 0, out_slot = 0;
-                if (marker->kf_slot != UINT32_MAX) {
-                    /* Bulk markers persist the exact slot selected before
-                       index apply.  Do not re-probe here: a recovery-time
-                       resplit could otherwise move the kf record while its
-                       already-durable bitmap bit still names the old slot. */
-                    if (marker->kf_slot >= kh->capacity ||
-                        kh->map[marker->kf_slot].flag == 1) {
-                        step3_rc = -1;
-                    } else {
-                        KfInsertPlan replay_plan = {
-                            .target_slot = marker->kf_slot,
-                            .reused_tomb = kh->map[marker->kf_slot].flag == 2,
-                            .key = key2,
-                            .klen = klen2,
-                        };
-                        memcpy(replay_plan.hash, hash, sizeof(replay_plan.hash));
-                        kf_commit_planned_slot(kh, &replay_plan,
-                                               marker->new_stream_id,
-                                               marker->new_file_id,
-                                               marker->new_offset,
-                                               &used_delta, &out_slot);
-                        size_t slots[] = { out_slot };
-                        if (kfcache_sync_slots_locked(kh, slots, 1, 1) != 0)
-                            step3_rc = -1;
-                        resolved_kf_slot = out_slot;
-                    }
+        if (!found) {
+            size_t used_delta = 0, out_slot = 0;
+            if (marker->kf_slot != UINT32_MAX) {
+                /* Bulk markers persist the exact slot selected before
+                   index apply.  Do not re-probe here: a recovery-time
+                   resplit could otherwise move the kf record while its
+                   already-durable bitmap bit still names the old slot. */
+                if (marker->kf_slot >= kh->capacity ||
+                    kh->map[marker->kf_slot].flag == 1) {
+                    step3_rc = -1;
                 } else {
-                    char keybuf[1024];
-                    if (klen2 > sizeof(keybuf)) {
+                    KfInsertPlan replay_plan = {
+                        .target_slot = marker->kf_slot,
+                        .reused_tomb = kh->map[marker->kf_slot].flag == 2,
+                        .key = key2,
+                        .klen = klen2,
+                    };
+                    memcpy(replay_plan.hash, new_rec.hash,
+                           sizeof(replay_plan.hash));
+                    kf_commit_planned_slot(kh, &replay_plan,
+                                           marker->new_stream_id,
+                                           marker->new_file_id,
+                                           marker->new_offset,
+                                           &used_delta, &out_slot);
+                    size_t slots[] = { out_slot };
+                    if (kfcache_sync_slots_locked(kh, slots, 1, 1) != 0)
                         step3_rc = -1;
-                    } else {
-                        memcpy(keybuf, key2, klen2);
-                        if (kf_put_new(NULL, kh, hash, marker->new_stream_id,
-                                       marker->new_file_id, marker->new_offset,
-                                       keybuf, klen2, data_dir, &used_delta, &out_slot) != 0) {
-                            step3_rc = -1;
-                        } else {
-                            size_t slots[] = { out_slot };
-                            if (kfcache_sync_slots_locked(kh, slots, 1, 1) != 0) step3_rc = -1;
-                            resolved_kf_slot = out_slot;
-                        }
-                    }
+                    resolved_kf_slot = out_slot;
                 }
             } else {
-                resolved_kf_slot = existing_slot;
+                char keybuf[1024];
+                if (klen2 > sizeof(keybuf)) {
+                    step3_rc = -1;
+                } else {
+                    memcpy(keybuf, key2, klen2);
+                    if (kf_put_new(NULL, kh, new_rec.hash, marker->new_stream_id,
+                                   marker->new_file_id, marker->new_offset,
+                                   keybuf, klen2, data_dir, &used_delta, &out_slot) != 0) {
+                        step3_rc = -1;
+                    } else {
+                        size_t slots[] = { out_slot };
+                        if (kfcache_sync_slots_locked(kh, slots, 1, 1) != 0) step3_rc = -1;
+                        resolved_kf_slot = out_slot;
+                    }
+                }
             }
-            segcache_release(&h2);
+        } else {
+            resolved_kf_slot = existing_slot;
         }
     }
 
-    if (step3_rc != 0) {
-        if (oh_open) segcache_release(&oh);
-        segcache_release(&h);
-        return -1;
-    }
+    if (step3_rc != 0) goto out;
 
     /* Steps 4-5: reconcile index state via the registered recovery
        callback. slotcask.c stays decoupled from schema/index logic (owned
        by storage.c) — see g_recovery_index_diff_fn in shard_db_internal.h.
-       NULL registration is a no-op, for kf-layer-only test builds. */
-    int diff_rc = 0;
-    if (g_recovery_index_diff_fn) {
-        char err_buf[256] = {0};
-        diff_rc = g_recovery_index_diff_fn(eff_root, object, kf_shard,
-                                           (uint32_t)resolved_kf_slot, hash,
-                                           old_value, old_vlen, new_value, new_vlen,
-                                           err_buf, sizeof(err_buf));
-    }
-
-    if (oh_open) segcache_release(&oh);
-    segcache_release(&h);
-
-    if (diff_rc != 0) return -1;
-
-    return 0;
+       NULL registration is a no-op, for kf-layer-only test builds. Old/new
+       records are explicit and nullable, so the recovery callback never
+       receives a NULL value buffer. */
+    if (kf_marker_apply_recovery_diff(eff_root, object, kf_shard,
+                                      (uint32_t)resolved_kf_slot,
+                                      marker->has_old ? &old_rec : NULL,
+                                      &new_rec) != 0)
+        goto out;
+    rc = 0;
+out:
+    marker_record_destroy(&old_rec);
+    marker_record_destroy(&new_rec);
+    return rc;
 }
 
 /* Single-marker compatibility wrapper.  Batch callers use the entry helper
@@ -2430,6 +2995,117 @@ static int batch_marker_id_cmp(const void *a, const void *b) {
     return (aa > bb) - (aa < bb);
 }
 
+/* Read a batch-marker file exactly: size must be a positive multiple of
+   sizeof(KfMarkerSlot), every entry must carry KF_MARKER_MAGIC, a valid
+   checksum, and a valid op/reserved layout, and a final pread must confirm
+   EOF. Returns 0 on success, 1 when absent, -1 (errno; EILSEQ for corrupt
+   evidence) otherwise. Never used as "read until EOF": a partial entry or an
+   extra trailing byte is corrupt evidence, not a shorter valid file. */
+static int kf_batch_marker_read_exact(const char *path, KfMarkerSlot **out,
+                                      size_t *out_count) {
+    struct stat st;
+    KfMarkerSlot *markers = NULL;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? 1 : -1;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0 ||
+        (size_t)st.st_size % sizeof(KfMarkerSlot) != 0) {
+        int saved = errno ? errno : EILSEQ; close(fd); errno = saved; return -1;
+    }
+    size_t count = (size_t)st.st_size / sizeof(KfMarkerSlot);
+    markers = calloc(count, sizeof(*markers));
+    if (!markers) { close(fd); return -1; }
+    ssize_t n = pread(fd, markers, (size_t)st.st_size, 0);
+    if (n != (ssize_t)st.st_size) {
+        int saved = errno ? errno : EILSEQ;
+        free(markers); close(fd); errno = saved;
+        return -1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (markers[i].magic != KF_MARKER_MAGIC ||
+            markers[i].checksum !=
+                XXH32(&markers[i], offsetof(KfMarkerSlot, checksum), 0) ||
+            !kf_marker_op_valid(&markers[i])) {
+            errno = EILSEQ;
+            free(markers); close(fd);
+            return -1;
+        }
+    }
+    char probe;
+    if (pread(fd, &probe, 1, (off_t)st.st_size) != 0) {
+        errno = EILSEQ;
+        free(markers); close(fd);
+        return -1;
+    }
+    close(fd);
+    *out = markers;
+    *out_count = count;
+    return 0;
+}
+
+/* Apply a pinned batch abort while the kf writer lock is held, in the
+   binding cleanup order: every inverse index diff (+ speculative NEW segment
+   tombstone for upserts), then unlink the marker and fsync, then unlink the
+   sidecar and fsync. On any failure leave both files and fail closed. */
+static int kf_batch_marker_abort_locked(const char *eff_root,
+        const char *object, const char *data_dir, int kf_shard,
+        SlotcaskKfHandle *kh, const KfMarkerSlot *markers, size_t count,
+        const char *marker_path, const char *abort_path) {
+    char kf_dir[PATH_MAX];
+    snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+    for (size_t i = 0; i < count; i++) {
+        const KfMarkerSlot *marker = &markers[i];
+        if (!kf_marker_op_valid(marker)) { errno = EILSEQ; goto failed; }
+        if (marker->op == KF_MARKER_OP_DELETE) {
+            if (kf_marker_apply_abort_diff(eff_root, object, data_dir,
+                    kf_shard, marker->kf_slot, marker) != 0)
+                goto failed;
+            continue; /* OLD remains live and Kf was never tombstoned. */
+        }
+        if (kf_marker_apply_abort_diff(eff_root, object, data_dir,
+                kf_shard, marker->kf_slot, marker) != 0 ||
+            seg_write_marker_new_tombstone_durable(data_dir, marker) != 0)
+            goto failed;
+    }
+    if (unlink(marker_path) != 0 || fsync_dir(kf_dir) != 0) goto failed;
+    if (kf_abort_clear_after_marker(abort_path, kf_dir) != 0) goto failed;
+    return 0;
+failed:
+    kf_marker_fail_closed(data_dir, kf_shard, "abort recovery");
+    return -1;
+}
+
+/* Batch equivalent of kf_marker_replay_current, used only after a
+   post-publication Kf sync failure: re-run the forward diff for every entry
+   and clear the marker so the committed state and marker-cleanup state both
+   converge synchronously. */
+static int kf_batch_marker_replay_current_locked(const char *data_dir,
+        int kf_shard, SlotcaskKfHandle *kh, const KfMarkerSlot *markers,
+        size_t count, const char *marker_path) {
+    char eff_root[PATH_MAX], object[256], kf_dir[PATH_MAX];
+
+    if (!data_dir || !kh || !kh->writer || !markers || count == 0 ||
+        !marker_path) {
+        errno = EINVAL;
+        return -1;
+    }
+    split_data_dir(data_dir, eff_root, sizeof(eff_root), object,
+                   sizeof(object));
+    for (size_t i = 0; i < count; i++) {
+        if (kf_marker_replay_entry_locked(eff_root, object, data_dir,
+                                          kf_shard, kh, &markers[i]) != 0)
+            return -1;
+    }
+    snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+    if (unlink(marker_path) != 0 || fsync_dir(kf_dir) != 0)
+        return -1;
+    return 0;
+}
+
+/* Bulk counterpart to kf_marker_gate().  A retained batch marker belongs to
+   this kf shard, so replay or abort it while the shard writer lock is held
+   before a new bulk window can reuse its batch-id/path.  Without this gate a
+   later call starts again at batch 0 and O_TRUNC can discard the recovery
+   intent left by a failed apply or kf sync. */
 static int kf_batch_marker_gate(int kf_shard, SlotcaskKfHandle *kh,
                                 const char *data_dir) {
     char kf_dir[PATH_MAX];
@@ -2445,10 +3121,23 @@ static int kf_batch_marker_gate(int kf_shard, SlotcaskKfHandle *kh,
     while ((e = readdir(d)) != NULL) {
         int marker_shard = -1, consumed = 0;
         unsigned batch_id = 0;
-        if (sscanf(e->d_name, "%x_batch_%u_marker.dat%n", &marker_shard,
-                   &batch_id, &consumed) != 2 || consumed != (int)strlen(e->d_name) ||
-            marker_shard != kf_shard)
+        int is_marker = sscanf(e->d_name, "%x_batch_%u_marker.dat%n",
+                               &marker_shard, &batch_id, &consumed) == 2 &&
+                        consumed == (int)strlen(e->d_name);
+        consumed = 0;
+        int is_abort = sscanf(e->d_name, "%x_batch_%u_abort.dat%n",
+                              &marker_shard, &batch_id, &consumed) == 2 &&
+                       consumed == (int)strlen(e->d_name);
+        if ((!is_marker && !is_abort) || marker_shard != kf_shard)
             continue;
+        int duplicate = 0;
+        for (size_t i = 0; i < nids; i++) {
+            if (ids[i] == (uint32_t)batch_id) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate) continue;
         if (nids == cap_ids) {
             size_t next = cap_ids ? cap_ids * 2 : 4;
             uint32_t *grown = realloc(ids, next * sizeof(*ids));
@@ -2463,23 +3152,105 @@ static int kf_batch_marker_gate(int kf_shard, SlotcaskKfHandle *kh,
 
     int rc = 0;
     for (size_t i = 0; i < nids && rc == 0; i++) {
-        char path[PATH_MAX];
+        char path[PATH_MAX], abort_path[PATH_MAX];
+        KfMarkerSlot *markers = NULL;
+        size_t count = 0;
         kf_batch_marker_path(path, sizeof(path), data_dir, kf_shard, ids[i]);
-        FILE *bf = fopen(path, "rb");
-        if (!bf) { rc = -1; break; }
-        KfMarkerSlot marker;
-        while (fread(&marker, sizeof(marker), 1, bf) == 1) {
-            uint32_t stored = marker.checksum;
-            uint32_t calc = XXH32(&marker, offsetof(KfMarkerSlot, checksum), 0);
-            if (stored != calc ||
-                kf_marker_replay_entry_locked(eff_root, object, data_dir, kf_shard, kh, &marker) != 0) {
-                rc = -1;
-                break;
+        struct stat marker_st;
+        int marker_present = stat(path, &marker_st) == 0;
+        int mrc = kf_batch_marker_read_exact(path, &markers, &count);
+
+        kf_abort_path(abort_path, sizeof(abort_path), data_dir,
+                      KF_ABORT_BATCH, kf_shard, ids[i]);
+        KfAbortHeader hdr;
+        int arc;
+        if (mrc == 0) {
+            arc = kf_abort_read_exact(abort_path, KF_ABORT_BATCH,
+                                      (uint32_t)kf_shard, ids[i],
+                                      (uint32_t)count, &hdr);
+        } else {
+            /* A sidecar without its marker is only the cleanup window after
+               the marker unlink was durable. Revalidate its self-consistent
+               identity before clearing it; never let a stale/corrupt sidecar
+               be hidden by a new batch reusing this id. */
+            arc = kf_abort_read_header(abort_path, &hdr);
+            if (arc == 0 &&
+                (hdr.kind != KF_ABORT_BATCH ||
+                 hdr.kf_shard != (uint32_t)kf_shard ||
+                 hdr.batch_id != ids[i] || hdr.marker_count == 0)) {
+                errno = EILSEQ;
+                arc = -1;
             }
         }
-        if (ferror(bf)) rc = -1;
-        fclose(bf);
-        if (rc == 0 && kf_batch_marker_clear(data_dir, kf_shard, ids[i]) != 0) rc = -1;
+        if (!marker_present && mrc != 1) {
+            /* kf_batch_marker_read_exact only ever returns 0/1/-1; reaching
+               here (mrc != 1) means mrc is 0 or -1. The marker may have
+               vanished between stat and read only when another gate
+               completed it (mrc == 1, excluded above) — anything else,
+               including a read that raced a concurrent write (mrc == 0) or
+               a genuinely corrupt marker (mrc == -1), is evidence, not an
+               orphan-cleanup success. */
+            free(markers);
+            rc = -1;
+            break;
+        }
+        if (marker_present && mrc != 0) {
+            free(markers);
+            rc = -1;
+            break;
+        }
+        if (!marker_present && arc == 0) {
+            if (kf_abort_clear_after_marker(abort_path, kf_dir) != 0)
+                rc = -1;
+            free(markers);
+            continue;
+        }
+        if (!marker_present && arc == 1) {
+            free(markers);
+            continue;
+        }
+        if (!marker_present) {
+            free(markers);
+            if (errno != EILSEQ) {
+                LOG_WARN(LOG_SUB_SLOTCASK,
+                         "abort-sidecar: transient I/O reading %s errno=%d (%s); "
+                         "failing this write, not terminating", abort_path,
+                         errno, strerror(errno));
+                rc = -1;
+            } else {
+                kf_marker_fail_closed(data_dir, kf_shard,
+                                      "corrupt orphan batch abort sidecar");
+            }
+            break;
+        }
+        if (arc == 0) {
+            if (kf_batch_marker_abort_locked(eff_root, object, data_dir,
+                                             kf_shard, kh, markers, count,
+                                             path, abort_path) != 0)
+                rc = -1;
+        } else if (arc == 1) {
+            /* No sidecar — forward replay to completion. */
+            for (size_t j = 0; j < count && rc == 0; j++) {
+                if (kf_marker_replay_entry_locked(eff_root, object, data_dir,
+                                                  kf_shard, kh,
+                                                  &markers[j]) != 0)
+                    rc = -1;
+            }
+            if (rc == 0 && kf_batch_marker_clear(data_dir, kf_shard,
+                                                 ids[i]) != 0)
+                rc = -1;
+        } else if (errno != EILSEQ) {
+            LOG_WARN(LOG_SUB_SLOTCASK,
+                    "abort-sidecar: transient I/O reading %s errno=%d (%s); "
+                    "failing this write, not terminating", abort_path,
+                    errno, strerror(errno));
+            rc = -1;
+        } else {
+            kf_marker_fail_closed(data_dir, kf_shard,
+                                  "corrupt batch abort sidecar");
+            rc = -1;
+        }
+        free(markers);
     }
     free(ids);
     return rc;
@@ -2522,6 +3293,7 @@ int marker_recovery_sweep_object(const char *eff_root, const char *data_dir, con
         int kf_shard = -1;
         unsigned batch_id = 0;
         int is_batch = 0;
+        int is_abort = 0;
         int name_len = (int)strlen(e->d_name);
         int consumed = 0;
 
@@ -2531,10 +3303,63 @@ int marker_recovery_sweep_object(const char *eff_root, const char *data_dir, con
         } else if ((consumed = 0, sscanf(e->d_name, "%x_marker.dat%n", &kf_shard, &consumed) == 1) &&
                    consumed == name_len) {
             /* single-record marker match */
+        } else if ((consumed = 0, sscanf(e->d_name, "%x_batch_%u_abort.dat%n", &kf_shard, &batch_id, &consumed) == 2) &&
+                   consumed == name_len) {
+            is_abort = 1;
+            is_batch = 1;
+        } else if ((consumed = 0, sscanf(e->d_name, "%x_marker_abort.dat%n", &kf_shard, &consumed) == 1) &&
+                   consumed == name_len) {
+            is_abort = 1;
         } else {
             continue;
         }
         if (kf_shard < 0) continue;
+
+        if (is_abort) {
+            /* Sidecar entry. Paired sidecars are consumed by the marker
+               branches / batch gate below; a sidecar whose marker file is
+               fully gone is completed cleanup (binding order: marker
+               unlinked before sidecar) and may be revalidated and cleared
+               here. Any other combination — marker still present, or the
+               sidecar itself corrupt — fails closed. */
+            char marker_path[PATH_MAX], abort_path[PATH_MAX];
+            if (is_batch)
+                kf_batch_marker_path(marker_path, sizeof(marker_path),
+                                     data_dir, kf_shard, batch_id);
+            else
+                kf_marker_path(marker_path, sizeof(marker_path), data_dir,
+                               kf_shard);
+            kf_abort_path(abort_path, sizeof(abort_path), data_dir,
+                          is_batch ? KF_ABORT_BATCH : KF_ABORT_SINGLE,
+                          kf_shard, batch_id);
+            struct stat st;
+            if (stat(marker_path, &st) == 0) continue; /* paired — handled below */
+            if (errno != ENOENT) { rc = -1; continue; }
+            KfAbortHeader hdr;
+            int hrc = kf_abort_read_header(abort_path, &hdr);
+            if (hrc == 0) {
+                int valid = hdr.kind == (is_batch ? KF_ABORT_BATCH : KF_ABORT_SINGLE) &&
+                            hdr.kf_shard == (uint32_t)kf_shard &&
+                            hdr.batch_id == (is_batch ? batch_id : 0) &&
+                            hdr.marker_count > 0 &&
+                            (is_batch || hdr.marker_count == 1);
+                if (!valid) {
+                    errno = EILSEQ;
+                    rc = -1;
+                } else if (kf_abort_clear_after_marker(abort_path, kf_dir) != 0) {
+                    rc = -1;
+                }
+            } else if (hrc == 1) {
+                /* Sidecar vanished between readdir() and here — cleared by
+                   a concurrent gate/sweep already (same benign race the
+                   marker branch below tolerates for rrc==1). Nothing left
+                   to do for this dirent. */
+            } else {
+                rc = -1; /* corrupt orphan sidecar — fail closed, leave it */
+            }
+            continue;
+        }
+
         if (out_replayed) (*out_replayed)++;
 
         if (is_batch) {
@@ -2561,13 +3386,40 @@ int marker_recovery_sweep_object(const char *eff_root, const char *data_dir, con
 
         KfMarkerSlot marker;
         int rrc = kf_marker_read(data_dir, kf_shard, &marker);
-        if (rrc == 1) {
-            /* Marker vanished (replayed by a concurrent gate already). */
-        } else if (rrc == 2) {
-            if (kf_marker_clear(data_dir, kf_shard) != 0) rc = -1;
-        } else if (rrc == 0) {
-            if (kf_marker_replay_locked(eff_root, object_name, data_dir, kf_shard, &kh, &marker) != 0)
+        char abort_path[PATH_MAX];
+        KfAbortHeader hdr;
+        kf_abort_path(abort_path, sizeof(abort_path), data_dir,
+                      KF_ABORT_SINGLE, kf_shard, 0);
+        int arc = kf_abort_read_exact(abort_path, KF_ABORT_SINGLE,
+                                      (uint32_t)kf_shard, 0, 1, &hdr);
+        if (rrc == 0 && arc == 0) {
+            /* Valid marker + valid sidecar: the abort is pinned — redo it. */
+            char marker_path[PATH_MAX];
+            kf_marker_path(marker_path, sizeof(marker_path), data_dir,
+                           kf_shard);
+            if (kf_marker_abort_single_locked(eff_root, object_name,
+                                              data_dir, kf_shard, &kh, &hdr,
+                                              marker_path, abort_path) != 0)
                 rc = -1;
+        } else if (rrc == 0) {
+            if (arc == -1) {
+                rc = -1; /* corrupt sidecar — fail closed, leave both */
+            } else if (kf_marker_replay_locked(eff_root, object_name,
+                                               data_dir, kf_shard, &kh,
+                                               &marker) != 0) {
+                rc = -1;
+            }
+        } else if (rrc == 1) {
+            /* Marker vanished (replayed by a concurrent gate already);
+               an orphan sidecar is cleared by the abort-file branch. */
+        } else if (rrc == 2) {
+            if (arc == 0) {
+                rc = -1; /* torn marker beside a sidecar — corrupt evidence */
+            } else if (arc == 1) {
+                if (kf_marker_clear(data_dir, kf_shard) != 0) rc = -1;
+            } else {
+                rc = -1;
+            }
         } else {
             rc = -1; /* corrupt — fail closed, leave marker in place */
         }
@@ -2614,21 +3466,23 @@ int object_has_pending_markers(const char *data_dir) {
         int is_single_match = !is_batch_match &&
                                sscanf(e->d_name, "%x_marker.dat%n", &kf_shard, &consumed) == 1 &&
                                consumed == name_len;
-        if (is_batch_match || is_single_match) {
+        consumed = 0;
+        int is_abort_batch_match = !is_batch_match && !is_single_match &&
+            sscanf(e->d_name, "%x_batch_%u_abort.dat%n", &kf_shard, &batch_id, &consumed) == 2 &&
+            consumed == name_len;
+        consumed = 0;
+        int is_abort_single_match = !is_batch_match && !is_single_match &&
+            !is_abort_batch_match &&
+            sscanf(e->d_name, "%x_marker_abort.dat%n", &kf_shard, &consumed) == 1 &&
+            consumed == name_len;
+        if (is_batch_match || is_single_match || is_abort_batch_match ||
+            is_abort_single_match) {
             found = 1;
             break;
         }
     }
     closedir(d);
     return found;
-}
-
-/* Direct tombstone at a known slot — see kf_repoint_at_slot rationale.
-   Bumps the header's deleted counter; total is unchanged (the slot was
-   already counted as non-empty when it was inserted). */
-static inline void kf_tombstone_at_slot(SlotcaskKfHandle *kh, size_t slot) {
-    kh->map[slot].flag = 2;
-    if (kh->hdr) kh->hdr->deleted++;
 }
 
 /* Repoint EXISTING key's slot. Atomic 8B store on the trailing group keeps
@@ -2973,6 +3827,31 @@ static int seg_write_flag(const SlotcaskDb *db, uint8_t stream_id,
     }
     segcache_release(&h);
     return 0;
+}
+
+/* seg_write_flag, then make the byte durable: msync the touched page and
+   fdatasync the segment. Used by recovery paths whose outcome is judged
+   after a restart, where a non-durable tombstone is indistinguishable
+   from no tombstone at all. */
+static int seg_write_flag_durable(const char *data_dir, uint8_t stream_id,
+                                  uint16_t file_id, uint32_t offset,
+                                  uint8_t flag) {
+    char path[PATH_MAX];
+    SlotcaskSegHandle h;
+    int rc = -1;
+
+    seg_path_for(path, data_dir, stream_id, file_id);
+    if (segcache_acquire(&h, path, 0, 0, 1) != 0) return -1;
+    __atomic_store_n(&h.map[offset + 18], flag, __ATOMIC_RELEASE);
+    if (h.slot >= 0) {
+        SegCacheEntry *entry = &g_segcache[h.slot];
+        durability_mark_dirty(&entry->dirty, &entry->dirty_since_ms);
+    }
+    if (durability_msync_range(h.map, offset + 18, 1) == 0 &&
+        fdatasync(h.fd) == 0)
+        rc = 0;
+    segcache_release(&h);
+    return rc;
 }
 
 /* ============================================================ Public CRUD */
@@ -4104,6 +4983,8 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
     SlotcaskUpsertOpts blank = {0};
     if (!opts) opts = &blank;
+    if (opts->out_durability_degraded)
+        *opts->out_durability_degraded = 0;
 
     /* Fail loud on a missed two-phase migration: an indexed, fresh-insert
        capable object with a legacy pre_commit alongside only one half of
@@ -4673,16 +5554,17 @@ new_from_old_done:
     /* Marker-guarded commit (has_indexed_fields=1). Every branch below
        writes and fsyncs the marker *before* the kf mutation it protects —
        for `found` the old/new locations are already known from the lookup
-       above; for insert, an insert-type marker's kf_slot is intentionally
-       UINT32_MAX (recovery re-derives it via key lookup), so its content
-       doesn't depend on kf_put_new's result either. Once the marker fsync
-       returns, the operation is never rolled back: a later kf/index failure
-       is retried via the same replay helper startup recovery uses, while
-       this lock is still held, and fails closed (aborts, so the next start
-       runs the mandatory recovery sweep) if replay still can't converge. */
+       above; for insert, the marker's kf_slot is the pre-planned target
+       slot (resolved before this point), so its content doesn't depend on
+       kf_put_new's result. Once the marker fsync returns, the operation is
+       never rolled back: a later kf/index failure is retried via the same
+       replay helper startup recovery uses, while this lock is still held,
+       and fails closed (aborts, so the next start runs the mandatory
+       recovery sweep) if replay still can't converge. */
     if (found) {
         KfMarkerSlot marker = {
             .magic = KF_MARKER_MAGIC, .kf_slot = (uint32_t)kf_slot, .has_old = 1,
+            .op = KF_MARKER_OP_UPSERT,
             .old_stream_id = old_sid, .old_file_id = old_fid, .old_offset = old_off,
             .new_stream_id = target_stream, .new_file_id = target_fid, .new_offset = target_off,
         };
@@ -4699,14 +5581,27 @@ new_from_old_done:
         if (opts->pre_commit) {
             int rc = opts->pre_commit(old_ptr, write_value, write_vlen, 1, opts->pre_commit_ctx);
             if (rc != 0) {
-                /* kf has not been repointed yet -- no commit-intent has been
-                   acted on, safe to clear the marker and roll back. */
-                kf_marker_clear(db->data_dir, sid_kf);
-                seg_write_flag(db, target_stream, target_fid, target_off, 2);
-                pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+                /* pre_commit IS the forward apply for updates (it has OLD
+                   and writes the index diff). For has_indexed_fields=1
+                   objects its mutations are durable (commit-intent marker
+                   already fsynced), so failures are only legal for genuine
+                   I/O/OOM — never a clean rollback. Write the abort sidecar
+                   and apply the inverse (re-insert old index entries,
+                   tombstone NEW, return the slot to the pool) while the
+                   writer lock is held, then reject the record. */
+                int saved = errno ? errno : EIO;
+                if (kf_marker_abort_single_current_locked(db->data_dir, sid_kf,
+                                                          &marker) != 0)
+                    kf_marker_fail_closed(db->data_dir, sid_kf,
+                                          "abort after index apply on update");
+                if (opts->prepare_commit && opts->abort_commit)
+                    opts->abort_commit(opts->pre_commit_ctx);
+                pool_push_free_cap(pool, target_fid, target_off,
+                                   slot_capacity, db->slot_size);
                 kfcache_release(&kh);
                 free(callback_value);
                 free(old_buf);
+                errno = saved;
                 return -1;
             }
         }
@@ -4723,7 +5618,9 @@ new_from_old_done:
               return 0;
           }
         }
-        kf_marker_clear(db->data_dir, sid_kf);
+        if (kf_marker_clear(db->data_dir, sid_kf) != 0 &&
+            opts->out_durability_degraded)
+            *opts->out_durability_degraded = 1;
         kfcache_release(&kh);
         if (slotcask_tombstone_and_push_back(db, old_sid, old_fid, old_off) != 0) {
             free(callback_value);
@@ -4769,7 +5666,8 @@ new_from_old_done:
         }
 
         KfMarkerSlot marker = {
-            .magic = KF_MARKER_MAGIC, .kf_slot = UINT32_MAX, .has_old = 0,
+            .magic = KF_MARKER_MAGIC, .kf_slot = (uint32_t)plan.target_slot, .has_old = 0,
+            .op = KF_MARKER_OP_UPSERT,
             .new_stream_id = target_stream, .new_file_id = target_fid, .new_offset = target_off,
         };
         if (kf_marker_write(db->data_dir, sid_kf, &marker) != 0) {
@@ -4789,16 +5687,26 @@ new_from_old_done:
             if (rc != 0) {
                 /* Marker is durable. apply_commit failures are only legal
                    for genuine I/O/OOM (prepare_commit already rejected
-                   every legitimate policy failure) — treat it like any
-                   other post-marker durability failure: replay
-                   (idempotent) rather than a silent second rollback path. */
-                if (kf_marker_replay_current(db->data_dir, sid_kf, &kh, &marker) != 0)
-                    kf_marker_fail_closed(db->data_dir, sid_kf, "index apply after insert");
+                   every legitimate policy failure). Unlike the pre-flight
+                   check, the commit-intent here must not be converted into
+                   a success: write the abort sidecar, apply the inverse
+                   (drop the just-written index entries, tombstone NEW,
+                   return the slot to the pool), reject the record, and
+                   surface the original apply error. */
+                int saved = errno ? errno : EIO;
+                if (kf_marker_abort_single_current_locked(db->data_dir, sid_kf,
+                                                          &marker) != 0)
+                    kf_marker_fail_closed(db->data_dir, sid_kf,
+                                          "abort after index apply on insert");
+                if (opts->prepare_commit && opts->abort_commit)
+                    opts->abort_commit(opts->pre_commit_ctx);
+                pool_push_free_cap(pool, target_fid, target_off,
+                                   slot_capacity, db->slot_size);
                 kfcache_release(&kh);
                 free(callback_value);
                 free(old_buf);
-                if (result) { result->was_update = 0; result->condition_not_met = 0; }
-                return 0;
+                errno = saved;
+                return -1;
             }
         }
 
@@ -4817,7 +5725,9 @@ new_from_old_done:
           }
         }
 
-        kf_marker_clear(db->data_dir, sid_kf);
+        if (kf_marker_clear(db->data_dir, sid_kf) != 0 &&
+            opts->out_durability_degraded)
+            *opts->out_durability_degraded = 1;
         kfcache_release(&kh);
     }
 
@@ -4854,6 +5764,8 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
     SlotcaskUpsertOpts blank = {0};
     if (!opts) opts = &blank;
+    if (opts->out_durability_degraded)
+        *opts->out_durability_degraded = 0;
 
     /* require_existing is incompatible with INSERT-only semantics; the caller
        should route through slotcask_upsert_with_hooks for that. */
@@ -5016,7 +5928,8 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         }
 
         KfMarkerSlot marker = {
-            .magic = KF_MARKER_MAGIC, .kf_slot = UINT32_MAX, .has_old = 0,
+            .magic = KF_MARKER_MAGIC, .kf_slot = (uint32_t)plan.target_slot, .has_old = 0,
+            .op = KF_MARKER_OP_UPSERT,
             .new_stream_id = target_stream, .new_file_id = target_fid, .new_offset = target_off,
         };
         if (kf_marker_write(db->data_dir, sid_kf, &marker) != 0) {
@@ -5034,13 +5947,24 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
             if (rc != 0) {
                 /* Marker is durable; apply_commit failures are only legal
                    for genuine I/O/OOM (prepare_commit already rejected
-                   every legitimate policy failure) — replay/fail-closed,
-                   unchanged from the pre-existing post-marker contract. */
-                if (kf_marker_replay_current(db->data_dir, sid_kf, &kh, &marker) != 0)
-                    kf_marker_fail_closed(db->data_dir, sid_kf, "index apply after insert");
+                   every legitimate policy failure). Write the abort sidecar
+                   and apply the inverse (drop the just-written index
+                   entries, tombstone NEW, return the slot to the pool),
+                   then reject the record with the original apply error —
+                   never convert the failed commit into a success. */
+                int saved = errno ? errno : EIO;
+                if (kf_marker_abort_single_current_locked(db->data_dir, sid_kf,
+                                                          &marker) != 0)
+                    kf_marker_fail_closed(db->data_dir, sid_kf,
+                                          "abort after index apply on insert");
+                if (opts->prepare_commit && opts->abort_commit)
+                    opts->abort_commit(opts->pre_commit_ctx);
+                pool_push_free_cap(pool, target_fid, target_off,
+                                   slot_capacity, db->slot_size);
                 kfcache_release(&kh);
                 if (result) { result->was_update = 0; result->condition_not_met = 0; }
-                return 0;
+                errno = saved;
+                return -1;
             }
         }
 
@@ -5056,7 +5980,9 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
               return 0;
           }
         }
-        kf_marker_clear(db->data_dir, sid_kf);
+        if (kf_marker_clear(db->data_dir, sid_kf) != 0 &&
+            opts->out_durability_degraded)
+            *opts->out_durability_degraded = 1;
         kfcache_release(&kh);
         return 0;
     }
@@ -5504,6 +6430,8 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     if (n == 0) return 0;
     SlotcaskBulkOpts blank = {0};
     if (!opts) opts = &blank;
+    if (opts->out_durability_degraded)
+        *opts->out_durability_degraded = 0;
 
     /* Bulk equivalent of the single-record guard: fail loud rather than
        silently run an indexed window with half of the prepare_window/
@@ -5718,6 +6646,8 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                pattern actually recognizes. */
             uint32_t batch_id = (uint32_t)w_start;
             int keep_marker = 0;
+            int marker_cleared = 0;
+            int apply_failed = 0;
 
             if (opts->prepare_window && opts->apply_window) {
                 /* ---- Two-phase window protocol. Stages+validates every
@@ -5846,6 +6776,7 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                             KfMarkerSlot *ms = &mslots[vi];
                             memset(ms, 0, sizeof(*ms));
                             ms->magic = KF_MARKER_MAGIC;
+                            ms->op = KF_MARKER_OP_UPSERT;
                             ms->new_stream_id = st[j].target_stream;
                             ms->new_file_id = st[j].target_fid;
                             ms->new_offset = st[j].target_off;
@@ -5932,15 +6863,51 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 /* ---- apply_window: fires once the window's batch marker
                    is durable, before kf is committed for the surviving
                    records. A nonzero return is always a genuine I/O/OOM
-                   failure — routed through the same degraded/replay path
-                   as a kfcache_sync_slots_locked failure below, never a
-                   policy rejection (those are handled by prepare_window,
-                   above, before the marker existed). */
+                   failure. Pin ABORT before returning that error: this
+                   window must never publish Kf or be forward-replayed on a
+                   later restart. */
                 if (napply_active > 0) {
                     if (opts->apply_window(recs, apply_active, napply_active, opts->bulk_hook_ctx) != 0) {
-                        keep_marker = 1;
-                        if (opts->out_durability_degraded)
-                            *opts->out_durability_degraded = 1;
+                        int saved = errno ? errno : EIO;
+                        char abort_path[PATH_MAX];
+                        kf_abort_path(abort_path, sizeof(abort_path),
+                                      db->data_dir, KF_ABORT_BATCH,
+                                      kf_shard_id, batch_id);
+                        if (kf_abort_write_sidecar(db->data_dir,
+                                                   KF_ABORT_BATCH, kf_shard_id,
+                                                   batch_id,
+                                                   (uint32_t)nsurvive) != 0)
+                            kf_marker_fail_closed(db->data_dir, kf_shard_id,
+                                                  "bulk upsert abort sidecar write");
+                        char eff_root[PATH_MAX], object[256];
+                        split_data_dir(db->data_dir, eff_root,
+                                       sizeof(eff_root), object,
+                                       sizeof(object));
+                        if (kf_batch_marker_abort_locked(
+                                eff_root, object, db->data_dir, kf_shard_id,
+                                &kh, mslots, nsurvive, bpath,
+                                abort_path) != 0)
+                            kf_marker_fail_closed(db->data_dir, kf_shard_id,
+                                                  "bulk upsert abort recovery");
+                        if (opts->abort_window)
+                            opts->abort_window(opts->bulk_hook_ctx);
+                        for (size_t a = 0; a < napply_active; a++)
+                            recs[apply_active[a]].status = -1;
+                        for (size_t j = w_end; j < n; j++) {
+                            if (recs[j].status == 0 && st[j].needs_write) {
+                                seg_write_flag(db, st[j].target_stream,
+                                               st[j].target_fid,
+                                               st[j].target_off, 2);
+                                pool_push_free(&db->streams[st[j].target_stream],
+                                               st[j].target_fid,
+                                               st[j].target_off,
+                                               db->slot_size);
+                                recs[j].status = -1;
+                            }
+                        }
+                        marker_cleared = 1;
+                        apply_failed = 1;
+                        errno = saved;
                     }
                 } else if (nactive > 0 && opts->abort_window) {
                     /* prepare_window staged resources (open bitmap writer
@@ -5951,11 +6918,12 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                     opts->abort_window(opts->bulk_hook_ctx);
                 }
 
-                durability_test_pause(db->data_dir, "bulk-window-applied");
+                if (!apply_failed)
+                    durability_test_pause(db->data_dir, "bulk-window-applied");
 
                 size_t vslots[BULK_COMMIT_MAX_RECORDS];
                 size_t nvslots = 0;
-                for (size_t a = 0; a < napply_active; a++) {
+                for (size_t a = 0; !apply_failed && a < napply_active; a++) {
                     size_t j = apply_active[a];
                     SlotcaskBulkRec *r = &recs[j];
                     size_t pub_slot;
@@ -5982,11 +6950,18 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                     vslots[nvslots++] = pub_slot;
                 }
 
-                if (nvslots > 0 &&
+                if (!apply_failed && nvslots > 0 &&
                     kfcache_sync_slots_locked(&kh, vslots, nvslots, 0) != 0) {
-                    keep_marker = 1;
-                    if (opts->out_durability_degraded)
-                        *opts->out_durability_degraded = 1;
+                    int saved = errno ? errno : EIO;
+                    if (kf_batch_marker_replay_current_locked(
+                            db->data_dir, kf_shard_id, &kh, mslots, nsurvive,
+                            bpath) != 0) {
+                        errno = saved;
+                        kf_marker_fail_closed(db->data_dir, kf_shard_id,
+                                              "indexed bulk Kf sync");
+                    } else {
+                        marker_cleared = 1;
+                    }
                 }
             } else {
                 /* ---- Legacy single-phase path: pre_commit fires per
@@ -6122,7 +7097,7 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                         *opts->out_durability_degraded = 1;
                 }
 
-                if (!keep_marker) {
+                if (!keep_marker && !marker_cleared) {
                     for (size_t j = w_start; j < w_end; j++) {
                         if (recs[j].status != 0 || !st[j].needs_write) continue;
                         SlotcaskBulkRec *r = &recs[j];
@@ -6158,7 +7133,7 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                         durability_test_pause(db->data_dir, "bulk-window-cleared");
                     }
                 } else {
-                    if (opts->out_durability_degraded)
+                    if (keep_marker && opts->out_durability_degraded)
                         *opts->out_durability_degraded = 1;
                 }
                 free(mslots);
@@ -6173,6 +7148,10 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 }
             }
 
+            if (apply_failed) {
+                wi = n;
+                break;
+            }
             wi = w_end;
         }
     } else {
@@ -6463,11 +7442,18 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     if (n == 0) return 0;
     SlotcaskBulkDeleteOpts blank = {0};
     if (!opts) opts = &blank;
+    if (opts->out_durability_degraded)
+        *opts->out_durability_degraded = 0;
 
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, db->data_dir, kf_shard_id);
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+    if (opts->has_indexed_fields &&
+        kf_shard_marker_gate(kf_shard_id, &kh, db->data_dir) != 0) {
+        kfcache_release(&kh);
+        return -1;
+    }
 
     SlotcaskBulkDelState *st = calloc(n, sizeof(SlotcaskBulkDelState));
     if (!st) { kfcache_release(&kh); return -1; }
@@ -6497,8 +7483,9 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     }
 
     /* ===== Phase 1b — batched OLD reads (sorted by old_sid/old_fid).
-       Skipped entirely when pre_commit_needs_old=0. */
-    if (opts->pre_commit_needs_old) {
+       Skipped when neither pre_commit_needs_old nor the indexed window path
+       needs OLD (apply_window requires the old value for the forward diff). */
+    if (opts->pre_commit_needs_old || (opts->has_indexed_fields && opts->apply_window)) {
         int *read_idx = malloc(n * sizeof(int));
         if (read_idx) {
             int rcount = 0;
@@ -6548,7 +7535,226 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         }
     }
 
-    /* ===== Phase 2 — per-record pre_commit + kf_tombstone (under wrlock). */
+    /* ===== Indexed path: windowed batch-marker protocol (has_indexed_fields
+       + apply_window). The contract mirrors bulk-upsert's two-phase window
+       but for deletes the "mutation" is the forward index diff
+       (old=OLD, new=NULL), which fires AFTER the batch marker is durable.
+       On apply_window failure the batch abort sidecar is written and every
+       inverse (old=NULL, new=OLD) runs while the kf wrlock is held, then
+       every record in the window is rejected. */
+    int aborted = 0;
+    if (opts->has_indexed_fields && opts->apply_window) {
+        size_t wi = 0;
+        while (wi < n) {
+            size_t w_start = wi;
+            size_t w_end   = wi;
+            size_t nactive = 0;
+            size_t active[BULK_COMMIT_MAX_RECORDS];
+
+            while (w_end < n && nactive < (size_t)BULK_COMMIT_MAX_RECORDS) {
+                if (recs[w_end].status == 0 && st[w_end].found)
+                    active[nactive++] = w_end;
+                w_end++;
+            }
+
+            if (nactive == 0) { wi = w_end; continue; }
+
+            /* ---- Publish OLD values into recs early so prepare_window
+               can read them for criteria/CAS checks before the marker. */
+            for (size_t a = 0; a < nactive; a++) {
+                size_t j = active[a];
+                SlotcaskBulkRec *r = &recs[j];
+                r->kf_shard = kf_shard_id;
+                r->kf_slot  = (uint32_t)st[j].kf_slot;
+                if (!r->old_value && st[j].old_buf) {
+                    r->old_value = st[j].old_buf;
+                    r->old_vlen  = st[j].old_vlen;
+                }
+            }
+
+            /* ---- prepare_window: fires BEFORE the marker, allowing
+               callers (e.g. criteria-based bulk delete) to reject records
+               that fail CAS or criteria checks before any durable state
+               is created. Survivors are compacted into the active array. */
+            if (opts->prepare_window &&
+                opts->prepare_window(recs, active, nactive,
+                                     opts->bulk_hook_ctx) != 0) {
+                /* prepare_window returned non-zero = all records rejected. */
+                for (size_t a = 0; a < nactive; a++)
+                    recs[active[a]].status = -1;
+                if (opts->abort_window)
+                    opts->abort_window(opts->bulk_hook_ctx);
+                nactive = 0;
+            }
+
+            /* ---- Compact active[] to remove any records that
+               prepare_window rejected (status != 0). */
+            if (opts->prepare_window && nactive > 0) {
+                size_t wi2 = 0;
+                for (size_t a = 0; a < nactive; a++) {
+                    if (recs[active[a]].status == 0)
+                        active[wi2++] = active[a];
+                }
+                nactive = wi2;
+            }
+
+            if (nactive == 0) { wi = w_end; continue; }
+
+            uint32_t batch_id = (uint32_t)w_start;
+            int fd = -1;
+            char bpath[PATH_MAX], dpath[PATH_MAX];
+            KfMarkerSlot *mslots = NULL;
+            int keep_marker = 0;
+
+            snprintf(dpath, sizeof(dpath), "%s/data/kf", db->data_dir);
+            kf_batch_marker_path(bpath, sizeof(bpath), db->data_dir,
+                                  kf_shard_id, batch_id);
+
+            /* ---- Write batch delete markers (op=DELETE, has_old=1). */
+            mslots = calloc(nactive, sizeof(KfMarkerSlot));
+            if (mslots) {
+                fd = open(bpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd >= 0) {
+                    if (fsync_dir(dpath) != 0) {
+                        close(fd); fd = -1; unlink(bpath);
+                    }
+                }
+                if (fd < 0) { free(mslots); mslots = NULL; }
+            }
+
+            if (!mslots) {
+                for (size_t a = 0; a < nactive; a++)
+                    recs[active[a]].status = -1;
+                wi = w_end;
+                continue;
+            }
+
+            int marker_ok = 1;
+            for (size_t a = 0; a < nactive && marker_ok; a++) {
+                size_t j = active[a];
+                KfMarkerSlot *ms = &mslots[a];
+                memset(ms, 0, sizeof(*ms));
+                ms->magic         = KF_MARKER_MAGIC;
+                ms->kf_slot       = (uint32_t)st[j].kf_slot;
+                ms->op            = KF_MARKER_OP_DELETE;
+                ms->has_old       = 1;
+                ms->old_stream_id = st[j].old_sid;
+                ms->old_file_id   = st[j].old_fid;
+                ms->old_offset    = st[j].old_off;
+                ms->checksum      = XXH32(ms, offsetof(KfMarkerSlot, checksum), 0);
+                off_t off = (off_t)(a * sizeof(KfMarkerSlot));
+                if (pwrite(fd, ms, sizeof(*ms), off) != (ssize_t)sizeof(*ms) ||
+                    fsync(fd) != 0) {
+                    marker_ok = 0;
+                }
+            }
+
+            if (marker_ok) {
+                durability_test_pause(db->data_dir, "bulk-delete-marker-after-write");
+            } else {
+                close(fd); fd = -1;
+                if (unlink(bpath) != 0 || fsync_dir(dpath) != 0)
+                    kf_marker_fail_closed(db->data_dir, kf_shard_id,
+                                          "could not durably discard partial bulk marker");
+                for (size_t a = 0; a < nactive; a++)
+                    recs[active[a]].status = -1;
+                free(mslots);
+                wi = w_end;
+                continue;
+            }
+
+            /* ---- apply_window: forward index diff (old=OLD, new=NULL). */
+            if (opts->apply_window(recs, active, nactive,
+                                   opts->bulk_hook_ctx) != 0) {
+                /* Abort: write sidecar, run inverse per entry, reject. */
+                int saved = errno ? errno : EIO;
+                char abort_path[PATH_MAX];
+                kf_abort_path(abort_path, sizeof(abort_path), db->data_dir,
+                              KF_ABORT_BATCH, kf_shard_id, batch_id);
+                if (kf_abort_write_sidecar(db->data_dir, KF_ABORT_BATCH,
+                                            kf_shard_id, batch_id,
+                                            (uint32_t)nactive) != 0) {
+                    kf_marker_fail_closed(db->data_dir, kf_shard_id,
+                                          "bulk delete abort sidecar write");
+                }
+                {
+                    char eff_root[PATH_MAX], object[256];
+                    split_data_dir(db->data_dir, eff_root, sizeof(eff_root),
+                                   object, sizeof(object));
+                    if (kf_batch_marker_abort_locked(eff_root, object,
+                                                     db->data_dir, kf_shard_id,
+                                                     &kh, mslots, nactive,
+                                                     bpath, abort_path) != 0)
+                        kf_marker_fail_closed(db->data_dir, kf_shard_id,
+                                              "bulk delete abort recovery");
+                }
+                if (opts->abort_window)
+                    opts->abort_window(opts->bulk_hook_ctx);
+                if (fd >= 0) close(fd);
+                free(mslots);
+                for (size_t a = 0; a < nactive; a++)
+                    recs[active[a]].status = -1;
+                /* Everything from w_end onward was never attempted — the
+                   batch stops here. Reject those records too so a caller
+                   counting recs[i].status==0 as "deleted" (the default,
+                   untouched value) never mistakes an un-attempted record
+                   for a successful one. */
+                for (size_t i = w_end; i < n; i++)
+                    if (recs[i].status == 0) recs[i].status = -1;
+                errno = saved;
+                aborted = 1;
+                /* Break out of the window loop and fall through to the
+                   shared kfcache_release() + Phase 3 segment-tombstone
+                   sweep below, so windows that committed successfully
+                   before this one aborted still get their old segment
+                   slots reclaimed. */
+                break;
+            }
+
+            /* ---- Commit: tombstone kf slots synchronously, then sync. */
+            for (size_t a = 0; a < nactive; a++) {
+                size_t j = active[a];
+                kf_tombstone_at_slot(&kh, st[j].kf_slot);
+                st[j].committed = 1;
+                recs[j].was_update = 1;
+            }
+
+            {
+                size_t vslots[BULK_COMMIT_MAX_RECORDS];
+                size_t nvslots = 0;
+                for (size_t a = 0; a < nactive; a++)
+                    vslots[nvslots++] = st[active[a]].kf_slot;
+                if (kfcache_sync_slots_locked(&kh, vslots, nvslots, 0) != 0) {
+                    keep_marker = 1;
+                    if (opts->out_durability_degraded)
+                        *opts->out_durability_degraded = 1;
+                }
+            }
+
+            /* ---- Marker cleanup (binding order: marker unlink, then
+               sidecar if present). keep_marker=1 means the committed
+               state is converged but marker/sidecar cleanup failed —
+               startup recovery handles this. */
+            if (fd >= 0) close(fd);
+            if (!keep_marker) {
+                if (unlink(bpath) != 0 || fsync_dir(dpath) != 0) {
+                    if (opts->out_durability_degraded)
+                        *opts->out_durability_degraded = 1;
+                } else {
+                    durability_test_pause(db->data_dir,
+                                          "bulk-delete-window-cleared");
+                }
+            } else {
+                if (opts->out_durability_degraded)
+                    *opts->out_durability_degraded = 1;
+            }
+            free(mslots);
+
+            wi = w_end;
+        }
+    } else {
+    /* ===== Legacy Phase 2 — per-record pre_commit + kf_tombstone
+       (under wrlock). Unchanged for non-indexed objects. */
     for (size_t i = 0; i < n; i++) {
         if (recs[i].status != 0) continue;
         if (!st[i].found) continue;
@@ -6571,6 +7777,7 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         st[i].committed = 1;
         r->was_update = 1;
     }
+    } /* end legacy Phase 2 else block */
 
     kfcache_release(&kh);
 
@@ -6629,7 +7836,7 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
 
     for (size_t i = 0; i < n; i++) free(st[i].old_buf);
     free(st);
-    return 0;
+    return aborted ? -1 : 0;
 }
 
 /* ============================================================ Bulk lookup
@@ -6975,6 +8182,13 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
     if (klen > UINT16_MAX) return -1;
     SlotcaskDeleteOpts blank = {0};
     if (!opts) opts = &blank;
+    if (opts->out_durability_degraded)
+        *opts->out_durability_degraded = 0;
+    if (opts->has_indexed_fields &&
+        (!opts->apply_commit || opts->pre_commit)) {
+        errno = EINVAL;
+        return -1;
+    }
 
     uint8_t hash[16];
     compute_hash(key, klen, hash);
@@ -6984,6 +8198,11 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
 
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+    if (opts->has_indexed_fields &&
+        kf_shard_marker_gate(sid_kf, &kh, db->data_dir) != 0) {
+        kfcache_release(&kh);
+        return -1;
+    }
 
     /* kf_lookup_with_slot captures the kf entry's slot index so the
        commit phase below can flip the flag directly via
@@ -7006,12 +8225,15 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
 
     /* Read OLD value unless caller explicitly opts out via skip_old_read.
        check needs OLD by definition (it inspects the record). pre_commit
-       might or might not — caller signals via skip_old_read. Default
-       behavior (flag = 0) reads OLD whenever any hook is set, matching
-       the original contract. Saves one segcache_acquire + 100B memcpy +
-       malloc/free pair per call when set on non-indexed delete. */
+       might or might not — caller signals via skip_old_read. The delete
+       state machine (has_indexed_fields + apply_commit) always needs OLD:
+       the forward diff is (old=OLD,new=NULL). Default behavior (flag = 0)
+       reads OLD whenever any hook is set, matching the original contract.
+       Saves one segcache_acquire + 100B memcpy + malloc/free pair per call
+       when set on non-indexed delete. */
     int needs_old = (opts->check != NULL) ||
-                    (opts->pre_commit != NULL && !opts->skip_old_read);
+                    (opts->pre_commit != NULL && !opts->skip_old_read) ||
+                    opts->has_indexed_fields;
     uint8_t *old_buf = NULL;
     size_t   old_vlen = 0;
     if (needs_old) {
@@ -7041,7 +8263,18 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
     if (opts->out_kf_shard) *opts->out_kf_shard = sid_kf;
     if (opts->out_kf_slot)  *opts->out_kf_slot  = (uint32_t)kf_slot;
 
-    if (opts->pre_commit) {
+    if (opts->has_indexed_fields) {
+        if (opts->prepare_commit &&
+            opts->prepare_commit(needs_old ? &old_rec : NULL,
+                                  (uint32_t)kf_slot,
+                                  opts->pre_commit_ctx) != 0) {
+            if (opts->abort_commit)
+                opts->abort_commit(opts->pre_commit_ctx);
+            kfcache_release(&kh);
+            free(old_buf);
+            return -1;
+        }
+    } else if (opts->pre_commit) {
         int rc = opts->pre_commit(needs_old ? &old_rec : NULL,
                                    opts->pre_commit_ctx);
         if (rc != 0) {
@@ -7049,6 +8282,75 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
             free(old_buf);
             return -1;
         }
+    }
+
+    /* Marker-guarded indexed delete. The forward diff for a delete is
+       (old=OLD, new=NULL): the marker is written and fsynced first, then
+       apply_commit drops the index entries, then the kf slot is tombstoned
+       synchronously (the primitive's own commit point). On apply failure
+       the abort sidecar is written, the inverse (old=NULL, new=OLD) runs
+       while the writer lock is still held, the record is rejected, and the
+       original apply error is returned only after the sidecar was fsynced.
+       has_indexed_fields=1 routes here unconditionally when hooks are set. */
+    if (opts->has_indexed_fields && opts->apply_commit) {
+        KfMarkerSlot marker = {
+            .magic = KF_MARKER_MAGIC, .kf_slot = (uint32_t)kf_slot, .has_old = 1,
+            .op = KF_MARKER_OP_DELETE,
+            .old_stream_id = old_sid, .old_file_id = old_fid,
+            .old_offset = old_off,
+        };
+        if (kf_marker_write(db->data_dir, sid_kf, &marker) != 0) {
+            if (opts->prepare_commit && opts->abort_commit)
+                opts->abort_commit(opts->pre_commit_ctx);
+            kfcache_release(&kh);
+            free(old_buf);
+            return -1;
+        }
+        durability_test_pause(db->data_dir, "marker-after-write");
+
+        {
+            int arc = opts->apply_commit(needs_old ? &old_rec : NULL,
+                                         (uint32_t)kf_slot,
+                                         opts->pre_commit_ctx);
+            if (arc != 0) {
+                int saved = errno ? errno : EIO;
+                if (kf_marker_abort_single_current_locked(db->data_dir, sid_kf,
+                                                          &marker) != 0)
+                    kf_marker_fail_closed(db->data_dir, sid_kf,
+                                          "abort after index apply on delete");
+                if (opts->abort_commit) opts->abort_commit(opts->pre_commit_ctx);
+                kfcache_release(&kh);
+                free(old_buf);
+                errno = saved;
+                return -1;
+            }
+        }
+
+        /* Commit point: tombstone the kf slot, sync, then clear the marker. */
+        kf_tombstone_at_slot(&kh, kf_slot);
+        {
+            size_t cs[] = { kf_slot };
+            if (kfcache_sync_slots_locked(&kh, cs, 1, 0) != 0) {
+                if (kf_marker_replay_current(db->data_dir, sid_kf, &kh,
+                                             &marker) != 0)
+                    kf_marker_fail_closed(db->data_dir, sid_kf,
+                                          "kf-slot sync after delete");
+                kfcache_release(&kh);
+                free(old_buf);
+                return 0;
+            }
+        }
+        if (kf_marker_clear(db->data_dir, sid_kf) != 0 &&
+            opts->out_durability_degraded)
+            *opts->out_durability_degraded = 1;
+        kfcache_release(&kh);
+        if (slotcask_tombstone_and_push_back(db, old_sid, old_fid,
+                                             old_off) != 0) {
+            free(old_buf);
+            return -1;
+        }
+        free(old_buf);
+        return 0;
     }
 
     /* Direct flag flip at the captured slot — no probe, no verify. */

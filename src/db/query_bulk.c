@@ -2513,6 +2513,7 @@ typedef struct {
     TypedSchema *ts;
     /* Results */
     int deleted;
+    int durability_degraded;
     /* Collected index deletions: [nidx][key_count] — parallel (val, vlen).
        val is malloc'd index-key bytes (or NULL). */
     uint8_t ***idx_vals;
@@ -2521,64 +2522,72 @@ typedef struct {
 
 /* === v2 bulk-delete (key-list) worker ===
  *
- * Per-record slotcask_delete_with_hooks; the pre_commit hook drops every
- * indexed-field's old btree entry under the keyfile wrlock. Phase-2 parallel
- * index-cleanup is skipped for v2 — the hook does it inline (lower latency,
- * matches what cmd_delete_v2 does for single deletes). */
-typedef struct {
-    BulkDelShardWork *sw;
-    int               ki;
-    /* Shared scratch arena for index-key extraction. nidx slots of
-       INDEX_KEY_MAX bytes each, reused across every pre_commit call
-       in this shard's batch — the worker fires records serially under
-       the kf wrlock so the buffer is safe to reuse. NULL if the
-       worker's arena malloc failed; pre_commit then falls back to the
-       per-call malloc path. */
-    uint8_t          *arena;
-    size_t            arena_slot;   /* INDEX_KEY_MAX, repeated for clarity */
-} V2BulkDelCtx;
+ * Indexed deletes use the two-phase window callbacks below. Non-indexed
+ * deletes need no callback: the slotcask primitive tombstones the captured
+ * Kf entries directly. */
+/* Builds a fully-populated UpdateIdxArg for one field's forward index diff
+   (old_key -> new_key), including kf_shard/kf_slot/bm_max_values/sync_after
+   — required whenever type==IT_BITMAP (index.c's update_idx_fn dispatches
+   IT_BITMAP straight into bitmap_update using these raw). Callers either
+   dispatch immediately via update_idx_fn() or batch several into a
+   parallel_for() array; either way out_error must be checked afterward. */
+static UpdateIdxArg make_index_diff_arg(const char *db_root, const char *object,
+                                         const char *field, int splits,
+                                         enum IndexType itype,
+                                         uint8_t *new_key, size_t new_len,
+                                         uint8_t *old_key, size_t old_len,
+                                         const uint8_t *hash,
+                                         int kf_shard, uint32_t kf_slot) {
+    UpdateIdxArg a = {0};
+    a.db_root = db_root; a.object = object;
+    a.field = field; a.splits = splits;
+    a.new_key = new_key; a.new_len = new_len;
+    a.old_key = old_key; a.old_len = old_len;
+    a.hash = hash; a.type = itype;
+    a.kf_shard = kf_shard; a.kf_slot = kf_slot;
+    a.bm_max_values = 0;  /* default cap — header wins on existing */
+    a.sync_after = 1;
+    return a;
+}
 
-/* Per-record pre_commit, bulk-shaped: ctx via rec->user_ctx. */
-static int v2_bulk_del_pre_commit_bulk(const SlotcaskOldRecord *old,
-                                        SlotcaskBulkRec *rec) {
-    V2BulkDelCtx *ctx = (V2BulkDelCtx *)rec->user_ctx;
-    BulkDelShardWork *sw = ctx->sw;
-    int ki = ctx->ki;
-    if (!old || sw->nidx == 0 || !sw->ts) return 0;
+/* Batch apply_window for indexed bulk deletes: fires once per window after
+   the batch delete marker is durable, performs the forward index diff
+   (old=OLD, new=NULL) for every active record. BulkDelShardWork* is passed
+   via ctx. Returns 0 on success, non-zero on I/O/OOM (triggers batch
+   abort sidecar + inverse in the primitive). */
+static int v2_bulk_del_apply_window(SlotcaskBulkRec *recs,
+                                     const size_t *active, size_t nactive,
+                                     void *ctx) {
+    BulkDelShardWork *sw = (BulkDelShardWork *)ctx;
+    if (!sw || sw->nidx == 0 || !sw->ts) return 0;
 
-    for (int fi = 0; fi < sw->nidx; fi++) {
-        uint8_t *buf = NULL; size_t blen = 0;
-        int from_arena = 0;
-        if (ctx->arena) {
-            uint8_t *slot = ctx->arena + (size_t)fi * ctx->arena_slot;
-            int rc = build_index_key_from_record_into(sw->ts, old->value,
-                                                       sw->idx_fields[fi],
-                                                       slot, ctx->arena_slot, &blen);
-            if (rc == 1) { buf = slot; from_arena = 1; }
-            else if (rc == 0) continue;     /* missing/empty field */
-            /* rc == -1: oversized index key — fall through to malloc. */
-        }
-        if (!buf) {
-            if (!build_index_key_from_record(sw->ts, old->value, sw->idx_fields[fi],
+    int idx_failed = 0;
+    for (size_t a = 0; a < nactive; a++) {
+        size_t j = active[a];
+        SlotcaskBulkRec *r = &recs[j];
+        if (r->status != 0) continue;
+        if (!r->old_value) continue;
+
+        uint8_t hash[16];
+        compute_hash_raw(r->key, r->klen, hash);
+
+        for (int fi = 0; fi < sw->nidx; fi++) {
+            uint8_t *buf = NULL; size_t blen = 0;
+            if (!build_index_key_from_record(sw->ts, r->old_value,
+                                              sw->idx_fields[fi],
                                               &buf, &blen))
                 continue;
+            enum IndexType itype = sw->idx_types ? sw->idx_types[fi] : IT_BTREE;
+            UpdateIdxArg a2 = make_index_diff_arg(sw->db_root, sw->object,
+                                                   sw->idx_fields[fi], sw->sch->splits,
+                                                   itype, NULL, 0, buf, blen, hash,
+                                                   r->kf_shard, r->kf_slot);
+            update_idx_fn(&a2);
+            if (a2.out_error) idx_failed = 1;
+            free(buf);
         }
-        enum IndexType itype = sw->idx_types ? sw->idx_types[fi] : IT_BTREE;
-        if (itype == IT_TRIGRAM) {
-            UpdateIdxArg a = {0};
-            a.db_root = sw->db_root; a.object = sw->object;
-            a.field = sw->idx_fields[fi]; a.splits = sw->sch->splits;
-            a.new_key = NULL; a.new_len = 0;
-            a.old_key = buf;  a.old_len = blen;
-            a.hash = sw->hashes[ki]; a.type = IT_TRIGRAM;
-            update_idx_fn(&a);
-        } else {
-            delete_index_entry(sw->db_root, sw->object, sw->idx_fields[fi],
-                                sw->sch->splits, buf, blen, sw->hashes[ki]);
-        }
-        if (!from_arena) free(buf);
     }
-    return 0;
+    return idx_failed ? -1 : 0;
 }
 
 static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
@@ -2597,33 +2606,17 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
     int kf_shard_id = compute_record_shard(sw->hashes[0], sw->sch->splits);
 
     SlotcaskBulkRec *batch = calloc(sw->key_count, sizeof(SlotcaskBulkRec));
-    V2BulkDelCtx    *ctxs  = malloc(sw->key_count * sizeof(V2BulkDelCtx));
-    if (!batch || !ctxs) {
+    if (!batch) {
         LOG_ERROR(LOG_SUB_QUERY, "bulk_del_shard_worker_v2: alloc failed, dropping %d deletes", sw->key_count);
-        free(batch); free(ctxs); return NULL;
-    }
-
-    /* One arena allocation for the whole shard's batch. Replaces
-       (key_count * nidx) per-field mallocs in the pre_commit hook with
-       a single malloc/free pair shared across every record. The arena
-       gets reused for each record under the kf wrlock — pre_commits
-       fire serially inside slotcask_bulk_delete_in_kfshard. */
-    enum { INDEX_KEY_MAX = 4096 };
-    uint8_t *arena = NULL;
-    if (sw->nidx > 0) {
-        arena = malloc((size_t)sw->nidx * INDEX_KEY_MAX);
+        free(batch); return NULL;
     }
 
     for (int ki = 0; ki < sw->key_count; ki++) {
-        ctxs[ki].sw         = sw;
-        ctxs[ki].ki         = ki;
-        ctxs[ki].arena      = arena;
-        ctxs[ki].arena_slot = INDEX_KEY_MAX;
         batch[ki].key       = sw->keys[ki];
         batch[ki].klen      = strlen(sw->keys[ki]);
         batch[ki].value     = NULL;
         batch[ki].vlen      = 0;
-        batch[ki].user_ctx  = &ctxs[ki];
+        batch[ki].user_ctx  = NULL;
         batch[ki].old_value = NULL;
         batch[ki].old_vlen  = 0;
         batch[ki].status    = 0;
@@ -2631,18 +2624,27 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
     }
 
     SlotcaskBulkDeleteOpts opts = {
-        .pre_commit           = v2_bulk_del_pre_commit_bulk,
-        .pre_commit_needs_old = sw->nidx > 0,
+        .has_indexed_fields = (sw->nidx > 0),
     };
-    (void)slotcask_bulk_delete_in_kfshard(sdb, kf_shard_id,
-                                           batch, sw->key_count, &opts);
+    int durability_degraded = 0;
+    opts.out_durability_degraded = &durability_degraded;
+    if (sw->nidx > 0) {
+        opts.apply_window = v2_bulk_del_apply_window;
+        opts.bulk_hook_ctx = sw;
+    }
+    int bulk_rc = slotcask_bulk_delete_in_kfshard(sdb, kf_shard_id,
+                                                   batch, sw->key_count, &opts);
+    if (bulk_rc != 0) {
+        for (int ki = 0; ki < sw->key_count; ki++)
+            if (batch[ki].status == 0) batch[ki].status = -1;
+    }
+    sw->durability_degraded = durability_degraded;
 
     for (int ki = 0; ki < sw->key_count; ki++) {
         if (batch[ki].status == 0) sw->deleted++;
         /* status=-2 (not found) and status=-1 (error) are not counted. */
     }
-    free(arena);
-    free(batch); free(ctxs);
+    free(batch);
     return NULL;
 }
 
@@ -2793,7 +2795,11 @@ static int bulk_delete_run(const char *db_root, const char *object,
        v2: the per-record pre_commit hook in bulk_del_shard_worker_v2 already
        drops the btree entries under the kf-shard wrlock. */
     int total_deleted = 0;
-    for (int g = 0; g < nshard_groups; g++) total_deleted += workers[g].deleted;
+    int any_durability_degraded = 0;
+    for (int g = 0; g < nshard_groups; g++) {
+        total_deleted += workers[g].deleted;
+        any_durability_degraded |= workers[g].durability_degraded;
+    }
 
     /* v2 drops btree index entries inside the per-record pre_commit hook
        in bulk_del_shard_worker_v2 (under the kf-shard wrlock), so no
@@ -2818,7 +2824,10 @@ static int bulk_delete_run(const char *db_root, const char *object,
         update_deleted_count(db_root, object, total_deleted);
     }
 
-    OUT("{\"deleted\":%d}\n", total_deleted);
+    if (any_durability_degraded)
+        OUT("{\"deleted\":%d,\"durability_degraded\":true}\n", total_deleted);
+    else
+        OUT("{\"deleted\":%d}\n", total_deleted);
     for (int i = 0; i < key_count; i++) free(keys[i]);
     free(keys); free(hashes); free(shard_ids); free(start_slots); free(raw);
     return 0;
@@ -3139,6 +3148,112 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
     return 0;
 }
 
+/* Batch apply_window for structured bulk updates: fires once per window
+   AFTER the batch marker, performs the forward index diff (old→new) for
+   every active record. V2BulkUpdCtx* arenas are passed via ctx. Returns
+   0 on success, non-zero on I/O/OOM. */
+
+/* No-op prepare_window required by the indexed window gate
+   (opts->prepare_window && opts->apply_window). CAS/validation is
+   already handled by value_compute in Phase 1c. */
+static int v2_bulk_upd_noop_prepare(SlotcaskBulkRec *recs,
+                                     const size_t *active, size_t nactive,
+                                     void *ctx) {
+    (void)recs; (void)active; (void)nactive; (void)ctx;
+    return 0;
+}
+
+static int v2_bulk_upd_apply_window(SlotcaskBulkRec *recs,
+                                     const size_t *active, size_t nactive,
+                                     void *ctx) {
+    (void)ctx;
+    int idx_failed = 0;
+    for (size_t a = 0; a < nactive; a++) {
+        size_t j = active[a];
+        SlotcaskBulkRec *r = &recs[j];
+        if (r->status != 0) continue;
+        if (!r->old_value || !r->value) continue;
+        V2BulkUpdCtx *uctx = (V2BulkUpdCtx *)r->user_ctx;
+        BulkUpdShardWork *w = uctx->w;
+        if (w->nidx == 0) continue;
+
+        UpdateIdxArg args[MAX_FIELDS];
+        uint8_t *fb_bufs[2 * MAX_FIELDS]; int n_fb = 0;
+        int n_args = 0;
+
+        for (int fi = 0; fi < w->nidx; fi++) {
+            uint8_t *old_buf = NULL, *new_buf_p = NULL;
+            size_t   old_len = 0,   new_len = 0;
+            int have_old = 0, have_new = 0;
+
+            if (uctx->old_arena) {
+                uint8_t *slot = uctx->old_arena + (size_t)fi * uctx->arena_slot;
+                int rc = build_index_key_from_record_into(w->ts, r->old_value,
+                                                           w->idx_fields[fi],
+                                                           slot, uctx->arena_slot, &old_len);
+                if (rc == 1) { old_buf = slot; have_old = 1; }
+                else if (rc == -1) {
+                    have_old = build_index_key_from_record(w->ts, r->old_value,
+                                                           w->idx_fields[fi],
+                                                           &old_buf, &old_len);
+                    if (have_old) fb_bufs[n_fb++] = old_buf;
+                }
+            } else {
+                have_old = build_index_key_from_record(w->ts, r->old_value,
+                                                       w->idx_fields[fi],
+                                                       &old_buf, &old_len);
+                if (have_old) fb_bufs[n_fb++] = old_buf;
+            }
+
+            if (uctx->new_arena) {
+                uint8_t *slot = uctx->new_arena + (size_t)fi * uctx->arena_slot;
+                int rc = build_index_key_from_record_into(w->ts, r->value,
+                                                           w->idx_fields[fi],
+                                                           slot, uctx->arena_slot, &new_len);
+                if (rc == 1) { new_buf_p = slot; have_new = 1; }
+                else if (rc == -1) {
+                    have_new = build_index_key_from_record(w->ts, r->value,
+                                                           w->idx_fields[fi],
+                                                           &new_buf_p, &new_len);
+                    if (have_new) fb_bufs[n_fb++] = new_buf_p;
+                }
+            } else {
+                have_new = build_index_key_from_record(w->ts, r->value,
+                                                       w->idx_fields[fi],
+                                                       &new_buf_p, &new_len);
+                if (have_new) fb_bufs[n_fb++] = new_buf_p;
+            }
+
+            int changed = 0;
+            if (have_new && !have_old) changed = 1;
+            else if (!have_new && have_old) changed = 1;
+            else if (have_new && have_old) {
+                if (new_len != old_len ||
+                    memcmp(new_buf_p, old_buf, new_len) != 0) changed = 1;
+            }
+            if (changed) {
+                args[n_args] = make_index_diff_arg(w->db_root, w->object,
+                                                    w->idx_fields[fi], w->sch->splits,
+                                                    w->idx_types ? w->idx_types[fi] : IT_BTREE,
+                                                    have_new ? new_buf_p : NULL, new_len,
+                                                    have_old ? old_buf : NULL, old_len,
+                                                    uctx->rec->hash,
+                                                    r->kf_shard, r->kf_slot);
+                n_args++;
+            }
+        }
+
+        if (n_args > 0) {
+            parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
+            for (int i = 0; i < n_args; i++) {
+                if (args[i].out_error) idx_failed = 1;
+            }
+        }
+        for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
+    }
+    return idx_failed ? -1 : 0;
+}
+
 static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
     SlotcaskSchemaInfo info = {
         .splits = w->sch->splits, .slot_size = w->sch->slot_size,
@@ -3191,11 +3306,17 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
 
     SlotcaskBulkOpts opts = {
         .require_existing     = 1,
-        .pre_commit           = v2_bulk_upd_pre_commit_bulk,
-        .pre_commit_needs_old = w->nidx > 0,
         .has_indexed_fields   = w->nidx > 0,
         .value_compute        = v2_bulk_upd_value_compute,
     };
+    if (w->nidx > 0) {
+        opts.prepare_window   = v2_bulk_upd_noop_prepare;
+        opts.apply_window     = v2_bulk_upd_apply_window;
+        opts.bulk_hook_ctx    = NULL;
+    } else {
+        opts.pre_commit           = v2_bulk_upd_pre_commit_bulk;
+        opts.pre_commit_needs_old = 1;
+    }
     uint64_t _commit_t0 = now_us();
     (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
                                            batch, (size_t)w->count, &opts);
@@ -3499,6 +3620,58 @@ static int v2_bulk_upd_delim_pre_commit_bulk(const SlotcaskOldRecord *old,
     return 0;
 }
 
+/* Batch apply_window for delimited bulk updates: fires once per window
+   AFTER the batch marker, performs the forward index diff (old→new) for
+   every active record. */
+static int v2_bulk_upd_delim_apply_window(SlotcaskBulkRec *recs,
+                                           const size_t *active, size_t nactive,
+                                           void *ctx) {
+    (void)ctx;
+    int idx_failed = 0;
+    for (size_t a = 0; a < nactive; a++) {
+        size_t j = active[a];
+        SlotcaskBulkRec *r = &recs[j];
+        if (r->status != 0) continue;
+        if (!r->old_value || !r->value) continue;
+        V2BulkUpdDelimCtx *uctx = (V2BulkUpdDelimCtx *)r->user_ctx;
+        BulkUpdDelimShardWork *w = uctx->w;
+        BulkUpdDelimRec *delim_rec = uctx->rec;
+        if (w->nidx == 0) continue;
+
+        for (int fi = 0; fi < w->nidx; fi++) {
+            uint8_t *old_buf = NULL, *new_buf = NULL;
+            size_t   old_len = 0,   new_len = 0;
+            int have_old = build_index_key_from_record(w->ts, r->old_value,
+                                                        w->idx_fields[fi],
+                                                        &old_buf, &old_len);
+            int have_new = build_index_key_from_record(w->ts, r->value,
+                                                        w->idx_fields[fi],
+                                                        &new_buf, &new_len);
+            int changed = 0;
+            if (have_new && !have_old) changed = 1;
+            else if (!have_new && have_old) changed = 1;
+            else if (have_new && have_old) {
+                if (new_len != old_len ||
+                    memcmp(new_buf, old_buf, new_len) != 0) changed = 1;
+            }
+            if (changed) {
+                enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
+                UpdateIdxArg a = make_index_diff_arg(w->db_root, w->object,
+                                                      w->idx_fields[fi], w->sch->splits,
+                                                      itype,
+                                                      have_new ? new_buf : NULL, new_len,
+                                                      have_old ? old_buf : NULL, old_len,
+                                                      delim_rec->hash,
+                                                      r->kf_shard, r->kf_slot);
+                update_idx_fn(&a);
+                if (a.out_error) idx_failed = 1;
+            }
+            free(old_buf); free(new_buf);
+        }
+    }
+    return idx_failed ? -1 : 0;
+}
+
 /* value_compute hook: derive NEW from OLD by copying old into the worker-
    allocated scratch slot, then applying CSV cells + auto_update. The
    scratch slot location is rec->value (pre-pointed by the worker). */
@@ -3617,11 +3790,17 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
 
     SlotcaskBulkOpts opts = {
         .require_existing     = 1,
-        .pre_commit           = v2_bulk_upd_delim_pre_commit_bulk,
-        .pre_commit_needs_old = w->nidx > 0,
         .has_indexed_fields   = w->nidx > 0,
         .value_compute        = v2_bulk_upd_delim_value_compute,
     };
+    if (w->nidx > 0) {
+        opts.prepare_window   = v2_bulk_upd_noop_prepare;
+        opts.apply_window     = v2_bulk_upd_delim_apply_window;
+        opts.bulk_hook_ctx    = NULL;
+    } else {
+        opts.pre_commit           = v2_bulk_upd_delim_pre_commit_bulk;
+        opts.pre_commit_needs_old = 1;
+    }
     uint64_t _commit_t0 = now_us();
     (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
                                            batch, (size_t)w->count, &opts);
@@ -3973,6 +4152,58 @@ static int v2_bulk_upd_json_pre_commit_bulk(const SlotcaskOldRecord *old,
     return 0;
 }
 
+/* Batch apply_window for JSON bulk updates: fires once per window
+   AFTER the batch marker, performs the forward index diff (old→new) for
+   every active record. */
+static int v2_bulk_upd_json_apply_window(SlotcaskBulkRec *recs,
+                                          const size_t *active, size_t nactive,
+                                          void *ctx) {
+    (void)ctx;
+    int idx_failed = 0;
+    for (size_t a = 0; a < nactive; a++) {
+        size_t j = active[a];
+        SlotcaskBulkRec *r = &recs[j];
+        if (r->status != 0) continue;
+        if (!r->old_value || !r->value) continue;
+        V2BulkUpdJsonCtx *uctx = (V2BulkUpdJsonCtx *)r->user_ctx;
+        BulkUpdJsonShardWork *w = uctx->w;
+        BulkUpdJsonRec *json_rec = uctx->rec;
+        if (w->nidx == 0) continue;
+
+        for (int fi = 0; fi < w->nidx; fi++) {
+            uint8_t *old_buf = NULL, *new_buf = NULL;
+            size_t   old_len = 0,   new_len = 0;
+            int have_old = build_index_key_from_record(w->ts, r->old_value,
+                                                        w->idx_fields[fi],
+                                                        &old_buf, &old_len);
+            int have_new = build_index_key_from_record(w->ts, r->value,
+                                                        w->idx_fields[fi],
+                                                        &new_buf, &new_len);
+            int changed = 0;
+            if (have_new && !have_old) changed = 1;
+            else if (!have_new && have_old) changed = 1;
+            else if (have_new && have_old) {
+                if (new_len != old_len ||
+                    memcmp(new_buf, old_buf, new_len) != 0) changed = 1;
+            }
+            if (changed) {
+                enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
+                UpdateIdxArg a = make_index_diff_arg(w->db_root, w->object,
+                                                      w->idx_fields[fi], w->sch->splits,
+                                                      itype,
+                                                      have_new ? new_buf : NULL, new_len,
+                                                      have_old ? old_buf : NULL, old_len,
+                                                      json_rec->hash,
+                                                      r->kf_shard, r->kf_slot);
+                update_idx_fn(&a);
+                if (a.out_error) idx_failed = 1;
+            }
+            free(old_buf); free(new_buf);
+        }
+    }
+    return idx_failed ? -1 : 0;
+}
+
 /* Compute NEW from OLD: copy old to scratch, patch JSON-named fields,
    apply auto_update. Same logic the per-record path used to inline. */
 static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
@@ -4081,11 +4312,17 @@ static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
 
     SlotcaskBulkOpts opts = {
         .require_existing     = 1,
-        .pre_commit           = v2_bulk_upd_json_pre_commit_bulk,
-        .pre_commit_needs_old = w->nidx > 0,
         .has_indexed_fields   = w->nidx > 0,
         .value_compute        = v2_bulk_upd_json_value_compute,
     };
+    if (w->nidx > 0) {
+        opts.prepare_window   = v2_bulk_upd_noop_prepare;
+        opts.apply_window     = v2_bulk_upd_json_apply_window;
+        opts.bulk_hook_ctx    = NULL;
+    } else {
+        opts.pre_commit           = v2_bulk_upd_json_pre_commit_bulk;
+        opts.pre_commit_needs_old = 1;
+    }
     uint64_t _commit_t0 = now_us();
     (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
                                            batch, (size_t)w->count, &opts);
@@ -4471,13 +4708,6 @@ int cmd_bulk_update_json_string(const char *db_root, const char *object, char *j
  * folds CAS re-verification + index drop into a single callback —
  * non-zero return skips the record (CAS rejection) so the kf entry
  * stays live. */
-typedef struct {
-    int              field_idx;   /* index into w->idx_fields[] */
-    enum IndexType   itype;
-    uint8_t          hash[16];
-    uint8_t         *idx_key;     /* heap-alloc'd; freed by bulk_delete_flush_drops */
-    size_t           idx_key_len;
-} BulkDelCritDropEntry;
 
 typedef struct {
     SlotcaskDb     *sdb;
@@ -4496,14 +4726,10 @@ typedef struct {
     char          **keys;
     uint8_t       (*hashes)[16];
     int             count;
-    /* per-worker deferred index drop buffer (collected during Phase 2,
-       flushed in bulk after parallel_for returns) */
-    BulkDelCritDropEntry *drop_entries;
-    int                   drop_count;
-    int                   drop_cap;
     /* result */
     int             deleted;
     int             skipped;
+    int             durability_degraded;
 } BulkDelCritShardWork;
 
 typedef struct {
@@ -4511,41 +4737,81 @@ typedef struct {
     int                    ki;
 } V2BulkDelCritCtx;
 
+/* Legacy per-record hook for criteria-based bulk delete (no indexes).
+   Only does criteria + CAS check; index drops are handled by the
+   windowed apply_window path when nidx > 0. */
 static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
                                              SlotcaskBulkRec *rec) {
     V2BulkDelCritCtx *ctx = (V2BulkDelCritCtx *)rec->user_ctx;
     BulkDelCritShardWork *w = ctx->w;
-    int ki = ctx->ki;
     if (!old) return -1;
     if (!criteria_match_tree(old->value, w->tree, w->fs)) return -1;
     if (w->cas_crit && w->cas_ncrit > 0 &&
         !cas_check(w->ts, old->value, (int)old->vlen, w->cas_crit, w->cas_ncrit)) return -1;
+    return 0;
+}
 
-    if (w->nidx > 0 && w->ts) {
-        for (int fi = 0; fi < w->nidx; fi++) {
-            uint8_t *buf = NULL; size_t blen = 0;
-            if (!build_index_key_from_record(w->ts, old->value,
-                                               w->idx_fields[fi], &buf, &blen))
-                continue;
-            enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
-            /* Grow drop buffer if needed */
-            if (w->drop_count >= w->drop_cap) {
-                int new_cap = w->drop_cap ? w->drop_cap * 2 : 16;
-                BulkDelCritDropEntry *tmp = realloc(w->drop_entries,
-                    (size_t)new_cap * sizeof(BulkDelCritDropEntry));
-                if (!tmp) { free(buf); continue; }
-                w->drop_entries = tmp;
-                w->drop_cap = new_cap;
-            }
-            BulkDelCritDropEntry *e = &w->drop_entries[w->drop_count++];
-            e->field_idx  = fi;
-            e->itype      = itype;
-            memcpy(e->hash, w->hashes[ki], 16);
-            e->idx_key    = buf;   /* ownership transferred; freed by flush */
-            e->idx_key_len = blen;
+/* Batch prepare_window for criteria-based indexed bulk deletes: fires once
+   per window BEFORE the batch marker, rejects records that fail criteria
+   match or CAS check. BulkDelCritShardWork* is passed via ctx. Returns 0
+   (some records survived) or -1 (all rejected — the primitive will skip
+   the marker for this window). */
+static int v2_bulk_del_crit_prepare_window(SlotcaskBulkRec *recs,
+                                            const size_t *active, size_t nactive,
+                                            void *ctx) {
+    BulkDelCritShardWork *w = (BulkDelCritShardWork *)ctx;
+    for (size_t a = 0; a < nactive; a++) {
+        size_t j = active[a];
+        SlotcaskBulkRec *r = &recs[j];
+        if (r->status != 0) continue;
+        if (!r->old_value) { r->status = -1; continue; }
+        if (!criteria_match_tree(r->old_value, w->tree, w->fs)) {
+            r->status = -1; continue;
+        }
+        if (w->cas_crit && w->cas_ncrit > 0 &&
+            !cas_check(w->ts, r->old_value, (int)r->old_vlen,
+                       w->cas_crit, w->cas_ncrit)) {
+            r->status = -1; continue;
         }
     }
     return 0;
+}
+
+/* Batch apply_window for criteria-based indexed bulk deletes: fires once
+   per window AFTER the batch marker, performs the forward index diff
+   (old=OLD, new=NULL) for every active record. BulkDelCritShardWork* is
+   passed via ctx. Returns 0 on success, non-zero on I/O/OOM (triggers
+   batch abort sidecar + inverse in the primitive). */
+static int v2_bulk_del_crit_apply_window(SlotcaskBulkRec *recs,
+                                          const size_t *active, size_t nactive,
+                                          void *ctx) {
+    BulkDelCritShardWork *w = (BulkDelCritShardWork *)ctx;
+    int idx_failed = 0;
+    for (size_t a = 0; a < nactive; a++) {
+        size_t j = active[a];
+        SlotcaskBulkRec *r = &recs[j];
+        if (r->status != 0) continue;
+        if (!r->old_value) continue;
+
+        uint8_t hash[16];
+        compute_hash_raw(r->key, r->klen, hash);
+
+        for (int fi = 0; fi < w->nidx; fi++) {
+            uint8_t *buf = NULL; size_t blen = 0;
+            if (!build_index_key_from_record(w->ts, r->old_value,
+                                              w->idx_fields[fi], &buf, &blen))
+                continue;
+            enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;
+            UpdateIdxArg a2 = make_index_diff_arg(w->db_root, w->object,
+                                                   w->idx_fields[fi], w->sch->splits,
+                                                   itype, NULL, 0, buf, blen, hash,
+                                                   r->kf_shard, r->kf_slot);
+            update_idx_fn(&a2);
+            if (a2.out_error) idx_failed = 1;
+            free(buf);
+        }
+    }
+    return idx_failed ? -1 : 0;
 }
 
 static void *bulk_del_crit_shard_worker(void *arg) {
@@ -4578,13 +4844,27 @@ static void *bulk_del_crit_shard_worker(void *arg) {
         batch[i].was_update = 0;
     }
     SlotcaskBulkDeleteOpts opts = {
-        .pre_commit           = v2_bulk_del_crit_pre_commit_bulk,
+        .has_indexed_fields = (w->nidx > 0),
+    };
+    int durability_degraded = 0;
+    opts.out_durability_degraded = &durability_degraded;
+    if (w->nidx > 0) {
+        opts.prepare_window = v2_bulk_del_crit_prepare_window;
+        opts.apply_window   = v2_bulk_del_crit_apply_window;
+        opts.bulk_hook_ctx  = w;
+    } else {
+        opts.pre_commit           = v2_bulk_del_crit_pre_commit_bulk;
         /* CAS re-verification needs OLD even if there are no indexes;
            force the batched read regardless of nidx. */
-        .pre_commit_needs_old = 1,
-    };
-    (void)slotcask_bulk_delete_in_kfshard(w->sdb, kf_shard_id,
-                                           batch, (size_t)w->count, &opts);
+        opts.pre_commit_needs_old = 1;
+    }
+    int bulk_rc = slotcask_bulk_delete_in_kfshard(w->sdb, kf_shard_id,
+                                                   batch, (size_t)w->count, &opts);
+    if (bulk_rc != 0) {
+        for (int i = 0; i < w->count; i++)
+            if (batch[i].status == 0) batch[i].status = -1;
+    }
+    w->durability_degraded = durability_degraded;
 
     for (int i = 0; i < w->count; i++) {
         if (batch[i].status == 0) w->deleted++;
@@ -4592,67 +4872,6 @@ static void *bulk_del_crit_shard_worker(void *arg) {
     }
     free(batch); free(ctxs);
     return NULL;
-}
-
-/* Comparator for bulk_delete_flush_drops: sort by (field_idx, hash[0:2])
-   so drops to the same btree shard are adjacent (cache locality). */
-static int cmp_bulk_del_drop(const void *a, const void *b) {
-    const BulkDelCritDropEntry *ea = a, *eb = b;
-    if (ea->field_idx != eb->field_idx) return ea->field_idx - eb->field_idx;
-    return memcmp(ea->hash, eb->hash, 2);
-}
-
-/* Merge all per-worker drop buffers, sort for locality, process in order.
-   Called after Phase 2's parallel_for returns. Workers own their idx_key
-   buffers; this function frees them. */
-static void bulk_delete_flush_drops(BulkDelCritShardWork *workers,
-                                     int nshard_groups,
-                                     const char *db_root,
-                                     const char *object,
-                                     int splits,
-                                     char idx_fields[][256],
-                                     const enum IndexType *idx_types) {
-    /* Count total entries */
-    int total = 0;
-    for (int g = 0; g < nshard_groups; g++) total += workers[g].drop_count;
-    if (total == 0) return;
-
-    BulkDelCritDropEntry *all = malloc((size_t)total * sizeof(BulkDelCritDropEntry));
-    if (!all) {
-        /* OOM: free idx_key buffers in workers to avoid leaks */
-        for (int g = 0; g < nshard_groups; g++)
-            for (int i = 0; i < workers[g].drop_count; i++)
-                free(workers[g].drop_entries[i].idx_key);
-        return;
-    }
-    int pos = 0;
-    for (int g = 0; g < nshard_groups; g++) {
-        if (workers[g].drop_count == 0) continue;
-        memcpy(&all[pos], workers[g].drop_entries,
-               (size_t)workers[g].drop_count * sizeof(BulkDelCritDropEntry));
-        pos += workers[g].drop_count;
-    }
-
-    qsort(all, (size_t)total, sizeof(BulkDelCritDropEntry), cmp_bulk_del_drop);
-
-    for (int i = 0; i < total; i++) {
-        BulkDelCritDropEntry *e = &all[i];
-        if (e->itype == IT_TRIGRAM) {
-            UpdateIdxArg a = {0};
-            a.db_root  = db_root; a.object = object;
-            a.field    = idx_fields[e->field_idx];
-            a.splits   = splits;
-            a.new_key  = NULL; a.new_len = 0;
-            a.old_key  = e->idx_key; a.old_len = e->idx_key_len;
-            a.hash     = e->hash; a.type = IT_TRIGRAM;
-            update_idx_fn(&a);
-        } else {
-            delete_index_entry(db_root, object, idx_fields[e->field_idx],
-                                splits, e->idx_key, e->idx_key_len, e->hash);
-        }
-        free(e->idx_key);
-    }
-    free(all);
 }
 
 int cmd_bulk_delete_criteria(const char *db_root, const char *object,
@@ -4726,6 +4945,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     /* Phase 2: Write — for each key, acquire wrlock, re-verify, tombstone */
     TypedSchema *ts = load_typed_schema(db_root, object);
     int deleted = 0, skipped = 0;
+    int any_durability_degraded = 0;
 
     /* v2 fast path: bucket matched keys by kf shard, then fan out one
        worker per bucket. Each worker calls slotcask_bulk_delete_in_kfshard
@@ -4830,15 +5050,10 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     for (int g = 0; g < nshard_groups; g++) {
         deleted += workers[g].deleted;
         skipped += workers[g].skipped;
+        any_durability_degraded |= workers[g].durability_degraded;
         free(workers[g].keys);
         free(workers[g].hashes);
     }
-    /* Phase 3: flush deferred index drops in sorted (field, shard) order */
-    bulk_delete_flush_drops(workers, nshard_groups,
-                             db_root, object, sch.splits,
-                             idx_fields, idx_types);
-    for (int g = 0; g < nshard_groups; g++)
-        free(workers[g].drop_entries);
     free(workers); free(hashes); free(shard_ids);
     free(shard_counts); free(worker_shards); free(shard_to_worker);
 
@@ -4848,7 +5063,12 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     }
     LOG_INFO(LOG_SUB_QUERY, "BULK-DELETE %s matched=%d deleted=%d skipped=%d (v2)",
              object, matched, deleted, skipped);
-    OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d}\n", matched, deleted, skipped);
+    if (any_durability_degraded)
+        OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d,\"durability_degraded\":true}\n",
+            matched, deleted, skipped);
+    else
+        OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d}\n",
+            matched, deleted, skipped);
 
     if (cas_crit) free_criteria(cas_crit, cas_ncrit);
     for (int i = 0; i < matched; i++) free(ctx.keys[i]);
