@@ -933,6 +933,35 @@ static int segcache_test_consume_identity_mismatch(void) {
 static int segcache_test_consume_identity_mismatch(void) { return 0; }
 #endif
 
+#ifdef TEST_BUILD
+/* One-shot TEST_BUILD pause hook: the invocation atomically takes and
+   clears the stored function/context pair before calling it, so at most
+   one call site per install fires (mirrors btree_test_set_after_extract_hook,
+   plus the consume semantics of segcache_test_consume_identity_mismatch). */
+static pthread_mutex_t g_after_old_lock = PTHREAD_MUTEX_INITIALIZER;
+static slotcask_test_after_old_fn g_after_old_fn = NULL;
+static void *g_after_old_ctx = NULL;
+
+void slotcask_test_set_after_old_hook(slotcask_test_after_old_fn fn, void *ctx) {
+    pthread_mutex_lock(&g_after_old_lock);
+    g_after_old_fn = fn;
+    g_after_old_ctx = ctx;
+    pthread_mutex_unlock(&g_after_old_lock);
+}
+
+void slotcask_test_after_old(int under_kf_wrlock) {
+    slotcask_test_after_old_fn fn;
+    void *ctx;
+    pthread_mutex_lock(&g_after_old_lock);
+    fn = g_after_old_fn;
+    ctx = g_after_old_ctx;
+    g_after_old_fn = NULL;
+    g_after_old_ctx = NULL;
+    pthread_mutex_unlock(&g_after_old_lock);
+    if (fn) fn(under_kf_wrlock, ctx);
+}
+#endif
+
 void segcache_init(int cap) {
     if (g_segcache) return;
     if (cap < 16) cap = 16;
@@ -4103,7 +4132,8 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
        its own lookup before touching kf, so it can honor the required
        marker-before-kf ordering; the fast path cannot, so it is restricted
        to has_indexed_fields=0 objects, where that ordering doesn't matter. */
-    if (opts->require_existing || opts->check_needs_old || opts->has_indexed_fields) {
+    if (opts->require_existing || opts->check_needs_old || opts->has_indexed_fields ||
+        opts->new_from_old) {
         return upsert_slow_path(db, stream_id_hint, key, klen, value, vlen,
                                 opts, result, hash, sid_kf);
     }
@@ -4114,6 +4144,14 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
        upgrade-to-update branch loads OLD and runs the same diff path
        the slow path would. Order: seg → kf → pre_commit so a duplicate
        rejection bails cleanly without leaving stale index entries. */
+
+    /* Fail-closed guard: unreachable with the corrected dispatch condition
+       above; keeps a future fast-path dispatch edit from silently writing a
+       new_from_old caller's NULL value. */
+    if (opts->new_from_old) {
+        errno = EINVAL;
+        return -1;
+    }
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, db->data_dir, sid_kf);
 
@@ -4430,6 +4468,49 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
         return -2;
     }
 
+    /* Opt-in NEW-from-OLD: after the built-in gates above have accepted
+       old_ptr, build the replacement from the OLD bytes read under the held
+       wrlock — never from a caller-supplied earlier snapshot. Runs before
+       any pool_try_pop_* / append_reserve_* call. write_value/write_vlen
+       are used for every reservation, segment write, and pre_commit below.
+       Only reached via the callers that set new_from_old. */
+    size_t write_vlen = vlen;
+    const uint8_t *write_value = value;
+    uint8_t *callback_value = NULL;
+
+    if (opts->new_from_old) {
+        if (!found || !old_ptr) goto new_from_old_failed;
+        if ((size_t)db->slot_size < (size_t)24 + klen)
+            goto new_from_old_failed;
+
+        size_t out_capacity = (size_t)db->slot_size - 24 - klen;
+        callback_value = malloc(out_capacity ? out_capacity : 1);
+        if (!callback_value) goto new_from_old_failed;
+
+        write_vlen = 0;
+        if (opts->new_from_old(old_ptr, callback_value, out_capacity,
+                               &write_vlen, opts->new_from_old_ctx) != 0 ||
+            write_vlen > out_capacity) {
+            goto new_from_old_failed;
+        }
+        if (db->format == SLOTCASK_FORMAT_VARIABLE && db->trim_fn)
+            write_vlen = db->trim_fn(callback_value, write_vlen, db->trim_ctx);
+        if ((size_t)24 + klen + write_vlen > (size_t)db->slot_size)
+            goto new_from_old_failed;
+        write_value = callback_value;
+    }
+    goto new_from_old_done;
+
+new_from_old_failed:
+    /* Callback-mode abort: no segment was reserved or written, no tombstone
+       was created, no marker was written. */
+    kfcache_release(&kh);
+    free(callback_value);
+    free(old_buf);
+    return -1;
+
+new_from_old_done:
+
     /* Reserve target slot. */
     int sid_data = stream_id_hint;
     if (sid_data < 0 || sid_data >= db->num_streams)
@@ -4443,17 +4524,18 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
     uint32_t target_off;
     int got_pool;
     if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + vlen),
+        got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + write_vlen),
                                            db->slot_size, &fs) == 0);
         if (got_pool) {
             target_fid = fs.file_id;
             target_off = fs.offset;
             slot_capacity = fs.capacity;
         } else {
-            size_t rec_size = slotcask_record_size_varlen(klen, vlen);
+            size_t rec_size = slotcask_record_size_varlen(klen, write_vlen);
             uint32_t fid, off;
             if (append_reserve_single_varlen(db, pool, rec_size, &fid, &off) != 0) {
                 kfcache_release(&kh);
+                free(callback_value);
                 free(old_buf);
                 return -1;
             }
@@ -4471,6 +4553,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
             uint32_t fid, off;
             if (append_reserve_n(db, pool, 1, &fid, &off) != 0) {
                 kfcache_release(&kh);
+                free(callback_value);
                 free(old_buf);
                 return -1;
             }
@@ -4482,19 +4565,21 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
     /* Write new record. */
     if (db->format == SLOTCASK_FORMAT_VARIABLE) {
         if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
-                                     hash, key, klen, value, vlen,
+                                     hash, key, klen, write_value, write_vlen,
                                      slot_capacity, 1) != 0) {
             if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
                                               slot_capacity, db->slot_size);
             kfcache_release(&kh);
+            free(callback_value);
             free(old_buf);
             return -1;
         }
     } else {
         if (seg_write_record(db, target_stream, target_fid, target_off,
-                              hash, key, klen, value, vlen, 1) != 0) {
+                              hash, key, klen, write_value, write_vlen, 1) != 0) {
             if (got_pool) pool_push_free(pool, target_fid, target_off, db->slot_size);
             kfcache_release(&kh);
+            free(callback_value);
             free(old_buf);
             return -1;
         }
@@ -4518,11 +4603,12 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
            commit: on abort, kf stays untouched and the speculative new
            segment slot is tombstoned. */
         if (opts->pre_commit) {
-            int rc = opts->pre_commit(old_ptr, value, vlen, found, opts->pre_commit_ctx);
+            int rc = opts->pre_commit(old_ptr, write_value, write_vlen, found, opts->pre_commit_ctx);
             if (rc != 0) {
                 kfcache_release(&kh);
                 seg_write_flag(db, target_stream, target_fid, target_off, 2);
                 pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
+                free(callback_value);
                 free(old_buf);
                 return -1;
             }
@@ -4533,6 +4619,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
                 size_t cs[] = { kf_slot };
                 if (kfcache_sync_slots_locked(&kh, cs, 1, 0) != 0) {
                     kfcache_release(&kh);
+                    free(callback_value);
                     free(old_buf);
                     return -1;
                 }
@@ -4547,6 +4634,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
                 seg_write_flag(db, target_stream, target_fid, target_off, 2);
                 pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
                 kfcache_release(&kh);
+                free(callback_value);
                 free(old_buf);
                 return -1;
             }
@@ -4554,6 +4642,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
                 size_t cs[] = { insert_slot };
                 if (kfcache_sync_slots_locked(&kh, cs, 1, 1) != 0) {
                     kfcache_release(&kh);
+                    free(callback_value);
                     free(old_buf);
                     return -1;
                 }
@@ -4561,10 +4650,12 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
         }
         kfcache_release(&kh);
         if (found && slotcask_tombstone_and_push_back(db, old_sid, old_fid, old_off) != 0) {
+            free(callback_value);
             free(old_buf);
             return -1;
         }
         if (result) { result->was_update = found ? 1 : 0; result->condition_not_met = 0; }
+        free(callback_value);
         free(old_buf);
         return 0;
     }
@@ -4574,6 +4665,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
         seg_write_flag(db, target_stream, target_fid, target_off, 2);
         pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
         kfcache_release(&kh);
+        free(callback_value);
         free(old_buf);
         return -1;
     }
@@ -4598,13 +4690,14 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
             seg_write_flag(db, target_stream, target_fid, target_off, 2);
             pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
             kfcache_release(&kh);
+            free(callback_value);
             free(old_buf);
             return -1;
         }
         durability_test_pause(db->data_dir, "marker-after-write");
 
         if (opts->pre_commit) {
-            int rc = opts->pre_commit(old_ptr, value, vlen, 1, opts->pre_commit_ctx);
+            int rc = opts->pre_commit(old_ptr, write_value, write_vlen, 1, opts->pre_commit_ctx);
             if (rc != 0) {
                 /* kf has not been repointed yet -- no commit-intent has been
                    acted on, safe to clear the marker and roll back. */
@@ -4612,6 +4705,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
                 seg_write_flag(db, target_stream, target_fid, target_off, 2);
                 pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
                 kfcache_release(&kh);
+                free(callback_value);
                 free(old_buf);
                 return -1;
             }
@@ -4623,6 +4717,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
               if (kf_marker_replay_current(db->data_dir, sid_kf, &kh, &marker) != 0)
                   kf_marker_fail_closed(db->data_dir, sid_kf, "kf-slot sync after repoint");
               kfcache_release(&kh);
+              free(callback_value);
               free(old_buf);
               if (result) { result->was_update = 1; result->condition_not_met = 0; }
               return 0;
@@ -4631,6 +4726,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
         kf_marker_clear(db->data_dir, sid_kf);
         kfcache_release(&kh);
         if (slotcask_tombstone_and_push_back(db, old_sid, old_fid, old_off) != 0) {
+            free(callback_value);
             free(old_buf);
             return -1;
         }
@@ -4649,6 +4745,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
             seg_write_flag(db, target_stream, target_fid, target_off, 2);
             pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
             kfcache_release(&kh);
+            free(callback_value);
             free(old_buf);
             return -1;
         }
@@ -4665,6 +4762,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
                 seg_write_flag(db, target_stream, target_fid, target_off, 2);
                 pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
                 kfcache_release(&kh);
+                free(callback_value);
                 free(old_buf);
                 return -1;
             }
@@ -4680,6 +4778,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
             seg_write_flag(db, target_stream, target_fid, target_off, 2);
             pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
             kfcache_release(&kh);
+            free(callback_value);
             free(old_buf);
             return -1;
         }
@@ -4696,6 +4795,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
                 if (kf_marker_replay_current(db->data_dir, sid_kf, &kh, &marker) != 0)
                     kf_marker_fail_closed(db->data_dir, sid_kf, "index apply after insert");
                 kfcache_release(&kh);
+                free(callback_value);
                 free(old_buf);
                 if (result) { result->was_update = 0; result->condition_not_met = 0; }
                 return 0;
@@ -4710,6 +4810,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
               if (kf_marker_replay_current(db->data_dir, sid_kf, &kh, &marker) != 0)
                   kf_marker_fail_closed(db->data_dir, sid_kf, "kf-slot sync after insert");
               kfcache_release(&kh);
+              free(callback_value);
               free(old_buf);
               if (result) { result->was_update = 0; result->condition_not_met = 0; }
               return 0;
@@ -4724,6 +4825,7 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
         result->was_update = found ? 1 : 0;
         result->condition_not_met = 0;
     }
+    free(callback_value);
     free(old_buf);
     return 0;
 }

@@ -4,6 +4,7 @@ build/
 /shard-cli
 /shardkv
 /shard-db-test
+/shard-db-test-server
 /shard-db-bench
 /migrate
 *.o
