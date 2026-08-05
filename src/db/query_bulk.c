@@ -4054,13 +4054,46 @@ typedef struct {
     uint8_t      hash[16];
     int          start_slot;
     int          shard_id;
-    /* Field deltas: aligned arrays of (typed-field index, owned-string value).
-       Only fields present in `data` populate these — missing fields are
-       left alone in the worker. */
-    int          n_fields;
-    int         *field_indices;  /* heap-owned, length n_fields */
-    char       **field_values;   /* heap-owned strings, length n_fields */
+    /* Field deltas: aligned arrays of (typed-field index, owned-string value). */
+    int         n_fields;
+    int         *field_indices;
+    char       **field_values;
+    /* Optional per-record CAS, parsed before any worker is dispatched. */
+    int          if_present;
+    SearchCriterion *if_crit;
+    int          if_ncrit;
 } BulkUpdJsonRec;
+
+static int bulk_upd_json_parse_if(const JsonObj *obj,
+                                  SearchCriterion **out, int *out_count) {
+    const char *raw = NULL;
+    size_t raw_len = 0;
+    *out = NULL;
+    *out_count = 0;
+    if (!json_obj_get(obj, "if", &raw, &raw_len)) return 0;
+    if (raw_len == 0) return -1;
+
+    char *buf = malloc(raw_len + 1);
+    if (!buf) return -1;
+    memcpy(buf, raw, raw_len);
+    buf[raw_len] = '\0';
+
+    int rc = parse_criteria_json(buf, out, out_count);
+    free(buf);
+    if (rc != 0 || *out_count <= 0) {
+        if (*out) free_criteria(*out, *out_count);
+        *out = NULL;
+        *out_count = 0;
+        return -1;
+    }
+    return 1;
+}
+
+static void bulk_upd_json_if_free(SearchCriterion **crit, int *count) {
+    if (*crit) free_criteria(*crit, *count);
+    *crit = NULL;
+    *count = 0;
+}
 
 typedef struct {
     const char       *db_root;
@@ -4212,6 +4245,10 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
     BulkUpdJsonShardWork *w = ctx->w;
     BulkUpdJsonRec       *json_rec = ctx->rec;
     if (!old) return -1;
+    if (json_rec->if_present &&
+        !cas_check(w->ts, old->value, (int)old->vlen,
+                   json_rec->if_crit, json_rec->if_ncrit))
+        return -1;
 
     uint8_t *new_buf = (uint8_t *)rec->value;
     if (old->vlen >= (size_t)w->ts->total_size) {
@@ -4266,15 +4303,13 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
 }
 
 /* Concurrency caveat (bulk-update-json + delim, partial-field):
-   the read-old → patch → upsert sequence is NOT atomic. The kf-shard
-   wrlock is acquired per record, not held for the whole worker, so a
-   concurrent writer between the slotcask_get and the upsert can lose the
-   racing writer's changes to fields THIS bulk doesn't touch. Bulk-update
-   has no CAS semantics (`if_json` is not a per-record knob in the bulk
-   protocol), so the loss is silent. Use single-record cmd_update with
-   `if_json` for strict CAS; bulk-update is documented as
-   "last-writer-wins on the touched fields, snapshot-of-read on the
-   untouched fields." */
+   JSON partial updates derive NEW from OLD inside slotcask_bulk_upsert_in_kfshard
+   while the kf-shard write lock is held; different requests on the same key
+   merge only through this lock. Per-record CAS (`if`) is evaluated against
+   the current value under the same lock, so a stale writer is rejected
+   atomically. Duplicate keys within one array request are rejected before any
+   write starts. Delimited updates retain their existing semantics unless they
+   are separately changed. */
 static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
     SlotcaskSchemaInfo info = {
         .splits = w->sch->splits, .slot_size = w->sch->slot_size,
@@ -4345,6 +4380,116 @@ static void *bulk_upd_json_shard_worker(void *arg) {
 
 /* Internal helper: read input (file path or in-memory string) into a heap buffer.
    `input_is_file` is 1 for file path, 0 for in-memory string passed verbatim. */
+
+typedef struct {
+    char *key;
+    char *message;
+} BulkUpdJsonError;
+
+static void bulk_upd_json_errors_free(BulkUpdJsonError *errors, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        free(errors[i].key);
+        free(errors[i].message);
+    }
+    free(errors);
+}
+
+static int bulk_upd_json_error_add(BulkUpdJsonError **errors, size_t *count,
+                                   size_t *capacity, const char *key,
+                                   const char *message) {
+    if (*count == *capacity) {
+        size_t next = *capacity ? *capacity * 2 : 8;
+        BulkUpdJsonError *grown = realloc(*errors,
+                                          next * sizeof(BulkUpdJsonError));
+        if (!grown) return -1;
+        *errors = grown;
+        *capacity = next;
+    }
+    (*errors)[*count].key = strdup(key ? key : "");
+    (*errors)[*count].message = strdup(message);
+    if (!(*errors)[*count].key || !(*errors)[*count].message) {
+        free((*errors)[*count].key);
+        free((*errors)[*count].message);
+        (*errors)[*count].key = NULL;
+        (*errors)[*count].message = NULL;
+        return -1;
+    }
+    (*count)++;
+    return 0;
+}
+
+static void bulk_upd_json_emit_response(int matched, int updated, int skipped,
+                                        const BulkUpdJsonError *errors,
+                                        size_t error_count) {
+    OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d",
+        matched, updated, skipped);
+    if (error_count > 0) {
+        OUT(",\"errors\":[");
+        for (size_t i = 0; i < error_count; i++) {
+            char *key = json_escape_const(errors[i].key);
+            char *message = json_escape_const(errors[i].message);
+            if (i > 0) OUT(",");
+            OUT("{\"key\":\"%s\",\"error\":\"%s\"}",
+                key ? key : "", message ? message : "");
+            free(key);
+            free(message);
+        }
+        OUT("]");
+    }
+    OUT("}\n");
+}
+
+typedef struct {
+    char *key;                 /* owned by the temporary ref array */
+    size_t klen;
+} BulkUpdJsonKeyRef;
+
+static void bulk_upd_json_key_refs_free(BulkUpdJsonKeyRef *refs, size_t count) {
+    for (size_t i = 0; i < count; i++) free(refs[i].key);
+    free(refs);
+}
+
+static int bulk_upd_json_key_ref_add(BulkUpdJsonKeyRef **refs, size_t *count,
+                                     size_t *capacity, const char *key,
+                                     size_t klen) {
+    if (*count == *capacity) {
+        size_t next = *capacity ? *capacity * 2 : 8;
+        BulkUpdJsonKeyRef *grown = realloc(*refs,
+                                           next * sizeof(BulkUpdJsonKeyRef));
+        if (!grown) return -1;
+        *refs = grown;
+        *capacity = next;
+    }
+    (*refs)[*count].key = strndup(key, klen);
+    if (!(*refs)[*count].key) return -1;
+    (*refs)[*count].klen = klen;
+    (*count)++;
+    return 0;
+}
+
+static int bulk_upd_json_key_ref_cmp(const void *lhs, const void *rhs) {
+    const BulkUpdJsonKeyRef *a = (const BulkUpdJsonKeyRef *)lhs;
+    const BulkUpdJsonKeyRef *b = (const BulkUpdJsonKeyRef *)rhs;
+    if (a->klen < b->klen) return -1;
+    if (a->klen > b->klen) return 1;
+    return memcmp(a->key, b->key, a->klen);
+}
+
+static int bulk_upd_json_find_duplicate(BulkUpdJsonKeyRef *refs, size_t count,
+                                         char **duplicate_key) {
+    *duplicate_key = NULL;
+    if (count < 2) return 0;
+    qsort(refs, count, sizeof(*refs), bulk_upd_json_key_ref_cmp);
+    for (size_t i = 1; i < count; i++) {
+        if (refs[i - 1].klen == refs[i].klen &&
+            memcmp(refs[i - 1].key, refs[i].key, refs[i].klen) == 0) {
+            *duplicate_key = strndup(refs[i].key, refs[i].klen);
+            return *duplicate_key ? 1 : -1;
+        }
+    }
+    return 0;
+}
+
 static int bulk_upd_json_run(const char *db_root, const char *object,
                               const char *input, int input_is_file) {
     TypedSchema *ts = load_typed_schema(db_root, object);
@@ -4398,6 +4543,17 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
 
     int matched = 0, skipped = 0;
 
+    BulkUpdJsonError *errors = NULL;
+    size_t error_count = 0;
+    size_t error_capacity = 0;
+    int parse_oom = 0;
+    BulkUpdJsonKeyRef *key_refs = NULL;
+    size_t key_ref_count = 0;
+    size_t key_ref_capacity = 0;
+    SearchCriterion *if_crit = NULL;
+    int if_ncrit = 0;
+    int if_rc = 0;
+
     const char *p = json_skip(json);
     int is_object_format = (*p == '{'); /* {"k1":{...},"k2":{...}}    — round-trips with get-multi */
     int is_array_format  = (*p == '[');  /* [{"key":"k1","value":{...}},...] */
@@ -4430,6 +4586,9 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         char obj_buf[8192];
         char *obj_str = NULL;
         int obj_heap = 0;
+        if_crit = NULL;
+        if_ncrit = 0;
+        if_rc = 0;
 
         if (is_object_format) {
             /* "key": {...} */
@@ -4482,11 +4641,38 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
                 data_str = dv;
                 (void)dl;
             }
+
+            if (key && bulk_upd_json_key_ref_add(&key_refs, &key_ref_count,
+                                                 &key_ref_capacity, key, klen) != 0) {
+                free(key);
+                if (obj_heap) free(obj_str);
+                parse_oom = 1;
+                break;
+            }
+
+            if_rc = bulk_upd_json_parse_if(&rec, &if_crit, &if_ncrit);
+            if (if_rc < 0) {
+                matched++;
+                skipped++;
+                if (bulk_upd_json_error_add(&errors, &error_count, &error_capacity,
+                                            key, "invalid if condition") != 0) {
+                    free(key);
+                    if (obj_heap) free(obj_str);
+                    bulk_upd_json_if_free(&if_crit, &if_ncrit);
+                    parse_oom = 1;
+                    break;
+                }
+                free(key);
+                if (obj_heap) free(obj_str);
+                p = obj_end;
+                continue;
+            }
         }
 
         if (!key || !data_str) {
             skipped++;
             free(key);
+            bulk_upd_json_if_free(&if_crit, &if_ncrit);
             if (obj_heap) free(obj_str);
             p = obj_end;
             continue;
@@ -4494,6 +4680,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         if ((int)klen > sch.max_key) {
             skipped++;
             free(key);
+            bulk_upd_json_if_free(&if_crit, &if_ncrit);
             if (obj_heap) free(obj_str);
             p = obj_end;
             continue;
@@ -4513,6 +4700,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
             skipped++;
             free(key);
+            bulk_upd_json_if_free(&if_crit, &if_ncrit);
             if (obj_heap) free(obj_str);
             p = obj_end;
             continue;
@@ -4532,23 +4720,26 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             if (!t) {
                 /* OOM: free per-record nested allocations, then the array,
                    then the current iteration's locals (whose ownership
-                   hadn't transferred to records[rec_count] yet). Reset
-                   rec_count so the downstream phase-2 loop sees an empty
-                   set and the rec_count==0 branch handles the response. */
+                   hadn't transferred to records[rec_count] yet). Mark the
+                   parse as OOM so no worker is dispatched and the parse-phase
+                   cleanup emits the error response. */
                 for (size_t k = 0; k < rec_count; k++) {
                     free(records[k].key);
                     for (int j = 0; j < records[k].n_fields; j++)
                         free(records[k].field_values[j]);
                     free(records[k].field_values);
                     free(records[k].field_indices);
+                    if (records[k].if_crit)
+                        free_criteria(records[k].if_crit, records[k].if_ncrit);
                 }
                 free(records);
                 records = NULL;
                 rec_count = 0;
-                matched--;
                 free(key);
                 for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
+                bulk_upd_json_if_free(&if_crit, &if_ncrit);
                 if (obj_heap) free(obj_str);
+                parse_oom = 1;
                 break;
             }
             records = t;
@@ -4559,6 +4750,9 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         compute_hash_raw(key, klen, r->hash);
         r->shard_id = compute_record_shard(r->hash, sch.splits);
         r->start_slot = 0;
+        r->if_present = 0;
+        r->if_crit = NULL;
+        r->if_ncrit = 0;
         /* v2 alignment — see cmd_bulk_insert for rationale. */
                     r->shard_id = compute_record_shard(r->hash, sch.splits);
         if (n_touched > 0) {
@@ -4578,12 +4772,85 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             r->field_indices = NULL;
             r->field_values = NULL;
         }
+        if (if_rc == 1) {
+            r->if_present = 1;
+            r->if_crit = if_crit;
+            r->if_ncrit = if_ncrit;
+            if_crit = NULL;
+            if_ncrit = 0;
+        }
         if (obj_heap) free(obj_str);
         p = obj_end;
     }
 
+    if (parse_oom) {
+        for (size_t i = 0; i < rec_count; i++) {
+            free(records[i].key);
+            for (int j = 0; j < records[i].n_fields; j++)
+                free(records[i].field_values[j]);
+            free(records[i].field_values);
+            free(records[i].field_indices);
+            if (records[i].if_crit)
+                free_criteria(records[i].if_crit, records[i].if_ncrit);
+        }
+        free(records);
+        bulk_upd_json_errors_free(errors, error_count);
+        bulk_upd_json_key_refs_free(key_refs, key_ref_count);
+        if (json_mmaped) munmap((void *)json, len);
+        else if (input_is_file) free(json);
+        OUT("{\"error\":\"out of memory\"}\n");
+        return 1;
+    }
+
+    char *duplicate_key = NULL;
+    int duplicate_rc = bulk_upd_json_find_duplicate(key_refs, key_ref_count,
+                                                    &duplicate_key);
+    if (duplicate_rc == 1) {
+        char *escaped = json_escape_const(duplicate_key);
+        OUT("{\"error\":\"duplicate key in records: %s\"}\n",
+            escaped ? escaped : "");
+        free(escaped);
+        free(duplicate_key);
+        bulk_upd_json_key_refs_free(key_refs, key_ref_count);
+        bulk_upd_json_errors_free(errors, error_count);
+        for (size_t i = 0; i < rec_count; i++) {
+            free(records[i].key);
+            for (int j = 0; j < records[i].n_fields; j++)
+                free(records[i].field_values[j]);
+            free(records[i].field_values);
+            free(records[i].field_indices);
+            if (records[i].if_crit)
+                free_criteria(records[i].if_crit, records[i].if_ncrit);
+        }
+        free(records);
+        if (json_mmaped) munmap((void *)json, len);
+        else if (input_is_file) free(json);
+        return 1;
+    }
+    if (duplicate_rc < 0) {
+        for (size_t i = 0; i < rec_count; i++) {
+            free(records[i].key);
+            for (int j = 0; j < records[i].n_fields; j++)
+                free(records[i].field_values[j]);
+            free(records[i].field_values);
+            free(records[i].field_indices);
+            if (records[i].if_crit)
+                free_criteria(records[i].if_crit, records[i].if_ncrit);
+        }
+        free(records);
+        bulk_upd_json_errors_free(errors, error_count);
+        bulk_upd_json_key_refs_free(key_refs, key_ref_count);
+        if (json_mmaped) munmap((void *)json, len);
+        else if (input_is_file) free(json);
+        OUT("{\"error\":\"out of memory\"}\n");
+        return 1;
+    }
+    bulk_upd_json_key_refs_free(key_refs, key_ref_count);
+    key_refs = NULL;
+
     if (rec_count == 0) {
-        OUT("{\"matched\":0,\"updated\":0,\"skipped\":%d}\n", skipped);
+        bulk_upd_json_emit_response(matched, 0, skipped, errors, error_count);
+        bulk_upd_json_errors_free(errors, error_count);
         if (json_mmaped) munmap((void *)json, len);
         else if (input_is_file) free(json);
         free(records);
@@ -4598,8 +4865,12 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             for (int j = 0; j < records[i].n_fields; j++) free(records[i].field_values[j]);
             free(records[i].field_values);
             free(records[i].field_indices);
+            if (records[i].if_crit)
+                free_criteria(records[i].if_crit, records[i].if_ncrit);
         }
         free(records);
+        bulk_upd_json_errors_free(errors, error_count);
+        bulk_upd_json_key_refs_free(key_refs, key_ref_count);
         if (json_mmaped) munmap((void *)json, len); else if (input_is_file) free(json);
         OUT("{\"error\":\"oom: shard_counts\"}\n");
         return 1;
@@ -4617,8 +4888,12 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             for (int j = 0; j < records[i].n_fields; j++) free(records[i].field_values[j]);
             free(records[i].field_values);
             free(records[i].field_indices);
+            if (records[i].if_crit)
+                free_criteria(records[i].if_crit, records[i].if_ncrit);
         }
         free(records);
+        bulk_upd_json_errors_free(errors, error_count);
+        bulk_upd_json_key_refs_free(key_refs, key_ref_count);
         if (json_mmaped) munmap((void *)json, len); else if (input_is_file) free(json);
         OUT("{\"error\":\"oom: workers\"}\n");
         return 1;
@@ -4659,6 +4934,8 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         records[i].key = NULL;
         records[i].field_values = NULL;
         records[i].field_indices = NULL;
+        records[i].if_crit = NULL;
+        records[i].if_ncrit = 0;
     }
     free(shard_counts);
 
@@ -4676,6 +4953,8 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             for (int j = 0; j < r->n_fields; j++) free(r->field_values[j]);
             free(r->field_values);
             free(r->field_indices);
+            if (r->if_crit)
+                free_criteria(r->if_crit, r->if_ncrit);
         }
         free(workers[gi].recs);
     }
@@ -4687,7 +4966,8 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
 
     LOG_INFO(LOG_SUB_QUERY, "BULK-UPDATE-JSON %s matched=%d updated=%d skipped=%d",
             object, matched, updated, skipped);
-    OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
+    bulk_upd_json_emit_response(matched, updated, skipped, errors, error_count);
+    bulk_upd_json_errors_free(errors, error_count);
     return 0;
 }
 
