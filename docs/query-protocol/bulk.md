@@ -237,6 +237,32 @@ Or the array form:
 - Missing keys count toward `skipped`, not `updated`.
 - Indexes stay in sync.
 
+#### Per-record CAS (array form only)
+
+Each array record may include an `if` condition using the standard criteria grammar. The condition is evaluated against the key's current record while the kf-shard write lock is held. If the condition fails, that record is skipped; other records continue.
+
+```json
+{
+  "mode": "bulk-update",
+  "dir": "<dir>",
+  "object": "<obj>",
+  "records": [
+    {
+      "key": "<key1>",
+      "value": {"<field>": "<new value>"},
+      "if": [{"field": "<field>", "op": "eq", "value": "<expected>"}]
+    }
+  ]
+}
+```
+
+- A matching CAS commits the update; a non-matching CAS skips the record (included in `skipped`).
+- A syntactically invalid per-record `if` also rejects only that record: it is included in `matched` and `skipped`, and reported in an `errors` array so the caller can distinguish malformed input from a valid CAS miss.
+- Duplicate keys in the array form are rejected as a request-level input error before any write starts.
+- The dictionary form and delimited form do not support per-record CAS.
+- There is no batch-wide transaction across keys.
+- The `errors` member is a new optional response field; existing clients that only read `matched`/`updated`/`skipped` remain compatible.
+
 ### Per-key partial update — from a file
 
 ```json
@@ -275,5 +301,7 @@ For `bulk-update` and `bulk-delete` on criteria, **always** run `dry_run:true` f
 
 ## What bulk ops don't support
 
-- **Per-record error recovery in JSON** — if record #50 fails type validation, records 1–49 are committed and the response's `errors` count goes up. The failed record's details are logged but not returned to the client today.
+- **Per-record error recovery in JSON** — if record #50 fails type validation, records 1–49 are committed and the record is skipped. Invalid per-record CAS conditions are returned in the optional `errors` array; other validation failures do not currently include detailed record errors in the response.
+- **Per-record CAS in dictionary or delimited form** — the `if` condition is only available in the array form.
+- **Batch-wide transactionality** — each key update is atomic, but there is no all-or-nothing across keys.
 - **Heterogeneous objects in one call** — a bulk operation is scoped to one `(dir, object)` pair.

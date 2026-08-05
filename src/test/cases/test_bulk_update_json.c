@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 
 static int do_count(TestClient *tc, const char *criteria) {
@@ -25,6 +26,29 @@ static int do_count(TestClient *tc, const char *criteria) {
     int n = tu_parse_count(resp);
     free(resp);
     return n;
+}
+
+typedef struct {
+    int port;
+    const char *status;
+    char *response;
+} BulkCasWriter;
+
+static void *bulk_cas_writer_run(void *arg) {
+    BulkCasWriter *writer = (BulkCasWriter *)arg;
+    TestClientCfg cfg = { .port = writer->port, .io_timeout_ms = 30000 };
+    TestClient *client = tc_connect(&cfg);
+    if (!client) return NULL;
+    char request[512];
+    snprintf(request, sizeof(request),
+        "{\"mode\":\"bulk-update\",\"dir\":\"default\","
+        "\"object\":\"budj_t\",\"records\":[{\"key\":\"k4\","
+        "\"value\":{\"status\":\"%s\",\"amount\":8},"
+        "\"if\":[{\"field\":\"amount\",\"op\":\"eq\","
+        "\"value\":\"7\"}]}]}", writer->status);
+    tc_request(client, request, &writer->response);
+    tc_close(client);
+    return NULL;
 }
 
 static int test_bulk_update_json_run(void) {
@@ -62,9 +86,98 @@ static int test_bulk_update_json_run(void) {
     ASSERT_CONTAINS(resp, "\"skipped\":1", "skipped=1");
     free(resp); resp = NULL;
 
-    /* absent fields untouched */
+    /* matching per-record CAS commits and preserves an unmodified field */
+    tc_request(tc,
+        "{\"mode\":\"bulk-update\",\"dir\":\"default\",\"object\":\"budj_t\","
+        "\"records\":[{\"key\":\"k1\",\"value\":{\"status\":\"approved\"},"
+        "\"if\":[{\"field\":\"amount\",\"op\":\"eq\",\"value\":\"100\"}]}]}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"updated\":1", "matching per-key CAS updates");
+    free(resp); resp = NULL;
+    ASSERT_EQ_INT(do_count(tc,
+                           "[{\"field\":\"status\",\"op\":\"eq\","
+                           "\"value\":\"approved\"}]"),
+                  1, "matching CAS updates the index");
+
+    /* non-matching CAS skips and leaves the record unchanged */
+    tc_request(tc,
+        "{\"mode\":\"bulk-update\",\"dir\":\"default\",\"object\":\"budj_t\","
+        "\"records\":[{\"key\":\"k1\",\"value\":{\"status\":\"stale\"},"
+        "\"if\":[{\"field\":\"amount\",\"op\":\"eq\",\"value\":\"999\"}]}]}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"updated\":0", "non-matching CAS does not update");
+    ASSERT_CONTAINS(resp, "\"skipped\":1", "non-matching CAS skips");
+    free(resp); resp = NULL;
+
+    /* malformed per-record if rejects only that record and reports its key */
+    tc_request(tc,
+        "{\"mode\":\"bulk-update\",\"dir\":\"default\",\"object\":\"budj_t\","
+        "\"records\":[{\"key\":\"k1\",\"value\":{\"status\":\"bad\"},"
+        "\"if\":[{\"field\":\"amount\",\"op\":\"not-an-operator\",\"value\":\"100\"}]},"
+        "{\"key\":\"k3\",\"value\":{\"note\":\"peer\"}}]}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"matched\":2", "invalid if is matched");
+    ASSERT_CONTAINS(resp, "\"updated\":1", "valid peer still updates");
+    ASSERT_CONTAINS(resp, "\"skipped\":1", "invalid if skips");
+    ASSERT_CONTAINS(resp, "\"key\":\"k1\"", "invalid if reports its key");
+    ASSERT_CONTAINS(resp, "invalid if condition", "invalid if is reported");
+    free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"budj_t\",\"key\":\"k1\"}", &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"refunded\"", "k1 status=refunded");
+    ASSERT_CONTAINS(resp, "\"status\":\"approved\"", "invalid if leaves record unchanged");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\","
+        "\"object\":\"budj_t\",\"records\":[{\"key\":\"k4\","
+        "\"value\":{\"status\":\"pending\",\"amount\":7,"
+        "\"note\":\"cas\"}}]}", &resp);
+    free(resp); resp = NULL;
+
+    BulkCasWriter writer_a = { env.port, "writer-a", NULL };
+    BulkCasWriter writer_b = { env.port, "writer-b", NULL };
+    pthread_t thread_a, thread_b;
+    int create_a = pthread_create(&thread_a, NULL, bulk_cas_writer_run, &writer_a);
+    int create_b = pthread_create(&thread_b, NULL, bulk_cas_writer_run, &writer_b);
+    ASSERT_EQ_INT(create_a, 0, "start CAS writer A");
+    ASSERT_EQ_INT(create_b, 0, "start CAS writer B");
+    if (create_a == 0) ASSERT_EQ_INT(pthread_join(thread_a, NULL), 0,
+                                      "join CAS writer A");
+    if (create_b == 0) ASSERT_EQ_INT(pthread_join(thread_b, NULL), 0,
+                                      "join CAS writer B");
+    if (create_a == 0 && create_b == 0) {
+        ASSERT_TRUE((SAFE_STRSTR(writer_a.response, "\"updated\":1") != NULL) !=
+                    (SAFE_STRSTR(writer_b.response, "\"updated\":1") != NULL),
+                    "exactly one CAS writer updates");
+        ASSERT_TRUE((SAFE_STRSTR(writer_a.response, "\"skipped\":1") != NULL) !=
+                    (SAFE_STRSTR(writer_b.response, "\"skipped\":1") != NULL),
+                    "exactly one CAS writer skips");
+    }
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\","
+                    "\"object\":\"budj_t\",\"key\":\"k4\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"amount\":8", "one CAS writer changed revision");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"status\":\"writer-a\"") != NULL ||
+                SAFE_STRSTR(resp, "\"status\":\"writer-b\"") != NULL,
+                "one CAS writer's patch is visible");
+    free(resp); resp = NULL;
+    free(writer_a.response);
+    free(writer_b.response);
+
+    tc_request(tc,
+        "{\"mode\":\"bulk-update\",\"dir\":\"default\","
+        "\"object\":\"budj_t\",\"records\":["
+        "{\"key\":\"k4\",\"value\":{\"note\":\"first\"}},"
+        "{\"key\":\"k4\",\"value\":{\"note\":\"second\"}}]}", &resp);
+    ASSERT_CONTAINS(resp, "duplicate key in records", "duplicate keys reject request");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\","
+                    "\"object\":\"budj_t\",\"key\":\"k4\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"amount\":8", "duplicate request did not alter record");
+    ASSERT_CONTAINS(resp, "\"note\":\"cas\"", "duplicate request preserved note");
+    free(resp); resp = NULL;
+
+    /* absent fields untouched — note: CAS test above changed k1 status to "approved" */
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"budj_t\",\"key\":\"k1\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"approved\"", "k1 status=approved (CAS set)");
     ASSERT_CONTAINS(resp, "\"amount\":100", "k1 amount=100 untouched");
     ASSERT_CONTAINS(resp, "\"note\":\"vip\"", "k1 note=vip untouched");
     free(resp); resp = NULL;
@@ -77,7 +190,7 @@ static int test_bulk_update_json_run(void) {
 
     /* indexes track */
     ASSERT_EQ_INT(do_count(tc, "[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}]"), 0, "count(paid)=0");
-    ASSERT_EQ_INT(do_count(tc, "[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"refunded\"}]"), 2, "count(refunded)=2");
+    ASSERT_EQ_INT(do_count(tc, "[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"refunded\"}]"), 1, "count(refunded)=1");
     ASSERT_EQ_INT(do_count(tc, "[{\"field\":\"amount\",\"op\":\"eq\",\"value\":\"200\"}]"), 0, "count(amount=200)=0");
     ASSERT_EQ_INT(do_count(tc, "[{\"field\":\"amount\",\"op\":\"eq\",\"value\":\"201\"}]"), 1, "count(amount=201)=1");
 
@@ -86,7 +199,8 @@ static int test_bulk_update_json_run(void) {
     snprintf(path, sizeof(path), "/tmp/budj_%d.json", (int)getpid());
     FILE *f = fopen(path, "w");
     if (f) {
-        fprintf(f, "[{\"key\":\"k1\",\"value\":{\"amount\":111}},"
+        fprintf(f, "[{\"key\":\"k1\",\"value\":{\"amount\":111},"
+                  "\"if\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"approved\"}]},"
                   "{\"key\":\"k3\",\"value\":{\"status\":\"paid\"}}]");
         fclose(f);
     }
@@ -102,7 +216,7 @@ static int test_bulk_update_json_run(void) {
 
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"budj_t\",\"key\":\"k1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"amount\":111", "k1 amount=111 (file update)");
-    ASSERT_CONTAINS(resp, "\"status\":\"refunded\"", "k1 status untouched");
+    ASSERT_CONTAINS(resp, "\"status\":\"approved\"", "k1 status untouched");
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"budj_t\",\"key\":\"k3\"}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"paid\"", "k3 status=paid (file update)");
