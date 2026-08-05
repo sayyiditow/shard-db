@@ -86,10 +86,14 @@ later) upgrade with a binary swap:
 ```
 
 The `./migrate` binary was reinstated in 2026.07.1 and ships with
-2026.07.1+. It runs compact (VARIABLE-format conversion) and
-`rebuild-kf` automatically. It is idempotent — safe to re-run if
-interrupted. A review in 2026.08 will determine which migration steps
-are no longer needed and can be removed.
+2026.07.1+. It runs two phases: (1) varlen segment migration, then
+(2) offline compact. It is idempotent — safe to re-run if interrupted.
+
+Operators who upgraded from a pre-2026.07.1 build affected by kf
+corruption must run the 2026.07.1 release's `rebuild-kf` against a
+backup before upgrading past this release. This release removes
+`rebuild-kf` and makes full rebuilds abort on invalid live kf
+references.
 
 Operators on a pre-2026.05.5 install with legacy v1 (probe-into-slot)
 objects on disk must first install 2026.05.4 and run that release's

@@ -344,6 +344,8 @@ All vacuum flavors take the object's write lock. Normal ops block for the durati
 Response (v2 light path): `{"status":"vacuumed","cleaned":<seg-files-dropped>}`.
 Response (heavy path — `compact`, `splits`, or streams-mismatch): `{"status":"rebuilt","live":N,"splits":N,"streams":N,"slot_size":N,"compact":true|false,"indexes_rebuilt":N}`.
 
+A full rebuild (`vacuum` with `compact`, `splits`, or streams correction; field add/edit/remove rebuilds) validates every live kf reference before it copies anything. If any live kf entry points to a missing or unreadable segment record, the rebuild aborts with `{"error":"Rebuild aborted: N invalid live kf reference(s); original data restored"}` and leaves the pre-rebuild object intact. Operators should restore from backup or use the previous release's repair tool (2026.07.1 `rebuild-kf`) against a backup copy.
+
 ## truncate
 
 Delete all records; schema and indexes survive.
@@ -368,25 +370,6 @@ Rescans every shard, counts live/tombstoned slots, and rewrites `metadata/counts
 
 Response: `{"count":N,"orphaned":M}`.
 
-## rebuild-kf
-
-New in 2026.07.1. Repairs corrupted/dangling kf (keyfile) entries by rescanning every segment file and re-deriving each live record's kf slot from scratch. Use after suspected kf corruption — e.g. a prior crash mid-compact left kf entries pointing at segment files that no longer exist, causing bulk-insert or find to intermittently report `some_records_dropped` or miss records that are actually present on disk.
-
-```json
-{"mode":"rebuild-kf","dir":"<dir>","object":"<obj>"}
-```
-
-```bash
-./shard-db rebuild-kf <dir> <obj>
-```
-
-- Idempotent — safe to re-run; a clean object reports `repaired:0`.
-- `./migrate` runs this automatically (phase 2/3, before compact) on every upgrade and writes a `.kf_rebuild_done` sentinel so it isn't repeated on every subsequent embedded startup.
-- Embedded (npm) clients auto-run this once per `db_root` on first use, gated by the same sentinel — no manual step needed for npm consumers. Exposed directly as `shardDb.rebuildKf(dir, object)` for on-demand repair.
-- Takes no `objlock` (neither rdlock nor wrlock) — safe to run against a live object, though concurrent writes during the rescan are not guaranteed to be reflected in the repair pass (re-run if you suspect a race).
-
-Response: `{"status":"ok","repaired":N}` where `N` is the count of kf entries that were corrected.
-
 ## backup
 
 Copies the object's `data/`, `indexes/`, `metadata/`, and `files/` directories into a timestamped snapshot under the same root.
@@ -408,7 +391,6 @@ Snapshot is a point-in-time copy — in-flight writes after the copy starts may 
 | `truncate` | `objlock_wrlock` | Same. |
 | `add-index`, `remove-index` | `objlock_wrlock` | Same — both unlink()+rebuild index files in place; needs exclusivity against concurrent on-the-fly index writes (2026.07.1). |
 | `backup`, `recount` | `objlock_rdlock` | Only schema mutations. |
-| `rebuild-kf` | none | Nothing — safe to run live, but concurrent writes during the rescan aren't guaranteed to be reflected. |
 | Normal CRUD / queries | `objlock_rdlock` | Only schema mutations. |
 
 Held only for the rebuild duration. For multi-second rebuilds, clients see temporarily-blocked queries; consider running these in a maintenance window.

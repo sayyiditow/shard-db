@@ -268,52 +268,6 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    /* rebuild-kf — offline repair of corrupted kf entries by rescanning
-       all segment files.  Same offline pattern as compact above. */
-    if (strcmp(cmd, "rebuild-kf") == 0) {
-        if (argc < 4) {
-            fprintf(stderr, "Usage: shard-db rebuild-kf <dir> <object>\n");
-            return 1;
-        }
-        const char *rkf_dir = argv[2];
-        const char *rkf_obj = argv[3];
-        char db_root[PATH_MAX];
-        if (load_db_root(db_root, sizeof(db_root)) != 0) return 1;
-        char eff_root[PATH_MAX];
-        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, rkf_dir);
-        shard_db_offline_init(db_root);
-        Schema sc = load_schema(eff_root, rkf_obj);
-        if (sc.splits <= 0) {
-            fprintf(stderr, "rebuild-kf: cannot load schema for %s/%s\n", rkf_dir, rkf_obj);
-            return 1;
-        }
-        slotcask_init(sc.splits, 256);
-        char obj_data[PATH_MAX];
-        snprintf(obj_data, sizeof(obj_data), "%s/%s/%s", db_root, rkf_dir, rkf_obj);
-        {
-            char kf_probe[PATH_MAX];
-            snprintf(kf_probe, sizeof(kf_probe), "%s/data/kf", obj_data);
-            struct stat _st;
-            if (stat(kf_probe, &_st) != 0) {
-                fprintf(stdout, "rebuild-kf: %s/%s skipped (no data dir)\n", rkf_dir, rkf_obj);
-                return 0;
-            }
-        }
-        SlotcaskDb sdb;
-        if (slotcask_open(&sdb, obj_data, sc.splits, sc.streams, sc.slot_size) != 0) {
-            fprintf(stderr, "rebuild-kf: slotcask_open failed\n");
-            return 1;
-        }
-        int repaired = slotcask_rebuild_kf(&sdb);
-        slotcask_close(&sdb);
-        if (repaired < 0) {
-            fprintf(stderr, "rebuild-kf: failed for %s/%s (oom)\n", rkf_dir, rkf_obj);
-            return 1;
-        }
-        fprintf(stdout, "rebuild-kf: %s/%s done (repaired=%d)\n", rkf_dir, rkf_obj, repaired);
-        return 0;
-    }
-
     /* All other commands — route through server via TCP */
     char db_root[PATH_MAX];
     if (load_db_root(db_root, sizeof(db_root)) != 0) return 1;

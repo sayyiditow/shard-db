@@ -24,10 +24,6 @@ class ShardDb {
     return this.query({ mode: 'migrate', dir, object })
   }
 
-  rebuildKf(dir, object) {
-    return this.query({ mode: 'rebuild-kf', dir, object })
-  }
-
   close() {
     binding.close(this._handle)
   }

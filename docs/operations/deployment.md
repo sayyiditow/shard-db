@@ -260,7 +260,7 @@ systemctl stop shard-db
 systemctl start shard-db
 ```
 
-The `./migrate` binary ships with 2026.07.1+ and is required for the compact/VARIABLE-format conversion and `rebuild-kf` repair. It is idempotent — safe to re-run if interrupted. Once your objects are on the slotcask engine and compact format, point-release upgrades are a binary swap. On startup the daemon sweeps stale `.new` rebuild artifacts from interrupted resplits/vacuum runs before accepting connections.
+The `./migrate` binary ships with 2026.07.1+ and is required for the compact/VARIABLE-format conversion. It runs two phases: (1) varlen segment migration, then (2) offline compact. It is idempotent — safe to re-run if interrupted. Once your objects are on the slotcask engine and compact format, point-release upgrades are a binary swap. On startup the daemon sweeps stale `.new` rebuild artifacts from interrupted resplits/vacuum runs before accepting connections. Operators who upgraded from a pre-2026.07.1 build affected by kf corruption must run the 2026.07.1 release's `rebuild-kf` against a backup before upgrading past this release.
 
 **Upgrading from a pre-2026.05.5 install with legacy v1 (probe-into-slot) objects.** This binary refuses v1 objects at load. Run the migration on the previous release first:
 

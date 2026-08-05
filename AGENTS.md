@@ -46,7 +46,7 @@ Bench cases live in `src/bench/bench_*.c`, run via `./build/bin/shard-db-bench`.
 - `query_aggregate.c` — aggregate operations, group-by, having, top-N, hash tables
 - `query_join.c` — join planning, resolution, lookup, and result emission
 - `query_plan.c` — compiled criteria, match_typed*, criteria tree parser, planner (plan_filter), cmd_explain
-- `query_maint.c` — maintenance ops (vacuum, backup, recount, rebuild-kf, reindex, etc.)
+- `query_maint.c` — maintenance ops (vacuum, backup, recount, reindex, etc.)
 - `query_schema.c` — schema mutations (create/drop object, edit/add/remove fields/indexes)
 - `query_bulk.c` — bulk insert/delete/update
 - `query_find.c` — scan helpers, fetch, keys, exists, CSV output, file ops
@@ -154,7 +154,6 @@ Deep dive: [docs/concepts/indexes.md](docs/concepts/indexes.md).
 ./shard-db size <dir> <obj>                                     # disk bytes used by the object (all data + index files); same as du -sb
 ./shard-db orphaned <dir> <obj>                                 # deleted record count (O(1) metadata)
 ./shard-db recount | truncate | vacuum | backup <dir> <obj>
-./shard-db rebuild-kf <dir> <obj>                               # repair corrupted/dangling kf entries by rescanning segments; idempotent
 ./shard-db add-index <dir> <obj> <field> [-f]                   # field or field1+field2
 ./shard-db remove-index <dir> <obj> <field>
 ./shard-db edit-field <dir> <obj> <name:type[:param]>           # same-type only, v2 only; JSON form covers batch
@@ -204,7 +203,7 @@ All advanced queries: `./shard-db query '<json>'`. Wire format: newline-delimite
 | `bulk-insert / bulk-delete / bulk-update` | [bulk.md](docs/query-protocol/bulk.md) |
 | `insert / update / delete` with `if` / `if_not_exists` (CAS) | [cas.md](docs/query-protocol/cas.md) |
 | `put-file / get-file / delete-file / list-files / get-file-path` | [files.md](docs/query-protocol/files.md) |
-| `add-field / edit-field / remove-field / rename-field / vacuum / add-index / remove-index / rebuild-kf` | [schema-mutations.md](docs/query-protocol/schema-mutations.md) |
+| `add-field / edit-field / remove-field / rename-field / vacuum / add-index / remove-index` | [schema-mutations.md](docs/query-protocol/schema-mutations.md) |
 | `add-token / remove-token / list-tokens / add-ip / remove-ip / list-ips / stats / shard-stats / vacuum-check / list-objects / describe-object` | [diagnostics.md](docs/query-protocol/diagnostics.md) |
 | `create-object / drop-object` | [overview.md](docs/query-protocol/overview.md) |
 

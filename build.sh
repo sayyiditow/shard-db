@@ -224,8 +224,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_cursor_sparse_prefetch.c \
     src/test/cases/test_vacuum_addfield.c \
     src/test/cases/test_vacuum_streams_mismatch.c \
-    src/test/cases/test_rebuild_kf.c \
     src/test/cases/test_rebuild_recovery.c \
+    src/test/cases/test_rebuild_validation.c \
     src/test/cases/test_rebuild_txn_recovery.c \
     src/test/cases/test_slotcask_resplit.c \
     src/test/cases/test_per_tenant_auth.c \

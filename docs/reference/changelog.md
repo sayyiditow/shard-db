@@ -49,15 +49,15 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
   path for the non-indexed case called the legacy v1 `scan_shards`/
   `count_scan_cb` path on `slotcask_registry_get` failure, returning a bare
   (likely 0) integer rather than surfacing the open failure. Now returns
-  `{"error":"object not open"}`, matching `cmd_rebuild_kf`'s existing
-  behavior for the same failure.
+  `{"error":"object not open"}`, matching the standard error pattern for
+  object-not-found failures.
 - **`bt_cache`/`kfcache`/`segcache`/bitmap-cache per-file rwlocks now
   initialize writer-preferring on glibc/Linux**
   (`PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP`) — a writer blocked on one
   of these per-file locks could previously be starved indefinitely by
   continuous concurrent reader traffic on the same file, since
   default-attribute rwlocks on glibc/NPTL always grant new readers ahead of
-  a waiting writer. `objlock.c` (schema mutations, vacuum, rebuild-kf) is
+  a waiting writer. `objlock.c` (schema mutations, vacuum) is
   unchanged and keeps its current (platform-default, recursion-safe)
   behavior, since its API permits recursive read locks that a nonrecursive
   writer-preferring policy can't support safely. No portable equivalent
@@ -76,6 +76,16 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
   those names don't break — see
   [monitoring.md](../operations/monitoring.md) and
   [diagnostics.md](../query-protocol/diagnostics.md).
+- **`rebuild-kf` removed** — the command reconstructed kf state by guessing
+  from segment-file history, which could repoint a live kf entry to the wrong
+  value when two live records shared a hash. PR #273 (`fix/durability-write-ordering`)
+  closed the crash ordering that created the defect; the command is no longer
+  a safe repair path. A full rebuild (`vacuum` with `compact`/`splits`/streams
+  correction, or a field add/edit/remove rebuild) now validates every live kf
+  reference before copying; invalid references produce an error and restore the
+  pre-rebuild object. Operators who upgraded from an affected build without
+  running the 2026.07.1 repair must run the last release containing `rebuild-kf`
+  against a backup before upgrading past this release.
 
 ## 2026.07.3
 
@@ -251,7 +261,7 @@ echo 'find default users "age > 25" --limit 5' | nc localhost 9199
 ### kf corruption recovery
 
 - **compact-kf guard** — `vacuum`/compact's segment-merge path no longer deletes a donor segment file when a record's kf update couldn't be confirmed during migration; previously this left dangling kf pointers to files that no longer existed.
-- **`rebuild-kf` command** — repairs already-corrupted kf entries by rescanning all segment files for an object and rebuilding kf slots from what's actually on disk. Idempotent. `./migrate` runs it automatically (phase 2/3, before compact); embedded (npm) clients auto-run it once per `db_root` on first use, also exposed as `shardDb.rebuildKf(dir, object)`. See [schema-mutations.md#rebuild-kf](../query-protocol/schema-mutations.md#rebuild-kf).
+- **`rebuild-kf` command** — repairs already-corrupted kf entries by rescanning all segment files for an object and rebuilding kf slots from what's actually on disk. Idempotent. `./migrate` runs it automatically (phase 2/3, before compact); embedded (npm) clients auto-run it once per `db_root` on first use, also exposed as `shardDb.rebuildKf(dir, object)`.
 - **`rebuild_object_v2` (`vacuum --splits`) recovery** — restores `data/` from `.rebuild_legacy_root` on walk failure instead of stranding the object half-migrated; a single corrupt record during the walk is skipped (logged) instead of aborting the whole rebuild.
 
 ### add-index / remove-index locking fix

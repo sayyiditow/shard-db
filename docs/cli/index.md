@@ -80,7 +80,6 @@ Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). Fo
 | `vacuum` | `<dir> <obj>` | Fast in-place tombstone reclaim (no schema changes). For compact/reshard, use [JSON mode](../query-protocol/schema-mutations.md). |
 | `compact` | `<dir> <obj>` | Offline VARCHAR compaction — rewrites all VARIABLE-format segments, trimming trailing zero bytes from every record. Reclaims the space saved by switching from fixed-width slots to the VARIABLE format. Run once after `./migrate` on upgrade. Requires the server to be stopped. |
 | `recount` | `<dir> <obj>` | Rescans shards and rewrites the cached `counts` file. |
-| `rebuild-kf` | `<dir> <obj>` | Repair corrupted/dangling kf entries by rescanning every segment file and re-deriving each live record's kf slot. Idempotent. New in 2026.07.1 — see [`rebuild-kf`](../query-protocol/schema-mutations.md#rebuild-kf). |
 | `truncate` | `<dir> <obj>` | Delete all records. Schema + indexes survive. |
 | `backup` | `<dir> <obj>` | Copy the object's data + metadata + indexes to a timestamped backup directory. |
 | `edit-field` | `<dir> <obj> <name:type[:param]>` | Single-field shortcut for [`edit-field`](../query-protocol/schema-mutations.md#edit-field). Same-type edits only (varchar grow/shrink, integer family widen/narrow, numeric scale change, float→double). v2 only. Use JSON mode for batch edits. |

@@ -214,10 +214,6 @@ static void db_cleanup_before_pools(ShardDb *db) {
 
 /* Run startup migrations for every registered object:
  *   1. varlen conversion  — fixed-slot → variable-length segment format.
- *   2. rebuild-kf         — repair kf entries corrupted by a prior buggy
- *                           compact run.  Gated by a sentinel file so it
- *                           only runs once per db_root; idempotent and
- *                           non-fatal on failure (logs warning and skips).
  *
  * Called from shard_db_open before thread pools start — no registry
  * entries are open and slotcask_close is safe.
@@ -227,13 +223,6 @@ static int run_startup_migration(const char *db_root) {
     snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
     FILE *f = fopen(schema_path, "r");
     if (!f) return 0; /* no schema.conf — nothing to migrate */
-
-    /* Sentinel: rebuild-kf runs once per db_root, then is skipped.
-       ./migrate writes the same sentinel after its rebuild-kf phase,
-       so daemon users who already ran migrate skip it here too. */
-    char kf_sentinel[PATH_MAX];
-    snprintf(kf_sentinel, sizeof(kf_sentinel), "%s/.kf_rebuild_done", db_root);
-    int need_kf_rebuild = (access(kf_sentinel, F_OK) != 0);
 
     char line[4096];
     int failed = 0;
@@ -272,7 +261,7 @@ static int run_startup_migration(const char *db_root) {
         if (slotcask_open(&sdb, obj_data, sch.splits, sch.streams, sch.slot_size) != 0)
             continue;
 
-        /* Step 1: varlen migration (fatal on failure). */
+        /* varlen migration (fatal on failure). */
         if (sdb.format != SLOTCASK_FORMAT_VARIABLE) {
             fprintf(stderr, "[shard-db] migrating %s/%s...\n", dir, obj);
             int mrc = slotcask_migrate_to_varlen(&sdb);
@@ -285,26 +274,9 @@ static int run_startup_migration(const char *db_root) {
             fprintf(stderr, "[shard-db] migrated %s/%s\n", dir, obj);
         }
 
-        /* Step 2: rebuild-kf (non-fatal, once per db_root). */
-        if (need_kf_rebuild) {
-            int repaired = slotcask_rebuild_kf(&sdb);
-            if (repaired > 0)
-                fprintf(stderr, "[shard-db] rebuild-kf %s/%s: %d entries repaired\n",
-                        dir, obj, repaired);
-            else if (repaired < 0)
-                fprintf(stderr, "[shard-db] rebuild-kf %s/%s: failed (oom) — skipping\n",
-                        dir, obj);
-        }
-
         slotcask_close(&sdb);
     }
     fclose(f);
-
-    /* Write sentinel so rebuild-kf is skipped on future startups. */
-    if (need_kf_rebuild && !failed) {
-        FILE *sf = fopen(kf_sentinel, "w");
-        if (sf) fclose(sf);
-    }
 
     return failed ? -1 : 0;
 }
