@@ -8516,6 +8516,57 @@ void slotcask_registry_shutdown(void) {
     pthread_mutex_unlock(&g_reg_lock);
 }
 
+int slotcask_validate_live_refs(SlotcaskDb *db, uint64_t *out_invalid) {
+    if (!db || !out_invalid) return -1;
+    *out_invalid = 0;
+
+    for (int shard = 0; shard < db->num_shards; shard++) {
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, db->data_dir, shard);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0)
+            return -1;
+
+        for (size_t slot = 0; slot < kh.capacity; slot++) {
+            SlotcaskKfEntry *entry = &kh.map[slot];
+            if (__atomic_load_n(&entry->flag, __ATOMIC_ACQUIRE) != 1)
+                continue;
+
+            int invalid = entry->stream_id >= db->num_streams;
+            SlotcaskSegHandle sh = { .slot = -1, .fd = -1 };
+            if (!invalid) {
+                char seg_path[PATH_MAX];
+                seg_path_for(seg_path, db->data_dir, entry->stream_id,
+                             entry->file_id);
+                if (segcache_acquire(&sh, seg_path, 0, 0, 0) != 0) {
+                    invalid = 1;
+                } else if (entry->offset > sh.map_size ||
+                           sh.map_size - entry->offset < 24) {
+                    invalid = 1;
+                } else {
+                    const uint8_t *record = sh.map + entry->offset;
+                    uint16_t klen = seg_rec_klen(record);
+                    uint32_t vlen = seg_rec_vlen(record);
+                    size_t record_size = db->format == SLOTCASK_FORMAT_VARIABLE
+                        ? slotcask_record_size_varlen((size_t)klen, (size_t)vlen)
+                        : (size_t)db->slot_size;
+                    size_t encoded_size = 24u + (size_t)klen + (size_t)vlen;
+
+                    if (record_size > (size_t)db->slot_size ||
+                        encoded_size > (size_t)db->slot_size ||
+                        record_size > sh.map_size - entry->offset ||
+                        !seg_rec_live_with_hash(record, entry->hash))
+                        invalid = 1;
+                }
+            }
+            if (sh.slot >= 0 || sh.fd >= 0) segcache_release(&sh);
+            if (invalid) (*out_invalid)++;
+        }
+        kfcache_release(&kh);
+    }
+    return *out_invalid == 0 ? 0 : 1;
+}
+
 /* ============================================================ Query primitives
  *
  * Phase 3A: walk_live + lookup_by_hash. Both feed the query layer's scan
@@ -9800,7 +9851,8 @@ static int compact_one_stream_varlen(SlotcaskDb *db, int stream_id) {
                    was successfully repointed.  kf_failed > 0 means at least
                    one live kf entry exists for a record in this donor but
                    verify_stored_key could not reach its backing file — the
-                   donor must be preserved so rebuild-kf can recover it. */
+                   donor must be preserved rather than deleting a segment the live kf
+                   entry still references. */
                 if (kf_failed == 0) {
                     if (compact_drop_seg_file(db, stream_id, files[i].file_id) == 0)
                         dropped++;
@@ -9816,175 +9868,6 @@ static int compact_one_stream_varlen(SlotcaskDb *db, int stream_id) {
 
     free(files);
     return dropped;
-}
-
-/* File-id comparator for qsort (ascending). */
-static int cmp_fid_asc(const void *a, const void *b) {
-    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
-    return (x > y) - (x < y);
-}
-
-typedef struct {
-    uint8_t hash[16];
-    uint32_t offset;
-} RebuildKfCandidate;
-
-/* Apply candidates only after releasing the segment-cache entry lock.
-   Normal reads hold a kf entry while verifying its segment record, so rebuild
-   must never acquire a kf entry while it still owns a segment entry. */
-static int rebuild_kf_apply_candidates(SlotcaskDb *db,
-                                       const RebuildKfCandidate *candidates,
-                                       size_t count, uint8_t stream_id,
-                                       uint16_t file_id) {
-    int repaired = 0;
-
-    for (size_t i = 0; i < count; i++) {
-        const uint8_t *hash16 = candidates[i].hash;
-        int kfshard = shard_for_hash(hash16, db->num_shards);
-        char kfp[PATH_MAX];
-        kf_path_for(kfp, db->data_dir, kfshard);
-        SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kfp, db->slots_per_shard, 1) != 0)
-            continue;
-
-        /* Match kf entries by hash only -- no key re-fetch from the segment.
-           xxh128 collisions are negligible; a segment record with a corrupted
-           hash field could theoretically repoint an unrelated live entry.
-           Acceptable: this is a recovery-only operation invoked explicitly by
-           an operator. */
-        size_t cap = kh.capacity;
-        size_t kstart = kf_slot_for(hash16, cap);
-        for (size_t ki = 0; ki < cap; ki++) {
-            size_t kslot = (kstart + ki) % cap;
-            SlotcaskKfEntry *ke = &kh.map[kslot];
-            if (ke->flag == 0) break; /* probe chain end */
-            if (memcmp(ke->hash, hash16, 16) != 0) continue;
-            if (ke->flag == 1 &&
-                (ke->stream_id != stream_id ||
-                 ke->file_id != file_id ||
-                 ke->offset != candidates[i].offset)) {
-                kf_repoint_at_slot(&kh, kslot, stream_id, file_id,
-                                   candidates[i].offset);
-                repaired++;
-            }
-            /* flag=2: deleted key -- leave tombstone intact. */
-            break;
-        }
-        kfcache_release(&kh);
-    }
-
-    return repaired;
-}
-
-/* Rebuild the kf for every live segment record.
- *
- * Scans ALL segment files for all streams in ascending file_id order.
- * For each flag=1 (live) record, probes the corresponding kf shard by
- * hash alone (no segment re-read) and repoints the entry to the current
- * (stream_id, file_id, offset).  Processing in ascending file_id order
- * ensures the final kf entry for each key points to the highest-file_id
- * occurrence, which is the most recent version.
- *
- * Invariants:
- *   - Caller must hold the per-object write lock (objlock_wrlock).
- *   - Skips kf entries with flag=2 (tombstone) — deleted keys stay deleted.
- *   - Skips keys not found in kf (no ghost insertions).
- *   - After scan, invalidates kfcache for the object so callers see new pointers.
- *
- * Returns the number of kf entries actually updated (changed to a different
- * stream_id/file_id/offset).  Returns -1 on a fatal allocation error.
- */
-int slotcask_rebuild_kf(SlotcaskDb *db) {
-    if (!db) return 0;
-    int total_repaired = 0;
-
-    for (int s = 0; s < db->num_streams; s++) {
-        char stream_dir[PATH_MAX];
-        stream_dir_for(stream_dir, db->data_dir, s);
-
-        DIR *dh = opendir(stream_dir);
-        if (!dh) continue;
-
-        uint32_t *fids = NULL;
-        size_t nfids = 0, fcap = 0;
-        struct dirent *de;
-        while ((de = readdir(dh)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            size_t nlen = strlen(de->d_name);
-            if (nlen != 10 || strcmp(de->d_name + 6, ".dat") != 0) continue;
-            uint32_t fid = (uint32_t)strtoul(de->d_name, NULL, 10);
-            if (nfids == fcap) {
-                size_t nc = fcap ? fcap * 2 : 16;
-                uint32_t *t = realloc(fids, nc * sizeof(uint32_t));
-                if (!t) { free(fids); closedir(dh); return -1; }
-                fids = t; fcap = nc;
-            }
-            fids[nfids++] = fid;
-        }
-        closedir(dh);
-        if (nfids == 0) { free(fids); continue; }
-
-        qsort(fids, nfids, sizeof(uint32_t), cmp_fid_asc);
-
-        for (size_t fi = 0; fi < nfids; fi++) {
-            char seg_path[PATH_MAX];
-            seg_path_for(seg_path, db->data_dir, s, fids[fi]);
-            size_t off = 0;
-            int scan_done = 0;
-
-            while (!scan_done) {
-                SlotcaskSegHandle sh;
-                if (segcache_acquire(&sh, seg_path, 0, 0, 0) != 0) break;
-
-                RebuildKfCandidate candidates[256];
-                size_t candidate_count = 0;
-                size_t file_size = sh.map_size;
-
-                while (off + 24 <= file_size &&
-                       candidate_count < sizeof(candidates) / sizeof(candidates[0])) {
-                    const uint8_t *rec = sh.map + off;
-                    uint8_t flag = rec[18];
-                    uint16_t klen;
-                    uint32_t vlen;
-                    memcpy(&klen, rec + 16, 2);
-                    memcpy(&vlen, rec + 20, 4);
-
-                    size_t rec_size;
-                    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-                        rec_size = slotcask_record_size_varlen((size_t)klen,
-                                                               (size_t)vlen);
-                    } else {
-                        rec_size = (size_t)db->slot_size;
-                    }
-                    if (off + rec_size > file_size) {
-                        scan_done = 1;
-                        break;
-                    }
-
-                    if (flag == 1) {
-                        memcpy(candidates[candidate_count].hash, rec, 16);
-                        candidates[candidate_count].offset = (uint32_t)off;
-                        candidate_count++;
-                    }
-                    off += rec_size;
-                }
-
-                if (off + 24 > file_size) scan_done = 1;
-                segcache_release(&sh);
-
-                total_repaired += rebuild_kf_apply_candidates(
-                    db, candidates, candidate_count, (uint8_t)s,
-                    (uint16_t)fids[fi]);
-            }
-        }
-
-        free(fids);
-    }
-
-    /* Flush kf cache so subsequent reads pick up the new pointers. */
-    kfcache_invalidate_prefix(db->data_dir);
-
-    return total_repaired;
 }
 
 /* Public entry point. Caller must hold objlock_wrlock for the object. */

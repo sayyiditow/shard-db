@@ -871,21 +871,6 @@ int cmd_shard_stats(const char *db_root, const char *object, int as_table) {
    command is functionally redundant on v2 since the kf headers are
    already authoritative; kept as a fast diagnostic / parity wrapper.
     v1 still has the full text-counts file write path below. */
-int cmd_rebuild_kf(const char *db_root, const char *object) {
-    Schema sch = load_schema(db_root, object);
-    if (!sch.splits) { OUT("{\"error\":\"object not found\"}\n"); return 1; }
-    SlotcaskSchemaInfo info = {
-        .splits = sch.splits, .slot_size = sch.slot_size,
-        .streams = sch.streams,
-    };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) { OUT("{\"error\":\"object not open\"}\n"); return 1; }
-    int repaired = slotcask_rebuild_kf(sdb);
-    if (repaired < 0) { OUT("{\"error\":\"rebuild-kf failed (oom)\"}\n"); return 1; }
-    OUT("{\"status\":\"ok\",\"repaired\":%d}\n", repaired);
-    return 0;
-}
-
 int cmd_recount(const char *db_root, const char *object) {
     Schema sch = load_schema(db_root, object);
     if (!sch.splits) {

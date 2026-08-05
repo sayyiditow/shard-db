@@ -317,9 +317,6 @@ void slotcask_close(SlotcaskDb *db);
    objlock_wrlock for the object. *out_dropped (optional) receives the total
    number of seg files unlinked across all streams. Returns 0 on success. */
 int  slotcask_compact_segs(SlotcaskDb *db, int *out_dropped);
-/* Rebuild kf from segment scan.  Caller holds objlock_wrlock.
-   Returns number of entries repaired, or -1 on fatal error. */
-int  slotcask_rebuild_kf(SlotcaskDb *db);
 
 /* Migrate an object's segment files from fixed-size to variable-length format.
    Daemon must be stopped. Uses atomic rename: writes to streams.new/ + kf.new/,
@@ -902,6 +899,12 @@ typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
                                const void *key, size_t klen,
                                const void *value, size_t vlen,
                                void *ctx);
+
+/* Strictly validate every flag=1 kf entry against its backing segment.
+   Caller must hold objlock_wrlock, so a failed check cannot be a concurrent
+   repoint race. Returns 0 when all entries are valid, 1 when one or more
+   entries are invalid, and -1 when the kf itself cannot be read. */
+int slotcask_validate_live_refs(SlotcaskDb *db, uint64_t *out_invalid);
 
 /* Walk every live (flag=1) record. Parallelized across keyfile shards
    internally; cb may run on multiple threads — caller's ctx is responsible

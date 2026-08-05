@@ -167,9 +167,6 @@ declare namespace ShardDb {
     | { mode: 'migrate'
         dir: string; object: string }
 
-    | { mode: 'rebuild-kf'
-        dir: string; object: string }
-
     | { mode: 'compact'
         dir: string; object: string }
 

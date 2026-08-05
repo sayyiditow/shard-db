@@ -970,6 +970,7 @@ static void query_aggregate(CliConn *c) {
                     char *req = malloc(strlen(crit) + strlen(specs) + strlen(having_json)
                                        + strlen(grp_json) + strlen(ob_clause)
                                        + strlen(oi.dir) + strlen(oi.object) + 1024);
+                    if (!req) continue;
                     sprintf(req,
                         "{\"mode\":\"aggregate\",\"dir\":\"%s\",\"object\":\"%s\","
                         "\"criteria\":%s,\"aggregates\":%s,\"group_by\":%s,"
@@ -1043,6 +1044,7 @@ static void query_count(CliConn *c) {
         if (tui_criteria_builder(&oi, crit_rows, &crit_n, &crit) != 0) return;
 
         char *req = malloc(strlen(crit) + strlen(oi.dir) + strlen(oi.object) + 256);
+        if (!req) { free(crit); continue; }
         sprintf(req,
             "{\"mode\":\"count\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s}",
             oi.dir, oi.object, crit);
@@ -1173,6 +1175,7 @@ static void query_find(CliConn *c) {
                data-returning queries. */
             char *req = malloc(strlen(crit) + strlen(fields_json) + strlen(ob_clause)
                                + strlen(oi.dir) + strlen(oi.object) + 1024);
+            if (!req) continue;
             sprintf(req,
                 "{\"mode\":\"find\",\"dir\":\"%s\",\"object\":\"%s\",\"criteria\":%s,"
                 "\"offset\":%d,\"limit\":%d,\"fields\":%s%s}",

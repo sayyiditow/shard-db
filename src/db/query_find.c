@@ -1015,7 +1015,8 @@ int rebuild_object_v2(const char *db_root, const char *object,
     SlotcaskDb legacy_db, new_db;
     V2RebuildCtx walk_ctx = {0};
     int legacy_open = 0, new_open = 0;
-    const char *failure = "Rebuild transaction failed";
+    char *failure = "Rebuild transaction failed";
+    char failure_buf[128];
     legacy_open = slotcask_open(&legacy_db, rebuild_txn_legacy_root(txn),
                                 old_sch->splits, old_sch->streams,
                                 old_sch->slot_size) == 0;
@@ -1023,6 +1024,21 @@ int rebuild_object_v2(const char *db_root, const char *object,
                              new_sch->streams, new_sch->slot_size) == 0;
     if (!legacy_open || !new_open) {
         failure = "Failed to open slotcask handles for rebuild";
+        goto txn_fail;
+    }
+
+    uint64_t invalid_refs = 0;
+    int validate_rc = slotcask_validate_live_refs(&legacy_db, &invalid_refs);
+    if (validate_rc != 0) {
+        if (validate_rc < 0) {
+            failure = "Failed to validate live kf references";
+        } else {
+            snprintf(failure_buf, sizeof(failure_buf),
+                     "Rebuild aborted: %llu invalid live kf reference%s",
+                     (unsigned long long)invalid_refs,
+                     invalid_refs == 1 ? "" : "s");
+            failure = failure_buf;
+        }
         goto txn_fail;
     }
 
@@ -1199,9 +1215,10 @@ txn_fail:
         LOG_ERROR(LOG_SUB_CONFIG,
                   "rebuild_v2: abort failed for %s/%s; startup recovery required",
                   db_root, object);
-    OUT("{\"error\":\"%s%s\"}\n", failure,
-        abort_rc == 0 ? "; original data restored" :
-                        "; rollback incomplete, restart required");
+    if (abort_rc == 0)
+        OUT("{\"error\":\"%s; original data restored\"}\n", failure);
+    else
+        OUT("{\"error\":\"%s; rollback incomplete, restart required\"}\n", failure);
     return 1;
 }
 

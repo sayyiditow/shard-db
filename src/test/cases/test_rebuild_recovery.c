@@ -110,24 +110,36 @@ static int test_rebuild_recovery_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     /* Trigger rebuild_object_v2 via splits change 8 → 16.
-       Bug 2 fix: corrupt record is skipped, walk completes — no error. */
+       Strict validation: corrupt record causes rebuild to abort, original
+       data is restored. */
     tc_request(tc,
         "{\"mode\":\"vacuum\",\"dir\":\"default\",\"object\":\"rebuildrecov\",\"splits\":16}",
         &resp);
-    ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""),
-                "vacuum/rebuild succeeds despite corrupt segment record");
+    ASSERT_CONTAINS(resp, "\"error\":\"Rebuild aborted: 1 invalid live kf reference; original data restored\"",
+                    "rebuild rejects invalid backing record");
     free(resp); resp = NULL;
 
-    /* At least 99 records must survive (the corrupt record is skipped). */
+    /* Original data must be intact: count unchanged, first record readable. */
     tc_request(tc,
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"rebuildrecov\"}",
         &resp);
-    int after = tu_parse_count(resp);
-    ASSERT_TRUE(after >= 99, ">=99 records survive rebuild");
+    ASSERT_EQ_INT(tu_parse_count(resp), 100, "count unchanged after rebuild abort");
     free(resp); resp = NULL;
 
-    /* No rebuild-transaction artifacts left behind after successful walk
-       (replaces the old data.legacy/.rebuild_legacy_root staging scheme). */
+    tc_request(tc,
+        "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"rebuildrecov\",\"key\":\"item0000\"}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"score\"", "item0000 still readable after rebuild abort");
+    free(resp); resp = NULL;
+
+    /* Schema must still be eight splits. */
+    tc_request(tc,
+        "{\"mode\":\"describe-object\",\"dir\":\"default\",\"object\":\"rebuildrecov\"}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"splits\":8", "schema still has eight splits");
+    free(resp); resp = NULL;
+
+    /* No rebuild-transaction artifacts left behind after aborted rebuild. */
     char txn_active[PATH_MAX], txn_done[PATH_MAX], txn_preparing[PATH_MAX];
     snprintf(txn_active, sizeof(txn_active),
              "%s/default/rebuildrecov/.rebuild_txn.active", env.db_root);
