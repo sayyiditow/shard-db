@@ -46,7 +46,7 @@ In that envelope, a general-purpose SQL engine carries overhead you don't need: 
 | Joins | **Yes** | Yes | No | Yes |
 | Aggregates + group by | **Yes** | Yes | Limited | Yes |
 | Cursor pagination (O(1) deep pages) | **Yes** | Requires keyset | No | Requires keyset |
-| ACID transactions | No | **Yes** | Partial | **Yes** |
+| ACID transactions | Per-record | **Yes** | Partial | **Yes** |
 | Distributed | No | Extensions | **Cluster** | No |
 | Primary use case | Server DB, typed records, fast text search | General-purpose RDBMS | Cache, message broker | Embedded app storage |
 
@@ -76,7 +76,7 @@ Detailed feature reference: [docs/index.md](docs/index.md).
 ## Quick start
 
 ```bash
-./build.sh                      # builds shard-db (daemon) + shard-cli (TUI) + migrate (one-shot upgrades)
+./build.sh                      # builds shard-db (daemon) + shard-cli (TUI)
 ./shard-db start
 
 ./shard-db query '{
@@ -125,12 +125,13 @@ Prebuilt binaries for Linux x64/arm64 and macOS Apple Silicon (Node ≥ 18, Bun 
 
 ```bash
 ./shard-db stop
-# replace build/bin/ contents with the new release (shard-db, shard-cli, migrate)
-./migrate                       # runs every required migration for the new release; idempotent
-./shard-db start
+# replace build/bin/ contents with the new release (shard-db, shard-cli)
+./shard-db start                # startup reindex runs automatically when upgrading
 ```
 
-For the 2026.05.1 reissue specifically: `./migrate` lifts pre-2026.05.2 `<obj>/files/<XX>/<XX>/<filename>` hash buckets to flat layout, then rebuilds every B+ tree under the per-shard layout shipped in 2026.05.1. See [the 2026.05.1 changelog entry](docs/reference/changelog.md#202605132026-05-02-reissued) for the full list of breaking changes (read response shapes are bare values now: `get`, `exists`, `count`, `size` no longer wrap in JSON; `get-multi` returns a dict; `find`/`fetch` gain `format:"dict"`).
+The daemon compares `$DB_ROOT/.version` against its compiled-in version and runs this release's full index rebuild in-process on upgrade. The standalone `./migrate` binary is removed as of 2026.08.1. The minimum supported source release is 2026.07.3; that floor is recorded for operators but is informational and not enforced in this release because earlier releases did not write `.version`. `./shard-db reindex` remains available for on-demand use. For the 2026.05.1 reissue specifically, see [the 2026.05.1 changelog entry](docs/reference/changelog.md#202605132026-05-02-reissued) for the full list of breaking changes (read response shapes are bare values now: `get`, `exists`, `count`, `size` no longer wrap in JSON; `get-multi` returns a dict; `find`/`fetch` gain `format:"dict"`).
+
+Single-key writes are atomic, durable, and isolated by the per-object lock, but shard-db has no multi-statement or cross-object transaction scope; its ACID properties are therefore per-record/per-object.
 
 ## Performance snapshot
 

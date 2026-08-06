@@ -1911,7 +1911,8 @@ int cmd_get_file_path(const char *db_root, const char *object, const char *filen
 /* Compute the on-disk destination path for a filename. Caller supplies buffers.
    Files live flat under <object>/files/ — basename is the lookup key, no
    hashing or sub-bucketing. (Pre-2026.05.2 used XX/XX hash buckets; the
-   ./migrate binary's migrate_files() pass lifts those into place.) */
+   Historical pre-2026.05.2 installs required a separate file-layout
+   migration; current supported installs use the flat layout. */
 static void file_dest_path(const char *db_root, const char *object, const char *filename,
                            char *dest_dir, size_t dd_sz, char *dest, size_t d_sz) {
     snprintf(dest_dir, dd_sz, "%s/%s/files", db_root, object);
@@ -2051,8 +2052,8 @@ int cmd_delete_file(const char *db_root, const char *object, const char *filenam
    Walks <db_root>/<object>/files/, optionally filters by pattern + match
    mode, and returns a sorted page. Files live flat — basename is the
    lookup key; no bucketing. Pre-2026.05.2 used a 2-level XX/XX hash
-   bucket tree, lifted in place by the ./migrate binary's migrate_files()
-   pass. Pagination is offset/limit on a stable alphabetical sort. */
+   bucket tree and required a historical file-layout migration. Pagination
+   is offset/limit on a stable alphabetical sort. */
 
 static int cmp_str(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);

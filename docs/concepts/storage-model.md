@@ -174,7 +174,7 @@ Full detail: [Concepts → Indexes](indexes.md).
 
 ## Files (stored blobs, not records)
 
-`<object>/files/<filename>` — uploaded via [put-file](../query-protocol/files.md). Flat layout — basename is the lookup key. Not reachable through queries; fetched directly by filename. (Pre-2026.05.2 stored at `<object>/files/<XX>/<XX>/<filename>` with xxh128 hash buckets; existing installs upgrade with the one-shot `./migrate` binary.)
+`<object>/files/<filename>` — uploaded via [put-file](../query-protocol/files.md). Flat layout — basename is the lookup key. Not reachable through queries; fetched directly by filename. (Pre-2026.05.2 stored at `<object>/files/<XX>/<XX>/<filename>` with xxh128 hash buckets; those installs require the historical file-layout migration before upgrading to current releases.)
 
 ## Legacy v1 layout (pre-slotcask, removed in 2026.05.5)
 

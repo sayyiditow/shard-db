@@ -87,6 +87,52 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
   running the 2026.07.1 repair must run the last release containing `rebuild-kf`
   against a backup before upgrading past this release.
 
+### Automatic startup migration (2026.08.1)
+
+- **New `$DB_ROOT/.version` file** — records which shard-db release last
+  completed startup migration against this database. Written atomically
+  (temp-file + fsync + rename + directory-fsync) after the migration batch
+  completes successfully. Missing `.version` on an empty database triggers
+  a bootstrap path (no migration, just stamp). Missing `.version` on a
+  non-empty database is treated as an unversioned legacy root; earlier
+  releases did not write `.version`, so this release runs its reindex and
+  stamps the marker. The documented minimum source release is 2026.07.3,
+  but that floor is informational and not enforced in this release.
+
+- **Automatic startup migration on both daemon and embedded paths** —
+  `cmd_server()` and `shard_db_open()` both call the shared
+  `shard_db_startup_migrate()` before accepting connections or starting
+  thread pools. On start, the binary compares `$DB_ROOT/.version` against
+  its compiled-in `SHARD_DB_VERSION`. If the disk version is older, the
+  binary runs this release's migration batch (full reindex only)
+  in-process. If the disk version is newer, startup is refused with a
+  clear message (downgrade unsupported). If versions match, startup is a
+  fast no-op.
+
+- **One-time full reindex in 2026.08.1's migration batch** — this release
+  fixes a bug where JSON-escaped varchar values could build mismatched
+  index keys (see the "JSON-escaped varchar values are decoded
+  consistently..." fix above). An index shard written by any pre-2026.08.1
+  binary may already contain wrong keys on disk. The startup migration
+  batch runs `reindex_object_checked` on every object, which re-derives
+  every index shard from source-of-truth record data and publishes it
+  atomically. This repairs the escaping bug regardless of when or how the
+  bad key was originally written.
+
+- **Stale BTRH rejection message updated** — the error message for
+  non-current btree formats now points at `./shard-db reindex` (the
+  standalone command that still exists) instead of the removed `./migrate`.
+
+- **New `./shard-db version` subcommand** — prints the compiled-in
+  `SHARD_DB_VERSION` and `SHARD_DB_MIN_VERSION` without requiring a
+  running server or `db.env`. Useful for confirming what's deployed.
+
+- **Embedded mode gains version-gated migration** — `shard_db_open()`
+  now calls `shard_db_startup_migrate()` instead of unconditionally
+  scanning objects on every open. Embedded mode gains downgrade refusal
+  for versioned roots and gets faster (skips the full per-object scan once
+  versions match).
+
 ## 2026.07.3
 
 Coverity hardening (46 true-positive fixes across two triage rounds), aggregate `HAVING` clause OR/nested-tree support (JSON + NQL), an NQL `--join` flag, and a btree-cache concurrency improvement on the cold-miss path. No on-disk format changes. Wire-compatible with 2026.07.2, no `./migrate` required.

@@ -641,8 +641,8 @@ static int bt_open_file(const char *path, int writer,
            format ('BTRH', 2026.05.5+) adds (value, hash) leaf sort and
            hash-bearing internal-page separators — same on-disk leaf byte
            layout but the comparator + descent semantics differ. Operators
-           upgrade by running ./migrate which reindexes every object's
-           btrees with the current format. */
+           upgrade by running `./shard-db reindex`, which rebuilds every
+           object's btrees in the current format. */
         BtFileHeader *fh = (BtFileHeader *)map;
         if (fh->magic != BT_MAGIC) {
             const char *which = (fh->magic == BT_MAGIC_V1) ? "V1 (string-keyed)"
@@ -650,9 +650,9 @@ static int bt_open_file(const char *path, int writer,
                               : (fh->magic == BT_MAGIC_V3) ? "V3 (BTRG, value-only sort)"
                               : "unknown";
             fprintf(stderr,
-                "btree: rejecting %s format at %s — run ./migrate to reindex\n",
+                "btree: rejecting %s format at %s — run `./shard-db reindex`\n",
                 which, path);
-            LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: rejecting %s format — run ./migrate to reindex", path, which);
+            LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: rejecting %s format — run `./shard-db reindex`", path, which);
             munmap(map, sz);
             close(fd);
             return -1;

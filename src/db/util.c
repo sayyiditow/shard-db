@@ -725,3 +725,74 @@ int uuid_format_canonical(char *buf, size_t buflen, const uint8_t b[16]) {
         b[0], b[1], b[2],  b[3],  b[4],  b[5],  b[6],  b[7],
         b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
 }
+
+/* ========== CalVer version helpers ========== */
+
+/* Parse exactly yyyy.mm.N and compare numerically. A malformed string is
+   never equal to a valid version and sorts older than a valid version.
+   The canonical on-disk form is the repo's zero-padded CalVer — year
+   %04d, month %02d, counter %d (e.g. "2026.08.1", matching
+   SHARD_DB_VERSION and the docs/release-notes/ directory naming) — so
+   the canonical round-trip below pads the month. Unpadded months
+   ("2026.8.1") are malformed: .version is only ever written by the
+   binary itself, which always emits the canonical form. */
+static int parse_calver(const char *s, int out[3]) {
+    char extra;
+    if (!s || sscanf(s, "%d.%d.%d%c", &out[0], &out[1], &out[2], &extra) != 3)
+        return 0;
+    if (out[0] < 1000 || out[0] > 9999 ||
+        out[1] < 1 || out[1] > 12 || out[2] < 0)
+        return 0;
+    char canonical[32];
+    snprintf(canonical, sizeof(canonical), "%04d.%02d.%d",
+             out[0], out[1], out[2]);
+    if (strcmp(canonical, s) != 0) return 0;
+    return 1;
+}
+
+int shard_db_version_compare(const char *a, const char *b) {
+    int av[3], bv[3];
+    int a_ok = parse_calver(a, av);
+    int b_ok = parse_calver(b, bv);
+    if (!a_ok && !b_ok) return 0;
+    if (!a_ok) return -1;
+    if (!b_ok) return 1;
+    for (int i = 0; i < 3; i++) {
+        if (av[i] != bv[i]) return av[i] < bv[i] ? -1 : 1;
+    }
+    return 0;
+}
+
+int shard_db_version_is_valid(const char *version) {
+    int parsed[3];
+    return parse_calver(version, parsed);
+}
+
+int shard_db_version_decide(const char *disk_version, int version_present,
+                            int db_empty, const char *current_version,
+                            const char *minimum_version, int has_migration) {
+    if (db_empty) return SHARD_DB_VERSION_STAMP_ONLY;
+    if (!version_present) {
+#if SHARD_DB_ENFORCE_MIN_VERSION
+        if (minimum_version && minimum_version[0])
+            return SHARD_DB_VERSION_TOO_OLD;
+#endif
+        return has_migration ? SHARD_DB_VERSION_RUN_MIGRATION
+                             : SHARD_DB_VERSION_STAMP_ONLY;
+    }
+    if (!disk_version || !shard_db_version_is_valid(disk_version))
+        return SHARD_DB_VERSION_INVALID;
+#if SHARD_DB_ENFORCE_MIN_VERSION
+    if (minimum_version && minimum_version[0] &&
+        (!shard_db_version_is_valid(minimum_version) ||
+         shard_db_version_compare(disk_version, minimum_version) < 0))
+        return SHARD_DB_VERSION_TOO_OLD;
+#else
+    (void)minimum_version;
+#endif
+    int cmp = shard_db_version_compare(disk_version, current_version);
+    if (cmp > 0) return SHARD_DB_VERSION_DOWNGRADE;
+    if (cmp == 0) return SHARD_DB_VERSION_NOOP;
+    return has_migration ? SHARD_DB_VERSION_RUN_MIGRATION
+                         : SHARD_DB_VERSION_STAMP_ONLY;
+}
