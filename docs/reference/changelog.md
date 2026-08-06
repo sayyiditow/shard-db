@@ -4,7 +4,116 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
-## Unreleased
+## 2026.08.1
+
+Automatic version-gated startup migration on both daemon and embedded paths — replaces the standalone `./migrate` binary with a `$DB_ROOT/.version` check that runs a full secondary-index reindex in-process when needed. Also in this release: ACID-hardened writes (atomic indexed writes across crash boundaries, crash-safe object rebuild via `RebuildTxn`, atomic partial updates and index publication), a new opt-in auto-reshard feature, a broad set of concurrency fixes (read-path UAF, btree-cache eviction race, lock-order inversions, cache staleness on rebuild), NQL protocol fixes (quoted literals — breaking change, `--filter` on aggregate, lock-free reads), input-validation hardening across the criteria/NQL parsers and server dispatch, the dead v1 ucache/shard-file engine and `rebuild-kf` removed, and several correctness fixes (JSON-escaped varchar handling across storage/indexing/criteria/cursor/CSV paths, a `get`+`fields` v2 dispatch bug, a `decode_field` stack overflow on long composite fields, a `count` error-swallowing bug), plus writer-preferring per-file cache rwlocks to prevent writer starvation. No on-disk format changes.
+
+Full notes: [`docs/release-notes/2026.08.1.md`](../release-notes/2026.08.1.md).
+
+### Migration
+
+- **New `$DB_ROOT/.version` file** — records which shard-db release last
+  completed startup migration against this database. Written atomically
+  (temp-file + fsync + rename + directory-fsync) after the migration batch
+  completes successfully. Missing `.version` on an empty database triggers
+  a bootstrap path (no migration, just stamp). Missing `.version` on a
+  non-empty database is treated as an unversioned legacy root; earlier
+  releases did not write `.version`, so this release runs its reindex and
+  stamps the marker. The documented minimum source release is 2026.07.3,
+  but that floor is informational and not enforced in this release.
+
+- **Automatic startup migration on both daemon and embedded paths** —
+  `cmd_server()` and `shard_db_open()` both call the shared
+  `shard_db_startup_migrate()` before accepting connections or starting
+  thread pools. On start, the binary compares `$DB_ROOT/.version` against
+  its compiled-in `SHARD_DB_VERSION`. If the disk version is older, the
+  binary runs this release's migration batch (full reindex only)
+  in-process. If the disk version is newer, startup is refused with a
+  clear message (downgrade unsupported). If versions match, startup is a
+  fast no-op.
+
+- **One-time full reindex in 2026.08.1's migration batch** — this release
+  fixes a bug where JSON-escaped varchar values could build mismatched
+  index keys (see the "JSON-escaped varchar values are decoded
+  consistently..." fix below). An index shard written by any pre-2026.08.1
+  binary may already contain wrong keys on disk. The startup migration
+  batch runs `reindex_object_checked` on every object, which re-derives
+  every index shard from source-of-truth record data and publishes it
+  atomically. This repairs the escaping bug regardless of when or how the
+  bad key was originally written.
+
+- **Stale BTRH rejection message updated** — the error message for
+  non-current btree formats now points at `./shard-db reindex` (the
+  standalone command that still exists) instead of the removed `./migrate`.
+
+- **New `./shard-db version` subcommand** — prints the compiled-in
+  `SHARD_DB_VERSION` and `SHARD_DB_MIN_VERSION` without requiring a
+  running server or `db.env`. Useful for confirming what's deployed.
+
+- **Embedded mode gains version-gated migration** — `shard_db_open()`
+  now calls `shard_db_startup_migrate()` instead of unconditionally
+  scanning objects on every open. Embedded mode gains downgrade refusal
+  for versioned roots and gets faster (skips the full per-object scan once
+  versions match).
+
+### Durability
+
+- **Atomic indexed writes across crash boundaries** — commit-intent marker before index mutation; abort sidecar + inverse diff on post-marker failure. Covers single insert/update/delete and all bulk variants.
+- **Crash-safe object rebuild** — `RebuildTxn` (`.preparing → .active → .done`, atomic renames); startup recovery fails closed on ambiguous on-disk state; DB root flock'd during recovery.
+- **Atomic single-key partial updates** — closes a race where concurrent partial updates to different fields of the same key could drop a writer's change.
+- **Atomic index publication.**
+- **Durable write hardening** — keyfile sync failures on single-record writes now propagate instead of being swallowed.
+
+### Concurrency fixes
+
+- Read-path UAF: JSON `get`/`exists`/`count`/`describe-object` and NQL dispatch could race a concurrent rebuild/vacuum freeing the object. Also fixes a warmup-thread UAF, an `enum_values` leak, and a post-delete range-scan regression.
+- Warmup thread UAF against concurrent vacuum/rebuild.
+- Auto-reshard/auto-vacuum threads now joined before kfcache/slotcask shutdown (were detached, could touch freed state).
+- B-tree cache eviction race (use-after-unmap) + 3 memory leaks (`cmd_edit_fields`, `dispatch_json_query`, bulk-insert auto-key buffer).
+- kfcache/bitmap-cache lock-order inversion closed.
+- kfcache/segcache entries validated by file identity (dev/ino) on every hit, closing a rebuild-rename aliasing race.
+- B-tree mutations serialized per path, preventing delete resurrection during bulk-merge rebuilds.
+- `btree_bulk_merge` no longer writes a duplicate leaf entry on an exact `(value, hash)` tie.
+
+### New: auto-reshard
+
+Opt-in background thread (`AUTO_RESHARD_ENABLE`, `AUTO_RESHARD_HOUR`, `AUTO_RESHARD_THROTTLE_MS`) that walks every object once per day during the configured hour and grows its shard count to match its live record count. See [configuration.md](../getting-started/configuration.md).
+
+### Query protocol
+
+- **NQL quoted literals** — SQL-style `''`/`""` escaping, `"..."` wrapper delimiter. **Breaking:** an unterminated filter-string literal is now a hard parse error instead of silently truncating.
+- **NQL `--filter` flag on aggregate** for filters the positional heuristic misclassified (IN/BETWEEN/parenthesized).
+- **NQL reads no longer take a per-object lock** — matches JSON's lock-free read behavior.
+- Aggregate top-N streaming path no longer silently ignored `format:"csv"`.
+- Per-key CAS on array-form `bulk-update` JSON records.
+- `vacuum`/`recount` on a missing or unopenable object now error instead of reporting fake success.
+
+### Input validation hardening
+
+Unknown criteria/aggregate operators, malformed NQL `--limit`/`--offset`/`--order-by`, uppercase `DESC` in aggregate ordering, and missing required fields on `add-index`/`get-file-path`/`bulk-insert`/`bulk-delete`/negative `offset` now return structured errors instead of misbehaving silently.
+
+### Removed
+
+- **Dead v1 ucache/shard-file storage engine** — this binary has only ever
+  created v2 (slotcask) objects since 2026.05.5's v1→v2 migration
+  requirement; the entire v1 probe-into-slot code path (`ucache_*`,
+  `fcache_*`, `ShardHeader`, `zoneA_off`/`zoneB_off` and related shard-file
+  layout helpers) was unreachable and has been removed. The `stats`/
+  `stats-prom` `ucache` JSON fields and Prometheus metric names are
+  retained, permanently reporting zero, so existing dashboards parsing
+  those names don't break — see
+  [monitoring.md](../operations/monitoring.md) and
+  [diagnostics.md](../query-protocol/diagnostics.md).
+- **`rebuild-kf` removed** — the command reconstructed kf state by guessing
+  from segment-file history, which could repoint a live kf entry to the wrong
+  value when two live records shared a hash. PR #273 (`fix/durability-write-ordering`)
+  closed the crash ordering that created the defect; the command is no longer
+  a safe repair path. A full rebuild (`vacuum` with `compact`/`splits`/streams
+  correction, or a field add/edit/remove rebuild) now validates every live kf
+  reference before copying; invalid references produce an error and restore the
+  pre-rebuild object. Operators who upgraded from an affected build without
+  running the 2026.07.1 repair must run the last release containing `rebuild-kf`
+  against a backup before upgrading past this release.
 
 ### Fixes
 
@@ -64,74 +173,19 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
   exists on non-glibc platforms (macOS, other Linux libcs); those keep the
   prior platform-default behavior for all four caches, unchanged.
 
-### Removed
+### Upgrade
 
-- **Dead v1 ucache/shard-file storage engine** — this binary has only ever
-  created v2 (slotcask) objects since 2026.05.5's v1→v2 migration
-  requirement; the entire v1 probe-into-slot code path (`ucache_*`,
-  `fcache_*`, `ShardHeader`, `zoneA_off`/`zoneB_off` and related shard-file
-  layout helpers) was unreachable and has been removed. The `stats`/
-  `stats-prom` `ucache` JSON fields and Prometheus metric names are
-  retained, permanently reporting zero, so existing dashboards parsing
-  those names don't break — see
-  [monitoring.md](../operations/monitoring.md) and
-  [diagnostics.md](../query-protocol/diagnostics.md).
-- **`rebuild-kf` removed** — the command reconstructed kf state by guessing
-  from segment-file history, which could repoint a live kf entry to the wrong
-  value when two live records shared a hash. PR #273 (`fix/durability-write-ordering`)
-  closed the crash ordering that created the defect; the command is no longer
-  a safe repair path. A full rebuild (`vacuum` with `compact`/`splits`/streams
-  correction, or a field add/edit/remove rebuild) now validates every live kf
-  reference before copying; invalid references produce an error and restore the
-  pre-rebuild object. Operators who upgraded from an affected build without
-  running the 2026.07.1 repair must run the last release containing `rebuild-kf`
-  against a backup before upgrading past this release.
+```bash
+./shard-db stop
+# replace build/bin/ contents
+./shard-db start
+```
 
-### Automatic startup migration (2026.08.1)
-
-- **New `$DB_ROOT/.version` file** — records which shard-db release last
-  completed startup migration against this database. Written atomically
-  (temp-file + fsync + rename + directory-fsync) after the migration batch
-  completes successfully. Missing `.version` on an empty database triggers
-  a bootstrap path (no migration, just stamp). Missing `.version` on a
-  non-empty database is treated as an unversioned legacy root; earlier
-  releases did not write `.version`, so this release runs its reindex and
-  stamps the marker. The documented minimum source release is 2026.07.3,
-  but that floor is informational and not enforced in this release.
-
-- **Automatic startup migration on both daemon and embedded paths** —
-  `cmd_server()` and `shard_db_open()` both call the shared
-  `shard_db_startup_migrate()` before accepting connections or starting
-  thread pools. On start, the binary compares `$DB_ROOT/.version` against
-  its compiled-in `SHARD_DB_VERSION`. If the disk version is older, the
-  binary runs this release's migration batch (full reindex only)
-  in-process. If the disk version is newer, startup is refused with a
-  clear message (downgrade unsupported). If versions match, startup is a
-  fast no-op.
-
-- **One-time full reindex in 2026.08.1's migration batch** — this release
-  fixes a bug where JSON-escaped varchar values could build mismatched
-  index keys (see the "JSON-escaped varchar values are decoded
-  consistently..." fix above). An index shard written by any pre-2026.08.1
-  binary may already contain wrong keys on disk. The startup migration
-  batch runs `reindex_object_checked` on every object, which re-derives
-  every index shard from source-of-truth record data and publishes it
-  atomically. This repairs the escaping bug regardless of when or how the
-  bad key was originally written.
-
-- **Stale BTRH rejection message updated** — the error message for
-  non-current btree formats now points at `./shard-db reindex` (the
-  standalone command that still exists) instead of the removed `./migrate`.
-
-- **New `./shard-db version` subcommand** — prints the compiled-in
-  `SHARD_DB_VERSION` and `SHARD_DB_MIN_VERSION` without requiring a
-  running server or `db.env`. Useful for confirming what's deployed.
-
-- **Embedded mode gains version-gated migration** — `shard_db_open()`
-  now calls `shard_db_startup_migrate()` instead of unconditionally
-  scanning objects on every open. Embedded mode gains downgrade refusal
-  for versioned roots and gets faster (skips the full per-object scan once
-  versions match).
+Startup runs a one-time full reindex if `$DB_ROOT/.version` is older than
+2026.08.1, or missing on a non-empty root; a newer `.version` marker is
+refused (no downgrades). The standalone `./migrate` binary is no longer
+built or shipped — legacy v1 objects still require the historical
+2026.05.4 `./migrate` path before this binary can open them.
 
 ## 2026.07.3
 
