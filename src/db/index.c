@@ -3844,7 +3844,6 @@ static index_build_result resolve_bitmaps(const char *db_root, const char *objec
     for (int fi = 0; fi < n_fields; fi++) if (descs[fi].type == MF_BITMAP) n_bm++;
     if (n_bm == 0) return index_build_ok();
 
-    int slots = (int)slotcask_default_slots_for_splits(splits);
     index_build_result result = index_build_ok();
 
     /* mmap every kf shard once, read-only, shared across all bitmap fields. */
@@ -3917,7 +3916,11 @@ static index_build_result resolve_bitmaps(const char *db_root, const char *objec
                 field_failed = 1;
                 break;
             }
-            bm[s] = bm_open(temps[s], slots, 1 /* create */,
+            /* Keyfile shards can auto-resplit independently. Rebuild each
+               bitmap at its actual keyfile capacity, not the original
+               default tier, otherwise a live record whose kf slot is above
+               that tier makes bm_set() fail during the join. */
+            bm[s] = bm_open(temps[s], (int)kf[s].cap, 1 /* create */,
                             descs[fi].bm_bool_fastpath, descs[fi].bm_max_values,
                             1 /* writer */);
             if (!bm[s]) {

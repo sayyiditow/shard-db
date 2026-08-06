@@ -355,6 +355,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_update_partial_concurrent.c \
     src/test/cases/test_version_compare.c \
     src/test/cases/test_startup_auto_migration.c \
+    src/test/cases/test_reindex_bitmap_resplit.c \
     src/db/util.c \
     src/db/durability.c \
     src/bench/bench_stats.c \
