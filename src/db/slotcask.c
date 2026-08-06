@@ -5390,7 +5390,7 @@ new_from_old_failed:
     free(old_buf);
     return -1;
 
-new_from_old_done:
+new_from_old_done:;
 
     /* Reserve target slot. */
     int sid_data = stream_id_hint;
