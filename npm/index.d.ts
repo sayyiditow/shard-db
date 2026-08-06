@@ -73,35 +73,117 @@ declare namespace ShardDb {
    *  Also accepts an array of { field, op, value } filter objects. */
   type Criteria = Record<string, unknown> | unknown[]
 
+  /** Field projection — comma-separated string or array, both accepted on the wire. */
+  type Fields = string | string[]
+
   interface Aggregate {
     fn: 'sum' | 'avg' | 'min' | 'max' | 'count'
-    field: string
+    /** Required for sum/avg/min/max; omit for count() over all rows. */
+    field?: string
     alias?: string
+  }
+
+  interface Join {
+    object: string
+    local: string
+    /** "key" for a primary-key lookup, or any indexed field on the remote object. */
+    remote: string
+    /** Column prefix in the output. Defaults to the remote object name. */
+    as?: string
+    type?: 'inner' | 'left'
+    fields?: string[]
+  }
+
+  /** One record in bulk-insert/bulk-update array form. */
+  interface BulkRecord {
+    key: string
+    value: Record<string, unknown>
+    /** Per-record CAS guard (bulk-update array form only). */
+    if?: Criteria
   }
 
   type QueryBody =
     // ── CRUD ──────────────────────────────────────────────────────────────
     | { mode: 'get'
-        dir: string; object: string; key: string
-        fields?: string[] }
+        dir: string; object: string
+        /** Single-key form. */
+        key?: string
+        /** Multi-key form — response is {key: value | null}. */
+        keys?: string[]
+        fields?: Fields }
 
     | { mode: 'exists'
-        dir: string; object: string; key: string }
+        dir: string; object: string
+        key?: string
+        keys?: string[] }
 
     | { mode: 'insert'
+        dir: string; object: string
+        /** Omit when the object has auto_key configured — the server generates one. */
+        key?: string
+        value: Record<string, unknown>
+        /** CAS guard — fail if the key already exists. Not combinable with an omitted key. */
+        if_not_exists?: boolean
+        /** CAS guard — only insert/upsert if current value (if any) matches. */
+        if?: Criteria }
+
+    | { mode: 'update'
         dir: string; object: string; key: string
-        value: Record<string, unknown> }
+        value: Record<string, unknown>
+        /** CAS guard — only update if current value matches. */
+        if?: Criteria }
 
     | { mode: 'delete'
-        dir: string; object: string; key: string }
+        dir: string; object: string; key: string
+        /** CAS guard — only delete if current value matches. */
+        if?: Criteria }
 
+    | { mode: 'not-exists'
+        dir: string; object: string
+        keys: string[] }
+
+    // ── Bulk ──────────────────────────────────────────────────────────────
     | { mode: 'bulk-insert'
         dir: string; object: string
-        records: Array<{ key: string; value: Record<string, unknown> }> }
+        /** Dict form ({key: value}), array form, or omit and pass `file`. */
+        records?: Record<string, Record<string, unknown>> | BulkRecord[]
+        file?: string
+        /** Skip (don't overwrite) keys that already exist; response includes "skipped". */
+        if_not_exists?: boolean }
+
+    | { mode: 'bulk-insert-delimited'
+        dir: string; object: string
+        file?: string
+        data?: string
+        /** Single character; default '|'. */
+        delimiter?: string }
 
     | { mode: 'bulk-delete'
         dir: string; object: string
-        keys: string[] }
+        /** By key list. */
+        keys?: string[]
+        /** By criteria — mutually exclusive with `keys`. */
+        criteria?: Criteria
+        file?: string
+        limit?: number
+        dry_run?: boolean }
+
+    | { mode: 'bulk-update'
+        dir: string; object: string
+        /** Criteria-driven mass update. */
+        criteria?: Criteria
+        value?: Record<string, unknown>
+        /** Per-key partial update — dict or array form. Mutually exclusive with criteria/value. */
+        records?: Record<string, Record<string, unknown>> | BulkRecord[]
+        file?: string
+        limit?: number
+        dry_run?: boolean }
+
+    | { mode: 'bulk-update-delimited'
+        dir: string; object: string
+        file?: string
+        data?: string
+        delimiter?: string }
 
     // ── Query ─────────────────────────────────────────────────────────────
     | { mode: 'find'
@@ -109,14 +191,24 @@ declare namespace ShardDb {
         criteria?: Criteria
         limit?: number
         offset?: number
+        fields?: Fields
+        /** Skip these keys from results. Comma-separated string or array. */
+        excludedKeys?: Fields
         order_by?: string
-		order?: 'asc' | 'desc'
+        order?: 'asc' | 'desc'
         /** Resume cursor from a previous paginated response. null = first page. */
         cursor?: Record<string, unknown> | null
         /** Return full match count alongside the page. */
         total?: boolean
-        fields?: string[]
-        /** Response format — 'dict' returns a {key: value} object instead of an array. */
+        /** Response format — 'dict' returns a {key: value} object instead of an array. Ignored (forced tabular) when `join` is present. */
+        format?: 'rows' | 'dict'
+        join?: Join[]
+        explain?: boolean }
+
+    | { mode: 'fetch'
+        dir: string; object: string
+        offset?: number; limit?: number
+        fields?: Fields
         format?: 'dict' }
 
     | { mode: 'count'
@@ -126,43 +218,92 @@ declare namespace ShardDb {
     | { mode: 'aggregate'
         dir: string; object: string
         aggregates: Aggregate[]
-        group_by?: string
+        group_by?: string[]
         criteria?: Criteria
-        having?: Criteria }
+        /** Same shape as criteria, but fields are aggregate aliases (or group-by fields). */
+        having?: Criteria
+        order_by?: string
+        order?: 'asc' | 'desc'
+        limit?: number
+        explain?: boolean }
 
     | { mode: 'keys'
         dir: string; object: string
         offset?: number; limit?: number }
 
-    | { mode: 'fetch'
-        dir: string; object: string
-        offset?: number; limit?: number
-        fields?: string[] }
-
     // ── Schema ────────────────────────────────────────────────────────────
     | { mode: 'create-object'
         dir: string; object: string
-        splits: number; max_key: number
+        splits?: number; max_key?: number
         fields: string[]
-        indexes?: string[] }
+        indexes?: string[]
+        /** Server-generated keys: "uuid" or "seq(<name>)". Immutable once set. */
+        auto_key?: string }
 
-    | { mode: 'add-dir'
-        dir: string }
+    | { mode: 'drop-object'
+        dir: string; object: string }
+
+    | { mode: 'add-field'
+        dir: string; object: string
+        fields: string[] }
+
+    | { mode: 'edit-field'
+        dir: string; object: string
+        fields: string[]
+        /** Required to change an existing enum value at a position rather than append. */
+        allow_rename?: boolean
+        dry_run?: boolean }
+
+    | { mode: 'rename-field'
+        dir: string; object: string
+        old: string; new: string }
+
+    | { mode: 'remove-field'
+        dir: string; object: string
+        fields: string[] }
 
     | { mode: 'add-index'
         dir: string; object: string
-        fields: string[] }
+        /** Single field/spec (e.g. "email", "status:bitmap", "a+b"). */
+        field?: string
+        /** Multiple fields/specs, built in one shard scan. */
+        fields?: string[]
+        /** Rebuild even if the index already exists. */
+        force?: boolean }
 
     | { mode: 'remove-index'
         dir: string; object: string
-        fields: string[] }
+        /** Exact stored index name (e.g. "email", "body:trigram"). */
+        field?: string
+        fields?: string[] }
+
+    | { mode: 'estimate-index'
+        dir: string; object: string
+        spec: string }
 
     // ── Maintenance ───────────────────────────────────────────────────────
     | { mode: 'truncate'
         dir: string; object: string }
 
     | { mode: 'vacuum'
+        dir: string; object: string
+        /** Full rebuild: drops tombstoned fields, shrinks slot_size. */
+        compact?: boolean
+        /** Full rebuild with a new shard count; also triggers reindex. */
+        splits?: number }
+
+    | { mode: 'recount'
         dir: string; object: string }
+
+    | { mode: 'backup'
+        dir: string; object: string }
+
+    | { mode: 'restore'
+        dir: string; object: string
+        /** Timestamp directory name under <obj>/backup/. */
+        from: string
+        /** Required if the live object isn't empty. */
+        force?: boolean }
 
     | { mode: 'migrate'
         dir: string; object: string }
@@ -170,17 +311,56 @@ declare namespace ShardDb {
     | { mode: 'compact'
         dir: string; object: string }
 
-    | { mode: 'stats' }
+    | { mode: 'sequence'
+        dir: string; object: string
+        name: string
+        action: string
+        batch?: number }
 
-    // ── Single-record update ──────────────────────────────────────────────
-    | { mode: 'update'
-        dir: string; object: string; key: string
-        value: Record<string, unknown>
-        /** CAS guard — only update if current value matches. */
-        if?: Record<string, unknown> }
+    // ── Files ─────────────────────────────────────────────────────────────
+    | { mode: 'put-file'
+        dir: string; object: string
+        filename?: string
+        /** Base64-encoded bytes (remote-safe form). */
+        data?: string
+        /** Server-local path (admin fast path) — mutually exclusive with filename/data. */
+        path?: string
+        if_not_exists?: boolean }
 
-    // ── Object lifecycle ──────────────────────────────────────────────────
-    | { mode: 'drop-object'
+    | { mode: 'get-file'
+        dir: string; object: string; filename: string }
+
+    | { mode: 'get-file-path'
+        dir: string; object: string; filename: string }
+
+    | { mode: 'delete-file'
+        dir: string; object: string; filename: string }
+
+    | { mode: 'list-files'
+        dir: string; object: string
+        pattern?: string
+        match?: 'prefix' | 'suffix' | 'contains' | 'glob'
+        /** Legacy alias for pattern + match:"prefix". */
+        prefix?: string
+        offset?: number; limit?: number }
+
+    // ── Diagnostics ───────────────────────────────────────────────────────
+    | { mode: 'stats'; format?: 'table' }
+
+    | { mode: 'stats-prom' }
+
+    | { mode: 'shard-stats'
+        dir?: string; object?: string
+        format?: 'table' }
+
+    | { mode: 'vacuum-check' }
+
+    | { mode: 'db-dirs' }
+
+    | { mode: 'size'
+        dir: string; object: string }
+
+    | { mode: 'orphaned'
         dir: string; object: string }
 
     // ── Catalog ───────────────────────────────────────────────────────────
@@ -189,4 +369,31 @@ declare namespace ShardDb {
 
     | { mode: 'describe-object'
         dir: string; object: string }
+
+    // ── Auth administration (server-admin scope) ────────────────────────────
+    | { mode: 'add-token'
+        token: string
+        dir?: string; object?: string
+        perm?: 'r' | 'rw' | 'rwx' }
+
+    | { mode: 'remove-token'
+        token?: string
+        fingerprint?: string }
+
+    | { mode: 'list-tokens' }
+
+    | { mode: 'add-dir'
+        dir: string }
+
+    | { mode: 'remove-dir'
+        dir: string
+        check_empty?: boolean }
+
+    | { mode: 'add-ip'
+        ip: string }
+
+    | { mode: 'remove-ip'
+        ip: string }
+
+    | { mode: 'list-ips' }
 }
