@@ -60,7 +60,7 @@ jobs:
           # Source list must match build.sh's daemon link line — this step
           # links (-o /dev/null), so a missing TU is a hard failure.
           cov-build --dir cov-int gcc -O2 -g \
-            src/db/util.c src/db/config.c src/db/storage.c src/db/index.c \
+            src/db/util.c src/db/durability.c src/db/config.c src/db/storage.c src/db/index.c \
             src/db/query.c src/db/query_find.c src/db/query_aggregate.c \
             src/db/query_join.c src/db/query_plan.c src/db/query_bulk.c \
             src/db/query_maint.c src/db/query_schema.c \
