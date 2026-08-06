@@ -25,7 +25,7 @@ static int write_env(const char *env_dir, const char *db_root,
     FILE *f = fopen(path, "w");
     if (!f) return -1;
     fprintf(f,
-            "DB_ROOT=%s\nLOG_LEVEL=3\nTHREADS=2\nIO_THREADS=4\n"
+            "DB_ROOT=%s\nLOG_LEVEL=4\nTHREADS=2\nIO_THREADS=4\n"
             "FCACHE_MAX=4096\nDURABILITY_SYNC_MS=%d\n"
             "WARMUP_TEST_DELAY_MS=%d\n",
             db_root, durability_ms, warmup_delay_ms);

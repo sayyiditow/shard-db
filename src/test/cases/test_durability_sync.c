@@ -77,7 +77,7 @@ static int test_durability_sync_run(void) {
     ASSERT_NOT_NULL(envf, "create durability db.env");
     if (!envf) return 1;
     fprintf(envf,
-            "DB_ROOT=%s\nPORT=%d\nTIMEOUT=0\nLOG_DIR=%s\nLOG_LEVEL=3\n"
+            "DB_ROOT=%s\nPORT=%d\nTIMEOUT=0\nLOG_DIR=%s\nLOG_LEVEL=4\n"
             "THREADS=2\nWORKERS=4\nIO_THREADS=4\n"
             "MAX_CONCURRENT_QUERIES=8\nFCACHE_MAX=4096\nTLS_ENABLE=0\n"
             "WARMUP=off\nDURABILITY_SYNC_MS=100\n",
