@@ -30,6 +30,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "  stop                                 Graceful shutdown\n");
         fprintf(stderr, "  status                               Check if running\n");
         fprintf(stderr, "  server                               Start foreground (debug)\n");
+        fprintf(stderr, "  version                              Print compiled version + minimum supported source version\n");
         fprintf(stderr, "\nAll commands below require the server to be running:\n");
         fprintf(stderr, "  insert <object> <key> <value>        Insert/update a record\n");
         fprintf(stderr, "  get <object> <key>                   Get a record\n");
@@ -96,6 +97,17 @@ int main(int argc, char *argv[]) {
 
     const char *cmd = argv[1];
 
+    if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0) {
+        if (SHARD_DB_MIN_VERSION[0])
+            printf("shard-db %s (minimum supported source version: %s; "
+                   "informational, not enforced in this release)\n",
+                   SHARD_DB_VERSION, SHARD_DB_MIN_VERSION);
+        else
+            printf("shard-db %s (no minimum source version floor)\n",
+                   SHARD_DB_VERSION);
+        return 0;
+    }
+
     /* JSON query mode */
     if (strcmp(cmd, "query") == 0) {
         if (argc < 3) { fprintf(stderr, "Usage: shard-db query '{\"mode\":\"...\", ...}'\n"); return 1; }
@@ -150,13 +162,17 @@ int main(int argc, char *argv[]) {
         if (strcmp(cmd, "status") == 0) return cmd_status(db_root);
     }
 
-    /* migrate-files moved to the standalone ./migrate binary in 2026.05.1.
-       Redirect before the server check so the message lands whether the
-       daemon is running or not. */
+    /* migrate-files was a one-shot 2026.05.1 upgrade step (lift
+       pre-2026.05.2 <obj>/files/<XX>/<XX>/ hashed buckets to flat layout);
+       the standalone ./migrate binary is removed as of 2026.08.1 and
+       startup migration is automatic. Keep returning nonzero so scripts
+       that predate the removal fail loudly instead of misrecognizing the
+       command as a no-op. */
     if (strcmp(cmd, "migrate-files") == 0) {
         fprintf(stderr,
-            "shard-db: 'migrate-files' moved to ./migrate in 2026.05.1.\n"
-            "          Stop the daemon and run ./migrate instead.\n");
+            "shard-db: 'migrate-files' was the 2026.05.1 one-shot file-layout\n"
+            "          migration. Since 2026.08.1 migration is automatic:\n"
+            "          start this binary and it self-migrates via $DB_ROOT/.version.\n");
         return 1;
     }
 

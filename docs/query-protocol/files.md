@@ -2,7 +2,7 @@
 
 Upload and download arbitrary files (PDFs, images, CSVs, blobs) keyed by filename. Files live flat under `<obj>/files/<filename>` — the basename is the lookup key.
 
-> **Upgrading from pre-2026.05.2?** Storage was previously bucketed at `<obj>/files/<XX>/<XX>/<filename>`. Run `./migrate` once after upgrading the binary — it walks every (dir, object) and lifts each file into the flat layout. Idempotent, so safe to re-run.
+> **Upgrading from pre-2026.05.2?** Storage was previously bucketed at `<obj>/files/<XX>/<XX>/<filename>`. Current supported releases use the flat layout; the 2026.08.1 startup migration only rebuilds indexes. Upgrade through the historical release that performed the file-layout migration before using this release.
 
 Two variants for both upload and download:
 

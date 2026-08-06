@@ -11,7 +11,8 @@
  * widen/narrow, numeric scale change, float→double widen). Wire shape:
  *   {"mode":"edit-field","dir":..,"object":..,"fields":["name:varchar:200", ..]}
  *
- * v2 only — v1 is refused with a pointer to ./migrate. Cross-type changes
+ * v2 only — v1 is refused with a pointer to the historical 2026.05.4
+ * migration path. Cross-type changes
  * are refused with a hint to use add-field + remove-field + bulk-update.
  *
  * Strategy:

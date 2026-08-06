@@ -32,6 +32,7 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 #include "btree.h"
+#include "version.h"
 
 #define SLOT_SIZE   8192
 /* As of 2026.05.1 the valid splits set is restricted to powers of 2 from
@@ -736,6 +737,13 @@ int b64_decode(const char *b64, size_t b64_len, uint8_t *out, size_t *out_len);
 int valid_filename(const char *name);
 int is_valid_object(const char *name);
 
+/* CalVer version helpers (util.c) — parse yyyy.mm.N, compare numerically. */
+int shard_db_version_compare(const char *a, const char *b);
+int shard_db_version_is_valid(const char *version);
+int shard_db_version_decide(const char *disk_version, int version_present,
+                            int db_empty, const char *current_version,
+                            const char *minimum_version, int has_migration);
+
 /* config.c */
 int load_db_root(char *out, size_t outlen);
 Schema load_schema(const char *effective_root, const char *object);
@@ -1299,7 +1307,8 @@ int cmd_add_fields(const char *db_root, const char *object,
    (narrow refused pre-flight on out-of-range), numeric scale change
    (overflow refused pre-flight), float→double widen. Cross-type changes
    are refused with a hint to use add-field + remove-field + bulk-update.
-   v2 only — v1 objects are refused with a pointer to ./migrate.
+   v2 only — v1 objects are refused with a pointer to the historical
+   2026.05.4 migration path.
    Triggers a rebuild_object_v2 walk that re-encodes affected fields, then
    rewrites fields.conf in place and rebuilds every index in index.conf
    (affected ones are stale; the wipe-and-rebuild keeps the code simple
@@ -1323,6 +1332,11 @@ void objlock_wrunlock(const char *db_root, const char *object);
 int rebuild_recovery(const char *db_root);
 int db_root_lock_acquire(const char *db_root, int *out_fd);
 void db_root_lock_release(int *fd);
+
+/* Version file helpers (embedded.c) */
+int shard_db_version_file_read(const char *db_root, char *out, size_t out_sz);
+int shard_db_version_file_write(const char *db_root, const char *version);
+int shard_db_startup_migrate(const char *db_root, char *out_disk_version, size_t out_sz);
 
 typedef struct RebuildTxn RebuildTxn;
 

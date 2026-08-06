@@ -3733,6 +3733,42 @@ int cmd_server(const char *db_root, int daemonize) {
         }
     }
 
+    /* Auto-migrate: compare $DB_ROOT/.version against this binary's
+       compiled-in SHARD_DB_VERSION and migrate in-process if supported.
+       Empty roots bootstrap; minimum-version, invalid-evidence, and
+       downgrade refusals happen before fork/listen. */
+    {
+        char disk_version[64] = {0};
+        int mrc = shard_db_startup_migrate(db_root, disk_version, sizeof(disk_version));
+        if (mrc == SHARD_DB_VERSION_DOWNGRADE) {
+            fprintf(stderr,
+                    "shard-db: refusing to start: database version %s is newer "
+                    "than this binary (%s); install shard-db %s or newer.\n",
+                    disk_version, SHARD_DB_VERSION, disk_version);
+            db_root_lock_release(&lock_fd);
+            return 1;
+        }
+        if (mrc == SHARD_DB_VERSION_TOO_OLD) {
+            fprintf(stderr,
+                    "shard-db: refusing to start: this database requires "
+                    "shard-db %s or newer.\n", SHARD_DB_MIN_VERSION);
+            db_root_lock_release(&lock_fd);
+            return 1;
+        }
+        if (mrc == SHARD_DB_VERSION_INVALID) {
+            fprintf(stderr,
+                    "shard-db: refusing to start: %s/.version has invalid "
+                    "version evidence for a non-empty database.\n", db_root);
+            db_root_lock_release(&lock_fd);
+            return 1;
+        }
+        if (mrc != 0) {
+            fprintf(stderr, "shard-db: refusing to start: startup migration failed\n");
+            db_root_lock_release(&lock_fd);
+            return 1;
+        }
+    }
+
     /* Pre-fork validation: dirs.conf + schema.conf consistency must be
        checked while stderr still reaches the user's terminal. The earlier
        layout ran validate_metadata after the fork's stderr→/dev/null

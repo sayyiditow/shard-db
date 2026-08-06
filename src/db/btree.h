@@ -29,7 +29,7 @@
    value-cluster chain. Previous "BTRG" (v3) added last_leaf_page +
    prev_leaf for O(1)-step DESC iteration; the v2 "BTRF" and v1 "BTRE"
    magics predate that. All non-current magics are rejected on open —
-   run ./migrate to rebuild every btree. */
+   run `./shard-db reindex` to rebuild every btree. */
 #define BT_MAGIC_V1  0x42545245u  /* legacy: string-keyed */
 #define BT_MAGIC_V2  0x42545246u  /* legacy: binary keys without prev_leaf */
 #define BT_MAGIC_V3  0x42545247u  /* legacy: BTRG, prev_leaf + last_leaf_page */

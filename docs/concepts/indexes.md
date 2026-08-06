@@ -152,7 +152,7 @@ V3 (`BTRG`) added two header fields that make DESC iteration O(1)-step. V4 keeps
 - `BtFileHeader.last_leaf_page` — pointer to the rightmost leaf. DESC iterators start here in O(1).
 - `BtPageHeader.prev_leaf` — backward link maintained on every leaf split. DESC steps left one page at a time via `ph->prev_leaf` instead of indexing into a precomputed array.
 
-Older formats (`BTRE`, `BTRF`, `BTRG`) are rejected at open with a clear error and require a reindex. Run 2026.05.5's `./migrate` once — it spawns the daemon, calls `./shard-db reindex`, and stops the daemon. Idempotent: re-running on an already-BTRH install just rebuilds btrees in their current format. From pre-2026.05.1 installs, install 2026.05.4 first and run that release's `./migrate` to convert v1 objects to slotcask, then upgrade to 2026.05.5 and re-run `./migrate`.
+Older formats (`BTRE`, `BTRF`, `BTRG`) are rejected at open with a clear error and require a reindex. As of 2026.08.1, startup migration is automatic — the daemon compares `$DB_ROOT/.version` against its compiled-in version and rebuilds btrees in-process if the disk version is older. The standalone `./migrate` binary is removed; `./shard-db reindex` remains available for on-demand use. From pre-2026.05.1 installs, install 2026.05.4 first and run that release's `./migrate` to convert v1 objects to slotcask, then upgrade to 2026.05.5+.
 
 ## Index maintenance
 

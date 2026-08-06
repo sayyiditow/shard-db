@@ -26,7 +26,6 @@ build/
   bin/
     shard-db        # daemon binary
     shard-cli       # ncurses TUI client
-    migrate         # one-shot upgrade runner (per-release migrations)
     db.env.example  # template config — copy to db.env on first deploy
 ```
 
@@ -64,7 +63,7 @@ cd shard-db-2026.05.4
 ./shard-db start
 ```
 
-Each archive contains the stripped daemon (`shard-db`), the TUI client (`shard-cli`), the per-release upgrade runner (`migrate`), and a default `db.env.example`. All artifacts are cosign-signed; verify with:
+Current archives contain the stripped daemon (`shard-db`), the TUI client (`shard-cli`), and a default `db.env.example`; startup performs the 2026.08.1 index rebuild automatically. Historical 2026.05.4 archives also shipped the then-required `migrate` binary. All artifacts are cosign-signed; verify with:
 
 ```bash
 cosign verify-blob \
@@ -85,9 +84,13 @@ later) upgrade with a binary swap:
 ./shard-db start
 ```
 
-The `./migrate` binary was reinstated in 2026.07.1 and ships with
-2026.07.1+. It runs two phases: (1) varlen segment migration, then
-(2) offline compact. It is idempotent — safe to re-run if interrupted.
+As of 2026.08.1, startup migration is automatic — the daemon compares
+`$DB_ROOT/.version` against its compiled-in version and runs the full index
+rebuild in-process on start. The standalone `./migrate` binary is removed.
+The minimum supported source release is 2026.07.3; this is recorded for
+operators but is informational and not enforced in this release because
+earlier releases did not write `.version`. `./shard-db reindex` remains available
+for on-demand use.
 
 Operators who upgraded from a pre-2026.07.1 build affected by kf
 corruption must run the 2026.07.1 release's `rebuild-kf` against a

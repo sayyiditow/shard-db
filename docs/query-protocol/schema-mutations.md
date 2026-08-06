@@ -212,7 +212,7 @@ CLI shortcut (single-field — JSON form covers batch):
 ### What happens
 
 1. Takes the object's **write lock** (`objlock_wrlock`).
-2. Refuses immediately if `storage_version != 2` (point to `./migrate`).
+2. Refuses immediately if `storage_version != 2` (upgrade to 2026.05.4 and run that release's `./migrate` first, or upgrade to 2026.08.1+ for automatic startup migration).
 3. Parses every edit spec; refuses on unknown field name, tombstoned field, duplicate edit in the same request, invalid type, or cross-type change.
 4. Builds a new `TypedSchema` by overlaying each edited field onto a clone of the old schema (positions unchanged, only `size` / `offset` / `numeric_scale` move).
 5. **No-op fast path** — if no field's encoding actually changed (a varchar staying the same size with only `:default=...` modifier shift, say), skip the data rebuild and rewrite `fields.conf` only.

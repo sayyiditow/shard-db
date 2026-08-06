@@ -353,6 +353,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_json_aggregate_order_case.c \
     src/test/cases/test_runner_parallel.c \
     src/test/cases/test_update_partial_concurrent.c \
+    src/test/cases/test_version_compare.c \
+    src/test/cases/test_startup_auto_migration.c \
     src/db/util.c \
     src/db/durability.c \
     src/bench/bench_stats.c \
@@ -440,13 +442,6 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-bench
 
-# migrate — one-shot upgrade orchestrator. Spawns ./shard-db start, runs
-# ./shard-db reindex (idempotent — rewrites btrees in the (value, hash)
-# sort 2026.05.5 expects), then stops the daemon. Standalone binary; no
-# daemon source linkage.
-gcc $MODE_CFLAGS -o migrate src/migrate/main.c
-[ "$DO_STRIP" = 1 ] && strip migrate
-
 mkdir -p build/bin
 
 # Purge any dev-run artifacts so `./build.sh` always emits a clean tree.
@@ -458,7 +453,7 @@ mkdir -p build/bin
 rm -rf build/db build/logs
 rm -f  build/bin/db.env
 
-cp shard-db shard-cli shard-db-test shard-db-test-server shard-db-bench migrate build/bin/
+cp shard-db shard-cli shard-db-test shard-db-test-server shard-db-bench build/bin/
 cp src/db/shard_db.h build/bin/
 
 # Ship as db.env.example — operator copies to db.env on first deploy. Avoids
@@ -587,4 +582,11 @@ fi
 
 echo "Deploy: copy build/bin/ contents to your install dir (e.g. /opt/shard-db/bin/)."
 echo "First-time setup: cp db.env.example db.env, edit, then ./shard-db start."
-echo "Upgrades: replace build/bin/ contents (shard-db + shard-cli + migrate), then run ./migrate once to rebuild B+ trees into 2026.05.5's (value, hash)-sorted layout. If still on v1 (pre-2026.05.5), first upgrade to 2026.05.4 and run that release's ./migrate."
+BUILD_VERSION=$(sed -n 's/^#define SHARD_DB_VERSION "\(.*\)"/\1/p' src/db/version.h)
+BUILD_MIN_VERSION=$(sed -n 's/^#define SHARD_DB_MIN_VERSION "\(.*\)"/\1/p' src/db/version.h)
+if [ -n "$BUILD_MIN_VERSION" ]; then
+    MIN_MSG="minimum supported source release is shard-db $BUILD_MIN_VERSION (informational; not enforced in this release because earlier releases did not write .version)"
+else
+    MIN_MSG="accepts data from any prior release (no minimum floor set by this release)"
+fi
+echo "Upgrades: replace build/bin/ contents (shard-db + shard-cli), then run ./shard-db start — this build is shard-db $BUILD_VERSION; it self-migrates \$DB_ROOT/.version automatically on start and $MIN_MSG. Run './shard-db version' any time to check a binary's version without starting it. Legacy v1 objects (pre-2026.05.5) still require the historical 2026.05.4 ./migrate upgrade path before this binary can open them."
