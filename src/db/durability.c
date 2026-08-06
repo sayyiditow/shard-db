@@ -410,13 +410,13 @@ void *durability_sync_thread(void *arg) {
         uint64_t tick_started = now_ms();
         DurabilitySyncStats stats;
         durability_sync_one_pass(db, interval_ms, &stats);
-        LOG_INFO(LOG_SUB_DURABILITY,
-                 "DURABILITY-SYNC tick: kf=%d seg=%d bt=%d bm=%d failed=%d "
-                 "skipped=%d escalated=%d in %lums",
-                 stats.kf_synced, stats.seg_synced, stats.bt_synced,
-                 stats.bm_synced, stats.failed, stats.skipped,
-                 stats.escalated,
-                 (unsigned long)(now_ms() - tick_started));
+        LOG_DEBUG(LOG_SUB_DURABILITY,
+                  "DURABILITY-SYNC tick: kf=%d seg=%d bt=%d bm=%d failed=%d "
+                  "skipped=%d escalated=%d in %lums",
+                  stats.kf_synced, stats.seg_synced, stats.bt_synced,
+                  stats.bm_synced, stats.failed, stats.skipped,
+                  stats.escalated,
+                  (unsigned long)(now_ms() - tick_started));
 
         uint64_t now = now_ms();
         do {

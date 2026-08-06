@@ -598,7 +598,10 @@ static int bt_open_file(const char *path, int writer,
         fd = open(path, O_RDWR);
     }
     if (fd < 0) {
-        LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: open failed (writer=%d): %s", path, writer, strerror(errno));
+        if (!writer && errno == ENOENT)
+            LOG_DEBUG(LOG_SUB_BTREE, "bt_open_file %s: open failed (writer=0): %s", path, strerror(errno));
+        else
+            LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: open failed (writer=%d): %s", path, writer, strerror(errno));
         return -1;
     }
 
