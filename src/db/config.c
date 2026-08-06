@@ -69,6 +69,17 @@ pthread_t g_log_thread;
 _Atomic int g_log_running = 0;
 char g_log_dir[PATH_MAX];
 
+/* Process-global log handler. shard-db allows only one ShardDb instance per
+   process (V1), so the handler is a single process-wide slot rather than a
+   per-instance field — this also lets shard_db_set_log_handler_global() be
+   called before shard_db_open() returns, so startup-migration diagnostics
+   (which fire before the caller holds a ShardDb* to register a per-handle
+   callback on) reach it too. type: 1=ERROR 2=WARN 3=INFO 4=DEBUG 5=AUDIT
+   6=SLOW. _Atomic: background threads can start logging before the
+   registration call lands. */
+_Atomic(void (*)(int type, const char *msg, void *ud)) g_log_handler = NULL;
+void *_Atomic g_log_handler_ud = NULL;
+
 FILE *open_log_for_level(int level) {
     time_t now = time(NULL);
     struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
@@ -196,9 +207,8 @@ int db_thread_create(pthread_t *tid, void *(*fn)(void *), void *arg) {
 void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
     if (level > g_log_level) return;
     int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
-    void (*handler)(int, const char *, void *) = g_db ?
-        atomic_load_explicit(&g_db->log_handler, memory_order_acquire) : NULL;
-    if (!_running && !handler) return;
+    void (*handler)(int, const char *, void *) =
+        atomic_load_explicit(&g_log_handler, memory_order_acquire);
     const char *labels[] = {"", "ERROR", "WARN", "INFO", "DEBUG"};
     if (level < 1 || level > 4) level = LOG_LVL_INFO;
     const char *sub = subsystem ? subsystem : "unknown";
@@ -223,28 +233,36 @@ void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
         entry.msg[pos+1] = '\0';
     }
 
-    if (!_running && handler) {
-        void *ud = atomic_load_explicit(&g_db->log_handler_ud, memory_order_relaxed);
+    /* Disk writer (daemon mode) always wins when running — matches the
+       original mutually-exclusive contract documented on
+       shard_db_set_log_handler(). Otherwise a registered handler is the
+       sole sink (embedded mode, whether registered before or after
+       shard_db_open() returns — see g_log_handler above). If neither is
+       present, this is the last resort: an embedded caller that never
+       opted into a handler, printed instead of silently dropped or
+       written to a file the caller didn't ask for. */
+    if (_running) {
+        pthread_mutex_lock(&g_log_lock);
+        int next = (g_log_head + 1) % LOG_RING_SIZE;
+        if (next != g_log_tail) {
+            g_log_ring[g_log_head] = entry;
+            g_log_head = next;
+        }
+        pthread_cond_signal(&g_log_cond);
+        pthread_mutex_unlock(&g_log_lock);
+    } else if (handler) {
+        void *ud = atomic_load_explicit(&g_log_handler_ud, memory_order_relaxed);
         handler(level, entry.msg, ud);
-        return;
+    } else {
+        fputs(entry.msg, stderr);
     }
-
-    pthread_mutex_lock(&g_log_lock);
-    int next = (g_log_head + 1) % LOG_RING_SIZE;
-    if (next != g_log_tail) {
-        g_log_ring[g_log_head] = entry;
-        g_log_head = next;
-    }
-    pthread_cond_signal(&g_log_cond);
-    pthread_mutex_unlock(&g_log_lock);
 }
 
 
 void log_audit_sub(const char *subsystem, const char *fmt, ...) {
     int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
-    void (*handler)(int, const char *, void *) = g_db ?
-        atomic_load_explicit(&g_db->log_handler, memory_order_acquire) : NULL;
-    if (!_running && !handler) return;
+    void (*handler)(int, const char *, void *) =
+        atomic_load_explicit(&g_log_handler, memory_order_acquire);
     const char *sub = subsystem ? subsystem : "unknown";
 
     time_t now = time(NULL);
@@ -266,20 +284,22 @@ void log_audit_sub(const char *subsystem, const char *fmt, ...) {
         entry.msg[pos+1] = '\0';
     }
 
-    if (!_running && handler) {
-        void *ud = atomic_load_explicit(&g_db->log_handler_ud, memory_order_relaxed);
+    /* Routing priority — see log_msg_sub above. */
+    if (_running) {
+        pthread_mutex_lock(&g_log_lock);
+        int next = (g_log_head + 1) % LOG_RING_SIZE;
+        if (next != g_log_tail) {
+            g_log_ring[g_log_head] = entry;
+            g_log_head = next;
+        }
+        pthread_cond_signal(&g_log_cond);
+        pthread_mutex_unlock(&g_log_lock);
+    } else if (handler) {
+        void *ud = atomic_load_explicit(&g_log_handler_ud, memory_order_relaxed);
         handler(5 /* SHARD_DB_LOG_AUDIT */, entry.msg, ud);
-        return;
+    } else {
+        fputs(entry.msg, stderr);
     }
-
-    pthread_mutex_lock(&g_log_lock);
-    int next = (g_log_head + 1) % LOG_RING_SIZE;
-    if (next != g_log_tail) {
-        g_log_ring[g_log_head] = entry;
-        g_log_head = next;
-    }
-    pthread_cond_signal(&g_log_cond);
-    pthread_mutex_unlock(&g_log_lock);
 }
 
 void log_slow_query(const char *mode, const char *dir,
@@ -306,9 +326,8 @@ void log_slow_query(const char *mode, const char *dir,
        the drain thread; bypasses LOG_LEVEL because the SLOW_QUERY_MS
        threshold is the filter. */
     int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
-    void (*handler)(int, const char *, void *) = g_db ?
-        atomic_load_explicit(&g_db->log_handler, memory_order_acquire) : NULL;
-    if (!_running && !handler) return;
+    void (*handler)(int, const char *, void *) =
+        atomic_load_explicit(&g_log_handler, memory_order_acquire);
     time_t now = time(NULL);
     struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
     char ts[32];
@@ -326,20 +345,22 @@ void log_slow_query(const char *mode, const char *dir,
              object ? object : "",
              query  ? query  : "");
 
-    if (!_running && handler) {
-        void *ud = atomic_load_explicit(&g_db->log_handler_ud, memory_order_relaxed);
+    /* Routing priority — see log_msg_sub above. */
+    if (_running) {
+        pthread_mutex_lock(&g_log_lock);
+        int next2 = (g_log_head + 1) % LOG_RING_SIZE;
+        if (next2 != g_log_tail) {
+            g_log_ring[g_log_head] = entry;
+            g_log_head = next2;
+        }
+        pthread_cond_signal(&g_log_cond);
+        pthread_mutex_unlock(&g_log_lock);
+    } else if (handler) {
+        void *ud = atomic_load_explicit(&g_log_handler_ud, memory_order_relaxed);
         handler(6 /* SHARD_DB_LOG_SLOW */, entry.msg, ud);
-        return;
+    } else {
+        fputs(entry.msg, stderr);
     }
-
-    pthread_mutex_lock(&g_log_lock);
-    int next2 = (g_log_head + 1) % LOG_RING_SIZE;
-    if (next2 != g_log_tail) {
-        g_log_ring[g_log_head] = entry;
-        g_log_head = next2;
-    }
-    pthread_cond_signal(&g_log_cond);
-    pthread_mutex_unlock(&g_log_lock);
 }
 
 /* Records one commit's lock-hold duration into the aggregate durability

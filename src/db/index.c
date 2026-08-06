@@ -3660,6 +3660,11 @@ static int reindex_seg_cb(const uint8_t *rec, size_t vlen,
        the caller (seg_scan_o_direct_varlen) before this callback runs. */
     if (w->format != SLOTCASK_FORMAT_VARIABLE &&
         (size_t)24 + klen > (size_t)w->slot_size) {
+        LOG_ERROR(LOG_SUB_REINDEX,
+                  "REINDEX %s/%s: corrupt segment record (klen=%u exceeds "
+                  "slot_size=%d, worker=%d)",
+                  w->db_root, w->object, (unsigned)klen, w->slot_size,
+                  w->worker_idx);
         w->had_error = 1;
         return 0;
     }
@@ -3735,7 +3740,12 @@ static void *seg_scan_worker(void *arg) {
             rc = seg_scan_o_direct_varlen(path, reindex_seg_cb, w);
         else
             rc = seg_scan_o_direct(path, (int)w->slot_size, reindex_seg_cb, w);
-        if (rc < 0) w->had_error = 1;
+        if (rc < 0) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "REINDEX %s/%s: segment scan failed for %s (rc=%d %s)",
+                      w->db_root, w->object, path, rc, strerror(-rc));
+            w->had_error = 1;
+        }
         if (w->segs_done) atomic_fetch_add(w->segs_done, 1);
     }
 
@@ -4391,18 +4401,27 @@ static void reindex_cleanup_obsolete(const char *eff_root, const char *object,
    per-object; rebuild_object_v2 (vacuum) inherits it from the server dispatch.
    Checked form returns 0 on success and writes the rebuilt count; the
    compatibility wrapper below retains the historic count-or-zero result. */
-int reindex_object_checked(const char *eff_root, const char *object,
-                           int composites_only, int *out_count) {
+static int reindex_object_checked_impl(const char *eff_root, const char *object,
+                                       int composites_only, int *out_count,
+                                       int *out_errno) {
     if (!out_count) return -1;
     *out_count = 0;
     char ic_path[PATH_MAX];
     snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf",
              eff_root, object);
     FILE *ic = fopen(ic_path, "r");
-    if (!ic) return errno == ENOENT ? 0 : -1;
+    if (!ic) {
+        if (errno == ENOENT) return 0;
+        if (out_errno) *out_errno = errno;
+        return -1;
+    }
 
     char (*field_specs)[512] = malloc((size_t)MAX_FIELDS * 512);
-    if (!field_specs) { fclose(ic); return -1; }
+    if (!field_specs) {
+        fclose(ic);
+        if (out_errno) *out_errno = ENOMEM;
+        return -1;
+    }
     int nf = 0;
     char fline[512];
     while (fgets(fline, sizeof(fline), ic) && nf < MAX_FIELDS) {
@@ -4426,17 +4445,23 @@ int reindex_object_checked(const char *eff_root, const char *object,
         free(field_specs);
         LOG_ERROR(LOG_SUB_REINDEX, "REINDEX %s/%s: cannot load schema",
                   eff_root, object);
+        if (out_errno) *out_errno = EINVAL;
         return -1;
     }
     TypedSchema *ts = load_typed_schema(eff_root, object);
     if (!ts) {
         free(field_specs);
         LOG_ERROR(LOG_SUB_REINDEX, "REINDEX %s/%s: cannot load typed schema", eff_root, object);
+        if (out_errno) *out_errno = EINVAL;
         return -1;
     }
 
     MFFieldDesc *descs = calloc((size_t)nf, sizeof(MFFieldDesc));
-    if (!descs) { free(field_specs); return -1; }
+    if (!descs) {
+        free(field_specs);
+        if (out_errno) *out_errno = ENOMEM;
+        return -1;
+    }
     int n_desc = 0;
 
     for (int i = 0; i < nf; i++) {
@@ -4503,8 +4528,10 @@ int reindex_object_checked(const char *eff_root, const char *object,
     if (build_result.status == INDEX_BUILD_FAILED) {
         free(descs);
         free(field_specs);
-        LOG_ERROR(LOG_SUB_REINDEX, "REINDEX %s/%s: index build failed",
-                  eff_root, object);
+        LOG_ERROR(LOG_SUB_REINDEX, "REINDEX %s/%s: index build failed (errno=%d %s)",
+                  eff_root, object, build_result.error_errno,
+                  strerror(build_result.error_errno));
+        if (out_errno) *out_errno = build_result.error_errno;
         return -1;
     }
     if (build_result.all_requested_shards_published)
@@ -4515,6 +4542,19 @@ int reindex_object_checked(const char *eff_root, const char *object,
     *out_count = nf;
     LOG_INFO(LOG_SUB_REINDEX, "REINDEX %s/%s: rebuilt %d indexes", eff_root, object, nf);
     return 0;
+}
+
+int reindex_object_checked(const char *eff_root, const char *object,
+                           int composites_only, int *out_count) {
+    return reindex_object_checked_impl(eff_root, object, composites_only,
+                                       out_count, NULL);
+}
+
+int reindex_object_checked_ex(const char *eff_root, const char *object,
+                              int composites_only, int *out_count,
+                              int *out_errno) {
+    return reindex_object_checked_impl(eff_root, object, composites_only,
+                                       out_count, out_errno);
 }
 
 int reindex_object(const char *eff_root, const char *object,

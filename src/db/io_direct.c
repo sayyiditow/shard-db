@@ -696,6 +696,7 @@ int seg_scan_o_direct_varlen(const char *seg_path,
         return -ENOMEM;
     }
     int carry_len = 0;
+    off_t base_off = 0; /* DIAGNOSTIC (temporary): file offset of dc.active chunk 0 */
 
     pthread_t worker_tid = (pthread_t)0;
     if (!single_shot) {
@@ -727,6 +728,11 @@ int seg_scan_o_direct_varlen(const char *seg_path,
 
         /* Reassemble a record that straddled the previous chunk boundary. */
         if (carry_len > 0) {
+            /* DIAGNOSTIC (temporary): carry always holds the trailing bytes
+               of the stream ending exactly at base_off, so the record this
+               carry belongs to started at base_off - carry_len regardless
+               of how many earlier chunks contributed to it. */
+            off_t diag_rec_start = base_off - (off_t)carry_len;
             /* Stage 1: ensure we have the 24-byte header in carry. */
             if (carry_len < 24) {
                 int need = 24 - carry_len;
@@ -764,6 +770,18 @@ int seg_scan_o_direct_varlen(const char *seg_path,
                the small carry buffer (CID 1696466). Reject anything
                past the largest a legitimate segment record could be. */
             if (rec_size > SLOTCASK_SEG_MAX_BYTES) {
+                /* DIAGNOSTIC (temporary): dump exactly what was decoded and
+                   where, to find why a legitimate stream produced this. */
+                fprintf(stderr,
+                        "[od_varlen_diag] %s: bogus header at file_off=%lld "
+                        "(chunk base_off=%lld carry_len_at_entry=%lld) "
+                        "klen=%u vlen=%u flag=%u rec_size=%zu chunk_len=%zd "
+                        "single_shot=%d\n",
+                        seg_path, (long long)diag_rec_start,
+                        (long long)base_off,
+                        (long long)(base_off - diag_rec_start),
+                        (unsigned)klen, (unsigned)vlen, (unsigned)flag,
+                        rec_size, chunk_len, single_shot);
                 ret = -EIO;
                 goto done;
             }
@@ -834,6 +852,7 @@ int seg_scan_o_direct_varlen(const char *seg_path,
         }
 
 next_chunk:
+        base_off += chunk_len; /* DIAGNOSTIC (temporary) */
         {
             ssize_t next = dbctx_swap(&dc);
             if (next < 0) { ret = (int)next; goto done; }

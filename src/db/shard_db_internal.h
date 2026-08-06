@@ -257,16 +257,6 @@ struct ShardDb {
     char warmup_mode[16];
     int log_level;
     int log_retain_days;
-    /* embedded-mode log handler (set via shard_db_set_log_handler).
-       Called synchronously on the same thread as log emission when
-       g_log_running == 0 (no drain thread).  Must be thread-safe.
-       type: 1=ERROR 2=WARN 3=INFO 4=DEBUG 5=AUDIT 6=SLOW
-       _Atomic: background threads (e.g. durability_sync_thread) can start
-       logging as soon as shard_db_open() returns, before an embedded
-       caller's shard_db_set_log_handler() call lands -- plain reads/writes
-       here raced under TSan. */
-    _Atomic(void (*)(int type, const char *msg, void *ud)) log_handler;
-    void *_Atomic log_handler_ud;
 
     /* Joinable background-thread lifecycle. */
     pthread_t bg_auto_vac_tid;

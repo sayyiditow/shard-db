@@ -324,15 +324,18 @@ static int run_startup_migration(const char *db_root) {
         /* Rebuild every secondary index from source-of-truth records. */
         objlock_wrlock(eff_root, obj);
         int reindex_count = 0;
-        int reindex_rc = reindex_object_checked(eff_root, obj, 0,
-                                                &reindex_count);
+        int reindex_errno = 0;
+        int reindex_rc = reindex_object_checked_ex(eff_root, obj, 0,
+                                                    &reindex_count,
+                                                    &reindex_errno);
         objlock_wrunlock(eff_root, obj);
         if (reindex_rc != 0) {
-            fprintf(stderr, "[shard-db] reindex failed for %s/%s\n", dir, obj);
+            LOG_ERROR(LOG_SUB_REINDEX, "reindex failed for %s/%s (errno=%d %s)",
+                      dir, obj, reindex_errno, strerror(reindex_errno));
             failed = 1;
         } else if (reindex_count > 0) {
-            fprintf(stderr, "[shard-db] reindexed %s/%s (%d indexes)\n",
-                    dir, obj, reindex_count);
+            LOG_INFO(LOG_SUB_REINDEX, "reindexed %s/%s (%d indexes)",
+                     dir, obj, reindex_count);
         }
     }
     if (ferror(f)) failed = 1;
@@ -570,15 +573,27 @@ static void db_mutexes_destroy(void) {
     pthread_mutex_destroy(&g_token_lock);
 }
 
+/* Process-global slot (see g_log_handler in config.c) — shard-db allows
+   only one ShardDb instance per process (V1), and this is what lets an
+   embedded caller register a handler before shard_db_open() returns, so
+   startup-migration diagnostics reach it too. */
+void shard_db_set_log_handler_global(
+    void (*fn)(int type, const char *msg, void *userdata),
+    void *userdata) {
+    /* release: pairs with the acquire loads in log_msg_sub/log_audit_sub/
+       log_slow_query so a background thread that observes the new
+       g_log_handler also observes the g_log_handler_ud write below it. */
+    atomic_store_explicit(&g_log_handler_ud, userdata, memory_order_relaxed);
+    atomic_store_explicit(&g_log_handler, fn, memory_order_release);
+}
+
+/* Per-handle compatibility wrapper — db is accepted for API stability but
+   otherwise unused; see shard_db_set_log_handler_global(). */
 void shard_db_set_log_handler(ShardDb *db,
     void (*fn)(int type, const char *msg, void *userdata),
     void *userdata) {
     if (!db) return;
-    /* release: pairs with the acquire loads in log_msg_sub/log_audit_sub/
-       log_slow_query so a background thread that observes the new
-       log_handler also observes the log_handler_ud write below it. */
-    atomic_store_explicit(&db->log_handler_ud, userdata, memory_order_relaxed);
-    atomic_store_explicit(&db->log_handler, fn, memory_order_release);
+    shard_db_set_log_handler_global(fn, userdata);
 }
 
 /* Final instance teardown after callers have stopped background threads,

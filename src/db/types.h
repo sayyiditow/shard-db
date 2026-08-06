@@ -435,6 +435,10 @@ extern _Thread_local uint32_t g_request_timeout_ms;
 #define QUERY_BUFFER_ERR "{\"error\":\"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor\"}\n"
 extern char g_log_dir[PATH_MAX];
 
+/* Process-global log handler slot — see config.c for the full rationale. */
+extern _Atomic(void (*)(int type, const char *msg, void *ud)) g_log_handler;
+extern void *_Atomic g_log_handler_ud;
+
 /* Per-thread output stream — worker threads set this to their client socket FILE*.
    Defaults to stdout for CLI mode. All command output uses OUT() instead of printf(). */
 extern __thread FILE *g_out;
@@ -1083,6 +1087,12 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
 int reindex_object(const char *eff_root, const char *object, int composites_only);
 int reindex_object_checked(const char *eff_root, const char *object,
                            int composites_only, int *out_count);
+/* Same as reindex_object_checked, but on failure also reports the errno
+   behind the failure via out_errno (may be NULL if the caller only needs
+   the pass/fail result). */
+int reindex_object_checked_ex(const char *eff_root, const char *object,
+                              int composites_only, int *out_count,
+                              int *out_errno);
 int cmd_remove_index(const char *db_root, const char *object, const char *field);
 int cmd_remove_indexes(const char *db_root, const char *object, const char *fields_json);
 
