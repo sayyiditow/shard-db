@@ -2326,7 +2326,7 @@ static void *agg_od_seg_worker(void *raw) {
     if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
     OdSegAdapterCtx actx = { .wrap = &arg->wrap, .stop_flag = arg->stop_flag };
     if (arg->format == SLOTCASK_FORMAT_VARIABLE)
-        seg_scan_o_direct_varlen(arg->seg_path, od_seg_record_cb, &actx);
+        seg_scan_o_direct_varlen(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
     else
         seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
     return NULL;

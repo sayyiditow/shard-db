@@ -155,7 +155,11 @@ static int test_vacuum_recount_command_boundary_missing_object_run(void) {
 TEST_REGISTER("test-vacuum-recount-command-boundary-missing-object",
               test_vacuum_recount_command_boundary_missing_object_run)
 
-static int test_vacuum_recount_object_not_open_run(void) {
+/* Startup validation runs before maintenance requests can be served. This
+   case therefore verifies that a materialized object with an unreadable kf
+   shard is rejected at restart, then restores the file so the fixture can
+   be cleaned up normally. */
+static int test_startup_refuses_unreadable_kf_maintenance_run(void) {
     if (geteuid() == 0) {
         TAP_DIAG("# skipping: running as root, chmod-based open-failure "
                  "injection does not apply\n");
@@ -239,36 +243,12 @@ static int test_vacuum_recount_object_not_open_run(void) {
     chmod_changed = 1;
 
     int start_rc = test_env_start_at(&env, saved_db_root, saved_port);
-    ASSERT_EQ_INT(start_rc, 0, "restart daemon with unreadable kf shard");
-    if (start_rc != 0) goto cleanup;
-    restarted = 1;
-
-    cfg.port = env.port;
-    tc2 = tc_connect(&cfg);
-    ASSERT_NOT_NULL(tc2, "reconnect after permission injection");
-    if (!tc2) goto cleanup;
-
-    if (request_response(tc2,
-            "{\"mode\":\"vacuum\",\"dir\":\"default\","
-            "\"object\":\"maint_not_open\"}",
-            &resp, "vacuum unopenable object responds")) {
-        ASSERT_CONTAINS(resp, "\"error\":\"object not open\"",
-                        "vacuum reports registry open failure");
-        ASSERT_TRUE(!SAFE_STRSTR(resp, "\"status\":\"vacuumed\""),
-                    "vacuum open failure does not report success");
+    ASSERT_TRUE(start_rc != 0,
+                "restart refuses an unreadable materialized KF shard");
+    if (start_rc == 0) {
+        restarted = 1;
+        test_env_stop(&env);
     }
-    free(resp); resp = NULL;
-
-    if (request_response(tc2,
-            "{\"mode\":\"recount\",\"dir\":\"default\","
-            "\"object\":\"maint_not_open\"}",
-            &resp, "recount unopenable object responds")) {
-        ASSERT_CONTAINS(resp, "\"error\":\"object not open\"",
-                        "recount reports registry open failure");
-        ASSERT_TRUE(!SAFE_STRSTR(resp, "\"count\""),
-                    "recount open failure does not report a count");
-    }
-    free(resp); resp = NULL;
 
 cleanup:
     free(resp);
@@ -286,8 +266,8 @@ cleanup:
     return 0;
 }
 
-TEST_REGISTER("test-vacuum-recount-object-not-open",
-              test_vacuum_recount_object_not_open_run)
+TEST_REGISTER("test-startup-refuses-unreadable-kf-maintenance",
+              test_startup_refuses_unreadable_kf_maintenance_run)
 
 static int test_recount_kf_header_read_failure_run(void) {
     if (geteuid() == 0) {

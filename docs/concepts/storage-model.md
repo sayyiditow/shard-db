@@ -80,6 +80,16 @@ Offset  Size  Field
 
 Layout total per record: `24 + klen + vlen` bytes.
 
+VARLEN records are rounded up to the next 8-byte boundary. When a new
+record reuses a larger tombstoned slot, the bytes between the record's
+natural end and that slot's old capacity are zero-filled padding. Scanners
+must therefore advance by the record's natural size and, when they land in
+that padding, resynchronize only at the next 8-byte-aligned header whose
+flag and key hash validate. The resync search is bounded by the owning
+object's maximum slot size; an unrecoverable non-padding desync aborts the
+scan so compaction cannot mistake an unaccounted live record for an empty
+segment.
+
 **flag at byte 18** mirrors the keyfile flag. A `pwrite()` of one byte tombstones a record without rewriting the value. The kf flag is the *commit truth*; the seg flag is a redundant mirror used by full-segment recovery scans.
 
 ### How writes land

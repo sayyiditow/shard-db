@@ -276,29 +276,13 @@ static int test_get_fields_composite_overflow_run(void) {
 
 TEST_REGISTER("test-get-fields-composite-overflow", test_get_fields_composite_overflow_run)
 
-/* count "object not open" regression: forces slotcask_registry_get to fail
-   by revoking read permission on one kf shard file, then confirms count
-   reports an explicit error instead of silently returning 0. Skipped when
-   running as root, since root bypasses file permission checks. */
-/* Root-caused in review round 2 (Finding 1, Blocker): the original version
-   of this test sent `count` with EMPTY criteria, which takes the O(1)
-   get_live_count metadata fast path in cmd_count (query.c ~line 5331) --
-   that path never calls slotcask_registry_get at all, so it can never
-   observe an open failure. It also chmod'd the kf shard AFTER the
-   preceding `insert`, but insert already opened and cached the object's
-   SlotcaskDb handle in the daemon's process-wide registry
-   (storage.c ~line 1438), so a later chmod on a still-open handle does not
-   force a fresh (failing) reopen.
-   Fixed by: (a) sending a non-empty, non-indexed criterion so the request
-   reaches the scan_shards_v2_o_direct_match / slotcask_registry_get
-   fallback path that Task 3d rewrites, and (b) stopping the daemon
-   (test_env_stop_keep -- keeps db_root/port, unlike test_env_stop which
-   rm -rf's the tree), chmod'ing the kf shard while nothing has it open,
-   then restarting a FRESH daemon process (test_env_start_at) at the same
-   db_root/port. The new process starts with an empty registry, so the
-   very first count request on this object forces a real open() that
-   fails on the now-unreadable file. */
-static int test_count_object_not_open_run(void) {
+/* Skipped when running as root, since root bypasses file permission checks. */
+/* Startup now validates every materialized object before accepting
+   connections. Keep this regression focused on that fail-closed contract:
+   chmod the kf shard while no process has it open, then require a fresh
+   daemon process to refuse the database rather than serving a partial
+   object. */
+static int test_startup_refuses_unreadable_kf_count_run(void) {
     if (geteuid() == 0) {
         TAP_DIAG("# skipping: running as root, chmod-based open-failure "
                  "injection does not apply\n");
@@ -350,27 +334,13 @@ static int test_count_object_not_open_run(void) {
     snprintf(kf_path, sizeof(kf_path), "%s/default/gfnotopen/data/kf/000.kf", saved_db_root);
     ASSERT_TRUE(chmod(kf_path, 0) == 0, "revoke kf shard permissions");
 
-    ASSERT_TRUE(test_env_start_at(&env, saved_db_root, saved_port) == 0,
-        "daemon restarts fresh at the same db_root/port");
-
-    TestClient *tc2 = tc_connect(&cfg);
-    ASSERT_NOT_NULL(tc2, "reconnect after restart");
-    if (!tc2) {
-        chmod(kf_path, 0644);
-        test_env_stop(&env);
-        return 1;
-    }
-
-    tc_request(tc2,
-        "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"gfnotopen\","
-        "\"criteria\":[{\"field\":\"name\",\"op\":\"contains\",\"value\":\"A\"}]}", &resp);
-    ASSERT_CONTAINS(resp, "\"error\":\"object not open\"", "count reports the open failure, not zero");
-    free(resp); resp = NULL;
-
+    int start_rc = test_env_start_at(&env, saved_db_root, saved_port);
+    ASSERT_TRUE(start_rc != 0,
+        "daemon refuses restart when a materialized KF shard is unreadable");
+    if (start_rc == 0) test_env_stop(&env);
     chmod(kf_path, 0644);
-    tc_close(tc2);
-    test_env_stop(&env);
     return 0;
 }
 
-TEST_REGISTER("test-count-object-not-open", test_count_object_not_open_run)
+TEST_REGISTER("test-startup-refuses-unreadable-kf-count",
+              test_startup_refuses_unreadable_kf_count_run)

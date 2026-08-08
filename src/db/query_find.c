@@ -130,7 +130,7 @@ static void *od_seg_file_worker(void *raw) {
     if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
     OdSegAdapterCtx actx = { .wrap = arg->wrap, .stop_flag = arg->stop_flag };
     if (arg->format == SLOTCASK_FORMAT_VARIABLE)
-        seg_scan_o_direct_varlen(arg->seg_path, od_seg_record_cb, &actx);
+        seg_scan_o_direct_varlen(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
     else
         seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
     return NULL;
@@ -239,7 +239,7 @@ static void *od_match_file_worker(void *raw) {
             .count = &local_count, .fs = arg->fs,
             .single_cc = arg->single_cc, .tree = arg->tree,
         };
-        seg_scan_o_direct_varlen(arg->seg_path, varlen_match_cb, &mc);
+        seg_scan_o_direct_varlen(arg->seg_path, arg->slot_size, varlen_match_cb, &mc);
     } else {
         int rc = seg_scan_o_direct_match(arg->seg_path, arg->slot_size,
                                           arg->fs, arg->single_cc, arg->tree,

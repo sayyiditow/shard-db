@@ -356,6 +356,14 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_version_compare.c \
     src/test/cases/test_startup_auto_migration.c \
     src/test/cases/test_reindex_bitmap_resplit.c \
+    src/test/cases/test_varlen_scan_resync.c \
+    src/test/cases/test_varlen_scan_resync_odirect.c \
+    src/test/cases/test_varlen_compact_stat_resync.c \
+    src/test/cases/test_varlen_compact_recipient_resync.c \
+    src/test/cases/test_varlen_compact_donor_resync.c \
+    src/test/cases/test_varlen_compact_donor_preserved_on_desync.c \
+    src/test/cases/test_startup_format_sweep.c \
+    src/test/cases/test_varlen_compact_crash_mid_migration.c \
     src/db/util.c \
     src/db/durability.c \
     src/bench/bench_stats.c \

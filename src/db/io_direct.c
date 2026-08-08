@@ -49,6 +49,7 @@
 #endif
 
 #include "io_direct.h"
+#include "seg_scan_varlen.h"
 #include "btree.h"    /* BtFileHeader, BtPageHeader, BT_MAGIC*, bt_page_size,
                          BT_PAGE_DATA_START, BT_LEAF_RESTART_K,
                          BT_MAX_VAL_LEN, BT_HASH_SIZE               */
@@ -338,7 +339,7 @@ static void *prefetch_worker(void *arg)
  *   2. Call dbctx_kickoff() to start the first async prefetch into buf[1].
  *   3. Parse buf[0] (dc.active=0, dc.active_len bytes valid).
  */
-static int dbctx_init(DbCtx *c, int fd, off_t file_size, int single_shot)
+static int dbctx_init(DbCtx *c, int fd, off_t file_size, off_t start_off, int single_shot)
 {
     memset(c, 0, sizeof(*c));
     c->fd          = fd;
@@ -348,9 +349,12 @@ static int dbctx_init(DbCtx *c, int fd, off_t file_size, int single_shot)
     c->state       = DBS_IDLE;
     c->single_shot = single_shot;
 
+    off_t remain = file_size - start_off;
+    if (remain < 0) remain = 0;
+
     if (single_shot) {
         /* Allocate exactly what we need — no second buffer. */
-        size_t exact = ((size_t)file_size + ODIRECT_ALIGN - 1) & ~(size_t)(ODIRECT_ALIGN - 1);
+        size_t exact = ((size_t)remain + ODIRECT_ALIGN - 1) & ~(size_t)(ODIRECT_ALIGN - 1);
         if (posix_memalign((void **)&c->buf[0], ODIRECT_ALIGN, exact) != 0)
             return -ENOMEM;
         c->buf[1] = NULL;
@@ -368,17 +372,16 @@ static int dbctx_init(DbCtx *c, int fd, off_t file_size, int single_shot)
     pthread_cond_init(&c->prefetch_done,   NULL);
 
     /* Fill buf[0] synchronously. */
-    off_t  fsz  = file_size;
     size_t wanta;
     if (single_shot) {
-        wanta = ((size_t)fsz + ODIRECT_ALIGN - 1) & ~(size_t)(ODIRECT_ALIGN - 1);
+        wanta = ((size_t)remain + ODIRECT_ALIGN - 1) & ~(size_t)(ODIRECT_ALIGN - 1);
     } else {
-        size_t want = (fsz >= (off_t)odirect_buf_size) ? odirect_buf_size : (size_t)fsz;
+        size_t want = (remain >= (off_t)odirect_buf_size) ? odirect_buf_size : (size_t)remain;
         wanta = (want + ODIRECT_ALIGN - 1) & ~(size_t)(ODIRECT_ALIGN - 1);
         if (wanta > odirect_buf_size) wanta = odirect_buf_size;
     }
 
-    ssize_t got = pread(fd, c->buf[0], wanta, 0);
+    ssize_t got = pread(fd, c->buf[0], wanta, start_off);
     if (got < 0) {
         int e = errno;
         free(c->buf[0]); free(c->buf[1]);
@@ -388,7 +391,7 @@ static int dbctx_init(DbCtx *c, int fd, off_t file_size, int single_shot)
         return -e;
     }
     c->active_len = got;
-    c->next_off   = (off_t)got;
+    c->next_off   = start_off + (off_t)got;
     return 0;
 }
 
@@ -538,7 +541,7 @@ int seg_scan_o_direct(const char *seg_path, int slot_size,
     if (fd < 0) return -errno;
 
     DbCtx dc;
-    int rc = dbctx_init(&dc, fd, file_size, single_shot);
+    int rc = dbctx_init(&dc, fd, file_size, 0, single_shot);
     if (rc != 0) { close(fd); return rc; }
 
     /* Carry buffer: holds partial slot at a chunk boundary. */
@@ -663,10 +666,102 @@ static inline size_t od_varlen_rec_size(uint16_t klen, uint32_t vlen) {
     return (raw + 7) & ~(size_t)7;
 }
 
-int seg_scan_o_direct_varlen(const char *seg_path,
+/* Standalone resync search: opens its own read-only fd, entirely
+   independent of any live DbCtx/O_DIRECT scan state, so a failure here
+   leaves the caller's current scan context completely untouched and its
+   existing teardown path works unmodified. Reads a bounded window
+   starting at the 8-byte-aligned floor of desync_off and looks for the
+   next structurally valid, hash-verified record header via
+   seg_scan_varlen_resync(). Returns 0 and sets *out_resume_off on
+   success; 1 if the bounded window has no such record; -1 on I/O or
+   allocation failure. A flag==0 scan hit may treat the 1 result as the
+   ordinary sparse tail; every other desync must treat it as an
+   unrecoverable scan failure and must not delete or otherwise trust the
+   file beyond desync_off. */
+static int od_varlen_resync_find(const char *seg_path, off_t file_size,
+                                  size_t max_slot_size, off_t desync_off,
+                                  off_t *out_resume_off)
+{
+    off_t aligned_off = desync_off & ~(off_t)7;
+    if (aligned_off < 0) aligned_off = 0;
+    if (aligned_off >= file_size) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "od_varlen_resync_find: %s desync offset %lld at/past EOF (%lld)",
+                  seg_path, (long long)desync_off, (long long)file_size);
+        return -1;
+    }
+
+    size_t window = max_slot_size;
+    off_t remain = file_size - aligned_off;
+    if ((off_t)window > remain) window = (size_t)remain;
+    size_t read_cap = (max_slot_size > (size_t)remain - window)
+        ? (size_t)remain : window + max_slot_size;
+
+    int fd = open(seg_path, O_RDONLY);
+    if (fd < 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "od_varlen_resync_find: %s open failed: %s",
+                  seg_path, strerror(errno));
+        return -1;
+    }
+
+    uint8_t *buf = malloc(read_cap);
+    if (!buf) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "od_varlen_resync_find: %s OOM allocating %zu-byte resync buffer",
+                  seg_path, read_cap);
+        close(fd);
+        return -1;
+    }
+
+    size_t got_total = 0;
+    while (got_total < read_cap) {
+        ssize_t got = pread(fd, buf + got_total, read_cap - got_total,
+                             aligned_off + (off_t)got_total);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            LOG_ERROR(LOG_SUB_SLOTCASK,
+                      "od_varlen_resync_find: %s pread failed at %lld: %s",
+                      seg_path, (long long)(aligned_off + (off_t)got_total),
+                      strerror(errno));
+            free(buf);
+            close(fd);
+            return -1;
+        }
+        if (got == 0) break;
+        got_total += (size_t)got;
+    }
+    close(fd);
+
+    size_t next;
+    size_t search_from = (desync_off > aligned_off)
+        ? (size_t)(desync_off - aligned_off) : 0;
+    int found = (search_from < got_total) &&
+                seg_scan_varlen_resync(buf, got_total, search_from,
+                                       max_slot_size,
+                                       got_total - search_from < window
+                                           ? got_total - search_from : window,
+                                       &next);
+    free(buf);
+
+    if (!found) {
+        LOG_DEBUG(LOG_SUB_SLOTCASK,
+                  "od_varlen_resync_find: %s no valid record found within "
+                  "%zu-byte per-object window starting at %lld",
+                  seg_path, window, (long long)aligned_off);
+        return 1;
+    }
+
+    *out_resume_off = aligned_off + (off_t)next;
+    LOG_WARN(LOG_SUB_SLOTCASK,
+             "od_varlen_resync_find: %s resynced desync at %lld to %lld",
+             seg_path, (long long)desync_off, (long long)*out_resume_off);
+    return 0;
+}
+
+int seg_scan_o_direct_varlen(const char *seg_path, size_t max_slot_size,
                               od_record_cb cb, void *ctx)
 {
-    if (!seg_path || !cb) return -EINVAL;
+    if (!seg_path || max_slot_size < 32 || !cb) return -EINVAL;
 
     if (odirect_buf_size == 0) odirect_init_buf_size();
 
@@ -681,7 +776,7 @@ int seg_scan_o_direct_varlen(const char *seg_path,
     if (fd < 0) return -errno;
 
     DbCtx dc;
-    int rc = dbctx_init(&dc, fd, file_size, single_shot);
+    int rc = dbctx_init(&dc, fd, file_size, 0, single_shot);
     if (rc != 0) { close(fd); return rc; }
 
     size_t carry_cap = OD_VARLEN_CARRY_SIZE;
@@ -696,7 +791,8 @@ int seg_scan_o_direct_varlen(const char *seg_path,
         return -ENOMEM;
     }
     int carry_len = 0;
-    off_t base_off = 0; /* DIAGNOSTIC (temporary): file offset of dc.active chunk 0 */
+    off_t base_off = 0;
+    off_t resync_from = 0;
 
     pthread_t worker_tid = (pthread_t)0;
     if (!single_shot) {
@@ -715,7 +811,9 @@ int seg_scan_o_direct_varlen(const char *seg_path,
     }
 
     int ret = 0;
+    int padding_desync = 0;
 
+scan_top:
     for (;;) {
         ssize_t chunk_len = dc.active_len;
         if (chunk_len <= 0) {
@@ -728,16 +826,11 @@ int seg_scan_o_direct_varlen(const char *seg_path,
 
         /* Reassemble a record that straddled the previous chunk boundary. */
         if (carry_len > 0) {
-            /* DIAGNOSTIC (temporary): carry always holds the trailing bytes
-               of the stream ending exactly at base_off, so the record this
-               carry belongs to started at base_off - carry_len regardless
-               of how many earlier chunks contributed to it. */
-            off_t diag_rec_start = base_off - (off_t)carry_len;
+            off_t rec_start_off = base_off - (off_t)carry_len;
             /* Stage 1: ensure we have the 24-byte header in carry. */
             if (carry_len < 24) {
                 int need = 24 - carry_len;
                 if ((ssize_t)need > chunk_len) {
-                    /* Still not enough — stay in carry. */
                     size_t need_cap = (size_t)(carry_len + chunk_len);
                     if (need_cap > carry_cap) {
                         uint8_t *nc = realloc(carry, need_cap);
@@ -762,28 +855,18 @@ int seg_scan_o_direct_varlen(const char *seg_path,
             flag = carry[18];
             size_t rec_size = od_varlen_rec_size(klen, (uint32_t)vlen);
 
-            /* rec_size is derived from an on-disk, unvalidated vlen.
-               A corrupted vlen can make rec_size enormous; narrowing
-               it into `int` below would silently wrap and produce a
-               small or negative `need`, skipping the "need more data"
-               branch and passing a huge vlen straight to cb() against
-               the small carry buffer (CID 1696466). Reject anything
-               past the largest a legitimate segment record could be. */
-            if (rec_size > SLOTCASK_SEG_MAX_BYTES) {
-                /* DIAGNOSTIC (temporary): dump exactly what was decoded and
-                   where, to find why a legitimate stream produced this. */
-                fprintf(stderr,
-                        "[od_varlen_diag] %s: bogus header at file_off=%lld "
-                        "(chunk base_off=%lld carry_len_at_entry=%lld) "
-                        "klen=%u vlen=%u flag=%u rec_size=%zu chunk_len=%zd "
-                        "single_shot=%d\n",
-                        seg_path, (long long)diag_rec_start,
-                        (long long)base_off,
-                        (long long)(base_off - diag_rec_start),
-                        (unsigned)klen, (unsigned)vlen, (unsigned)flag,
-                        rec_size, chunk_len, single_shot);
-                ret = -EIO;
-                goto done;
+            /* flag==0 is sparse/pool-reuse padding, not a real record
+               start for this scanner. A flag outside 0/1/2, or a
+               rec_size (derived from an on-disk, unvalidated vlen) past
+               the largest legitimate record, likewise means this offset
+               isn't a real record start. Otherwise a reused-slot gap or
+               corrupted header could either narrow into a huge/negative
+               `need` below (CID 1696466) or walk `pos` through garbage.
+               Resync forward instead of aborting the whole scan. */
+            if (flag == 0 || flag > 2 || rec_size > max_slot_size) {
+                padding_desync = (flag == 0);
+                resync_from = rec_start_off;
+                goto do_resync;
             }
 
             int need = (int)rec_size - carry_len;
@@ -826,6 +909,12 @@ int seg_scan_o_direct_varlen(const char *seg_path,
             memcpy(&vlen, rec + 20, 4);
             size_t rec_size = od_varlen_rec_size(klen, (uint32_t)vlen);
 
+            if (flag == 0 || flag > 2 || rec_size > max_slot_size) {
+                padding_desync = (flag == 0);
+                resync_from = base_off + (off_t)pos;
+                goto do_resync;
+            }
+
             if (pos + rec_size > (size_t)chunk_len) {
                 /* Record straddles chunk boundary — save tail in carry. */
                 break;
@@ -852,7 +941,7 @@ int seg_scan_o_direct_varlen(const char *seg_path,
         }
 
 next_chunk:
-        base_off += chunk_len; /* DIAGNOSTIC (temporary) */
+        base_off += chunk_len;
         {
             ssize_t next = dbctx_swap(&dc);
             if (next < 0) { ret = (int)next; goto done; }
@@ -861,6 +950,74 @@ next_chunk:
                 break;
             }
         }
+    }
+
+    goto done;
+
+do_resync:
+    {
+        off_t resume_off;
+        int rrc = od_varlen_resync_find(seg_path, file_size, max_slot_size,
+                                        resync_from, &resume_off);
+        if (rrc != 0) {
+            /* A flag==0 header with no later real record is the normal
+               sparse tail; an I/O/allocation failure is still an error.
+               Non-padding desyncs are never silently truncated. */
+            ret = (rrc > 0 && padding_desync) ? 0 : -EIO;
+            dbctx_destroy(&dc, worker_tid);
+            free(carry);
+            close(fd);
+            return ret;
+        }
+
+        /* Old context confirmed no longer needed — safe to tear down now
+           that we know the rebuild has somewhere valid to resume from. */
+        dbctx_destroy(&dc, worker_tid);
+        close(fd);
+
+        /* `resume_off` is guaranteed only to be 8-byte aligned (record
+           alignment), not aligned to the device sector required by
+           O_DIRECT.  Restart the logical tail scan on a buffered fd; the
+           normal scan still uses od_open/O_DIRECT, and this bounded fallback
+           avoids turning every legitimate resync into EINVAL. */
+        fd = open(seg_path, O_RDONLY);
+        if (fd < 0) {
+            ret = -errno;
+            free(carry);
+            return ret;
+        }
+
+        single_shot = ((file_size - resume_off) <= (off_t)odirect_buf_size);
+        rc = dbctx_init(&dc, fd, file_size, resume_off, single_shot);
+        if (rc != 0) {
+            ret = rc;
+            close(fd);
+            free(carry);
+            return ret;
+        }
+
+        carry_len = 0;
+        base_off = resume_off;
+
+        if (!single_shot) {
+            int e2;
+            if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
+                e2 = errno;
+                free(dc.buf[0]); free(dc.buf[1]);
+                pthread_mutex_destroy(&dc.lock);
+                pthread_cond_destroy(&dc.prefetch_needed);
+                pthread_cond_destroy(&dc.prefetch_done);
+                close(fd);
+                free(carry);
+                return -e2;
+            }
+            dbctx_kickoff(&dc);
+        } else {
+            worker_tid = (pthread_t)0;
+        }
+
+        ret = 0;
+        goto scan_top;
     }
 
 done:
@@ -914,7 +1071,7 @@ int seg_scan_o_direct_match(const char *seg_path, int slot_size,
     if (fd < 0) return -errno;
 
     DbCtx dc;
-    int rc = dbctx_init(&dc, fd, file_size, single_shot);
+    int rc = dbctx_init(&dc, fd, file_size, 0, single_shot);
     if (rc != 0) { close(fd); return rc; }
 
     uint8_t *carry = malloc((size_t)slot_size);
@@ -2950,7 +3107,7 @@ int btree_leaf_scan_o_direct(const char *btree_path,
      * next chunk before parsing.  Same pattern as seg_scan_o_direct.
      */
     DbCtx dc;
-    int rc = dbctx_init(&dc, fd, file_size, 0);
+    int rc = dbctx_init(&dc, fd, file_size, 0, 0);
     if (rc != 0) { close(fd); return rc; }
 
     uint8_t *carry = malloc((size_t)page_sz);
