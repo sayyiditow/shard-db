@@ -77,7 +77,7 @@ char g_log_dir[PATH_MAX];
    callback on) reach it too. type: 1=ERROR 2=WARN 3=INFO 4=DEBUG 5=AUDIT
    6=SLOW. _Atomic: background threads can start logging before the
    registration call lands. */
-_Atomic(void (*)(int type, const char *msg, void *ud)) g_log_handler = NULL;
+_Atomic(void (*)(int type, const char *msg, void *ud)) g_log_handler = 0;
 void *_Atomic g_log_handler_ud = NULL;
 
 FILE *open_log_for_level(int level) {
