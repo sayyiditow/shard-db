@@ -228,6 +228,27 @@ ssize_t od_pread(int fd, void *buf, size_t len, off_t off)
     return pread(fd, buf, len, off);
 }
 
+/* Convert an already-open scan fd from unbuffered to buffered in place, so
+   a caller can pread at offsets that are only 8-byte (record) aligned, not
+   device-sector aligned.  Keeping the same fd for the whole scan pins the
+   file's inode — the path is never re-resolved, so a file swapped out from
+   under us cannot change what the scan reads.  Best-effort: on Linux F_SETFL
+   can clear O_DIRECT (a no-op when the fd is already buffered); on macOS
+   F_NOCACHE 0 re-enables caching (mirror of od_open's F_NOCACHE 1); other
+   platforms never set O_DIRECT at all. */
+static void od_disable_odirect(int fd)
+{
+#if defined(__linux__)
+    int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0 && (flags & O_DIRECT))
+        (void)fcntl(fd, F_SETFL, flags & ~O_DIRECT);
+#elif defined(__APPLE__)
+    (void)fcntl(fd, F_NOCACHE, 0);
+#else
+    (void)fd;
+#endif
+}
+
 void *od_alloc_buf(void)
 {
     if (odirect_buf_size == 0) odirect_init_buf_size();
@@ -666,19 +687,20 @@ static inline size_t od_varlen_rec_size(uint16_t klen, uint32_t vlen) {
     return (raw + 7) & ~(size_t)7;
 }
 
-/* Standalone resync search: opens its own read-only fd, entirely
-   independent of any live DbCtx/O_DIRECT scan state, so a failure here
-   leaves the caller's current scan context completely untouched and its
-   existing teardown path works unmodified. Reads a bounded window
-   starting at the 8-byte-aligned floor of desync_off and looks for the
-   next structurally valid, hash-verified record header via
-   seg_scan_varlen_resync(). Returns 0 and sets *out_resume_off on
-   success; 1 if the bounded window has no such record; -1 on I/O or
-   allocation failure. A flag==0 scan hit may treat the 1 result as the
-   ordinary sparse tail; every other desync must treat it as an
-   unrecoverable scan failure and must not delete or otherwise trust the
+/* Standalone resync search: reads through the caller's scan fd (which the
+   caller has made quiescent — the prefetch worker is joined — and buffered
+   via od_disable_odirect before calling), entirely independent of any live
+   DbCtx/O_DIRECT scan state, so a failure here leaves the caller's current
+   scan context completely untouched and its existing teardown path works
+   unmodified. Reads a bounded window starting at the 8-byte-aligned floor
+   of desync_off and looks for the next structurally valid, hash-verified
+   record header via seg_scan_varlen_resync(). Returns 0 and sets
+   *out_resume_off on success; 1 if the bounded window has no such record;
+   -1 on I/O or allocation failure. A flag==0 scan hit may treat the 1
+   result as the ordinary sparse tail; every other desync must treat it as
+   an unrecoverable scan failure and must not delete or otherwise trust the
    file beyond desync_off. */
-static int od_varlen_resync_find(const char *seg_path, off_t file_size,
+static int od_varlen_resync_find(int fd, const char *seg_path, off_t file_size,
                                   size_t max_slot_size, off_t desync_off,
                                   off_t *out_resume_off)
 {
@@ -697,19 +719,11 @@ static int od_varlen_resync_find(const char *seg_path, off_t file_size,
     size_t read_cap = (max_slot_size > (size_t)remain - window)
         ? (size_t)remain : window + max_slot_size;
 
-    int fd = open(seg_path, O_RDONLY);
-    if (fd < 0) {
-        LOG_ERROR(LOG_SUB_SLOTCASK, "od_varlen_resync_find: %s open failed: %s",
-                  seg_path, strerror(errno));
-        return -1;
-    }
-
     uint8_t *buf = malloc(read_cap);
     if (!buf) {
         LOG_ERROR(LOG_SUB_SLOTCASK,
                   "od_varlen_resync_find: %s OOM allocating %zu-byte resync buffer",
                   seg_path, read_cap);
-        close(fd);
         return -1;
     }
 
@@ -724,13 +738,11 @@ static int od_varlen_resync_find(const char *seg_path, off_t file_size,
                       seg_path, (long long)(aligned_off + (off_t)got_total),
                       strerror(errno));
             free(buf);
-            close(fd);
             return -1;
         }
         if (got == 0) break;
         got_total += (size_t)got;
     }
-    close(fd);
 
     size_t next;
     size_t search_from = (desync_off > aligned_off)
@@ -765,15 +777,22 @@ int seg_scan_o_direct_varlen(const char *seg_path, size_t max_slot_size,
 
     if (odirect_buf_size == 0) odirect_init_buf_size();
 
-    struct stat st;
-    if (stat(seg_path, &st) != 0) return -errno;
-    off_t file_size = st.st_size;
-    if (file_size == 0) return 0;
-
-    int single_shot = (file_size <= (off_t)odirect_buf_size);
-
+    /* Open first, then fstat the fd: seg_path is resolved exactly once per
+       scan, so the file that bounds the scan (file_size) is the same inode
+       the scan reads.  (CodeQL CWE-367: stat-then-open on the same path.) */
     int fd = od_open(seg_path);
     if (fd < 0) return -errno;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int e = errno;
+        close(fd);
+        return -e;
+    }
+    off_t file_size = st.st_size;
+    if (file_size == 0) { close(fd); return 0; }
+
+    int single_shot = (file_size <= (off_t)odirect_buf_size);
 
     DbCtx dc;
     int rc = dbctx_init(&dc, fd, file_size, 0, single_shot);
@@ -957,32 +976,32 @@ next_chunk:
 do_resync:
     {
         off_t resume_off;
-        int rrc = od_varlen_resync_find(seg_path, file_size, max_slot_size,
-                                        resync_from, &resume_off);
+
+        /* Tear the scan context down first so the fd is quiescent: joining
+           the prefetch worker guarantees no concurrent pread can touch it
+           while the resync probe and the restarted scan use it. */
+        dbctx_destroy(&dc, worker_tid);
+
+        /* `resume_off` (and the resync probe's own window reads) is
+           guaranteed only to be 8-byte aligned (record alignment), not
+           aligned to the device sector required by O_DIRECT.  Drop O_DIRECT
+           in place instead of closing and re-opening the path: the fd pins
+           this file's inode, so the path is never re-resolved and a file
+           swapped out from under us between the original open and here
+           cannot change what the scan reads.  The normal scan still uses
+           od_open/O_DIRECT; this bounded fallback avoids turning every
+           legitimate resync into EINVAL. */
+        od_disable_odirect(fd);
+
+        int rrc = od_varlen_resync_find(fd, seg_path, file_size,
+                                        max_slot_size, resync_from,
+                                        &resume_off);
         if (rrc != 0) {
             /* A flag==0 header with no later real record is the normal
                sparse tail; an I/O/allocation failure is still an error.
                Non-padding desyncs are never silently truncated. */
             ret = (rrc > 0 && padding_desync) ? 0 : -EIO;
-            dbctx_destroy(&dc, worker_tid);
-            free(carry);
             close(fd);
-            return ret;
-        }
-
-        /* Old context confirmed no longer needed — safe to tear down now
-           that we know the rebuild has somewhere valid to resume from. */
-        dbctx_destroy(&dc, worker_tid);
-        close(fd);
-
-        /* `resume_off` is guaranteed only to be 8-byte aligned (record
-           alignment), not aligned to the device sector required by
-           O_DIRECT.  Restart the logical tail scan on a buffered fd; the
-           normal scan still uses od_open/O_DIRECT, and this bounded fallback
-           avoids turning every legitimate resync into EINVAL. */
-        fd = open(seg_path, O_RDONLY);
-        if (fd < 0) {
-            ret = -errno;
             free(carry);
             return ret;
         }
