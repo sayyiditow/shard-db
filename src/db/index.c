@@ -3737,7 +3737,7 @@ static void *seg_scan_worker(void *arg) {
                  w->data_dir, (int)sr->sid, (unsigned)sr->fid);
         int rc;
         if (w->format == SLOTCASK_FORMAT_VARIABLE)
-            rc = seg_scan_o_direct_varlen(path, reindex_seg_cb, w);
+            rc = seg_scan_o_direct_varlen(path, (size_t)w->slot_size, reindex_seg_cb, w);
         else
             rc = seg_scan_o_direct(path, (int)w->slot_size, reindex_seg_cb, w);
         if (rc < 0) {

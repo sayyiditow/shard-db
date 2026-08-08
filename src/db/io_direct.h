@@ -108,12 +108,14 @@ int seg_scan_o_direct(const char *seg_path, int slot_size,
    are not at fixed stride.  Scans each record's 24-byte header to determine
    the padded record size, strides by that amount, and calls `cb` for every
    live record (flag == 1).  Max single-record carry buffer is 256 KB.
+   `max_slot_size` is the owning object's schema-derived maximum on-disk
+   record capacity (SlotcaskDb.slot_size); it is not the segment file cap.
 
    Returns:
     0    — success
    +1    — cb returned non-zero (early stop)
    -errno — I/O error */
-int seg_scan_o_direct_varlen(const char *seg_path,
+int seg_scan_o_direct_varlen(const char *seg_path, size_t max_slot_size,
                               od_record_cb cb, void *ctx);
 
 /* Same as seg_scan_o_direct, but the callback receives value bytes directly

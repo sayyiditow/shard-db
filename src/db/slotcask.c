@@ -31,6 +31,7 @@
 #include <time.h>
 #include <pthread.h>
 #include "io_direct.h"
+#include "seg_scan_varlen.h"
 
 /* Single source of truth for primary-key hashing — defined in util.c. We
    forward-declare it instead of pulling in types.h so slotcask stays
@@ -9229,7 +9230,10 @@ static int seg_stat_one(SlotcaskDb *db, int stream_id, uint32_t file_id,
     return 0;
 }
 
-/* Variable-length variant: walk records by reading headers sequentially. */
+/* Variable-length variant: walk records by reading headers sequentially.
+   Returns -1 (leaving the output counters unset) if the scan hits an
+   unrecoverable desync. The caller treats that as unknown stats and
+   preserves the file rather than deleting it as empty. */
 static int seg_stat_one_varlen(SlotcaskDb *db, int stream_id, uint32_t file_id,
                                uint32_t *out_live, uint32_t *out_total) {
     char path[PATH_MAX];
@@ -9242,16 +9246,36 @@ static int seg_stat_one_varlen(SlotcaskDb *db, int stream_id, uint32_t file_id,
     size_t off = 0;
 
     while (off + 24 <= file_size) {
-        const uint8_t *rec = h.map + off;
+        size_t rec_size;
+        uint8_t flag;
         uint16_t klen;
         uint32_t vlen;
-        uint8_t flag;
-        memcpy(&klen, rec + 16, 2);
-        memcpy(&vlen, rec + 20, 4);
-        flag = rec[18];
-        size_t rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
-        if (off + rec_size > file_size) break;
-        if (flag != 0) total++;
+        int ok = seg_scan_varlen_struct_ok(h.map, file_size, off,
+                                            db->slot_size, &rec_size,
+                                            &flag, &klen, &vlen);
+        if (ok && flag == 0) {
+            size_t next;
+            if (!seg_scan_varlen_resync(h.map, file_size, off,
+                                         db->slot_size, db->slot_size,
+                                         &next))
+                break; /* ordinary sparse tail */
+            off = next;
+            continue;
+        }
+        if (ok && flag != 0)
+            ok = seg_scan_varlen_hash_ok(h.map, off, klen);
+        if (!ok) {
+            size_t next;
+            if (!seg_scan_varlen_resync(h.map, file_size, off,
+                                         db->slot_size, db->slot_size,
+                                         &next)) {
+                segcache_release(&h);
+                return -1;
+            }
+            off = next;
+            continue;
+        }
+        total++;
         if (flag == 1) live++;
         off += rec_size;
     }
@@ -9483,6 +9507,7 @@ static int varlen_compact_cb(const uint8_t *rec, size_t vlen,
     kf_repoint_at_slot(&kh, kf_slot_idx, (uint8_t)c->stream_id,
                         (uint16_t)c->recipient_fid, target_off);
     kfcache_release(&kh);
+    durability_test_pause(c->db->data_dir, "compact-after-kf-repoint");
     return 0;
 }
 
@@ -9504,49 +9529,76 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
 
     size_t rmap_size = rh.map_size;
 
-    /* Walk recipient records to find free slots (flag != 1) with capacity.
-       Also collects the total number of records in the file for stats. */
+    /* Walk recipient records to find tombstone slots (flag == 2) with
+       capacity. Never add flag==0 padding or sparse tail bytes to the free
+       list: those bytes are not records and may contain a later record after
+       slot reuse. */
     uint32_t *free_offs = NULL;
     uint32_t *free_caps = NULL;
     size_t free_count = 0, free_cap = 0;
     size_t off = 0;
 
     while (off + 24 <= rmap_size) {
-        const uint8_t *rec = rh.map + off;
-        uint8_t flag = rec[18];
-        if (flag != 1) {
-            uint16_t klen;
-            uint32_t vlen;
-            memcpy(&klen, rec + 16, 2);
-            memcpy(&vlen, rec + 20, 4);
-            size_t rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
-            /* Only add as free if it's a complete record. */
-            if (off + rec_size <= rmap_size) {
-                if (free_count == free_cap) {
-                    size_t nc = free_cap ? free_cap * 2 : 256;
-                    uint32_t *old_o = free_offs;
-                    uint32_t *old_c = free_caps;
-                    uint32_t *t = realloc(free_offs, nc * sizeof(uint32_t));
-                    uint32_t *c = realloc(free_caps, nc * sizeof(uint32_t));
-                    if (!t) { free(old_o); free(c ? c : old_c); segcache_release(&rh); return -1; }
-                    if (!c) { free(t); free(old_c); segcache_release(&rh); return -1; }
-                    free_offs = t;
-                    free_caps = c;
-                    free_cap = nc;
-                }
-                free_offs[free_count] = (uint32_t)off;
-                free_caps[free_count] = (uint32_t)rec_size;
-                free_count++;
+        size_t rec_size;
+        uint8_t flag;
+        uint16_t klen;
+        uint32_t vlen;
+        int ok = seg_scan_varlen_struct_ok(rh.map, rmap_size, off,
+                                            db->slot_size, &rec_size,
+                                            &flag, &klen, &vlen);
+        if (!ok) {
+            size_t next;
+            if (!seg_scan_varlen_resync(rh.map, rmap_size, off,
+                                         db->slot_size, db->slot_size,
+                                         &next)) {
+                free(free_offs);
+                free(free_caps);
+                segcache_release(&rh);
+                return -1;
             }
-            off += rec_size;
-        } else {
-            uint16_t klen;
-            uint32_t vlen;
-            memcpy(&klen, rec + 16, 2);
-            memcpy(&vlen, rec + 20, 4);
-            size_t rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
-            off += rec_size;
+            off = next;
+            continue;
         }
+        if (flag == 0) {
+            size_t next;
+            if (!seg_scan_varlen_resync(rh.map, rmap_size, off,
+                                         db->slot_size, db->slot_size,
+                                         &next))
+                break; /* ordinary sparse tail */
+            off = next;
+            continue;
+        }
+        if (!seg_scan_varlen_hash_ok(rh.map, off, klen)) {
+            size_t next;
+            if (!seg_scan_varlen_resync(rh.map, rmap_size, off,
+                                         db->slot_size, db->slot_size,
+                                         &next)) {
+                free(free_offs);
+                free(free_caps);
+                segcache_release(&rh);
+                return -1;
+            }
+            off = next;
+            continue;
+        }
+        if (flag == 2) {
+            if (free_count == free_cap) {
+                size_t nc = free_cap ? free_cap * 2 : 256;
+                uint32_t *old_o = free_offs;
+                uint32_t *old_c = free_caps;
+                uint32_t *t = realloc(free_offs, nc * sizeof(uint32_t));
+                uint32_t *c = realloc(free_caps, nc * sizeof(uint32_t));
+                if (!t) { free(old_o); free(c ? c : old_c); segcache_release(&rh); return -1; }
+                if (!c) { free(t); free(old_c); segcache_release(&rh); return -1; }
+                free_offs = t;
+                free_caps = c;
+                free_cap = nc;
+            }
+            free_offs[free_count] = (uint32_t)off;
+            free_caps[free_count] = (uint32_t)rec_size;
+            free_count++;
+        }
+        off += rec_size;
     }
 
     VarlenCompactCtx ctx = {
@@ -9558,48 +9610,17 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
         .kf_lookup_failed = 0,
     };
 
-    /* Scan donor using the fixed O_DIRECT scanner with db->slot_size.
-       For varlen, this strides by slot_size, which is the fixed max-slot
-       size.  Most records are smaller, so we'll skip padding regions
-       (flag=0) just like the fixed format does.  Records are still at
-       variable offsets but the scanner doesn't need to care — it only
-       processes flag==1 records, which have their header set correctly
-       at their real offset.  The key insight: in varlen format, each
-       record occupies exactly its padded size, and flag=0 regions between
-       records don't exist (no fixed slot grid).  However, seg_scan_o_direct
-       uses slot_size stride which is wrong for varlen records that are
-       shorter than slot_size.  So we use a simpler mmap-based scan
-       instead for the donor. */
-    /* Donor: mmap walk of headers (not O_DIRECT — varlen records aren't
-       at fixed stride).  Since the donor will be unlinked after migration,
-       cache pollution is short-lived. */
+    /* Donor is read-only, so use the hardened VARLEN scanner. It validates
+       headers and resynchronizes across reused-slot zero-padding gaps. */
     {
-        SlotcaskSegHandle dh;
-        if (segcache_acquire(&dh, donor_path, 0, 0, 0) != 0) {
+        int drc = seg_scan_o_direct_varlen(donor_path, db->slot_size,
+                                           varlen_compact_cb, &ctx);
+        if (drc < 0) {
             free(free_offs);
             free(free_caps);
             segcache_release(&rh);
             return -1;
         }
-        size_t donor_size = dh.map_size;
-        size_t doff = 0;
-        while (doff + 24 <= donor_size) {
-            const uint8_t *rec = dh.map + doff;
-            uint8_t flag = rec[18];
-            if (flag == 1) {
-                uint32_t vlen;
-                memcpy(&vlen, rec + 20, 4);
-                if (varlen_compact_cb(rec, (size_t)vlen, rec, &ctx) != 0) {
-                    break;
-                }
-            }
-            uint16_t klen;
-            uint32_t vlen;
-            memcpy(&klen, rec + 16, 2);
-            memcpy(&vlen, rec + 20, 4);
-            doff += slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
-        }
-        segcache_release(&dh);
     }
 
     if (out_kf_failed) *out_kf_failed = ctx.kf_lookup_failed;
@@ -9891,8 +9912,16 @@ int slotcask_compact_segs(SlotcaskDb *db, int *out_dropped) {
    Daemon must NOT be running.  Walks every KF shard, reads each record
    from the old fixed-format segment, writes it to a new varlen segment,
    repoints the KF entry, then removes old segment files. */
-#define MIGRATE_STREAM_BASE 60000u
+#define MIGRATE_STREAM_BASE 48000u
+#define MIGRATE_STREAM_STRIDE 1000u
 #define COMPACT_STREAM_BASE 30000u   /* dest range for slotcask_compact; fits uint16_t, below MIGRATE_STREAM_BASE */
+
+_Static_assert(MIGRATE_STREAM_BASE +
+               (SLOTCASK_MAX_STREAMS - 1u) * MIGRATE_STREAM_STRIDE <= UINT16_MAX,
+               "migration stream file-id ranges must fit the uint16_t KF field");
+_Static_assert(COMPACT_STREAM_BASE +
+               (SLOTCASK_MAX_STREAMS - 1u) * MIGRATE_STREAM_STRIDE <= UINT16_MAX,
+               "compact stream file-id ranges must fit the uint16_t KF field");
 
 int slotcask_migrate_to_varlen(SlotcaskDb *db) {
     if (!db) return -1;
@@ -9922,7 +9951,7 @@ int slotcask_migrate_to_varlen(SlotcaskDb *db) {
     uint32_t dest_fid[SLOTCASK_MAX_STREAMS];
     size_t   dest_off[SLOTCASK_MAX_STREAMS];
     for (int s = 0; s < n_streams; s++) {
-        dest_fid[s] = MIGRATE_STREAM_BASE + (uint32_t)s * 1000u;
+        dest_fid[s] = MIGRATE_STREAM_BASE + (uint32_t)s * MIGRATE_STREAM_STRIDE;
         dest_off[s] = 0;
     }
 
@@ -10140,7 +10169,7 @@ static void *compact_stream_worker(void *arg_ptr) {
     SlotcaskDb *db = a->db;
     int sid = a->sid;
 
-    uint32_t dest_fid  = a->dest_base + (uint32_t)sid * 1000u;
+    uint32_t dest_fid  = a->dest_base + (uint32_t)sid * MIGRATE_STREAM_STRIDE;
     size_t   dest_off  = 0;
     uint8_t *dest_ptr  = NULL;
     size_t   dest_alloc = 0;
@@ -10166,7 +10195,7 @@ static void *compact_stream_worker(void *arg_ptr) {
             uint32_t off = kf[slot].offset;
 
             if (!a->smaps[sid].maps) continue;
-            uint32_t lo = a->src_min + (uint32_t)sid * 1000u;
+            uint32_t lo = a->src_min + (uint32_t)sid * MIGRATE_STREAM_STRIDE;
             if (fid < lo || fid - lo >= a->smaps[sid].count) continue;
             CmpSegMap *sm = &a->smaps[sid].maps[fid - lo];
             if (!sm->base || (size_t)off + 24 > sm->sz) continue;
@@ -10265,8 +10294,8 @@ int slotcask_compact(SlotcaskDb *db, SlotcaskTrimFn trim_fn, void *trim_ctx) {
         stream_dir_for(dir, db->data_dir, s);
         DIR *dh = opendir(dir);
         if (!dh) continue;
-        uint32_t lo = src_min + (uint32_t)s * 1000u;
-        uint32_t hi = lo + 1000u;
+        uint32_t lo = src_min + (uint32_t)s * MIGRATE_STREAM_STRIDE;
+        uint32_t hi = lo + MIGRATE_STREAM_STRIDE;
         uint32_t cnt = 0;
         struct dirent *de;
         while ((de = readdir(dh)) != NULL) {
@@ -10341,8 +10370,8 @@ int slotcask_compact(SlotcaskDb *db, SlotcaskTrimFn trim_fn, void *trim_ctx) {
         stream_dir_for(dir, db->data_dir, s);
         DIR *dh = opendir(dir);
         if (!dh) continue;
-        uint32_t lo = src_min + (uint32_t)s * 1000u;
-        uint32_t hi = lo + 1000u;
+        uint32_t lo = src_min + (uint32_t)s * MIGRATE_STREAM_STRIDE;
+        uint32_t hi = lo + MIGRATE_STREAM_STRIDE;
         struct dirent *de;
         while ((de = readdir(dh)) != NULL) {
             if (de->d_name[0] == '.') continue;

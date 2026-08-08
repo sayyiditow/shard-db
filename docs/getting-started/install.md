@@ -92,6 +92,15 @@ operators but is informational and not enforced in this release because
 earlier releases did not write `.version`. `./shard-db reindex` remains available
 for on-demand use.
 
+Independent of that `.version`-gated index rebuild, every startup with a
+non-empty `schema.conf` also sweeps every materialized object whose schema
+and on-disk stream sets agree for FIXED-format segments and converts them
+to VARIABLE in place (idempotent, matching the `migrate` JSON mode's
+semantics). This runs unconditionally, not just on a version change. A
+stream-count mismatch is logged and left untouched for the vacuum/rebuild
+path, because opening it with the lying schema could route new writes to
+the wrong stream set.
+
 Operators who upgraded from a pre-2026.07.1 build affected by kf
 corruption must run the 2026.07.1 release's `rebuild-kf` against a
 backup before upgrading past this release. This release removes

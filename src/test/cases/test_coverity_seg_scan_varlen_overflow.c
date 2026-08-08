@@ -104,7 +104,7 @@ static int test_coverity_seg_scan_varlen_overflow_run(void) {
                   "crafted file is the expected size");
 
     g_cb_calls = 0;
-    int rc = seg_scan_o_direct_varlen(path, capture_cb, NULL);
+    int rc = seg_scan_o_direct_varlen(path, 64, capture_cb, NULL);
 
     /* Pre-fix: rec_size (4294967304) truncates to int(8); with carry_len
        already at 24 by the time Stage 2 runs, need = 8 - 24 = -16 <= 0,
