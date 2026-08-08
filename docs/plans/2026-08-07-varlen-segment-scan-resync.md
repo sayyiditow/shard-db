@@ -803,12 +803,19 @@ static int od_varlen_resync_find(const char *seg_path, off_t file_size,
     }
 
     *out_resume_off = aligned_off + (off_t)next;
-    LOG_WARN(LOG_SUB_SLOTCASK,
-             "od_varlen_resync_find: %s resynced desync at %lld to %lld",
-             seg_path, (long long)desync_off, (long long)*out_resume_off);
     return 0;
 }
 ```
+
+Successful resyncs are deliberately silent — the WARN
+(`"od_varlen_resync_find: %s resynced desync at %lld to %lld"`) was
+removed after production showed it as per-resync log noise on every
+reused-slot gap. The `LOG_DEBUG` "no valid record found" line is
+retained for `LOG_LEVEL=4` debugging. The caller logs an
+`od_varlen_resync_find: %s unrecoverable desync at %lld ...` `LOG_ERROR`
+when this returns 1 for a non-padding desync (see 2e's `do_resync`
+block) — that is the only resync line that can appear in production
+logs.
 
 #### 2e. `seg_scan_o_direct_varlen` — full replacement
 
@@ -1237,6 +1244,12 @@ do_resync:
                sparse tail; an I/O/allocation failure is still an error.
                Non-padding desyncs are never silently truncated. */
             ret = (rrc > 0 && padding_desync) ? 0 : -EIO;
+            if (rrc > 0 && !padding_desync)
+                LOG_ERROR(LOG_SUB_SLOTCASK,
+                          "od_varlen_resync_find: %s unrecoverable desync at "
+                          "%lld: no valid record found within %zu-byte "
+                          "per-object window",
+                          seg_path, (long long)resync_from, max_slot_size);
             dbctx_destroy(&dc, worker_tid);
             free(carry);
             close(fd);

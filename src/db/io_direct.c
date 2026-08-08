@@ -764,9 +764,6 @@ static int od_varlen_resync_find(int fd, const char *seg_path, off_t file_size,
     }
 
     *out_resume_off = aligned_off + (off_t)next;
-    LOG_WARN(LOG_SUB_SLOTCASK,
-             "od_varlen_resync_find: %s resynced desync at %lld to %lld",
-             seg_path, (long long)desync_off, (long long)*out_resume_off);
     return 0;
 }
 
@@ -1001,6 +998,12 @@ do_resync:
                sparse tail; an I/O/allocation failure is still an error.
                Non-padding desyncs are never silently truncated. */
             ret = (rrc > 0 && padding_desync) ? 0 : -EIO;
+            if (rrc > 0 && !padding_desync)
+                LOG_ERROR(LOG_SUB_SLOTCASK,
+                          "od_varlen_resync_find: %s unrecoverable desync at "
+                          "%lld: no valid record found within %zu-byte "
+                          "per-object window",
+                          seg_path, (long long)resync_from, max_slot_size);
             close(fd);
             free(carry);
             return ret;
