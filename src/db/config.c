@@ -77,7 +77,7 @@ char g_log_dir[PATH_MAX];
    callback on) reach it too. type: 1=ERROR 2=WARN 3=INFO 4=DEBUG 5=AUDIT
    6=SLOW. _Atomic: background threads can start logging before the
    registration call lands. */
-_Atomic(void (*)(int type, const char *msg, void *ud)) g_log_handler = 0;
+_Atomic(log_handler_fn) g_log_handler = (log_handler_fn)0;
 void *_Atomic g_log_handler_ud = NULL;
 
 FILE *open_log_for_level(int level) {
@@ -207,7 +207,7 @@ int db_thread_create(pthread_t *tid, void *(*fn)(void *), void *arg) {
 void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
     if (level > g_log_level) return;
     int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
-    void (*handler)(int, const char *, void *) =
+    log_handler_fn handler =
         atomic_load_explicit(&g_log_handler, memory_order_acquire);
     const char *labels[] = {"", "ERROR", "WARN", "INFO", "DEBUG"};
     if (level < 1 || level > 4) level = LOG_LVL_INFO;
@@ -261,7 +261,7 @@ void log_msg_sub(int level, const char *subsystem, const char *fmt, ...) {
 
 void log_audit_sub(const char *subsystem, const char *fmt, ...) {
     int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
-    void (*handler)(int, const char *, void *) =
+    log_handler_fn handler =
         atomic_load_explicit(&g_log_handler, memory_order_acquire);
     const char *sub = subsystem ? subsystem : "unknown";
 
@@ -326,7 +326,7 @@ void log_slow_query(const char *mode, const char *dir,
        the drain thread; bypasses LOG_LEVEL because the SLOW_QUERY_MS
        threshold is the filter. */
     int _running = atomic_load_explicit(&g_log_running, memory_order_relaxed);
-    void (*handler)(int, const char *, void *) =
+    log_handler_fn handler =
         atomic_load_explicit(&g_log_handler, memory_order_acquire);
     time_t now = time(NULL);
     struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);

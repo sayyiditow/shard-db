@@ -436,7 +436,8 @@ extern _Thread_local uint32_t g_request_timeout_ms;
 extern char g_log_dir[PATH_MAX];
 
 /* Process-global log handler slot — see config.c for the full rationale. */
-extern _Atomic(void (*)(int type, const char *msg, void *ud)) g_log_handler;
+typedef void (*log_handler_fn)(int type, const char *msg, void *ud);
+extern _Atomic(log_handler_fn) g_log_handler;
 extern void *_Atomic g_log_handler_ud;
 
 /* Per-thread output stream — worker threads set this to their client socket FILE*.
