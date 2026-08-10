@@ -4,14 +4,12 @@ name: TSan (ThreadSanitizer)
 # Catches data races (one thread reading, another writing, no
 # synchronization) and lock-ordering deadlocks.
 #
-# Runs at --jobs 1 (not the ASan workflow's 2): TSan's shadow-memory
-# bookkeeping slows the daemon ~10-15x and roughly doubles memory
-# overhead versus ASan, and this shared/weak runner doesn't have room
-# for both that overhead and cross-test parallelism. --jobs 1 also
-# sidesteps two known full-suite-parallel-load-only flakes (a resource-
-# contention flake in test-binary-index and a test-harness port-picker
-# TOCTOU) that aren't sanitizer findings but would otherwise
-# intermittently redden this job for unrelated reasons.
+# Runs at --jobs 2: TSan's shadow-memory bookkeeping slows the daemon
+# ~10-15x and roughly doubles memory overhead versus ASan, so the outer
+# runner remains deliberately bounded on this shared/weak runner. This also
+# exercises the same bounded cross-test parallelism used by the other
+# workflows; resource-contention or test-harness flakes remain actionable
+# even when they are not sanitizer findings.
 #
 # Known, already-tracked findings are suppressed via .tsan.supp — see
 # that file for the full rationale on each. Suppressions are named and
@@ -40,7 +38,7 @@ jobs:
       BUILD_MODE: tsan
       TSAN_OPTIONS: "halt_on_error=0:second_deadlock_stack=1:print_stacktrace=1:report_signal_unsafe=0:report_atomic_races=0:suppressions=${{ github.workspace }}/.tsan.supp"
       # test-runner-parallel's own nested run-all spawns a --jobs 4
-      # sub-run internally, unrelated to the --jobs 1 outer setting below.
+      # sub-run internally, independent of the --jobs 2 outer setting below.
       # This runner is too weak for that nested width; narrow it to 2.
       SHARD_TEST_RUNNER_PARALLEL_JOBS: "2"
     steps:
@@ -50,7 +48,7 @@ jobs:
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
       - name: Run full C test suite under TSan
-        run: ./build/bin/shard-db-test run-all --jobs 1
+        run: ./build/bin/shard-db-test run-all --jobs 2
 
       - name: Fail if any TSan findings escaped
         run: |

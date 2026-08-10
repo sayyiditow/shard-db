@@ -28,7 +28,7 @@ jobs:
     env:
       BUILD_MODE: coverage
       # test-runner-parallel's own nested run-all spawns a --jobs 4
-      # sub-run internally, unrelated to the --jobs 1 outer setting below.
+      # sub-run internally, independent of the --jobs 2 outer setting below.
       # This runner is too weak for that nested width; narrow it to 2.
       SHARD_TEST_RUNNER_PARALLEL_JOBS: "2"
     steps:
@@ -45,12 +45,11 @@ jobs:
         # finishes well under timeout. -O0 keeps line attribution accurate.
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
-      - name: Run full C test suite (sequential)
-        # gcov counters aren't safe across forked/overlapping test cases.
-        # run-all now defaults to parallel (--jobs unset = nproc) since
-        # the parallel test runner landed, so --jobs 1 must be passed
-        # explicitly here to keep this step actually sequential.
-        run: ./build/bin/shard-db-test run-all --jobs 1
+      - name: Run full C test suite under coverage
+        # Exercise the bounded parallel runner used by the other workflows;
+        # --jobs 2 avoids full-nproc oversubscription on the shared runner.
+        # Coverage is collected only after all test workers have exited.
+        run: ./build/bin/shard-db-test run-all --jobs 2
 
       - name: Collect coverage
         run: |
