@@ -1,6 +1,6 @@
 {
   "name": "shard-db",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "description": "High-performance embedded database for Node.js (native N-API addon)",
   "main": "index.js",
   "types": "index.d.ts",
