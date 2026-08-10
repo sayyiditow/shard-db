@@ -200,6 +200,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_binary_index.c \
     src/test/cases/test_stats_prom.c \
     src/test/cases/test_parallel_index_integrity.c \
+    src/test/cases/test_parallel_cross_pool_nesting.c \
     src/test/cases/test_cli_shortcuts.c \
     src/test/cases/test_agg_neq_shortcut.c \
     src/test/cases/test_agg_indexed_groupby.c \
