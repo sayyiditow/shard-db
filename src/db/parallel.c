@@ -20,17 +20,17 @@
  *         site, but cooperates with other concurrent callers via the pool.
  *
  * Nesting: parallel_for is structurally safe under nesting (a parallel_for
- * task can itself call parallel_for) AND under concurrent callers. While
- * the caller waits for its task group to finish, it doesn't passively
- * block — it pops tasks from the global queue and runs them itself
- * (work-stealing). Every blocked thread is therefore an active drain on
- * the queue, so the queue can never stall: there's always at least one
- * runner per pending task. This holds regardless of pool_size vs
- * outer-task-count, so callers don't need any guard like `n < pool_size`.
- *
- * The fallback when the queue is momentarily empty but our group still has
- * tasks in flight (running on other workers) is a 1ms timed cond_wait on
- * the group's cv, which naturally re-checks the queue on wake-up.
+ * task can itself call parallel_for, or parallel_for_io, or vice versa)
+ * AND under concurrent callers. A thread that is already executing as a
+ * worker of either pool — CPU or IO — runs a nested call's tasks
+ * serially, inline, on itself rather than submitting them to the shared
+ * queue. This trades away fan-out parallelism for that nested call, but
+ * guarantees forward progress no matter how many nested callers pile up
+ * concurrently: none of them ever compete for the fixed-size worker
+ * pool's own capacity, so the pool can never be starved by its own
+ * nested callers. This holds for same-pool nesting and cross-pool
+ * nesting alike (both check the same t_in_pool_worker flag), so callers
+ * don't need any guard like `n < pool_size`.
  */
 
 #include "types.h"
@@ -113,60 +113,28 @@ int parallel_threads(void) {
     return n > 0 ? (int)n : 4;
 }
 
-/* Per-thread flag: 1 while a pool worker is running a task, 0 otherwise.
-   parallel_for uses this to decide between two wait strategies:
-     - Top-level callers (TCP handler, CLI) → plain cond_wait. Pool
-       workers grab and run tasks in parallel; the caller doesn't
-       compete for them, which gives full pool parallelism on the
-       common single-level case.
-     - Nested callers (already inside a pool task) → help-drain. The
-       caller pops tasks from the queue and runs them itself while
-       waiting, so the pool can never starve when (concurrent_outer ×
-       inner_count) >= pool_size. This is the deadlock-prevention path. */
-static __thread int t_in_pool_task = 0;
-/* Same flag for IO pool workers — used by parallel_for_io's help-drain
-   to detect nested IO calls and drain the IO queue while waiting. */
-static __thread int t_in_io_task = 0;
+/* Per-thread flag: 1 while the calling thread is executing as a worker
+   for EITHER pool (CPU or IO), 0 otherwise. Shared across both pools so
+   a cross-pool nested call (an IO-pool worker calling parallel_for(), or
+   a CPU-pool worker calling parallel_for_io()) is recognised as nested
+   too, not just a call back into the caller's own pool — a thread-local
+   scoped to just one pool previously let cross-pool nesting fall through
+   to the top-level enqueue-and-block path, which starves under enough
+   concurrent nested callers (see docs/plans/2026-08-10-parallel-pool-
+   cross-pool-nesting-starvation.md). parallel_for/parallel_for_io use
+   this flag to decide between two execution strategies:
+     - Top-level callers (any thread not currently a worker of either
+       pool) → enqueue and block on the pool's own dedicated workers,
+       for full pool parallelism on the common single-level case.
+     - Nested callers (already executing as a worker of either pool) →
+       run the n sub-tasks serially, inline, on the calling thread. */
+static __thread int t_in_pool_worker = 0;
 /* Read lock-free at parallel_pool_init/shutdown entry, parallel_pool_size,
    and parallel_for; written under g_q_lock at parallel_pool_shutdown and
    lock-free at parallel_pool_init. _Atomic gives correct cross-thread
    visibility regardless of which writer-lock was held. (Was volatile —
    volatile is for memory-mapped IO, not thread synchronization.) */
 static _Atomic int g_pool_running = 0;
-
-/* Pop one task from the head of the global queue if non-empty. Returns 1
-   on success (caller owns *out and must run it), 0 if queue is empty.
-   Used by both pool_worker and the help-drain loop in parallel_for. */
-static int try_pop_task(PoolTask *out) {
-    pthread_mutex_lock(&g_q_lock);
-    if (g_q_count == 0) {
-        pthread_mutex_unlock(&g_q_lock);
-        return 0;
-    }
-    *out = g_queue[g_q_head];
-    g_q_head = (g_q_head + 1) % POOL_QUEUE_CAP;
-    g_q_count--;
-    pthread_cond_signal(&g_q_not_full);
-    pthread_mutex_unlock(&g_q_lock);
-    return 1;
-}
-
-/* Pop one IO task from the head of the IO queue if non-empty. Same pattern
-   as try_pop_task but operates on g_io_queue[] / g_io_q_lock. Used by
-   io_pool_worker and the help-drain loop in parallel_for_io. */
-static int try_pop_io_task(PoolTask *out) {
-    pthread_mutex_lock(&g_io_q_lock);
-    if (g_io_q_count == 0) {
-        pthread_mutex_unlock(&g_io_q_lock);
-        return 0;
-    }
-    *out = g_io_queue[g_io_q_head];
-    g_io_q_head = (g_io_q_head + 1) % IO_QUEUE_CAP;
-    g_io_q_count--;
-    pthread_cond_signal(&g_io_q_not_full);
-    pthread_mutex_unlock(&g_io_q_lock);
-    return 1;
-}
 
 /* Run a task, then atomically decrement its group's remaining counter.
    Broadcast the group's cv when remaining hits zero so the parallel_for
@@ -207,9 +175,9 @@ static void *pool_worker(void *arg) {
         pthread_cond_signal(&g_q_not_full);
         pthread_mutex_unlock(&g_q_lock);
 
-        t_in_pool_task = 1;
+        t_in_pool_worker = 1;
         run_task_finish(t);
-        t_in_pool_task = 0;
+        t_in_pool_worker = 0;
     }
 }
 
@@ -255,12 +223,17 @@ static void enqueue_locked(PoolTask t) {
 
 void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
     if (n <= 0) return;
-    if (!g_pool_running || n == 1 || t_in_pool_task) {
-        /* Pool unavailable (e.g. CLI mode), single task, or already inside a
-           pool task. The last case prevents help-drain from picking up tasks
-           that re-enter a shared data structure (e.g. a flush buffer) whose
-           "done" signal only the current thread can issue — the same
-           self-deadlock that t_in_io_task guards against in parallel_for_io. */
+    if (!g_pool_running || n == 1 || t_in_pool_worker) {
+        /* Pool unavailable (e.g. CLI mode), single task, or the calling
+           thread is already a worker of either pool (same-pool or
+           cross-pool nesting). Run inline rather than enqueue: enqueuing
+           would let this call re-enter a shared data structure (e.g. a
+           flush buffer) whose "done" signal only the current thread can
+           issue — the same self-deadlock parallel_for_io's inline path
+           guards against — and, for cross-pool nesting specifically,
+           prevents the starvation this flag exists to close (see
+           docs/plans/2026-08-10-parallel-pool-cross-pool-nesting-
+           starvation.md). */
         for (int i = 0; i < n; i++) fn((char *)args + (size_t)i * stride);
         return;
     }
@@ -304,47 +277,15 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
         pthread_mutex_unlock(&g_q_lock);
     }
 
-    if (t_in_pool_task) {
-        /* Nested call (we're already running inside a pool task). If we
-           cond_wait passively, all pool workers could end up blocked on
-           their own outer tasks waiting for inner tasks that no one is
-           draining → deadlock. Help-drain instead: while our group has
-           tasks remaining, pop and run any task from the global queue.
-           When the queue is momentarily empty but our group still has
-           tasks running on other workers, fall back to a 1ms timed
-           cond_wait that re-checks both queue and group state on wake. */
-        while (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0) {
-            PoolTask t;
-            if (try_pop_task(&t)) {
-                run_task_finish(t);
-                continue;
-            }
-            pthread_mutex_lock(&group.mu);
-            /* coverity[wait_not_in_locked_loop] outer while-loop at line
-               above already re-checks `remaining` after wake, which is
-               what Coverity's rule asks for. Looping cond_timedwait
-               directly here would be wrong — we want a wake to fall back
-               out so try_pop_task gets re-tried (the queue may have
-               filled meanwhile), not to keep sleeping. */
-            if (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0) {
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_nsec += 1000000;  /* 1ms re-check cadence */
-                if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
-                pthread_cond_timedwait(&group.cv, &group.mu, &ts);
-            }
-            pthread_mutex_unlock(&group.mu);
-        }
-    } else {
-        /* Top-level call (TCP handler / CLI thread). Plain cond_wait
-           lets pool workers run the tasks in parallel without the
-           caller competing for them — the common case where the pool
-           is otherwise idle. */
-        pthread_mutex_lock(&group.mu);
-        while (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0)
-            pthread_cond_wait(&group.cv, &group.mu);
-        pthread_mutex_unlock(&group.mu);
-    }
+    /* The entry guard above already returned via the inline path whenever
+       the calling thread is a worker of either pool, so control only
+       reaches here for a genuine top-level caller (never a nested one).
+       Plain cond_wait lets pool workers run the tasks in parallel without
+       the caller competing for them. */
+    pthread_mutex_lock(&group.mu);
+    while (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0)
+        pthread_cond_wait(&group.cv, &group.mu);
+    pthread_mutex_unlock(&group.mu);
 
     /* All tasks complete (remaining==0) but the last worker may still
        be between fetch_sub and the broadcast unlock — wait for finishing
@@ -359,8 +300,9 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
 }
 
 /* IO pool worker — runs tasks from the IO queue. Same pattern as
-   pool_worker but sets t_in_io_task instead of t_in_pool_task so
-   parallel_for_io can detect nested calls and help-drain. */
+   pool_worker; sets the shared t_in_pool_worker flag so parallel_for and
+   parallel_for_io both recognise this thread as a pool worker for
+   nesting purposes, regardless of which pool it belongs to. */
 static void *io_pool_worker(void *arg) {
     (void)arg;
     g_db = g_shard_db_instance;
@@ -374,9 +316,9 @@ static void *io_pool_worker(void *arg) {
         g_io_q_count--;
         pthread_cond_signal(&g_io_q_not_full);
         pthread_mutex_unlock(&g_io_q_lock);
-        t_in_io_task = 1;
+        t_in_pool_worker = 1;
         run_task_finish(t);
-        t_in_io_task = 0;
+        t_in_pool_worker = 0;
     }
 }
 
@@ -408,13 +350,16 @@ int parallel_io_pool_size(void) { return g_io_nthreads; }
 
 void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
     if (n <= 0) return;
-    if (!g_io_running || n == 1 || t_in_io_task) {
-        /* Run inline when already inside an IO task. The help-drain loop
-           would otherwise pop arbitrary IO tasks (e.g. btree shard walkers)
-           that can re-enter a BatchFetchBuf whose flusher is this very
-           thread, causing pthread_cond_wait to deadlock on a broadcast that
-           only the flusher thread can issue. Inline execution avoids the
-           re-entry entirely at the cost of serialising the nested fetch. */
+    if (!g_io_running || n == 1 || t_in_pool_worker) {
+        /* Run inline when the calling thread is already a worker of
+           either pool (same-pool or cross-pool nesting). Enqueuing
+           instead would let this call re-enter a shared data structure
+           (e.g. a BatchFetchBuf) whose flusher is this very thread,
+           causing pthread_cond_wait to deadlock on a broadcast only the
+           flusher thread can issue — and, for cross-pool nesting
+           specifically, is exactly the starvation this flag exists to
+           close (see docs/plans/2026-08-10-parallel-pool-cross-pool-
+           nesting-starvation.md). */
         for (int i = 0; i < n; i++) fn((char *)args + (size_t)i * stride);
         return;
     }
@@ -450,34 +395,14 @@ void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
         pthread_mutex_unlock(&g_io_q_lock);
     }
 
-    if (t_in_io_task) {
-        /* Nested IO call — help-drain the IO queue while waiting so the
-           pool can never starve when (concurrent IO callers × inner tasks)
-           >= IO pool size. Same pattern as parallel_for's help-drain. */
-        while (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0) {
-            PoolTask t;
-            if (try_pop_io_task(&t)) {
-                run_task_finish(t);
-                continue;
-            }
-            pthread_mutex_lock(&group.mu);
-            if (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0) {
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_nsec += 1000000;
-                if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
-                pthread_cond_timedwait(&group.cv, &group.mu, &ts);
-            }
-            pthread_mutex_unlock(&group.mu);
-        }
-    } else {
-        /* Top-level or CPU-pool caller — plain cond_wait. IO pool has
-           its own workers to drain the queue. */
-        pthread_mutex_lock(&group.mu);
-        while (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0)
-            pthread_cond_wait(&group.cv, &group.mu);
-        pthread_mutex_unlock(&group.mu);
-    }
+    /* The entry guard above already returned via the inline path whenever
+       the calling thread is a worker of either pool, so control only
+       reaches here for a genuine top-level caller. Plain cond_wait — the
+       IO pool has its own workers to drain the queue. */
+    pthread_mutex_lock(&group.mu);
+    while (atomic_load_explicit(&group.remaining, memory_order_acquire) > 0)
+        pthread_cond_wait(&group.cv, &group.mu);
+    pthread_mutex_unlock(&group.mu);
 
     while (atomic_load_explicit(&group.finishing, memory_order_acquire) > 0)
         sched_yield();
