@@ -758,3 +758,37 @@ int test_env_test_hook_clear(TestEnv *env) {
     if (rep.kind != TEST_HOOK_ACK) return -1;
     return 0;
 }
+
+void tu_join_signal_init(TuJoinSignal *js) {
+    pthread_mutex_init(&js->lock, NULL);
+    pthread_cond_init(&js->cond, NULL);
+    js->done = 0;
+}
+
+void tu_join_signal_destroy(TuJoinSignal *js) {
+    pthread_mutex_destroy(&js->lock);
+    pthread_cond_destroy(&js->cond);
+}
+
+void tu_join_signal_mark_done(TuJoinSignal *js) {
+    pthread_mutex_lock(&js->lock);
+    js->done = 1;
+    pthread_cond_broadcast(&js->cond);
+    pthread_mutex_unlock(&js->lock);
+}
+
+int tu_timed_join(pthread_t tid, TuJoinSignal *js, int seconds) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += seconds;
+
+    pthread_mutex_lock(&js->lock);
+    int rc = 0;
+    while (!js->done) {
+        rc = pthread_cond_timedwait(&js->cond, &js->lock, &deadline);
+        if (rc != 0) break;
+    }
+    pthread_mutex_unlock(&js->lock);
+    if (rc != 0) return rc;
+    return pthread_join(tid, NULL);
+}

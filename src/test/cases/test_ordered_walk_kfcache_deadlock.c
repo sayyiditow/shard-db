@@ -4,9 +4,6 @@
  * lock and blocks on the matching index-shard bt_cache write lock. On the
  * unfixed path, releasing the reader makes it block on the kf-shard read
  * lock, completing the AB-BA cycle. */
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 #include "test_runner.h"
 #include "test_assert.h"
 #include "fixtures.h"
@@ -64,6 +61,7 @@ typedef struct {
     int single_write;
     char *response;
     int rc;
+    TuJoinSignal js;
 } QueryArgs;
 
 static void *query_thread_main(void *arg) {
@@ -73,7 +71,7 @@ static void *query_thread_main(void *arg) {
     g_db = a->db;
     size_t out_len = 0;
     FILE *out = open_memstream(&a->response, &out_len);
-    if (!out) { a->rc = -1; return NULL; }
+    if (!out) { a->rc = -1; tu_join_signal_mark_done(&a->js); return NULL; }
     g_out = out;
     if (a->role == 1) {
         a->rc = cmd_find(db_root, a->object,
@@ -93,14 +91,8 @@ static void *query_thread_main(void *arg) {
     fflush(out);
     fclose(out);
     g_out = NULL;
+    tu_join_signal_mark_done(&a->js);
     return NULL;
-}
-
-static int timed_join(pthread_t tid, int seconds) {
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += seconds;
-    return pthread_timedjoin_np(tid, NULL, &deadline);
 }
 
 static int request_ok(ShardDb *db, const char *request, char **response) {
@@ -226,6 +218,7 @@ static int run_ordered_walk_deadlock(int single_write) {
     QueryArgs reader = {
         .db = db, .dir = dir, .object = object, .role = 1
     };
+    tu_join_signal_init(&reader.js);
     pthread_t reader_tid;
     ASSERT_EQ_INT(pthread_create(&reader_tid, NULL, query_thread_main, &reader),
                   0, "start ordered reader");
@@ -251,6 +244,7 @@ static int run_ordered_walk_deadlock(int single_write) {
         .db = db, .dir = dir, .object = object, .writer_key = writer_key,
         .role = 2, .single_write = single_write
     };
+    tu_join_signal_init(&writer.js);
     pthread_t writer_tid;
     ASSERT_EQ_INT(pthread_create(&writer_tid, NULL, query_thread_main, &writer),
                   0, "start indexed writer");
@@ -273,8 +267,8 @@ static int run_ordered_walk_deadlock(int single_write) {
     pthread_cond_broadcast(&sync.cond);
     pthread_mutex_unlock(&sync.lock);
 
-    int reader_join = timed_join(reader_tid, JOIN_TIMEOUT_SEC);
-    int writer_join = timed_join(writer_tid, JOIN_TIMEOUT_SEC);
+    int reader_join = tu_timed_join(reader_tid, &reader.js, JOIN_TIMEOUT_SEC);
+    int writer_join = tu_timed_join(writer_tid, &writer.js, JOIN_TIMEOUT_SEC);
     if (reader_join != 0 || writer_join != 0) {
         TAP_DIAG("# reader still blocked in read_record_ref: %s\n",
                  reader_join == 0 ? "no" : strerror(reader_join));
@@ -319,6 +313,8 @@ static int run_ordered_walk_deadlock(int single_write) {
     free(writer.response);
     order_walk_test_set_pause_hook(NULL, NULL);
     race_sync_destroy(&sync);
+    tu_join_signal_destroy(&reader.js);
+    tu_join_signal_destroy(&writer.js);
 
 cleanup:
     free(response);
