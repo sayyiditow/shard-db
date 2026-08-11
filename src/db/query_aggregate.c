@@ -595,7 +595,9 @@ static void topn_finalize_run(TopNWalkCtx *c) {
 }
 
 static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
-                        const uint8_t *hash16, void *ctx_v) {
+                        const uint8_t *hash16,
+                        BtOrderedWalkHandle *wh, void *ctx_v) {
+    (void)wh;
     TopNWalkCtx *c = (TopNWalkCtx *)ctx_v;
 
     if (query_deadline_tick(c->dl, &c->dl_counter)) return -1;

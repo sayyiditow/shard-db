@@ -61,6 +61,17 @@ Each indexed field is sharded into `index_splits_for(splits)` btree files (`<obj
 
 This was the central reason for the per-shard layout. Pre-2026.05.1, a single `<field>.idx` file meant `bulk_build` (which truncates and rewrites the whole file) raced against in-flight readers holding an mmap of intermediate state. Per-file rwlocks give writers and readers proper isolation, and the parallel fan-out turns indexed lookups into N-way concurrent btree probes for free.
 
+### Ordered index-walk lock rule
+
+`btree_idx_walk_ordered` holds the `bt_cache` read locks for its open shard
+iterators while it invokes callbacks. A callback that needs the underlying
+record must call `read_record_ref_try` through its `BtOrderedWalkHandle`; if
+the kfcache read would block, it releases the iterators, performs the normal
+blocking fetch, and lets the walk reopen after the delivered entry. Calling
+`read_record_ref` directly from an ordered-walk callback recreates the
+`bt_cache rdlock → kfcache rdlock` inverse of the write path's
+`kfcache wrlock → bt_cache wrlock` order.
+
 ## Writer preference on file-cache rwlocks (2026.07.x+)
 
 `bt_cache`, `kfcache`, `segcache`, and the bitmap cache initialize their

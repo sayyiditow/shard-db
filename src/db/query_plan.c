@@ -2532,11 +2532,17 @@ void cmd_explain(const char *db_root, const char *object, const char *criteria_j
 /* Counting callback for btree cardinality estimation.  Returns -1 once n
    exceeds cap so btree_idx_walk_ordered stops early — O(min(K, cap)). */
 typedef struct { size_t n; size_t cap; } CardCountCtx;
-static int card_count_cb(const char *v, size_t vl, const uint8_t h[16], void *ctx) {
+static int card_count_range_cb(const char *v, size_t vl, const uint8_t h[16], void *ctx) {
     (void)v; (void)vl; (void)h;
     CardCountCtx *c = (CardCountCtx *)ctx;
     c->n++;
     return (c->n > c->cap) ? -1 : 0;
+}
+
+static int card_count_cb(const char *v, size_t vl, const uint8_t h[16],
+                         BtOrderedWalkHandle *wh, void *ctx) {
+    (void)wh;
+    return card_count_range_cb(v, vl, h, ctx);
 }
 
 CardEst card_est_leaf(const char *db_root, const char *object,
@@ -2715,7 +2721,7 @@ CardEst card_est_leaf(const char *db_root, const char *object,
                 btree_range(tp,
                             (const char *)trigrams[gi], 3,
                             (const char *)trigrams[gi], 3,
-                            card_count_cb, &cctx);
+                            card_count_range_cb, &cctx);
                 if (cctx.n > cap) break;   /* already saturated */
             }
             size_t gram_count = cctx.n;

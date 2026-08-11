@@ -213,6 +213,9 @@ typedef struct {
     atomic_int *release;
 } BtTestHoldRdlockArgs;
 void *btree_test_hold_rdlock(void *arg);
+
+/* Fail the next btree_range_iter_open for the selected index shard. */
+void btree_test_fail_next_range_open_shard(int shard);
 #endif
 
 /* Streaming bulk build — same output as btree_bulk_build but accepts entries
@@ -281,5 +284,51 @@ void bt_cache_init(int cap);
 void bt_cache_shutdown(void);
 void btree_cache_invalidate(const char *path);
 void btree_mutation_locks_shutdown(void);
+
+/* --- Globally-ordered range-set walker ---
+   Unified k-way merge across an explicit set of btree file ranges.  Used by
+   the ordinary-index adapter (btree_idx_walk_ordered) and the composite-OP_IN
+   adapter (find_via_composite_prefix) so both share one cursor/heap/resume
+   implementation. */
+
+/* Opaque handle passed to bt_ordered_result_cb. A callback that is about
+   to take a lock it cannot safely hold alongside the walk's per-shard
+   bt_cache rdlocks must call btree_ordered_walk_release_for_blocking(h)
+   FIRST — this closes every currently-open per-shard BtRangeIter
+   (releasing all bt_cache rdlocks the walk holds), after which it is safe
+   to make the blocking call.  The callback must not return a value
+   indicating "yield again" for the SAME entry after calling this. */
+typedef struct BtOrderedWalkHandle BtOrderedWalkHandle;
+
+typedef struct {
+    const char *path;
+    const char *min_val;
+    size_t min_len;
+    int min_exclusive;
+    const char *max_val;
+    size_t max_len;
+    int max_exclusive;
+    int tie_id;
+} BtOrderedRangeSpec;
+
+typedef int (*bt_ordered_result_cb)(const char *value, size_t vlen,
+                                    const uint8_t hash[BT_HASH_SIZE],
+                                    BtOrderedWalkHandle *handle,
+                                    void *ctx);
+
+void btree_ordered_walk_release_for_blocking(BtOrderedWalkHandle *handle);
+
+/* Walk every range in `ranges` (array of `range_count` specs) with a
+   globally-ordered k-way merge.  desc=1 reverses direction.  The range
+   specifications and all pointed-to path/bound bytes are borrowed,
+   immutable, and valid until the synchronous call returns.  A bound pointer
+   may be NULL only when its length is zero.  Callbacks may release iterator
+   locks through the handle before a blocking nested fetch; the walk
+   reopens and resumes after the last delivered (value,hash) pair. */
+void btree_walk_ordered_ranges(const BtOrderedRangeSpec *ranges,
+                               size_t range_count,
+                               int desc,
+                               bt_ordered_result_cb cb,
+                               void *ctx);
 
 #endif /* BTREE_H */

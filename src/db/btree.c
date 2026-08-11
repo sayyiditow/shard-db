@@ -394,6 +394,28 @@ static int bt_test_take_publish_failure(int stage) {
         &g_bt_test_publish_fail_stage, &expected, 0,
         memory_order_acq_rel, memory_order_acquire);
 }
+
+static _Atomic int g_bt_test_range_open_fail_shard = -1;
+
+void btree_test_fail_next_range_open_shard(int shard) {
+    atomic_store_explicit(&g_bt_test_range_open_fail_shard, shard,
+                          memory_order_release);
+}
+
+static int bt_test_take_range_open_failure(const char *path) {
+    int wanted = atomic_load_explicit(&g_bt_test_range_open_fail_shard,
+                                      memory_order_acquire);
+    if (wanted < 0) return 0;
+    char suffix[16];
+    snprintf(suffix, sizeof(suffix), "/%03x.idx", wanted);
+    size_t path_len = strlen(path), suffix_len = strlen(suffix);
+    if (path_len < suffix_len ||
+        memcmp(path + path_len - suffix_len, suffix, suffix_len) != 0)
+        return 0;
+    return atomic_compare_exchange_strong_explicit(
+        &g_bt_test_range_open_fail_shard, &wanted, -1,
+        memory_order_acq_rel, memory_order_acquire);
+}
 #endif
 
 bt_publish_result btree_bulk_merge_publish_result(void) {
@@ -2633,6 +2655,12 @@ BtRangeIter *btree_range_iter_open(const char *path,
                                    const char *min_val, size_t min_len, int min_exclusive,
                                    const char *max_val, size_t max_len, int max_exclusive,
                                    int desc) {
+#ifdef TEST_BUILD
+    if (bt_test_take_range_open_failure(path)) {
+        errno = EIO;
+        return NULL;
+    }
+#endif
     BtRangeIter *it = calloc(1, sizeof(*it));
     if (!it) {
         LOG_ERROR(LOG_SUB_BTREE, "btree_range_iter_open %s: calloc(BtRangeIter) failed", path);
@@ -3632,4 +3660,203 @@ done:
         errno = saved_errno;
     }
     return rc;
+}
+
+/* --- Globally-ordered range-set walker ---
+   K-way merge across an explicit set of btree file ranges.  This is the
+   single authoritative implementation of ordered cursor merge, release/reopen,
+   resume suppression, and failed-reopen retirement.  Two thin adapters call
+   this: btree_idx_walk_ordered (ordinary index walks) and the composite
+   OP_IN branch of find_via_composite_prefix. */
+
+typedef struct {
+    BtRangeIter *iter;
+    char    value[BT_MAX_VAL_LEN];
+    size_t  vlen;
+    uint8_t hash[BT_HASH_SIZE];
+    int     has_entry;
+    int     tie_id;       /* caller-supplied tie-breaker (shard id or IN index) */
+} OrderedRangeCursor;
+
+typedef struct {
+    char    val[BT_MAX_VAL_LEN];
+    size_t  len;
+    uint8_t hash[BT_HASH_SIZE];
+    int     have;
+    int     done;
+} OrderedRangeResume;
+
+struct BtOrderedWalkHandle {
+    BtRangeIter ***slots;
+    int           n;
+    int           released;
+};
+
+void btree_ordered_walk_release_for_blocking(BtOrderedWalkHandle *h) {
+    if (!h || h->released) return;
+    for (int s = 0; s < h->n; s++) {
+        if (*h->slots[s]) {
+            btree_range_iter_close(*h->slots[s]);
+            *h->slots[s] = NULL;
+        }
+    }
+    h->released = 1;
+}
+
+static int or_cmp_asc(const OrderedRangeCursor *a, const OrderedRangeCursor *b) {
+    size_t m = a->vlen < b->vlen ? a->vlen : b->vlen;
+    int r = memcmp(a->value, b->value, m);
+    if (r != 0) return r;
+    if (a->vlen != b->vlen) return a->vlen < b->vlen ? -1 : 1;
+    r = memcmp(a->hash, b->hash, BT_HASH_SIZE);
+    if (r != 0) return r;
+    if (a->tie_id == b->tie_id) return 0;
+    return a->tie_id < b->tie_id ? -1 : 1;
+}
+
+static void or_pull(OrderedRangeCursor *c) {
+    if (!c->iter) { c->has_entry = 0; return; }
+    const char *v;
+    size_t vl;
+    const uint8_t *h;
+    if (btree_range_iter_next(c->iter, &v, &vl, &h)) {
+        c->vlen = vl > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : vl;
+        memcpy(c->value, v, c->vlen);
+        memcpy(c->hash, h, BT_HASH_SIZE);
+        c->has_entry = 1;
+    } else {
+        c->has_entry = 0;
+    }
+}
+
+static inline int or_merge_cmp(int a, int b, const OrderedRangeCursor *cursors, int desc) {
+    int r = or_cmp_asc(&cursors[a], &cursors[b]);
+    return desc ? -r : r;
+}
+
+static inline void or_merge_swap(int *heap, int i, int j) {
+    int t = heap[i]; heap[i] = heap[j]; heap[j] = t;
+}
+
+static void or_merge_sift_down(int *heap, int n, int i,
+                               const OrderedRangeCursor *cursors, int desc) {
+    for (;;) {
+        int l = 2 * i + 1, r = 2 * i + 2, best = i;
+        if (l < n && or_merge_cmp(heap[l], heap[best], cursors, desc) < 0) best = l;
+        if (r < n && or_merge_cmp(heap[r], heap[best], cursors, desc) < 0) best = r;
+        if (best == i) return;
+        or_merge_swap(heap, i, best);
+        i = best;
+    }
+}
+
+void btree_walk_ordered_ranges(const BtOrderedRangeSpec *ranges,
+                               size_t range_count,
+                               int desc,
+                               bt_ordered_result_cb cb,
+                               void *ctx) {
+    if (!ranges || !cb || range_count == 0 || range_count > INT_MAX) return;
+
+    int n = (int)range_count;
+    OrderedRangeCursor *cursors = calloc((size_t)n, sizeof(OrderedRangeCursor));
+    int *heap = calloc((size_t)n, sizeof(int));
+    BtRangeIter ***slots = malloc((size_t)n * sizeof(BtRangeIter **));
+    OrderedRangeResume *resume = calloc((size_t)n, sizeof(OrderedRangeResume));
+    if (!cursors || !heap || !slots || !resume) {
+        free(cursors); free(heap); free(slots); free(resume);
+        return;
+    }
+    for (int s = 0; s < n; s++) slots[s] = &cursors[s].iter;
+    BtOrderedWalkHandle h = { .slots = slots, .n = n, .released = 0 };
+
+    for (;;) {
+        int nh = 0;
+        h.released = 0;
+        for (int s = 0; s < n; s++) {
+            cursors[s].iter = NULL;
+            cursors[s].has_entry = 0;
+            if (resume[s].done) continue;
+
+            const BtOrderedRangeSpec *r = &ranges[s];
+            const char *open_lo = r->min_val;
+            size_t open_lo_len = r->min_len;
+            int open_lo_excl = r->min_exclusive;
+            const char *open_hi = r->max_val;
+            size_t open_hi_len = r->max_len;
+            int open_hi_excl = r->max_exclusive;
+            if (resume[s].have) {
+                if (desc) { open_hi = resume[s].val; open_hi_len = resume[s].len; open_hi_excl = 0; }
+                else      { open_lo = resume[s].val; open_lo_len = resume[s].len; open_lo_excl = 0; }
+            }
+            cursors[s].tie_id = r->tie_id;
+            cursors[s].iter = btree_range_iter_open(r->path,
+                                                    open_lo, open_lo_len, open_lo_excl,
+                                                    open_hi, open_hi_len, open_hi_excl,
+                                                    desc);
+            if (!cursors[s].iter) {
+                resume[s].done = 1;
+                continue;
+            }
+            or_pull(&cursors[s]);
+            if (cursors[s].has_entry) heap[nh++] = s;
+        }
+        for (int i = nh / 2 - 1; i >= 0; i--)
+            or_merge_sift_down(heap, nh, i, cursors, desc);
+
+        while (nh > 0) {
+            int sid = heap[0];
+            OrderedRangeCursor *bc = &cursors[sid];
+            if (resume[sid].have && bc->vlen == resume[sid].len &&
+                memcmp(bc->value, resume[sid].val, resume[sid].len) == 0) {
+                int hc = memcmp(bc->hash, resume[sid].hash, BT_HASH_SIZE);
+                int already_delivered = desc ? (hc >= 0) : (hc <= 0);
+                if (already_delivered) {
+                    or_pull(bc);
+                    if (bc->has_entry) or_merge_sift_down(heap, nh, 0, cursors, desc);
+                    else {
+                        resume[sid].done = 1;
+                        heap[0] = heap[--nh];
+                        if (nh > 0)
+                            or_merge_sift_down(heap, nh, 0, cursors, desc);
+                    }
+                    continue;
+                }
+            }
+
+            int rc = cb(bc->value, bc->vlen, bc->hash, &h, ctx);
+            if (rc < 0) {
+                for (int s = 0; s < n; s++)
+                    if (cursors[s].iter) btree_range_iter_close(cursors[s].iter);
+                free(cursors); free(heap); free(slots);
+                free(resume);
+                return;
+            }
+
+            resume[sid].len = bc->vlen > sizeof(resume[sid].val)
+                                ? sizeof(resume[sid].val) : bc->vlen;
+            memcpy(resume[sid].val, bc->value, resume[sid].len);
+            memcpy(resume[sid].hash, bc->hash, BT_HASH_SIZE);
+            resume[sid].have = 1;
+
+            if (h.released) break;
+
+            int had_iter = (bc->iter != NULL);
+            or_pull(bc);
+            if (bc->has_entry) {
+                or_merge_sift_down(heap, nh, 0, cursors, desc);
+            } else {
+                if (had_iter) resume[sid].done = 1;
+                heap[0] = heap[--nh];
+                if (nh > 0) or_merge_sift_down(heap, nh, 0, cursors, desc);
+            }
+        }
+        if (!h.released) break;
+    }
+
+    for (int s = 0; s < n; s++)
+        if (cursors[s].iter) btree_range_iter_close(cursors[s].iter);
+    free(cursors);
+    free(heap);
+    free(slots);
+    free(resume);
 }

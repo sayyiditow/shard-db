@@ -125,6 +125,26 @@ Selectivity rank for intersect ordering: `eq < starts_with < between < in < rang
 
 ## Cost
 
+`btree_walk_ordered_ranges` owns the k-way streaming merge across an explicit
+set of btree file ranges. `btree_idx_walk_ordered` adapts ordinary per-shard
+index walks to it, while composite `IN` queries adapt one range per
+`(IN value, index shard)` pair. Its callback receives an opaque
+`BtOrderedWalkHandle`; callbacks that fetch records release *every* open
+iterator through that handle before any blocking kfcache fetch. On release,
+the walk records a per-range resume point — **every** cursor that has delivered
+at least one row continuously tracks its own last successful `(value, hash)`,
+not only the cursor that triggers the release — and stops draining the rest
+of that round's heap immediately. All iterators then reopen fresh on the next
+round, each from its own resume point (or its pristine bound if it never
+advanced).
+A failed reopen (e.g. disk I/O error) clears the cursor's in-memory
+`has_entry` flag and retires that cursor for the remainder of the walk, so a
+stale pre-release buffered head is never reused and the cursor cannot reappear
+behind the global delivery order after a later release.
+These invariants together keep global `(value, hash)` delivery order correct
+across a release/reopen boundary even though several shards' iterators were
+closed and reopened concurrently with in-flight kfcache contention.
+
 Indexed lookups on 1 M records stay in the 1–3 ms band across most of the 38 operators. That's mostly:
 
 - B+ tree descent: O(log N) page loads, hitting the warm `bt_cache` after first use.

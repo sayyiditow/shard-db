@@ -1623,8 +1623,41 @@ typedef struct {
     pthread_mutex_t lock;          /* guards printed/skip_remaining in batch path */
 } CompositePrefixCtx;
 
+#ifdef TEST_BUILD
+typedef void (*order_walk_test_pause_fn)(void *ctx);
+static order_walk_test_pause_fn g_order_walk_pause_fn = NULL;
+static void *g_order_walk_pause_ctx = NULL;
+static size_t g_order_walk_pause_skip = 0;
+
+void order_walk_test_set_pause_hook_after(order_walk_test_pause_fn fn,
+                                          void *ctx,
+                                          size_t callbacks_to_skip) {
+    g_order_walk_pause_fn = fn;
+    g_order_walk_pause_ctx = ctx;
+    g_order_walk_pause_skip = callbacks_to_skip;
+}
+
+void order_walk_test_set_pause_hook(order_walk_test_pause_fn fn, void *ctx) {
+    order_walk_test_set_pause_hook_after(fn, ctx, 0);
+}
+
+static void order_walk_test_maybe_pause(void) {
+    if (!g_order_walk_pause_fn) return;
+    if (g_order_walk_pause_skip > 0) {
+        g_order_walk_pause_skip--;
+        return;
+    }
+    order_walk_test_pause_fn fn = g_order_walk_pause_fn;
+    void *ctx = g_order_walk_pause_ctx;
+    g_order_walk_pause_fn = NULL;
+    g_order_walk_pause_ctx = NULL;
+    fn(ctx);
+}
+#endif
+
 static int composite_prefix_cb(const char *val, size_t vlen,
-                                const uint8_t *hash16, void *ctx) {
+                                const uint8_t *hash16,
+                                BtOrderedWalkHandle *wh, void *ctx) {
 #ifdef TEST_BUILD
     extern long g_order_walk_scanned;
     g_order_walk_scanned++;
@@ -1635,9 +1668,18 @@ static int composite_prefix_cb(const char *val, size_t vlen,
     if (query_deadline_tick(c->dl, &c->dl_counter)) return -1;
     if (c->printed >= c->limit) return -1;
 
+#ifdef TEST_BUILD
+    order_walk_test_maybe_pause();
+#endif
+
     /* Fetch the record by hash16. */
     RecordRef rr;
-    if (read_record_ref(c->db_root, c->object, c->sch, hash16, &rr) != 0) return 0;
+    int rc = read_record_ref_try(c->db_root, c->object, c->sch, hash16, &rr);
+    if (rc == 2) {
+        btree_ordered_walk_release_for_blocking(wh);
+        rc = read_record_ref(c->db_root, c->object, c->sch, hash16, &rr) != 0 ? 1 : 0;
+    }
+    if (rc != 0) return 0;
     const uint8_t *key_start = rr.key;
     const uint8_t *raw       = rr.val;
     uint32_t       value_len = (uint32_t)rr.vlen;
@@ -1791,59 +1833,16 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
     return done ? -1 : 0;
 }
 
-/* K-way merge cursor for composite prefix walks.
- * Replicates the per-shard merge from index.c but supports multiple
- * (lo,hi) range pairs — one per IN value — in a single heap. */
+/* Query-owned path and encoded-bound storage for one composite IN range.
+ * Iterator, heap, resume, and release/reopen state live exclusively behind
+ * btree_walk_ordered_ranges. */
 typedef struct {
-    BtRangeIter *iter;
-    char    value[BT_MAX_VAL_LEN];
-    size_t  vlen;
-    uint8_t hash[BT_HASH_SIZE];
-    int     has_entry;
-    int     stream_id;  /* which IN value this cursor belongs to */
-} CompMergeCursor;
-
-static int comp_cursor_cmp(const CompMergeCursor *a, const CompMergeCursor *b) {
-    size_t m = a->vlen < b->vlen ? a->vlen : b->vlen;
-    int r = memcmp(a->value, b->value, m);
-    if (r != 0) return r;
-    if (a->vlen != b->vlen) return a->vlen < b->vlen ? -1 : 1;
-    r = memcmp(a->hash, b->hash, BT_HASH_SIZE);
-    if (r != 0) return r;
-    return a->stream_id - b->stream_id;
-}
-
-static void comp_cursor_pull(CompMergeCursor *c) {
-    const char *v; size_t vl; const uint8_t *h;
-    if (btree_range_iter_next(c->iter, &v, &vl, &h)) {
-        c->vlen = vl > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : vl;
-        memcpy(c->value, v, c->vlen);
-        memcpy(c->hash, h, BT_HASH_SIZE);
-        c->has_entry = 1;
-    } else {
-        c->has_entry = 0;
-    }
-}
-
-static void comp_merge_sift_down(int *heap, int n, int i,
-                                 const CompMergeCursor *cursors, int desc) {
-    for (;;) {
-        int l = 2*i+1, r = 2*i+2, best = i;
-        if (l < n) {
-            int d = desc ? -comp_cursor_cmp(&cursors[heap[l]], &cursors[heap[best]])
-                         : comp_cursor_cmp(&cursors[heap[l]], &cursors[heap[best]]);
-            if (d < 0) best = l;
-        }
-        if (r < n) {
-            int d = desc ? -comp_cursor_cmp(&cursors[heap[r]], &cursors[heap[best]])
-                         : comp_cursor_cmp(&cursors[heap[r]], &cursors[heap[best]]);
-            if (d < 0) best = r;
-        }
-        if (best == i) return;
-        int t = heap[i]; heap[i] = heap[best]; heap[best] = t;
-        i = best;
-    }
-}
+    char    path[PATH_MAX];
+    uint8_t lo[1024 + 8];
+    size_t  lo_len;
+    uint8_t hi[1024 + 8];
+    size_t  hi_len;
+} CompositeRangeStorage;
 
 /* D1 executor entry point.  seed is the equality leaf on the prefix field
    (e.g. by="alice"); order_by is the sort field (e.g. "time").
@@ -1873,13 +1872,19 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
     if (seed->op == OP_IN && seed->in_count > 0) {
         int nv = seed->in_count;
         int ns = index_splits_for(sch->splits);
-        CompMergeCursor *cursors = calloc((size_t)(ns * nv), sizeof(CompMergeCursor));
-        int *heap = calloc((size_t)(ns * nv), sizeof(int));
-        if (!cursors || !heap) { free(cursors); free(heap); return 0; }
+        int total = ns * nv;
+        BtOrderedRangeSpec *ranges = calloc((size_t)total, sizeof(*ranges));
+        CompositeRangeStorage *range_storage =
+            calloc((size_t)total, sizeof(*range_storage));
+        if (!ranges || !range_storage) {
+            free(ranges);
+            free(range_storage);
+            return 0;
+        }
 
         const TypedField *seed_tf = resolve_idx_field(fs ? fs->ts : NULL, seed->field);
 
-        int nh = 0, ci = 0;
+        int ci = 0;
         for (int iv = 0; iv < nv; iv++) {
             uint8_t lo[1024 + 8]; size_t len_lo = 0;
             encode_criterion_value(seed_tf, seed->in_values[iv],
@@ -1942,23 +1947,25 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
             }
 
             for (int s = 0; s < ns; s++) {
-                char ip[PATH_MAX];
-                build_idx_path(ip, sizeof(ip), db_root, object, composite_field, s);
-                cursors[ci].iter = btree_range_iter_open(ip,
-                                     (const char *)lo, len_lo, min_excl,
-                                     (const char *)hi, len_hi, max_excl,
-                                     order_desc);
-                cursors[ci].stream_id = iv;
-                if (cursors[ci].iter) comp_cursor_pull(&cursors[ci]);
-                if (cursors[ci].has_entry) heap[nh++] = ci;
+                CompositeRangeStorage *storage = &range_storage[ci];
+                build_idx_path(storage->path, sizeof(storage->path),
+                               db_root, object, composite_field, s);
+                memcpy(storage->lo, lo, len_lo);
+                storage->lo_len = len_lo;
+                memcpy(storage->hi, hi, len_hi);
+                storage->hi_len = len_hi;
+
+                ranges[ci].path = storage->path;
+                ranges[ci].min_val = (const char *)storage->lo;
+                ranges[ci].min_len = storage->lo_len;
+                ranges[ci].min_exclusive = min_excl;
+                ranges[ci].max_val = (const char *)storage->hi;
+                ranges[ci].max_len = storage->hi_len;
+                ranges[ci].max_exclusive = max_excl;
+                ranges[ci].tie_id = iv;
                 ci++;
             }
         }
-
-        int total_cursors = ci;
-
-        for (int i = nh/2-1; i >= 0; i--)
-            comp_merge_sift_down(heap, nh, i, cursors, order_desc);
 
         CompositePrefixCtx ctx;
         memset(&ctx, 0, sizeof(ctx));
@@ -1971,22 +1978,12 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
         ctx.dl = dl; ctx.dl_counter = 0; ctx.parent_out = g_out;
         pthread_mutex_init(&ctx.lock, NULL);
 
-        while (nh > 0) {
-            CompMergeCursor *bc = &cursors[heap[0]];
-            if (composite_prefix_cb(bc->value, bc->vlen, bc->hash, &ctx) < 0) break;
-            comp_cursor_pull(bc);
-            if (bc->has_entry) {
-                comp_merge_sift_down(heap, nh, 0, cursors, order_desc);
-            } else {
-                heap[0] = heap[--nh];
-                if (nh > 0) comp_merge_sift_down(heap, nh, 0, cursors, order_desc);
-            }
-        }
+        btree_walk_ordered_ranges(ranges, (size_t)ci, order_desc,
+                                  composite_prefix_cb, &ctx);
 
         pthread_mutex_destroy(&ctx.lock);
-        for (int i = 0; i < total_cursors; i++)
-            if (cursors[i].iter) btree_range_iter_close(cursors[i].iter);
-        free(cursors); free(heap);
+        free(ranges);
+        free(range_storage);
         return ctx.printed;
     }
 
@@ -2265,7 +2262,8 @@ void order_walk_scanned_reset_for_test(void) { g_order_walk_scanned = 0; }
 #endif
 
 static int order_index_walk_cb(const char *val, size_t vlen,
-                                const uint8_t *hash16, void *ctx_ptr) {
+                                const uint8_t *hash16,
+                                BtOrderedWalkHandle *wh, void *ctx_ptr) {
 #ifdef TEST_BUILD
     g_order_walk_scanned++;
 #endif
@@ -2275,9 +2273,18 @@ static int order_index_walk_cb(const char *val, size_t vlen,
     if (query_deadline_tick(c->dl, &c->dl_counter)) return -1;
     if (c->printed >= c->limit) return -1;
 
+#ifdef TEST_BUILD
+    order_walk_test_maybe_pause();
+#endif
+
     /* Fetch the record by hash16. */
     RecordRef rr;
-    if (read_record_ref(c->db_root, c->object, c->sch, hash16, &rr) != 0) return 0;
+    int rc = read_record_ref_try(c->db_root, c->object, c->sch, hash16, &rr);
+    if (rc == 2) {
+        btree_ordered_walk_release_for_blocking(wh);
+        rc = read_record_ref(c->db_root, c->object, c->sch, hash16, &rr) != 0 ? 1 : 0;
+    }
+    if (rc != 0) return 0;
     const uint8_t *key_start = rr.key;
     const uint8_t *raw       = rr.val;
     uint32_t       value_len = (uint32_t)rr.vlen;
@@ -5634,7 +5641,8 @@ typedef struct {
 } CursorFindCtx;
 
 static int cursor_find_cb(const char *val, size_t vlen,
-                          const uint8_t *hash16, void *ctx) {
+                          const uint8_t *hash16,
+                          BtOrderedWalkHandle *wh, void *ctx) {
 #ifdef TEST_BUILD
     g_order_walk_scanned++;
 #endif
@@ -5695,7 +5703,12 @@ static int cursor_find_cb(const char *val, size_t vlen,
 
     /* Storage-version-agnostic fetch via the dispatch helper. */
     RecordRef rr;
-    if (read_record_ref(c->db_root, c->object, c->sch, hash16, &rr) != 0) return 0;
+    int rc = read_record_ref_try(c->db_root, c->object, c->sch, hash16, &rr);
+    if (rc == 2) {
+        btree_ordered_walk_release_for_blocking(wh);
+        rc = read_record_ref(c->db_root, c->object, c->sch, hash16, &rr) != 0 ? 1 : 0;
+    }
+    if (rc != 0) return 0;
     const uint8_t *key_start = rr.key;
     const uint8_t *raw       = rr.val;
     uint32_t       value_len = (uint32_t)rr.vlen;
@@ -6391,7 +6404,7 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
     cc.parent_out      = g_out;
 
     for (int i = 0; i < out_n; i++) {
-        if (cursor_find_cb("", 0, out[i].hash, &cc) < 0) break;
+        if (cursor_find_cb("", 0, out[i].hash, NULL, &cc) < 0) break;
     }
 
     free(heap);
@@ -7208,7 +7221,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                 for (int i = 0; i < n_kept; i++) {
                     if (cursor_find_cb((const char *)sp_rows[i].sort_key,
                                        sp_rows[i].sort_key_len,
-                                       sp_rows[i].hash, &cc) < 0) break;
+                                       sp_rows[i].hash, NULL, &cc) < 0) break;
                 }
                 OUT(dict_fmt ? "}" : "]");
                 if (cc.printed >= limit && cc.last_value_str
@@ -7781,7 +7794,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                     cc.parent_out      = g_out;
 
                     for (int i = 0; i < n_kept; i++) {
-                        if (cursor_find_cb("", 0, rows[i].hash, &cc) < 0) break;
+                        if (cursor_find_cb("", 0, rows[i].hash, NULL, &cc) < 0) break;
                     }
 
                     free(rows);
