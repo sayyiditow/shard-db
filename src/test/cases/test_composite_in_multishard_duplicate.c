@@ -9,9 +9,6 @@
  * IN-seed match that triggers contention, and a third (F=3) on the other
  * shard that becomes the resume floor; F=1 and F=2 are expected to be
  * delivered twice. */
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 #include "test_runner.h"
 #include "test_assert.h"
 #include "fixtures.h"
@@ -68,6 +65,7 @@ typedef struct {
     int role; /* 1 = OP_IN ordered find, 2 = indexed write */
     char *response;
     int rc;
+    TuJoinSignal js;
 } QueryArgs;
 
 static void *query_thread_main(void *arg) {
@@ -77,7 +75,7 @@ static void *query_thread_main(void *arg) {
     g_db = a->db;
     size_t out_len = 0;
     FILE *out = open_memstream(&a->response, &out_len);
-    if (!out) { a->rc = -1; return NULL; }
+    if (!out) { a->rc = -1; tu_join_signal_mark_done(&a->js); return NULL; }
     g_out = out;
     if (a->role == 1) {
         a->rc = cmd_find(db_root, a->object,
@@ -93,14 +91,8 @@ static void *query_thread_main(void *arg) {
     fflush(out);
     fclose(out);
     g_out = NULL;
+    tu_join_signal_mark_done(&a->js);
     return NULL;
-}
-
-static int timed_join(pthread_t tid, int seconds) {
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += seconds;
-    return pthread_timedjoin_np(tid, NULL, &deadline);
 }
 
 static int request_ok(ShardDb *db, const char *request, char **response) {
@@ -284,6 +276,7 @@ static int test_composite_in_multishard_duplicate_run(void) {
     order_walk_test_set_pause_hook_after(dup_pause, &sync, 2);
 
     QueryArgs reader = { .db = db, .dir = dir, .object = object, .role = 1 };
+    tu_join_signal_init(&reader.js);
     pthread_t reader_tid;
     ASSERT_EQ_INT(pthread_create(&reader_tid, NULL, query_thread_main, &reader),
                   0, "start OP_IN ordered reader");
@@ -309,6 +302,7 @@ static int test_composite_in_multishard_duplicate_run(void) {
     QueryArgs writer = {
         .db = db, .dir = dir, .object = object, .writer_key = writer_key, .role = 2
     };
+    tu_join_signal_init(&writer.js);
     pthread_t writer_tid;
     ASSERT_EQ_INT(pthread_create(&writer_tid, NULL, query_thread_main, &writer),
                   0, "start indexed writer");
@@ -325,8 +319,8 @@ static int test_composite_in_multishard_duplicate_run(void) {
     pthread_cond_broadcast(&sync.cond);
     pthread_mutex_unlock(&sync.lock);
 
-    int reader_join = timed_join(reader_tid, JOIN_TIMEOUT_SEC);
-    int writer_join = timed_join(writer_tid, JOIN_TIMEOUT_SEC);
+    int reader_join = tu_timed_join(reader_tid, &reader.js, JOIN_TIMEOUT_SEC);
+    int writer_join = tu_timed_join(writer_tid, &writer.js, JOIN_TIMEOUT_SEC);
     if (reader_join != 0 || writer_join != 0) {
         ASSERT_TRUE(0, "OP_IN walk and indexed writer finish before timeout");
         fflush(NULL);
@@ -359,6 +353,8 @@ static int test_composite_in_multishard_duplicate_run(void) {
     order_walk_test_set_pause_hook(NULL, NULL);
     btree_test_fail_next_range_open_shard(-1);
     race_sync_destroy(&sync);
+    tu_join_signal_destroy(&reader.js);
+    tu_join_signal_destroy(&writer.js);
 
 cleanup:
     free(response);
@@ -458,6 +454,7 @@ static int test_composite_in_multishard_duplicate_failed_reopen_run(void) {
     order_walk_test_set_pause_hook_after(dup_pause, &sync, 2);
 
     QueryArgs reader = { .db = db, .dir = dir, .object = object, .role = 1 };
+    tu_join_signal_init(&reader.js);
     pthread_t reader_tid;
     ASSERT_EQ_INT(pthread_create(&reader_tid, NULL, query_thread_main, &reader),
                   0, "start OP_IN ordered reader");
@@ -485,6 +482,7 @@ static int test_composite_in_multishard_duplicate_failed_reopen_run(void) {
     QueryArgs writer = {
         .db = db, .dir = dir, .object = object, .writer_key = writer_key, .role = 2
     };
+    tu_join_signal_init(&writer.js);
     pthread_t writer_tid;
     ASSERT_EQ_INT(pthread_create(&writer_tid, NULL, query_thread_main, &writer),
                   0, "start indexed writer");
@@ -501,8 +499,8 @@ static int test_composite_in_multishard_duplicate_failed_reopen_run(void) {
     pthread_cond_broadcast(&sync.cond);
     pthread_mutex_unlock(&sync.lock);
 
-    int reader_join = timed_join(reader_tid, JOIN_TIMEOUT_SEC);
-    int writer_join = timed_join(writer_tid, JOIN_TIMEOUT_SEC);
+    int reader_join = tu_timed_join(reader_tid, &reader.js, JOIN_TIMEOUT_SEC);
+    int writer_join = tu_timed_join(writer_tid, &writer.js, JOIN_TIMEOUT_SEC);
     if (reader_join != 0 || writer_join != 0) {
         ASSERT_TRUE(0, "OP_IN walk and indexed writer finish before timeout");
         fflush(NULL);
@@ -535,6 +533,8 @@ static int test_composite_in_multishard_duplicate_failed_reopen_run(void) {
     order_walk_test_set_pause_hook(NULL, NULL);
     btree_test_fail_next_range_open_shard(-1);
     race_sync_destroy(&sync);
+    tu_join_signal_destroy(&reader.js);
+    tu_join_signal_destroy(&writer.js);
 
 cleanup:
     free(response);

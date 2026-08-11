@@ -5,6 +5,7 @@
  */
 #ifndef TEST_FIXTURES_H
 #define TEST_FIXTURES_H
+#include <pthread.h>
 #include <sys/types.h>
 #include "../db/shard_db.h"
 
@@ -77,5 +78,25 @@ ShardDb *test_get_process_db(void);
 const char *test_get_process_db_root(void);
 int   tu_pdb_request(ShardDb *db, const char *json, char **out_response);
 int   tu_pdb_drop_object(ShardDb *db, const char *dir, const char *object);
+
+/* Portable stand-in for pthread_timedjoin_np (glibc-only, unavailable on
+   macOS). The target thread must call tu_join_signal_mark_done(js)
+   immediately before it returns; tu_timed_join then waits on that signal
+   with a deadline and performs the real (by then near-instant) join. */
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    int done;
+} TuJoinSignal;
+
+void tu_join_signal_init(TuJoinSignal *js);
+void tu_join_signal_destroy(TuJoinSignal *js);
+void tu_join_signal_mark_done(TuJoinSignal *js);
+
+/* Returns 0 if the thread signaled completion within `seconds` (the
+   thread is then joined for real). Returns ETIMEDOUT if it didn't — the
+   thread is presumed still running/deadlocked and is NOT joined; `js`
+   must not be destroyed in that case since the thread may still touch it. */
+int tu_timed_join(pthread_t tid, TuJoinSignal *js, int seconds);
 
 #endif
