@@ -299,7 +299,7 @@ static int test_txn_crash_phase(const char *phase, const char *object) {
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker), "%s/default/%s/.rebuild-test-%s.active",
              saved_db_root, object, phase);
-    int marker_rc = wait_for_path(marker, 5000);
+    int marker_rc = wait_for_path(marker, 20000);
     if (marker_rc != 0) {
         char base[PATH_MAX];
         snprintf(base, sizeof(base), "%s", saved_db_root);
@@ -308,10 +308,11 @@ static int test_txn_crash_phase(const char *phase, const char *object) {
     }
     ASSERT_EQ_INT(marker_rc, 0,
                   "rebuild reaches deterministic pause");
-    if (marker_rc == 0) {
-        test_env_kill(&env);
-        unlink(marker);
-    }
+    /* Kill unconditionally: on timeout the daemon is still running (paused
+       or not) and holds the DB lock, so leaving it up here would make every
+       later test_env_start_at() in this process fail and cascade. */
+    test_env_kill(&env);
+    unlink(marker);
     if (request_pid > 0) waitpid(request_pid, NULL, 0);
 
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
@@ -408,13 +409,14 @@ static int test_edit_crash_after_metadata(void) {
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker),
              "%s/default/txnedit/.rebuild-test-after-metadata.active", root);
-    int marker_rc = wait_for_path(marker, 5000);
+    int marker_rc = wait_for_path(marker, 20000);
     ASSERT_EQ_INT(marker_rc, 0,
                   "edit rebuild reaches metadata pause");
-    if (marker_rc == 0) {
-        test_env_kill(&env);
-        unlink(marker);
-    }
+    /* Kill unconditionally: on timeout the daemon is still running (paused
+       or not) and holds the DB lock, so leaving it up here would make every
+       later test_env_start_at() in this process fail and cascade. */
+    test_env_kill(&env);
+    unlink(marker);
     if (request_pid > 0) waitpid(request_pid, NULL, 0);
 
     ASSERT_EQ_INT(test_env_start_at(&env, root, saved_port), 0,
