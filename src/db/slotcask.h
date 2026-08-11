@@ -125,6 +125,8 @@ void kfcache_shutdown(void);
    absent. Returns 0 on success, -1 on error. */
 int  kfcache_acquire(SlotcaskKfHandle *h, const char *path,
                      size_t slots_capacity, int writer);
+int  kfcache_try_acquire_rd(SlotcaskKfHandle *h, const char *path,
+                            size_t slots_capacity);
 void kfcache_release(SlotcaskKfHandle *h);
 int  kfcache_sync_slots_locked(SlotcaskKfHandle *h,
                                const size_t *slots, size_t nslots,
@@ -141,6 +143,9 @@ int  kfcache_sync_slots_locked(SlotcaskKfHandle *h,
 int  kfcache_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
                              const char *path, size_t slots_capacity,
                              void *db, int kf_shard_id);
+int  kfcache_try_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
+                                const char *path, size_t slots_capacity,
+                                void *db, int kf_shard_id);
 
 /* Build the canonical kf shard path under a slotcask data_dir. Public
    wrapper around the internal kf_path_for so query.c (bitmap index path)
@@ -972,6 +977,8 @@ int64_t slotcask_count_live(SlotcaskDb *db);
  * 1 stops further probing. */
 int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
                              SlotcaskScanCb cb, void *ctx);
+int slotcask_lookup_by_hash_try(SlotcaskDb *db, const uint8_t hash16[16],
+                                SlotcaskScanCb cb, void *ctx);
 
 /* ============================================================ Two-phase bulk fetch */
 

@@ -407,8 +407,13 @@ static inline void kf_handle_from_uncached(SlotcaskKfHandle *h,
     h->capacity = (sz - SLOTCASK_KF_HDR_SIZE) / sizeof(SlotcaskKfEntry);
 }
 
-int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
-                    size_t slots_capacity, int writer) {
+static int kfcache_acquire_ex(SlotcaskKfHandle *h, const char *path,
+                              size_t slots_capacity, int writer,
+                              int nonblocking) {
+    /* nonblocking is currently only exercised with writer=0 (see
+       kfcache_try_acquire_rd). A writer=1,nonblocking=1 caller would
+       still block on wrlock — not audited/supported; add tryrwlock
+       handling here first if a future caller needs it. */
     h->slot = -1;
     h->writer = writer;
     h->fd = -1;
@@ -419,6 +424,7 @@ int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
 
 retry_kfcache_acquire:
     if (!g_kfcache) {
+        if (nonblocking) { errno = EBUSY; return -1; }
         if (writer) {
             errno = ENODEV;
             return -1;
@@ -441,8 +447,13 @@ retry_kfcache_acquire:
             __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
         pthread_rwlock_t *lock = &g_kfcache[slot].rwlock;
         pthread_mutex_unlock(&g_kfcache_lock);
-        if (writer) pthread_rwlock_wrlock(lock);
-        else        pthread_rwlock_rdlock(lock);
+        if (writer) {
+            pthread_rwlock_wrlock(lock);
+        } else if (nonblocking) {
+            if (pthread_rwlock_tryrdlock(lock) != 0) { errno = EBUSY; return -1; }
+        } else {
+            pthread_rwlock_rdlock(lock);
+        }
 
         /* coverity[atomicity] CID 1693850: `slot` came from the prior
            locked section, but we re-verify identity below
@@ -468,6 +479,7 @@ retry_kfcache_acquire:
                the miss path) re-opens the real current file instead of
                aliasing stale pre-rebuild data. */
             pthread_rwlock_unlock(lock);
+            if (nonblocking) { errno = EBUSY; return -1; }
             pthread_mutex_lock(&g_kfcache_lock);
             if (g_kfcache[slot].used && strcmp(g_kfcache[slot].path, path) == 0) {
                 kfcache_drop_slot(slot, CACHE_DROP_DISCARD, 1);
@@ -476,6 +488,7 @@ retry_kfcache_acquire:
             continue;
         }
         pthread_rwlock_unlock(lock);
+        if (nonblocking) { errno = EBUSY; return -1; }
         if (++retries >= 4) {
             /* slot/found get re-set by the kfcache_probe call below
                in the install path (Coverity CID 1693833). */
@@ -486,7 +499,15 @@ retry_kfcache_acquire:
     }
 
     /* Miss path: open + install. Drop table lock during open since it can
-       block on disk. */
+       block on disk. In nonblocking mode, bail here instead of opening —
+       the "try" contract (kfcache_try_acquire_rd / kfcache_try_acquire_direct)
+       is fast-path-only: it never touches the filesystem, so a genuine
+       cold/evicted shard is treated exactly like lock contention. */
+    if (nonblocking) {
+        pthread_mutex_unlock(&g_kfcache_lock);
+        errno = EBUSY;
+        return -1;
+    }
     pthread_mutex_unlock(&g_kfcache_lock);
     int fd; uint8_t *base; size_t sz; dev_t dev; ino_t ino;
     if (kf_open_file(path, slots_capacity, writer, &fd, &base, &sz, &dev, &ino) < 0) return -1;
@@ -499,8 +520,18 @@ retry_kfcache_acquire:
             __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
         pthread_rwlock_t *lock = &g_kfcache[slot].rwlock;
         pthread_mutex_unlock(&g_kfcache_lock);
-        if (writer) pthread_rwlock_wrlock(lock);
-        else        pthread_rwlock_rdlock(lock);
+        if (writer) {
+            pthread_rwlock_wrlock(lock);
+        } else if (nonblocking) {
+            if (pthread_rwlock_tryrdlock(lock) != 0) {
+                munmap(base, sz);
+                close(fd);
+                errno = EBUSY;
+                return -1;
+            }
+        } else {
+            pthread_rwlock_rdlock(lock);
+        }
         KfCacheEntry *e = &g_kfcache[slot];
         int matched = e->used && strcmp(e->path, path) == 0;
         if (matched) {
@@ -617,13 +648,18 @@ retry_kfcache_acquire:
        mapping; identity verification detects that and retries safely. */
     pthread_rwlock_t *lock = &e->rwlock;
     pthread_mutex_unlock(&g_kfcache_lock);
-    if (writer) pthread_rwlock_wrlock(lock);
-    else        pthread_rwlock_rdlock(lock);
+    if (writer) {
+        pthread_rwlock_wrlock(lock);
+    } else if (nonblocking) {
+        if (pthread_rwlock_tryrdlock(lock) != 0) { errno = EBUSY; return -1; }
+    } else {
+        pthread_rwlock_rdlock(lock);
+    }
 
     if (!e->used || strcmp(e->path, path) != 0 || e->file_dev != dev ||
         e->file_ino != ino) {
         pthread_rwlock_unlock(lock);
-        return kfcache_acquire(h, path, slots_capacity, writer);
+        return kfcache_acquire_ex(h, path, slots_capacity, writer, nonblocking);
     }
 
     h->slot = slot;
@@ -649,6 +685,21 @@ void kfcache_release(SlotcaskKfHandle *h) {
     h->map = NULL;
     h->map_size = 0;
     h->capacity = 0;
+}
+
+int kfcache_acquire(SlotcaskKfHandle *h, const char *path,
+                    size_t slots_capacity, int writer) {
+    return kfcache_acquire_ex(h, path, slots_capacity, writer, 0);
+}
+
+/* Non-blocking reader acquire for callers that must not block while
+   holding an unrelated lock (see btree_idx_walk_ordered's use via
+   read_record_ref_try / slotcask_lookup_by_hash_try). Returns 0 on
+   success, -1 with errno=EBUSY if the rdlock would have blocked, -1 with
+   a different errno for a genuine I/O/OOM failure. */
+int kfcache_try_acquire_rd(SlotcaskKfHandle *h, const char *path,
+                           size_t slots_capacity) {
+    return kfcache_acquire_ex(h, path, slots_capacity, 0, 1);
 }
 
 /* ── Marker file helpers (durability write-ordering intent) ── */
@@ -1207,9 +1258,9 @@ static void kf_marker_fail_closed(const char *data_dir, int kf_shard, const char
  * db and kf_shard_id are accepted but only used to update ref on the
  * slow path (so the caller's stored ref stays current after a miss).
  */
-int kfcache_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
-                            const char *path, size_t slots_capacity,
-                            void *db, int kf_shard_id) {
+static int kfcache_acquire_direct_ex(SlotcaskKfHandle *h, SlotRef *ref,
+                                     const char *path, size_t slots_capacity,
+                                     void *db, int kf_shard_id, int nonblocking) {
     (void)db;          /* used only to make the signature future-proof */
     (void)kf_shard_id; /* same */
 
@@ -1220,7 +1271,14 @@ int kfcache_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
         if (cur_gen == ref->gen) {
             /* Gen matches — slot should still hold our entry.
                Take rdlock and verify identity before returning. */
-            pthread_rwlock_rdlock(&e->rwlock);
+            if (nonblocking) {
+                if (pthread_rwlock_tryrdlock(&e->rwlock) != 0) {
+                    errno = EBUSY;
+                    return -1;
+                }
+            } else {
+                pthread_rwlock_rdlock(&e->rwlock);
+            }
             if (atomic_load_explicit(&e->used, memory_order_acquire) &&
                 strcmp(e->path, path) == 0) {
                 /* Warm hit confirmed. */
@@ -1236,13 +1294,29 @@ int kfcache_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
     }
 
     /* Slow path: standard kfcache_acquire, then refresh the SlotRef. */
-    int rc = kfcache_acquire(h, path, slots_capacity, 0);
+    int rc = kfcache_acquire_ex(h, path, slots_capacity, 0, nonblocking);
     if (rc == 0 && ref && h->slot >= 0) {
         ref->slot = h->slot;
         ref->gen  = atomic_load_explicit(&g_kfcache[h->slot].gen,
                                           memory_order_acquire);
     }
     return rc;
+}
+
+int kfcache_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
+                            const char *path, size_t slots_capacity,
+                            void *db, int kf_shard_id) {
+    return kfcache_acquire_direct_ex(h, ref, path, slots_capacity,
+                                     db, kf_shard_id, 0);
+}
+
+/* Non-blocking counterpart. Returns 0 on success, -1 with errno=EBUSY if
+   the rdlock would have blocked. See kfcache_try_acquire_rd. */
+int kfcache_try_acquire_direct(SlotcaskKfHandle *h, SlotRef *ref,
+                                const char *path, size_t slots_capacity,
+                                void *db, int kf_shard_id) {
+    return kfcache_acquire_direct_ex(h, ref, path, slots_capacity,
+                                     db, kf_shard_id, 1);
 }
 
 /* ============================================================ segcache */
@@ -9091,26 +9165,17 @@ int slotcask_walk_live_skip(SlotcaskDb *db, int64_t skip_n,
     return 0;
 }
 
-int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
-                            SlotcaskScanCb cb, void *ctx) {
-    if (!db || !cb) return -1;
-    int sid_kf = shard_for_hash(hash16, db->num_shards);
-    char kf_path[PATH_MAX];
-    kf_path_for(kf_path, db->data_dir, sid_kf);
-    SlotcaskKfHandle kh;
-    /* Same lock-free warm-hit fast path slotcask_get already uses:
-       db->kf_slot_refs[sid_kf] is a per-shard SlotRef owned by the
-       SlotcaskDb instance, so it stays warm across every call against
-       this shard regardless of caller. kfcache_acquire_direct falls
-       back to the plain kfcache_acquire slow path (and refreshes the
-       ref) on a cold miss or eviction race — same correctness, fewer
-       table-mutex acquisitions on the common warm path. */
-    SlotRef *kf_ref = (db->kf_slot_refs) ? &db->kf_slot_refs[sid_kf] : NULL;
-    if (kfcache_acquire_direct(&kh, kf_ref, kf_path, db->slots_per_shard,
-                               db, sid_kf) != 0) return -1;
-
-    size_t cap = kh.capacity;
-    SlotcaskKfEntry *kf = kh.map;
+/* Shared scan body for slotcask_lookup_by_hash / _try — kh must already
+   be acquired (reader) by the caller, who also releases it. segcache
+   stays blocking in both callers: segcache_acquire call sites are
+   confined to slotcask.c/storage.c and never nest under a btree_* call,
+   so it isn't part of the kfcache<->bt_cache inversion this function's
+   nonblocking sibling exists to avoid. */
+static void slotcask_lookup_scan_kf(SlotcaskDb *db, const uint8_t hash16[16],
+                                    SlotcaskKfHandle *kh,
+                                    SlotcaskScanCb cb, void *ctx) {
+    size_t cap = kh->capacity;
+    SlotcaskKfEntry *kf = kh->map;
     size_t start = kf_slot_for(hash16, cap);
     int stop = 0;
     for (size_t i = 0; i < cap && !stop; i++) {
@@ -9137,6 +9202,40 @@ int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
         if (cb(e->hash, key, klen, value, vlen, ctx) != 0) stop = 1;
         segcache_release(&sh);
     }
+}
+
+int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
+                            SlotcaskScanCb cb, void *ctx) {
+    if (!db || !cb) return -1;
+    int sid_kf = shard_for_hash(hash16, db->num_shards);
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+    SlotcaskKfHandle kh;
+    SlotRef *kf_ref = (db->kf_slot_refs) ? &db->kf_slot_refs[sid_kf] : NULL;
+    if (kfcache_acquire_direct(&kh, kf_ref, kf_path, db->slots_per_shard,
+                               db, sid_kf) != 0) return -1;
+    slotcask_lookup_scan_kf(db, hash16, &kh, cb, ctx);
+    kfcache_release(&kh);
+    return 0;
+}
+
+/* Non-blocking counterpart used by btree_idx_walk_ordered's vulnerable
+   callbacks (order_index_walk_cb, composite_prefix_cb, cursor_find_cb):
+   they hold every open index shard's bt_cache rdlock for the k-way
+   merge's lifetime and must not then block on this hash's kfcache rdlock.
+   Returns 0 (scan ran), 1 (kf acquire failed), or 2 (would block). */
+int slotcask_lookup_by_hash_try(SlotcaskDb *db, const uint8_t hash16[16],
+                                SlotcaskScanCb cb, void *ctx) {
+    if (!db || !cb) return 1;
+    int sid_kf = shard_for_hash(hash16, db->num_shards);
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, sid_kf);
+    SlotcaskKfHandle kh;
+    SlotRef *kf_ref = (db->kf_slot_refs) ? &db->kf_slot_refs[sid_kf] : NULL;
+    if (kfcache_try_acquire_direct(&kh, kf_ref, kf_path, db->slots_per_shard,
+                                   db, sid_kf) != 0)
+        return (errno == EBUSY) ? 2 : 1;
+    slotcask_lookup_scan_kf(db, hash16, &kh, cb, ctx);
     kfcache_release(&kh);
     return 0;
 }

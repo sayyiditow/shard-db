@@ -28,6 +28,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <regex.h>
+#include "btree.h"
 #include <semaphore.h>
 #define XXH_INLINE_ALL
 #include "xxhash.h"
@@ -1044,14 +1045,14 @@ void btree_idx_range_ex(const char *db_root, const char *object,
                         bt_result_cb cb, void *ctx);
 
 /* Globally-ordered range walk across all shards. desc=1 reverses direction.
-   Implementation: collect all matches into a buffer, qsort by (value, hash16)
-   tie-break, replay through `cb` in order. Used by cursor pagination —
-   k-way streaming merge is a perf-only follow-up. */
+   The implementation is a k-way streaming merge. Callbacks may release all
+   iterator locks through the handle before a blocking nested fetch; the walk
+   reopens and resumes after the last delivered (value,hash) pair. */
 void btree_idx_walk_ordered(const char *db_root, const char *object,
                             const char *field, int splits,
                             const char *min_val, size_t min_len, int min_exclusive,
                             const char *max_val, size_t max_len, int max_exclusive,
-                            int desc, bt_result_cb cb, void *ctx);
+                            int desc, bt_ordered_result_cb cb, void *ctx);
 
 /* Flush any thread-local accumulator populated by callbacks during the
    current btree per-shard walk. Defined in query.c (where idx_count_cb

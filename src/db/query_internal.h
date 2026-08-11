@@ -2,6 +2,15 @@
 #define QUERY_INTERNAL_H
 #include "types.h"
 #include <pthread.h>
+
+#ifdef TEST_BUILD
+typedef void (*order_walk_test_pause_fn)(void *ctx);
+void order_walk_test_set_pause_hook(order_walk_test_pause_fn fn, void *ctx);
+void order_walk_test_set_pause_hook_after(order_walk_test_pause_fn fn,
+                                          void *ctx,
+                                          size_t callbacks_to_skip);
+#endif
+
 /* Prototypes for helpers shared across the query_*.c translation units.
    These were `static` inside the monolithic query.c; splitting the file
    forces them to external linkage. Keep this header private to src/db. */
@@ -133,7 +142,11 @@ void transform_field_value(const TypedField *old_f,
                            const uint8_t *src,
                            uint8_t *dst);
 int field_needs_transform(const TypedField *old_f,
-                          const TypedField *new_f);
+                           const TypedField *new_f);
+
+int read_record_ref_try(const char *db_root, const char *object,
+                        const Schema *sch, const uint8_t hash[16],
+                        RecordRef *out);
 
 /* query.c — bulk criteria (used by query_bulk.c::cmd_bulk_delete_criteria) */
 int bulk_delete_phase1_indexed(const char *db_root, const char *object,

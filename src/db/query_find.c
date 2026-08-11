@@ -373,6 +373,28 @@ int read_record_ref(const char *db_root, const char *object,
     return out->v2_buf ? 0 : -1;
 }
 
+/* Non-blocking counterpart. Returns 0 (found), 1 (not found / registry
+   lookup failed), or 2 (would block on the kfcache rdlock — caller must
+   release whatever else it holds and retry with the blocking
+   read_record_ref). See slotcask_lookup_by_hash_try. */
+int read_record_ref_try(const char *db_root, const char *object,
+                        const Schema *sch, const uint8_t hash[16],
+                        RecordRef *out) {
+    memset(out, 0, sizeof(*out));
+    SlotcaskSchemaInfo info = {
+        .splits = sch->splits, .slot_size = sch->slot_size,
+        .streams = sch->streams,
+    };
+    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) {
+        LOG_WARN(LOG_SUB_SLOTCASK, "read_record_ref_try: slotcask_registry_get failed for %s/%s", db_root, object);
+        return 1;
+    }
+    int rc = slotcask_lookup_by_hash_try(sdb, hash, v2_record_capture_cb, out);
+    if (rc == 2) return 2;
+    return out->v2_buf ? 0 : 1;
+}
+
 void release_record_ref(RecordRef *r) {
     if (!r) return;
     /* Only free the malloc'd fallback — inline_buf is part of the

@@ -267,6 +267,11 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_v2_index_leak_on_clear.c \
     src/test/cases/test_btree.c \
     src/test/cases/test_btree_bulk_merge_delete_race.c \
+    src/test/cases/test_ordered_walk_kfcache_deadlock.c \
+    src/test/cases/test_ordered_walk_kfcache_deadlock_single_write.c \
+    src/test/cases/test_ordered_walk_multishard_skip.c \
+    src/test/cases/test_ordered_walk_ordered_ranges.c \
+    src/test/cases/test_composite_in_multishard_duplicate.c \
     src/test/cases/test_btree_bulk_merge_tie_duplicate.c \
     src/test/cases/test_btree_inplace_leaf.c \
     src/test/cases/test_btcache_evict_race.c \

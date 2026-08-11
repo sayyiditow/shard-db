@@ -202,128 +202,42 @@ void btree_idx_range_ex(const char *db_root, const char *object,
 }
 
 /* ----- Globally-ordered walk (for cursor pagination) =====
-   K-way merge across all idx shards. Each shard runs a streaming
-   BtRangeIter; a min-heap (ASC) or max-heap (DESC) of (current entry,
-   shard_id) picks the next globally-ordered entry. O(splits/4) memory —
-   one entry materialised per shard at a time, regardless of total range
-   cardinality. */
-
-typedef struct {
-    BtRangeIter *iter;
-    /* Currently-buffered head entry — copied out of the iterator since the
-       iterator's internal buffer gets overwritten on next(). */
-    char    value[BT_MAX_VAL_LEN];
-    size_t  vlen;
-    uint8_t hash[BT_HASH_SIZE];
-    int     has_entry;       /* 1 if value/hash hold a valid head, 0 if drained */
-    int     shard_id;        /* tie-break ordering when (value,hash) collide */
-} ShardCursor;
-
-static int sc_cmp_asc(const ShardCursor *a, const ShardCursor *b) {
-    size_t m = a->vlen < b->vlen ? a->vlen : b->vlen;
-    int r = memcmp(a->value, b->value, m);
-    if (r != 0) return r;
-    if (a->vlen != b->vlen) return a->vlen < b->vlen ? -1 : 1;
-    r = memcmp(a->hash, b->hash, BT_HASH_SIZE);
-    if (r != 0) return r;
-    return a->shard_id - b->shard_id;
-}
-
-/* Refill the head entry of cursor c by pulling one from its iterator. */
-static void sc_pull(ShardCursor *c) {
-    const char *v;
-    size_t vl;
-    const uint8_t *h;
-    if (btree_range_iter_next(c->iter, &v, &vl, &h)) {
-        c->vlen = vl > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : vl;
-        memcpy(c->value, v, c->vlen);
-        memcpy(c->hash, h, BT_HASH_SIZE);
-        c->has_entry = 1;
-    } else {
-        c->has_entry = 0;
-    }
-}
-
-/* Heap helpers for the k-way merge below.
-   Heap holds shard-cursor *indices* into cursors[]; we only swap small ints,
-   the underlying ShardCursor structs stay put.  Comparison delegates to
-   sc_cmp_asc and is negated for desc walks. */
-static inline int merge_cmp(int a, int b, const ShardCursor *cursors, int desc) {
-    int r = sc_cmp_asc(&cursors[a], &cursors[b]);
-    return desc ? -r : r;
-}
-
-static inline void merge_swap(int *heap, int i, int j) {
-    int t = heap[i]; heap[i] = heap[j]; heap[j] = t;
-}
-
-static void merge_sift_down(int *heap, int n, int i,
-                            const ShardCursor *cursors, int desc) {
-    for (;;) {
-        int l = 2 * i + 1, r = 2 * i + 2, best = i;
-        if (l < n && merge_cmp(heap[l], heap[best], cursors, desc) < 0) best = l;
-        if (r < n && merge_cmp(heap[r], heap[best], cursors, desc) < 0) best = r;
-        if (best == i) return;
-        merge_swap(heap, i, best);
-        i = best;
-    }
-}
+   Thin adapter: builds per-shard BtOrderedRangeSpec array and delegates
+   to btree_walk_ordered_ranges (the single authoritative merge in btree.c). */
 
 void btree_idx_walk_ordered(const char *db_root, const char *object,
                             const char *field, int splits,
                             const char *min_val, size_t min_len, int min_exclusive,
                             const char *max_val, size_t max_len, int max_exclusive,
-                            int desc, bt_result_cb cb, void *ctx) {
+                            int desc, bt_ordered_result_cb cb, void *ctx) {
     int n = index_splits_for(splits);
-    ShardCursor *cursors = calloc((size_t)n, sizeof(ShardCursor));
-    int *heap = calloc((size_t)n, sizeof(int));
-    if (!cursors || !heap) { free(cursors); free(heap); return; }
+    BtOrderedRangeSpec *ranges = calloc((size_t)n, sizeof(BtOrderedRangeSpec));
+    char (*paths)[PATH_MAX] = calloc((size_t)n, sizeof(*paths));
+    if (!ranges || !paths) { free(ranges); free(paths); return; }
 
-    /* Open one streaming iterator per shard and prime its head entry. Shards
-       whose iterator fails to open (missing file, etc.) or are immediately
-       drained drop out — they contribute nothing and don't enter the heap. */
-    int nh = 0;
-    for (int s = 0; s < n; s++) {
-        char idx_path[PATH_MAX];
-        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
-        cursors[s].shard_id = s;
-        cursors[s].iter = btree_range_iter_open(idx_path,
-                                                min_val, min_len, min_exclusive,
-                                                max_val, max_len, max_exclusive,
-                                                desc);
-        if (cursors[s].iter) sc_pull(&cursors[s]);
-        if (cursors[s].has_entry) heap[nh++] = s;
-    }
-
-    /* Build heap in O(nh) via Floyd's bottom-up sift-down. */
-    for (int i = nh / 2 - 1; i >= 0; i--)
-        merge_sift_down(heap, nh, i, cursors, desc);
-
-    /* k-way merge: pop the head of heap[0], advance its iterator, sift the
-       refilled (or, if drained, the swapped-in last) cursor back into place.
-       Per-emit cost is O(log nh) — replaces the previous O(nh) linear scan.
-       At high splits this is the difference between profile-page composite
-       walks completing in ms vs hitting the 30s daemon TIMEOUT (see
-       backlog-btree-walk-heap-merge for the failure shape). */
-    while (nh > 0) {
-        ShardCursor *bc = &cursors[heap[0]];
-        if (cb(bc->value, bc->vlen, bc->hash, ctx) < 0) break;
-        sc_pull(bc);
-        if (bc->has_entry) {
-            merge_sift_down(heap, nh, 0, cursors, desc);
-        } else {
-            /* Drained: drop heap[0] by overwriting with the last entry and
-               shrinking the heap, then sift the new root into place. */
-            heap[0] = heap[--nh];
-            merge_sift_down(heap, nh, 0, cursors, desc);
-        }
-    }
+    /* Caller bounds truncated to BT_MAX_VAL_LEN as before. */
+    char lo_buf[BT_MAX_VAL_LEN];
+    size_t lo_len = min_len > sizeof(lo_buf) ? sizeof(lo_buf) : min_len;
+    if (lo_len) memcpy(lo_buf, min_val, lo_len);
+    char hi_buf[BT_MAX_VAL_LEN];
+    size_t hi_len = max_len > sizeof(hi_buf) ? sizeof(hi_buf) : max_len;
+    if (hi_len) memcpy(hi_buf, max_val, hi_len);
 
     for (int s = 0; s < n; s++) {
-        if (cursors[s].iter) btree_range_iter_close(cursors[s].iter);
+        build_idx_path(paths[s], sizeof(paths[s]), db_root, object, field, s);
+        ranges[s].path         = paths[s];
+        ranges[s].min_val      = lo_len ? lo_buf : NULL;
+        ranges[s].min_len      = lo_len;
+        ranges[s].min_exclusive = min_exclusive;
+        ranges[s].max_val      = hi_len ? hi_buf : NULL;
+        ranges[s].max_len      = hi_len;
+        ranges[s].max_exclusive = max_exclusive;
+        ranges[s].tie_id       = s;
     }
-    free(cursors);
-    free(heap);
+
+    btree_walk_ordered_ranges(ranges, (size_t)n, desc, cb, ctx);
+    free(ranges);
+    free(paths);
 }
 
 void btree_idx_unlink_all(const char *db_root, const char *object,
