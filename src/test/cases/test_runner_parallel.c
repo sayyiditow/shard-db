@@ -6,9 +6,13 @@
  */
 #include "test_assert.h"
 #include "test_runner.h"
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
 /* Runs "./build/bin/shard-db-test run-all --filter criteria --jobs N",
    captures combined stdout, and returns it as a malloc'd buffer (caller
@@ -205,5 +209,111 @@ static int test_runner_watchdog_fires(void) {
     return 0;
 }
 
+/* These three tiny cases are invoked only by the scheduler meta-test below.
+   The event file is inherited by its nested runner children, allowing the
+   parent test to prove that an exclusive case never overlaps an ordinary
+   worker. Outside that sub-run they are deliberately no-ops. */
+static void exclusive_probe_event(const char *event) {
+    const char *path = getenv("SHARD_TEST_EXCLUSIVE_PROBE_LOG");
+    if (!path || !*path) return;
+    int fd = open(path, O_WRONLY | O_APPEND);
+    if (fd < 0) return;
+    dprintf(fd, "%s\n", event);
+    close(fd);
+}
+
+static void exclusive_probe_pause(void) {
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 150000000L };
+    nanosleep(&delay, NULL);
+}
+
+static int test_runner_exclusive_probe_ordinary_a(void) {
+    exclusive_probe_event("ordinary-a-start");
+    exclusive_probe_pause();
+    exclusive_probe_event("ordinary-a-end");
+    return 0;
+}
+
+static int test_runner_exclusive_probe_case(void) {
+    exclusive_probe_event("exclusive-start");
+    exclusive_probe_pause();
+    exclusive_probe_event("exclusive-end");
+    return 0;
+}
+
+static int test_runner_exclusive_probe_ordinary_b(void) {
+    exclusive_probe_event("ordinary-b-start");
+    exclusive_probe_pause();
+    exclusive_probe_event("ordinary-b-end");
+    return 0;
+}
+
+static int test_runner_exclusive_scheduling(void) {
+    char log_path[] = "/tmp/shard-db-test-exclusive-XXXXXX";
+    int fd = mkstemp(log_path);
+    ASSERT_TRUE(fd >= 0, "created exclusive scheduler event log");
+    if (fd < 0) return 1;
+    close(fd);
+
+    ASSERT_EQ_INT(setenv("SHARD_TEST_EXCLUSIVE_PROBE_LOG", log_path, 1), 0,
+                  "set exclusive scheduler event log");
+    FILE *p = popen("./build/bin/shard-db-test run-all "
+                    "--filter runner-exclusive-probe --jobs 2 2>&1", "r");
+    ASSERT_TRUE(p != NULL, "exclusive scheduler sub-run started");
+    if (!p) {
+        unsetenv("SHARD_TEST_EXCLUSIVE_PROBE_LOG");
+        unlink(log_path);
+        return 1;
+    }
+    char discard[512];
+    while (fgets(discard, sizeof(discard), p)) { }
+    int status = pclose(p);
+    unsetenv("SHARD_TEST_EXCLUSIVE_PROBE_LOG");
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                "exclusive scheduler sub-run exits 0");
+
+    FILE *events = fopen(log_path, "r");
+    ASSERT_TRUE(events != NULL, "opened exclusive scheduler event log");
+    if (!events) { unlink(log_path); return 1; }
+    char actual[512] = { 0 };
+    size_t n = fread(actual, 1, sizeof(actual) - 1, events);
+    actual[n] = '\0';
+    fclose(events);
+    unlink(log_path);
+
+    int ordinary_active = 0, exclusive_active = 0;
+    int saw_exclusive_start = 0, saw_exclusive_end = 0, event_count = 0;
+    for (char *line = strtok(actual, "\n"); line; line = strtok(NULL, "\n")) {
+        event_count++;
+        if (strncmp(line, "ordinary-", 9) == 0 && strstr(line, "-start")) {
+            ASSERT_TRUE(!exclusive_active,
+                        "ordinary worker does not start while exclusive case runs");
+            ordinary_active++;
+        } else if (strncmp(line, "ordinary-", 9) == 0 && strstr(line, "-end")) {
+            ordinary_active--;
+        } else if (strcmp(line, "exclusive-start") == 0) {
+            ASSERT_EQ_INT(ordinary_active, 0,
+                          "exclusive case starts only after ordinary workers drain");
+            exclusive_active = 1;
+            saw_exclusive_start = 1;
+        } else if (strcmp(line, "exclusive-end") == 0) {
+            ASSERT_TRUE(exclusive_active, "exclusive case has a matching start event");
+            exclusive_active = 0;
+            saw_exclusive_end = 1;
+        }
+    }
+    ASSERT_EQ_INT(event_count, 6, "exclusive scheduler probe recorded every event");
+    ASSERT_TRUE(saw_exclusive_start && saw_exclusive_end && !exclusive_active,
+                "exclusive scheduler probe completed its exclusive interval");
+    return 0;
+}
+
 TEST_REGISTER("test-runner-parallel", test_runner_parallel_matches_sequential)
 TEST_REGISTER("test-runner-watchdog", test_runner_watchdog_fires)
+TEST_REGISTER("test-runner-exclusive-probe-ordinary-a",
+              test_runner_exclusive_probe_ordinary_a)
+TEST_REGISTER_EXCLUSIVE("test-runner-exclusive-probe-case",
+                        test_runner_exclusive_probe_case)
+TEST_REGISTER("test-runner-exclusive-probe-ordinary-b",
+              test_runner_exclusive_probe_ordinary_b)
+TEST_REGISTER("test-runner-exclusive-scheduling", test_runner_exclusive_scheduling)

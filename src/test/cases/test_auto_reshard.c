@@ -78,15 +78,14 @@ static int fabricate_kf_total(const char *kf_path, uint64_t total) {
 
 /* The wait budgets below (20s/40s) are calibrated for uninstrumented
    execution: 5s thread-startup delay + a 1.05M-record bulk-insert +
-   a full kf/segment rebuild, all comfortably inside budget on plain and
-   ASan builds (ASan's overhead here is modest). TSan's shadow-memory and
-   happens-before tracking on every memory access materially slows the
-   same rebuild, which can push it past the un-scaled budget without any
-   functional problem -- the reshard still runs and still reaches the
+   a full kf/segment rebuild, all comfortably inside budget on plain builds.
+   ASan/TSan instrumentation materially slows the same rebuild under the
+   all-CPU test runner, which can push it past the un-scaled budget without
+   any functional problem -- the reshard still runs and still reaches the
    right target, just slower. Scale the *wait*, not the assertion: the
-   correctness check (did it reshape / reach the right target) is
-   unchanged either way. */
-#if defined(__SANITIZE_THREAD__)
+   correctness check (did it reshape / reach the right target) is unchanged
+   either way. */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define RESHARD_WAIT_SCALE 6
 #else
 #define RESHARD_WAIT_SCALE 1
@@ -641,7 +640,8 @@ static int test_auto_reshard_throttle_run(void) {
         free(resp); resp = NULL;
         if (a_done && b_done) { both_reshaped = 1; break; }
     }
-    ASSERT_TRUE(both_reshaped, "both grown_a and grown_b reshaped within 40s");
+    ASSERT_TRUE(both_reshaped,
+                "both grown_a and grown_b reshaped within the instrumentation-scaled deadline");
 
     /* Verify two distinct done-log lines exist in the log file. We compare
        the raw log lines since the log timestamp format is second-precision
@@ -694,4 +694,4 @@ static int test_auto_reshard_throttle_run(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-TEST_REGISTER("test-auto-reshard-throttle", test_auto_reshard_throttle_run)
+TEST_REGISTER_EXCLUSIVE("test-auto-reshard-throttle", test_auto_reshard_throttle_run)

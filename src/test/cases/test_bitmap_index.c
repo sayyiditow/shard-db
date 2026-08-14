@@ -1282,6 +1282,11 @@ static int test_bitmap_index_run(void) {
                 snprintf(req, sizeof(req),
                     "{\"mode\":\"exists\",\"dir\":\"t\",\"object\":\"bulkcapovf\",\"key\":\"bc%d\"}", k);
                 tc_request(tc, req, &resp);
+                if (!resp || SAFE_STRSTR(resp, "\"error\""))
+                    TAP_DIAG("# bulkcapovf restart exists response for bc%d: %s\n",
+                             k, resp ? resp : "(null)");
+                ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""),
+                            "bulkcapovf restart exists response");
                 if (resp && SAFE_STRSTR(resp, "true")) post_existing++;
                 free(resp); resp = NULL;
             }

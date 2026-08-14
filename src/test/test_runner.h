@@ -14,17 +14,25 @@ typedef int (*TestFn)(void);
 typedef struct TestCaseEntry {
     const char *name;
     TestFn fn;
+    /* An exclusive case runs alone in the process-pool scheduler. */
+    int exclusive;
     struct TestCaseEntry *next;
 } TestCaseEntry;
 
 void test_register(TestCaseEntry *entry);
 
-#define TEST_REGISTER(name_, fn_)                                    \
+#define TEST_REGISTER_IMPL(name_, fn_, exclusive_)                   \
     static int fn_(void);                                            \
-    static TestCaseEntry _tce_##fn_ = { name_, fn_, NULL };          \
+    static TestCaseEntry _tce_##fn_ = { name_, fn_, exclusive_, NULL }; \
     __attribute__((constructor)) static void _tcr_##fn_(void) {      \
         test_register(&_tce_##fn_);                                  \
     }
+
+#define TEST_REGISTER(name_, fn_) TEST_REGISTER_IMPL(name_, fn_, 0)
+
+/* Use only for intentionally high-contention integration cases whose
+   deadline is meaningful only when they have the machine to themselves. */
+#define TEST_REGISTER_EXCLUSIVE(name_, fn_) TEST_REGISTER_IMPL(name_, fn_, 1)
 
 /* Walk the registry (for `list` / `run-all` subcommands). Returns count. */
 int test_count(void);
