@@ -828,6 +828,54 @@ static int test_real_total_d3_order_walk(void) {
 }
 TEST_REGISTER("test-real-total-d3-order-walk", test_real_total_d3_order_walk)
 
+/* UUID auto-keys must not affect exact ordered pagination totals. */
+static int test_find_total_ordered_customers(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) return 1;
+    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
+    TestClient *tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop(&env); return 1; }
+
+    char *resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
+    free(resp); resp = NULL;
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"customers\","
+        "\"splits\":8,\"max_key\":16,\"fields\":[\"name:varchar:32\"],"
+        "\"indexes\":[\"name\"],\"auto_key\":\"uuid\"}", &resp);
+    free(resp); resp = NULL;
+    tc_request(tc,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"customers\",\"records\":["
+        "{\"key\":\"11111111-2222-4333-8444-555566667777\",\"value\":{\"name\":\"Scap Alpha\"}},"
+        "{\"key\":\"22222222-3333-4444-8555-666677778888\",\"value\":{\"name\":\"scap Beta\"}},"
+        "{\"key\":\"33333333-4444-4555-8666-777788889999\",\"value\":{\"name\":\"Other\"}}]}",
+        &resp);
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"customers\","
+        "\"criteria\":[],\"order_by\":\"name\",\"order\":\"asc\",\"limit\":1,\"total\":true}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"total\":3",
+                    "ordered UUID find without criteria emits numeric total");
+    ASSERT_EQ_INT(extract_total(resp), 3,
+                  "ordered UUID find without criteria has exact total");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"customers\","
+        "\"criteria\":[{\"field\":\"name\",\"op\":\"icontains\",\"value\":\"scap\"}],"
+        "\"order_by\":\"name\",\"order\":\"asc\",\"limit\":1,\"total\":true}", &resp);
+    ASSERT_EQ_INT(extract_total(resp), 2,
+                  "ordered icontains UUID find has exact total");
+    free(resp);
+    tc_close(tc);
+    test_env_stop(&env);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+TEST_REGISTER("test-find-total-ordered-customers", test_find_total_ordered_customers)
+
 /* ================================================================
  * Phase 1d.3 tests — cmd_aggregate computes total group count
  * ================================================================ */

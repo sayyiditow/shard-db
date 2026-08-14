@@ -1716,11 +1716,11 @@ static int v2_fetch_cb(const uint8_t hash16[16],
     memcpy(block, key, klen);
     memcpy(block + klen, value, vlen);
 
+    char wire_key[1100];
+    render_wire_key(ctx->fs, block, hdr.key_len, wire_key);
+
     if (ctx->csv_delim) {
-        char kbuf[1024];
-        size_t kl = klen < sizeof(kbuf) - 1 ? klen : sizeof(kbuf) - 1;
-        memcpy(kbuf, key, kl); kbuf[kl] = '\0';
-        csv_emit_row(kbuf, block + klen, (uint32_t)vlen,
+        csv_emit_row(wire_key, block + klen, (uint32_t)vlen,
                       ctx->proj_count > 0 ? ctx->proj_fields : NULL,
                       ctx->proj_count, ctx->fs, (char)ctx->csv_delim);
         ctx->printed++;
@@ -1728,15 +1728,14 @@ static int v2_fetch_cb(const uint8_t hash16[16],
         print_record_row(&hdr, block, ctx->proj_fields, ctx->proj_count,
                           &ctx->printed, ctx->fs);
     } else if (ctx->dict_fmt) {
-        OUT("%s\"%.*s\":", ctx->printed ? "," : "", (int)klen, (const char *)key);
+        OUT("%s\"%s\":", ctx->printed ? "," : "", wire_key);
         char *decoded = ctx->fs ? typed_decode(ctx->fs->ts,
                                                 (const uint8_t *)value, vlen) : NULL;
         OUT("%s", decoded ? decoded : "null");
         free(decoded);
         ctx->printed++;
     } else {
-        OUT("%s{\"key\":\"%.*s\",\"value\":", ctx->printed ? "," : "",
-            (int)klen, (const char *)key);
+        OUT("%s{\"key\":\"%s\",\"value\":", ctx->printed ? "," : "", wire_key);
         char *decoded = ctx->fs ? typed_decode(ctx->fs->ts,
                                                 (const uint8_t *)value, vlen) : NULL;
         OUT("%s}", decoded ? decoded : "null");

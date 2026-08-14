@@ -491,6 +491,53 @@ static int test_auto_key_run(void) {
     ASSERT_CONTAINS(resp, "\"amount\":400", "non-colliding auto-gen record present");
     free(resp); resp = NULL;
 
+    /* === 16. UUID read emitters render keys, never raw storage bytes ===== */
+
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"customers\","
+        "\"splits\":8,\"max_key\":16,\"fields\":[\"name:varchar:32\"],"
+        "\"indexes\":[\"name\"],\"auto_key\":\"uuid\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "uuid customers created");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"customers\",\"records\":["
+        "{\"key\":\"11111111-2222-4333-8444-555566667777\",\"value\":{\"name\":\"Scap Alpha\"}},"
+        "{\"key\":\"22222222-3333-4444-8555-666677778888\",\"value\":{\"name\":\"scap Beta\"}},"
+        "{\"key\":\"33333333-4444-4555-8666-777788889999\",\"value\":{\"name\":\"Other\"}}]}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"count\":3", "uuid customers seeded");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"fetch\",\"dir\":\"default\",\"object\":\"customers\",\"limit\":25}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"key\":\"11111111-2222-4333-8444-555566667777\"",
+                    "fetch renders UUID wire key");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"customers\","
+        "\"criteria\":[{\"field\":\"name\",\"op\":\"icontains\",\"value\":\"scap\"}],"
+        "\"order_by\":\"name\",\"order\":\"asc\",\"limit\":25}", &resp);
+    ASSERT_CONTAINS(resp, "\"key\":\"11111111-2222-4333-8444-555566667777\"",
+                    "ordered find renders UUID wire key");
+    ASSERT_CONTAINS(resp, "\"key\":\"22222222-3333-4444-8555-666677778888\"",
+                    "ordered find keeps all matching UUID keys");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"customers\","
+        "\"criteria\":[{\"field\":\"name\",\"op\":\"icontains\",\"value\":\"scap\"}],"
+        "\"order_by\":\"name\",\"order\":\"asc\",\"limit\":1,\"cursor\":null}",
+        &resp);
+    ASSERT_CONTAINS(resp, "\"key\":\"11111111-2222-4333-8444-555566667777\"",
+                    "cursor page renders UUID wire key");
+    ASSERT_CONTAINS(resp, "\"cursor\":{\"name\":\"Scap Alpha\","
+                          "\"key\":\"11111111-2222-4333-8444-555566667777\"}",
+                    "cursor stores UUID wire key");
+    free(resp); resp = NULL;
+
     free(uuid_alice); free(uuid_bob);
     tc_close(tc);
     test_env_stop(&env);
