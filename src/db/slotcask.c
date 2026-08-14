@@ -2221,17 +2221,45 @@ static void *slotcask_pool_rebuild_worker(void *raw) {
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, a->db->data_dir, a->shard_id);
     SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kf_path, a->db->slots_per_shard, 0) != 0) return NULL;
-    size_t cap = kh.capacity;
-    SlotcaskKfEntry *kf = kh.map;
-    for (size_t i = 0; i < cap; i++) {
-        if (kf[i].flag == 2 && kf[i].stream_id < a->db->num_streams) {
-            pool_push_free_cap(&a->db->streams[kf[i].stream_id],
-                               kf[i].file_id, kf[i].offset,
-                               (uint32_t)a->db->slot_size, a->db->slot_size);
-        }
+    if (kfcache_acquire(&kh, kf_path, a->db->slots_per_shard, 0) != 0)
+        return NULL;
+
+    size_t count = 0;
+    for (size_t i = 0; i < kh.capacity; i++)
+        if (kh.map[i].flag == 2 && kh.map[i].stream_id < a->db->num_streams)
+            count++;
+    SlotcaskKfEntry *candidates = calloc(count, sizeof(*candidates));
+    if (!candidates && count != 0) { kfcache_release(&kh); return NULL; }
+    size_t n = 0;
+    for (size_t i = 0; i < kh.capacity; i++) {
+        if (kh.map[i].flag == 2 && kh.map[i].stream_id < a->db->num_streams)
+            candidates[n++] = kh.map[i];
     }
     kfcache_release(&kh);
+
+    for (size_t i = 0; i < n; i++) {
+        SlotcaskKfEntry *e = &candidates[i];
+        char path[PATH_MAX];
+        seg_path_for(path, a->db->data_dir, e->stream_id, e->file_id);
+        SlotcaskSegHandle h;
+        if (segcache_acquire(&h, path, 0, 0, 0) != 0) continue;
+        size_t rec_size;
+        uint8_t flag;
+        uint16_t klen;
+        uint32_t vlen;
+        int valid = seg_scan_varlen_struct_ok(h.map, h.map_size, e->offset,
+                                               (size_t)a->db->slot_size,
+                                               &rec_size, &flag, &klen, &vlen);
+        if (valid && flag == 2)
+            valid = memcmp(h.map + e->offset, e->hash, sizeof(e->hash)) == 0 &&
+                    seg_scan_varlen_hash_ok(h.map, e->offset, klen);
+        if (valid && flag == 2)
+            pool_push_free_cap(&a->db->streams[e->stream_id], e->file_id,
+                               e->offset, (uint32_t)rec_size,
+                               a->db->slot_size);
+        segcache_release(&h);
+    }
+    free(candidates);
     return NULL;
 }
 
@@ -4334,135 +4362,6 @@ typedef struct {
     int         rc;  /* 0 = success, -1 = error */
 } RecoverStreamArg;
 
-/* Compute a buffer size that is a multiple of both ODIRECT_ALIGN and
-   slot_size. This guarantees every chunk holds an integer number of slots
-   so the scan loop needs no carry-over state.
-   slot_size is always a multiple of 8 (floor 32) so gcd(4096, slot_size)
-   >= 8 and the computed lcm is always manageable (< 8 MB for any valid
-   slot_size). */
-static size_t recover_od_buf_size(int slot_size) {
-    size_t a = (size_t)ODIRECT_ALIGN;
-    size_t b = (size_t)slot_size;
-    size_t x = a, y = b;
-    while (y) { size_t t = x % y; x = y; y = t; }  /* x = gcd(a,b) */
-    size_t lcm = a / x * b;
-    /* Scale up to ~4 MB so we amortise syscall overhead across many slots. */
-    size_t n = (ODIRECT_BUF_SIZE_DEFAULT + lcm - 1) / lcm;
-    if (n < 1) n = 1;
-    return lcm * n;
-}
-
-/* O_DIRECT scan of a non-active segment file for tombstoned (flag==2) slots.
-   Pages never enter the page cache. Called for every file_id != last_id
-   in recover_one_stream. Returns 0 on success; errors are non-fatal
-   (missed tombstones just reduce free-pool size until next vacuum). */
-static int recover_scan_tombstones_od(SlotcaskDb *db, int sid,
-                                       int file_id, const char *path) {
-    int fd = od_open(path);
-    if (fd < 0) return -1;
-
-    size_t buf_size = recover_od_buf_size(db->slot_size);
-    uint8_t *buf = aligned_alloc(ODIRECT_ALIGN, buf_size);
-    if (!buf) { close(fd); return -1; }
-
-    /* Records are variable-length, so use a carry buffer to handle records
-       that straddle O_DIRECT chunk boundaries. */
-        size_t carry_cap = 256u * 1024u;
-        uint8_t *carry = malloc(carry_cap);
-        if (!carry) { free(buf); close(fd); return -1; }
-        int carry_len = 0;
-        uint32_t carry_off = 0;
-        off_t file_off2 = 0;
-        for (;;) {
-            ssize_t nr = od_pread(fd, buf, buf_size, file_off2);
-            if (nr <= 0) break;
-            size_t pos = 0;
-            if (carry_len > 0) {
-                if (carry_len < 24) {
-                    int need = 24 - carry_len;
-                    if ((ssize_t)need > nr) {
-                        if ((size_t)(carry_len + nr) > carry_cap) {
-                            carry_cap = (size_t)(carry_len + nr);
-                            uint8_t *nc = realloc(carry, carry_cap);
-                            if (!nc) { free(carry); free(buf); close(fd); return -1; }
-                            carry = nc;
-                        }
-                        memcpy(carry + carry_len, buf, (size_t)nr);
-                        carry_len += (int)nr;
-                        file_off2 += nr; continue;
-                    }
-                    memcpy(carry + carry_len, buf, (size_t)need);
-                    pos += (size_t)need; carry_len = 24;
-                }
-                uint16_t klen; memcpy(&klen, carry + 16, 2);
-                uint32_t vlen; memcpy(&vlen, carry + 20, 4);
-                size_t rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
-                int need2 = (int)rec_size - carry_len;
-                if (need2 > 0) {
-                    /* Bytes actually remaining in this chunk starting at
-                       buf + pos — NOT the full chunk size nr, since Stage 1
-                       (header completion) may have already consumed pos
-                       bytes from the front of this same chunk
-                       (CID 1696471). */
-                    size_t remain = (size_t)nr - pos;
-                    if ((size_t)need2 > remain) {
-                        if ((size_t)(carry_len + remain) > carry_cap) {
-                            carry_cap = (size_t)(carry_len + remain);
-                            uint8_t *nc = realloc(carry, carry_cap);
-                            if (!nc) { free(carry); free(buf); close(fd); return -1; }
-                            carry = nc;
-                        }
-                        memcpy(carry + carry_len, buf + pos, remain);
-                        carry_len += (int)remain;
-                        file_off2 += nr; continue;
-                    }
-                    if (rec_size > carry_cap) {
-                        carry_cap = rec_size;
-                        uint8_t *nc = realloc(carry, carry_cap);
-                        if (!nc) { free(carry); free(buf); close(fd); return -1; }
-                        carry = nc;
-                    }
-                    memcpy(carry + carry_len, buf + pos, (size_t)need2);
-                    pos += (size_t)need2;
-                }
-                if (carry[18] == 2)
-                    pool_push_free_cap(&db->streams[sid], (uint16_t)file_id,
-                                       carry_off, (uint32_t)rec_size, db->slot_size);
-                carry_len = 0;
-            }
-            while (pos + 24 <= (size_t)nr) {
-                uint8_t *rec = buf + pos;
-                uint16_t klen; memcpy(&klen, rec + 16, 2);
-                uint32_t vlen; memcpy(&vlen, rec + 20, 4);
-                size_t rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
-                if (pos + rec_size > (size_t)nr) break;
-                if (rec[18] == 2)
-                    pool_push_free_cap(&db->streams[sid], (uint16_t)file_id,
-                                       (uint32_t)(file_off2 + (off_t)pos),
-                                       (uint32_t)rec_size, db->slot_size);
-                pos += rec_size;
-            }
-            if (pos < (size_t)nr) {
-                size_t tail = (size_t)nr - pos;
-                if (tail > carry_cap) {
-                    carry_cap = tail;
-                    uint8_t *nc = realloc(carry, carry_cap);
-                    if (!nc) { free(carry); free(buf); close(fd); return -1; }
-                    carry = nc;
-                }
-                carry_len = (int)tail;
-                carry_off = (uint32_t)(file_off2 + (off_t)pos);
-                memcpy(carry, buf + pos, tail);
-            }
-            file_off2 += (off_t)nr;
-            if (nr < (ssize_t)buf_size) break;
-        }
-        free(carry);
-        free(buf);
-        close(fd);
-        return 0;
-}
-
 /* Walk every segment for a single stream, populate the in-memory free-slot
    pool from flag=2 slots, and position reserve_off past the last live slot
    in the highest-numbered segment. Returns 0 on success, -1 on error. */
@@ -4511,33 +4410,47 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
         char path[PATH_MAX];
         seg_path_for(path, db->data_dir, sid, (uint32_t)file_id);
 
-        if (file_id != last_id) {
-            /* Non-active segment: O_DIRECT scan for tombstones only.
-               Read-once at startup, never written — pages must not enter
-               the page cache and displace KF/index pages loaded by warmup. */
-            recover_scan_tombstones_od(db, sid, file_id, path);
+        if (file_id != last_id)
             continue;
-        }
 
         /* Active (last) segment: mmap via segcache so the first post-startup
-           insert doesn't take a cold segcache miss. Also scans tombstones
-           and locates the reserve frontier. */
+           insert doesn't take a cold segcache miss and locate the reserve
+           frontier. Free-pool reconstruction is KF-driven after this walk. */
         SlotcaskSegHandle h;
         if (segcache_acquire(&h, path, 0, 0, 0) != 0) { free(ids); return -1; }
-        off_t pos = 0;
-        off_t lim = (off_t)h.map_size;
+        size_t pos = 0;
+        size_t lim = h.map_size;
         while (pos + 24 <= lim) {
-            uint8_t flag = __atomic_load_n(&h.map[pos + 18], __ATOMIC_ACQUIRE);
-            if (flag == 0) break;
-            uint16_t klen; memcpy(&klen, h.map + pos + 16, 2);
-            uint32_t vlen; memcpy(&vlen, h.map + pos + 20, 4);
-            size_t rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
-            if (flag == 2)
-                pool_push_free_cap(&db->streams[sid], (uint16_t)file_id,
-                                   (uint32_t)pos, (uint32_t)rec_size, db->slot_size);
-            pos += (off_t)rec_size;
+            size_t rec_size;
+            uint8_t flag;
+            uint16_t klen;
+            uint32_t vlen;
+            int valid = seg_scan_varlen_struct_ok(h.map, lim, pos,
+                                                   (size_t)db->slot_size,
+                                                   &rec_size, &flag,
+                                                   &klen, &vlen);
+            if (valid && flag != 0)
+                valid = seg_scan_varlen_hash_ok(h.map, pos, klen);
+
+            if (!valid || flag == 0) {
+                size_t next;
+                if (seg_scan_varlen_resync(h.map, lim, pos,
+                                            (size_t)db->slot_size,
+                                            (size_t)db->slot_size, &next)) {
+                    pos = next;
+                    continue;
+                }
+                if (valid && flag == 0)
+                    break; /* ordinary unwritten tail */
+                segcache_release(&h);
+                free(ids);
+                errno = EUCLEAN;
+                return -1;
+            }
+
+            pos += rec_size;
         }
-        last_offset = pos;
+        last_offset = (off_t)pos;
         segcache_release(&h);
     }
     /* Every writer of active_file_id/reserve_off follows the rotation lock:
