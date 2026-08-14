@@ -1,6 +1,6 @@
 /* src/test/cases/test_coverity_seg_scan_varlen_overflow.c
  *
- * CID 1696466: seg_scan_o_direct_varlen narrowed a size_t rec_size
+ * CID 1696466: seg_scan_o_direct narrowed a size_t rec_size
  * (derived from an on-disk, unvalidated vlen field) into an int before
  * computing `need`. A corrupted vlen near the top of the uint32_t range
  * makes the truncated int small or negative, skipping the "need more
@@ -15,7 +15,7 @@
  * (4294967304 mod 2^32 = 8) — reproducing the exact wrap described in
  * the finding.
  *
- * seg_scan_o_direct_varlen reads in odirect_buf_size-sized chunks
+ * seg_scan_o_direct reads in odirect_buf_size-sized chunks
  * (default 32 MiB = 33554432 bytes, set once lazily and shared across
  * the whole test-runner process — see io_direct.c). To make this
  * deterministic regardless of what earlier-run tests may have done to
@@ -33,7 +33,7 @@
  * (matches od_varlen_rec_size's minimum shape); vlen=0 padding records
  * are valid empty-value VARLEN tombstone-shaped records for this raw
  * scan (the callback is never invoked for flag=2 padding — see
- * seg_scan_o_direct_varlen's flag handling — so their content doesn't
+ * seg_scan_o_direct's flag handling — so their content doesn't
  * matter, only their header bytes).
  */
 #ifndef _GNU_SOURCE
@@ -50,7 +50,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <errno.h>
 
 static int g_cb_calls = 0;
 
@@ -104,7 +103,7 @@ static int test_coverity_seg_scan_varlen_overflow_run(void) {
                   "crafted file is the expected size");
 
     g_cb_calls = 0;
-    int rc = seg_scan_o_direct_varlen(path, 64, capture_cb, NULL);
+    int rc = seg_scan_o_direct(path, 64, capture_cb, NULL);
 
     /* Pre-fix: rec_size (4294967304) truncates to int(8); with carry_len
        already at 24 by the time Stage 2 runs, need = 8 - 24 = -16 <= 0,

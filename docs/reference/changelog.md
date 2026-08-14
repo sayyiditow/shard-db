@@ -4,6 +4,14 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.08.2
+
+Breaking storage boundary: new segments are VARIABLE-only and startup performs
+compatibility gating but no conversion or index rebuild. Populated roots must
+have clean 2026.08.1 evidence. Migration CLI/JSON/npm surfaces and standalone
+`compact` are removed. Use transactional `vacuum` with `compact:true` for a
+full rebuild; `slotcask_compact_segs()` alone is not an atomic full-repack.
+
 ## 2026.08.1
 
 Automatic version-gated startup migration on both daemon and embedded paths — replaces the standalone `./migrate` binary with a `$DB_ROOT/.version` check that runs a full secondary-index reindex in-process when needed. Also in this release: ACID-hardened writes (atomic indexed writes across crash boundaries, crash-safe object rebuild via `RebuildTxn`, atomic partial updates and index publication), a new opt-in auto-reshard feature, a broad set of concurrency fixes (read-path UAF, btree-cache eviction race, lock-order inversions, cache staleness on rebuild), NQL protocol fixes (quoted literals — breaking change, `--filter` on aggregate, lock-free reads), input-validation hardening across the criteria/NQL parsers and server dispatch, the dead v1 ucache/shard-file engine and `rebuild-kf` removed, and several correctness fixes (JSON-escaped varchar handling across storage/indexing/criteria/cursor/CSV paths, a `get`+`fields` v2 dispatch bug, a `decode_field` stack overflow on long composite fields, a `count` error-swallowing bug), plus writer-preferring per-file cache rwlocks to prevent writer starvation. No on-disk format changes.

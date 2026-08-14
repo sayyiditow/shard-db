@@ -748,7 +748,7 @@ int shard_db_version_compare(const char *a, const char *b);
 int shard_db_version_is_valid(const char *version);
 int shard_db_version_decide(const char *disk_version, int version_present,
                             int db_empty, const char *current_version,
-                            const char *minimum_version, int has_migration);
+                            const char *required_source_version);
 
 /* config.c */
 int load_db_root(char *out, size_t outlen);
@@ -793,6 +793,7 @@ int  enum_value_index(const TypedField *f, const char *val, size_t vlen);
 void free_enum_values(TypedField *f);
 void load_dirs(void);
 int is_valid_dir(const char *dir);
+int dir_name_ok(const char *dir);
 void build_effective_root(char *out, size_t outlen, const char *dir);
 
 /* Typed field system */
@@ -1345,10 +1346,17 @@ int rebuild_recovery(const char *db_root);
 int db_root_lock_acquire(const char *db_root, int *out_fd);
 void db_root_lock_release(int *fd);
 
-/* Version file helpers (embedded.c) */
+/* Read-only compatibility check. Caller holds the DB-root lock. */
+int shard_db_version_check(const char *db_root,
+                           char *out_disk_version, size_t out_sz);
+/* Atomic compatibility commit, called only after recovery and validation. */
+int shard_db_version_stamp(const char *db_root);
 int shard_db_version_file_read(const char *db_root, char *out, size_t out_sz);
 int shard_db_version_file_write(const char *db_root, const char *version);
-int shard_db_startup_migrate(const char *db_root, char *out_disk_version, size_t out_sz);
+int shard_db_recover_before_stamp(const char *db_root,
+                                  int *out_markers_replayed);
+int shard_db_validate_before_stamp(const char *db_root);
+int shard_db_mark_clean_if_safe(const char *db_root);
 
 typedef struct RebuildTxn RebuildTxn;
 
@@ -1410,7 +1418,7 @@ static inline uint32_t resolve_timeout_ms(void) {
 int cmd_server(const char *db_root, int daemonize);
 int cmd_stop(const char *db_root);
 int cmd_status(const char *db_root);
-void shard_db_offline_init(const char *db_root); /* minimal g_db stub for offline commands (migrate-varlen etc.) */
+void shard_db_offline_init(const char *db_root); /* minimal g_db stub for offline maintenance commands */
 int cmd_query(int port, int argc, char **argv);
 int cmd_query_json(int port, const char *json);
 int cmd_put_file_tcp(int port, const char *dir, const char *object,

@@ -86,10 +86,10 @@ static int test_version_subcommand_prints_compiled_version(void) {
     if (out) {
         ASSERT_TRUE(strstr(out, SHARD_DB_VERSION) != NULL,
                     "output contains the compiled-in version string");
-        ASSERT_TRUE(strstr(out, SHARD_DB_MIN_VERSION) != NULL,
-                    "output contains the informational minimum source version");
-        ASSERT_TRUE(strstr(out, "not enforced") != NULL,
-                    "output states that the minimum is informational");
+        ASSERT_TRUE(strstr(out, SHARD_DB_REQUIRED_SOURCE_VERSION) != NULL,
+                    "output contains the required source version");
+        ASSERT_TRUE(strstr(out, "enforced") != NULL,
+                    "output states that the source requirement is enforced");
         free(out);
     }
     return 0;

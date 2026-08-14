@@ -20,8 +20,6 @@ static int test_varlen_compact_recipient_resync_run(void) {
     memset(&db, 0, sizeof(db));
     int ret = slotcask_open(&db, tmpdir, 8, 1, 8192);
     ASSERT_EQ_INT(ret, 0, "slotcask_open");
-    ret = slotcask_migrate_to_varlen(&db);
-    ASSERT_EQ_INT(ret, 0, "migrate_to_varlen");
 
     ret = varlen_compact_fixture_build(&db);
     ASSERT_EQ_INT(ret, 0, "build rotated donor/recipient fixture");

@@ -178,14 +178,12 @@ that release's `./migrate` to convert v1 → v2; this version refuses
 any v1 object at load.
 
 2026.05.5 also rolls B+ tree magic `'BTRG'` → `'BTRH'` for the
-`(value, hash)` sort order. As of 2026.08.1, startup migration is
-automatic — the daemon compares `$DB_ROOT/.version` against its
-compiled-in `SHARD_DB_VERSION` and runs this release's full reindex
-in-process if the disk version is older. The standalone `./migrate`
-binary is removed; `./shard-db reindex` remains available for on-demand
-operator use. The minimum supported source release is 2026.07.3, recorded
-for operators but informational and not enforced in this release because
-earlier releases did not write `.version`.
+`(value, hash)` sort order. 2026.08.2 performs strict compatibility gating:
+an empty root initializes directly, while a populated root must contain
+2026.08.1 clean-open evidence. Startup does not migrate data or rebuild
+indexes; use `./shard-db reindex` explicitly when required. The standalone
+`./migrate`, `migrate-varlen`, and storage migration JSON modes are removed.
+The minimum supported source release is 2026.08.1.
 
 **Bulk-insert at scale**: pre-grow (2026.05.x) makes bulk-insert ~2× faster on every path. Parallel still wins for max throughput — C-bench shows CSV K/V at 5.34 M/sec single vs **7.55 M/sec at 5 conns × 2M** (1.41× single). The "single beats parallel" claim that briefly appeared in earlier docs was a bash-bench artifact (shell forked `$BIN query` subprocesses per chunk ×5; each fork costs 10–30 ms). With C pthreads, the original `R ≈ N/200K, 5 ≤ conns` rule still holds.
 

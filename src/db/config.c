@@ -709,7 +709,7 @@ int is_valid_dir(const char *dir) {
 /* Validate a tenant dir name: no path separators, no control chars, no
    leading dot or "..", reasonable length. Mirrors is_valid_dir's contract
    so add-dir can't sneak a malicious value past is_valid_dir later. */
-static int dir_name_ok(const char *dir) {
+int dir_name_ok(const char *dir) {
     if (!dir || !dir[0]) return 0;
     size_t L = strlen(dir);
     if (L > 64) return 0;

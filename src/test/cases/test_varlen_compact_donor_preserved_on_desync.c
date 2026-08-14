@@ -48,7 +48,7 @@ static int test_varlen_compact_donor_preserved_on_desync_run(void) {
     }
     fclose(f);
 
-    int rc = seg_scan_o_direct_varlen(path, max_slot_size, noop_cb, NULL);
+    int rc = seg_scan_o_direct(path, max_slot_size, noop_cb, NULL);
     ASSERT_TRUE(rc < 0, "scan reports failure on an unrecoverable desync, "
                          "instead of silently truncating (the exact "
                          "condition compact_migrate_records_varlen relies "

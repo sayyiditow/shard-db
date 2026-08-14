@@ -118,7 +118,6 @@ int od_seg_record_cb(const uint8_t *rec, size_t vlen,
 typedef struct {
     char           seg_path[PATH_MAX];
     int            slot_size;
-    int            format;     /* SLOTCASK_FORMAT_FIXED or SLOTCASK_FORMAT_VARIABLE */
     V2ScanWrap    *wrap;
     int           *stop_flag;
     FILE          *parent_out;
@@ -129,10 +128,7 @@ static void *od_seg_file_worker(void *raw) {
     g_out = arg->parent_out ? arg->parent_out : stdout;
     if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
     OdSegAdapterCtx actx = { .wrap = arg->wrap, .stop_flag = arg->stop_flag };
-    if (arg->format == SLOTCASK_FORMAT_VARIABLE)
-        seg_scan_o_direct_varlen(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
-    else
-        seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
+    seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
     return NULL;
 }
 
@@ -170,7 +166,6 @@ void scan_shards_v2_o_direct(SlotcaskDb *db, scan_callback cb, void *ctx) {
             snprintf(args[nargs].seg_path, PATH_MAX,
                      "%s/%s", stream_dir, de->d_name);
             args[nargs].slot_size  = db->slot_size;
-            args[nargs].format     = db->format;
             args[nargs].wrap       = &wrap;
             args[nargs].stop_flag  = &stop_flag;
             args[nargs].parent_out = parent_out;
@@ -195,14 +190,20 @@ typedef struct {
     FieldSchema        *fs;
     const CompiledCriterion *single_cc;
     const CriteriaNode  *tree;
+    QueryDeadline       *dl;
+    int                  dl_counter;
 } VarlenMatchCtx;
 
 /* od_record_cb wrapper for varlen match scanning.  Extracts the value
-   from the record and runs match_typed / criteria_match_tree directly. */
+   from the record and runs match_typed / criteria_match_tree directly.
+   A nonzero return tells seg_scan_o_direct to stop scanning immediately
+   (see its cb() call sites) — used here to bail out promptly once the
+   per-request deadline trips. */
 static int varlen_match_cb(const uint8_t *rec, size_t vlen,
                             const uint8_t hash16[16], void *raw) {
     VarlenMatchCtx *mc = (VarlenMatchCtx *)raw;
     (void)hash16;
+    if (query_deadline_tick(mc->dl, &mc->dl_counter)) return 1;
     uint16_t klen;
     memcpy(&klen, rec + 16, 2);
     const uint8_t *value = rec + 24 + (size_t)klen;
@@ -222,7 +223,6 @@ static int varlen_match_cb(const uint8_t *rec, size_t vlen,
 typedef struct {
     char                seg_path[PATH_MAX];
     int                 slot_size;
-    int                 format;     /* SLOTCASK_FORMAT_FIXED or SLOTCASK_FORMAT_VARIABLE */
     FieldSchema        *fs;
     const CompiledCriterion *single_cc;
     const CriteriaNode  *tree;
@@ -234,18 +234,12 @@ static void *od_match_file_worker(void *raw) {
     OdMatchFileArg *arg = (OdMatchFileArg *)raw;
     int64_t local_count = 0;
 
-    if (arg->format == SLOTCASK_FORMAT_VARIABLE) {
-        VarlenMatchCtx mc = {
-            .count = &local_count, .fs = arg->fs,
-            .single_cc = arg->single_cc, .tree = arg->tree,
-        };
-        seg_scan_o_direct_varlen(arg->seg_path, arg->slot_size, varlen_match_cb, &mc);
-    } else {
-        int rc = seg_scan_o_direct_match(arg->seg_path, arg->slot_size,
-                                          arg->fs, arg->single_cc, arg->tree,
-                                          arg->dl, &local_count);
-        (void)rc;
-    }
+    VarlenMatchCtx mc = {
+        .count = &local_count, .fs = arg->fs,
+        .single_cc = arg->single_cc, .tree = arg->tree,
+        .dl = arg->dl,
+    };
+    seg_scan_o_direct(arg->seg_path, arg->slot_size, varlen_match_cb, &mc);
 
     if (local_count > 0)
         __atomic_add_fetch(arg->out_count,
@@ -289,7 +283,6 @@ void scan_shards_v2_o_direct_match(SlotcaskDb *db,
             snprintf(args[nargs].seg_path, PATH_MAX,
                      "%s/%s", stream_dir, de->d_name);
             args[nargs].slot_size  = db->slot_size;
-            args[nargs].format     = db->format;
             args[nargs].fs         = fs;
             args[nargs].single_cc  = single_cc;
             args[nargs].tree       = tree;
@@ -743,8 +736,7 @@ typedef struct {
     TypedSchema       *new_ts;
     int               *new_to_old;
     int                slot_changed;
-    int                live_count;
-    int                skipped;
+    uint64_t           live_count;
     int                error;
     /* Per-new-field backfill state; indexed by new_ts field index.
        Entries for fields that don't need backfill have kind=DK_NONE. */
@@ -876,10 +868,11 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
         /* Layout unchanged (e.g., splits-only resplit). Re-insert the
            record bytes verbatim. */
         if (slotcask_insert(ctx->new_db, -1, key, klen, value, vlen) != 0) {
-            LOG_WARN(LOG_SUB_CONFIG, "rebuild_v2: insert failed for record %d (klen=%zu vlen=%zu), skipping",
-                     ctx->live_count + ctx->skipped + 1, klen, vlen);
-            ctx->skipped++;
-            return 0;
+            LOG_ERROR(LOG_SUB_CONFIG,
+                      "rebuild_v2: insert failed at copied record %llu (klen=%zu)",
+                      (unsigned long long)(ctx->live_count + 1u), klen);
+            ctx->error = 1;
+            return 1;
         }
         ctx->live_count++;
         return 0;
@@ -983,10 +976,11 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
                               buf, ctx->new_ts->total_size);
     free(buf);
     if (rc != 0) {
-        LOG_WARN(LOG_SUB_CONFIG, "rebuild_v2: insert failed for record %d (klen=%zu), skipping",
-                 ctx->live_count + ctx->skipped + 1, klen);
-        ctx->skipped++;
-        return 0;
+        LOG_ERROR(LOG_SUB_CONFIG,
+                  "rebuild_v2: insert failed at copied record %llu (klen=%zu)",
+                  (unsigned long long)(ctx->live_count + 1u), klen);
+        ctx->error = 1;
+        return 1;
     }
     ctx->live_count++;
     return 0;
@@ -1072,16 +1066,15 @@ int rebuild_object_v2(const char *db_root, const char *object,
     walk_ctx.db_root       = db_root;
     walk_ctx.object        = object;
 
-    /* Pre-flight an existing live count so DK_SEQ ranges can be reserved
-       up-front (one flock per field rather than per record). The walk
-       below is sequential so this count is exact at walk time. */
-    long long pf_live = 0;
-    if (slot_changed) {
-        uint64_t pf_total = 0, pf_deleted = 0;
-        if (slotcask_sum_kf_totals(&legacy_db, &pf_total, &pf_deleted) == 0) {
-            pf_live = (long long)(pf_total - pf_deleted);
-        }
+    /* Read the authoritative source count for every rebuild. */
+    uint64_t source_total = 0, source_deleted = 0;
+    if (slotcask_sum_kf_totals(&legacy_db, &source_total, &source_deleted) != 0 ||
+        source_deleted > source_total || source_total - source_deleted > INT64_MAX) {
+        failure = "Failed to read a valid source live count";
+        goto txn_fail;
     }
+    uint64_t expected_live = source_total - source_deleted;
+    long long pf_live = (long long)expected_live;
 
     /* Allocate per-new-field backfill specs. Only fields with new_to_old==-1
        AND a computed default kind need anything; the rest stay DK_NONE. */
@@ -1098,6 +1091,10 @@ int rebuild_object_v2(const char *db_root, const char *object,
             const TypedField *nf = &new_ts->fields[k];
             walk_ctx.backfill[k].kind = nf->default_kind;
             if (nf->default_kind == DK_SEQ && pf_live > 0) {
+                if (pf_live > INT_MAX) {
+                    failure = "Sequence backfill exceeds batch API limit";
+                    goto txn_fail;
+                }
                 long long start = seq_next_val_batch(db_root, object,
                                                       nf->default_val,
                                                       (int)pf_live);
@@ -1116,11 +1113,8 @@ int rebuild_object_v2(const char *db_root, const char *object,
     }
 
     slotcask_walk_live(&legacy_db, v2_rebuild_walk_cb, &walk_ctx);
-    int live_count = walk_ctx.live_count;
-    int skipped    = walk_ctx.skipped;
+    uint64_t live_count = walk_ctx.live_count;
     int walk_err   = walk_ctx.error;
-    if (skipped > 0)
-        LOG_WARN(LOG_SUB_CONFIG, "rebuild_v2: skipped %d records due to insert failure", skipped);
     free(walk_ctx.backfill);
     walk_ctx.backfill = NULL;
 
@@ -1132,6 +1126,10 @@ int rebuild_object_v2(const char *db_root, const char *object,
 
     if (walk_err) {
         failure = "Rebuild walk failed";
+        goto txn_fail;
+    }
+    if (live_count != expected_live) {
+        failure = "Rebuild copied record count does not match source";
         goto txn_fail;
     }
 
@@ -1215,14 +1213,14 @@ int rebuild_object_v2(const char *db_root, const char *object,
     rebuild_txn_free(txn);
     txn = NULL;
     reset_deleted_count(db_root, object);
-    set_count(db_root, object, live_count);
+    set_count(db_root, object, live_count > INT_MAX ? INT_MAX : (int)live_count);
 
-    LOG_AUDIT(LOG_SUB_CONFIG, "REBUILD-V2 %s/%s: live=%d, splits=%d→%d, streams=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
-            db_root, object, live_count, old_sch->splits, new_sch->splits,
+    LOG_AUDIT(LOG_SUB_CONFIG, "REBUILD-V2 %s/%s: live=%llu, splits=%d→%d, streams=%d→%d, slot_size=%d→%d, compact=%d, idx_rebuilt=%d",
+            db_root, object, (unsigned long long)live_count, old_sch->splits, new_sch->splits,
             old_sch->streams, new_sch->streams,
             old_sch->slot_size, new_sch->slot_size, drop_tombstoned, idx_rebuilt);
-    OUT("{\"status\":\"rebuilt\",\"live\":%d,\"splits\":%d,\"streams\":%d,\"slot_size\":%d,\"compact\":%s,\"indexes_rebuilt\":%d}\n",
-        live_count, new_sch->splits, new_sch->streams, new_sch->slot_size,
+    OUT("{\"status\":\"rebuilt\",\"live\":%llu,\"splits\":%d,\"streams\":%d,\"slot_size\":%d,\"compact\":%s,\"indexes_rebuilt\":%d}\n",
+        (unsigned long long)live_count, new_sch->splits, new_sch->streams, new_sch->slot_size,
         drop_tombstoned ? "true" : "false", idx_rebuilt);
     return 0;
 
@@ -1335,8 +1333,10 @@ int rebuild_object(const char *db_root, const char *object,
        the old vlen) AND computed defaults are never stamped. */
     int slot_changed = (new_sch.slot_size != old_sch.slot_size) || (n_added > 0);
 
-    /* Nothing to do — caller probably called rebuild without flags */
-    if (!splits_changed && !slot_changed && !streams_changed && n_added == 0) {
+    /* Explicit compact is itself work: it must rebuild the data generation
+       even when no schema, split, or stream setting changes. */
+    if (!drop_tombstoned && !splits_changed && !slot_changed &&
+        !streams_changed && n_added == 0) {
         OUT("{\"status\":\"noop\",\"reason\":\"no change requested\"}\n");
         return 0;
     }

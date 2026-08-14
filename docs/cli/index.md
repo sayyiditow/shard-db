@@ -77,8 +77,7 @@ Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). Fo
 
 | Command | Args | Description |
 |---|---|---|
-| `vacuum` | `<dir> <obj>` | Fast in-place tombstone reclaim (no schema changes). For compact/reshard, use [JSON mode](../query-protocol/schema-mutations.md). |
-| `compact` | `<dir> <obj>` | Offline VARCHAR compaction — rewrites all VARIABLE-format segments, trimming trailing zero bytes from every record. Reclaims the space saved by switching from fixed-width slots to the VARIABLE format. Earlier releases performed this before 2026.08.1; startup migration now only rebuilds indexes. Requires the server to be stopped. |
+| `vacuum` | `<dir> <obj>` | Lightweight in-place cleanup. Use JSON `{"compact":true}` for the supported transactional full rebuild. |
 | `recount` | `<dir> <obj>` | Rescans shards and rewrites the cached `counts` file. |
 | `truncate` | `<dir> <obj>` | Delete all records. Schema + indexes survive. |
 | `backup` | `<dir> <obj>` | Copy the object's data + metadata + indexes to a timestamped backup directory. |
@@ -95,7 +94,7 @@ Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). Fo
 | `vacuum-check` | — | List objects where tombstoned ≥ 10 % AND live ≥ 1000. Suggests candidates for `vacuum`. |
 | `reindex` | `[dir] [obj]` | Rebuild indexes — wipes per-field idx directories and rebuilds at the current `index_splits_for(splits)` shard count. No args = all tenants. |
 | `orphaned` | `<dir> <obj>` | Bare integer count of tombstoned-but-not-vacuumed slots. O(1) metadata read. New in 2026.05.1. |
-| `(./migrate)` | — | **Removed as of 2026.08.1.** Startup migration now compares `$DB_ROOT/.version` against the compiled-in version and performs the release's full index rebuild in-process on upgrade. |
+| `(./migrate)` | — | Removed. 2026.08.2 does not convert or rebuild storage at startup; upgrade through the documented 2026.08.1 clean-open boundary. |
 
 ## JSON query mode
 

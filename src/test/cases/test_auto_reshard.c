@@ -1,7 +1,7 @@
 /* src/test/cases/test_auto_reshard.c
  * Auto-reshard thread fires within its configured hour, reshards an
- * object whose fabricated live count has outgrown its current splits,
- * and leaves an already-correctly-sized object untouched.
+ * object that has outgrown its current splits, and leaves an
+ * already-correctly-sized object untouched.
  *
  * Custom daemon spawn: sets AUTO_RESHARD_HOUR to the test's own current
  * server-local hour so the thread's first wall-clock check matches
@@ -14,16 +14,29 @@
  * 5s startup delay + the object setup this test does first (well under
  * 1s) + reshard duration, all comfortably inside a 20s poll window.
  *
- * Live-count fabrication: this test spawns the daemon as a separate
- * process (fork+execl), so it cannot call in-process helpers like
- * slotcask_test_set_kf_total() (those need an already-open SlotcaskDb*
- * in the same address space). Instead it writes directly into shard 0's
- * on-disk kf header (offset 8, 8 bytes, the `total` field) after
- * create-object has created the (real, empty) kf shard files. This is
- * safe here because slotcask_sum_kf_totals() (which get_live_count()
- * calls, src/db/slotcask.c:2884) does a fresh open()+pread() per shard
- * rather than going through the mmap'd kfcache, so it observes the
- * external pwrite() via the OS page cache with no staleness window.
+ * 'grown' uses real bulk-inserted records (rebuild_object_v2 now hard-
+ * fails a reshard whose copied live count doesn't match the source kf
+ * header's declared total — see query_find.c's `expected_live` check —
+ * so a live count backed by no real records can no longer complete an
+ * actual rebuild the way it could pre-refactor). 1.05M real records
+ * bulk-insert in ~1-2s, well inside the poll budget, and keep this
+ * test's valuable concurrent-writer-during-a-real-rebuild lock coverage
+ * (see WriterCtx below) intact.
+ *
+ * 'huge' cannot follow the same path — 3 billion real records isn't
+ * something a routine test can create — so it keeps the on-disk kf
+ * header fabrication technique (writes shard 0's `total` field directly,
+ * offset 8, 8 bytes; safe because slotcask_sum_kf_totals(), which
+ * get_live_count() calls, does a fresh open()+pread() per shard rather
+ * than going through the mmap'd kfcache, so it observes the external
+ * pwrite() via the OS page cache with no staleness window). Because the
+ * fabricated total has no matching real records, the actual rebuild now
+ * correctly refuses (by design — this is the same invariant that makes
+ * 'grown' need real data). What this still proves: reshard_target_for_
+ * count() and the full-width live-count read reach the right decision
+ * at true past-INT_MAX scale, verified via the "AUTO-RESHARD ... starting
+ * 8 -> 2048" log line emitted before the (expected-to-fail) rebuild
+ * attempt — not via the rebuild actually completing.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -58,6 +71,49 @@ static int fabricate_kf_total(const char *kf_path, uint64_t total) {
     ssize_t n = pwrite(fd, &total, sizeof(total), 8);
     close(fd);
     return (n == (ssize_t)sizeof(total)) ? 0 : -1;
+}
+
+#define GROWN_BASE_COUNT 1050000
+#define GROWN_CHUNK      50000
+
+/* The wait budgets below (20s/40s) are calibrated for uninstrumented
+   execution: 5s thread-startup delay + a 1.05M-record bulk-insert +
+   a full kf/segment rebuild, all comfortably inside budget on plain and
+   ASan builds (ASan's overhead here is modest). TSan's shadow-memory and
+   happens-before tracking on every memory access materially slows the
+   same rebuild, which can push it past the un-scaled budget without any
+   functional problem -- the reshard still runs and still reaches the
+   right target, just slower. Scale the *wait*, not the assertion: the
+   correctness check (did it reshape / reach the right target) is
+   unchanged either way. */
+#if defined(__SANITIZE_THREAD__)
+#define RESHARD_WAIT_SCALE 6
+#else
+#define RESHARD_WAIT_SCALE 1
+#endif
+
+/* Poll `<base>/logs/<date_str>-info.log` for a line containing `tag`. LOG_WARN
+   is level 2, which open_log_for_level() (config.c) routes to -info.log
+   (only level 1 / ERROR gets its own -error.log) -- see
+   test_auto_reshard_shutdown_race.c's wait_for_reshard_start() for the
+   original version of this pattern. */
+static int wait_for_log_line(const char *base, const char *date_str,
+                              const char *tag, int timeout_s) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/logs/%s-info.log", base, date_str);
+    for (int i = 0; i < timeout_s * 2; i++) {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char line[1024];
+            while (fgets(line, sizeof(line), f)) {
+                if (strstr(line, tag)) { fclose(f); return 1; }
+            }
+            fclose(f);
+        }
+        struct timespec ts = { 0, 500 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
 }
 
 /* Concurrent-write guard against the reshard: while auto_reshard_thread
@@ -128,6 +184,8 @@ static int test_auto_reshard_run(void) {
         now = time(NULL);
         localtime_r(&now, &tmv);
     }
+    char date_str[16];
+    strftime(date_str, sizeof(date_str), "%Y-%m-%d", &tmv);
 
     char env_path[300]; snprintf(env_path, sizeof(env_path), "%s/db.env", base);
     FILE *f = fopen(env_path, "w");
@@ -188,17 +246,41 @@ static int test_auto_reshard_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
 
-    /* Object 1: under-split. splits=8, fabricate shard 0's live count to
-       2,000,000 (falls in the 1M-10M band -> target=16 > 8). */
+    /* Object 1: under-split. splits=8, seeded with GROWN_BASE_COUNT
+       (1,050,000) real records (falls in the 1M-10M band -> target=16 > 8).
+       Real records, not a fabricated kf header total, because
+       rebuild_object_v2 now hard-fails a reshard whose copied live count
+       doesn't match the source header's declared total (see this file's
+       header comment). */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"grown\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"v:int\"],\"indexes\":[]}",
         &resp); free(resp); resp = NULL;
 
-    char kf_path[PATH_MAX];
-    snprintf(kf_path, sizeof(kf_path), "%s/default/grown/data/kf/000.kf", db_root);
-    ASSERT_EQ_INT(fabricate_kf_total(kf_path, 2000000ULL), 0,
-                  "fabricate shard 0 total=2,000,000 on 'grown'");
+    {
+        size_t buf_cap = (size_t)GROWN_CHUNK * 40 + 256;
+        char *bulk = malloc(buf_cap);
+        ASSERT_NOT_NULL(bulk, "malloc grown bulk-insert buffer");
+        int all_ok = bulk != NULL;
+        for (int base_i = 0; all_ok && base_i < GROWN_BASE_COUNT; base_i += GROWN_CHUNK) {
+            int end = base_i + GROWN_CHUNK;
+            if (end > GROWN_BASE_COUNT) end = GROWN_BASE_COUNT;
+            size_t off = 0;
+            off += (size_t)snprintf(bulk + off, buf_cap - off,
+                "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"grown\","
+                "\"records\":{");
+            for (int i = base_i; i < end; i++) {
+                off += (size_t)snprintf(bulk + off, buf_cap - off,
+                    "%s\"g%d\":{\"v\":%d}", i == base_i ? "" : ",", i, i);
+            }
+            off += (size_t)snprintf(bulk + off, buf_cap - off, "}}");
+            tc_request(tc, bulk, &resp);
+            if (!resp || SAFE_STRSTR(resp, "\"error\"")) all_ok = 0;
+            free(resp); resp = NULL;
+        }
+        free(bulk);
+        ASSERT_TRUE(all_ok, "grown seeded with 1,050,000 real records");
+    }
 
     /* Object 2: already correctly sized. splits=64, live stays tiny
        (a few real inserts) -> target=8 <= 64, must stay untouched. */
@@ -220,7 +302,17 @@ static int test_auto_reshard_run(void) {
        Before this task's fix, get_live_count()'s (int) cast wraps this to
        a negative value, reshard_target_for_count() falls through to its
        `return 8` default, 8 <= 8, and 'huge' is silently never reshaped —
-       the exact bug this test catches. */
+       the exact bug this test catches.
+
+       3 billion real records isn't something a routine test can create, so
+       this object keeps the fabricated-header technique. That means the
+       actual rebuild attempt is now expected to fail (rebuild_object_v2's
+       live-count-matches-source-total invariant correctly refuses a
+       fabricated total with no matching real records) -- so verification
+       below checks the "AUTO-RESHARD ... starting 8 -> 2048" log line
+       (proving reshard_target_for_count() reached the right decision at
+       true past-INT_MAX scale) rather than waiting for the rebuild/
+       describe-object to report the new splits. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"huge\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"v:int\"],\"indexes\":[]}",
@@ -243,7 +335,7 @@ static int test_auto_reshard_run(void) {
     TAP_DIAG("# auto-reshard: waiting up to 20s for the first thread tick...\n");
     fflush(_TAP_OUT);
     int grown_reshaped = 0;
-    for (int i = 0; i < 40; i++) {
+    for (int i = 0; i < 40 * RESHARD_WAIT_SCALE; i++) {
         struct timespec ts = { 0, 500 * 1000000L }; nanosleep(&ts, NULL);
         tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"default\",\"object\":\"grown\"}", &resp);
         if (resp && SAFE_STRSTR(resp, "\"splits\":16")) { grown_reshaped = 1; free(resp); resp = NULL; break; }
@@ -271,9 +363,10 @@ static int test_auto_reshard_run(void) {
     ASSERT_TRUE(wctx.sent > 0, "writer thread issued at least one insert");
     ASSERT_EQ_INT(wctx.sent, wctx.ok, "no insert on 'grown' errored after reshard");
     tc_request(tc, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"grown\"}", &resp);
-    ASSERT_EQ_INT(tu_parse_count(resp), wctx.ok,
-                  "grown's count matches exactly the writer's successful inserts "
-                  "(after reshard, inserts land in the rebuilt kf+segments)");
+    ASSERT_EQ_INT(tu_parse_count(resp), GROWN_BASE_COUNT + wctx.ok,
+                  "grown's count matches the 1,050,000 seeded records plus the "
+                  "writer's successful post-reshard inserts (rebuild preserved "
+                  "every seeded record and inserts land in the rebuilt kf+segments)");
     free(resp); resp = NULL;
 
     /* sized must be untouched. */
@@ -286,23 +379,21 @@ static int test_auto_reshard_run(void) {
     ASSERT_EQ_INT(tu_parse_count(resp), 5, "sized count=5 (untouched)");
     free(resp); resp = NULL;
 
-    /* 'huge' must have reshaped from splits=8 to splits=2048 -- proves
+    /* 'huge' must have been picked up with target=2048 -- proves
        get_live_count_ll's full-width count reached
-       reshard_target_for_count without truncating. Same 20s budget: the
-       sweep already ran (grown_reshaped proved that above), so this is
-       just waiting for 'huge's entry in the same completed sweep tick,
-       plus slack for a second full reshard in the unlikely case the
-       sweep serializes across two ticks. */
-    int huge_reshaped = 0;
-    for (int i = 0; i < 40; i++) {
-        struct timespec ts = { 0, 500 * 1000000L }; nanosleep(&ts, NULL);
-        tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"default\",\"object\":\"huge\"}", &resp);
-        if (resp && SAFE_STRSTR(resp, "\"splits\":2048")) { huge_reshaped = 1; free(resp); resp = NULL; break; }
-        free(resp); resp = NULL;
-    }
-    ASSERT_TRUE(huge_reshaped,
-        "huge (live=3,000,000,000, past INT_MAX) reshaped from splits=8 to splits=2048 within 20s "
-        "-- regression check for get_live_count()'s int-truncation bug");
+       reshard_target_for_count without truncating. The sweep already ran
+       (grown_reshaped proved that above), so this is just waiting for
+       'huge's "starting" log line from the same completed sweep tick,
+       plus slack for a second tick in the unlikely case the sweep
+       serializes. The rebuild itself is expected to fail (fabricated
+       total, no matching real records -- see the object-3 comment above),
+       so this checks the log line, not describe-object's splits. */
+    int huge_target_logged = wait_for_log_line(base, date_str,
+        "AUTO-RESHARD default/huge: starting 8 -> 2048", 20 * RESHARD_WAIT_SCALE);
+    ASSERT_TRUE(huge_target_logged,
+        "huge (live=3,000,000,000, past INT_MAX) computed target=2048 within 20s "
+        "-- regression check for get_live_count()'s int-truncation bug "
+        "(rebuild itself is expected to fail against the fabricated total)");
 
     tc_close(tc);
     test_env_stop_keep(&env);
@@ -495,11 +586,15 @@ static int test_auto_reshard_throttle_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
 
-    /* Two objects, both under-split (splits=8, fabricated to 2,000,000 ->
-       target=16). readdir order across two objects in the same dir isn't
-       alphabetically guaranteed, but both must reshape regardless of
-       order -- the test only cares about the gap between the two
-       "done" log lines, not which ran first. */
+    /* Two objects, both under-split (splits=8, seeded with GROWN_BASE_COUNT
+       real records -> falls in the 1M-10M band -> target=16). Real
+       records, not a fabricated kf header total, because rebuild_object_v2
+       now hard-fails a reshard whose copied live count doesn't match the
+       source header's declared total (see this file's header comment).
+       readdir order across two objects in the same dir isn't alphabetically
+       guaranteed, but both must reshape regardless of order -- the test
+       only cares about the gap between the two "done" log lines, not which
+       ran first. */
     const char *names[2] = { "grown_a", "grown_b" };
     for (int oi = 0; oi < 2; oi++) {
         char req[512];
@@ -508,15 +603,35 @@ static int test_auto_reshard_throttle_run(void) {
             "\"splits\":8,\"max_key\":16,\"fields\":[\"v:int\"],\"indexes\":[]}",
             names[oi]);
         tc_request(tc, req, &resp); free(resp); resp = NULL;
-        char kf_path[PATH_MAX];
-        snprintf(kf_path, sizeof(kf_path), "%s/default/%s/data/kf/000.kf", db_root, names[oi]);
-        ASSERT_EQ_INT(fabricate_kf_total(kf_path, 2000000ULL), 0, "fabricate shard 0 total on grown_*");
+
+        size_t buf_cap = (size_t)GROWN_CHUNK * 40 + 256;
+        char *bulk = malloc(buf_cap);
+        ASSERT_NOT_NULL(bulk, "malloc grown_* bulk-insert buffer");
+        int all_ok = bulk != NULL;
+        for (int base_i = 0; all_ok && base_i < GROWN_BASE_COUNT; base_i += GROWN_CHUNK) {
+            int end = base_i + GROWN_CHUNK;
+            if (end > GROWN_BASE_COUNT) end = GROWN_BASE_COUNT;
+            size_t off = 0;
+            off += (size_t)snprintf(bulk + off, buf_cap - off,
+                "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"%s\","
+                "\"records\":{", names[oi]);
+            for (int i = base_i; i < end; i++) {
+                off += (size_t)snprintf(bulk + off, buf_cap - off,
+                    "%s\"k%d\":{\"v\":%d}", i == base_i ? "" : ",", i, i);
+            }
+            off += (size_t)snprintf(bulk + off, buf_cap - off, "}}");
+            tc_request(tc, bulk, &resp);
+            if (!resp || SAFE_STRSTR(resp, "\"error\"")) all_ok = 0;
+            free(resp); resp = NULL;
+        }
+        free(bulk);
+        ASSERT_TRUE(all_ok, "grown_* seeded with 1,050,000 real records");
     }
 
     /* Wait for both to reshape (generous budget: two reshards plus a 3s
        throttle gap between them, on top of the usual 5s startup delay). */
     int both_reshaped = 0;
-    for (int i = 0; i < 80; i++) {
+    for (int i = 0; i < 80 * RESHARD_WAIT_SCALE; i++) {
         struct timespec ts = { 0, 500 * 1000000L }; nanosleep(&ts, NULL);
         tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"default\",\"object\":\"grown_a\"}", &resp);
         int a_done = resp && SAFE_STRSTR(resp, "\"splits\":16");

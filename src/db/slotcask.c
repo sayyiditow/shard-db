@@ -2108,7 +2108,9 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
 /* Forward decl — defined further down with the rest of the free-pool
    primitives. Needed here because the parallel_for workers below
    (slotcask_pool_rebuild_worker) call it before its file position. */
-static int pool_push_free(SlotcaskStream *p, uint16_t file_id, uint32_t offset, int max_slot_size);
+static int pool_push_free_cap(SlotcaskStream *p, uint16_t file_id,
+                               uint32_t offset, uint32_t capacity,
+                               int max_slot_size);
 
 /* Pre-grow worker: opens one kf shard with wrlock, projects post-insert
    load, resplits in-place until projected load <= 75% (or hits the
@@ -2208,8 +2210,9 @@ static void *slotcask_pool_rebuild_worker(void *raw) {
     SlotcaskKfEntry *kf = kh.map;
     for (size_t i = 0; i < cap; i++) {
         if (kf[i].flag == 2 && kf[i].stream_id < a->db->num_streams) {
-            pool_push_free(&a->db->streams[kf[i].stream_id],
-                            kf[i].file_id, kf[i].offset, a->db->slot_size);
+            pool_push_free_cap(&a->db->streams[kf[i].stream_id],
+                               kf[i].file_id, kf[i].offset,
+                               (uint32_t)a->db->slot_size, a->db->slot_size);
         }
     }
     kfcache_release(&kh);
@@ -2969,11 +2972,26 @@ int clean_flag_write(const char *data_dir) {
     snprintf(path, sizeof(path), "%s/.shard-db.clean", data_dir);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return -1;
-    if (fsync(fd) != 0) { close(fd); return -1; }
-    close(fd);
-    /* Fsync containing directory too. */
+    int sync_rc0 = fsync(fd);
+    int close_rc0 = close(fd);
+    if (sync_rc0 != 0 || close_rc0 != 0) {
+        (void)unlink(path);
+        (void)fsync_dir(data_dir);
+        return -1;
+    }
     fd = open(data_dir, O_RDONLY | O_DIRECTORY);
-    if (fd >= 0) { fsync(fd); close(fd); }
+    if (fd < 0) {
+        (void)unlink(path);
+        (void)fsync_dir(data_dir);
+        return -1;
+    }
+    int sync_rc = fsync(fd);
+    int close_rc = close(fd);
+    if (sync_rc != 0 || close_rc != 0) {
+        (void)unlink(path);
+        (void)fsync_dir(data_dir);
+        return -1;
+    }
     return 0;
 }
 
@@ -2987,10 +3005,12 @@ int clean_flag_remove(const char *data_dir) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/.shard-db.clean", data_dir);
     if (unlink(path) != 0 && errno != ENOENT) return -1;
-    /* Fsync dir after unlink. */
+    /* Fsync dir after unlink, including the no-op ENOENT case. */
     int fd = open(data_dir, O_RDONLY | O_DIRECTORY);
-    if (fd >= 0) { fsync(fd); close(fd); }
-    return 0;
+    if (fd < 0) return -1;
+    int sync_rc = fsync(fd);
+    int close_rc = close(fd);
+    return sync_rc == 0 && close_rc == 0 ? 0 : -1;
 }
 
 /* Bulk marker I/O: one file contains one KfMarkerSlot per record. */
@@ -3629,7 +3649,9 @@ static int pool_push_free_cap(SlotcaskStream *p, uint16_t file_id,
     return 0;
 }
 
-/* Convenience wrapper for fixed-format (capacity == db->slot_size always). */
+/* Conservative fallback for rollback paths that do not retain the encoded
+   record length. A max-capacity bucket remains safe; normal tombstone and
+   recovery paths preserve the exact record capacity. */
 static int pool_push_free(SlotcaskStream *p, uint16_t file_id,
                            uint32_t offset, int max_slot_size) {
     return pool_push_free_cap(p, file_id, offset,
@@ -3644,69 +3666,55 @@ static int pool_try_pop_for_size(SlotcaskStream *p, uint32_t needed_size,
     if (pthread_mutex_trylock(&p->pool_lock) != 0) return 1;
     int start_b = slotcask_bucket_for(needed_size, max_slot_size);
     for (int b = start_b; b < SLOTCASK_POOL_BUCKETS; b++) {
-        if (p->free_count[b] == 0) continue;
-        p->free_count[b]--;
-        *out = p->free_slots[b][p->free_count[b]];
-        pthread_mutex_unlock(&p->pool_lock);
-        return 0;
+        /* Bucket membership is a coarse capacity range (see
+           slotcask_bucket_for), not a single fixed size, now that every
+           object uses variable-length records — a bucket can hold entries
+           smaller than needed_size (e.g. bucket 0 spans [0,256)). Scan for
+           one that actually fits rather than trusting the top of the
+           stack; swap-remove keeps this O(1) once found. */
+        for (size_t i = p->free_count[b]; i > 0; i--) {
+            SlotcaskFreeSlot *cand = &p->free_slots[b][i - 1];
+            if (cand->capacity >= needed_size) {
+                *out = *cand;
+                p->free_slots[b][i - 1] = p->free_slots[b][p->free_count[b] - 1];
+                p->free_count[b]--;
+                pthread_mutex_unlock(&p->pool_lock);
+                return 0;
+            }
+        }
     }
     pthread_mutex_unlock(&p->pool_lock);
     return 2;
 }
 
-/* Fixed-format compat: pop any slot (all same size). */
-static int pool_try_pop_n(SlotcaskStream *p, size_t n, SlotcaskFreeSlot *out) {
-    if (n != 1) {
-        /* bulk fixed-format path — try bucket 3 (catch-all) */
-        if (pthread_mutex_trylock(&p->pool_lock) != 0) return 1;
-        size_t total = 0;
-        for (int b = 0; b < SLOTCASK_POOL_BUCKETS; b++) total += p->free_count[b];
-        if (total < n) { pthread_mutex_unlock(&p->pool_lock); return 2; }
-        size_t got = 0;
-        for (int b = SLOTCASK_POOL_BUCKETS - 1; b >= 0 && got < n; b--) {
-            while (p->free_count[b] > 0 && got < n) {
-                p->free_count[b]--;
-                out[got++] = p->free_slots[b][p->free_count[b]];
-            }
-        }
-        pthread_mutex_unlock(&p->pool_lock);
-        return 0;
+/* A free-pool slot popped by pool_try_pop_for_size() may be larger than
+   the record about to be written into it (coarse bucket matching, see the
+   comment above) — never let the excess be silently folded into that
+   record's zero-padding, or every reader that recomputes stride from the
+   record's own header (24+klen+vlen) will under-advance and misalign
+   against genuinely live data past it. Zero the excess in place and
+   return it to the pool as its own independent, correctly-capacitied
+   entry so the invariant "on-disk footprint == header-computed size"
+   holds for every record unconditionally. */
+static int pool_split_leftover(SlotcaskDb *db, uint8_t stream_id,
+                                uint16_t file_id, uint32_t offset,
+                                uint32_t len) {
+    if (len == 0) return 0;
+    char path[PATH_MAX];
+    seg_path_for(path, db->data_dir, stream_id, file_id);
+    SlotcaskSegHandle h;
+    if (segcache_acquire(&h, path, 0, 0, 1) != 0) return -1;
+    memset(h.map + offset, 0, len);
+    if (h.slot >= 0) {
+        SegCacheEntry *e = &g_segcache[h.slot];
+        durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
     }
-    /* n==1: pop from any non-empty bucket */
-    if (pthread_mutex_trylock(&p->pool_lock) != 0) return 1;
-    for (int b = 0; b < SLOTCASK_POOL_BUCKETS; b++) {
-        if (p->free_count[b] == 0) continue;
-        p->free_count[b]--;
-        out[0] = p->free_slots[b][p->free_count[b]];
-        pthread_mutex_unlock(&p->pool_lock);
-        return 0;
-    }
-    pthread_mutex_unlock(&p->pool_lock);
-    return 2;
+    segcache_release(&h);
+    return pool_push_free_cap(&db->streams[stream_id], file_id, offset, len,
+                              db->slot_size);
 }
 
 /* ============================================================ Append path */
-
-/* Reserve N consecutive fixed-size slots in the active segment of stream `p`.
-   Rotates if the active segment is full. Returns 0 on success, -1 on error. */
-static int append_reserve_n(SlotcaskDb *db, SlotcaskStream *p,
-                            size_t n, uint32_t *file_id_out,
-                            uint32_t *offsets_out) {
-    pthread_mutex_lock(&p->rotation_lock);
-    size_t need = n * (size_t)db->slot_size;
-    if (p->reserve_off + need > SLOTCASK_SEG_MAX_BYTES) {
-        /* Rotate. */
-        p->active_file_id++;
-        p->reserve_off = 0;
-    }
-    *file_id_out = p->active_file_id;
-    for (size_t i = 0; i < n; i++) {
-        offsets_out[i] = (uint32_t)(p->reserve_off + i * (size_t)db->slot_size);
-    }
-    p->reserve_off += need;
-    pthread_mutex_unlock(&p->rotation_lock);
-    return 0;
-}
 
 /* Reserve a single variable-length slot. rec_size includes the header
    + key + value + alignment padding. Rotates if not enough space in the
@@ -3716,8 +3724,15 @@ static int append_reserve_single_varlen(SlotcaskDb *db, SlotcaskStream *p,
                                          uint32_t *file_id_out,
                                          uint32_t *offset_out) {
     (void)db;
+    if (!file_id_out || !offset_out || rec_size > SLOTCASK_SEG_MAX_BYTES)
+        return -1;
     pthread_mutex_lock(&p->rotation_lock);
-    if (p->reserve_off + rec_size > SLOTCASK_SEG_MAX_BYTES) {
+    if (p->reserve_off > SLOTCASK_SEG_MAX_BYTES - rec_size) {
+        if (p->active_file_id >= UINT16_MAX) {
+            pthread_mutex_unlock(&p->rotation_lock);
+            errno = EFBIG;
+            return -1;
+        }
         p->active_file_id++;
         p->reserve_off = 0;
     }
@@ -3739,23 +3754,6 @@ static inline size_t slotcask_record_size_varlen(size_t klen, size_t vlen) {
 
 /* ============================================================ Record I/O */
 
-
-/* Build a slot record in `buf` (caller-allocated, slot_size bytes). */
-static void build_record_buf(uint8_t *buf, int slot_size,
-                             const uint8_t hash[16], uint8_t flag,
-                             const void *key, size_t klen,
-                             const void *value, size_t vlen) {
-    memset(buf, 0, slot_size);
-    memcpy(buf, hash, 16);
-    uint16_t k16 = (uint16_t)klen;
-    memcpy(buf + 16, &k16, 2);
-    buf[18] = flag;
-    buf[19] = 0;
-    uint32_t v32 = (uint32_t)vlen;
-    memcpy(buf + 20, &v32, 4);
-    memcpy(buf + 24, key, klen);
-    memcpy(buf + 24 + klen, value, vlen);
-}
 
 /* Emit one record into a slot at `dst`: 24-B header (hash, klen, flag=0,
    _, vlen) → key bytes → value bytes → zero pad to slot_size → release
@@ -3792,34 +3790,6 @@ static inline void seg_record_emit(uint8_t *dst, int slot_size,
 
 /* Memcpy a complete record (key+value already concatenated) into the segment
    mmap with crash-safe ordering: payload first, fence, flag byte last. */
-static int seg_write_record(const SlotcaskDb *db, uint8_t stream_id,
-                             uint16_t file_id, uint32_t offset,
-                             const uint8_t hash[16],
-                             const void *key, size_t klen,
-                             const void *value, size_t vlen,
-                             int sync_now) {
-    char path[PATH_MAX];
-    seg_path_for(path, db->data_dir, stream_id, file_id);
-    SlotcaskSegHandle h;
-    /* rdlock is sufficient: each caller owns a unique reserved offset
-       (via append_reserve_n / pool_try_pop_n), so concurrent writes
-       don't race; the segcache rwlock only serialises us against
-       eviction, which takes wrlock and waits for all rdlock holders.
-       create=1: first writer to a freshly-rotated segment file
-       materialises it (open O_CREAT + ftruncate to max). */
-    if (segcache_acquire(&h, path, 1, 0, 1) != 0) return -1;
-    seg_record_emit(h.map + offset, db->slot_size, hash, key, klen, value, vlen);
-    if (h.slot >= 0) {
-        SegCacheEntry *e = &g_segcache[h.slot];
-        durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
-    }
-    int rc = 0;
-    if (sync_now && durability_msync_range(h.map, offset, (size_t)db->slot_size) != 0)
-        rc = -1;
-    segcache_release(&h);
-    return rc;
-}
-
 /* Variable-length variant: writes a record without padding to slot_size.
    rec_size must be slotcask_record_size_varlen(klen, vlen). */
 static int seg_write_record_varlen(const SlotcaskDb *db, uint8_t stream_id,
@@ -3844,40 +3814,29 @@ static int seg_write_record_varlen(const SlotcaskDb *db, uint8_t stream_id,
     return rc;
 }
 
-/* Forward decl — seg_write_flag is defined below this function but
-   called from the fixed-format branch. */
-static int seg_write_flag(const SlotcaskDb *db, uint8_t stream_id,
-                           uint16_t file_id, uint32_t offset, uint8_t flag);
-
 /* Tombstone an old seg slot and return it to its stream pool.
-   For variable-length format, reads the record's klen/vlen from the
-   segment header to determine the slot's capacity. For fixed format,
-   uses db->slot_size. Must be called with a non-const db because it
-   modifies the stream's free pool. */
+   Reads the record's klen/vlen from the segment header to determine the
+   slot's capacity. Must be called with a non-const db because it modifies
+   the stream's free pool. */
 static inline int slotcask_tombstone_and_push_back(SlotcaskDb *db,
                                                     uint8_t stream_id,
                                                     uint16_t file_id,
                                                     uint32_t offset) {
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        char path[PATH_MAX];
-        seg_path_for(path, db->data_dir, stream_id, file_id);
-        SlotcaskSegHandle h;
-        if (segcache_acquire(&h, path, 0, 0, 1) != 0) return -1;
-        __atomic_store_n(&h.map[offset + 18], 2, __ATOMIC_RELEASE);
-        if (h.slot >= 0) {
-            SegCacheEntry *e = &g_segcache[h.slot];
-            durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
-        }
-        uint16_t klen = seg_rec_klen(h.map + offset);
-        uint32_t vlen = seg_rec_vlen(h.map + offset);
-        uint32_t cap = (uint32_t)slotcask_record_size_varlen(klen, vlen);
-        segcache_release(&h);
-        pool_push_free_cap(&db->streams[stream_id], file_id, offset,
-                           cap, db->slot_size);
-    } else {
-        if (seg_write_flag(db, stream_id, file_id, offset, 2) != 0) return -1;
-        pool_push_free(&db->streams[stream_id], file_id, offset, db->slot_size);
+    char path[PATH_MAX];
+    seg_path_for(path, db->data_dir, stream_id, file_id);
+    SlotcaskSegHandle h;
+    if (segcache_acquire(&h, path, 0, 0, 1) != 0) return -1;
+    __atomic_store_n(&h.map[offset + 18], 2, __ATOMIC_RELEASE);
+    if (h.slot >= 0) {
+        SegCacheEntry *e = &g_segcache[h.slot];
+        durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
     }
+    uint16_t klen = seg_rec_klen(h.map + offset);
+    uint32_t vlen = seg_rec_vlen(h.map + offset);
+    uint32_t cap = (uint32_t)slotcask_record_size_varlen(klen, vlen);
+    segcache_release(&h);
+    pool_push_free_cap(&db->streams[stream_id], file_id, offset,
+                       cap, db->slot_size);
     return 0;
 }
 
@@ -3951,52 +3910,32 @@ int slotcask_insert(SlotcaskDb *db, int stream_id_hint,
     uint8_t target_stream = (uint8_t)sid_data;
     uint16_t target_fid;
     uint32_t target_off;
-    int got_pool;
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + vlen),
+    size_t rec_size = slotcask_record_size_varlen(klen, vlen);
+    int got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + vlen),
                                            db->slot_size, &fs) == 0);
-        if (got_pool) {
-            target_fid = fs.file_id;
-            target_off = fs.offset;
-            slot_capacity = fs.capacity;
-        } else {
-            size_t rec_size = slotcask_record_size_varlen(klen, vlen);
-            uint32_t fid, off;
-            if (append_reserve_single_varlen(db, pool, rec_size, &fid, &off) != 0)
-                return -1;
-            target_fid = (uint16_t)fid;
-            target_off = off;
-            slot_capacity = (uint32_t)rec_size;
-        }
+    if (got_pool) {
+        target_fid = fs.file_id;
+        target_off = fs.offset;
+        slot_capacity = (uint32_t)rec_size;
+        if (fs.capacity > slot_capacity)
+            pool_split_leftover(db, target_stream, target_fid,
+                                target_off + slot_capacity,
+                                fs.capacity - slot_capacity);
     } else {
-        slot_capacity = (uint32_t)db->slot_size;
-        got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
-        if (got_pool) {
-            target_fid = fs.file_id;
-            target_off = fs.offset;
-        } else {
-            uint32_t fid;
-            uint32_t off;
-            if (append_reserve_n(db, pool, 1, &fid, &off) != 0) return -1;
-            target_fid = (uint16_t)fid;
-            target_off = off;
-        }
+        uint32_t fid, off;
+        if (append_reserve_single_varlen(db, pool, rec_size, &fid, &off) != 0)
+            return -1;
+        target_fid = (uint16_t)fid;
+        target_off = off;
+        slot_capacity = (uint32_t)rec_size;
     }
 
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
-                                     hash, key, klen, value, vlen,
-                                     slot_capacity, 1) != 0) {
-            if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
-                                              slot_capacity, db->slot_size);
-            return -1;
-        }
-    } else {
-        if (seg_write_record(db, target_stream, target_fid, target_off,
-                              hash, key, klen, value, vlen, 1) != 0) {
-            if (got_pool) pool_push_free(pool, target_fid, target_off, db->slot_size);
-            return -1;
-        }
+    if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
+                                 hash, key, klen, value, vlen,
+                                 slot_capacity, 1) != 0) {
+        if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
+                                          slot_capacity, db->slot_size);
+        return -1;
     }
 
     char kf_path[PATH_MAX];
@@ -4004,10 +3943,7 @@ int slotcask_insert(SlotcaskDb *db, int stream_id_hint,
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) {
         seg_write_flag(db, target_stream, target_fid, target_off, 2);
-        if (db->format == SLOTCASK_FORMAT_VARIABLE)
-            pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
-        else
-            pool_push_free(pool, target_fid, target_off, db->slot_size);
+        pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
         return -1;
     }
     size_t used_delta = 0;
@@ -4016,10 +3952,7 @@ int slotcask_insert(SlotcaskDb *db, int stream_id_hint,
     kfcache_release(&kh);
     if (put_rc != 0) {
         seg_write_flag(db, target_stream, target_fid, target_off, 2);
-        if (db->format == SLOTCASK_FORMAT_VARIABLE)
-            pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
-        else
-            pool_push_free(pool, target_fid, target_off, db->slot_size);
+        pool_push_free_cap(pool, target_fid, target_off, slot_capacity, db->slot_size);
         return (put_rc == 1) ? -2 : -1;
     }
     return 0;
@@ -4072,58 +4005,35 @@ int slotcask_update(SlotcaskDb *db, int stream_id_hint,
     SlotcaskFreeSlot fs;
     uint16_t target_fid;
     uint32_t target_off;
-    int got_pool;
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + vlen),
+    size_t rec_size = slotcask_record_size_varlen(klen, vlen);
+    int got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + vlen),
                                            db->slot_size, &fs) == 0);
-        if (got_pool) {
-            target_fid = fs.file_id;
-            target_off = fs.offset;
-            slot_capacity = fs.capacity;
-        } else {
-            size_t rec_size = slotcask_record_size_varlen(klen, vlen);
-            uint32_t fid, off;
-            if (append_reserve_single_varlen(db, pool, rec_size, &fid, &off) != 0) {
-                kfcache_release(&kh);
-                return -1;
-            }
-            target_fid = (uint16_t)fid;
-            target_off = off;
-            slot_capacity = (uint32_t)rec_size;
-        }
+    if (got_pool) {
+        target_fid = fs.file_id;
+        target_off = fs.offset;
+        slot_capacity = (uint32_t)rec_size;
+        if (fs.capacity > slot_capacity)
+            pool_split_leftover(db, target_stream, target_fid,
+                                target_off + slot_capacity,
+                                fs.capacity - slot_capacity);
     } else {
-        slot_capacity = (uint32_t)db->slot_size;
-        got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
-        if (got_pool) {
-            target_fid = fs.file_id;
-            target_off = fs.offset;
-        } else {
-            uint32_t fid, off;
-            if (append_reserve_n(db, pool, 1, &fid, &off) != 0) {
-                kfcache_release(&kh);
-                return -1;
-            }
-            target_fid = (uint16_t)fid;
-            target_off = off;
+        uint32_t fid, off;
+        if (append_reserve_single_varlen(db, pool, rec_size, &fid, &off) != 0) {
+            kfcache_release(&kh);
+            return -1;
         }
+        target_fid = (uint16_t)fid;
+        target_off = off;
+        slot_capacity = (uint32_t)rec_size;
     }
 
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
-                                     hash, key, klen, value, vlen,
-                                     slot_capacity, 1) != 0) {
-            kfcache_release(&kh);
-            if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
-                                              slot_capacity, db->slot_size);
-            return -1;
-        }
-    } else {
-        if (seg_write_record(db, target_stream, target_fid, target_off,
-                              hash, key, klen, value, vlen, 1) != 0) {
-            kfcache_release(&kh);
-            if (got_pool) pool_push_free(pool, target_fid, target_off, db->slot_size);
-            return -1;
-        }
+    if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
+                                 hash, key, klen, value, vlen,
+                                 slot_capacity, 1) != 0) {
+        kfcache_release(&kh);
+        if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
+                                          slot_capacity, db->slot_size);
+        return -1;
     }
 
     /* Repoint at the slot we already probed — same wrlock window, so the
@@ -4262,80 +4172,41 @@ int slotcask_bulk_update(SlotcaskDb *db, const SlotcaskRecord *recs, size_t n) {
     }
 
     /* 2. Reserve destination slots. */
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        /* Varlen: each record has a different size, so reserve per-record. */
-        for (size_t i = 0; i < n; i++) {
-            int s = infos[i].target_sid;
-            size_t klen = recs[i].klen, vlen = recs[i].vlen;
-            size_t rec_size = slotcask_record_size_varlen(klen, vlen);
-            SlotcaskFreeSlot fs;
-            if (pool_try_pop_for_size(&db->streams[s], (uint32_t)(24 + klen + vlen),
-                                      db->slot_size, &fs) == 0) {
-                infos[i].target = fs;
-            } else {
-                uint32_t fid, off;
-                if (append_reserve_single_varlen(db, &db->streams[s],
-                                                 rec_size, &fid, &off) != 0) {
-                    free(infos); return -1;
-                }
-                infos[i].target.file_id  = (uint16_t)fid;
-                infos[i].target.offset   = off;
-                infos[i].target.capacity = (uint32_t)rec_size;
+    for (size_t i = 0; i < n; i++) {
+        int s = infos[i].target_sid;
+        size_t rec_size = slotcask_record_size_varlen(recs[i].klen, recs[i].vlen);
+        SlotcaskFreeSlot fs;
+        if (pool_try_pop_for_size(&db->streams[s],
+                                  (uint32_t)(24 + recs[i].klen + recs[i].vlen),
+                                  db->slot_size, &fs) == 0) {
+            infos[i].target = fs;
+            infos[i].target.capacity = (uint32_t)rec_size;
+            if (fs.capacity > (uint32_t)rec_size)
+                pool_split_leftover(db, (uint8_t)s, fs.file_id,
+                                    fs.offset + (uint32_t)rec_size,
+                                    fs.capacity - (uint32_t)rec_size);
+        } else {
+            uint32_t fid, off;
+            if (append_reserve_single_varlen(db, &db->streams[s], rec_size,
+                                             &fid, &off) != 0) {
+                free(infos); return -1;
             }
-        }
-    } else {
-        /* Fixed: all slots are slot_size bytes; batch reserve per stream. */
-        size_t per_stream[SLOTCASK_MAX_STREAMS] = {0};
-        for (size_t i = 0; i < n; i++) per_stream[infos[i].target_sid]++;
-
-        for (int s = 0; s < db->num_streams; s++) {
-            size_t sub_n = per_stream[s];
-            if (sub_n == 0) continue;
-            SlotcaskFreeSlot *targets = malloc(sub_n * sizeof(SlotcaskFreeSlot));
-            if (!targets) { free(infos); return -1; }
-            int from_pool = (pool_try_pop_n(&db->streams[s], sub_n, targets) == 0);
-            if (!from_pool) {
-                uint32_t *offsets = malloc(sub_n * sizeof(uint32_t));
-                uint32_t fid;
-                if (!offsets || append_reserve_n(db, &db->streams[s], sub_n,
-                                                 &fid, offsets) != 0) {
-                    free(offsets); free(targets); free(infos); return -1;
-                }
-                for (size_t j = 0; j < sub_n; j++) {
-                    targets[j].file_id = (uint16_t)fid;
-                    targets[j].offset = offsets[j];
-                }
-                free(offsets);
-            }
-            size_t tgt_idx = 0;
-            for (size_t i = 0; i < n; i++) {
-                if (infos[i].target_sid != s) continue;
-                infos[i].target = targets[tgt_idx++];
-            }
-            free(targets);
+            infos[i].target.file_id = (uint16_t)fid;
+            infos[i].target.offset = off;
+            infos[i].target.capacity = (uint32_t)rec_size;
         }
     }
 
     /* 3. Write + repoint + tombstone. */
     for (size_t i = 0; i < n; i++) {
-        int write_rc;
-        if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-            size_t rec_size = slotcask_record_size_varlen(recs[i].klen, recs[i].vlen);
-            write_rc = seg_write_record_varlen(db, infos[i].target_sid,
+        size_t rec_size = slotcask_record_size_varlen(recs[i].klen, recs[i].vlen);
+        int write_rc = seg_write_record_varlen(db, infos[i].target_sid,
                                                infos[i].target.file_id,
                                                infos[i].target.offset,
                                                infos[i].hash,
                                                recs[i].key, recs[i].klen,
                                                recs[i].value, recs[i].vlen,
                                                (uint32_t)rec_size, 0);
-        } else {
-            write_rc = seg_write_record(db, infos[i].target_sid,
-                                        infos[i].target.file_id,
-                                        infos[i].target.offset,
-                                        infos[i].hash,
-                                        recs[i].key, recs[i].klen,
-                                        recs[i].value, recs[i].vlen, 0);
-        }
         if (write_rc != 0) { free(infos); return -1; }
         int sid_kf = shard_for_hash(infos[i].hash, db->num_shards);
         char kf_path[PATH_MAX];
@@ -4362,55 +4233,76 @@ int slotcask_bulk_update(SlotcaskDb *db, const SlotcaskRecord *recs, size_t n) {
 
 /* ============================================================ Open / close */
 
-static void dirty_marker_path(const SlotcaskDb *db, char out[PATH_MAX]) {
-    snprintf(out, PATH_MAX, "%s/.dirty", db->data_dir);
-}
-static int touch_dirty_marker(const SlotcaskDb *db) {
-    char p[PATH_MAX]; dirty_marker_path(db, p);
-    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
-    close(fd); return 0;
-}
-static int dirty_marker_exists(const SlotcaskDb *db) {
-    char p[PATH_MAX]; dirty_marker_path(db, p);
-    struct stat st; return stat(p, &st) == 0;
-}
-static int remove_dirty_marker(const SlotcaskDb *db) {
-    char p[PATH_MAX]; dirty_marker_path(db, p);
-    if (unlink(p) != 0 && errno != ENOENT) return -1;
-    return 0;
-}
-
-/* ---- format marker (.format) ---- */
-static void format_file_path(const SlotcaskDb *db, char out[PATH_MAX]) {
-    snprintf(out, PATH_MAX, "%s/.format", db->data_dir);
-}
-static int read_format_marker(const SlotcaskDb *db) {
-    char p[PATH_MAX]; format_file_path(db, p);
-    int fd = open(p, O_RDONLY);
-    if (fd < 0) return -1;
-    char buf[2] = {0};
-    int n = (int)read(fd, buf, 1);
-    close(fd);
-    if (n != 1) return -1;
-    if (buf[0] == '0') return SLOTCASK_FORMAT_FIXED;
-    if (buf[0] == '1') return SLOTCASK_FORMAT_VARIABLE;
-    return -1;
-}
-static int write_format_marker(const SlotcaskDb *db, int fmt) {
-    char p[PATH_MAX]; format_file_path(db, p);
-    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
-    char c = (fmt == SLOTCASK_FORMAT_VARIABLE) ? '1' : '0';
-    int rc = (write(fd, &c, 1) == 1) ? 0 : -1;
-    close(fd);
-    return rc;
-}
-
 static int data_file_id_from_name(const char *name) {
-    /* Segment files: <data_dir>/data/streams/SSS/NNNNNN.dat */
-    int id;
-    return (sscanf(name, "%d.dat", &id) == 1) ? id : -1;
+    size_t len = strlen(name);
+    if (len < 4 || strcmp(name + len - 4, ".dat") != 0) return -1;
+    if (len != 10) return -2;
+    uint32_t id = 0;
+    for (int i = 0; i < 6; i++) {
+        if (name[i] < '0' || name[i] > '9') return -2;
+        id = id * 10u + (uint32_t)(name[i] - '0');
+    }
+    return id <= UINT16_MAX ? (int)id : -2;
+}
+
+enum StreamSegmentState {
+    STREAM_SEGMENTS_ERROR = -1,
+    STREAM_SEGMENTS_INVALID = -2,
+    STREAM_SEGMENTS_EMPTY = 0,
+    STREAM_SEGMENTS_PRESENT = 1
+};
+
+static int stream_segment_state(const char *stream_dir) {
+    DIR *dir = opendir(stream_dir);
+    if (!dir) return STREAM_SEGMENTS_ERROR;
+    int has = 0;
+    int saved_errno = 0;
+    errno = 0;
+    for (struct dirent *de = readdir(dir); de; de = readdir(dir)) {
+        int parsed = data_file_id_from_name(de->d_name);
+        if (parsed == -1) continue;
+        if (parsed == -2) {
+            closedir(dir);
+            return STREAM_SEGMENTS_INVALID;
+        }
+        has = 1;
+    }
+    saved_errno = errno;
+    int close_rc = closedir(dir);
+    if (saved_errno != 0 || close_rc != 0) return STREAM_SEGMENTS_ERROR;
+    return has ? STREAM_SEGMENTS_PRESENT : STREAM_SEGMENTS_EMPTY;
+}
+
+int slotcask_validate_segment_files(const char *data_dir, int num_streams) {
+    if (!data_dir || num_streams <= 0 || num_streams > SLOTCASK_MAX_STREAMS) {
+        errno = EINVAL;
+        return -1;
+    }
+    char streams_dir[PATH_MAX];
+    snprintf(streams_dir, sizeof(streams_dir), "%s/streams", data_dir);
+    for (int stream_id = 0; stream_id < num_streams; stream_id++) {
+        char stream_dir[PATH_MAX];
+        snprintf(stream_dir, sizeof(stream_dir), "%s/%03d", streams_dir,
+                 stream_id);
+        errno = 0;
+        int state = stream_segment_state(stream_dir);
+        if (state == STREAM_SEGMENTS_ERROR && errno == ENOENT) {
+            /* schema.conf's declared stream count can legitimately exceed
+               what's on disk (CPU-upgrade resize, hand-edited schema.conf) --
+               slotcask_open() transparently mkdirp's any missing stream
+               directory on the next real open, and `vacuum` rebalances
+               existing segments across the new count. That's the documented
+               self-heal path, so a missing-directory count mismatch alone
+               isn't corruption and must not block startup. */
+            continue;
+        }
+        if (state == STREAM_SEGMENTS_INVALID) {
+            errno = EUCLEAN;
+            return -1;
+        }
+        if (state == STREAM_SEGMENTS_ERROR) return -1;
+    }
+    return 0;
 }
 static int cmp_int(const void *a, const void *b) {
     int ia = *(const int *)a, ib = *(const int *)b;
@@ -4456,9 +4348,8 @@ static int recover_scan_tombstones_od(SlotcaskDb *db, int sid,
     uint8_t *buf = aligned_alloc(ODIRECT_ALIGN, buf_size);
     if (!buf) { close(fd); return -1; }
 
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        /* Varlen: records are not at fixed stride, so use a carry buffer to
-           handle records that straddle O_DIRECT chunk boundaries. */
+    /* Records are variable-length, so use a carry buffer to handle records
+       that straddle O_DIRECT chunk boundaries. */
         size_t carry_cap = 256u * 1024u;
         uint8_t *carry = malloc(carry_cap);
         if (!carry) { free(buf); close(fd); return -1; }
@@ -4553,29 +4444,6 @@ static int recover_scan_tombstones_od(SlotcaskDb *db, int sid,
         free(buf);
         close(fd);
         return 0;
-    }
-
-    int slot_size = db->slot_size;
-    off_t file_off = 0;
-    for (;;) {
-        ssize_t nr = od_pread(fd, buf, buf_size, file_off);
-        if (nr <= 0) break;
-        /* buf_size is a multiple of slot_size, so nr is also a multiple
-           (or a short final read whose incomplete trailing bytes are safely
-           skipped by the <= condition). */
-        for (ssize_t off = 0; off + slot_size <= nr; off += slot_size) {
-            if (buf[off + 18] == 2) {
-                pool_push_free(&db->streams[sid], (uint16_t)file_id,
-                               (uint32_t)(file_off + off), db->slot_size);
-            }
-        }
-        file_off += (off_t)nr;
-        if (nr < (ssize_t)buf_size) break; /* EOF */
-    }
-
-    free(buf);
-    close(fd);
-    return 0;
 }
 
 /* Walk every segment for a single stream, populate the in-memory free-slot
@@ -4591,9 +4459,16 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
     }
     int *ids = NULL; size_t n_ids = 0, cap_ids = 0;
     struct dirent *de;
+    errno = 0;
     while ((de = readdir(d)) != NULL) {
         int id = data_file_id_from_name(de->d_name);
-        if (id < 0) continue;
+        if (id == -1) continue;
+        if (id == -2) {
+            free(ids);
+            closedir(d);
+            errno = EUCLEAN;
+            return -1;
+        }
         if (n_ids == cap_ids) {
             cap_ids = cap_ids ? cap_ids * 2 : 64;
             int *nids = realloc(ids, cap_ids * sizeof(int));
@@ -4602,7 +4477,12 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
         }
         ids[n_ids++] = id;
     }
-    closedir(d);
+    int read_errno = errno;
+    int close_rc = closedir(d);
+    if (read_errno != 0 || close_rc != 0) {
+        free(ids);
+        return -1;
+    }
     if (n_ids == 0) { free(ids); return 0; }
     qsort(ids, n_ids, sizeof(int), cmp_int);
 
@@ -4629,34 +4509,21 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
         if (segcache_acquire(&h, path, 0, 0, 0) != 0) { free(ids); return -1; }
         off_t pos = 0;
         off_t lim = (off_t)h.map_size;
-        if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-            while (pos + 24 <= lim) {
-                uint8_t flag = __atomic_load_n(&h.map[pos + 18], __ATOMIC_ACQUIRE);
-                if (flag == 0) break;
-                uint16_t klen; memcpy(&klen, h.map + pos + 16, 2);
-                uint32_t vlen; memcpy(&vlen, h.map + pos + 20, 4);
-                size_t rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
-                if (flag == 2)
-                    pool_push_free_cap(&db->streams[sid], (uint16_t)file_id,
-                                       (uint32_t)pos, (uint32_t)rec_size, db->slot_size);
-                pos += (off_t)rec_size;
-            }
-        } else {
-            while (pos + db->slot_size <= lim) {
-                uint8_t flag = __atomic_load_n(&h.map[pos + 18], __ATOMIC_ACQUIRE);
-                if (flag == 2) {
-                    pool_push_free(&db->streams[sid], (uint16_t)file_id,
-                                   (uint32_t)pos, db->slot_size);
-                } else if (flag == 0) {
-                    break;
-                }
-                pos += db->slot_size;
-            }
+        while (pos + 24 <= lim) {
+            uint8_t flag = __atomic_load_n(&h.map[pos + 18], __ATOMIC_ACQUIRE);
+            if (flag == 0) break;
+            uint16_t klen; memcpy(&klen, h.map + pos + 16, 2);
+            uint32_t vlen; memcpy(&vlen, h.map + pos + 20, 4);
+            size_t rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
+            if (flag == 2)
+                pool_push_free_cap(&db->streams[sid], (uint16_t)file_id,
+                                   (uint32_t)pos, (uint32_t)rec_size, db->slot_size);
+            pos += (off_t)rec_size;
         }
         last_offset = pos;
         segcache_release(&h);
     }
-    /* Same invariant as the equivalent update in slotcask_migrate_to_varlen:
+    /* Every writer of active_file_id/reserve_off follows the rotation lock:
        every writer of active_file_id/reserve_off holds rotation_lock
        (CID 1696416, CID 1696410). rotation_lock for this stream was already
        pthread_mutex_init'd earlier in slotcask_open, so this is always safe
@@ -4712,30 +4579,11 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
     db->num_shards = num_shards;
     db->num_streams = num_streams;
     db->slot_size = slot_size;
-    db->format = SLOTCASK_FORMAT_FIXED;
     db->slots_per_shard = slotcask_default_slots_for_splits(num_shards);
 
     if (mkdirp_local(data_dir) != 0) return -1;
 
-    /* Detect or persist the segment format marker (.format).
-       If the marker already exists, its value is authoritative.
-       If not, write one with the default (FIXED) so future opens
-       read the correct value.  This ensures existing fixed-format
-       databases are automatically annotated on first open after
-       upgrade. */
-    {
-        int fmt = read_format_marker(db);
-        if (fmt >= 0) {
-            db->format = fmt;
-        } else {
-            /* No marker yet — write one now so subsequent opens
-               don't need to guess. */
-            if (write_format_marker(db, SLOTCASK_FORMAT_FIXED) != 0) {
-                /* Non-fatal — we'll try again on next open. */
-            }
-        }
-    }
-
+    pthread_mutex_init(&db->trim_init_lock, NULL);
     db->streams = calloc(num_streams, sizeof(SlotcaskStream));
     if (!db->streams) return -1;
     for (int i = 0; i < num_streams; i++) {
@@ -4748,26 +4596,6 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
         s->active_file_id = 0;
         s->reserve_off = 0;
         /* free_slots[b], free_count[b], free_cap[b] zeroed by calloc */
-    }
-
-    /* Eagerly create file_000 in each stream so the first append doesn't
-       race the create path through the cache. */
-    for (int i = 0; i < num_streams; i++) {
-        char path[PATH_MAX];
-        seg_path_for(path, data_dir, i, 0);
-        SlotcaskSegHandle h;
-        if (segcache_acquire(&h, path, 1, 1, 0) != 0) goto fail;
-        /* Prime the seg slot ref for file_id 0 so point reads hit the
-           fast path immediately after open. */
-        if (db->seg_slot_refs && h.slot >= 0) {
-            SlotRef *ref = seg_ref_for(db, i, 0);
-            if (ref) {
-                ref->slot = h.slot;
-                ref->gen  = atomic_load_explicit(&g_segcache[h.slot].gen,
-                                                  memory_order_acquire);
-            }
-        }
-        segcache_release(&h);
     }
 
     /* Eagerly materialize every keyfile shard on disk. Mirrors the prototype's
@@ -4822,16 +4650,48 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
     db->seg_slot_caps = calloc((size_t)num_streams, sizeof(int));
     if (!db->seg_slot_refs || !db->seg_slot_caps) { free(open_args); goto fail; }
 
+    int *segment_states = calloc((size_t)num_streams, sizeof(int));
+    if (!segment_states) { free(open_args); goto fail; }
+    for (int i = 0; i < num_streams; i++) {
+        segment_states[i] = stream_segment_state(db->streams[i].stream_dir);
+        if (segment_states[i] < 0) {
+            errno = segment_states[i] == STREAM_SEGMENTS_INVALID ? EUCLEAN : errno;
+            free(segment_states);
+            free(open_args);
+            goto fail;
+        }
+    }
+
     /* Always run recover_streams — reserve_off / active_file_id aren't
        persisted, so a clean close + reopen would otherwise leave them
        at 0 and the next write would clobber a live record at the head
        of the active segment. No-op when the directory is empty. */
-    (void)dirty_marker_exists;  /* silence unused warning */
-    if (recover_streams(db) != 0) { free(open_args); goto fail; }
-    if (touch_dirty_marker(db) != 0) {
-        /* Non-fatal — recovery will simply re-walk on the next open. */
+    if (recover_streams(db) != 0) {
+        free(segment_states);
+        free(open_args);
+        goto fail;
     }
-
+    for (int i = 0; i < num_streams; i++) {
+        if (segment_states[i] != STREAM_SEGMENTS_EMPTY) continue;
+        char path[PATH_MAX];
+        seg_path_for(path, data_dir, i, 0);
+        SlotcaskSegHandle h;
+        if (segcache_acquire(&h, path, 1, 1, 0) != 0) {
+            free(segment_states);
+            free(open_args);
+            goto fail;
+        }
+        if (h.slot >= 0) {
+            SlotRef *ref = seg_ref_for(db, i, 0);
+            if (ref) {
+                ref->slot = h.slot;
+                ref->gen = atomic_load_explicit(&g_segcache[h.slot].gen,
+                                                memory_order_acquire);
+            }
+        }
+        segcache_release(&h);
+    }
+    free(segment_states);
     /* Rebuild the per-stream free-slot pool from kf state. The pool is
        in-memory only — every daemon start would otherwise lose track of
        tombstoned seg slots, leaving them unreusable until the next
@@ -4866,6 +4726,7 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
     return 0;
 
 fail:
+    pthread_mutex_destroy(&db->trim_init_lock);
     if (db->streams) {
         for (int i = 0; i < num_streams; i++) {
             pthread_mutex_destroy(&db->streams[i].rotation_lock);
@@ -4880,6 +4741,7 @@ fail:
 }
 
 void slotcask_close(SlotcaskDb *db) {
+    pthread_mutex_destroy(&db->trim_init_lock);
     if (db->streams) {
         for (int i = 0; i < db->num_streams; i++) {
             pthread_mutex_destroy(&db->streams[i].rotation_lock);
@@ -4896,7 +4758,6 @@ void slotcask_close(SlotcaskDb *db) {
         free(db->seg_slot_refs);
     }
     free(db->seg_slot_caps);
-    remove_dirty_marker(db);
     memset(db, 0, sizeof(*db));
 }
 
@@ -5052,8 +4913,9 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
 
     /* Trim value to field boundary for compact varlen storage. */
-    if (db->format == SLOTCASK_FORMAT_VARIABLE && db->trim_fn)
-        vlen = db->trim_fn(value, vlen, db->trim_ctx);
+    SlotcaskTrimFn trim_fn = atomic_load_explicit(&db->trim_fn, memory_order_acquire);
+    if (trim_fn)
+        vlen = trim_fn(value, vlen, db->trim_ctx);
 
     if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
     SlotcaskUpsertOpts blank = {0};
@@ -5123,51 +4985,33 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     uint16_t target_fid;
     uint32_t target_off;
     int got_pool;
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + vlen),
-                                           db->slot_size, &fs) == 0);
-        if (got_pool) {
-            target_fid = fs.file_id;
-            target_off = fs.offset;
-            slot_capacity = fs.capacity;
-        } else {
-            size_t rec_size = slotcask_record_size_varlen(klen, vlen);
-            uint32_t fid, off;
-            if (append_reserve_single_varlen(db, pool, rec_size, &fid, &off) != 0)
-                return -1;
-            target_fid = (uint16_t)fid;
-            target_off = off;
-            slot_capacity = (uint32_t)rec_size;
-        }
+    size_t rec_size = slotcask_record_size_varlen(klen, vlen);
+    got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + vlen),
+                                       db->slot_size, &fs) == 0);
+    if (got_pool) {
+        target_fid = fs.file_id;
+        target_off = fs.offset;
+        slot_capacity = (uint32_t)rec_size;
+        if (fs.capacity > slot_capacity)
+            pool_split_leftover(db, target_stream, target_fid,
+                                target_off + slot_capacity,
+                                fs.capacity - slot_capacity);
     } else {
-        slot_capacity = (uint32_t)db->slot_size;
-        got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
-        if (got_pool) {
-            target_fid = fs.file_id;
-            target_off = fs.offset;
-        } else {
-            uint32_t fid, off;
-            if (append_reserve_n(db, pool, 1, &fid, &off) != 0) return -1;
-            target_fid = (uint16_t)fid;
-            target_off = off;
-        }
+        uint32_t fid, off;
+        if (append_reserve_single_varlen(db, pool, rec_size, &fid, &off) != 0)
+            return -1;
+        target_fid = (uint16_t)fid;
+        target_off = off;
+        slot_capacity = (uint32_t)rec_size;
     }
 
     /* Write seg. */
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
-                                     hash, key, klen, value, vlen,
-                                     slot_capacity, 1) != 0) {
-            if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
-                                              slot_capacity, db->slot_size);
-            return -1;
-        }
-    } else {
-        if (seg_write_record(db, target_stream, target_fid, target_off,
-                              hash, key, klen, value, vlen, 1) != 0) {
-            if (got_pool) pool_push_free(pool, target_fid, target_off, db->slot_size);
-            return -1;
-        }
+    if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
+                                 hash, key, klen, value, vlen,
+                                 slot_capacity, 1) != 0) {
+        if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
+                                          slot_capacity, db->slot_size);
+        return -1;
     }
 
     /* Acquire kf wrlock + commit attempt. */
@@ -5449,8 +5293,9 @@ static int upsert_slow_path(SlotcaskDb *db, int stream_id_hint,
             write_vlen > out_capacity) {
             goto new_from_old_failed;
         }
-        if (db->format == SLOTCASK_FORMAT_VARIABLE && db->trim_fn)
-            write_vlen = db->trim_fn(callback_value, write_vlen, db->trim_ctx);
+        SlotcaskTrimFn trim_fn = atomic_load_explicit(&db->trim_fn, memory_order_acquire);
+        if (trim_fn)
+            write_vlen = trim_fn(callback_value, write_vlen, db->trim_ctx);
         if ((size_t)24 + klen + write_vlen > (size_t)db->slot_size)
             goto new_from_old_failed;
         write_value = callback_value;
@@ -5479,66 +5324,40 @@ new_from_old_done:;
     uint16_t target_fid;
     uint32_t target_off;
     int got_pool;
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + write_vlen),
-                                           db->slot_size, &fs) == 0);
-        if (got_pool) {
-            target_fid = fs.file_id;
-            target_off = fs.offset;
-            slot_capacity = fs.capacity;
-        } else {
-            size_t rec_size = slotcask_record_size_varlen(klen, write_vlen);
-            uint32_t fid, off;
-            if (append_reserve_single_varlen(db, pool, rec_size, &fid, &off) != 0) {
-                kfcache_release(&kh);
-                free(callback_value);
-                free(old_buf);
-                return -1;
-            }
-            target_fid = (uint16_t)fid;
-            target_off = off;
-            slot_capacity = (uint32_t)rec_size;
-        }
+    size_t rec_size = slotcask_record_size_varlen(klen, write_vlen);
+    got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + write_vlen),
+                                       db->slot_size, &fs) == 0);
+    if (got_pool) {
+        target_fid = fs.file_id;
+        target_off = fs.offset;
+        slot_capacity = (uint32_t)rec_size;
+        if (fs.capacity > slot_capacity)
+            pool_split_leftover(db, target_stream, target_fid,
+                                target_off + slot_capacity,
+                                fs.capacity - slot_capacity);
     } else {
-        slot_capacity = (uint32_t)db->slot_size;
-        got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
-        if (got_pool) {
-            target_fid = fs.file_id;
-            target_off = fs.offset;
-        } else {
-            uint32_t fid, off;
-            if (append_reserve_n(db, pool, 1, &fid, &off) != 0) {
-                kfcache_release(&kh);
-                free(callback_value);
-                free(old_buf);
-                return -1;
-            }
-            target_fid = (uint16_t)fid;
-            target_off = off;
+        uint32_t fid, off;
+        if (append_reserve_single_varlen(db, pool, rec_size, &fid, &off) != 0) {
+            kfcache_release(&kh);
+            free(callback_value);
+            free(old_buf);
+            return -1;
         }
+        target_fid = (uint16_t)fid;
+        target_off = off;
+        slot_capacity = (uint32_t)rec_size;
     }
 
     /* Write new record. */
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
-                                     hash, key, klen, write_value, write_vlen,
-                                     slot_capacity, 1) != 0) {
-            if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
-                                              slot_capacity, db->slot_size);
-            kfcache_release(&kh);
-            free(callback_value);
-            free(old_buf);
-            return -1;
-        }
-    } else {
-        if (seg_write_record(db, target_stream, target_fid, target_off,
-                              hash, key, klen, write_value, write_vlen, 1) != 0) {
-            if (got_pool) pool_push_free(pool, target_fid, target_off, db->slot_size);
-            kfcache_release(&kh);
-            free(callback_value);
-            free(old_buf);
-            return -1;
-        }
+    if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
+                                 hash, key, klen, write_value, write_vlen,
+                                 slot_capacity, 1) != 0) {
+        if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
+                                          slot_capacity, db->slot_size);
+        kfcache_release(&kh);
+        free(callback_value);
+        free(old_buf);
+        return -1;
     }
 
     /* Publish (shard, slot) for index hooks that key by physical location
@@ -5833,8 +5652,9 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
 
     /* Trim value to field boundary for compact varlen storage. */
-    if (db->format == SLOTCASK_FORMAT_VARIABLE && db->trim_fn)
-        vlen = db->trim_fn(value, vlen, db->trim_ctx);
+    SlotcaskTrimFn trim_fn = atomic_load_explicit(&db->trim_fn, memory_order_acquire);
+    if (trim_fn)
+        vlen = trim_fn(value, vlen, db->trim_ctx);
 
     if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
     SlotcaskUpsertOpts blank = {0};
@@ -5880,51 +5700,33 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     uint16_t target_fid;
     uint32_t target_off;
     int got_pool;
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + vlen),
-                                           db->slot_size, &fs) == 0);
-        if (got_pool) {
-            target_fid = fs.file_id;
-            target_off = fs.offset;
-            slot_capacity = fs.capacity;
-        } else {
-            size_t rec_size = slotcask_record_size_varlen(klen, vlen);
-            uint32_t fid, off;
-            if (append_reserve_single_varlen(db, pool, rec_size, &fid, &off) != 0)
-                return -1;
-            target_fid = (uint16_t)fid;
-            target_off = off;
-            slot_capacity = (uint32_t)rec_size;
-        }
+    size_t rec_size = slotcask_record_size_varlen(klen, vlen);
+    got_pool = (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + vlen),
+                                       db->slot_size, &fs) == 0);
+    if (got_pool) {
+        target_fid = fs.file_id;
+        target_off = fs.offset;
+        slot_capacity = (uint32_t)rec_size;
+        if (fs.capacity > slot_capacity)
+            pool_split_leftover(db, target_stream, target_fid,
+                                target_off + slot_capacity,
+                                fs.capacity - slot_capacity);
     } else {
-        slot_capacity = (uint32_t)db->slot_size;
-        got_pool = (pool_try_pop_n(pool, 1, &fs) == 0);
-        if (got_pool) {
-            target_fid = fs.file_id;
-            target_off = fs.offset;
-        } else {
-            uint32_t fid, off;
-            if (append_reserve_n(db, pool, 1, &fid, &off) != 0) return -1;
-            target_fid = (uint16_t)fid;
-            target_off = off;
-        }
+        uint32_t fid, off;
+        if (append_reserve_single_varlen(db, pool, rec_size, &fid, &off) != 0)
+            return -1;
+        target_fid = (uint16_t)fid;
+        target_off = off;
+        slot_capacity = (uint32_t)rec_size;
     }
 
     /* Write seg with flag=1 set so kf can point to valid live data. */
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-        if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
-                                     hash, key, klen, value, vlen,
-                                     slot_capacity, 1) != 0) {
-            if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
-                                              slot_capacity, db->slot_size);
-            return -1;
-        }
-    } else {
-        if (seg_write_record(db, target_stream, target_fid, target_off,
-                              hash, key, klen, value, vlen, 1) != 0) {
-            if (got_pool) pool_push_free(pool, target_fid, target_off, db->slot_size);
-            return -1;
-        }
+    if (seg_write_record_varlen(db, target_stream, target_fid, target_off,
+                                 hash, key, klen, value, vlen,
+                                 slot_capacity, 1) != 0) {
+        if (got_pool) pool_push_free_cap(pool, target_fid, target_off,
+                                          slot_capacity, db->slot_size);
+        return -1;
     }
 
     /* Acquire kf wrlock and attempt the insert. */
@@ -6231,177 +6033,61 @@ oom:
     return -1;
 }
 
-/* Phase 3 — per-stream batched reserve + seg write. For each stream
-   with non-zero count: try the free pool first (sort by file_id and
-   batch one segcache_acquire per file); if the pool is empty or short,
-   append_reserve_n a contiguous run + single segcache_acquire for the
-   whole bucket. On per-stream failure marks affected recs status=-1
-   and continues — never propagates failure as a return value. */
+/* Phase 3 — per-stream variable-length reserve and segment writes. */
 static void bulk_phase3_seg_writes(SlotcaskDb *db,
                                     SlotcaskBulkRec *recs, SlotcaskBulkState *st,
                                     int *stream_counts, int **stream_idx) {
-    int is_varlen = (db->format == SLOTCASK_FORMAT_VARIABLE);
-
     for (int s = 0; s < db->num_streams; s++) {
         int cnt = stream_counts[s];
         if (cnt == 0) continue;
         SlotcaskStream *pool = &db->streams[s];
 
-        if (is_varlen) {
-            /* Variable-length path: each record may have a different size.
-               Pop from pool per-record (no batch pop possible). If the pool
-               doesn't have a fitting slot, fall through to the append path. */
-            for (int k = 0; k < cnt; k++) {
-                int i = stream_idx[s][k];
-                SlotcaskBulkRec *r = &recs[i];
-                SlotcaskFreeSlot fs;
-                size_t needed = 24 + r->klen + r->vlen;
-                size_t rec_size = slotcask_record_size_varlen(r->klen, r->vlen);
-                if (pool_try_pop_for_size(pool, (uint32_t)needed,
-                                           db->slot_size, &fs) == 0) {
-                    st[i].target_fid = fs.file_id;
-                    st[i].target_off = fs.offset;
-                    st[i].got_pool   = 1;
-                    r->slot_capacity = fs.capacity;
-                } else {
-                    uint32_t fid, off;
-                    if (append_reserve_single_varlen(db, pool, rec_size,
-                                                      &fid, &off) != 0) {
-                        r->status = -1;
-                        continue;
-                    }
-                    st[i].target_fid = (uint16_t)fid;
-                    st[i].target_off = off;
-                    st[i].got_pool   = 0;
-                    r->slot_capacity = (uint32_t)rec_size;
-                }
-                char path[PATH_MAX];
-                seg_path_for(path, db->data_dir, (uint8_t)s, st[i].target_fid);
-                SlotcaskSegHandle h;
-                if (segcache_acquire(&h, path, 1, 0, 1) != 0) {
-                    if (st[i].got_pool)
-                        pool_push_free_cap(pool, st[i].target_fid,
-                                            st[i].target_off,
-                                            r->slot_capacity, db->slot_size);
-                    r->status = -1;
-                    continue;
-                }
-                seg_record_emit(h.map + st[i].target_off, (int)rec_size,
-                                 st[i].hash, r->key, r->klen,
-                                 r->value, r->vlen);
-                SegCacheEntry *e = &g_segcache[h.slot];
-                durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
-                segcache_release(&h);
-            }
-            continue;
-        }
-
-        /* ——— Fixed-format path (unchanged) ——— */
-        SlotcaskFreeSlot *fs = malloc((size_t)cnt * sizeof(SlotcaskFreeSlot));
-        if (!fs) {
-            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
-            continue;
-        }
-        int got_pool = (pool_try_pop_n(pool, (size_t)cnt, fs) == 0);
-
-        if (got_pool) {
-            typedef struct { uint16_t fid; uint32_t off; int rec_idx; } PoolItem;
-            PoolItem *items = malloc((size_t)cnt * sizeof(PoolItem));
-            if (!items) {
-                for (int k = 0; k < cnt; k++) {
-                    int i = stream_idx[s][k];
-                    pool_push_free(pool, fs[k].file_id, fs[k].offset, db->slot_size);
-                    recs[i].status = -1;
-                }
-                free(fs);
-                continue;
-            }
-            for (int k = 0; k < cnt; k++) {
-                items[k].fid     = fs[k].file_id;
-                items[k].off     = fs[k].offset;
-                items[k].rec_idx = stream_idx[s][k];
-            }
-            free(fs);
-            for (int a = 1; a < cnt; a++) {
-                PoolItem tmp = items[a];
-                int b = a - 1;
-                while (b >= 0 && items[b].fid > tmp.fid) {
-                    items[b + 1] = items[b];
-                    b--;
-                }
-                items[b + 1] = tmp;
-            }
-
-            int k = 0;
-            while (k < cnt) {
-                int run_end = k + 1;
-                while (run_end < cnt && items[run_end].fid == items[k].fid)
-                    run_end++;
-                char path[PATH_MAX];
-                seg_path_for(path, db->data_dir, (uint8_t)s, items[k].fid);
-                SlotcaskSegHandle h;
-                if (segcache_acquire(&h, path, 0, 0, 1) != 0) {
-                    for (int j = k; j < run_end; j++) {
-                        int i = items[j].rec_idx;
-                        pool_push_free(pool, items[j].fid, items[j].off, db->slot_size);
-                        recs[i].status = -1;
-                    }
-                    k = run_end;
-                    continue;
-                }
-                for (int j = k; j < run_end; j++) {
-                    int i = items[j].rec_idx;
-                    SlotcaskBulkRec *r = &recs[i];
-                    st[i].target_fid = items[j].fid;
-                    st[i].target_off = items[j].off;
-                    st[i].got_pool   = 1;
-                    seg_record_emit(h.map + items[j].off, db->slot_size,
-                                     st[i].hash, r->key, r->klen,
-                                     r->value, r->vlen);
-                }
-                SegCacheEntry *e = &g_segcache[h.slot];
-                durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
-                segcache_release(&h);
-                k = run_end;
-            }
-            free(items);
-            continue;
-        }
-        free(fs);
-
-        uint32_t *offsets = malloc((size_t)cnt * sizeof(uint32_t));
-        if (!offsets) {
-            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
-            continue;
-        }
-        uint32_t base_fid = 0;
-        if (append_reserve_n(db, pool, (size_t)cnt, &base_fid, offsets) != 0) {
-            free(offsets);
-            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
-            continue;
-        }
-        char path[PATH_MAX];
-        seg_path_for(path, db->data_dir, (uint8_t)s, base_fid);
-        SlotcaskSegHandle h;
-        if (segcache_acquire(&h, path, 1, 0, 1) != 0) {
-            free(offsets);
-            for (int k = 0; k < cnt; k++) recs[stream_idx[s][k]].status = -1;
-            continue;
-        }
         for (int k = 0; k < cnt; k++) {
             int i = stream_idx[s][k];
             SlotcaskBulkRec *r = &recs[i];
-            st[i].target_fid = (uint16_t)base_fid;
-            st[i].target_off = offsets[k];
-            st[i].got_pool   = 0;
-            seg_record_emit(h.map + offsets[k], db->slot_size,
-                             st[i].hash, r->key, r->klen,
-                             r->value, r->vlen);
+            SlotcaskFreeSlot fs;
+            size_t needed = 24 + r->klen + r->vlen;
+            size_t rec_size = slotcask_record_size_varlen(r->klen, r->vlen);
+            if (pool_try_pop_for_size(pool, (uint32_t)needed,
+                                      db->slot_size, &fs) == 0) {
+                st[i].target_fid = fs.file_id;
+                st[i].target_off = fs.offset;
+                st[i].got_pool = 1;
+                r->slot_capacity = (uint32_t)rec_size;
+                if (fs.capacity > (uint32_t)rec_size)
+                    pool_split_leftover(db, (uint8_t)s, fs.file_id,
+                                        fs.offset + (uint32_t)rec_size,
+                                        fs.capacity - (uint32_t)rec_size);
+            } else {
+                uint32_t fid, off;
+                if (append_reserve_single_varlen(db, pool, rec_size,
+                                                 &fid, &off) != 0) {
+                    r->status = -1;
+                    continue;
+                }
+                st[i].target_fid = (uint16_t)fid;
+                st[i].target_off = off;
+                st[i].got_pool = 0;
+                r->slot_capacity = (uint32_t)rec_size;
+            }
+            char path[PATH_MAX];
+            seg_path_for(path, db->data_dir, (uint8_t)s, st[i].target_fid);
+            SlotcaskSegHandle h;
+            if (segcache_acquire(&h, path, 1, 0, 1) != 0) {
+                if (st[i].got_pool)
+                    pool_push_free_cap(pool, st[i].target_fid,
+                                       st[i].target_off,
+                                       r->slot_capacity, db->slot_size);
+                r->status = -1;
+                continue;
+            }
+            seg_record_emit(h.map + st[i].target_off, (int)rec_size,
+                            st[i].hash, r->key, r->klen,
+                            r->value, r->vlen);
+            SegCacheEntry *e = &g_segcache[h.slot];
+            durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
+            segcache_release(&h);
         }
-        SegCacheEntry *e = &g_segcache[h.slot];
-        durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
-        segcache_release(&h);
-        free(offsets);
     }
 }
 
@@ -6462,17 +6148,12 @@ static void bulk_phase5_tombstone_olds(SlotcaskDb *db,
         for (int j = k; j < run_end; j++) {
             int i = tomb_idx[j];
             __atomic_store_n(&h.map[st[i].old_off + 18], 2, __ATOMIC_RELEASE);
-            if (db->format == SLOTCASK_FORMAT_VARIABLE) {
-                uint16_t klen = seg_rec_klen(h.map + st[i].old_off);
-                uint32_t vlen = seg_rec_vlen(h.map + st[i].old_off);
-                uint32_t cap  = (uint32_t)slotcask_record_size_varlen(
-                                    (size_t)klen, (size_t)vlen);
-                pool_push_free_cap(&db->streams[sid], st[i].old_fid,
-                                   st[i].old_off, cap, db->slot_size);
-            } else {
-                pool_push_free(&db->streams[sid], st[i].old_fid,
-                               st[i].old_off, db->slot_size);
-            }
+            uint16_t klen = seg_rec_klen(h.map + st[i].old_off);
+            uint32_t vlen = seg_rec_vlen(h.map + st[i].old_off);
+            uint32_t cap  = (uint32_t)slotcask_record_size_varlen(
+                                (size_t)klen, (size_t)vlen);
+            pool_push_free_cap(&db->streams[sid], st[i].old_fid,
+                               st[i].old_off, cap, db->slot_size);
         }
         SegCacheEntry *e = &g_segcache[h.slot];
         durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
@@ -7041,7 +6722,7 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             } else {
                 /* ---- Legacy single-phase path: pre_commit fires per
                    record after kf is already committed and the marker is
-                   durable. Preserved unchanged for non-migrated callers
+                   durable. Preserved unchanged for callers without a batch
                    (bulk-update sites; require_existing = 1). */
                 if (w_valid > 0) {
                     kf_batch_marker_path(bpath, sizeof(bpath), db->data_dir,
@@ -8622,9 +8303,8 @@ int slotcask_validate_live_refs(SlotcaskDb *db, uint64_t *out_invalid) {
                     const uint8_t *record = sh.map + entry->offset;
                     uint16_t klen = seg_rec_klen(record);
                     uint32_t vlen = seg_rec_vlen(record);
-                    size_t record_size = db->format == SLOTCASK_FORMAT_VARIABLE
-                        ? slotcask_record_size_varlen((size_t)klen, (size_t)vlen)
-                        : (size_t)db->slot_size;
+                    size_t record_size = slotcask_record_size_varlen(
+                        (size_t)klen, (size_t)vlen);
                     size_t encoded_size = 24u + (size_t)klen + (size_t)vlen;
 
                     if (record_size > (size_t)db->slot_size ||
@@ -9311,24 +8991,6 @@ static int seg_stat_cmp_live_asc(const void *a, const void *b) {
 }
 
 /* Walk a non-active seg file; count flag==1 slots and capacity. */
-static int seg_stat_one(SlotcaskDb *db, int stream_id, uint32_t file_id,
-                        uint32_t *out_live, uint32_t *out_total) {
-    char path[PATH_MAX];
-    seg_path_for(path, db->data_dir, stream_id, file_id);
-    SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 0, 0, 0) != 0) return -1;
-    size_t total = h.map_size / (size_t)db->slot_size;
-    uint32_t live = 0;
-    for (size_t s = 0; s < total; s++) {
-        const uint8_t *rec = h.map + s * (size_t)db->slot_size;
-        if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) == 1) live++;
-    }
-    segcache_release(&h);
-    *out_live = live;
-    *out_total = (uint32_t)total;
-    return 0;
-}
-
 /* Variable-length variant: walk records by reading headers sequentially.
    Returns -1 (leaving the output counters unset) if the scan hits an
    unrecoverable desync. The caller treats that as unknown stats and
@@ -9405,94 +9067,6 @@ static void pool_drop_for_file(SlotcaskStream *p, uint16_t fid) {
    Caller pre-verified `recipient_free >= donor_live` so all donor records
    fit. After return, donor still holds (now stale) flag=1 records bytewise;
    caller invokes compact_drop_seg_file to evict + unlink it. */
-/* Context for compact_od_cb — carries recipient mmap and free-slot list. */
-typedef struct {
-    SlotcaskDb *db;
-    int         stream_id;
-    uint32_t    donor_fid;
-    uint32_t    recipient_fid;
-    uint8_t    *rmap;        /* recipient mmap base (MAP_SHARED, writeable) */
-    uint32_t   *free_offs;   /* free slot byte-offsets in recipient */
-    size_t      free_count;
-    size_t      free_idx;
-    int         rc;
-    uint32_t    kf_lookup_failed; /* live records where kf lookup returned -1 */
-} CompactOdCtx;
-
-/* od_record_cb adapter: called by seg_scan_o_direct for each live donor slot.
-   Writes the record to the next free recipient slot, then repoints the kf entry
-   under the kf shard's wrlock. */
-static int compact_od_cb(const uint8_t *rec, size_t vlen,
-                          const uint8_t hash16[16], void *raw) {
-    CompactOdCtx *c = (CompactOdCtx *)raw;
-    if (c->rc != 0) return 1;  /* already failed — abort scan */
-
-    if (c->free_idx >= c->free_count) { c->rc = -1; return 1; }
-
-    uint32_t target_off = c->free_offs[c->free_idx];
-
-    uint16_t klen;
-    memcpy(&klen, rec + 16, 2);
-    const uint8_t *key   = rec + 24;
-    const uint8_t *value = rec + 24 + (size_t)klen;
-
-    /* Step 1: write record into recipient free slot (vacuum holds objlock_wrlock
-       so no concurrent writer can race on this offset). */
-    seg_record_emit(c->rmap + target_off, c->db->slot_size,
-                    hash16, key, (size_t)klen, value, (size_t)vlen);
-
-    if (durability_msync_range(c->rmap, target_off, (size_t)c->db->slot_size) != 0) {
-        c->rc = -1;
-        return 1;
-    }
-    durability_test_pause(c->db->data_dir, "compact-after-recipient-sync");
-
-    /* Step 2: repoint kf entry under the kf shard wrlock. */
-    int kfshard = shard_for_hash(hash16, c->db->num_shards);
-    char kfp[PATH_MAX];
-    kf_path_for(kfp, c->db->data_dir, kfshard);
-    SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kfp, c->db->slots_per_shard, 1) != 0) {
-        c->rc = -1; return 1;
-    }
-
-    uint8_t cur_flag, cur_sid;
-    uint16_t cur_fid;
-    uint32_t cur_off;
-    size_t kf_slot_idx;
-    int lr = kf_lookup_with_slot(&kh, hash16, key, klen, c->db->data_dir,
-                                  &cur_flag, &cur_sid, &cur_fid,
-                                  &cur_off, &kf_slot_idx);
-    if (lr != 0) {
-        size_t cap = kh.capacity;
-        size_t kstart = kf_slot_for(hash16, cap);
-        for (size_t ki = 0; ki < cap; ki++) {
-            size_t kslot = (kstart + ki) % cap;
-            SlotcaskKfEntry *ke = &kh.map[kslot];
-            if (ke->flag == 0) break;
-            if (memcmp(ke->hash, hash16, 16) == 0) {
-                if (ke->flag == 1) c->kf_lookup_failed++;
-                break;
-            }
-        }
-        kfcache_release(&kh);
-        c->free_idx++;
-        return 0;
-    }
-    if ((int)cur_sid != c->stream_id || (uint32_t)cur_fid != c->donor_fid) {
-        /* Already repointed elsewhere (legitimate orphan). */
-        kfcache_release(&kh);
-        c->free_idx++;
-        return 0;
-    }
-
-    kf_repoint_at_slot(&kh, kf_slot_idx, (uint8_t)c->stream_id,
-                        (uint16_t)c->recipient_fid, target_off);
-    kfcache_release(&kh);
-    c->free_idx++;
-    return 0;
-}
-
 /* Context for varlen compact_cb. */
 typedef struct {
     SlotcaskDb *db;
@@ -9712,7 +9286,7 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
     /* Donor is read-only, so use the hardened VARLEN scanner. It validates
        headers and resynchronizes across reused-slot zero-padding gaps. */
     {
-        int drc = seg_scan_o_direct_varlen(donor_path, db->slot_size,
+        int drc = seg_scan_o_direct(donor_path, db->slot_size,
                                            varlen_compact_cb, &ctx);
         if (drc < 0) {
             free(free_offs);
@@ -9725,58 +9299,6 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
     if (out_kf_failed) *out_kf_failed = ctx.kf_lookup_failed;
     free(free_offs);
     free(free_caps);
-    segcache_release(&rh);
-    return ctx.rc;
-}
-
-static int compact_migrate_records(SlotcaskDb *db, int stream_id,
-                                    uint32_t donor_fid, uint32_t recipient_fid,
-                                    uint32_t *out_kf_failed) {
-    char donor_path[PATH_MAX], recipient_path[PATH_MAX];
-    seg_path_for(donor_path, db->data_dir, stream_id, donor_fid);
-    seg_path_for(recipient_path, db->data_dir, stream_id, recipient_fid);
-
-    /* Recipient: mmap for writes and for building the free-slot list. */
-    SlotcaskSegHandle rh;
-    if (segcache_acquire(&rh, recipient_path, 0, 0, 0) != 0) return -1;
-
-    int slot_size = db->slot_size;
-    size_t total = rh.map_size / (size_t)slot_size;
-
-    /* Build recipient free-offset list (every slot whose flag != 1). */
-    uint32_t *free_offs = NULL;
-    size_t free_count = 0, free_cap = 0;
-    for (size_t s = 0; s < total; s++) {
-        const uint8_t *rec = rh.map + s * (size_t)slot_size;
-        if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) == 1) continue;
-        if (free_count == free_cap) {
-            size_t nc = free_cap ? free_cap * 2 : 256;
-            uint32_t *t = realloc(free_offs, nc * sizeof(uint32_t));
-            if (!t) {
-                free(free_offs);
-                segcache_release(&rh);
-                return -1;
-            }
-            free_offs = t;
-            free_cap = nc;
-        }
-        free_offs[free_count++] = (uint32_t)(s * (size_t)slot_size);
-    }
-
-    /* Donor: O_DIRECT scan — read-once, then unlinked; pages must not enter
-       the page cache. compact_od_cb handles kf repoint per live record. */
-    CompactOdCtx ctx = {
-        .db = db, .stream_id = stream_id,
-        .donor_fid = donor_fid, .recipient_fid = recipient_fid,
-        .rmap = rh.map,
-        .free_offs = free_offs, .free_count = free_count,
-        .free_idx = 0, .rc = 0,
-        .kf_lookup_failed = 0,
-    };
-    seg_scan_o_direct(donor_path, slot_size, compact_od_cb, &ctx);
-
-    if (out_kf_failed) *out_kf_failed = ctx.kf_lookup_failed;
-    free(free_offs);
     segcache_release(&rh);
     return ctx.rc;
 }
@@ -9819,173 +9341,103 @@ static int compact_one_stream(SlotcaskDb *db, int stream_id) {
     pthread_mutex_unlock(&p->rotation_lock);
 
     DIR *dh = opendir(dir);
-    if (!dh) return 0;
+    if (!dh) return -1;
 
     SegStat *files = NULL;
     size_t nfiles = 0, fcap = 0;
-    struct dirent *de;
-    while ((de = readdir(dh)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        size_t nlen = strlen(de->d_name);
-        if (nlen != 10 || strcmp(de->d_name + 6, ".dat") != 0) continue;
-        uint32_t fid = (uint32_t)strtoul(de->d_name, NULL, 10);
+    int read_errno = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(dh);
+        if (!de) {
+            read_errno = errno;
+            break;
+        }
+        int parsed = data_file_id_from_name(de->d_name);
+        if (parsed == -1) continue;
+        if (parsed < 0) {
+            free(files);
+            closedir(dh);
+            return -1;
+        }
+        uint32_t fid = (uint32_t)parsed;
         if (fid == active) continue;
-
         if (nfiles == fcap) {
             size_t nc = fcap ? fcap * 2 : 16;
-            SegStat *t = realloc(files, nc * sizeof(SegStat));
-            if (!t) { free(files); closedir(dh); return 0; }
-            files = t;
-            fcap = nc;
-        }
-        files[nfiles].stream_id = stream_id;
-        files[nfiles].file_id = fid;
-        files[nfiles].live_count = 0;
-        files[nfiles].total_slots = 0;
-        nfiles++;
-    }
-    closedir(dh);
-
-    if (nfiles == 0) { free(files); return 0; }
-
-    for (size_t i = 0; i < nfiles; i++) {
-        if (seg_stat_one(db, stream_id, files[i].file_id,
-                          &files[i].live_count, &files[i].total_slots) != 0) {
-            files[i].live_count = files[i].total_slots = 0;
-        }
-    }
-
-    qsort(files, nfiles, sizeof(SegStat), seg_stat_cmp_live_asc);
-
-    int dropped = 0;
-
-    /* Two-pointer pair-merge: i = sparsest donor, j = densest recipient.
-       Skip empties first (drop unconditionally), then merge i→j when j
-       has free room for all of i's live records. */
-    size_t i = 0;
-    size_t j = nfiles - 1;
-    while (i < j) {
-        if (files[i].total_slots == 0) { i++; continue; }
-        if (files[i].live_count == 0) {
-            if (compact_drop_seg_file(db, stream_id, files[i].file_id) == 0)
-                dropped++;
-            i++;
-            continue;
-        }
-        uint32_t recip_free = files[j].total_slots - files[j].live_count;
-        if (recip_free >= files[i].live_count) {
-            uint32_t kf_failed = 0;
-            if (compact_migrate_records(db, stream_id,
-                                          files[i].file_id, files[j].file_id,
-                                          &kf_failed) == 0) {
-                if (kf_failed == 0) {
-                    if (compact_drop_seg_file(db, stream_id, files[i].file_id) == 0)
-                        dropped++;
-                }
-                files[j].live_count += files[i].live_count;
+            SegStat *next = realloc(files, nc * sizeof(*files));
+            if (!next) {
+                free(files);
+                closedir(dh);
+                return -1;
             }
-            i++;
-        } else {
-            /* Recipient too full for this donor; donors only get sparser
-               below i so no point retrying with a sparser donor. Move
-               recipient down. */
-            if (j == i + 1) break;
-            j--;
-        }
-    }
-
-    free(files);
-    return dropped;
-}
-
-/* Variable-length variant: same two-pointer merge as compact_one_stream
-   but uses seg_stat_one_varlen and compact_migrate_records_varlen. */
-static int compact_one_stream_varlen(SlotcaskDb *db, int stream_id) {
-    char dir[PATH_MAX];
-    stream_dir_for(dir, db->data_dir, stream_id);
-
-    SlotcaskStream *p = &db->streams[stream_id];
-    pthread_mutex_lock(&p->rotation_lock);
-    uint32_t active = p->active_file_id;
-    pthread_mutex_unlock(&p->rotation_lock);
-
-    DIR *dh = opendir(dir);
-    if (!dh) return 0;
-
-    SegStat *files = NULL;
-    size_t nfiles = 0, fcap = 0;
-    struct dirent *de;
-    while ((de = readdir(dh)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        size_t nlen = strlen(de->d_name);
-        if (nlen != 10 || strcmp(de->d_name + 6, ".dat") != 0) continue;
-        uint32_t fid = (uint32_t)strtoul(de->d_name, NULL, 10);
-        if (fid == active) continue;
-
-        if (nfiles == fcap) {
-            size_t nc = fcap ? fcap * 2 : 16;
-            SegStat *t = realloc(files, nc * sizeof(SegStat));
-            if (!t) { free(files); closedir(dh); return 0; }
-            files = t;
+            files = next;
             fcap = nc;
         }
-        files[nfiles].stream_id = stream_id;
-        files[nfiles].file_id = fid;
-        files[nfiles].live_count = 0;
-        files[nfiles].total_slots = 0;
-        nfiles++;
+        files[nfiles++] = (SegStat){
+            .stream_id = stream_id,
+            .file_id = fid,
+            .live_count = 0,
+            .total_slots = 0
+        };
     }
-    closedir(dh);
+    int close_rc = closedir(dh);
+    if (read_errno != 0 || close_rc != 0) {
+        free(files);
+        return -1;
+    }
+    if (nfiles == 0) {
+        free(files);
+        return 0;
+    }
 
-    if (nfiles == 0) { free(files); return 0; }
-
-    for (size_t i = 0; i < nfiles; i++) {
-        if (seg_stat_one_varlen(db, stream_id, files[i].file_id,
-                                 &files[i].live_count,
-                                 &files[i].total_slots) != 0) {
-            files[i].live_count = files[i].total_slots = 0;
+    for (size_t k = 0; k < nfiles; k++) {
+        if (seg_stat_one_varlen(db, stream_id, files[k].file_id,
+                                &files[k].live_count,
+                                &files[k].total_slots) != 0) {
+            free(files);
+            return -1;
         }
     }
-
-    qsort(files, nfiles, sizeof(SegStat), seg_stat_cmp_live_asc);
+    qsort(files, nfiles, sizeof(*files), seg_stat_cmp_live_asc);
 
     int dropped = 0;
-    size_t i = 0;
-    size_t j = nfiles - 1;
+    size_t i = 0, j = nfiles - 1;
     while (i < j) {
-        if (files[i].total_slots == 0) { i++; continue; }
-        if (files[i].live_count == 0) {
-            if (compact_drop_seg_file(db, stream_id, files[i].file_id) == 0)
-                dropped++;
+        if (files[i].total_slots == 0) {
             i++;
             continue;
         }
-        uint32_t recip_free = files[j].total_slots - files[j].live_count;
-        if (recip_free >= files[i].live_count) {
+        if (files[i].live_count == 0) {
+            if (compact_drop_seg_file(db, stream_id, files[i].file_id) != 0) {
+                free(files);
+                return -1;
+            }
+            dropped++;
+            i++;
+            continue;
+        }
+        uint32_t recipient_free =
+            files[j].total_slots - files[j].live_count;
+        if (recipient_free >= files[i].live_count) {
             uint32_t kf_failed = 0;
             if (compact_migrate_records_varlen(db, stream_id,
                                                 files[i].file_id,
                                                 files[j].file_id,
-                                                &kf_failed) == 0) {
-                /* Only delete donor if every live kf entry that referenced it
-                   was successfully repointed.  kf_failed > 0 means at least
-                   one live kf entry exists for a record in this donor but
-                   verify_stored_key could not reach its backing file — the
-                   donor must be preserved rather than deleting a segment the live kf
-                   entry still references. */
-                if (kf_failed == 0) {
-                    if (compact_drop_seg_file(db, stream_id, files[i].file_id) == 0)
-                        dropped++;
-                }
-                files[j].live_count += files[i].live_count;
+                                                &kf_failed) != 0 ||
+                kf_failed != 0 ||
+                compact_drop_seg_file(db, stream_id,
+                                      files[i].file_id) != 0) {
+                free(files);
+                return -1;
             }
+            dropped++;
+            files[j].live_count += files[i].live_count;
             i++;
         } else {
             if (j == i + 1) break;
             j--;
         }
     }
-
     free(files);
     return dropped;
 }
@@ -9993,513 +9445,15 @@ static int compact_one_stream_varlen(SlotcaskDb *db, int stream_id) {
 /* Public entry point. Caller must hold objlock_wrlock for the object. */
 int slotcask_compact_segs(SlotcaskDb *db, int *out_dropped) {
     if (!db) return -1;
-    int (*compact_fn)(SlotcaskDb *, int) =
-        (db->format == SLOTCASK_FORMAT_VARIABLE)
-        ? compact_one_stream_varlen
-        : compact_one_stream;
     int total = 0;
     for (int s = 0; s < db->num_streams; s++) {
-        total += compact_fn(db, s);
+        int rc = compact_one_stream(db, s);
+        if (rc < 0) return -1;
+        total += rc;
     }
     if (out_dropped) *out_dropped = total;
     return 0;
 }
-
-/* ─── offline fixed → varlen migration ─── */
-
-/* Migrate an object from fixed-size to variable-length segment format.
-   Daemon must NOT be running.  Walks every KF shard, reads each record
-   from the old fixed-format segment, writes it to a new varlen segment,
-   repoints the KF entry, then removes old segment files. */
-#define MIGRATE_STREAM_BASE 48000u
-#define MIGRATE_STREAM_STRIDE 1000u
-#define COMPACT_STREAM_BASE 30000u   /* dest range for slotcask_compact; fits uint16_t, below MIGRATE_STREAM_BASE */
-
-_Static_assert(MIGRATE_STREAM_BASE +
-               (SLOTCASK_MAX_STREAMS - 1u) * MIGRATE_STREAM_STRIDE <= UINT16_MAX,
-               "migration stream file-id ranges must fit the uint16_t KF field");
-_Static_assert(COMPACT_STREAM_BASE +
-               (SLOTCASK_MAX_STREAMS - 1u) * MIGRATE_STREAM_STRIDE <= UINT16_MAX,
-               "compact stream file-id ranges must fit the uint16_t KF field");
-
-int slotcask_migrate_to_varlen(SlotcaskDb *db) {
-    if (!db) return -1;
-    if (db->format == SLOTCASK_FORMAT_VARIABLE) return 0;
-    if (db->format != SLOTCASK_FORMAT_FIXED) return -1;
-
-    int n_streams = db->num_streams;
-
-    /* Phase 0: open all source segment files as direct mmaps.
-       Bypassing segcache eliminates per-record mutex/probe overhead. */
-    typedef struct { uint8_t *base; size_t sz; } SrcMap;
-    SrcMap *src[SLOTCASK_MAX_STREAMS];
-    uint32_t src_cnt[SLOTCASK_MAX_STREAMS];
-    memset(src, 0, sizeof(src));
-    memset(src_cnt, 0, sizeof(src_cnt));
-
-    /* Per-stream dest segment state (one open mmap at a time per
-       stream). Declared and zeroed before the source-scanning loop
-       below so that if that loop `goto fail`s partway through (e.g.
-       a calloc failure), the fail: cleanup path finds a fully
-       zero-initialized dest[] instead of uninitialized stack memory
-       (CID 1696419). */
-    typedef struct { uint8_t *base; size_t alloc; int fd; } DestMap;
-    DestMap dest[SLOTCASK_MAX_STREAMS];
-    memset(dest, 0, sizeof(dest));
-    for (int s = 0; s < n_streams; s++) dest[s].fd = -1;
-    uint32_t dest_fid[SLOTCASK_MAX_STREAMS];
-    size_t   dest_off[SLOTCASK_MAX_STREAMS];
-    for (int s = 0; s < n_streams; s++) {
-        dest_fid[s] = MIGRATE_STREAM_BASE + (uint32_t)s * MIGRATE_STREAM_STRIDE;
-        dest_off[s] = 0;
-    }
-
-    for (int s = 0; s < n_streams; s++) {
-        uint32_t cnt = 0;
-        for (;;) {
-            char p[PATH_MAX];
-            seg_path_for(p, db->data_dir, s, cnt);
-            if (access(p, F_OK) != 0) break;
-            cnt++;
-        }
-        src_cnt[s] = cnt;
-        if (cnt == 0) continue;
-        src[s] = calloc((size_t)cnt, sizeof(SrcMap));
-        if (!src[s]) goto fail;
-        for (uint32_t f = 0; f < cnt; f++) {
-            char p[PATH_MAX];
-            seg_path_for(p, db->data_dir, s, f);
-            int fd = open(p, O_RDONLY);
-            if (fd < 0) continue;
-            struct stat st;
-            if (fstat(fd, &st) == 0 && st.st_size > 0) {
-                void *m = mmap(NULL, (size_t)st.st_size,
-                               PROT_READ, MAP_SHARED, fd, 0);
-                if (m != MAP_FAILED) {
-                    src[s][f].base = (uint8_t *)m;
-                    src[s][f].sz   = (size_t)st.st_size;
-                }
-            }
-            close(fd);
-        }
-    }
-
-    /* Phase 1: KF walk with direct-mmap reads and writes — no per-record locks. */
-    for (int shard = 0; shard < db->num_shards; shard++) {
-        char kf_path[PATH_MAX];
-        kf_path_for(kf_path, db->data_dir, shard);
-        SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0)
-            goto fail;
-
-        size_t cap = kh.capacity;
-        SlotcaskKfEntry *kf = kh.map;
-
-        for (size_t slot = 0; slot < cap; slot++) {
-            uint8_t flag = kf[slot].flag;
-            /* Skip empty (0) and tombstoned (2) KF entries — tombstones are
-               logically deleted so we don't copy them to the dest segment.
-               They keep their existing file_id/offset (pointing to the old
-               source segments about to be deleted), which is harmless since
-               flag==2 offsets are never dereferenced for actual data. */
-            if (flag != 1) continue;
-
-            uint8_t  sid = kf[slot].stream_id;
-            uint16_t fid = kf[slot].file_id;
-            uint32_t off = kf[slot].offset;
-
-            if (sid >= (uint8_t)n_streams) continue;
-            if (!src[sid] || fid >= src_cnt[sid]) continue;
-            SrcMap *sm = &src[sid][fid];
-            if (!sm->base || (size_t)off + 24 > sm->sz) continue;
-
-            uint16_t klen; memcpy(&klen, sm->base + off + 16, 2);
-            uint32_t vlen; memcpy(&vlen, sm->base + off + 20, 4);
-            if ((size_t)off + 24 + klen + vlen > sm->sz) continue;
-
-            const uint8_t *key   = sm->base + off + 24;
-            const uint8_t *value = key + klen;
-            size_t rec_size = slotcask_record_size_varlen((size_t)klen, (size_t)vlen);
-
-            /* Open dest if needed or rotate when full. */
-            if (!dest[sid].base ||
-                dest_off[sid] + rec_size > SLOTCASK_SEG_MAX_BYTES) {
-                if (dest[sid].base) {
-                    size_t used = dest_off[sid];
-                    munmap(dest[sid].base, dest[sid].alloc);
-                    dest[sid].base = NULL;
-                    if (ftruncate(dest[sid].fd, (off_t)used) < 0) {
-                        close(dest[sid].fd);
-                        dest[sid].fd = -1;
-                        kfcache_release(&kh);
-                        goto fail;
-                    }
-                    close(dest[sid].fd);
-                    dest[sid].fd   = -1;
-                    dest_fid[sid]++;
-                    dest_off[sid] = 0;
-                }
-                char np[PATH_MAX];
-                seg_path_for(np, db->data_dir, sid, dest_fid[sid]);
-                { char d2[PATH_MAX]; snprintf(d2, sizeof(d2), "%s", np);
-                  char *sl = strrchr(d2, '/'); if (sl) { *sl = '\0'; mkdirp_local(d2); } }
-                int fd = open(np, O_RDWR | O_CREAT | O_TRUNC, 0644);
-                if (fd < 0) { kfcache_release(&kh); goto fail; }
-                if (ftruncate(fd, (off_t)SLOTCASK_SEG_MAX_BYTES) < 0)
-                    { close(fd); kfcache_release(&kh); goto fail; }
-                void *dm = mmap(NULL, SLOTCASK_SEG_MAX_BYTES,
-                                PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-                if (dm == MAP_FAILED)
-                    { close(fd); kfcache_release(&kh); goto fail; }
-                dest[sid].base  = (uint8_t *)dm;
-                dest[sid].alloc = SLOTCASK_SEG_MAX_BYTES;
-                dest[sid].fd    = fd;
-            }
-
-            uint32_t new_off = (uint32_t)dest_off[sid];
-            dest_off[sid] += rec_size;
-
-            seg_record_emit(dest[sid].base + new_off, (int)rec_size,
-                            kf[slot].hash, key, (size_t)klen, value, (size_t)vlen);
-
-            kf_repoint_at_slot(&kh, slot, sid,
-                               (uint16_t)dest_fid[sid], new_off);
-        }
-        kfcache_release(&kh);
-    }
-
-    /* Close dest maps.  Do NOT ftruncate the last file for each stream —
-       segcache_acquire(grow=0) in recover_one_stream requires the file to be
-       SLOTCASK_SEG_MAX_BYTES.  Intermediate rotation files were already
-       truncated when they were closed mid-migration. */
-    for (int s = 0; s < n_streams; s++) {
-        if (dest[s].base) {
-            munmap(dest[s].base, dest[s].alloc);
-            close(dest[s].fd);
-            dest[s].base = NULL;
-        }
-        /* Update stream state so the daemon resumes from the right file.
-           reserve_off must reflect actual bytes written — offset 0 would
-           cause the next online insert to overwrite the start of the
-           compacted segment. Offline restarts re-derive via recover_one_stream
-           anyway, but correct it here for the server-side path too. */
-        pthread_mutex_lock(&db->streams[s].rotation_lock);
-        db->streams[s].active_file_id = dest_fid[s];
-        db->streams[s].reserve_off    = dest_off[s];
-        pthread_mutex_unlock(&db->streams[s].rotation_lock);
-    }
-
-    /* Close source mmaps. */
-    for (int s = 0; s < n_streams; s++) {
-        if (src[s]) {
-            for (uint32_t f = 0; f < src_cnt[s]; f++)
-                if (src[s][f].base) munmap(src[s][f].base, src[s][f].sz);
-            free(src[s]);
-            src[s] = NULL;
-        }
-    }
-
-    /* Phase 2: write format marker before deleting old files.
-       This ordering ensures a crash between here and cleanup leaves the
-       object readable: .format=VARIABLE, KF already repointed, old files
-       still present but unreferenced (cleaned up on next migrate run). */
-    db->format = SLOTCASK_FORMAT_VARIABLE;
-    if (write_format_marker(db, SLOTCASK_FORMAT_VARIABLE) != 0)
-        return -1;
-
-    /* Phase 3: delete old segment files (file_id < MIGRATE_STREAM_BASE). */
-    for (int s = 0; s < n_streams; s++) {
-        char dir[PATH_MAX];
-        stream_dir_for(dir, db->data_dir, s);
-        DIR *dh = opendir(dir);
-        if (!dh) continue;
-        struct dirent *de;
-        while ((de = readdir(dh)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            size_t nlen = strlen(de->d_name);
-            if (nlen != 10 || strcmp(de->d_name + 6, ".dat") != 0) continue;
-            uint32_t file_id = (uint32_t)strtoul(de->d_name, NULL, 10);
-            if (file_id >= MIGRATE_STREAM_BASE) continue;
-            char full[PATH_MAX];
-            snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
-            segcache_invalidate_prefix(full);
-            unlink(full);
-        }
-        closedir(dh);
-    }
-    return 0;
-
-fail:
-    for (int s = 0; s < n_streams; s++) {
-        if (dest[s].base) { munmap(dest[s].base, dest[s].alloc); close(dest[s].fd); }
-        if (src[s]) {
-            for (uint32_t f = 0; f < src_cnt[s]; f++)
-                if (src[s][f].base) munmap(src[s][f].base, src[s][f].sz);
-            free(src[s]);
-        }
-    }
-    return -1;
-}
-
-/* Per-stream source map (read-only mmap of one source segment file). */
-typedef struct { uint8_t *base; size_t sz; } CmpSegMap;
-typedef struct { CmpSegMap *maps; uint32_t count; } CmpStreamMaps;
-
-/* Per-stream worker arg for parallel compact. */
-typedef struct {
-    SlotcaskDb     *db;
-    CmpStreamMaps  *smaps;        /* shared read-only across all workers */
-    uint32_t        src_min;
-    uint32_t        dest_base;
-    int             sid;          /* stream this worker owns */
-    SlotcaskTrimFn  trim_fn;
-    void           *trim_ctx;
-    uint32_t        dest_fid_out; /* final active file id after compaction */
-    size_t          dest_off_out; /* bytes written to final file */
-    int             rc;
-} CmpStreamArg;
-
-/* Repack one stream: scan all KF shards for entries belonging to sid,
-   trim and write each to a fresh dest segment file, repoint KF entries.
-   Workers for different streams run concurrently; they serialise briefly
-   on kfcache_acquire per shard (exclusive lock, held for one shard scan). */
-static void *compact_stream_worker(void *arg_ptr) {
-    CmpStreamArg *a = arg_ptr;
-    SlotcaskDb *db = a->db;
-    int sid = a->sid;
-
-    uint32_t dest_fid  = a->dest_base + (uint32_t)sid * MIGRATE_STREAM_STRIDE;
-    size_t   dest_off  = 0;
-    uint8_t *dest_ptr  = NULL;
-    size_t   dest_alloc = 0;
-    int      dest_fd   = -1;
-
-    for (int shard = 0; shard < db->num_shards; shard++) {
-        char kf_path[PATH_MAX];
-        kf_path_for(kf_path, db->data_dir, shard);
-        SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) {
-            a->rc = -1;
-            goto worker_fail;
-        }
-
-        size_t cap = kh.capacity;
-        SlotcaskKfEntry *kf = kh.map;
-
-        for (size_t slot = 0; slot < cap; slot++) {
-            if (kf[slot].flag != 1) continue;
-            if ((int)kf[slot].stream_id != sid) continue;
-
-            uint32_t fid = kf[slot].file_id;
-            uint32_t off = kf[slot].offset;
-
-            if (!a->smaps[sid].maps) continue;
-            uint32_t lo = a->src_min + (uint32_t)sid * MIGRATE_STREAM_STRIDE;
-            if (fid < lo || fid - lo >= a->smaps[sid].count) continue;
-            CmpSegMap *sm = &a->smaps[sid].maps[fid - lo];
-            if (!sm->base || (size_t)off + 24 > sm->sz) continue;
-
-            uint16_t klen; memcpy(&klen, sm->base + off + 16, 2);
-            uint32_t vlen; memcpy(&vlen, sm->base + off + 20, 4);
-            if ((size_t)off + 24 + klen + vlen > sm->sz) continue;
-
-            const uint8_t *key   = sm->base + off + 24;
-            const uint8_t *value = key + klen;
-
-            size_t trimmed_vlen = a->trim_fn(value, (size_t)vlen, a->trim_ctx);
-            size_t rec_size = slotcask_record_size_varlen((size_t)klen, trimmed_vlen);
-
-            if (!dest_ptr || dest_off + rec_size > SLOTCASK_SEG_MAX_BYTES) {
-                if (dest_ptr) {
-                    munmap(dest_ptr, dest_alloc);
-                    dest_ptr = NULL;
-                    if (ftruncate(dest_fd, (off_t)dest_off) < 0) {
-                        close(dest_fd);
-                        dest_fd = -1;
-                        kfcache_release(&kh);
-                        a->rc = -1;
-                        goto worker_fail;
-                    }
-                    close(dest_fd);
-                    dest_fd = -1;
-                    dest_fid++;
-                    dest_off = 0;
-                }
-                char np[PATH_MAX];
-                seg_path_for(np, db->data_dir, sid, dest_fid);
-                { char d2[PATH_MAX]; snprintf(d2, sizeof(d2), "%s", np);
-                  char *sl = strrchr(d2, '/'); if (sl) { *sl = '\0'; mkdirp_local(d2); } }
-                int fd = open(np, O_RDWR | O_CREAT | O_TRUNC, 0644);
-                if (fd < 0) { kfcache_release(&kh); a->rc = -1; goto worker_fail; }
-                if (ftruncate(fd, (off_t)SLOTCASK_SEG_MAX_BYTES) < 0) {
-                    close(fd); kfcache_release(&kh); a->rc = -1; goto worker_fail;
-                }
-                void *dm = mmap(NULL, SLOTCASK_SEG_MAX_BYTES,
-                                PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-                if (dm == MAP_FAILED) {
-                    close(fd); kfcache_release(&kh); a->rc = -1; goto worker_fail;
-                }
-                dest_ptr   = (uint8_t *)dm;
-                dest_alloc = SLOTCASK_SEG_MAX_BYTES;
-                dest_fd    = fd;
-            }
-
-            uint32_t new_off = (uint32_t)dest_off;
-            dest_off += rec_size;
-
-            seg_record_emit(dest_ptr + new_off, (int)rec_size,
-                            kf[slot].hash, key, (size_t)klen, value, trimmed_vlen);
-            kf_repoint_at_slot(&kh, slot, (uint8_t)sid,
-                               (uint16_t)dest_fid, new_off);
-        }
-        kfcache_release(&kh);
-    }
-
-    if (dest_ptr) { munmap(dest_ptr, dest_alloc); close(dest_fd); }
-    a->dest_fid_out = dest_fid;
-    a->dest_off_out = dest_off;
-    a->rc = 0;
-    return NULL;
-
-worker_fail:
-    if (dest_ptr) { munmap(dest_ptr, dest_alloc); close(dest_fd); }
-    return NULL;
-}
-
-int slotcask_compact(SlotcaskDb *db, SlotcaskTrimFn trim_fn, void *trim_ctx) {
-    if (!db || db->format != SLOTCASK_FORMAT_VARIABLE) return -1;
-    if (!trim_fn) return 0;
-
-    int n_streams = db->num_streams;
-    if (n_streams <= 0 || n_streams > SLOTCASK_MAX_STREAMS) return -1;
-
-    uint32_t cur_max = 0;
-    for (int s = 0; s < n_streams; s++) {
-        pthread_mutex_lock(&db->streams[s].rotation_lock);
-        uint32_t fid = db->streams[s].active_file_id;
-        pthread_mutex_unlock(&db->streams[s].rotation_lock);
-        if (fid > cur_max) cur_max = fid;
-    }
-    uint32_t dest_base = (cur_max >= MIGRATE_STREAM_BASE)
-        ? COMPACT_STREAM_BASE : MIGRATE_STREAM_BASE;
-    uint32_t src_min = (dest_base == COMPACT_STREAM_BASE)
-        ? MIGRATE_STREAM_BASE : COMPACT_STREAM_BASE;
-
-    CmpStreamMaps *smaps = calloc((size_t)n_streams, sizeof(CmpStreamMaps));
-    if (!smaps) return -1;
-
-    for (int s = 0; s < n_streams; s++) {
-        char dir[PATH_MAX];
-        stream_dir_for(dir, db->data_dir, s);
-        DIR *dh = opendir(dir);
-        if (!dh) continue;
-        uint32_t lo = src_min + (uint32_t)s * MIGRATE_STREAM_STRIDE;
-        uint32_t hi = lo + MIGRATE_STREAM_STRIDE;
-        uint32_t cnt = 0;
-        struct dirent *de;
-        while ((de = readdir(dh)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            uint32_t fid = (uint32_t)strtoul(de->d_name, NULL, 10);
-            if (fid >= lo && fid < hi && fid >= cnt + lo) cnt = fid - lo + 1;
-        }
-        closedir(dh);
-        if (cnt == 0) continue;
-        smaps[s].maps = calloc((size_t)cnt, sizeof(CmpSegMap));
-        smaps[s].count = cnt;
-        if (!smaps[s].maps) goto fail_smaps;
-        for (uint32_t i = 0; i < cnt; i++) {
-            char p[PATH_MAX];
-            seg_path_for(p, db->data_dir, s, lo + i);
-            int fd = open(p, O_RDONLY);
-            if (fd < 0) continue;
-            struct stat st;
-            if (fstat(fd, &st) == 0 && st.st_size > 0) {
-                void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-                if (m != MAP_FAILED) {
-                    smaps[s].maps[i].base = (uint8_t *)m;
-                    smaps[s].maps[i].sz   = (size_t)st.st_size;
-                }
-            }
-            close(fd);
-        }
-    }
-
-    CmpStreamArg *args = calloc((size_t)n_streams, sizeof(CmpStreamArg));
-    if (!args) goto fail_smaps;
-    for (int s = 0; s < n_streams; s++) {
-        args[s].db        = db;
-        args[s].smaps     = smaps;
-        args[s].src_min   = src_min;
-        args[s].dest_base = dest_base;
-        args[s].sid       = s;
-        args[s].trim_fn   = trim_fn;
-        args[s].trim_ctx  = trim_ctx;
-        args[s].rc        = 0;
-    }
-
-    parallel_for_io(compact_stream_worker, args, n_streams, sizeof(CmpStreamArg));
-
-    int any_fail = 0;
-    for (int s = 0; s < n_streams; s++)
-        if (args[s].rc != 0) { any_fail = 1; break; }
-
-    if (!any_fail) {
-        for (int s = 0; s < n_streams; s++) {
-            pthread_mutex_lock(&db->streams[s].rotation_lock);
-            db->streams[s].active_file_id = args[s].dest_fid_out;
-            db->streams[s].reserve_off    = args[s].dest_off_out;
-            pthread_mutex_unlock(&db->streams[s].rotation_lock);
-        }
-    }
-    free(args);
-
-    for (int s = 0; s < n_streams; s++) {
-        if (smaps[s].maps) {
-            for (uint32_t i = 0; i < smaps[s].count; i++)
-                if (smaps[s].maps[i].base)
-                    munmap(smaps[s].maps[i].base, smaps[s].maps[i].sz);
-            free(smaps[s].maps);
-        }
-    }
-    free(smaps);
-    if (any_fail) return -1;
-
-    for (int s = 0; s < n_streams; s++) {
-        char dir[PATH_MAX];
-        stream_dir_for(dir, db->data_dir, s);
-        DIR *dh = opendir(dir);
-        if (!dh) continue;
-        uint32_t lo = src_min + (uint32_t)s * MIGRATE_STREAM_STRIDE;
-        uint32_t hi = lo + MIGRATE_STREAM_STRIDE;
-        struct dirent *de;
-        while ((de = readdir(dh)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            size_t nlen = strlen(de->d_name);
-            if (nlen != 10 || strcmp(de->d_name + 6, ".dat") != 0) continue;
-            uint32_t fid = (uint32_t)strtoul(de->d_name, NULL, 10);
-            if (fid < lo || fid >= hi) continue;
-            char full[PATH_MAX];
-            snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
-            segcache_invalidate_prefix(full);
-            unlink(full);
-        }
-        closedir(dh);
-    }
-    return 0;
-
-fail_smaps:
-    for (int s = 0; s < n_streams; s++) {
-        if (smaps[s].maps) {
-            for (uint32_t i = 0; i < smaps[s].count; i++)
-                if (smaps[s].maps[i].base)
-                    munmap(smaps[s].maps[i].base, smaps[s].maps[i].sz);
-            free(smaps[s].maps);
-        }
-    }
-    free(smaps);
-    return -1;
-}
-
 /* Rebuild every kf shard in place to drop tombstones (flag=2 entries).
    Reuses the resplit machinery with new_cap = current_cap, so the rebuilt
    kf has total = live count and deleted = 0. Holds each shard's wrlock
@@ -10512,17 +9466,13 @@ int slotcask_compact_kf(SlotcaskDb *db) {
         char kf_path[PATH_MAX];
         kf_path_for(kf_path, db->data_dir, s);
         SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) continue;
-        if (kh.hdr && kh.hdr->deleted > 0) {
-            (void)kfcache_resplit_locked(&kh, kh.capacity);
-        }
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0)
+            return -1;
+        int rc = 0;
+        if (kh.hdr && kh.hdr->deleted > 0)
+            rc = kfcache_resplit_locked(&kh, kh.capacity);
         kfcache_release(&kh);
+        if (rc != 0) return -1;
     }
     return 0;
 }
-
-/* Suppress unused-static warnings for build_record_buf which remains in the
-   file as a reference for migrators / future bulk paths but isn't called
-   from the current code (seg_write_record builds inline into the mmap). */
-__attribute__((unused)) static void *_silence_build_record_buf =
-    (void *)build_record_buf;

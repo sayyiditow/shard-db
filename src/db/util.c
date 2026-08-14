@@ -770,29 +770,22 @@ int shard_db_version_is_valid(const char *version) {
 
 int shard_db_version_decide(const char *disk_version, int version_present,
                             int db_empty, const char *current_version,
-                            const char *minimum_version, int has_migration) {
-    if (db_empty) return SHARD_DB_VERSION_STAMP_ONLY;
-    if (!version_present) {
-#if SHARD_DB_ENFORCE_MIN_VERSION
-        if (minimum_version && minimum_version[0])
-            return SHARD_DB_VERSION_TOO_OLD;
-#endif
-        return has_migration ? SHARD_DB_VERSION_RUN_MIGRATION
-                             : SHARD_DB_VERSION_STAMP_ONLY;
-    }
-    if (!disk_version || !shard_db_version_is_valid(disk_version))
+                            const char *required_source_version) {
+    if (!current_version || !required_source_version ||
+        !shard_db_version_is_valid(current_version) ||
+        !shard_db_version_is_valid(required_source_version))
         return SHARD_DB_VERSION_INVALID;
-#if SHARD_DB_ENFORCE_MIN_VERSION
-    if (minimum_version && minimum_version[0] &&
-        (!shard_db_version_is_valid(minimum_version) ||
-         shard_db_version_compare(disk_version, minimum_version) < 0))
-        return SHARD_DB_VERSION_TOO_OLD;
-#else
-    (void)minimum_version;
-#endif
-    int cmp = shard_db_version_compare(disk_version, current_version);
-    if (cmp > 0) return SHARD_DB_VERSION_DOWNGRADE;
-    if (cmp == 0) return SHARD_DB_VERSION_NOOP;
-    return has_migration ? SHARD_DB_VERSION_RUN_MIGRATION
-                         : SHARD_DB_VERSION_STAMP_ONLY;
+    if (db_empty)
+        return version_present ? SHARD_DB_VERSION_INVALID
+                               : SHARD_DB_VERSION_STAMP;
+    if (!version_present || !disk_version ||
+        !shard_db_version_is_valid(disk_version))
+        return SHARD_DB_VERSION_INVALID;
+
+    int current_cmp = shard_db_version_compare(disk_version, current_version);
+    if (current_cmp > 0) return SHARD_DB_VERSION_DOWNGRADE;
+    if (current_cmp == 0) return SHARD_DB_VERSION_NOOP;
+    if (strcmp(disk_version, required_source_version) == 0)
+        return SHARD_DB_VERSION_STAMP;
+    return SHARD_DB_VERSION_TOO_OLD;
 }

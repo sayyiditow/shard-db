@@ -61,9 +61,7 @@ static int mode_is_schema(const char *m) {
            strcasecmp(m, "vacuum") == 0 ||
            strcasecmp(m, "truncate") == 0 ||
            strcasecmp(m, "add-index") == 0 || strcasecmp(m, "remove-index") == 0 ||
-            strcasecmp(m, "migrate-storage-version") == 0 ||
-            strcasecmp(m, "migrate") == 0 ||
-            strcasecmp(m, "compact") == 0;
+            0;
 }
 
 /* ========== Auth: IP allowlist + token set ========== */
@@ -1836,64 +1834,6 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         int new_splits = splits_s ? atoi(splits_s) : 0;
         cmd_vacuum(db_root, object, compact, new_splits);
         free(splits_s);
-    } else if (strcmp(mode, "migrate") == 0) {
-        /* Migrate one object from FIXED to VARIABLE segment format.
-           Idempotent — returns migrated:false if already VARIABLE.
-           Exclusive schema wrlock (mode_is_schema) serialises against
-           concurrent queries; the registry instance is updated in-place
-           so no registry invalidation is needed. */
-        Schema sch = load_schema(db_root, object);
-        if (sch.splits <= 0) {
-            OUT("{\"error\":\"object not found in schema\"}\n");
-        } else {
-            SlotcaskSchemaInfo info = {
-                .splits    = sch.splits,
-                .slot_size = sch.slot_size,
-                .streams   = sch.streams,
-            };
-            SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-            if (!sdb) {
-                OUT("{\"error\":\"failed to open object\"}\n");
-            } else if (sdb->format == SLOTCASK_FORMAT_VARIABLE) {
-                OUT("{\"status\":\"ok\",\"migrated\":false}\n");
-            } else {
-                int mrc = slotcask_migrate_to_varlen(sdb);
-                if (mrc != 0)
-                    OUT("{\"error\":\"migration failed\"}\n");
-                else
-                    OUT("{\"status\":\"ok\",\"migrated\":true}\n");
-            }
-        }
-    } else if (strcmp(mode, "compact") == 0) {
-        /* "compact" is in mode_is_schema, so took_wrlock is already held for
-           the whole branch (taken above, before this if/else chain) — do not
-           take objlock_wrlock again here, pthread_rwlock wrlock is not
-           recursive and a same-thread re-lock deadlocks. */
-        Schema sc = load_schema(db_root, object);
-        TypedSchema *ts = load_typed_schema(db_root, object);
-        SlotcaskSchemaInfo info = { .splits = sc.splits, .slot_size = sc.slot_size,
-                                     .streams = sc.streams };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
-        if (!sdb || sdb->format != SLOTCASK_FORMAT_VARIABLE) {
-            OUT("{\"error\":\"object not found or not in VARIABLE format\"}\n");
-            if (took_wrlock) objlock_wrunlock(db_root, object);
-            else if (took_rdlock) objlock_rdunlock(db_root, object);
-            free(mode); free(dir); free(object);
-            return;
-        }
-        int rc = slotcask_compact(sdb, schema_trim_fn, (void *)ts);
-        if (rc != 0) {
-            OUT("{\"error\":\"compact failed\"}\n");
-            if (took_wrlock) objlock_wrunlock(db_root, object);
-            else if (took_rdlock) objlock_rdunlock(db_root, object);
-            free(mode); free(dir); free(object);
-            return;
-        }
-        OUT("{\"ok\":true}\n");
-        if (took_wrlock) objlock_wrunlock(db_root, object);
-        else if (took_rdlock) objlock_rdunlock(db_root, object);
-        free(mode); free(dir); free(object);
-        return;
     } else if (strcmp(mode, "rename-field") == 0) {
         char *oldn = json_obj_strdup(&req, "old");
         char *newn = json_obj_strdup(&req, "new");
@@ -3227,8 +3167,19 @@ static void *auto_reshard_thread(void *arg) {
 
     /* Startup grace period — see the function doc comment above for why
        this must run before the first wall-clock check, not just before
-       the loop's steady-state ticks. */
-    for (int i = 0; i < 5 && server_running; i++) sleep(1);
+       the loop's steady-state ticks. Under TSan, callers that seed a
+       large record set immediately after startup (see test_auto_reshard.c)
+       can take longer than this window to finish their own setup purely
+       from shadow-memory/happens-before instrumentation overhead on the
+       write path — widen the window under TSan so this thread's first
+       eligibility check still reliably lands after such setup completes;
+       the wait is scaled, not the eligibility logic itself. */
+#if defined(__SANITIZE_THREAD__)
+#define AUTO_RESHARD_STARTUP_GRACE_S (5 * 6)
+#else
+#define AUTO_RESHARD_STARTUP_GRACE_S 5
+#endif
+    for (int i = 0; i < AUTO_RESHARD_STARTUP_GRACE_S && server_running; i++) sleep(1);
 
     /* Discard cmd_vacuum's JSON output — there's no client connection.
        /dev/null open failure shouldn't kill the thread; fall back to
@@ -3427,186 +3378,36 @@ void bg_threads_stop(ShardDb *db) {
  *
  * Returns 0 on clean, count-of-errors otherwise.
  */
-static int validate_metadata(const char *db_root) {
-    int errors = 0;
-
-    /* Pass 1: build an in-memory list of "dir:object:" prefixes from
-       schema.conf so we can do O(1) lookups during the filesystem walk
-       (small, startup-only, won't grow large enough to need a hash). */
-    char schema_path[PATH_MAX];
-    snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
-
-    typedef struct { char dir[64]; char obj[128]; } SchemaEntry;
-    SchemaEntry *schema_entries = NULL;
-    int schema_count = 0, schema_cap = 0;
-
-    FILE *sf = fopen(schema_path, "r");
-    if (sf) {
-        char line[512];
-        while (fgets(line, sizeof(line), sf)) {
-            if (line[0] == '#' || line[0] == '\n') continue;
-            char *colon1 = strchr(line, ':');
-            if (!colon1) continue;
-            char *colon2 = strchr(colon1 + 1, ':');
-            if (!colon2) continue;
-            if (schema_count >= schema_cap) {
-                schema_cap = schema_cap ? schema_cap * 2 : 32;
-                SchemaEntry *t = realloc(schema_entries,
-                                         (size_t)schema_cap * sizeof(SchemaEntry));
-                if (!t) {
-                    LOG_ERROR(LOG_SUB_SERVER, "validate_metadata: realloc failed growing schema_entries to cap=%d", schema_cap);
-                    free(schema_entries); fclose(sf); return -1;
-                }
-                schema_entries = t;
-            }
-            size_t dlen = (size_t)(colon1 - line);
-            size_t olen = (size_t)(colon2 - colon1 - 1);
-            if (dlen >= sizeof(schema_entries[0].dir)) dlen = sizeof(schema_entries[0].dir) - 1;
-            if (olen >= sizeof(schema_entries[0].obj)) olen = sizeof(schema_entries[0].obj) - 1;
-            memcpy(schema_entries[schema_count].dir, line, dlen);
-            schema_entries[schema_count].dir[dlen] = '\0';
-            memcpy(schema_entries[schema_count].obj, colon1 + 1, olen);
-            schema_entries[schema_count].obj[olen] = '\0';
-            schema_count++;
-        }
-        fclose(sf);
-    }
-    /* No schema.conf at all is fine on a fresh DB — no objects to validate. */
-
-    /* Rule 3: every dir referenced in schema.conf SHOULD be in dirs.conf.
-       Soft warning — not fatal. The auth/route layer rejects unknown dirs
-       before any read is dispatched, so a stale schema entry can't cause
-       silent mis-routing. (An older revision treated this as fatal, which
-       blocked startup on any DB that had outlived a removed test tenant —
-       the operator-visible failure mode of "started... immediately
-       stopped" with the only diagnostic in error.log.) */
-    for (int i = 0; i < schema_count; i++) {
-        if (!is_valid_dir(schema_entries[i].dir)) {
-            LOG_WARN(LOG_SUB_SERVER,
-                "VALIDATE warning: schema.conf references dir [%s] (object [%s]) "
-                "not in dirs.conf — entry ignored",
-                schema_entries[i].dir, schema_entries[i].obj);
-        }
-    }
-
-    /* Rules 1+2: walk filesystem, check each object dir.
-       opendir() returns NULL with ENOTDIR for non-directories, so we skip
-       the explicit stat() pre-check (Coverity TOCTOU CID-1692480: between
-       stat-says-dir and opendir, a symlink swap could redirect to an
-       attacker-controlled path). The opendir result IS the type check. */
-    DIR *root = opendir(db_root);
-    if (!root) { free(schema_entries); return errors; }
-    struct dirent *de;
-    while ((de = readdir(root))) {
-        if (de->d_name[0] == '.') continue;
-        char dir_path[PATH_MAX];
-        snprintf(dir_path, sizeof(dir_path), "%s/%s", db_root, de->d_name);
-        /* Only treat as a tenant if listed in dirs.conf — skips any other
-           top-level dirs an operator may have left at $DB_ROOT. */
-        if (!is_valid_dir(de->d_name)) continue;
-
-        DIR *dd = opendir(dir_path);
-        if (!dd) continue;  /* not a directory or unreadable — skip */
-        struct dirent *oe;
-        while ((oe = readdir(dd))) {
-            if (oe->d_name[0] == '.') continue;
-            /* Object is "real" (worth validating) iff data/ exists.
-               Both v1 (data/NNN.bin) and v2 (data/kf/, data/streams/)
-               share the data/ umbrella, so a single stat() covers
-               both layouts. */
-            char data_check[PATH_MAX];
-            snprintf(data_check, sizeof(data_check),
-                     "%s/%s/data", dir_path, oe->d_name);
-            struct stat ost;
-            if (stat(data_check, &ost) != 0 || !S_ISDIR(ost.st_mode)) continue;
-
-            const char *layout_marker = "data/";
-
-            /* Rule 2: fields.conf must exist. */
-            char fields_check[PATH_MAX];
-            snprintf(fields_check, sizeof(fields_check),
-                     "%s/%s/fields.conf", dir_path, oe->d_name);
-            struct stat fst;
-            if (stat(fields_check, &fst) != 0) {
-                fprintf(stderr,
-                    "validate: object [%s/%s] has %s but missing fields.conf\n",
-                    de->d_name, oe->d_name, layout_marker);
-                LOG_ERROR(LOG_SUB_SERVER,
-                    "VALIDATE %s/%s has %s but no fields.conf",
-                    de->d_name, oe->d_name, layout_marker);
-                errors++;
-            }
-
-            /* Rule 1: schema.conf line must exist. */
-            int found = 0;
-            for (int i = 0; i < schema_count; i++) {
-                if (strcmp(schema_entries[i].dir, de->d_name) == 0
-                 && strcmp(schema_entries[i].obj, oe->d_name) == 0) {
-                    found = 1; break;
-                }
-            }
-            if (!found) {
-                fprintf(stderr,
-                    "validate: object [%s/%s] has %s but missing schema.conf line\n",
-                    de->d_name, oe->d_name, layout_marker);
-                LOG_ERROR(LOG_SUB_SERVER,
-                    "VALIDATE %s/%s has %s but no schema.conf line",
-                    de->d_name, oe->d_name, layout_marker);
-                errors++;
-            }
-        }
-        closedir(dd);
-    }
-    closedir(root);
-
-    free(schema_entries);
-    return errors;
-}
-
-/* Walks schema.conf the same way the startup marker-recovery sweep does,
-   checking each object's data/kf/ for a retained marker file. Used only at
-   graceful shutdown to decide whether writing .shard-db.clean is safe —
-   unlike the startup sweep, this never replays anything, it only observes.
-   Returns 1 if any object has a pending marker, 0 if none do, -1 on an
-   I/O error reading schema.conf itself (treated as "not safe" by the
-   caller, since we can't prove no markers remain). */
-static int any_markers_pending(const char *db_root) {
-    char scpath[PATH_MAX];
-    snprintf(scpath, sizeof(scpath), "%s/schema.conf", db_root);
-    FILE *sf = fopen(scpath, "r");
-    if (!sf) return -1;
-
-    int pending = 0;
-    char line[1024];
-    while (!pending && fgets(line, sizeof(line), sf)) {
-        line[strcspn(line, "\n")] = '\0';
-        if (!line[0] || line[0] == '#') continue;
-        char *c1 = strchr(line, ':');
-        if (!c1) continue;
-        *c1 = '\0';
-        const char *dir = line;
-        char *rest = c1 + 1;
-        char *c2 = strchr(rest, ':');
-        if (!c2) continue;
-        *c2 = '\0';
-        const char *obj = rest;
-
-        char data_dir[PATH_MAX];
-        snprintf(data_dir, sizeof(data_dir), "%s/%s/%s", db_root, dir, obj);
-
-        int rc = object_has_pending_markers(data_dir);
-        if (rc != 0) pending = 1;   /* both "found" (1) and "I/O error" (-1) are treated as pending */
-    }
-    fclose(sf);
-    return pending;
-}
-
 int cmd_server(const char *db_root, int daemonize) {
     /* Recovery mutates object directories, so DB-root ownership must be
        established before any instance initialization or recovery work. */
     mkdirp(db_root);
     int lock_fd = -1;
     if (db_root_lock_acquire(db_root, &lock_fd) != 0) return 1;
+
+    char disk_version[64] = {0};
+    int version_decision = shard_db_version_check(db_root, disk_version,
+                                                  sizeof(disk_version));
+    if (version_decision < 0) {
+        if (version_decision == SHARD_DB_VERSION_DOWNGRADE) {
+            fprintf(stderr,
+                    "shard-db: refusing to start: database version %s is newer "
+                    "than this binary (%s); install shard-db %s or newer.\n",
+                    disk_version, SHARD_DB_VERSION, disk_version);
+        } else if (version_decision == SHARD_DB_VERSION_TOO_OLD) {
+            fprintf(stderr,
+                    "shard-db: refusing to start: this database requires "
+                    "shard-db %s or newer.\n",
+                    SHARD_DB_REQUIRED_SOURCE_VERSION);
+        } else {
+            fprintf(stderr,
+                    "shard-db: non-empty DB_ROOT lacks valid "
+                    "2026.08.1/2026.08.2 compatibility evidence\n");
+        }
+        db_root_lock_release(&lock_fd);
+        return 1;
+    }
+    int stamp_required = version_decision == SHARD_DB_VERSION_STAMP;
 
     /* Allocate and initialise the ShardDb instance. Must happen before
        any code that uses g_* macros (which are now field accesses via
@@ -3665,129 +3466,26 @@ int cmd_server(const char *db_root, int daemonize) {
         }
     }
 
-    if (rebuild_recovery(db_root) != 0) {
+    int markers_replayed = 0;
+    if (shard_db_recover_before_stamp(db_root, &markers_replayed) != 0) {
         fprintf(stderr,
-                "shard-db: refusing to start: rebuild recovery requires manual intervention\n");
+                "shard-db: refusing to start: crash recovery failed; "
+                "manual investigation required\n");
         db_root_lock_release(&lock_fd);
         return 1;
     }
+    g_marker_recovery_ran = markers_replayed > 0 ? 1 : 0;
 
-    /* Marker recovery sweep: on unclean exit (no .shard-db.clean flag),
-       enumerate every object listed in schema.conf and replay any marker
-       files left in its data/kf/ directory before accepting connections. */
-    int was_clean = clean_flag_exists(db_root);
-    if (clean_flag_remove(db_root) != 0) {
+    if (shard_db_validate_before_stamp(db_root) != 0) {
         fprintf(stderr,
-                "shard-db: refusing to start: failed to consume %s/.shard-db.clean (%s); "
-                "a stale clean flag could cause a future crash to skip recovery\n",
-                db_root, strerror(errno));
+                "shard-db: refusing to start: metadata validation failed\n");
         db_root_lock_release(&lock_fd);
         return 1;
     }
-    if (!was_clean) {
-        LOG_WARN(LOG_SUB_DURABILITY, "Unclean shutdown detected — running marker recovery sweep");
-        char scpath[PATH_MAX];
-        snprintf(scpath, sizeof(scpath), "%s/schema.conf", db_root);
-        FILE *sf = fopen(scpath, "r");
-        int sweep_failures = 0;
-        int markers_replayed = 0;
-        if (sf) {
-            char line[1024];
-            while (fgets(line, sizeof(line), sf)) {
-                line[strcspn(line, "\n")] = '\0';
-                if (!line[0] || line[0] == '#') continue;
-                char *c1 = strchr(line, ':');
-                if (!c1) continue;
-                *c1 = '\0';
-                const char *dir = line;
-                char *rest = c1 + 1;
-                char *c2 = strchr(rest, ':');
-                if (!c2) continue;
-                *c2 = '\0';
-                const char *obj = rest;
-
-                char eff_root[PATH_MAX];
-                snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
-                char data_dir[PATH_MAX];
-                snprintf(data_dir, sizeof(data_dir), "%s/%s", eff_root, obj);
-
-                objlock_wrlock(eff_root, obj);
-                int rc = marker_recovery_sweep_object(eff_root, data_dir, obj, &markers_replayed);
-                objlock_wrunlock(eff_root, obj);
-                if (rc != 0) {
-                    sweep_failures++;
-                    LOG_ERROR(LOG_SUB_DURABILITY,
-                              "marker recovery failed for %s/%s: corrupt or unreplayable marker left on disk",
-                              dir, obj);
-                }
-            }
-            fclose(sf);
-        }
-        g_marker_recovery_ran = (markers_replayed > 0) ? 1 : 0;
-        if (sweep_failures > 0) {
-            fprintf(stderr,
-                    "shard-db: refusing to start: %d object(s) have unreplayable durability markers; "
-                    "manual investigation required (see error log)\n", sweep_failures);
-            db_root_lock_release(&lock_fd);
-            return 1;
-        }
-    }
-
-    /* Auto-migrate: compare $DB_ROOT/.version against this binary's
-       compiled-in SHARD_DB_VERSION and migrate in-process if supported.
-       Empty roots bootstrap; minimum-version, invalid-evidence, and
-       downgrade refusals happen before fork/listen. */
-    {
-        char disk_version[64] = {0};
-        int mrc = shard_db_startup_migrate(db_root, disk_version, sizeof(disk_version));
-        if (mrc == SHARD_DB_VERSION_DOWNGRADE) {
-            fprintf(stderr,
-                    "shard-db: refusing to start: database version %s is newer "
-                    "than this binary (%s); install shard-db %s or newer.\n",
-                    disk_version, SHARD_DB_VERSION, disk_version);
-            db_root_lock_release(&lock_fd);
-            return 1;
-        }
-        if (mrc == SHARD_DB_VERSION_TOO_OLD) {
-            fprintf(stderr,
-                    "shard-db: refusing to start: this database requires "
-                    "shard-db %s or newer.\n", SHARD_DB_MIN_VERSION);
-            db_root_lock_release(&lock_fd);
-            return 1;
-        }
-        if (mrc == SHARD_DB_VERSION_INVALID) {
-            fprintf(stderr,
-                    "shard-db: refusing to start: %s/.version has invalid "
-                    "version evidence for a non-empty database.\n", db_root);
-            db_root_lock_release(&lock_fd);
-            return 1;
-        }
-        if (mrc != 0) {
-            fprintf(stderr, "shard-db: refusing to start: startup migration failed\n");
-            db_root_lock_release(&lock_fd);
-            return 1;
-        }
-    }
-
-    /* Pre-fork validation: dirs.conf + schema.conf consistency must be
-       checked while stderr still reaches the user's terminal. The earlier
-       layout ran validate_metadata after the fork's stderr→/dev/null
-       redirect, leaving the parent's "shard-db started (pid N)" message
-       and a stale pid file with no listener — operators saw "started"
-       then immediate "stopped" with no diagnostic outside error.log. */
-    load_dirs();
-    {
-        int validate_errors = validate_metadata(db_root);
-        if (validate_errors > 0) {
-            fprintf(stderr,
-                "\nshard-db: refusing to start: %d metadata error%s detected.\n"
-                "  Recover with: ./shard-db import-schema <manifest.json>\n"
-                "  Or restore from a backup: ./shard-db restore <object> <timestamp>\n"
-                "  See full error log at %s/error-*.log.\n\n",
-                validate_errors, validate_errors == 1 ? "" : "s", g_log_dir);
-            db_root_lock_release(&lock_fd);
-            return 1;
-        }
+    if (stamp_required &&
+        shard_db_version_stamp(db_root) != SHARD_DB_VERSION_STAMP_OK) {
+        db_root_lock_release(&lock_fd);
+        return 1;
     }
 
     if (daemonize) {
@@ -4061,31 +3759,13 @@ int cmd_server(const char *db_root, int daemonize) {
        would race cache rwlock destruction and mapped-entry teardown. */
     bg_threads_stop(g_shard_db_instance);
 
-    /* Mark shutdown as clean, but only if no object still has a retained
-       durability marker (all in-flight commits fully drained/replayed).
-       This flag is checked at startup: if present, recovery sweep is
-       skipped; if absent, it runs. Writing it while a marker is still
-       pending would make a future crash silently skip recovery. */
-    {
-        int pending = any_markers_pending(db_root);
-        if (pending != 0) {
-            LOG_WARN(LOG_SUB_DURABILITY,
-                     "shutdown: %s — leaving .shard-db.clean absent so the next "
-                     "startup runs a recovery sweep",
-                     pending < 0 ? "failed to check for retained markers"
-                                 : "retained durability marker(s) found");
-        } else if (clean_flag_write(db_root) != 0) {
-            LOG_ERROR(LOG_SUB_DURABILITY,
-                      "shutdown: failed to write %s/.shard-db.clean (%s); next startup "
-                      "will run a recovery sweep unnecessarily but safely",
-                      db_root, strerror(errno));
-        }
-    }
-
-    remove_pid_file(db_root);
     parallel_io_pool_shutdown();
     parallel_pool_shutdown();
     counts_flush_all();        /* persist in-memory atomic counts → disk */
+    if (shard_db_mark_clean_if_safe(db_root) != 0)
+        LOG_ERROR(LOG_SUB_DURABILITY,
+                  "shutdown: failed to record clean shutdown for %s", db_root);
+    remove_pid_file(db_root);
     bt_cache_shutdown();
     bm_cache_shutdown();
     slotcask_shutdown();
@@ -4375,8 +4055,8 @@ static int query_collect(int port, const char *json, size_t json_len, char **out
 }
 
 /* ========== Schema export / import (CLI argv form) ==========
-   Mirrors the TUI's Migrate menu (src/cli/main.c::migrate_export /
-   migrate_import) so the two are wire-compatible — manifests written by
+   Mirrors the TUI's Schema Transfer menu (src/cli/main.c::schema_transfer_export /
+   schema_transfer_import) so the two are wire-compatible — manifests written by
    one can be imported by the other. Uses only the existing JSON modes
    db-dirs / list-objects / describe-object / create-object. */
 

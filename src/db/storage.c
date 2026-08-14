@@ -926,10 +926,20 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         return 1;
     }
 
-    /* Wire up compact trim for VARIABLE-format typed objects. */
-    if (sdb->format == SLOTCASK_FORMAT_VARIABLE && !sdb->trim_fn) {
-        sdb->trim_fn  = schema_trim_fn;
-        sdb->trim_ctx = (void *)ts;
+    /* Wire up compact trim for VARIABLE-format typed objects. sdb is a
+       registry-cached SlotcaskDb shared across all concurrent request
+       threads for this object (only guarded by a shared objlock rdlock
+       here), so first-publish must be serialized and trim_fn must be
+       published via release so any thread that observes it non-NULL also
+       sees trim_ctx. */
+    if (!atomic_load_explicit(&sdb->trim_fn, memory_order_acquire)) {
+        pthread_mutex_lock(&sdb->trim_init_lock);
+        if (!sdb->trim_fn) {
+            sdb->trim_ctx = (void *)ts;
+            atomic_store_explicit(&sdb->trim_fn, schema_trim_fn,
+                                  memory_order_release);
+        }
+        pthread_mutex_unlock(&sdb->trim_init_lock);
     }
 
     /* auto_create: stamp now() on first insert only; preserve the stored value
@@ -1465,10 +1475,20 @@ static int cmd_update_v2(const char *db_root, const char *object,
     TypedSchema *ts = load_typed_schema(db_root, object);
     if (!ts) { OUT("{\"error\":\"Object not found\"}\n"); return 1; }
 
-    /* Wire up compact trim for VARIABLE-format typed objects. */
-    if (sdb->format == SLOTCASK_FORMAT_VARIABLE && !sdb->trim_fn) {
-        sdb->trim_fn  = schema_trim_fn;
-        sdb->trim_ctx = (void *)ts;
+    /* Wire up compact trim for VARIABLE-format typed objects. sdb is a
+       registry-cached SlotcaskDb shared across all concurrent request
+       threads for this object (only guarded by a shared objlock rdlock
+       here), so first-publish must be serialized and trim_fn must be
+       published via release so any thread that observes it non-NULL also
+       sees trim_ctx. */
+    if (!atomic_load_explicit(&sdb->trim_fn, memory_order_acquire)) {
+        pthread_mutex_lock(&sdb->trim_init_lock);
+        if (!sdb->trim_fn) {
+            sdb->trim_ctx = (void *)ts;
+            atomic_store_explicit(&sdb->trim_fn, schema_trim_fn,
+                                  memory_order_release);
+        }
+        pthread_mutex_unlock(&sdb->trim_init_lock);
     }
 
     /* dry_run validates criteria but doesn't write — race-tolerant. It is
@@ -1728,10 +1748,20 @@ static int cmd_delete_v2(const char *db_root, const char *object,
 
     TypedSchema *ts = load_typed_schema(db_root, object);
 
-    /* Wire up compact trim for VARIABLE-format typed objects. */
-    if (sdb->format == SLOTCASK_FORMAT_VARIABLE && !sdb->trim_fn) {
-        sdb->trim_fn  = schema_trim_fn;
-        sdb->trim_ctx = (void *)ts;
+    /* Wire up compact trim for VARIABLE-format typed objects. sdb is a
+       registry-cached SlotcaskDb shared across all concurrent request
+       threads for this object (only guarded by a shared objlock rdlock
+       here), so first-publish must be serialized and trim_fn must be
+       published via release so any thread that observes it non-NULL also
+       sees trim_ctx. */
+    if (!atomic_load_explicit(&sdb->trim_fn, memory_order_acquire)) {
+        pthread_mutex_lock(&sdb->trim_init_lock);
+        if (!sdb->trim_fn) {
+            sdb->trim_ctx = (void *)ts;
+            atomic_store_explicit(&sdb->trim_fn, schema_trim_fn,
+                                  memory_order_release);
+        }
+        pthread_mutex_unlock(&sdb->trim_init_lock);
     }
 
     /* dry_run: read + validate, never tombstone. */

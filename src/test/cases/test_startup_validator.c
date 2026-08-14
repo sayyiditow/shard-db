@@ -155,6 +155,7 @@ static int test_startup_validator_run(void) {
     test_env_stop_keep(&env);
 
     /* === Phase 3: delete the schema.conf line, restart should refuse. */
+    char saved_line[512] = {0};
     {
         char schema_path[400], tmp[400];
         snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
@@ -163,8 +164,13 @@ static int test_startup_validator_run(void) {
         FILE *fout = fopen(tmp, "w");
         if (fin && fout) {
             char line[512];
-            while (fgets(line, sizeof(line), fin))
-                if (strncmp(line, "default:v:", 10) != 0) fputs(line, fout);
+            while (fgets(line, sizeof(line), fin)) {
+                if (strncmp(line, "default:v:", 10) != 0) {
+                    fputs(line, fout);
+                } else {
+                    snprintf(saved_line, sizeof(saved_line), "%s", line);
+                }
+            }
         }
         if (fin) fclose(fin);
         if (fout) fclose(fout);
@@ -173,12 +179,18 @@ static int test_startup_validator_run(void) {
     int refused = spawn_expecting_failure(base, shard_db_abs, port, &env);
     ASSERT_TRUE(refused, "validator refuses start when schema.conf line is missing");
 
-    /* Restore the line so phase 4 can isolate the fields.conf-deletion case. */
+    /* Restore the exact original line (captured above) so phase 4 can
+       isolate the fields.conf-deletion case. A hand-typed replacement
+       must match the real "dir:object:splits:max_key:2:streams[...]"
+       format on-disk, not just the dir/object/splits/max_key prefix. */
     {
         char schema_path[400];
         snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
         FILE *sf = fopen(schema_path, "a");
-        if (sf) { fputs("default:v:16:16\n", sf); fclose(sf); }
+        if (sf) {
+            fputs(saved_line[0] ? saved_line : "default:v:16:16:2:1\n", sf);
+            fclose(sf);
+        }
     }
 
     /* === Phase 4: delete fields.conf, restart should refuse. */
@@ -205,7 +217,7 @@ static int test_startup_validator_run(void) {
         char schema_path[400];
         snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
         FILE *sf = fopen(schema_path, "a");
-        if (sf) { fputs("ghost_tenant:obj:16:16\n", sf); fclose(sf); }
+        if (sf) { fputs("ghost_tenant:obj:16:16:2:1\n", sf); fclose(sf); }
     }
     refused = spawn_expecting_failure(base, shard_db_abs, port, &env);
     ASSERT_TRUE(!refused, "stale schema.conf dir is warned, not refused");

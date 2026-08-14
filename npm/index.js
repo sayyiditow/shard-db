@@ -20,10 +20,6 @@ class ShardDb {
     return binding.query(this._handle, json)
   }
 
-  migrate(dir, object) {
-    return this.query({ mode: 'migrate', dir, object })
-  }
-
   close() {
     binding.close(this._handle)
   }

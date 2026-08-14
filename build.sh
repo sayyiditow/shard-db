@@ -264,6 +264,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_slotcask_v2_schema.c \
     src/test/cases/test_slotcask_v2_crash.c \
     src/test/cases/test_slotcask_v2_concurrent.c \
+    src/test/cases/test_varlen_pool_donation_stride.c \
     src/test/cases/test_v2_index_leak_on_clear.c \
     src/test/cases/test_btree.c \
     src/test/cases/test_btree_bulk_merge_delete_race.c \
@@ -292,6 +293,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_error_paths.c \
     src/test/cases/test_explain.c \
     src/test/cases/test_dispatch_leak_paths.c \
+    src/test/cases/test_removed_storage_surfaces.c \
     src/test/cases/test_keyset.c \
     src/test/cases/test_objlock_unit.c \
     src/test/cases/test_parallel.c \
@@ -360,7 +362,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_runner_parallel.c \
     src/test/cases/test_update_partial_concurrent.c \
     src/test/cases/test_version_compare.c \
-    src/test/cases/test_startup_auto_migration.c \
+    src/test/cases/test_version_compat.c \
     src/test/cases/test_reindex_bitmap_resplit.c \
     src/test/cases/test_varlen_scan_resync.c \
     src/test/cases/test_varlen_scan_resync_odirect.c \
@@ -368,7 +370,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_varlen_compact_recipient_resync.c \
     src/test/cases/test_varlen_compact_donor_resync.c \
     src/test/cases/test_varlen_compact_donor_preserved_on_desync.c \
-    src/test/cases/test_startup_format_sweep.c \
+    src/test/cases/test_version_startup_paths.c \
     src/test/cases/test_varlen_compact_crash_mid_migration.c \
     src/db/util.c \
     src/db/durability.c \
@@ -598,10 +600,5 @@ fi
 echo "Deploy: copy build/bin/ contents to your install dir (e.g. /opt/shard-db/bin/)."
 echo "First-time setup: cp db.env.example db.env, edit, then ./shard-db start."
 BUILD_VERSION=$(sed -n 's/^#define SHARD_DB_VERSION "\(.*\)"/\1/p' src/db/version.h)
-BUILD_MIN_VERSION=$(sed -n 's/^#define SHARD_DB_MIN_VERSION "\(.*\)"/\1/p' src/db/version.h)
-if [ -n "$BUILD_MIN_VERSION" ]; then
-    MIN_MSG="minimum supported source release is shard-db $BUILD_MIN_VERSION (informational; not enforced in this release because earlier releases did not write .version)"
-else
-    MIN_MSG="accepts data from any prior release (no minimum floor set by this release)"
-fi
-echo "Upgrades: replace build/bin/ contents (shard-db + shard-cli), then run ./shard-db start — this build is shard-db $BUILD_VERSION; it self-migrates \$DB_ROOT/.version automatically on start and $MIN_MSG. Run './shard-db version' any time to check a binary's version without starting it. Legacy v1 objects (pre-2026.05.5) still require the historical 2026.05.4 ./migrate upgrade path before this binary can open them."
+BUILD_REQUIRED_SOURCE_VERSION=$(sed -n 's/^#define SHARD_DB_REQUIRED_SOURCE_VERSION "\(.*\)"/\1/p' src/db/version.h)
+echo "Upgrades: this build is shard-db $BUILD_VERSION. A filesystem-empty DB_ROOT initializes directly; every non-empty root must have been cleanly opened by exactly shard-db $BUILD_REQUIRED_SOURCE_VERSION before this binary starts. Run './shard-db version' to inspect a binary without starting it. Legacy v1 objects (pre-2026.05.5) still require the historical 2026.05.4 ./migrate upgrade path before this binary can open them."

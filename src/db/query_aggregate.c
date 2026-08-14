@@ -2315,7 +2315,6 @@ static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
 typedef struct {
     char       seg_path[PATH_MAX];
     int        slot_size;
-    int        format;     /* SLOTCASK_FORMAT_FIXED or SLOTCASK_FORMAT_VARIABLE */
     AggCtx     local;         /* per-segment private accumulator */
     V2ScanWrap wrap;          /* .cb = agg_scan_cb, .ctx = &this->local */
     int       *stop_flag;
@@ -2327,10 +2326,7 @@ static void *agg_od_seg_worker(void *raw) {
     g_out = arg->parent_out ? arg->parent_out : stdout;
     if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
     OdSegAdapterCtx actx = { .wrap = &arg->wrap, .stop_flag = arg->stop_flag };
-    if (arg->format == SLOTCASK_FORMAT_VARIABLE)
-        seg_scan_o_direct_varlen(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
-    else
-        seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
+    seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
     return NULL;
 }
 
@@ -2365,7 +2361,6 @@ static void parallel_agg_scan_shards_o_direct(AggCtx *main_ctx,
             memset(a, 0, sizeof(*a));
             snprintf(a->seg_path, PATH_MAX, "%s/%s", stream_dir, de->d_name);
             a->slot_size   = sdb->slot_size;
-            a->format      = sdb->format;
             agg_ctx_clone_shared(&a->local, main_ctx);
             a->wrap.cb     = agg_scan_cb;
             /* wrap.ctx set in fixup pass below — realloc may move args */

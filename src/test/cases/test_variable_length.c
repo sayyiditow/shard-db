@@ -1,7 +1,7 @@
 /* test_variable_length.c — slotcask variable-length record format.
  *
- * Exercises offline fixed→varlen migration, verifies data survives
- * close+reopen, and confirms new varlen writes work correctly.
+ * Exercises variable-length records across close/reopen and confirms
+ * new variable-length writes work correctly.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -85,12 +85,11 @@ static int test_variable_length_run(void) {
     test_trim_len_basics();
 
     /* ---------------------------------------------------------------
-     * Phase 1: create a fixed-format DB, insert records, verify reads.
+     * Phase 1: create a VARIABLE DB, insert records, verify reads.
      * ------------------------------------------------------------- */
     SlotcaskDb db;
     int rc = slotcask_open(&db, dir, 8, 4, 256);
-    ASSERT_EQ_INT(rc, 0, "slotcask_open (fixed) succeeds");
-    ASSERT_EQ_INT(db.format, SLOTCASK_FORMAT_FIXED, "default format is FIXED");
+    ASSERT_EQ_INT(rc, 0, "slotcask_open (variable) succeeds");
 
     int inserted = 0;
     for (int i = 0; i < 10; i++) {
@@ -120,24 +119,18 @@ static int test_variable_length_run(void) {
     slotcask_close(&db);
 
     /* ---------------------------------------------------------------
-     * Phase 2: reopen fixed-format DB, run offline migration to varlen.
+     * Phase 2: reopen VARIABLE DB and verify persistence.
      * ------------------------------------------------------------- */
     rc = slotcask_open(&db, dir, 8, 4, 256);
-    ASSERT_EQ_INT(rc, 0, "reopen succeeds before migration");
-    ASSERT_EQ_INT(db.format, SLOTCASK_FORMAT_FIXED, "format still FIXED before migration");
-
-    rc = slotcask_migrate_to_varlen(&db);
-    ASSERT_EQ_INT(rc, 0, "migration succeeds");
-    ASSERT_EQ_INT(db.format, SLOTCASK_FORMAT_VARIABLE, "format is VARIABLE after migration");
+    ASSERT_EQ_INT(rc, 0, "reopen succeeds");
 
     slotcask_close(&db);
 
     /* ---------------------------------------------------------------
-     * Phase 3: reopen as varlen, verify all data survived.
+     * Phase 3: verify all data survived.
      * ------------------------------------------------------------- */
     rc = slotcask_open(&db, dir, 8, 4, 256);
-    ASSERT_EQ_INT(rc, 0, "reopen after migration succeeds");
-    ASSERT_EQ_INT(db.format, SLOTCASK_FORMAT_VARIABLE, "format persists across close+reopen");
+    ASSERT_EQ_INT(rc, 0, "reopen after VARIABLE creation succeeds");
 
     ok = 0;
     for (int i = 0; i < 10; i++) {
@@ -151,10 +144,10 @@ static int test_variable_length_run(void) {
             free(v);
         }
     }
-    ASSERT_EQ_INT(ok, 10, "all 10 values readable after migration");
+    ASSERT_EQ_INT(ok, 10, "all 10 values readable after reopen");
 
     /* ---------------------------------------------------------------
-     * Phase 4: insert new records in varlen mode, verify they work.
+     * Phase 4: insert new records, verify they work.
      * ------------------------------------------------------------- */
     inserted = 0;
     for (int i = 100; i < 105; i++) {
@@ -181,10 +174,10 @@ static int test_variable_length_run(void) {
     ASSERT_EQ_INT(ok, 5, "all 5 varlen-inserted values match");
 
     /* ---------------------------------------------------------------
-     * Phase 5: update a pre-migration key and verify in varlen mode.
+     * Phase 5: update an existing key and verify VARIABLE behavior.
      * ------------------------------------------------------------- */
     rc = slotcask_update(&db, -1, "key_003", 7, "UPDATED_VARLEN", 14);
-    ASSERT_EQ_INT(rc, 0, "update pre-migration key in varlen mode succeeds");
+    ASSERT_EQ_INT(rc, 0, "update existing key in VARIABLE mode succeeds");
     void *v = NULL; size_t vl = 0;
     rc = slotcask_get(&db, "key_003", 7, &v, &vl);
     ASSERT_EQ_INT(rc, 0, "get updated key succeeds");
@@ -220,7 +213,6 @@ static int test_variable_length_run(void) {
 
     rc = slotcask_open(&db, dir, 8, 4, 256);
     ASSERT_EQ_INT(rc, 0, "final reopen succeeds");
-    ASSERT_EQ_INT(db.format, SLOTCASK_FORMAT_VARIABLE, "format still VARIABLE after second reopen");
 
     /* Original keys (now varlen) readable. */
     ok = 0;
