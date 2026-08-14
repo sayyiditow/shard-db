@@ -481,10 +481,11 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
     if (child_ctl_fd >= 0) close(child_ctl_fd);
     env->daemon_pid = pid;
 
-    /* Restarting an existing database may synchronously migrate fixed-format
-       objects during startup.  Sanitizer builds make that conversion much
-       slower; allow the restart helper to wait for the daemon to become
-       ready without weakening the production startup path. */
+    /* Restarting an existing database runs shared crash-recovery evidence
+       checks (marker/sidecar replay, clean-lifecycle verification) before
+       serving.  Sanitizer builds make that recovery path much slower;
+       allow the restart helper to wait for the daemon to become ready
+       without weakening the production startup path. */
     if (wait_daemon_ready(env->port, 30000) != 0) {
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);

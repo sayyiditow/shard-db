@@ -84,22 +84,16 @@ later) upgrade with a binary swap:
 ./shard-db start
 ```
 
-As of 2026.08.1, startup migration is automatic — the daemon compares
-`$DB_ROOT/.version` against its compiled-in version and runs the full index
-rebuild in-process on start. The standalone `./migrate` binary is removed.
-The minimum supported source release is 2026.07.3; this is recorded for
-operators but is informational and not enforced in this release because
-earlier releases did not write `.version`. `./shard-db reindex` remains available
-for on-demand use.
-
-Independent of that `.version`-gated index rebuild, every startup with a
-non-empty `schema.conf` also sweeps every materialized object whose schema
-and on-disk stream sets agree for FIXED-format segments and converts them
-to VARIABLE in place (idempotent, matching the `migrate` JSON mode's
-semantics). This runs unconditionally, not just on a version change. A
-stream-count mismatch is logged and left untouched for the vacuum/rebuild
-path, because opening it with the lying schema could route new writes to
-the wrong stream set.
+2026.08.2 performs no startup migration or index rebuild. Upgrade exactly as:
+backup → stop writes → run 2026.08.1 once → wait for its startup sweep →
+cleanly stop 2026.08.1 → replace with 2026.08.2 → start and verify.
+A failed 2026.08.1 sweep blocks the upgrade. The new binary requires a
+populated root to carry 2026.08.1 clean-open evidence; it refuses missing,
+malformed, older, or newer markers. A later `reindex` is explicit operator
+work, not an automatic compatibility action. Low-numbered segment files are
+valid for new VARIABLE objects; `048000+` files are valid legacy output from
+the 2026.08.1 conversion. Neither filename range identifies a format, and
+operators must not rename or delete those files during upgrade.
 
 Operators who upgraded from a pre-2026.07.1 build affected by kf
 corruption must run the 2026.07.1 release's `rebuild-kf` against a

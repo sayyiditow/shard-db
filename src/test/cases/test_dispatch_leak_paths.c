@@ -20,7 +20,9 @@
 
 static int test_dispatch_leak_paths_run(void) {
     TestEnv env = {0};
-    if (test_env_start(&env) != 0) return 1;
+    int start_rc = test_env_start(&env);
+    ASSERT_EQ_INT(start_rc, 0, "daemon starts for leak-path coverage");
+    if (start_rc != 0) return 1;
 
     TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
     TestClient *tc = tc_connect(&cfg);
@@ -46,18 +48,10 @@ static int test_dispatch_leak_paths_run(void) {
     ASSERT_CONTAINS(resp, "\"error\"", "negative offset rejected");
     free(resp); resp = NULL;
 
-    /* (b) compact on a nonexistent object. */
+    /* (b) removed standalone storage command is rejected. */
     tc_request(tc, "{\"mode\":\"compact\",\"dir\":\"default\",\"object\":\"nope\"}", &resp);
-    ASSERT_CONTAINS(resp, "\"error\"", "compact on nonexistent object rejected");
+    ASSERT_CONTAINS(resp, "\"error\"", "removed compact mode rejected");
     free(resp); resp = NULL;
-
-    /* NOTE: the compact-success and compact-failed early returns in
-       dispatch_json_query are NOT black-box reachable here — create-object
-       defaults to SLOTCASK_FORMAT_FIXED, and compact refuses anything that
-       isn't SLOTCASK_FORMAT_VARIABLE (which only arises via the offline
-       varlen migration). Those two return sites are leak-fixed by the same
-       symmetric free(mode)/free(dir)/free(object) insertion as site (b)
-       above, which this test does exercise. */
 
     tc_close(tc);
     test_env_stop(&env);

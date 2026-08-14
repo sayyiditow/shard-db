@@ -1,5 +1,4 @@
 #include "types.h"
-#include "slotcask.h"
 #include "nql.h"
 #ifdef TEST_BUILD
 #include "test_control.h"
@@ -98,13 +97,8 @@ int main(int argc, char *argv[]) {
     const char *cmd = argv[1];
 
     if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0) {
-        if (SHARD_DB_MIN_VERSION[0])
-            printf("shard-db %s (minimum supported source version: %s; "
-                   "informational, not enforced in this release)\n",
-                   SHARD_DB_VERSION, SHARD_DB_MIN_VERSION);
-        else
-            printf("shard-db %s (no minimum source version floor)\n",
-                   SHARD_DB_VERSION);
+        printf("shard-db %s (required source release: %s; enforced)\n",
+               SHARD_DB_VERSION, SHARD_DB_REQUIRED_SOURCE_VERSION);
         return 0;
     }
 
@@ -160,128 +154,6 @@ int main(int argc, char *argv[]) {
         }
         if (strcmp(cmd, "stop") == 0) return cmd_stop(db_root);
         if (strcmp(cmd, "status") == 0) return cmd_status(db_root);
-    }
-
-    /* migrate-files was a one-shot 2026.05.1 upgrade step (lift
-       pre-2026.05.2 <obj>/files/<XX>/<XX>/ hashed buckets to flat layout);
-       the standalone ./migrate binary is removed as of 2026.08.1 and
-       startup migration is automatic. Keep returning nonzero so scripts
-       that predate the removal fail loudly instead of misrecognizing the
-       command as a no-op. */
-    if (strcmp(cmd, "migrate-files") == 0) {
-        fprintf(stderr,
-            "shard-db: 'migrate-files' was the 2026.05.1 one-shot file-layout\n"
-            "          migration. Since 2026.08.1 migration is automatic:\n"
-            "          start this binary and it self-migrates via $DB_ROOT/.version.\n");
-        return 1;
-    }
-
-    /* migrate-varlen — offline conversion of fixed-size segment records to
-       variable-length format.  Daemon must NOT be running. */
-    if (strcmp(cmd, "migrate-varlen") == 0) {
-        if (argc < 4) {
-            fprintf(stderr, "Usage: shard-db migrate-varlen <dir> <object>\n");
-            return 1;
-        }
-        const char *mig_dir = argv[2];
-        const char *mig_obj = argv[3];
-        char db_root[PATH_MAX];
-        if (load_db_root(db_root, sizeof(db_root)) != 0) return 1;
-        char eff_root[PATH_MAX];
-        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, mig_dir);
-        shard_db_offline_init(db_root);
-        Schema sc = load_schema(eff_root, mig_obj);
-        if (sc.splits <= 0) {
-            fprintf(stderr, "migrate-varlen: cannot load schema for %s/%s\n",
-                    mig_dir, mig_obj);
-            return 1;
-        }
-        /* kfcache sized to hold all shards; segcache=256 holds source+dest
-           segment files without eviction during migration. */
-        slotcask_init(sc.splits, 256);
-        char obj_data[PATH_MAX];
-        snprintf(obj_data, sizeof(obj_data), "%s/%s/%s",
-                 db_root, mig_dir, mig_obj);
-        /* Skip objects whose data directory does not yet exist — they have
-           no segments to migrate and slotcask_open would create the dir. */
-        {
-            char kf_probe[PATH_MAX];
-            snprintf(kf_probe, sizeof(kf_probe), "%s/data/kf", obj_data);
-            struct stat _st;
-            if (stat(kf_probe, &_st) != 0) {
-                fprintf(stdout, "migrate-varlen: %s/%s skipped (no data dir)\n",
-                        mig_dir, mig_obj);
-                return 0;
-            }
-        }
-        SlotcaskDb sdb;
-        if (slotcask_open(&sdb, obj_data, sc.splits, sc.streams, sc.slot_size) != 0) {
-            fprintf(stderr, "migrate-varlen: slotcask_open failed\n");
-            return 1;
-        }
-        int mrc = slotcask_migrate_to_varlen(&sdb);
-        slotcask_close(&sdb);
-        if (mrc != 0) {
-            fprintf(stderr, "migrate-varlen: migration failed\n");
-            return 1;
-        }
-        fprintf(stdout, "migrate-varlen: %s/%s done\n", mig_dir, mig_obj);
-        return 0;
-    }
-
-    /* compact — offline repack of migrated segments, applying trim_fn to recover
-       disk space from records stored before trim-on-write was active. */
-    if (strcmp(cmd, "compact") == 0) {
-        if (argc < 4) {
-            fprintf(stderr, "Usage: shard-db compact <dir> <object>\n");
-            return 1;
-        }
-        const char *cmp_dir = argv[2];
-        const char *cmp_obj = argv[3];
-        char db_root[PATH_MAX];
-        if (load_db_root(db_root, sizeof(db_root)) != 0) return 1;
-        char eff_root[PATH_MAX];
-        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, cmp_dir);
-        shard_db_offline_init(db_root);
-        Schema sc = load_schema(eff_root, cmp_obj);
-        if (sc.splits <= 0) {
-            fprintf(stderr, "compact: cannot load schema for %s/%s\n", cmp_dir, cmp_obj);
-            return 1;
-        }
-        TypedSchema *ts = load_typed_schema(eff_root, cmp_obj);
-        slotcask_init(sc.splits, 256);
-        char obj_data[PATH_MAX];
-        snprintf(obj_data, sizeof(obj_data), "%s/%s/%s", db_root, cmp_dir, cmp_obj);
-        {
-            char kf_probe[PATH_MAX];
-            snprintf(kf_probe, sizeof(kf_probe), "%s/data/kf", obj_data);
-            struct stat _st;
-            if (stat(kf_probe, &_st) != 0) {
-                fprintf(stdout, "compact: %s/%s skipped (no data dir)\n", cmp_dir, cmp_obj);
-                return 0;
-            }
-        }
-        SlotcaskDb sdb;
-        if (slotcask_open(&sdb, obj_data, sc.splits, sc.streams, sc.slot_size) != 0) {
-            fprintf(stderr, "compact: slotcask_open failed\n");
-            return 1;
-        }
-        if (sdb.format != SLOTCASK_FORMAT_VARIABLE) {
-            fprintf(stderr, "compact: %s/%s is FIXED format — run migrate-varlen first\n",
-                    cmp_dir, cmp_obj);
-            slotcask_close(&sdb);
-            return 1;
-        }
-        fprintf(stdout, "compact: repacking %s/%s ...\n", cmp_dir, cmp_obj);
-        fflush(stdout);
-        int rc = slotcask_compact(&sdb, schema_trim_fn, (void *)ts);
-        slotcask_close(&sdb);
-        if (rc != 0) {
-            fprintf(stderr, "compact: failed for %s/%s\n", cmp_dir, cmp_obj);
-            return 1;
-        }
-        fprintf(stdout, "compact: %s/%s done\n", cmp_dir, cmp_obj);
-        return 0;
     }
 
     /* All other commands — route through server via TCP */

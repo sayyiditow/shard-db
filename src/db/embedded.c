@@ -213,13 +213,7 @@ static void db_cleanup_before_pools(ShardDb *db) {
     g_db = NULL;
 }
 
-/* $DB_ROOT/.version — durable record of which shard-db release last
-   completed startup migration against this db_root. Returns
-   SHARD_DB_VERSION_FILE_OK and fills out on success,
-   SHARD_DB_VERSION_FILE_MISSING when the path does not exist, or
-   SHARD_DB_VERSION_FILE_ERROR for an unreadable, oversized, or empty file.
-   Missing and unreadable are intentionally distinct: a non-empty database
-   must not silently mutate when its version evidence cannot be read. */
+/* $DB_ROOT/.version — durable compatibility evidence. */
 int shard_db_version_file_read(const char *db_root, char *out, size_t out_sz) {
     if (!db_root || !out || out_sz < 2) return SHARD_DB_VERSION_FILE_ERROR;
     char path[PATH_MAX];
@@ -237,9 +231,8 @@ int shard_db_version_file_read(const char *db_root, char *out, size_t out_sz) {
         out[n++] = (char)ch;
     }
     int read_error = ferror(f);
-    int close_error = (fclose(f) != 0);
-    if (read_error || close_error || n == 0)
-        return SHARD_DB_VERSION_FILE_ERROR;
+    int close_error = fclose(f) != 0;
+    if (read_error || close_error || n == 0) return SHARD_DB_VERSION_FILE_ERROR;
     if (out[n - 1] == '\n') n--;
     if (n == 0 || memchr(out, '\n', n) || memchr(out, '\r', n))
         return SHARD_DB_VERSION_FILE_ERROR;
@@ -248,375 +241,443 @@ int shard_db_version_file_read(const char *db_root, char *out, size_t out_sz) {
 }
 
 int shard_db_version_file_write(const char *db_root, const char *version) {
-    if (!db_root || !version || !version[0]) return -1;
+    if (!db_root || !version || !version[0])
+        return SHARD_DB_VERSION_STAMP_FAILED;
     char path[PATH_MAX];
     char tmp[PATH_MAX];
     snprintf(path, sizeof(path), "%s/.version", db_root);
     snprintf(tmp, sizeof(tmp), "%s/.version.tmp.XXXXXX", db_root);
     int fd = mkstemp(tmp);
-    if (fd < 0) return -1;
+    if (fd < 0) return SHARD_DB_VERSION_STAMP_FAILED;
+
     size_t len = strlen(version);
     const char *p = version;
     while (len > 0) {
         ssize_t n = write(fd, p, len);
-        if (n <= 0) { close(fd); unlink(tmp); return -1; }
-        p += n; len -= (size_t)n;
+        if (n <= 0) {
+            (void)close(fd);
+            (void)unlink(tmp);
+            return SHARD_DB_VERSION_STAMP_FAILED;
+        }
+        p += n;
+        len -= (size_t)n;
     }
     if (write(fd, "\n", 1) != 1 || fsync(fd) != 0) {
-        close(fd); unlink(tmp); return -1;
+        (void)close(fd);
+        (void)unlink(tmp);
+        return SHARD_DB_VERSION_STAMP_FAILED;
     }
-    if (close(fd) != 0 || rename(tmp, path) != 0) {
-        unlink(tmp);
-        return -1;
+    if (close(fd) != 0) {
+        (void)unlink(tmp);
+        return SHARD_DB_VERSION_STAMP_FAILED;
     }
+    if (rename(tmp, path) != 0) {
+        (void)unlink(tmp);
+        return SHARD_DB_VERSION_STAMP_FAILED;
+    }
+
     int dfd = open(db_root, O_RDONLY | O_DIRECTORY);
-    if (dfd < 0 || fsync(dfd) != 0 || close(dfd) != 0) return -1;
+    if (dfd < 0) return SHARD_DB_VERSION_STAMP_UNCERTAIN;
+    int sync_rc = fsync(dfd);
+    int close_rc = close(dfd);
+    if (sync_rc != 0 || close_rc != 0)
+        return SHARD_DB_VERSION_STAMP_UNCERTAIN;
+    return SHARD_DB_VERSION_STAMP_OK;
+}
+
+/* True iff `path` is a directory containing no entries besides "." and
+   "..". Returns 1 empty, 0 non-empty, -1 on error. */
+static int dir_is_empty(const char *path) {
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    int empty = 1;
+    int read_errno = 0;
+    errno = 0;
+    for (struct dirent *de = readdir(d); de; de = readdir(d)) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        empty = 0;
+        break;
+    }
+    if (empty) read_errno = errno;
+    int close_rc = closedir(d);
+    if (read_errno != 0 || close_rc != 0) return -1;
+    return empty;
+}
+
+/* "No real data yet" check for the compatibility gate below. Bootstrap-
+   only config files (dirs.conf, tokens.conf, allowed_ips.conf) and empty
+   tenant directories are commonly hand-seeded by an operator before the
+   very first daemon start ever (configuration.md documents this as a
+   supported first-run workflow: "Add tenants with a plain edit + server
+   restart") and carry no on-disk format risk -- only a materialized
+   object, which always lives under a tenant directory, does. Skip those
+   specific bootstrap filenames, and skip any subdirectory that is itself
+   still empty (a tenant dir pre-created before any create-object has run
+   against it); anything else marks the root non-empty. */
+static int db_root_is_filesystem_empty(const char *db_root) {
+    DIR *dir = opendir(db_root);
+    if (!dir) return -1;
+    int empty = 1;
+    int read_errno = 0;
+    int sub_failed = 0;
+    errno = 0;
+    for (struct dirent *de = readdir(dir); de; de = readdir(dir)) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0 ||
+            strcmp(de->d_name, ".shard-db.lock") == 0 ||
+            strcmp(de->d_name, "dirs.conf") == 0 ||
+            strcmp(de->d_name, "tokens.conf") == 0 ||
+            strcmp(de->d_name, "allowed_ips.conf") == 0)
+            continue;
+        char sub_path[PATH_MAX];
+        snprintf(sub_path, sizeof(sub_path), "%s/%s", db_root, de->d_name);
+        struct stat st;
+        if (stat(sub_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            int sub_empty = dir_is_empty(sub_path);
+            if (sub_empty < 0) { sub_failed = 1; break; }
+            if (sub_empty) continue;
+        }
+        empty = 0;
+        break;
+    }
+    if (empty && !sub_failed) read_errno = errno;
+    int close_rc = closedir(dir);
+    if (sub_failed || read_errno != 0 || close_rc != 0) return -1;
+    return empty;
+}
+
+int shard_db_version_check(const char *db_root,
+                           char *out_disk_version, size_t out_sz) {
+    char disk_version[64] = {0};
+    int empty = db_root_is_filesystem_empty(db_root);
+    if (empty < 0) return SHARD_DB_VERSION_INVALID;
+    int read_rc = shard_db_version_file_read(db_root, disk_version,
+                                              sizeof(disk_version));
+    int present = read_rc == SHARD_DB_VERSION_FILE_OK;
+    if (read_rc == SHARD_DB_VERSION_FILE_ERROR)
+        return SHARD_DB_VERSION_INVALID;
+    if (present && out_disk_version && out_sz > 0)
+        snprintf(out_disk_version, out_sz, "%s", disk_version);
+    return shard_db_version_decide(present ? disk_version : NULL, present,
+                                   empty, SHARD_DB_VERSION,
+                                   SHARD_DB_REQUIRED_SOURCE_VERSION);
+}
+
+int shard_db_version_stamp(const char *db_root) {
+    int rc = shard_db_version_file_write(db_root, SHARD_DB_VERSION);
+    if (rc == SHARD_DB_VERSION_STAMP_UNCERTAIN) {
+        fprintf(stderr,
+                "shard-db: stamp commit uncertain; retry startup to verify "
+                ".version\n");
+    } else if (rc == SHARD_DB_VERSION_STAMP_FAILED) {
+        fprintf(stderr,
+                "shard-db: failed to stamp compatible database version\n");
+    }
+    return rc;
+}
+
+typedef struct {
+    char dir[PATH_MAX];
+    char object[PATH_MAX];
+    int streams;
+} StartupSchemaEntry;
+
+static int startup_schema_line(char *line, StartupSchemaEntry *out) {
+    if (!line || !out) return -1;
+    line[strcspn(line, "\r\n")] = '\0';
+    char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p || *p == '#') return 1;
+
+    char *save = NULL;
+    char *parts[7] = {0};
+    int n = 0;
+    for (char *part = strtok_r(p, ":", &save);
+         part && n < 7; part = strtok_r(NULL, ":", &save))
+        parts[n++] = part;
+    /* dir_name_ok is a pure string-format check (no path separators,
+       no control chars, no leading dot). is_valid_dir would additionally
+       require the dir to be currently registered in dirs.conf, which is
+       wrong here — a schema.conf entry for a since-removed tenant dir
+       must still parse so the caller can treat it as a soft/stale entry
+       instead of a hard parse failure. */
+    if (n < 6 || n > 7 || !dir_name_ok(parts[0]) ||
+        !is_valid_object(parts[1]))
+        return -1;
+
+    char *end = NULL;
+    long streams = strtol(parts[5], &end, 10);
+    if (*parts[2] == '\0' || *parts[3] == '\0' || *parts[4] == '\0' ||
+        *end != '\0' || streams <= 0 || streams > SLOTCASK_MAX_STREAMS)
+        return -1;
+    if (strcmp(parts[4], "2") != 0) return -1;
+
+    snprintf(out->dir, sizeof(out->dir), "%s", parts[0]);
+    snprintf(out->object, sizeof(out->object), "%s", parts[1]);
+    out->streams = (int)streams;
     return 0;
 }
 
-/* Run this release's startup migration for every registered object.
- *
- * 2026.08.1 only repairs secondary indexes. Earlier releases already
- * completed the fixed-slot → VARIABLE conversion and compaction.
- * Called before thread pools start, while the database is offline. */
-static int run_startup_migration(const char *db_root) {
-    char schema_path[PATH_MAX];
-    snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
-    FILE *f = fopen(schema_path, "r");
-    if (!f) return 0; /* no schema.conf — nothing to migrate */
+static int startup_read_schema(const char *db_root,
+                               StartupSchemaEntry **out_entries,
+                               size_t *out_count) {
+    if (!out_entries || !out_count) return -1;
+    *out_entries = NULL;
+    *out_count = 0;
 
-    char line[4096];
-    int failed = 0;
-    while (!failed && fgets(line, sizeof(line), f)) {
-        line[strcspn(line, "\n")] = '\0';
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || !*p) continue;
-
-        /* Format: dir:object:splits:max_key:2:streams[...] */
-        char *c1 = strchr(p, ':');
-        if (!c1) { failed = 1; break; }
-        *c1 = '\0';
-        char *c2 = strchr(c1 + 1, ':');
-        if (!c2) { failed = 1; break; }
-        *c2 = '\0';
-
-        const char *dir = p;
-        const char *obj = c1 + 1;
-
-        char obj_data[PATH_MAX];
-        snprintf(obj_data, sizeof(obj_data), "%s/%s/%s", db_root, dir, obj);
-
-        /* Objects with no materialised data have no indexes to rebuild. */
-        char kf_probe[PATH_MAX];
-        snprintf(kf_probe, sizeof(kf_probe), "%s/data/kf", obj_data);
-        struct stat kf_st;
-        if (stat(kf_probe, &kf_st) != 0) {
-            if (errno == ENOENT) continue;
-            failed = 1;
-            break;
-        }
-
-        char eff_root[PATH_MAX];
-        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
-        Schema sch = load_schema(eff_root, obj);
-        if (sch.splits <= 0) { failed = 1; break; }
-
-        /* Rebuild every secondary index from source-of-truth records. */
-        objlock_wrlock(eff_root, obj);
-        int reindex_count = 0;
-        int reindex_errno = 0;
-        int reindex_rc = reindex_object_checked_ex(eff_root, obj, 0,
-                                                    &reindex_count,
-                                                    &reindex_errno);
-        objlock_wrunlock(eff_root, obj);
-        if (reindex_rc != 0) {
-            LOG_ERROR(LOG_SUB_REINDEX, "reindex failed for %s/%s (errno=%d %s)",
-                      dir, obj, reindex_errno, strerror(reindex_errno));
-            failed = 1;
-        } else if (reindex_count > 0) {
-            LOG_INFO(LOG_SUB_REINDEX, "reindexed %s/%s (%d indexes)",
-                     dir, obj, reindex_count);
-        }
-    }
-    if (ferror(f)) failed = 1;
-    if (fclose(f) != 0) failed = 1;
-
-    return failed ? -1 : 0;
-}
-
-/* Empty means no active object records in schema.conf. Configuration-only
- * roots are allowed to bootstrap; schema-only roots are non-empty. */
-static int db_root_is_empty(const char *db_root) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/schema.conf", db_root);
     FILE *f = fopen(path, "r");
-    if (!f) return errno == ENOENT ? 1 : -1;
+    if (!f) return errno == ENOENT ? 0 : -1;
 
+    size_t cap = 0;
     char line[4096];
-    int has_object = 0;
     while (fgets(line, sizeof(line), f)) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\n' || *p == '\0') continue;
-        /* Any non-comment schema content makes this a non-empty root.
-           Malformed metadata must not obtain the empty-root bypass. */
-        has_object = 1;
-        break;
+        StartupSchemaEntry entry;
+        int rc = startup_schema_line(line, &entry);
+        if (rc < 0) {
+            free(*out_entries);
+            *out_entries = NULL;
+            *out_count = 0;
+            fclose(f);
+            return -1;
+        }
+        if (rc > 0) continue;
+        if (*out_count == cap) {
+            size_t next_cap = cap ? cap * 2 : 16;
+            StartupSchemaEntry *next = realloc(
+                *out_entries, next_cap * sizeof(**out_entries));
+            if (!next) {
+                free(*out_entries);
+                *out_entries = NULL;
+                *out_count = 0;
+                fclose(f);
+                return -1;
+            }
+            *out_entries = next;
+            cap = next_cap;
+        }
+        (*out_entries)[(*out_count)++] = entry;
     }
-    if (ferror(f) || fclose(f) != 0) return -1;
-    return has_object ? 0 : 1;
-}
-
-/* Convert every FIXED-format object to VARIABLE, unconditionally, on
- * every startup with a non-empty schema.conf. Mirrors the "migrate"
- * JSON mode's semantics (idempotent — no-op if already VARIABLE) and
- * its objlock_wrlock/slotcask_migrate_to_varlen/objlock_wrunlock
- * sequence; unlike server.c's "migrate" handler (which relies on the
- * outer mode_is_schema dispatch already holding the lock), this sweep
- * has no outer dispatch to rely on and takes the lock itself. */
-static int run_startup_format_sweep(const char *db_root) {
-    char schema_path[PATH_MAX];
-    snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
-    FILE *f = fopen(schema_path, "r");
-    if (!f) {
-        LOG_ERROR(LOG_SUB_CONFIG,
-                  "startup format sweep: cannot open %s: %s",
-                  schema_path, strerror(errno));
+    int read_error = ferror(f);
+    int close_error = fclose(f) != 0;
+    if (read_error || close_error) {
+        free(*out_entries);
+        *out_entries = NULL;
+        *out_count = 0;
         return -1;
     }
+    return 0;
+}
 
-    char line[4096];
-    int failed = 0;
-    while (!failed && fgets(line, sizeof(line), f)) {
-        line[strcspn(line, "\n")] = '\0';
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || !*p) continue;
+static int startup_find_schema(const StartupSchemaEntry *entries, size_t count,
+                               const char *dir, const char *object) {
+    for (size_t i = 0; i < count; i++)
+        if (strcmp(entries[i].dir, dir) == 0 &&
+            strcmp(entries[i].object, object) == 0)
+            return 1;
+    return 0;
+}
 
-        char *c1 = strchr(p, ':');
-        if (!c1) { failed = 1; break; }
-        *c1 = '\0';
-        char *c2 = strchr(c1 + 1, ':');
-        if (!c2) { failed = 1; break; }
-        *c2 = '\0';
+static int startup_readable_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int failed = ferror(f);
+    int close_rc = fclose(f);
+    return failed || close_rc != 0 ? -1 : 0;
+}
 
-        const char *dir = p;
-        const char *obj = c1 + 1;
+int shard_db_validate_before_stamp(const char *db_root) {
+    StartupSchemaEntry *entries = NULL;
+    size_t count = 0;
+    if (startup_read_schema(db_root, &entries, &count) != 0) return -1;
 
-        char obj_data[PATH_MAX];
-        snprintf(obj_data, sizeof(obj_data), "%s/%s/%s", db_root, dir, obj);
-
-        /* Objects with no materialised data have no format to convert. */
-        char kf_probe[PATH_MAX];
-        snprintf(kf_probe, sizeof(kf_probe), "%s/data/kf", obj_data);
-        struct stat kf_st;
-        if (stat(kf_probe, &kf_st) != 0) {
-            if (errno == ENOENT) continue;
-            LOG_ERROR(LOG_SUB_SLOTCASK,
-                      "startup format sweep: cannot inspect %s: %s",
-                      kf_probe, strerror(errno));
-            failed = 1;
-            break;
-        }
-        if (!S_ISDIR(kf_st.st_mode)) {
-            LOG_ERROR(LOG_SUB_SLOTCASK,
-                      "startup format sweep: %s is not a directory",
-                      kf_probe);
-            failed = 1;
-            break;
-        }
-
-        /* Read the .format marker directly — avoids opening the object
-           through the registry (which would register it with whatever
-           streams count schema.conf currently declares, potentially
-           wrong if an operator or vacuum is mid-rebuild). A materialised
-           object without a valid marker is unsafe to interpret. */
-        char fmt_path[PATH_MAX];
-        snprintf(fmt_path, sizeof(fmt_path), "%s/.format", obj_data);
-        int fmt_fd = open(fmt_path, O_RDONLY);
-        if (fmt_fd < 0) {
-            LOG_ERROR(LOG_SUB_SLOTCASK,
-                      "startup format sweep: cannot open format marker %s: %s",
-                      fmt_path, strerror(errno));
-            failed = 1;
-            break;
-        }
-        char fmt_byte = 0;
-        ssize_t fmt_n;
-        do {
-            fmt_n = read(fmt_fd, &fmt_byte, 1);
-        } while (fmt_n < 0 && errno == EINTR);
-        int fmt_errno = errno;
-        int fmt_close_rc = close(fmt_fd);
-        if (fmt_n != 1 || fmt_close_rc != 0 ||
-            (fmt_byte != '0' && fmt_byte != '1')) {
-            LOG_ERROR(LOG_SUB_SLOTCASK,
-                      "startup format sweep: invalid format marker %s%s%s",
-                      fmt_path, fmt_n < 0 ? ": " : "",
-                      fmt_n < 0 ? strerror(fmt_errno) :
-                      (fmt_close_rc != 0 ? strerror(errno) : ""));
-            failed = 1;
-            break;
-        }
-        if (fmt_byte == '1') continue;  /* already VARIABLE */
-
-        /* Object is FIXED on disk. Count actual stream directories rather
-           than trusting schema.conf — schema.conf may declare a different
-           count mid-rebuild or during deliberate mismatch testing. */
-        char streams_dir[PATH_MAX];
-        snprintf(streams_dir, sizeof(streams_dir), "%s/data/streams", obj_data);
-        DIR *sd = opendir(streams_dir);
-        if (!sd) {
-            LOG_ERROR(LOG_SUB_SLOTCASK,
-                      "startup format sweep: cannot open streams directory %s: %s",
-                      streams_dir, strerror(errno));
-            failed = 1;
-            break;
-        }
-        int actual_streams = 0;
-        struct dirent *de;
-        errno = 0;
-        while ((de = readdir(sd)) != NULL) {
-            if (de->d_name[0] == '.') continue;
-            struct stat stream_st;
-            if (fstatat(dirfd(sd), de->d_name, &stream_st,
-                        AT_SYMLINK_NOFOLLOW) != 0) {
-                LOG_ERROR(LOG_SUB_SLOTCASK,
-                          "startup format sweep: cannot inspect stream %s/%s: %s",
-                          streams_dir, de->d_name, strerror(errno));
-                failed = 1;
-                break;
-            }
-            if (!S_ISDIR(stream_st.st_mode)) {
-                LOG_ERROR(LOG_SUB_SLOTCASK,
-                          "startup format sweep: unexpected non-directory in %s: %s",
-                          streams_dir, de->d_name);
-                failed = 1;
-                break;
-            }
-            actual_streams++;
-        }
-        int stream_errno = errno;
-        int stream_close_rc = closedir(sd);
-        if (failed) break;
-        if (stream_errno != 0 || stream_close_rc != 0) {
-            LOG_ERROR(LOG_SUB_SLOTCASK,
-                      "startup format sweep: stream enumeration failed for %s: %s",
-                      streams_dir, strerror(stream_errno != 0 ? stream_errno : errno));
-            failed = 1;
-            break;
-        }
-        if (actual_streams < 1) {
-            LOG_ERROR(LOG_SUB_SLOTCASK,
-                      "startup format sweep: no stream directories under %s",
-                      streams_dir);
-            failed = 1;
-            break;
-        }
-
+    for (size_t i = 0; i < count; i++) {
         char eff_root[PATH_MAX];
-        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, dir);
-        Schema sch = load_schema(eff_root, obj);
-        if (sch.splits <= 0) {
-            LOG_ERROR(LOG_SUB_SLOTCASK,
-                      "startup format sweep: invalid schema for %s/%s",
-                      dir, obj);
-            failed = 1;
-            break;
+        char object_dir[PATH_MAX];
+        snprintf(eff_root, sizeof(eff_root), "%s/%s",
+                 db_root, entries[i].dir);
+        snprintf(object_dir, sizeof(object_dir), "%s/%s",
+                 eff_root, entries[i].object);
+
+        struct stat obj_st;
+        if (stat(object_dir, &obj_st) != 0) {
+            /* Stale schema.conf entry with no materialized object on disk
+               at all — e.g. a leftover reference to a removed tenant dir.
+               The auth/route layer rejects unknown dirs before any read
+               is dispatched, so this can't cause silent mis-routing; warn
+               (soft) rather than refuse startup. A materialized object
+               with a genuinely missing/unreadable fields.conf below is
+               still fatal. */
+            if (errno == ENOENT) continue;
+            free(entries);
+            return -1;
         }
-        if (sch.streams != actual_streams) {
-            /* A streams mismatch is an intentional rebuild hand-off state:
-               opening with schema.conf's value could route new writes into
-               the wrong stream set. Leave the object untouched and make the
-               deferred repair visible; vacuum/rebuild owns this transition. */
-            LOG_WARN(LOG_SUB_SLOTCASK,
-                     "startup format sweep: deferring %s/%s due to stream "
-                     "mismatch (schema=%d disk=%d)",
-                     dir, obj, sch.streams, actual_streams);
+
+        char fields_path[PATH_MAX];
+        snprintf(fields_path, sizeof(fields_path), "%s/fields.conf",
+                 object_dir);
+        if (startup_readable_file(fields_path) != 0) {
+            free(entries);
+            return -1;
+        }
+
+        char data_dir[PATH_MAX];
+        snprintf(data_dir, sizeof(data_dir), "%s/data", object_dir);
+        struct stat st;
+        if (stat(data_dir, &st) != 0) {
+            if (errno != ENOENT) {
+                free(entries);
+                return -1;
+            }
             continue;
         }
-
-        SlotcaskSchemaInfo info = {
-            .splits    = sch.splits,
-            .slot_size = sch.slot_size,
-            .streams   = actual_streams,
-        };
-        SlotcaskDb *sdb = slotcask_registry_get(eff_root, obj, &info);
-        if (!sdb) {
-            LOG_ERROR(LOG_SUB_SLOTCASK,
-                      "startup format sweep: cannot open registry entry for %s/%s",
-                      dir, obj);
-            failed = 1;
-            break;
+        if (!S_ISDIR(st.st_mode)) {
+            free(entries);
+            return -1;
         }
 
-        if (sdb->format != SLOTCASK_FORMAT_FIXED) {
-            LOG_ERROR(LOG_SUB_SLOTCASK,
-                      "startup format sweep: format marker/registry mismatch for %s/%s",
-                      dir, obj);
-            slotcask_registry_invalidate(eff_root, obj);
-            failed = 1;
-            break;
+        char kf_dir[PATH_MAX];
+        char streams_dir[PATH_MAX];
+        snprintf(kf_dir, sizeof(kf_dir), "%s/kf", data_dir);
+        snprintf(streams_dir, sizeof(streams_dir), "%s/streams", data_dir);
+        if (stat(kf_dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
+            stat(streams_dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
+            slotcask_validate_segment_files(data_dir,
+                                             entries[i].streams) != 0) {
+            free(entries);
+            return -1;
         }
 
-        objlock_wrlock(eff_root, obj);
-        int mrc = slotcask_migrate_to_varlen(sdb);
-        objlock_wrunlock(eff_root, obj);
-        slotcask_registry_invalidate(eff_root, obj);
-        if (mrc != 0) {
-            LOG_ERROR(LOG_SUB_SLOTCASK,
-                      "startup format sweep: migration failed for %s/%s (rc=%d)",
-                      dir, obj, mrc);
-            failed = 1;
-            break;
+        /* Every materialized kf shard file must be readable -- an
+           unreadable shard (permissions, corruption) would otherwise
+           surface lazily as a partial-object failure on first query
+           instead of at startup. */
+        DIR *kfd = opendir(kf_dir);
+        if (!kfd) {
+            free(entries);
+            return -1;
         }
-        LOG_INFO(LOG_SUB_SLOTCASK,
-                 "startup format sweep: migrated %s/%s to VARIABLE",
-                 dir, obj);
+        int kf_failed = 0;
+        errno = 0;
+        for (struct dirent *ke = readdir(kfd); ke; ke = readdir(kfd)) {
+            if (ke->d_name[0] == '.') continue;
+            char kf_path[PATH_MAX];
+            snprintf(kf_path, sizeof(kf_path), "%s/%s", kf_dir, ke->d_name);
+            struct stat kst;
+            if (stat(kf_path, &kst) != 0 || !S_ISREG(kst.st_mode)) continue;
+            if (startup_readable_file(kf_path) != 0) {
+                kf_failed = 1;
+                break;
+            }
+        }
+        int kf_errno = errno;
+        int kfd_close = closedir(kfd);
+        if (kf_failed || kf_errno != 0 || kfd_close != 0) {
+            free(entries);
+            return -1;
+        }
     }
-    if (ferror(f)) failed = 1;
-    if (fclose(f) != 0) failed = 1;
 
+    DIR *root = opendir(db_root);
+    if (!root) {
+        free(entries);
+        return -1;
+    }
+    int failed = 0;
+    errno = 0;
+    /* errno is reset immediately before every readdir(root) call (not just
+       once, up front) because the loop body's own stat() probe below is
+       expected to fail with ENOTDIR/ENOENT for ordinary non-object dirents
+       (e.g. a tenant-scoped tokens.conf file sitting next to real object
+       dirs, probed as "<tokens.conf>/data"). Without the per-iteration
+       reset, that expected failure's errno survives past the loop and is
+       misread below as a genuine readdir() error on a clean directory. */
+    for (struct dirent *de = readdir(root); de; errno = 0, de = readdir(root)) {
+        if (de->d_name[0] == '.') continue;
+        if (!is_valid_dir(de->d_name)) continue;
+        char dir_path[PATH_MAX];
+        snprintf(dir_path, sizeof(dir_path), "%s/%s", db_root, de->d_name);
+        DIR *tenant = opendir(dir_path);
+        if (!tenant) {
+            failed = 1;
+            break;
+        }
+        for (struct dirent *oe = readdir(tenant); oe; oe = readdir(tenant)) {
+            if (oe->d_name[0] == '.') continue;
+            char object_dir[PATH_MAX];
+            snprintf(object_dir, sizeof(object_dir), "%s/%s",
+                     dir_path, oe->d_name);
+            char data_dir[PATH_MAX];
+            snprintf(data_dir, sizeof(data_dir), "%s/data", object_dir);
+            struct stat st;
+            if (stat(data_dir, &st) == 0 && S_ISDIR(st.st_mode) &&
+                !startup_find_schema(entries, count, de->d_name, oe->d_name)) {
+                failed = 1;
+                break;
+            }
+        }
+        int tenant_close = closedir(tenant);
+        if (tenant_close != 0) failed = 1;
+        if (failed) break;
+    }
+    int root_errno = errno;
+    int root_close = closedir(root);
+    if (root_errno != 0 || root_close != 0) failed = 1;
+    free(entries);
     return failed ? -1 : 0;
 }
 
-/* Shared startup seam used by cmd_server() and shard_db_open(). */
-int shard_db_startup_migrate(const char *db_root,
-                             char *out_disk_version, size_t out_sz) {
-    char disk_version[64] = {0};
-    int read_rc = shard_db_version_file_read(db_root, disk_version,
-                                              sizeof(disk_version));
-    int empty = db_root_is_empty(db_root);
-    if (empty < 0) return -1;
-    int present = (read_rc == SHARD_DB_VERSION_FILE_OK);
+int shard_db_recover_before_stamp(const char *db_root,
+                                  int *out_markers_replayed) {
+    if (!out_markers_replayed) return -1;
+    *out_markers_replayed = 0;
+    if (rebuild_recovery(db_root) != 0) return -1;
 
-    if (read_rc == SHARD_DB_VERSION_FILE_ERROR && !empty) return -4;
-    int decision = shard_db_version_decide(
-        present ? disk_version : NULL, present, empty,
-        SHARD_DB_VERSION, SHARD_DB_MIN_VERSION,
-        SHARD_DB_HAS_STARTUP_MIGRATION);
-    if (decision == SHARD_DB_VERSION_DOWNGRADE && out_disk_version)
-        snprintf(out_disk_version, out_sz, "%s", disk_version);
-    if (decision < 0) return decision;
+    int was_clean = clean_flag_exists(db_root);
+    if (clean_flag_remove(db_root) != 0) return -1;
+    if (was_clean) return 0;
 
-    /* Runs on every accepted startup with a non-empty schema.conf,
-       independent of the .version decision — a matching .version only
-       means this release's index-rebuild migration already ran once; it
-       says nothing about whether every object is on VARIABLE format (an
-       object can be created, or restored from backup, in FIXED format at
-       any later point). This is the standing invariant-enforcement sweep,
-       not a per-release migration step. Version refusal must happen first:
-       a newer/unsupported database must not be mutated before rejection. */
-    if (!empty && run_startup_format_sweep(db_root) != 0) return -1;
+    StartupSchemaEntry *entries = NULL;
+    size_t count = 0;
+    if (startup_read_schema(db_root, &entries, &count) != 0) return -1;
+    for (size_t i = 0; i < count; i++) {
+        char eff_root[PATH_MAX];
+        char data_dir[PATH_MAX];
+        snprintf(eff_root, sizeof(eff_root), "%s/%s",
+                 db_root, entries[i].dir);
+        snprintf(data_dir, sizeof(data_dir), "%s/%s/%s",
+                 db_root, entries[i].dir, entries[i].object);
+        objlock_wrlock(eff_root, entries[i].object);
+        int rc = marker_recovery_sweep_object(eff_root, data_dir,
+                                               entries[i].object,
+                                               out_markers_replayed);
+        objlock_wrunlock(eff_root, entries[i].object);
+        if (rc != 0) {
+            free(entries);
+            return -1;
+        }
+    }
+    free(entries);
+    return 0;
+}
 
-    if (decision == SHARD_DB_VERSION_NOOP) return 0;
-#if SHARD_DB_HAS_STARTUP_MIGRATION
-    if (decision == SHARD_DB_VERSION_RUN_MIGRATION &&
-        run_startup_migration(db_root) != 0)
-        return -1;
-#endif
-    return shard_db_version_file_write(db_root, SHARD_DB_VERSION) == 0 ? 0 : -1;
+int shard_db_mark_clean_if_safe(const char *db_root) {
+    StartupSchemaEntry *entries = NULL;
+    size_t count = 0;
+    if (startup_read_schema(db_root, &entries, &count) != 0) return -1;
+    for (size_t i = 0; i < count; i++) {
+        char data_dir[PATH_MAX];
+        snprintf(data_dir, sizeof(data_dir), "%s/%s/%s",
+                 db_root, entries[i].dir, entries[i].object);
+        int pending = object_has_pending_markers(data_dir);
+        if (pending != 0) {
+            free(entries);
+            return -1;
+        }
+    }
+    free(entries);
+    return clean_flag_write(db_root);
 }
 
 /* ── Public API ── */
@@ -635,6 +696,31 @@ ShardDb *shard_db_open(const char *db_root) {
         return NULL;
     }
 
+    char disk_version[64] = {0};
+    int version_decision = shard_db_version_check(db_root, disk_version,
+                                                  sizeof(disk_version));
+    if (version_decision < 0) {
+        if (version_decision == SHARD_DB_VERSION_DOWNGRADE) {
+            fprintf(stderr,
+                    "shard_db_open: refusing to open: database version %s is "
+                    "newer than this binary (%s); install shard-db %s or newer.\n",
+                    disk_version, SHARD_DB_VERSION, disk_version);
+        } else if (version_decision == SHARD_DB_VERSION_TOO_OLD) {
+            fprintf(stderr,
+                    "shard_db_open: refusing to open: this database requires "
+                    "shard-db %s or newer.\n",
+                    SHARD_DB_REQUIRED_SOURCE_VERSION);
+        } else {
+            fprintf(stderr,
+                    "shard_db_open: refusing to open: non-empty DB_ROOT lacks "
+                    "valid 2026.08.1/2026.08.2 compatibility evidence\n");
+        }
+        db_root_lock_release(&lock_fd);
+        atomic_store(&g_instance_open, 0);
+        return NULL;
+    }
+    int stamp_required = version_decision == SHARD_DB_VERSION_STAMP;
+
     ShardDb *db = shard_db_open_internal(db_root);
     if (!db) {
         db_root_lock_release(&lock_fd);
@@ -647,58 +733,23 @@ ShardDb *shard_db_open(const char *db_root) {
        can bind their thread-local g_db on entry. */
     g_shard_db_instance = db;
 
-    if (rebuild_recovery(db_root) != 0) {
+    int markers_replayed = 0;
+    if (shard_db_recover_before_stamp(db_root, &markers_replayed) != 0 ||
+        shard_db_validate_before_stamp(db_root) != 0) {
         fprintf(stderr,
-                "shard_db_open: refusing to open: rebuild recovery requires manual intervention\n");
+                "shard_db_open: refusing to open: startup preparation failed\n");
         g_shard_db_instance = NULL;
         g_db = NULL;
         db_cleanup_before_pools(db);
         atomic_store(&g_instance_open, 0);
         return NULL;
     }
+    (void)markers_replayed;
 
-    /* Sweep FIXED-format objects before thread pools start, then run this
-       release's version-gated startup migration when required. The format
-       invariant is checked on every accepted startup; matching .version
-       only suppresses the per-release index-rebuild batch. */
-    char disk_version[64] = {0};
-    int mrc = shard_db_startup_migrate(db_root, disk_version, sizeof(disk_version));
-    if (mrc == SHARD_DB_VERSION_DOWNGRADE) {
-        fprintf(stderr,
-                "shard_db_open: refusing to open: database version %s is newer "
-                "than this binary (%s); install shard-db %s or newer.\n",
-                disk_version, SHARD_DB_VERSION, disk_version);
+    if (stamp_required &&
+        shard_db_version_stamp(db_root) != SHARD_DB_VERSION_STAMP_OK) {
         g_shard_db_instance = NULL;
         g_db = NULL;
-        db_cleanup_before_pools(db);
-        atomic_store(&g_instance_open, 0);
-        return NULL;
-    }
-    if (mrc == SHARD_DB_VERSION_TOO_OLD) {
-        fprintf(stderr,
-                "shard_db_open: refusing to open: this database requires "
-                "shard-db %s or newer.\n", SHARD_DB_MIN_VERSION);
-        g_shard_db_instance = NULL;
-        g_db = NULL;
-        db_cleanup_before_pools(db);
-        atomic_store(&g_instance_open, 0);
-        return NULL;
-    }
-    if (mrc == SHARD_DB_VERSION_INVALID) {
-        fprintf(stderr,
-                "shard_db_open: refusing to open: %s/.version has invalid "
-                "version evidence for a non-empty database.\n", db_root);
-        g_shard_db_instance = NULL;
-        g_db = NULL;
-        db_cleanup_before_pools(db);
-        atomic_store(&g_instance_open, 0);
-        return NULL;
-    }
-    if (mrc != 0) {
-        fprintf(stderr, "shard_db_open: startup migration failed\n");
-        g_shard_db_instance = NULL;
-        g_db = NULL;
-        /* Thread pools have not started yet. */
         db_cleanup_before_pools(db);
         atomic_store(&g_instance_open, 0);
         return NULL;
@@ -852,6 +903,8 @@ void shard_db_close(ShardDb *db) {
     parallel_io_pool_shutdown();
     parallel_pool_shutdown();
     counts_flush_all();
+    if (shard_db_mark_clean_if_safe(db->db_root) != 0)
+        fprintf(stderr, "shard_db_close: failed to record clean shutdown\n");
     bt_cache_shutdown();
     bm_cache_shutdown();
     slotcask_shutdown();

@@ -55,7 +55,7 @@ static int test_varlen_scan_resync_odirect_run(void) {
     fclose(f);
 
     CaptureCtx ctx = {0};
-    int rc = seg_scan_o_direct_varlen(path, 64, capture_cb, &ctx);
+    int rc = seg_scan_o_direct(path, 64, capture_cb, &ctx);
 
     ASSERT_EQ_INT(rc, 0, "scan completes without error (resync recovers and sparse flag-0 tail is clean)");
     ASSERT_EQ_INT(ctx.count, 2, "both A and C are delivered to the callback");

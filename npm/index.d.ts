@@ -30,16 +30,6 @@ declare class ShardDb {
   setLogHandler(fn: ShardDb.LogHandler | null): void
 
   /**
-   * Migrate one object from fixed-slot to variable-length segment format.
-   * Idempotent — safe to call on already-migrated objects (returns immediately).
-   * Resolves to `{"status":"ok","migrated":true}` on success,
-   * `{"status":"ok","migrated":false}` if already variable-length,
-   * or `{"error":"..."}` on failure.
-   * Called automatically during construction; use this for explicit per-object control.
-   */
-  migrate(dir: string, object: string): Promise<string>
-
-  /**
    * Repair corrupted kf (key-file) entries by rescanning all segment files.
    * Idempotent — objects with clean kf return `{"status":"ok","repaired":0}` immediately.
    * Resolves to `{"status":"ok","repaired":N}` where N is the number of entries fixed,
@@ -304,12 +294,6 @@ declare namespace ShardDb {
         from: string
         /** Required if the live object isn't empty. */
         force?: boolean }
-
-    | { mode: 'migrate'
-        dir: string; object: string }
-
-    | { mode: 'compact'
-        dir: string; object: string }
 
     | { mode: 'sequence'
         dir: string; object: string

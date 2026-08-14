@@ -1,5 +1,9 @@
 # shard-db
 
+2026.08.2 removes the storage `migrate()` method. Embedded opens now require
+clean 2026.08.1 evidence for populated roots and perform no conversion or
+automatic index rebuild; run explicit maintenance operations instead.
+
 High-performance embedded database for Node.js and Bun. Runs entirely in-process — no daemon, no TCP socket, no external dependencies.
 
 ```bash

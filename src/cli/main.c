@@ -1894,7 +1894,7 @@ static void menu_auth(void) {
     }
 }
 
-/* ---- Migrate menu ---- schema export/import for local→prod bootstrap.
+/* ---- Schema Transfer menu ---- schema export/import for local→prod bootstrap.
    No data, no tokens — just object/dir/index definitions. Roundtrip uses
    the existing db-dirs, list-objects, describe-object, and create-object
    modes; no server-side changes needed. */
@@ -1917,7 +1917,7 @@ static void cached_field_to_spec(const CachedField *fd, char *out, size_t out_sz
     }
 }
 
-static void migrate_export(CliConn *c) {
+static void schema_transfer_export(CliConn *c) {
     FormField fs[1] = {0};
     fs[0].label = "output path"; fs[0].kind = FF_TEXT;
     snprintf(fs[0].value, sizeof(fs[0].value), "schema.json");
@@ -1984,7 +1984,7 @@ static void migrate_export(CliConn *c) {
     snprintf(msg, sizeof(msg),
         "exported %d object%s across %d tenant%s to %s\n\n"
         "no data and no tokens were copied — only schema/index definitions.\n"
-        "use migrate import on the prod machine to recreate.",
+        "use Schema Transfer → Import on the prod machine to recreate.",
         total, total == 1 ? "" : "s",
         ndirs, ndirs == 1 ? "" : "s", fs[0].value);
     tui_alert("export-schema", msg);
@@ -2117,7 +2117,7 @@ static int import_walk_objects(const char *manifest, ImportCtx *ic) {
     return 0;
 }
 
-static void migrate_import(CliConn *c) {
+static void schema_transfer_import(CliConn *c) {
     FormField fs[2] = {0};
     fs[0].label = "input path"; fs[0].kind = FF_TEXT;
     snprintf(fs[0].value, sizeof(fs[0].value), "schema.json");
@@ -2164,7 +2164,7 @@ static void migrate_import(CliConn *c) {
     tui_alert("import-schema", msg);
 }
 
-static void menu_migrate(void) {
+static void menu_schema_transfer(void) {
     CliConn *c = get_conn();
     if (!c) return;
     int sel = 0;
@@ -2173,11 +2173,11 @@ static void menu_migrate(void) {
             { "export schema", "write all dir/object/index definitions to a JSON file (no data)" },
             { "import schema", "replay an exported manifest against this DB (recreate objects)" },
         };
-        int choice = tui_menu_at("Migrate", items, 2, &sel);
+        int choice = tui_menu_at("Schema Transfer", items, 2, &sel);
         if (choice < 0) return;
         switch (choice) {
-            case 0: migrate_export(c); break;
-            case 1: migrate_import(c); break;
+            case 0: schema_transfer_export(c); break;
+            case 1: schema_transfer_import(c); break;
         }
     }
 }
@@ -2847,7 +2847,7 @@ int main(int argc, char **argv) {
             { "Tenants",     "list / add / remove tenant directories" },
             { "Auth",        "tokens and trusted-IP allowlist" },
             { "Files",       "put-file / get-file / delete-file (per object)" },
-            { "Migrate",     "export/import schema to bootstrap another DB (no data)" },
+            { "Schema Transfer", "export/import schema to bootstrap another DB (no data)" },
             { "Diagnostics", "shard-stats / vacuum-check / size" },
             { "Stats",       "live counters, refreshes every 5s" },
             { "Quit",        "exit shard-cli" },
@@ -2864,7 +2864,7 @@ int main(int argc, char **argv) {
             case 6:  menu_tenants();     break;
             case 7:  menu_auth();        break;
             case 8:  menu_files();       break;
-            case 9:  menu_migrate();     break;
+            case 9:  menu_schema_transfer(); break;
             case 10: menu_diagnostics(); break;
             case 11: menu_stats();       break;
         }

@@ -87,23 +87,6 @@ typedef int (*od_value_cb)(const uint8_t *value, size_t vlen, void *ctx);
 typedef int (*od_leaf_cb)(const uint8_t *value, size_t vlen,
                           const uint8_t hash16[16], void *ctx);
 
-/* ---------------------------------------------------------------------------
- * Double-buffered seg-file walker
- * ------------------------------------------------------------------------- */
-
-/* Walk all live slots in `seg_path` end-to-end using O_DIRECT + double-
- * buffered async pre-fetch.  Calls `cb` for every live slot (flag == 1).
- * `slot_size` is the fixed per-record byte width for this object (from
- * SlotcaskDb.slot_size / Schema.slot_size).
- *
- * Returns:
- *   0    — success (all slots visited)
- *  +1    — cb returned non-zero (early stop)
- *  -errno — I/O error
- */
-int seg_scan_o_direct(const char *seg_path, int slot_size,
-                      od_record_cb cb, void *ctx);
-
 /* Variable-length variant: walks a varlen-format segment file where records
    are not at fixed stride.  Scans each record's 24-byte header to determine
    the padded record size, strides by that amount, and calls `cb` for every
@@ -115,36 +98,8 @@ int seg_scan_o_direct(const char *seg_path, int slot_size,
     0    — success
    +1    — cb returned non-zero (early stop)
    -errno — I/O error */
-int seg_scan_o_direct_varlen(const char *seg_path, size_t max_slot_size,
+int seg_scan_o_direct(const char *seg_path, size_t max_slot_size,
                               od_record_cb cb, void *ctx);
-
-/* Same as seg_scan_o_direct, but the callback receives value bytes directly
- * (the key-and-hash extraction adapter is moved into the inner loop, saving
- * one function-call frame per record).  Use this when the caller only needs
- * to inspect the value (e.g. field matching). */
-int seg_scan_o_direct_values(const char *seg_path, int slot_size,
-                              od_value_cb cb, void *ctx);
-
-/* Zero-callback variant: scans seg_path with O_DIRECT double-buffer,
- * extracts the value from each live slot, and calls match_typed() or
- * criteria_match_tree() directly — no function-pointer indirection.
- *
- * Parameters:
- *   seg_path   — path to the .dat file
- *   slot_size  — fixed per-record byte width
- *   fs         — FieldSchema for typed-field decode
- *   single_cc  — single compiled criterion (fast path, can be NULL)
- *   tree       — criteria tree (fallback when single_cc is NULL)
- *   dl         — QueryDeadline for timeout (can be NULL)
- *   out_count  — set to number of matched records on return
- *
- * Returns 0 on success, -errno on I/O error. */
-int seg_scan_o_direct_match(const char *seg_path, int slot_size,
-                             FieldSchema *fs,
-                             const CompiledCriterion *single_cc,
-                             const CriteriaNode *tree,
-                             QueryDeadline *dl,
-                             int64_t *out_count);
 
 /* ---------------------------------------------------------------------------
  * Double-buffered btree leaf-page walker

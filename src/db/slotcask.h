@@ -204,12 +204,6 @@ int  segcache_test_identity_mismatches_remaining(void);
 
 /* ============================================================ Per-stream pool */
 
-/* Format constants — stored in <data_dir>/segment_format file.
-   FIXED = original padded slots (slot_size bytes each).
-   VARIABLE = no padding; record is exactly 24 + klen + vlen bytes. */
-#define SLOTCASK_FORMAT_FIXED    0
-#define SLOTCASK_FORMAT_VARIABLE 1
-
 /* Number of size-class buckets in the per-stream free pool.
    Bucket 0: capacity < 256B
    Bucket 1: capacity < 1024B
@@ -235,7 +229,7 @@ typedef struct {
     /* Free pool — try_lock pattern; only one consumer at a time.
        Bucketed by slot capacity for variable-length format:
        bucket 0 < 256B, 1 < 1024B, 2 < 8192B, 3 = catch-all.
-       Fixed-format uses bucket 0 only (all slots same size). */
+       All segments use variable-length records. */
     pthread_mutex_t   pool_lock;
     SlotcaskFreeSlot *free_slots[SLOTCASK_POOL_BUCKETS];
     size_t            free_count[SLOTCASK_POOL_BUCKETS];
@@ -254,7 +248,6 @@ typedef struct SlotcaskDb {
     int     num_shards;
     int     num_streams;
     int     slot_size;       /* max slot size; for varlen = 24 + max_key + max_value */
-    int     format;          /* SLOTCASK_FORMAT_FIXED or SLOTCASK_FORMAT_VARIABLE */
     size_t  slots_per_shard; /* per-shard kf capacity floor; individual
                                 shards may have grown larger via auto-resplit */
 
@@ -272,12 +265,17 @@ typedef struct SlotcaskDb {
     SlotRef **seg_slot_refs;
     int      *seg_slot_caps;
 
-    /* Optional value trim callback. When non-NULL and format == SLOTCASK_FORMAT_VARIABLE,
-       called in insert_with_hooks / upsert_with_hooks to shorten vlen before writing.
-       trim_ctx is passed as the third argument. Not used by compact (which passes
-       the trim function explicitly). Not thread-safe to change after first write. */
-    SlotcaskTrimFn  trim_fn;
-    void           *trim_ctx;
+    /* Optional value trim callback. Called in insert_with_hooks / upsert_with_hooks
+       to shorten vlen before writing. Lazily published on first use by any
+       request thread (all publishers write the same (trim_fn, trim_ctx) pair
+       for a given object, so a plain double-checked-locking init is safe);
+       trim_init_lock serializes the publish, and trim_fn's atomic
+       release/acquire pair ensures trim_ctx is visible to any thread that
+       observes trim_fn != NULL. Readers must atomic-load trim_fn — never
+       read the field directly. */
+    _Atomic(SlotcaskTrimFn) trim_fn;
+    void                   *trim_ctx;
+    pthread_mutex_t         trim_init_lock;
 } SlotcaskDb;
 
 /* Test-only: write a synthetic `total` (and matching `deleted`) into a kf
@@ -308,9 +306,13 @@ int  slotcask_streams_for_nproc(void);
 
 /* Open (or create) an object's slotcask state. data_dir is the per-object root
    (e.g., $DB_ROOT/<dir>/<obj>). num_shards must be a power of 2 in
-   [1, SLOTCASK_MAX_SHARDS]. slot_size is the fixed per-record byte width
-   (header + max key + max value, rounded to 8). Performs crash recovery
+   [1, SLOTCASK_MAX_SHARDS]. slot_size is the schema-derived maximum record
+   width (header + max key + max value, rounded to 8). Performs crash recovery
    if `.dirty` marker is present. */
+/* Read-only validation of every stream directory and segment filename.
+   Does not create, recover, select, truncate, or open a segment for write. */
+int  slotcask_validate_segment_files(const char *data_dir, int num_streams);
+
 int  slotcask_open(SlotcaskDb *db, const char *data_dir,
                    int num_shards, int num_streams, int slot_size);
 void slotcask_close(SlotcaskDb *db);
@@ -322,19 +324,6 @@ void slotcask_close(SlotcaskDb *db);
    objlock_wrlock for the object. *out_dropped (optional) receives the total
    number of seg files unlinked across all streams. Returns 0 on success. */
 int  slotcask_compact_segs(SlotcaskDb *db, int *out_dropped);
-
-/* Migrate an object's segment files from fixed-size to variable-length format.
-   Daemon must be stopped. Uses atomic rename: writes to streams.new/ + kf.new/,
-   renames atomically, writes segment_format file, cleans up old dirs.
-   Returns 0 on success. */
-int  slotcask_migrate_to_varlen(SlotcaskDb *db);
-
-/* Repack a VARIABLE-format object in-place, applying trim_fn to shorten each
-   value. Writes compacted records to a fresh file-ID range, repoints KF entries,
-   then deletes the old segment files. Idempotent across two calls (alternates
-   between MIGRATE_STREAM_BASE and COMPACT_STREAM_BASE ranges). Returns 0 on
-   success, -1 on error (object state is consistent on any partial failure). */
-int slotcask_compact(SlotcaskDb *db, SlotcaskTrimFn trim_fn, void *trim_ctx);
 
 /* Returns the pool bucket index (0-3) for a slot of given capacity.
    max_slot_size is db->slot_size (the object's schema max). */
@@ -873,7 +862,6 @@ typedef struct {
     int splits;            /* num_shards for the keyfile */
     int slot_size;         /* max per-record byte width (slot_size for fixed, max for variable) */
     int streams;           /* persisted at create time, hardcoded by nproc */
-    int format;            /* SLOTCASK_FORMAT_FIXED or SLOTCASK_FORMAT_VARIABLE */
 } SlotcaskSchemaInfo;
 
 SlotcaskDb *slotcask_registry_get(const char *effective_root,

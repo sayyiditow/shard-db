@@ -57,8 +57,6 @@ static void compact_child_main(const char *data_dir, const char *phase) {
     memset(&db, 0, sizeof(db));
     int rc = slotcask_open(&db, data_dir, 8, 1, 8192);
     if (rc != 0) _exit(10);
-    rc = slotcask_migrate_to_varlen(&db);
-    if (rc != 0) { slotcask_close(&db); _exit(11); }
     rc = varlen_compact_fixture_build(&db);
     if (rc != 0) { slotcask_close(&db); _exit(12); }
 

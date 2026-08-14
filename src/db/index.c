@@ -3537,7 +3537,7 @@ typedef struct { uint8_t sid; uint32_t fid; } SegRef;
 
 typedef struct {
     const char        *db_root, *object, *data_dir;
-    int                splits, idx_n, slot_size, format, worker_idx;
+    int                splits, idx_n, slot_size, worker_idx;
     TypedSchema       *ts;
     int                n_fields;
     const MFFieldDesc *descs;     /* all fields (btree/trigram/bitmap) */
@@ -3567,21 +3567,6 @@ static int reindex_seg_cb(const uint8_t *rec, size_t vlen,
                            const uint8_t hash16[16], void *ctx) {
     SegScanWorker *w = (SegScanWorker *)ctx;
     uint16_t klen = (uint16_t)rec[16] | ((uint16_t)rec[17] << 8);
-    /* FIXED-format records are exactly w->slot_size bytes; a corrupted
-       on-disk klen that would push the value pointer past the record's
-       actual bounds must be rejected before the pointer arithmetic below
-       (CID 1696451). VARLEN-format records already have klen validated by
-       the caller (seg_scan_o_direct_varlen) before this callback runs. */
-    if (w->format != SLOTCASK_FORMAT_VARIABLE &&
-        (size_t)24 + klen > (size_t)w->slot_size) {
-        LOG_ERROR(LOG_SUB_REINDEX,
-                  "REINDEX %s/%s: corrupt segment record (klen=%u exceeds "
-                  "slot_size=%d, worker=%d)",
-                  w->db_root, w->object, (unsigned)klen, w->slot_size,
-                  w->worker_idx);
-        w->had_error = 1;
-        return 0;
-    }
     const uint8_t *value = rec + 24 + klen;
     /* Compact VARIABLE records may be shorter than ts->total_size (trailing
        zero fields trimmed). Pad to total_size so field access at tf->offset
@@ -3649,11 +3634,8 @@ static void *seg_scan_worker(void *arg) {
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/data/streams/%03d/%06u.dat",
                  w->data_dir, (int)sr->sid, (unsigned)sr->fid);
-        int rc;
-        if (w->format == SLOTCASK_FORMAT_VARIABLE)
-            rc = seg_scan_o_direct_varlen(path, (size_t)w->slot_size, reindex_seg_cb, w);
-        else
-            rc = seg_scan_o_direct(path, (int)w->slot_size, reindex_seg_cb, w);
+        int rc = seg_scan_o_direct(path, (size_t)w->slot_size,
+                                          reindex_seg_cb, w);
         if (rc < 0) {
             LOG_ERROR(LOG_SUB_REINDEX,
                       "REINDEX %s/%s: segment scan failed for %s (rc=%d %s)",
@@ -4017,7 +3999,6 @@ static index_build_result seg_seq_build_spills(const char *db_root, const char *
         workers[w].splits     = sch->splits;
         workers[w].idx_n      = idx_n;
         workers[w].slot_size  = sch->slot_size;
-        workers[w].format     = sdb->format;
         workers[w].worker_idx = w;
         workers[w].ts         = ts;
         workers[w].n_fields   = n_fields;
@@ -4029,7 +4010,7 @@ static index_build_result seg_seq_build_spills(const char *db_root, const char *
         workers[w].fields = calloc((size_t)n_fields, sizeof(MFWorkerField));
         workers[w].bm_writers = calloc((size_t)n_fields, sizeof(SpillWriter));
         if (!workers[w].fields || !workers[w].bm_writers) { alloc_ok = 0; break; }
-        if (sdb->format == SLOTCASK_FORMAT_VARIABLE && ts->total_size > 0) {
+        if (ts->total_size > 0) {
             workers[w].padded_value = calloc(1, (size_t)ts->total_size);
             if (!workers[w].padded_value) { alloc_ok = 0; break; }
         }

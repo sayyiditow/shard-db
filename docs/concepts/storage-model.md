@@ -1,5 +1,13 @@
 # Storage model
 
+## Current segment contract (2026.08.2)
+
+All newly created objects use VARIABLE-length segment records directly. A
+fresh stream may begin at `000000.dat`; a file beginning at `048000.dat` is
+also valid legacy output from the 2026.08.1 conversion. Filename ranges are
+not format markers, and 2026.08.2 does not rename or convert segments at
+startup.
+
 shard-db's storage engine is **slotcask** — a bitcask-style key/value layout where keys and values live in separate files. Slotcask has been the default for new objects since 2026.05.1 and is the only supported engine as of 2026.05.5; the legacy probe-into-slot engine (historically "v1") was removed in that release. Operators upgrading from a pre-2026.05.5 install with v1 objects on disk must first run 2026.05.4's `./migrate` to convert them.
 
 For the full on-disk tree, see [Configuration → Storage layout](../getting-started/configuration.md#storage-layout). This page walks through what actually happens when you insert, read, or delete a record.
