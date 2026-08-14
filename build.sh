@@ -263,6 +263,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_slotcask_v2_parity.c \
     src/test/cases/test_slotcask_v2_schema.c \
     src/test/cases/test_slotcask_v2_crash.c \
+    src/test/cases/test_slotcask_active_recovery_resync.c \
     src/test/cases/test_slotcask_v2_concurrent.c \
     src/test/cases/test_varlen_pool_donation_stride.c \
     src/test/cases/test_v2_index_leak_on_clear.c \
