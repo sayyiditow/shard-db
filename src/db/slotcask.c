@@ -2190,6 +2190,7 @@ typedef struct {
     SlotcaskDb *db;
     int         shard_id;
     int         ok;          /* 1 = success, 0 = open failed (any error) */
+    int         error;       /* worker-local errno propagated to opener */
     int         needs_pool;  /* 1 if hdr->deleted > 0 (pool-rebuild required) */
 } SlotcaskOpenArg;
 
@@ -2203,6 +2204,7 @@ static void *slotcask_open_kf_worker(void *raw) {
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, a->db->slots_per_shard, 1) != 0) {
         a->ok = 0;
+        a->error = errno ? errno : EIO;
         a->needs_pool = 0;
         return NULL;
     }
@@ -3693,15 +3695,6 @@ static int pool_push_free_cap(SlotcaskStream *p, uint16_t file_id,
     return 0;
 }
 
-/* Conservative fallback for rollback paths that do not retain the encoded
-   record length. A max-capacity bucket remains safe; normal tombstone and
-   recovery paths preserve the exact record capacity. */
-static int pool_push_free(SlotcaskStream *p, uint16_t file_id,
-                           uint32_t offset, int max_slot_size) {
-    return pool_push_free_cap(p, file_id, offset,
-                              (uint32_t)max_slot_size, max_slot_size);
-}
-
 /* Pop one slot that can fit needed_size bytes. Tries smallest fitting bucket
    first, then larger buckets. Returns 0 and fills *out on success. Returns 1
    if trylock contested, 2 if no fitting slot available. */
@@ -4360,6 +4353,7 @@ typedef struct {
     SlotcaskDb *db;
     int         sid;
     int         rc;  /* 0 = success, -1 = error */
+    int         error;
 } RecoverStreamArg;
 
 /* Walk every segment for a single stream, populate the in-memory free-slot
@@ -4469,6 +4463,7 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
 static void *recover_stream_worker(void *raw) {
     RecoverStreamArg *a = (RecoverStreamArg *)raw;
     a->rc = recover_one_stream(a->db, a->sid);
+    if (a->rc != 0) a->error = errno ? errno : EIO;
     return NULL;
 }
 
@@ -4493,7 +4488,11 @@ static int recover_streams(SlotcaskDb *db) {
     }
     parallel_for_io(recover_stream_worker, args, db->num_streams, sizeof(RecoverStreamArg));
     for (int i = 0; i < db->num_streams; i++) {
-        if (args[i].rc != 0) { free(args); return -1; }
+        if (args[i].rc != 0) {
+            errno = args[i].error ? args[i].error : EIO;
+            free(args);
+            return -1;
+        }
     }
     free(args);
     return 0;
@@ -4550,7 +4549,11 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
     parallel_for_io(slotcask_open_kf_worker, open_args, num_shards,
                      sizeof(SlotcaskOpenArg));
     for (int i = 0; i < num_shards; i++) {
-        if (!open_args[i].ok) { free(open_args); goto fail; }
+        if (!open_args[i].ok) {
+            errno = open_args[i].error ? open_args[i].error : EIO;
+            free(open_args);
+            goto fail;
+        }
     }
 
     /* Populate per-shard kf slot refs so the hot read path can skip the
@@ -4656,7 +4659,18 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
     return 0;
 
 fail:
+    if (errno == 0) errno = EIO;
     pthread_mutex_destroy(&db->trim_init_lock);
+    /* slotcask_registry_get frees the outer SlotcaskDb after this return.
+       Release every auxiliary allocation made before a failed open too;
+       otherwise a deliberately refused reopen leaks its shard/segment
+       reference arrays on each request. */
+    free(db->kf_slot_refs);
+    db->kf_slot_refs = NULL;
+    free(db->seg_slot_refs);
+    db->seg_slot_refs = NULL;
+    free(db->seg_slot_caps);
+    db->seg_slot_caps = NULL;
     if (db->streams) {
         for (int i = 0; i < num_streams; i++) {
             pthread_mutex_destroy(&db->streams[i].rotation_lock);
@@ -6377,8 +6391,9 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                             if (prc != 0) {
                                 seg_write_flag(db, st[j].target_stream, st[j].target_fid,
                                                st[j].target_off, 2);
-                                pool_push_free(&db->streams[st[j].target_stream],
-                                               st[j].target_fid, st[j].target_off, db->slot_size);
+                                pool_push_free_cap(&db->streams[st[j].target_stream],
+                                                   st[j].target_fid, st[j].target_off,
+                                                   r->slot_capacity, db->slot_size);
                                 r->status = -1;
                                 st[j].needs_write = 0;
                                 continue;
@@ -6408,8 +6423,9 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                         if (recs[j].status != 0) {
                             seg_write_flag(db, st[j].target_stream, st[j].target_fid,
                                            st[j].target_off, 2);
-                            pool_push_free(&db->streams[st[j].target_stream],
-                                           st[j].target_fid, st[j].target_off, db->slot_size);
+                            pool_push_free_cap(&db->streams[st[j].target_stream],
+                                               st[j].target_fid, st[j].target_off,
+                                               recs[j].slot_capacity, db->slot_size);
                             st[j].needs_write = 0;
                             st[j].has_plan = 0;
                             continue;
@@ -6427,8 +6443,9 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                             size_t j = survive[a];
                             seg_write_flag(db, st[j].target_stream, st[j].target_fid,
                                            st[j].target_off, 2);
-                            pool_push_free(&db->streams[st[j].target_stream],
-                                           st[j].target_fid, st[j].target_off, db->slot_size);
+                            pool_push_free_cap(&db->streams[st[j].target_stream],
+                                               st[j].target_fid, st[j].target_off,
+                                               recs[j].slot_capacity, db->slot_size);
                             recs[j].status = -1;
                             st[j].needs_write = 0;
                             st[j].has_plan = 0;
@@ -6505,8 +6522,9 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                                           "could not durably discard partial bulk marker");
                                 seg_write_flag(db, st[j].target_stream, st[j].target_fid,
                                                 st[j].target_off, 2);
-                                pool_push_free(&db->streams[st[j].target_stream],
-                                                st[j].target_fid, st[j].target_off, db->slot_size);
+                                pool_push_free_cap(&db->streams[st[j].target_stream],
+                                                   st[j].target_fid, st[j].target_off,
+                                                   r->slot_capacity, db->slot_size);
                                 r->status = -1;
                                 vi++;
                                 continue;
@@ -6531,8 +6549,9 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                             if (recs[j].status == 0) {
                                 seg_write_flag(db, st[j].target_stream, st[j].target_fid,
                                                 st[j].target_off, 2);
-                                pool_push_free(&db->streams[st[j].target_stream],
-                                                st[j].target_fid, st[j].target_off, db->slot_size);
+                                pool_push_free_cap(&db->streams[st[j].target_stream],
+                                                   st[j].target_fid, st[j].target_off,
+                                                   recs[j].slot_capacity, db->slot_size);
                                 recs[j].status = -1;
                             }
                         }
@@ -6584,10 +6603,11 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                 seg_write_flag(db, st[j].target_stream,
                                                st[j].target_fid,
                                                st[j].target_off, 2);
-                                pool_push_free(&db->streams[st[j].target_stream],
-                                               st[j].target_fid,
-                                               st[j].target_off,
-                                               db->slot_size);
+                                pool_push_free_cap(&db->streams[st[j].target_stream],
+                                                   st[j].target_fid,
+                                                   st[j].target_off,
+                                                   recs[j].slot_capacity,
+                                                   db->slot_size);
                                 recs[j].status = -1;
                             }
                         }
@@ -6713,8 +6733,9 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                                           "could not durably discard partial bulk marker");
                                 seg_write_flag(db, st[j].target_stream, st[j].target_fid,
                                                 st[j].target_off, 2);
-                                pool_push_free(&db->streams[st[j].target_stream],
-                                                st[j].target_fid, st[j].target_off, db->slot_size);
+                                pool_push_free_cap(&db->streams[st[j].target_stream],
+                                                   st[j].target_fid, st[j].target_off,
+                                                   r->slot_capacity, db->slot_size);
                                 r->status = -1;
                                 vi++;
                                 continue;
@@ -6731,8 +6752,9 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                             if (recs[j].status == 0 && st[j].needs_write) {
                                 seg_write_flag(db, st[j].target_stream, st[j].target_fid,
                                                 st[j].target_off, 2);
-                                pool_push_free(&db->streams[st[j].target_stream],
-                                                st[j].target_fid, st[j].target_off, db->slot_size);
+                                pool_push_free_cap(&db->streams[st[j].target_stream],
+                                                   st[j].target_fid, st[j].target_off,
+                                                   recs[j].slot_capacity, db->slot_size);
                                 recs[j].status = -1;
                             }
                         }
@@ -6861,8 +6883,9 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 if (kf_rc != 0) {
                     seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                     st[i].target_off, 2);
-                    pool_push_free(&db->streams[st[i].target_stream],
-                                    st[i].target_fid, st[i].target_off, db->slot_size);
+                    pool_push_free_cap(&db->streams[st[i].target_stream],
+                                       st[i].target_fid, st[i].target_off,
+                                       r->slot_capacity, db->slot_size);
                     r->status = -1;
                     continue;
                 }
@@ -6884,8 +6907,9 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                     }
                     seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                     st[i].target_off, 2);
-                    pool_push_free(&db->streams[st[i].target_stream],
-                                    st[i].target_fid, st[i].target_off, db->slot_size);
+                    pool_push_free_cap(&db->streams[st[i].target_stream],
+                                       st[i].target_fid, st[i].target_off,
+                                       r->slot_capacity, db->slot_size);
                     r->status = -1;
                     continue;
                 }
@@ -6902,8 +6926,9 @@ static int bulk_upsert_slow_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             if (kf_rc != 0) {
                 seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                 st[i].target_off, 2);
-                pool_push_free(&db->streams[st[i].target_stream],
-                                st[i].target_fid, st[i].target_off, db->slot_size);
+                pool_push_free_cap(&db->streams[st[i].target_stream],
+                                   st[i].target_fid, st[i].target_off,
+                                   r->slot_capacity, db->slot_size);
                 r->status = -1;
                 continue;
             }
@@ -6999,8 +7024,9 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                     kf_tombstone_at_slot(&kh, put_slot);
                     seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                     st[i].target_off, 2);
-                    pool_push_free(&db->streams[st[i].target_stream],
-                                    st[i].target_fid, st[i].target_off, db->slot_size);
+                    pool_push_free_cap(&db->streams[st[i].target_stream],
+                                       st[i].target_fid, st[i].target_off,
+                                       r->slot_capacity, db->slot_size);
                     r->status = -1;
                 }
             }
@@ -7016,8 +7042,9 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             if (opts->if_not_exists || r->if_not_exists) {
                 seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                 st[i].target_off, 2);
-                pool_push_free(&db->streams[st[i].target_stream],
-                                st[i].target_fid, st[i].target_off, db->slot_size);
+                pool_push_free_cap(&db->streams[st[i].target_stream],
+                                   st[i].target_fid, st[i].target_off,
+                                   r->slot_capacity, db->slot_size);
                 r->status = -2;
                 r->was_update = 1;
                 continue;
@@ -7032,8 +7059,9 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                      &ex_off, &ex_slot) != 0) {
                 seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                 st[i].target_off, 2);
-                pool_push_free(&db->streams[st[i].target_stream],
-                                st[i].target_fid, st[i].target_off, db->slot_size);
+                pool_push_free_cap(&db->streams[st[i].target_stream],
+                                   st[i].target_fid, st[i].target_off,
+                                   r->slot_capacity, db->slot_size);
                 r->status = -1;
                 continue;
             }
@@ -7043,8 +7071,9 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                    &old_buf, &old_vlen) != 0) {
                 seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                 st[i].target_off, 2);
-                pool_push_free(&db->streams[st[i].target_stream],
-                                st[i].target_fid, st[i].target_off, db->slot_size);
+                pool_push_free_cap(&db->streams[st[i].target_stream],
+                                   st[i].target_fid, st[i].target_off,
+                                   r->slot_capacity, db->slot_size);
                 r->status = -1;
                 continue;
             }
@@ -7059,8 +7088,9 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                 if (rc != 0) {
                     seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                                     st[i].target_off, 2);
-                    pool_push_free(&db->streams[st[i].target_stream],
-                                    st[i].target_fid, st[i].target_off, db->slot_size);
+                    pool_push_free_cap(&db->streams[st[i].target_stream],
+                                       st[i].target_fid, st[i].target_off,
+                                       r->slot_capacity, db->slot_size);
                     free(old_buf);
                     r->status = -1;
                     continue;
@@ -7080,8 +7110,9 @@ static int bulk_upsert_fast_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         /* Other kf error. */
         seg_write_flag(db, st[i].target_stream, st[i].target_fid,
                         st[i].target_off, 2);
-        pool_push_free(&db->streams[st[i].target_stream],
-                        st[i].target_fid, st[i].target_off, db->slot_size);
+        pool_push_free_cap(&db->streams[st[i].target_stream],
+                           st[i].target_fid, st[i].target_off,
+                           r->slot_capacity, db->slot_size);
         r->status = -1;
     }
 
@@ -7497,8 +7528,12 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
             }
             for (int j = k; j < run_end; j++) {
                 int i = tomb_idx[j];
+                uint16_t klen = seg_rec_klen(h.map + st[i].old_off);
+                uint32_t vlen = seg_rec_vlen(h.map + st[i].old_off);
+                uint32_t cap = (uint32_t)slotcask_record_size_varlen(klen, vlen);
                 __atomic_store_n(&h.map[st[i].old_off + 18], 2, __ATOMIC_RELEASE);
-                pool_push_free(&db->streams[sid], st[i].old_fid, st[i].old_off, db->slot_size);
+                pool_push_free_cap(&db->streams[sid], st[i].old_fid,
+                                   st[i].old_off, cap, db->slot_size);
             }
             SegCacheEntry *e = &g_segcache[h.slot];
             durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
@@ -7510,12 +7545,10 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         /* OOM: fall back to per-record tombstone via the existing helper. */
         for (size_t i = 0; i < n; i++) {
             if (!st[i].committed) continue;
-            if (seg_write_flag(db, st[i].old_sid, st[i].old_fid,
-                               st[i].old_off, 2) != 0) {
+            if (slotcask_tombstone_and_push_back(db, st[i].old_sid,
+                                                 st[i].old_fid,
+                                                 st[i].old_off) != 0) {
                 recs[i].status = -1;
-            } else {
-                pool_push_free(&db->streams[st[i].old_sid],
-                               st[i].old_fid, st[i].old_off, db->slot_size);
             }
         }
     }
@@ -8130,9 +8163,15 @@ SlotcaskDb *slotcask_registry_get(const char *effective_root,
         snprintf(data_dir, sizeof(data_dir), "%s/%s", effective_root, object);
 
         SlotcaskDb *db = calloc(1, sizeof(SlotcaskDb));
-        int open_rc = db ? slotcask_open(db, data_dir, info->splits,
-                                          info->streams, info->slot_size)
-                          : -1;
+        int open_rc;
+        if (db) {
+            open_rc = slotcask_open(db, data_dir, info->splits,
+                                    info->streams, info->slot_size);
+        } else {
+            errno = ENOMEM;
+            open_rc = -1;
+        }
+        int open_errno = errno;
 
         pthread_mutex_lock(&g_reg_lock);
         if (open_rc != 0 || !db) {
@@ -8141,8 +8180,9 @@ SlotcaskDb *slotcask_registry_get(const char *effective_root,
             g_reg[reserved].key[0] = '\0';
             pthread_cond_broadcast(&g_reg_cond);
             pthread_mutex_unlock(&g_reg_lock);
-            fprintf(stderr, "slotcask_registry: open failed for %s/%s\n",
-                    effective_root, object);
+            fprintf(stderr, "slotcask_registry: open failed for %s/%s: %s\n",
+                    effective_root, object, strerror(open_errno));
+            errno = open_errno;
             return NULL;
         }
         g_reg[reserved].db = db;

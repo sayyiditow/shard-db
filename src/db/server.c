@@ -2142,7 +2142,12 @@ WorkQueue g_work_queue;
 void handle_shutdown(int sig) {
     (void)sig;
     server_running = 0;
-    g_scan_stop = 1;  /* abort any in-flight shard scans, vacuum, index builds */
+    /* A process-directed SIGTERM may run on an idle worker, whose thread-
+       local g_db has never been bound. The daemon instance is process-wide,
+       so use it directly rather than the g_scan_stop TLS convenience macro. */
+    if (g_shard_db_instance)
+        atomic_store_explicit(&g_shard_db_instance->scan_stop, 1,
+                              memory_order_relaxed);
     /* Wake all waiting workers */
     pthread_cond_broadcast(&g_work_queue.not_empty);
     pthread_cond_broadcast(&g_work_queue.not_full);

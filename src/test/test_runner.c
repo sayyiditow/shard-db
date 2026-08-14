@@ -303,16 +303,34 @@ static int run_all_parallel(TestCaseEntry **cases, int n, int jobs) {
 
     int next = 0, active = 0, total_passed = 0, total_failed = 0;
     while (next < n || active > 0) {
-        for (int i = 0; i < jobs && next < n; i++) {
-            if (slots[i].pid != 0) continue;
-            if (start_case(&slots[i], cases[next]) == 0) {
-                active++;
-            } else {
-                fprintf(stderr, "# %s: runner failed to start worker: %s\n",
-                        cases[next]->name, strerror(errno));
-                total_failed++;
+        int exclusive_active = 0;
+        for (int i = 0; i < jobs; i++) {
+            if (slots[i].pid > 0 && slots[i].tc->exclusive) {
+                exclusive_active = 1;
+                break;
             }
-            next++;
+        }
+
+        /* Preserve registry order around an exclusive case: drain ordinary
+           workers before it starts, then leave every other slot idle until
+           it completes. This is a scheduling property, not a name-based
+           exception, so future high-contention cases can opt in explicitly. */
+        if (!exclusive_active && next < n &&
+            (!cases[next]->exclusive || active == 0)) {
+            for (int i = 0; i < jobs && next < n; i++) {
+                if (slots[i].pid != 0) continue;
+                if (cases[next]->exclusive && active > 0) break;
+                if (start_case(&slots[i], cases[next]) == 0) {
+                    active++;
+                } else {
+                    fprintf(stderr, "# %s: runner failed to start worker: %s\n",
+                            cases[next]->name, strerror(errno));
+                    total_failed++;
+                }
+                int started_exclusive = cases[next]->exclusive;
+                next++;
+                if (started_exclusive) break;
+            }
         }
 
         int progressed = 0;
