@@ -1380,6 +1380,21 @@ void slotcask_test_after_old(int under_kf_wrlock) {
 }
 #endif
 
+#ifdef TEST_BUILD
+static _Atomic size_t g_slotcask_test_seg_max_bytes = 0;
+
+size_t slotcask_seg_max_bytes(void) {
+    size_t bytes = atomic_load_explicit(&g_slotcask_test_seg_max_bytes,
+                                        memory_order_acquire);
+    return bytes ? bytes : SLOTCASK_SEG_MAX_BYTES;
+}
+
+void slotcask_test_set_seg_max_bytes(size_t bytes) {
+    atomic_store_explicit(&g_slotcask_test_seg_max_bytes, bytes,
+                          memory_order_release);
+}
+#endif
+
 void segcache_init(int cap) {
     if (g_segcache) return;
     if (cap < 16) cap = 16;
@@ -1501,7 +1516,7 @@ static int segcache_drop_slot(int slot, CacheDropReason reason, int wait) {
     return 1;
 }
 
-/* Open + ftruncate to SLOTCASK_SEG_MAX_BYTES (sparse) + mmap MAP_SHARED. */
+/* Open + ftruncate to slotcask_seg_max_bytes() (sparse) + mmap MAP_SHARED. */
 static int seg_open_file(const char *path, int create,
                          int *out_fd, uint8_t **out_map, size_t *out_size,
                          dev_t *out_dev, ino_t *out_ino) {
@@ -1517,25 +1532,26 @@ static int seg_open_file(const char *path, int create,
     }
     if (fd < 0) return -1;
 
+    size_t seg_max = slotcask_seg_max_bytes();
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return -1; }
-    if ((size_t)st.st_size < SLOTCASK_SEG_MAX_BYTES) {
+    if ((size_t)st.st_size < seg_max) {
         if (!create) { close(fd); return -1; }
-        if (ftruncate(fd, (off_t)SLOTCASK_SEG_MAX_BYTES) < 0) {
+        if (ftruncate(fd, (off_t)seg_max) < 0) {
             close(fd); return -1;
         }
     }
-    void *m = mmap(NULL, SLOTCASK_SEG_MAX_BYTES, PROT_READ | PROT_WRITE,
+    void *m = mmap(NULL, seg_max, PROT_READ | PROT_WRITE,
                    MAP_SHARED, fd, 0);
     if (m == MAP_FAILED) { close(fd); return -1; }
     /* Transparent huge pages hint — segments are 128 MB sparse files
        walked sequentially during scans and randomly during point reads.
        2 MB hugepages (vs 4 KB) cut TLB entries by 500× over the
        working set. Kernel ignores if THP is off; no functional impact. */
-    SHARD_MADV_HUGEPAGE(m, SLOTCASK_SEG_MAX_BYTES);
+    SHARD_MADV_HUGEPAGE(m, seg_max);
     *out_fd = fd;
     *out_map = (uint8_t *)m;
-    *out_size = SLOTCASK_SEG_MAX_BYTES;
+    *out_size = seg_max;
     *out_dev = st.st_dev;
     *out_ino = st.st_ino;
     return 0;
@@ -3724,10 +3740,11 @@ static int append_reserve_single_varlen(SlotcaskDb *db, SlotcaskStream *p,
                                          uint32_t *file_id_out,
                                          uint32_t *offset_out) {
     (void)db;
-    if (!file_id_out || !offset_out || rec_size > SLOTCASK_SEG_MAX_BYTES)
+    size_t seg_max = slotcask_seg_max_bytes();
+    if (!file_id_out || !offset_out || rec_size > seg_max)
         return -1;
     pthread_mutex_lock(&p->rotation_lock);
-    if (p->reserve_off > SLOTCASK_SEG_MAX_BYTES - rec_size) {
+    if (p->reserve_off > seg_max - rec_size) {
         if (p->active_file_id >= UINT16_MAX) {
             pthread_mutex_unlock(&p->rotation_lock);
             errno = EFBIG;

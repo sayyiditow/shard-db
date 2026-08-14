@@ -202,6 +202,14 @@ void segcache_test_force_identity_mismatches(int count);
 int  segcache_test_identity_mismatches_remaining(void);
 #endif
 
+/* Test-only override for the segment rotation/allocation threshold. */
+#ifdef TEST_BUILD
+size_t slotcask_seg_max_bytes(void);
+void slotcask_test_set_seg_max_bytes(size_t bytes);
+#else
+#define slotcask_seg_max_bytes() SLOTCASK_SEG_MAX_BYTES
+#endif
+
 /* ============================================================ Per-stream pool */
 
 /* Number of size-class buckets in the per-stream free pool.

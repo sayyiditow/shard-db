@@ -14,6 +14,7 @@ static int test_varlen_compact_donor_resync_run(void) {
     mkdir(tmpdir, 0755);
 
     slotcask_init(64, 64);
+    slotcask_test_set_seg_max_bytes(VARLEN_FIXTURE_TEST_SEG_BYTES);
 
     SlotcaskDb db;
     memset(&db, 0, sizeof(db));
@@ -38,6 +39,7 @@ static int test_varlen_compact_donor_resync_run(void) {
     }
 
     slotcask_close(&db);
+    slotcask_test_set_seg_max_bytes(0);
     slotcask_shutdown();
 
     char rmcmd[512];

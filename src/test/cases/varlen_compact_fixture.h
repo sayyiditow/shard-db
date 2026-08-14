@@ -7,6 +7,7 @@
 #include <string.h>
 
 #define VARLEN_FIXTURE_VALUE_LEN 8000u
+#define VARLEN_FIXTURE_TEST_SEG_BYTES (512u * 1024u)
 
 /* Build three files on stream 0:
  *   file 0: A and C live, all filler tombstoned (donor with a reuse gap)
@@ -32,7 +33,7 @@ static int varlen_compact_fixture_build(SlotcaskDb *db) {
     uint32_t base_file_id = db->streams[0].active_file_id;
 
     size_t rec_size = (24u + 10u + VARLEN_FIXTURE_VALUE_LEN + 7u) & ~7u;
-    size_t key_cap = (size_t)(SLOTCASK_SEG_MAX_BYTES / rec_size) + 4u;
+    size_t key_cap = (size_t)(slotcask_seg_max_bytes() / rec_size) + 4u;
     char (*file0_keys)[32] = calloc(key_cap, sizeof(*file0_keys));
     if (!file0_keys) return -1;
 

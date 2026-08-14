@@ -184,10 +184,16 @@ static int run_crash_test(const char *phase) {
         return 1;
     }
 
+    slotcask_test_set_seg_max_bytes(VARLEN_FIXTURE_TEST_SEG_BYTES);
+
     /* Phase 1: build fixture, trigger compaction with pause, SIGKILL. */
     pid_t pid = fork();
     ASSERT_TRUE(pid >= 0, "fork");
-    if (pid < 0) { rmdir(tmpdir); return 1; }
+    if (pid < 0) {
+        slotcask_test_set_seg_max_bytes(0);
+        rmdir(tmpdir);
+        return 1;
+    }
 
     if (pid == 0) {
         compact_child_main(tmpdir, phase);
@@ -210,6 +216,7 @@ static int run_crash_test(const char *phase) {
         snprintf(cmd, sizeof(cmd), "rm -rf %s", tmpdir);
         system(cmd);
         TAP_DIAG("# phase %s: marker not reached (child rc=%d)\n", phase, child_rc);
+        slotcask_test_set_seg_max_bytes(0);
         return 1;
     }
 
@@ -225,7 +232,12 @@ static int run_crash_test(const char *phase) {
     memset(&db, 0, sizeof(db));
     int rc = slotcask_open(&db, tmpdir, 8, 1, 8192);
     ASSERT_EQ_INT(rc, 0, "reopen database after simulated crash");
-    if (rc != 0) { slotcask_shutdown(); rmdir(tmpdir); return 1; }
+    if (rc != 0) {
+        slotcask_test_set_seg_max_bytes(0);
+        slotcask_shutdown();
+        rmdir(tmpdir);
+        return 1;
+    }
 
     /* Verify A survived (key from fixture). */
     void *val = NULL;
@@ -277,6 +289,7 @@ static int run_crash_test(const char *phase) {
     verify_fixture_live_records(&db, baseline_live);
 
     slotcask_close(&db);
+    slotcask_test_set_seg_max_bytes(0);
     slotcask_shutdown();
 
     char cmd[512];

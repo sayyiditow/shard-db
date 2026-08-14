@@ -99,6 +99,53 @@ paths, so per `AGENTS.md`'s standing exception it must be validated locally
 under both `BUILD_MODE=asan` and `BUILD_MODE=tsan` before being called
 done, even though the new override itself is TEST_BUILD-gated.
 
+## 2026-08-14 amendment: VARIABLE-only implementation
+
+PR #297 removed the fixed-length `append_reserve_n()` path and changed
+`slotcask_compact_segs()` to reuse free capacity in existing recipient
+segments rather than allocate destination segments. The original Task 2b and
+2c anchors predate that refactor and are superseded by this amendment.
+
+The current executable inventory is seven runtime uses of
+`SLOTCASK_SEG_MAX_BYTES` in `src/db/slotcask.c`: five in `seg_open_file()`
+and two in `append_reserve_single_varlen()`. Route all seven through
+`slotcask_seg_max_bytes()`. `slotcask_compact_segs()` has no independent
+maximum-size allocation or rotation decision; it operates on the segment
+maps created by those two paths, so it needs no edit for the override.
+
+Replace the current VARIABLE-only reservation function exactly with:
+
+```c
+static int append_reserve_single_varlen(SlotcaskDb *db, SlotcaskStream *p,
+                                         size_t rec_size,
+                                         uint32_t *file_id_out,
+                                         uint32_t *offset_out) {
+    (void)db;
+    size_t seg_max = slotcask_seg_max_bytes();
+    if (!file_id_out || !offset_out || rec_size > seg_max)
+        return -1;
+    pthread_mutex_lock(&p->rotation_lock);
+    if (p->reserve_off > seg_max - rec_size) {
+        if (p->active_file_id >= UINT16_MAX) {
+            pthread_mutex_unlock(&p->rotation_lock);
+            errno = EFBIG;
+            return -1;
+        }
+        p->active_file_id++;
+        p->reserve_off = 0;
+    }
+    *file_id_out = p->active_file_id;
+    *offset_out = (uint32_t)(p->reserve_off);
+    p->reserve_off += rec_size;
+    pthread_mutex_unlock(&p->rotation_lock);
+    return 0;
+}
+```
+
+For Task 2 verification, `grep -n SLOTCASK_SEG_MAX_BYTES src/db/slotcask.c`
+must show comments only; no runtime code use remains. The definition in the
+header remains the production fallback.
+
 ## Task 1 — Add the test-only segment-size override
 
 **File:** `src/db/slotcask.h`
