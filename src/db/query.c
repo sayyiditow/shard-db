@@ -1604,6 +1604,13 @@ static int idx_find_streaming(const char *db_root, const char *object,
    the planner didn't cover.
 */
 
+static void format_query_wire_key(const FieldSchema *fs, const uint8_t *key,
+                                  size_t klen, char out[1100]) {
+    const Schema *sc = (fs && fs->auto_key != AK_NONE)
+                     ? &fs->auto_key_schema_snapshot : NULL;
+    format_wire_key(sc, (const char *)key, klen, out, 1100);
+}
+
 typedef struct {
     const char    *db_root;
     const char    *object;
@@ -1687,9 +1694,8 @@ static int composite_prefix_cb(const char *val, size_t vlen,
     /* Excluded-keys check: the key is a string in ExcludedKeys.
        is_excluded() takes a char* key so build it from the fetched record. */
     if (c->excluded && c->excluded->count > 0) {
-        char keybuf[1024];
-        size_t klen = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
-        memcpy(keybuf, key_start, klen); keybuf[klen] = '\0';
+        char keybuf[1100];
+        format_query_wire_key(c->fs, key_start, rr.klen, keybuf);
         if (is_excluded(c->excluded, keybuf)) {
             release_record_ref(&rr);
             return 0;
@@ -1712,10 +1718,8 @@ static int composite_prefix_cb(const char *val, size_t vlen,
 
     /* Emit the row.  Supports default JSON and dict_fmt; rows_fmt/csv are
        excluded by the caller guard so we don't need those branches here. */
-    char key_buf[1024];
-    size_t klen = rr.klen < sizeof(key_buf) - 1 ? rr.klen : sizeof(key_buf) - 1;
-    memcpy(key_buf, key_start, klen);
-    key_buf[klen] = '\0';
+    char key_buf[1100];
+    format_query_wire_key(c->fs, key_start, rr.klen, key_buf);
 
     if (c->dict_fmt) {
         OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
@@ -1769,9 +1773,8 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
     g_out = c->parent_out;
 
     if (c->excluded && c->excluded->count > 0) {
-        char keybuf[1024];
-        size_t kl = klen < sizeof(keybuf) - 1 ? klen : sizeof(keybuf) - 1;
-        memcpy(keybuf, key, kl); keybuf[kl] = '\0';
+        char keybuf[1100];
+        format_query_wire_key(c->fs, key, klen, keybuf);
         if (is_excluded(c->excluded, keybuf)) return 0;
     }
 
@@ -1784,10 +1787,8 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
         return 0;
     }
 
-    char key_buf[1024];
-    size_t kl = klen < sizeof(key_buf) - 1 ? klen : sizeof(key_buf) - 1;
-    memcpy(key_buf, key, kl);
-    key_buf[kl] = '\0';
+    char key_buf[1100];
+    format_query_wire_key(c->fs, key, klen, key_buf);
 
     if (c->dict_fmt) {
         OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
@@ -2291,9 +2292,8 @@ static int order_index_walk_cb(const char *val, size_t vlen,
 
     /* Excluded-keys check. */
     if (c->excluded && c->excluded->count > 0) {
-        char keybuf[1024];
-        size_t klen = rr.klen < sizeof(keybuf) - 1 ? rr.klen : sizeof(keybuf) - 1;
-        memcpy(keybuf, key_start, klen); keybuf[klen] = '\0';
+        char keybuf[1100];
+        format_query_wire_key(c->fs, key_start, rr.klen, keybuf);
         if (is_excluded(c->excluded, keybuf)) {
             release_record_ref(&rr);
             return 0;
@@ -2316,10 +2316,8 @@ static int order_index_walk_cb(const char *val, size_t vlen,
 
     /* Emit the row.  Supports default JSON and dict_fmt; rows_fmt/csv are
        excluded by the caller guard so we don't need those branches here. */
-    char key_buf[1024];
-    size_t klen = rr.klen < sizeof(key_buf) - 1 ? rr.klen : sizeof(key_buf) - 1;
-    memcpy(key_buf, key_start, klen);
-    key_buf[klen] = '\0';
+    char key_buf[1100];
+    format_query_wire_key(c->fs, key_start, rr.klen, key_buf);
 
     if (c->dict_fmt) {
         OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
@@ -5730,11 +5728,11 @@ static int cursor_find_cb(const char *val, size_t vlen,
         return 0;
     }
 
-    /* Emit row. Supports json-default and rows_fmt. */
-    char key_buf[1024];
-    size_t klen = rr.klen < sizeof(key_buf) - 1 ? rr.klen : sizeof(key_buf) - 1;
-    memcpy(key_buf, key_start, klen);
-    key_buf[klen] = '\0';
+    /* Emit the primary key's protocol representation, never its binary
+       storage bytes.  This is also the key stored in the next cursor. */
+    char key_buf[1100];
+    format_query_wire_key(c->fs, key_start, rr.klen, key_buf);
+    size_t klen = strlen(key_buf);
 
     if (c->rows_fmt) {
         OUT("%s[\"%s\"", c->printed ? "," : "", key_buf);
@@ -6226,9 +6224,8 @@ static int fetch_sort_batch_cb(const uint8_t hash16[16],
     if (c->tree && !criteria_match_tree((const uint8_t *)value,
                                          c->tree, c->fs)) return 0;
     if (c->excluded && c->excluded->count > 0) {
-        char keybuf[1024];
-        size_t kl = klen < sizeof(keybuf) - 1 ? klen : sizeof(keybuf) - 1;
-        memcpy(keybuf, key, kl); keybuf[kl] = '\0';
+        char keybuf[1100];
+        format_query_wire_key(c->fs, key, klen, keybuf);
         if (is_excluded(c->excluded, keybuf)) return 0;
     }
 
@@ -7859,12 +7856,19 @@ static int cmd_find_do(const char *db_root, const char *object,
                                        hi_b, hi_l, hi_e,
                                        desc, cursor_find_cb, &cc);
             }
-            if (dict_fmt)
-                OUT(want_total ? "},\"total\":null}\n" : "}\n");
-            else if (rows_fmt)
-                OUT(want_total ? "],\"total\":null}\n" : "]\n");
-            else
-                OUT(want_total ? "],\"total\":null}\n" : "]\n");
+            if (dict_fmt) {
+                if (!want_total) OUT("}\n");
+                else if (!tree) OUT("},\"total\":%zu}\n", find_N_live);
+                else OUT("},\"total\":null}\n");
+            } else if (rows_fmt) {
+                if (!want_total) OUT("]\n");
+                else if (!tree) OUT("],\"total\":%zu}\n", find_N_live);
+                else OUT("],\"total\":null}\n");
+            } else {
+                if (!want_total) OUT("]\n");
+                else if (!tree) OUT("],\"total\":%zu}\n", find_N_live);
+                else OUT("],\"total\":null}\n");
+            }
 
             if (prefilter_ks) keyset_free(prefilter_ks);
             free(cc.last_value_str);
@@ -7929,16 +7933,19 @@ static int cmd_find_do(const char *db_root, const char *object,
         int printed = 0;
         for (size_t i = start; i < end; i++) {
             OrderedRow *r = &oc.rows[i];
+            char wire_key[1100];
+            format_query_wire_key(&driver_fs, (const uint8_t *)r->key,
+                                  r->key_len, wire_key);
             const uint8_t *val = r->record + r->key_len;
             if (csv_delim) {
-                csv_emit_row(r->key, val, r->value_len,
+                csv_emit_row(wire_key, val, r->value_len,
                              proj_count > 0 ? proj_fields : NULL,
                              proj_count, &driver_fs, csv_delim);
                 printed++;
                 continue;
             }
             if (rows_fmt) {
-                OUT("%s[\"%s\"", printed ? "," : "", r->key);
+                OUT("%s[\"%s\"", printed ? "," : "", wire_key);
                 if (proj_count > 0) {
                     for (int j = 0; j < proj_count; j++) {
                         char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
@@ -7957,7 +7964,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                 }
                 OUT("]");
             } else if (dict_fmt) {
-                OUT("%s\"%s\":", printed ? "," : "", r->key);
+                OUT("%s\"%s\":", printed ? "," : "", wire_key);
                 if (proj_count > 0) {
                     OUT("{");
                     int first = 1;
@@ -7975,7 +7982,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                     free(v);
                 }
             } else if (proj_count > 0) {
-                OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", r->key);
+                OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", wire_key);
                 int first = 1;
                 for (int j = 0; j < proj_count; j++) {
                     char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
@@ -7987,7 +7994,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                 OUT("}}");
             } else {
                 char *v = decode_value((const char *)val, r->value_len, &driver_fs);
-                OUT("%s{\"key\":\"%s\",\"value\":%s}", printed ? "," : "", r->key, v);
+                OUT("%s{\"key\":\"%s\",\"value\":%s}", printed ? "," : "", wire_key, v);
                 free(v);
             }
             printed++;
