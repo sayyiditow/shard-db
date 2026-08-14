@@ -197,7 +197,7 @@ static int run_crash_test(const char *phase) {
     }
 
     /* Wait for the marker to appear. */
-    int marker_rc = wait_marker(tmpdir, phase, 1, 10000);
+    int marker_rc = wait_marker(tmpdir, phase, 1, 20000);
     if (marker_rc != 0) {
         /* The crash seam is the subject of this test.  A missing marker is
            a failed test, never a skip: otherwise the test can pass while

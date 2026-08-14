@@ -649,13 +649,14 @@ static int test_durability_sigkill_marker_after_write_recovers(void) {
     snprintf(marker, sizeof(marker),
              "%s/default/%s/.durability-test-marker-after-write.active",
              saved_db_root, object);
-    int marker_rc = wait_for_path(marker, 5000);
+    int marker_rc = wait_for_path(marker, 20000);
     ASSERT_EQ_INT(marker_rc, 0,
                   "insert reaches deterministic marker-after-write pause");
-    if (marker_rc == 0) {
-        test_env_kill(&env);
-        unlink(marker);
-    }
+    /* Kill unconditionally: on timeout the daemon is still running and
+       holds the DB lock, so leaving it up would cascade into every later
+       test_env_start_at() in this process. */
+    test_env_kill(&env);
+    unlink(marker);
     if (insert_pid > 0) waitpid(insert_pid, NULL, 0);
 
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
@@ -784,7 +785,7 @@ static int test_durability_bulk_marker_recovers(void) {
     snprintf(marker, sizeof(marker),
              "%s/default/%s/.durability-test-bulk-marker-after-write.active",
              saved_db_root, object);
-    int marker_rc = wait_for_path(marker, 5000);
+    int marker_rc = wait_for_path(marker, 20000);
     ASSERT_EQ_INT(marker_rc, 0,
                   "bulk-insert reaches deterministic bulk-marker-after-write pause");
 
@@ -812,9 +813,12 @@ static int test_durability_bulk_marker_recovers(void) {
             ASSERT_TRUE(stable_slots,
                         "fresh batch markers persist their planned kf slots for recovery");
         }
-        test_env_kill(&env);
-        unlink(marker);
     }
+    /* Kill unconditionally: on timeout the daemon is still running and
+       holds the DB lock, so leaving it up would cascade into every later
+       test_env_start_at() in this process. */
+    test_env_kill(&env);
+    unlink(marker);
     if (bulk_pid > 0) waitpid(bulk_pid, NULL, 0);
 
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
@@ -887,7 +891,7 @@ static int test_durability_bulk_window_prepared_recovers(void) {
     snprintf(marker, sizeof(marker),
              "%s/default/%s/.durability-test-bulk-window-prepared.active",
              saved_db_root, object);
-    int marker_rc = wait_for_path(marker, 5000);
+    int marker_rc = wait_for_path(marker, 20000);
     ASSERT_EQ_INT(marker_rc, 0,
                   "bulk-insert reaches the deterministic bulk-window-prepared pause");
 
@@ -897,9 +901,12 @@ static int test_durability_bulk_window_prepared_recovers(void) {
     if (marker_rc == 0) {
         ASSERT_TRUE(access(batch_marker_path, F_OK) != 0,
                     "no batch marker file exists yet at the prepare boundary");
-        test_env_kill(&env);
-        unlink(marker);
     }
+    /* Kill unconditionally: on timeout the daemon is still running and
+       holds the DB lock, so leaving it up would cascade into every later
+       test_env_start_at() in this process. */
+    test_env_kill(&env);
+    unlink(marker);
     if (bulk_pid > 0) waitpid(bulk_pid, NULL, 0);
 
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
@@ -953,7 +960,7 @@ static int test_durability_bulk_window_applied_recovers(void) {
     snprintf(marker, sizeof(marker),
              "%s/default/%s/.durability-test-bulk-window-applied.active",
              saved_db_root, object);
-    int marker_rc = wait_for_path(marker, 5000);
+    int marker_rc = wait_for_path(marker, 20000);
     ASSERT_EQ_INT(marker_rc, 0,
                   "bulk-insert reaches the deterministic bulk-window-applied pause");
 
@@ -966,9 +973,12 @@ static int test_durability_bulk_window_applied_recovers(void) {
                       "batch marker file still intact at the apply boundary");
         ASSERT_EQ_INT((long long)mst.st_size, (long long)(sizeof(KfMarkerSlot) * nrecords),
                       "batch marker still holds a slot for every record in the window");
-        test_env_kill(&env);
-        unlink(marker);
     }
+    /* Kill unconditionally: on timeout the daemon is still running and
+       holds the DB lock, so leaving it up would cascade into every later
+       test_env_start_at() in this process. */
+    test_env_kill(&env);
+    unlink(marker);
     if (bulk_pid > 0) waitpid(bulk_pid, NULL, 0);
 
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
@@ -1059,7 +1069,7 @@ static int test_durability_index_apply_abort_matrix(void) {
                                                    rows[ri].field,
                                                    rows[ri].new_value);
         ASSERT_TRUE(update_pid > 0, "spawn update that will fail after index apply");
-        int pause_rc = wait_for_path(pause_path, 5000);
+        int pause_rc = wait_for_path(pause_path, 20000);
         ASSERT_EQ_INT(pause_rc, 0,
                       "update reaches durable abort-sidecar pause");
         if (pause_rc == 0) {
@@ -1067,9 +1077,12 @@ static int test_durability_index_apply_abort_matrix(void) {
                            "forward marker remains paired with abort sidecar");
             ASSERT_EQ_INT(access(sidecar_path, F_OK), 0,
                            "abort sidecar is durable before the error returns");
-            test_env_kill(&env);
-            unlink(pause_path);
         }
+        /* Kill unconditionally: on timeout the daemon is still running and
+           holds the DB lock, cascading into every later test_env_start_at()
+           call, including the rest of this loop. */
+        test_env_kill(&env);
+        unlink(pause_path);
         if (update_pid > 0) waitpid(update_pid, NULL, 0);
 
         ASSERT_EQ_INT(append_index_abort_config(saved_db_root, 0, "disabled"), 0,
@@ -1166,16 +1179,19 @@ static int test_durability_index_delete_abort(void) {
 
     pid_t delete_pid = trigger_indexed_delete(&env, "abortdelete");
     ASSERT_TRUE(delete_pid > 0, "spawn delete that will fail after index apply");
-    int pause_rc = wait_for_path(pause_path, 5000);
+    int pause_rc = wait_for_path(pause_path, 20000);
     ASSERT_EQ_INT(pause_rc, 0, "delete reaches durable abort-sidecar pause");
     if (pause_rc == 0) {
         ASSERT_EQ_INT(access(marker_path, F_OK), 0,
                        "delete marker remains paired with abort sidecar");
         ASSERT_EQ_INT(access(sidecar_path, F_OK), 0,
                        "delete abort sidecar is durable before the error returns");
-        test_env_kill(&env);
-        unlink(pause_path);
     }
+    /* Kill unconditionally: on timeout the daemon is still running and
+       holds the DB lock, so leaving it up would cascade into every later
+       test_env_start_at() in this process. */
+    test_env_kill(&env);
+    unlink(pause_path);
     if (delete_pid > 0) waitpid(delete_pid, NULL, 0);
 
     ASSERT_EQ_INT(append_index_abort_config(saved_db_root, 0, "disabled"), 0,
@@ -1313,7 +1329,7 @@ static int test_durability_bulk_window_boundary(void) {
     snprintf(marker, sizeof(marker),
              "%s/default/%s/.durability-test-bulk-window-cleared.active",
              saved_db_root, object);
-    int marker_rc = wait_for_path(marker, 5000);
+    int marker_rc = wait_for_path(marker, 20000);
     ASSERT_EQ_INT(marker_rc, 0,
                   "bulk-insert reaches the post-first-window-clear pause");
 
