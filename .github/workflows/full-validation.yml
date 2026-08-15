@@ -1,0 +1,26 @@
+name: Full validation (manual)
+
+# The PR workflows are a bounded fast gate. Run this before a release (or
+# manually while investigating a heavyweight integration regression) to retain
+# full-suite coverage without repeatedly delaying every pull request.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  full-suite:
+    name: Full C suite (Linux x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build
+        run: SKIP_TESTS=1 ./build.sh
+      - name: Run every registered test
+        run: ./build/bin/shard-db-test run-all --jobs 2

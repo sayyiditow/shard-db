@@ -21,7 +21,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
         fprintf(stderr,
-            "usage: shard-db-test list | run <name> | run-all [--filter <substr>] [--jobs N]\n");
+            "usage: shard-db-test list | run <name> | run-all [--filter <substr>] [--exclude <name,...>] [--jobs N]\n");
         return 1;
     }
     const char *cmd = argv[1];
@@ -35,16 +35,18 @@ int main(int argc, char **argv) {
     }
     if (strcmp(cmd, "run-all") == 0) {
         const char *filter = NULL;
+        const char *exclude = NULL;
         int jobs = 0;
         for (int i = 2; i + 1 < argc; i++) {
             if (strcmp(argv[i], "--filter") == 0) filter = argv[i + 1];
+            else if (strcmp(argv[i], "--exclude") == 0) exclude = argv[i + 1];
             else if (strcmp(argv[i], "--jobs") == 0) jobs = atoi(argv[i + 1]);
         }
         if (jobs <= 0) {
             long nproc = sysconf(_SC_NPROCESSORS_ONLN);
             jobs = (nproc > 0) ? (int)nproc : 4;
         }
-        return test_run_all(filter, jobs) == 0 ? 0 : 1;
+        return test_run_all(filter, exclude, jobs) == 0 ? 0 : 1;
     }
     fprintf(stderr, "unknown subcommand: %s\n", cmd);
     return 1;

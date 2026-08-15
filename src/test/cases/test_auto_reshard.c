@@ -76,6 +76,20 @@ static int fabricate_kf_total(const char *kf_path, uint64_t total) {
 #define GROWN_BASE_COUNT 1050000
 #define GROWN_CHUNK      50000
 
+/* Append formatted request data without allowing a truncated snprintf result
+   to turn the next `buf_cap - off` calculation into a size_t underflow. */
+static int append_requestf(char *buf, size_t cap, size_t *off,
+                           const char *fmt, ...) {
+    if (*off >= cap) return -1;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *off, cap - *off, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - *off) return -1;
+    *off += (size_t)n;
+    return 0;
+}
+
 /* The wait budgets below (20s/40s) are calibrated for uninstrumented
    execution: 5s thread-startup delay + a 1.05M-record bulk-insert +
    a full kf/segment rebuild, all comfortably inside budget on plain builds.
@@ -265,15 +279,23 @@ static int test_auto_reshard_run(void) {
             int end = base_i + GROWN_CHUNK;
             if (end > GROWN_BASE_COUNT) end = GROWN_BASE_COUNT;
             size_t off = 0;
-            off += (size_t)snprintf(bulk + off, buf_cap - off,
-                "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"grown\","
-                "\"records\":{");
-            for (int i = base_i; i < end; i++) {
-                off += (size_t)snprintf(bulk + off, buf_cap - off,
-                    "%s\"g%d\":{\"v\":%d}", i == base_i ? "" : ",", i, i);
+            if (append_requestf(bulk, buf_cap, &off,
+                    "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"grown\","
+                    "\"records\":{") != 0) {
+                all_ok = 0;
+                break;
             }
-            off += (size_t)snprintf(bulk + off, buf_cap - off, "}}");
-            tc_request(tc, bulk, &resp);
+            for (int i = base_i; i < end; i++) {
+                if (append_requestf(bulk, buf_cap, &off,
+                        "%s\"g%d\":{\"v\":%d}",
+                        i == base_i ? "" : ",", i, i) != 0) {
+                    all_ok = 0;
+                    break;
+                }
+            }
+            if (all_ok && append_requestf(bulk, buf_cap, &off, "}}") != 0)
+                all_ok = 0;
+            if (all_ok) tc_request(tc, bulk, &resp);
             if (!resp || SAFE_STRSTR(resp, "\"error\"")) all_ok = 0;
             free(resp); resp = NULL;
         }
@@ -611,15 +633,23 @@ static int test_auto_reshard_throttle_run(void) {
             int end = base_i + GROWN_CHUNK;
             if (end > GROWN_BASE_COUNT) end = GROWN_BASE_COUNT;
             size_t off = 0;
-            off += (size_t)snprintf(bulk + off, buf_cap - off,
-                "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"%s\","
-                "\"records\":{", names[oi]);
-            for (int i = base_i; i < end; i++) {
-                off += (size_t)snprintf(bulk + off, buf_cap - off,
-                    "%s\"k%d\":{\"v\":%d}", i == base_i ? "" : ",", i, i);
+            if (append_requestf(bulk, buf_cap, &off,
+                    "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"%s\","
+                    "\"records\":{", names[oi]) != 0) {
+                all_ok = 0;
+                break;
             }
-            off += (size_t)snprintf(bulk + off, buf_cap - off, "}}");
-            tc_request(tc, bulk, &resp);
+            for (int i = base_i; i < end; i++) {
+                if (append_requestf(bulk, buf_cap, &off,
+                        "%s\"k%d\":{\"v\":%d}",
+                        i == base_i ? "" : ",", i, i) != 0) {
+                    all_ok = 0;
+                    break;
+                }
+            }
+            if (all_ok && append_requestf(bulk, buf_cap, &off, "}}") != 0)
+                all_ok = 0;
+            if (all_ok) tc_request(tc, bulk, &resp);
             if (!resp || SAFE_STRSTR(resp, "\"error\"")) all_ok = 0;
             free(resp); resp = NULL;
         }

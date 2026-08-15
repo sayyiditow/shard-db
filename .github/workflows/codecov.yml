@@ -9,8 +9,6 @@ name: Coverage (Codecov)
 # (For private repos, CODECOV_TOKEN must be configured in repo secrets.)
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -31,6 +29,7 @@ jobs:
       # sub-run internally, unrelated to the --jobs 1 outer setting below.
       # This runner is too weak for that nested width; narrow it to 2.
       SHARD_TEST_RUNNER_PARALLEL_JOBS: "2"
+      SHARD_TEST_EXCLUDE: "test-auto-reshard-throttle,test-auto-reshard,test-auto-vacuum,test-startup-refuses-unreadable-kf-maintenance,test-startup-refuses-unreadable-kf-count,test-rebuild-legacy-ambiguous-refuses-start,test-parallel-index-integrity,test-durability-corrupt-marker-policy,test-auto-reshard-shutdown-race"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -50,7 +49,7 @@ jobs:
         # run-all now defaults to parallel (--jobs unset = nproc) since
         # the parallel test runner landed, so --jobs 1 must be passed
         # explicitly here to keep this step actually sequential.
-        run: ./build/bin/shard-db-test run-all --jobs 1
+        run: ./build/bin/shard-db-test run-all --exclude "$SHARD_TEST_EXCLUDE" --jobs 1
 
       - name: Collect coverage
         run: |
