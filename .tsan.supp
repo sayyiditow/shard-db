@@ -8,16 +8,6 @@
 # does its work, bt_release's, without any other bt_acquire in between).
 # Real deadlock would require nesting that doesn't exist in the codebase.
 deadlock:bt_acquire
-# segcache_acquire / kfcache_acquire follow the same verify-retry pattern
-# as bt_acquire (take global lock → release → take per-entry rwlock → on
-# mismatch release rwlock and re-take global lock). TSan's lock-order
-# tracking doesn't model the unlocks tightly enough to know the
-# ordering was broken. Real nested acquisition would require slotcask
-# callers to hold an open segcache handle across a different slotcask
-# call, which doesn't happen — each cmd_* function acquires, does work,
-# releases.
-deadlock:segcache_acquire
-deadlock:kfcache_acquire
 # seg_record_emit + seg_rec_live_with_hash use the byte-18 flag as a
 # release/acquire synchronization point: writer memcpy's all record bytes,
 # then atomic_store_release(flag=1); reader does atomic_load_acquire(flag),

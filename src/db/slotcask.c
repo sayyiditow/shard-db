@@ -250,26 +250,32 @@ static int kfcache_drop_slot(int slot, CacheDropReason reason, int wait) {
     return 1;
 }
 
-/* Drop every cached kf shard whose path starts with `prefix`. Used by
-   slotcask_registry_invalidate to flush stale mmap regions before the
-   on-disk files move (rebuild_object_v2) or vanish (drop-object).
+/* Invalidate one matching slot. Cache table metadata (used/path) is always
+   read or written under g_kfcache_lock. Take the entry lock before re-taking
+   the table lock: kfcache_acquire_ex can hold an entry lock before retrying
+   the table, so waiting entry <- table would deadlock. */
+static int kfcache_invalidate_slot_if_prefix(int slot, const char *prefix,
+                                             size_t pl) {
+    KfCacheEntry *e = &g_kfcache[slot];
+    uint64_t expected_gen;
+    char expected_path[PATH_MAX];
 
-   Lock-ordering: cache eviction and installation never hold the table mutex
-   while waiting for an entry rwlock. Prefix invalidation likewise takes only
-   the entry rwlock. The slots array is fixed-size; `used` is published
-   atomically, and identity is rechecked after taking the entry lock. The
-   caller (per-object wrlock) guarantees no concurrent ops on THIS object, so
-   rwlock contention is bounded. */
-static void kfcache_invalidate_prefix(const char *prefix) {
-    if (!g_kfcache || !prefix || !prefix[0]) return;
-    size_t pl = strlen(prefix);
-    for (int i = 0; i < g_kfcache_slots; i++) {
-        KfCacheEntry *e = &g_kfcache[i];
-        if (!atomic_load_explicit(&e->used, memory_order_acquire)) continue;
-        if (strncmp(e->path, prefix, pl) != 0) continue;
-        pthread_rwlock_wrlock(&e->rwlock);
-        if (atomic_load_explicit(&e->used, memory_order_acquire) &&
-            strncmp(e->path, prefix, pl) == 0) {
+    pthread_mutex_lock(&g_kfcache_lock);
+    if (!atomic_load_explicit(&e->used, memory_order_acquire) ||
+        strncmp(e->path, prefix, pl) != 0) {
+        pthread_mutex_unlock(&g_kfcache_lock);
+        return 0;
+    }
+    expected_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
+    snprintf(expected_path, sizeof(expected_path), "%s", e->path);
+    pthread_mutex_unlock(&g_kfcache_lock);
+
+    pthread_rwlock_wrlock(&e->rwlock);
+    pthread_mutex_lock(&g_kfcache_lock);
+    if (atomic_load_explicit(&e->used, memory_order_acquire) &&
+        atomic_load_explicit(&e->gen, memory_order_acquire) == expected_gen &&
+        strcmp(e->path, expected_path) == 0 &&
+        strncmp(e->path, prefix, pl) == 0) {
             if (g_db && g_kfcache_test_hold_ms > 0) {
                 /* Test-only hook (KFCACHE_TEST_HOLD_MS): widens this
                    window deterministically for the shutdown-race
@@ -295,19 +301,25 @@ static void kfcache_invalidate_prefix(const char *prefix) {
             atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
             atomic_store_explicit(&e->used, 0, memory_order_release);
             __sync_fetch_and_sub(&g_kfcache_count, 1);
-            /* Test-only early exit: unlock this entry, then leave the
-               remaining prefix-matched entries alone.  One held entry is
-               enough for the shutdown-race regression test; iterating
-               the rest would multiply HOLD_MS and blow the test's 10s
-               waitpid timeout at high splits.  Production
-               (g_kfcache_test_hold_ms=0) never takes this path — all
-               matching entries are invalidated in one pass. */
-            if (g_db && g_kfcache_test_hold_ms > 0) {
-                pthread_rwlock_unlock(&e->rwlock);
-                break;
-            }
-        }
+        pthread_mutex_unlock(&g_kfcache_lock);
         pthread_rwlock_unlock(&e->rwlock);
+        return 1;
+    }
+    pthread_mutex_unlock(&g_kfcache_lock);
+    pthread_rwlock_unlock(&e->rwlock);
+    return 0;
+}
+
+/* Drop every cached kf shard whose path starts with `prefix`. Used by
+   slotcask_registry_invalidate to flush stale mmap regions before the
+   on-disk files move (rebuild_object_v2) or vanish (drop-object). */
+static void kfcache_invalidate_prefix(const char *prefix) {
+    if (!g_kfcache || !prefix || !prefix[0]) return;
+    size_t pl = strlen(prefix);
+    for (int i = 0; i < g_kfcache_slots; i++) {
+        if (kfcache_invalidate_slot_if_prefix(i, prefix, pl) &&
+            g_db && g_kfcache_test_hold_ms > 0)
+            break;
     }
 }
 
@@ -9043,8 +9055,7 @@ typedef struct {
     int         stream_id;
     uint32_t    donor_fid;
     uint32_t    recipient_fid;
-    uint8_t    *rmap;        /* recipient mmap base */
-    size_t      rmap_size;   /* total mapped bytes */
+    char        recipient_path[PATH_MAX];
     uint32_t   *free_offs;   /* free slot byte-offsets in recipient */
     uint32_t   *free_caps;   /* capacity of each free slot (0 = unbounded) */
     size_t      free_count;
@@ -9096,16 +9107,10 @@ static int varlen_compact_cb(const uint8_t *rec, size_t vlen,
 
     const uint8_t *key   = rec + 24;
     const uint8_t *value = rec + 24 + (size_t)klen;
-    seg_record_emit(c->rmap + target_off, (int)donor_rec_size,
-                    hash16, key, (size_t)klen, value, vlen);
 
-    if (durability_msync_range(c->rmap, target_off, donor_rec_size) != 0) {
-        c->rc = -1;
-        return 1;
-    }
-    durability_test_pause(c->db->data_dir, "compact-after-recipient-sync");
-
-    /* Repoint kf entry. */
+    /* The cache lock order is kfcache then segcache.  Do not retain the
+       recipient segcache handle across this kf acquire: ordinary lookup and
+       walk paths hold a kf handle while verifying a segment record. */
     int kfshard = shard_for_hash(hash16, c->db->num_shards);
     char kfp[PATH_MAX];
     kf_path_for(kfp, c->db->data_dir, kfshard);
@@ -9147,8 +9152,25 @@ static int varlen_compact_cb(const uint8_t *rec, size_t vlen,
         return 0;
     }
 
+    SlotcaskSegHandle rh;
+    if (segcache_acquire(&rh, c->recipient_path, 0, 0, 0) != 0) {
+        kfcache_release(&kh);
+        c->rc = -1;
+        return 1;
+    }
+    seg_record_emit(rh.map + target_off, (int)donor_rec_size,
+                    hash16, key, (size_t)klen, value, vlen);
+    if (durability_msync_range(rh.map, target_off, donor_rec_size) != 0) {
+        segcache_release(&rh);
+        kfcache_release(&kh);
+        c->rc = -1;
+        return 1;
+    }
+    durability_test_pause(c->db->data_dir, "compact-after-recipient-sync");
+
     kf_repoint_at_slot(&kh, kf_slot_idx, (uint8_t)c->stream_id,
                         (uint16_t)c->recipient_fid, target_off);
+    segcache_release(&rh);
     kfcache_release(&kh);
     durability_test_pause(c->db->data_dir, "compact-after-kf-repoint");
     return 0;
@@ -9244,14 +9266,19 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
         off += rec_size;
     }
 
+    /* The callback acquires kfcache before briefly reacquiring this recipient
+       handle, matching every other nested cache acquisition path. */
+    segcache_release(&rh);
+
     VarlenCompactCtx ctx = {
         .db = db, .stream_id = stream_id,
         .donor_fid = donor_fid, .recipient_fid = recipient_fid,
-        .rmap = rh.map, .rmap_size = rmap_size,
         .free_offs = free_offs, .free_caps = free_caps,
         .free_count = free_count, .free_next = 0, .rc = 0,
         .kf_lookup_failed = 0,
     };
+    snprintf(ctx.recipient_path, sizeof(ctx.recipient_path), "%s",
+             recipient_path);
 
     /* Donor is read-only, so use the hardened VARLEN scanner. It validates
        headers and resynchronizes across reused-slot zero-padding gaps. */
@@ -9261,7 +9288,6 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
         if (drc < 0) {
             free(free_offs);
             free(free_caps);
-            segcache_release(&rh);
             return -1;
         }
     }
@@ -9269,7 +9295,6 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
     if (out_kf_failed) *out_kf_failed = ctx.kf_lookup_failed;
     free(free_offs);
     free(free_caps);
-    segcache_release(&rh);
     return ctx.rc;
 }
 
