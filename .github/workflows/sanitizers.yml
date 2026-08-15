@@ -15,6 +15,8 @@ name: Sanitizers (ASan + UBSan)
 # x86_64 will catch.
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
 

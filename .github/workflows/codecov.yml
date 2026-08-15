@@ -9,6 +9,8 @@ name: Coverage (Codecov)
 # (For private repos, CODECOV_TOKEN must be configured in repo secrets.)
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
 
