@@ -41,7 +41,8 @@ const TestCaseEntry *test_first(void);
 /* Run a single test by name. Returns 0 on pass, non-zero on fail. */
 int test_run_one(const char *name);
 
-/* Run all (optionally filtered by substring), using `jobs` worker
+/* Run all (optionally filtered by substring and excluded by comma-separated
+   exact case names), using `jobs` worker
    processes. jobs<=1 runs strictly sequentially (byte-identical output to
    the pre-parallel implementation) — this is the safety fallback.
    jobs>1 uses a bounded process pool: a single-threaded parent forks one
@@ -50,6 +51,6 @@ int test_run_one(const char *name);
    never interleaves and their process-global test state cannot race. The
    parent _exit(124)s after killing active children if any one exceeds
    SHARD_TEST_WATCHDOG_SEC (default 180s). Returns total fail count. */
-int test_run_all(const char *filter, int jobs);
+int test_run_all(const char *filter, const char *exclude, int jobs);
 
 #endif

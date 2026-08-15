@@ -40,6 +40,31 @@ static char *run_subcommand(int jobs, int *exit_code) {
     return buf;
 }
 
+/* Same focused subprocess helper, with an exact-name exclusion list. */
+static char *run_subcommand_excluding(const char *filter, const char *exclude,
+                                      int jobs, int *exit_code) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "./build/bin/shard-db-test run-all --filter %s --exclude %s --jobs %d 2>&1",
+             filter, exclude, jobs);
+    FILE *p = popen(cmd, "r");
+    if (!p) { *exit_code = -1; return NULL; }
+
+    size_t cap = 65536, len = 0;
+    char *buf = malloc(cap);
+    buf[0] = '\0';
+    char line[4096];
+    while (fgets(line, sizeof(line), p)) {
+        size_t l = strlen(line);
+        if (len + l + 1 > cap) { cap *= 2; buf = realloc(buf, cap); }
+        memcpy(buf + len, line, l + 1);
+        len += l;
+    }
+    int rc = pclose(p);
+    *exit_code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+    return buf;
+}
+
 /* Parses "# total: N passed, M failed across K cases" out of `out`.
    Returns 1 on match (fills *passed, *failed, *cases), 0 if not found. */
 static int parse_total(const char *out, int *passed, int *failed, int *cases) {
@@ -168,6 +193,28 @@ static int test_runner_parallel_matches_sequential(void) {
 
     free(out_seq);
     free(out_par);
+    return 0;
+}
+
+/* Regression for CI's fast-tier selection: exclusions are exact test names,
+   so excluding one measured slow case cannot silently remove similarly named
+   coverage. Before --exclude support this subprocess includes all three
+   probes and this assertion fails. */
+static int test_runner_exclude_exact_case(void) {
+    int exit_code = -1;
+    char *out = run_subcommand_excluding("runner-exclusive-probe",
+        "test-runner-exclusive-probe-case", 1, &exit_code);
+    ASSERT_NOT_NULL(out, "exclude subprocess output captured");
+    if (!out) return 1;
+
+    ASSERT_EQ_INT(exit_code, 0, "exclude subprocess exits cleanly");
+    ASSERT_TRUE(strstr(out, "# test-runner-exclusive-probe-ordinary-a\n") != NULL,
+                "non-excluded ordinary-a case still runs");
+    ASSERT_TRUE(strstr(out, "# test-runner-exclusive-probe-ordinary-b\n") != NULL,
+                "non-excluded ordinary-b case still runs");
+    ASSERT_TRUE(strstr(out, "# test-runner-exclusive-probe-case\n") == NULL,
+                "excluded exact case does not run");
+    free(out);
     return 0;
 }
 
@@ -309,6 +356,7 @@ static int test_runner_exclusive_scheduling(void) {
 }
 
 TEST_REGISTER("test-runner-parallel", test_runner_parallel_matches_sequential)
+TEST_REGISTER("test-runner-exclude-exact-case", test_runner_exclude_exact_case)
 TEST_REGISTER("test-runner-watchdog", test_runner_watchdog_fires)
 TEST_REGISTER("test-runner-exclusive-probe-ordinary-a",
               test_runner_exclusive_probe_ordinary_a)

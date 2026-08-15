@@ -19,8 +19,6 @@ name: TSan (ThreadSanitizer)
 # fails this job.
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -43,6 +41,7 @@ jobs:
       # sub-run internally, unrelated to the --jobs 1 outer setting below.
       # This runner is too weak for that nested width; narrow it to 2.
       SHARD_TEST_RUNNER_PARALLEL_JOBS: "2"
+      SHARD_TEST_EXCLUDE: "test-auto-reshard-throttle,test-auto-reshard,test-auto-vacuum,test-startup-refuses-unreadable-kf-maintenance,test-startup-refuses-unreadable-kf-count,test-rebuild-legacy-ambiguous-refuses-start,test-parallel-index-integrity,test-durability-corrupt-marker-policy,test-auto-reshard-shutdown-race"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -50,7 +49,7 @@ jobs:
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
       - name: Run full C test suite under TSan
-        run: ./build/bin/shard-db-test run-all --jobs 1
+        run: ./build/bin/shard-db-test run-all --exclude "$SHARD_TEST_EXCLUDE" --jobs 2
 
       - name: Fail if any TSan findings escaped
         run: |

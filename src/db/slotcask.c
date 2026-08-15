@@ -22,6 +22,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* Linux exposes EUCLEAN for detected on-disk corruption; Darwin does not.
+   EIO is the portable errno for an unreadable/corrupt storage object. */
+#ifndef EUCLEAN
+#define EUCLEAN EIO
+#endif
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>

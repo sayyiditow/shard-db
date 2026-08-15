@@ -73,15 +73,32 @@ int test_run_one(const char *name) {
     return 1;
 }
 
-/* Builds a flat array of every registered case matching `filter` (NULL
-   = all). Returns the count; *out receives a malloc'd array the caller
-   must free. Both the sequential and parallel paths share this so
-   filtering behavior is identical between them. */
-static int collect_matching(const char *filter, TestCaseEntry ***out) {
+/* `exclude` is a comma-separated list of complete case names. Exact matching
+   keeps a CI fast-tier exclusion from accidentally dropping a similarly
+   named regression case. */
+static int is_excluded(const char *name, const char *exclude) {
+    if (!exclude || !*exclude) return 0;
+    const char *item = exclude;
+    while (*item) {
+        const char *end = strchr(item, ',');
+        size_t len = end ? (size_t)(end - item) : strlen(item);
+        if (strlen(name) == len && memcmp(name, item, len) == 0) return 1;
+        if (!end) break;
+        item = end + 1;
+    }
+    return 0;
+}
+
+/* Builds a flat array of registered cases matching `filter` (NULL = all)
+   except exact names in `exclude`. Returns the count; *out receives a
+   malloc'd array the caller must free. Both scheduler paths share this. */
+static int collect_matching(const char *filter, const char *exclude,
+                            TestCaseEntry ***out) {
     int cap = 16, n = 0;
     TestCaseEntry **arr = malloc((size_t)cap * sizeof(*arr));
     for (TestCaseEntry *p = g_head; p; p = p->next) {
         if (filter && !strstr(p->name, filter)) continue;
+        if (is_excluded(p->name, exclude)) continue;
         if (n == cap) {
             cap *= 2;
             void *np = realloc(arr, (size_t)cap * sizeof(*arr));
@@ -368,10 +385,10 @@ static int run_all_parallel(TestCaseEntry **cases, int n, int jobs) {
     return total_failed;
 }
 
-int test_run_all(const char *filter, int jobs) {
+int test_run_all(const char *filter, const char *exclude, int jobs) {
     test_fixture_set_jobs(jobs);
     TestCaseEntry **cases = NULL;
-    int n = collect_matching(filter, &cases);
+    int n = collect_matching(filter, exclude, &cases);
 
     int result = jobs <= 1 ? run_all_sequential(cases, n)
                            : run_all_parallel(cases, n, jobs);
