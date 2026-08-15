@@ -18,13 +18,13 @@ jobs:
     timeout-minutes: 25
     env:
       # test-runner-parallel's own nested run-all spawns a --jobs 4
-      # sub-run internally, unrelated to the --jobs 1 outer setting below.
+      # sub-run internally, unrelated to the --jobs 2 outer setting below.
       # These runners are too weak for that nested width; narrow it to 2.
       SHARD_TEST_RUNNER_PARALLEL_JOBS: "2"
       # Measured ARM64 cases that alone consume ~9 minutes serially. They
       # remain in the manual/scheduled full gate while their regressions are
       # investigated; the PR gate must finish within five minutes.
-      SHARD_TEST_EXCLUDE: "test-auto-reshard-throttle,test-auto-reshard,test-auto-vacuum,test-startup-refuses-unreadable-kf-maintenance,test-startup-refuses-unreadable-kf-count,test-rebuild-legacy-ambiguous-refuses-start,test-parallel-index-integrity,test-durability-corrupt-marker-policy,test-auto-reshard-shutdown-race"
+      SHARD_TEST_EXCLUDE: "test-auto-reshard-throttle,test-auto-reshard,test-auto-vacuum,test-startup-refuses-unreadable-kf-maintenance,test-startup-refuses-unreadable-kf-count,test-rebuild-legacy-ambiguous-refuses-start,test-parallel-index-integrity,test-durability-corrupt-marker-policy,test-auto-reshard-shutdown-race,test-parallel-cross-pool-nesting"
     strategy:
       # Don't cancel the other arch when one fails — we want full signal.
       fail-fast: false
