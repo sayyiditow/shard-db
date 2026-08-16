@@ -6,6 +6,18 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#ifdef TEST_BUILD
+/* Deterministic OOM injection for bulk_upd_json_run (precedent:
+   index.c's g_index_spill_open_fail_errno). Armed with the number of
+   allocations to fail: each checked allocation site decrements and the
+   site that reaches 0 behaves as if malloc returned NULL. 0 = never. */
+static int g_bulk_upd_test_fail_alloc;
+
+void bulk_upd_json_test_set_fail_alloc(int fail_n) {
+    g_bulk_upd_test_fail_alloc = fail_n;
+}
+#endif
+
 /* ========== BULK INSERT ========== */
 
 /* Bulk ops use the v2 slotcask storage backend (registry-cached SlotcaskDb handles). */
@@ -645,6 +657,11 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                 for (int si = 0; si < sw->idx_field_counts[fi]; si++) {
                     int tidx = sw->idx_field_indices[fi][si];
                     if (tidx < 0) { ok = 0; break; }
+                    /* Pre-check remaining scratch space before the write:
+                       the field's max encoded key length is its on-disk
+                       size (mirrors mf_append_field). */
+                    if ((size_t)sw->ts->fields[tidx].size >
+                        sizeof(cat) - (size_t)cp) { ok = 0; break; }
                     size_t blen = 0;
                     typed_field_to_index_key(sw->ts, new_value, tidx,
                                               (uint8_t *)cat + cp, &blen);
@@ -4492,6 +4509,18 @@ static int bulk_upd_json_find_duplicate(BulkUpdJsonKeyRef *refs, size_t count,
 
 static int bulk_upd_json_run(const char *db_root, const char *object,
                               const char *input, int input_is_file) {
+    int parse_oom = 0;
+    /* Cleanup-block variables hoisted to the head: the OOM cleanups jump
+       (goto parse_oom_cleanup) from before their original declaration
+       points, so they must carry their initializers here. */
+    BulkUpdJsonRec *records = NULL;
+    size_t rec_cap = 1024, rec_count = 0;
+    BulkUpdJsonError *errors = NULL;
+    size_t error_count = 0;
+    size_t error_capacity = 0;
+    BulkUpdJsonKeyRef *key_refs = NULL;
+    size_t key_ref_count = 0;
+    size_t key_ref_capacity = 0;
     TypedSchema *ts = load_typed_schema(db_root, object);
     if (!ts) {
         OUT("{\"error\":\"bulk-update-json requires typed fields (fields.conf)\"}\n");
@@ -4518,6 +4547,12 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         json = mmap(NULL, len, PROT_READ, MAP_SHARED, ifd, 0);
         if (json == MAP_FAILED) {
             json = malloc(len + 1);
+#ifdef TEST_BUILD
+            if (g_bulk_upd_test_fail_alloc > 0 && --g_bulk_upd_test_fail_alloc == 0) {
+                free(json); json = NULL;
+            }
+#endif
+            if (!json) { close(ifd); parse_oom = 1; goto parse_oom_cleanup; }
             lseek(ifd, 0, SEEK_SET);
             size_t rd = 0;
             while (rd < len) {
@@ -4537,19 +4572,16 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
     }
 
     /* Phase 1: parse the array, extract per-record (key, touched fields, hash, shard). */
-    BulkUpdJsonRec *records = NULL;
-    size_t rec_cap = 1024, rec_count = 0;
     records = malloc(rec_cap * sizeof(BulkUpdJsonRec));
+#ifdef TEST_BUILD
+    if (g_bulk_upd_test_fail_alloc > 0 && --g_bulk_upd_test_fail_alloc == 0) {
+        free(records); records = NULL;
+    }
+#endif
+    if (!records) { parse_oom = 1; goto parse_oom_cleanup; }
 
     int matched = 0, skipped = 0;
 
-    BulkUpdJsonError *errors = NULL;
-    size_t error_count = 0;
-    size_t error_capacity = 0;
-    int parse_oom = 0;
-    BulkUpdJsonKeyRef *key_refs = NULL;
-    size_t key_ref_count = 0;
-    size_t key_ref_capacity = 0;
     SearchCriterion *if_crit = NULL;
     int if_ncrit = 0;
     int if_rc = 0;
@@ -4598,6 +4630,12 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             while (*p && *p != '"') p++;
             klen = p - key_start;
             key = malloc(klen + 1);
+#ifdef TEST_BUILD
+            if (g_bulk_upd_test_fail_alloc > 0 && --g_bulk_upd_test_fail_alloc == 0) {
+                free(key); key = NULL;
+            }
+#endif
+            if (!key) { parse_oom = 1; goto parse_oom_cleanup; }
             memcpy(key, key_start, klen);
             key[klen] = '\0';
             if (*p == '"') p++;
@@ -4620,6 +4658,12 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
                 obj_str = obj_buf;
             } else {
                 obj_str = malloc(obj_len + 1);
+#ifdef TEST_BUILD
+                if (g_bulk_upd_test_fail_alloc > 0 && --g_bulk_upd_test_fail_alloc == 0) {
+                    free(obj_str); obj_str = NULL;
+                }
+#endif
+                if (!obj_str) { parse_oom = 1; goto parse_oom_cleanup; }
                 memcpy(obj_str, obj_start, obj_len);
                 obj_str[obj_len] = '\0';
                 obj_heap = 1;
@@ -4631,6 +4675,16 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             const char *iv; size_t ivl;
             if (json_obj_unquoted(&rec, "key", &iv, &ivl)) {
                 key = malloc(ivl + 1);
+#ifdef TEST_BUILD
+                if (g_bulk_upd_test_fail_alloc > 0 && --g_bulk_upd_test_fail_alloc == 0) {
+                    free(key); key = NULL;
+                }
+#endif
+                if (!key) {
+                    if (obj_heap) free(obj_str);
+                    obj_heap = 0;
+                    parse_oom = 1; goto parse_oom_cleanup;
+                }
                 memcpy(key, iv, ivl);
                 key[ivl] = '\0';
                 klen = ivl;
@@ -4759,6 +4813,27 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             r->n_fields = n_touched;
             r->field_indices = malloc(n_touched * sizeof(int));
             r->field_values = malloc(n_touched * sizeof(char *));
+#ifdef TEST_BUILD
+            if (g_bulk_upd_test_fail_alloc > 0 && --g_bulk_upd_test_fail_alloc == 0) {
+                free(r->field_indices); free(r->field_values);
+                r->field_indices = NULL; r->field_values = NULL;
+            }
+#endif
+            if (!r->field_indices || !r->field_values) {
+                free(r->field_indices);
+                free(r->field_values);
+                r->field_indices = NULL;
+                r->field_values = NULL;
+                r->n_fields = 0;
+                for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
+                if (obj_heap) free(obj_str);
+                obj_heap = 0;
+                bulk_upd_json_if_free(&if_crit, &if_ncrit);
+                if_crit = NULL;
+                if_ncrit = 0;
+                parse_oom = 1;
+                break;
+            }
             int j = 0;
             for (int i = 0; i < ts->nfields; i++) {
                 if (vals_buf[i]) {
@@ -4783,6 +4858,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         p = obj_end;
     }
 
+    parse_oom_cleanup:
     if (parse_oom) {
         for (size_t i = 0; i < rec_count; i++) {
             free(records[i].key);

@@ -2155,6 +2155,10 @@ static int btree_test_delete_gate_is_bypassed(void) {
 
 int btree_delete(const char *path, const char *value, size_t vlen,
                  const uint8_t hash[BT_HASH_SIZE]) {
+    if (vlen > BT_MAX_VAL_LEN) {
+        errno = EINVAL;
+        return -1;
+    }
 #ifdef TEST_BUILD
     if (btree_test_delete_gate_is_bypassed())
         return btree_delete_locked(path, value, vlen, hash);
@@ -2898,8 +2902,14 @@ static int btree_bulk_build_locked(const char *path, BtEntry *entries, size_t co
     /* Running last-key buffer for prefix compression within current leaf. */
     char last_key[BT_MAX_VAL_LEN];
     size_t last_key_len = 0;
+    size_t stored = 0;
 
     for (size_t i = 0; i < count; i++) {
+        /* Best-effort index policy (mirrors btree_insert_batch_locked):
+           an index key longer than BT_MAX_VAL_LEN cannot be stored in a
+           leaf, so skip it rather than overflow the prefix buffer. The
+           record still exists in the data shard. */
+        if (entries[i].vlen > BT_MAX_VAL_LEN) continue;
         uint8_t *page = bt_page(&bt, cur_leaf);
         int result = leaf_append(page, entries[i].value, entries[i].vlen,
                                  entries[i].hash, last_key, &last_key_len);
@@ -2936,7 +2946,9 @@ static int btree_bulk_build_locked(const char *path, BtEntry *entries, size_t co
             int ins = leaf_append(bt_page(&bt, cur_leaf),
                                   entries[i].value, entries[i].vlen,
                                   entries[i].hash, last_key, &last_key_len);
-            (void)ins;
+            if (ins == 0) stored++;
+        } else {
+            stored++;
         }
     }
 
@@ -3011,7 +3023,7 @@ static int btree_bulk_build_locked(const char *path, BtEntry *entries, size_t co
     /* Set root */
     fh = (BtFileHeader *)bt.map;
     fh->root_page = child_ids[0];
-    fh->entry_count = count;
+    fh->entry_count = stored;
     /* leaf_ids[leaf_count - 1] is the rightmost leaf in the chain we
        just built (loop appends leaves in order); record it for O(1)
        DESC iteration start. */

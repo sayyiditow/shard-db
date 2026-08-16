@@ -8,6 +8,18 @@
 #include <math.h>
 #include <dirent.h>
 
+#ifdef TEST_BUILD
+/* Deterministic realloc-failure injection for parse_one_criterion's
+   IN-list grow sites (precedent: index.c's errcode injection). Armed
+   with the number of grows to skip: each grow site decrements and the
+   site that reaches 0 behaves as if realloc returned NULL. 0 = never. */
+static int g_query_plan_test_fail_grow;
+
+void query_plan_test_set_fail_grow(int fail_n) {
+    g_query_plan_test_fail_grow = fail_n;
+}
+#endif
+
 /* ========== Compiled criteria ========== */
 /* ========== Typed-binary compiled criteria (fast path) ==========
  *
@@ -1379,7 +1391,14 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                         free(raw);
                         if (c->in_count >= c->in_cap) {
                             int new_cap = c->in_cap * 2;
-                            char **t = xrealloc_or_free(c->in_values, (size_t)new_cap * sizeof(char *));
+#ifdef TEST_BUILD
+                            char **t = (g_query_plan_test_fail_grow > 0 &&
+                                        --g_query_plan_test_fail_grow == 0)
+                                       ? NULL
+                                       : realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+#else
+                            char **t = realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+#endif
                             if (!t) {
                                 free(val);
                                 for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
@@ -1400,12 +1419,32 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                         if (len > 0) {
                             if (c->in_count >= c->in_cap) {
                                 int new_cap = c->in_cap * 2;
-                                char **t = xrealloc_or_free(c->in_values, (size_t)new_cap * sizeof(char *));
-                                if (!t) { c->in_values = NULL; c->in_count = 0; c->in_cap = 0; break; }
+#ifdef TEST_BUILD
+                                char **t = (g_query_plan_test_fail_grow > 0 &&
+                                            --g_query_plan_test_fail_grow == 0)
+                                           ? NULL
+                                           : realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+#else
+                                char **t = realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+#endif
+                                if (!t) {
+                                    for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
+                                    free(c->in_values); c->in_values = NULL;
+                                    c->in_count = 0; c->in_cap = 0;
+                                    free(v); free(v_raw); free(v2);
+                                    return -1;
+                                }
                                 c->in_values = t;
                                 c->in_cap = new_cap;
                             }
                             char *val = malloc(len + 1);
+                            if (!val) {
+                                for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
+                                free(c->in_values); c->in_values = NULL;
+                                c->in_count = 0; c->in_cap = 0;
+                                free(v); free(v_raw); free(v2);
+                                return -1;
+                            }
                             memcpy(val, start, len); val[len] = '\0';
                             c->in_values[c->in_count++] = val;
                         }
@@ -1426,8 +1465,23 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                     }
                     if (c->in_count >= c->in_cap) {
                         int new_cap = c->in_cap * 2;
-                        char **t = xrealloc_or_free(c->in_values, (size_t)new_cap * sizeof(char *));
-                        if (!t) { c->in_values = NULL; c->in_count = 0; c->in_cap = 0; break; }
+#ifdef TEST_BUILD
+                        char **t = (g_query_plan_test_fail_grow > 0 &&
+                                    --g_query_plan_test_fail_grow == 0)
+                                   ? NULL
+                                   : realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+#else
+                        char **t = realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+#endif
+                        if (!t) {
+                            for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
+                            free(c->in_values); c->in_values = NULL;
+                            c->in_count = 0; c->in_cap = 0;
+                            free(val);
+                            free(iv);
+                            free(v); free(v_raw); free(v2);
+                            return -1;
+                        }
                         c->in_values = t;
                         c->in_cap = new_cap;
                     }

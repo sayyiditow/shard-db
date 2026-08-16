@@ -9,6 +9,8 @@ void order_walk_test_set_pause_hook(order_walk_test_pause_fn fn, void *ctx);
 void order_walk_test_set_pause_hook_after(order_walk_test_pause_fn fn,
                                           void *ctx,
                                           size_t callbacks_to_skip);
+void bulk_upd_json_test_set_fail_alloc(int fail_n);
+void query_plan_test_set_fail_grow(int fail_n);
 #endif
 
 /* Prototypes for helpers shared across the query_*.c translation units.

@@ -1111,8 +1111,8 @@ static int parse_stats_into(const char *json, StatRow *rows, int max_rows) {
         skip_value(&p);
         size_t vlen = (size_t)(p - vs);
 
-        /* Flatten one level of nested object: ucache → ucache.used,
-           ucache.total, … (much more readable than dumping the JSON). */
+        /* Flatten one level of nested object: bt_cache → bt_cache.used,
+           bt_cache.total, … (much more readable than dumping the JSON). */
         if (vlen > 0 && vs[0] == '{') {
             char prefix[64];
             snprintf(prefix, sizeof(prefix), "%.*s", (int)klen, ks);

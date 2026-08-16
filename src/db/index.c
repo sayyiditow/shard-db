@@ -77,6 +77,10 @@ int btree_idx_delete(const char *db_root, const char *object,
                      const char *field, int splits,
                      const char *value, size_t vlen,
                      const uint8_t hash[BT_HASH_SIZE]) {
+    /* Best-effort parity with the insert side (btree_insert rejects,
+       btree_insert_batch_locked skips): oversized index keys are never
+       stored, so an oversized delete is a no-op, not an error. */
+    if (vlen > BT_MAX_VAL_LEN) return 0;
     int idx_shard = idx_shard_for_hash(hash, splits);
     char idx_path[PATH_MAX];
     build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, idx_shard);
@@ -2982,32 +2986,38 @@ int cmd_add_indexes(const char *db_root, const char *object,
             if (!force && index_conf_has_line(existing_conf ? existing_conf : "",
                                               existing_conf_len, canonical))
                 continue;
-            if (descs) {
-                int fi_t = typed_field_index(ts_for_idx, names[i]);
-                MFFieldDesc *d = &descs[n_desc++];
-                memset(d, 0, sizeof(*d));
-                d->type = MF_BITMAP;
-                strncpy(d->name, names[i], sizeof(d->name) - 1);
-                d->field_indices[0] = fi_t;
-                d->field_index_count = 1;
-                d->bm_max_values = maxes[i];
-                d->bm_bool_fastpath = (ts_for_idx->fields[fi_t].type == FT_BOOL) ? 1 : 0;
+            int fi_t = typed_field_index(ts_for_idx, names[i]);
+            if (fi_t < 0) {
+                OUT("{\"error\":\"add-indexes: unknown field \\\"%s\\\"\"}\n", names[i]);
+                free(descs);
+                return -1;
             }
+            MFFieldDesc *d = &descs[n_desc++];
+            memset(d, 0, sizeof(*d));
+            d->type = MF_BITMAP;
+            strncpy(d->name, names[i], sizeof(d->name) - 1);
+            d->field_indices[0] = fi_t;
+            d->field_index_count = 1;
+            d->bm_max_values = maxes[i];
+            d->bm_bool_fastpath = (ts_for_idx->fields[fi_t].type == FT_BOOL) ? 1 : 0;
             continue;
         }
         if (types[i] == IT_TRIGRAM) {
             if (!force && index_conf_has_line(existing_conf ? existing_conf : "",
                                               existing_conf_len, canonical))
                 continue;
-            if (descs) {
-                int fi_t = typed_field_index(ts_for_idx, names[i]);
-                MFFieldDesc *d = &descs[n_desc++];
-                memset(d, 0, sizeof(*d));
-                d->type = STREAM_TRIGRAM;
-                strncpy(d->name, names[i], sizeof(d->name) - 1);
-                d->field_indices[0] = fi_t;
-                d->field_index_count = 1;
+            int fi_t = typed_field_index(ts_for_idx, names[i]);
+            if (fi_t < 0) {
+                OUT("{\"error\":\"add-indexes: unknown field \\\"%s\\\"\"}\n", names[i]);
+                free(descs);
+                return -1;
             }
+            MFFieldDesc *d = &descs[n_desc++];
+            memset(d, 0, sizeof(*d));
+            d->type = STREAM_TRIGRAM;
+            strncpy(d->name, names[i], sizeof(d->name) - 1);
+            d->field_indices[0] = fi_t;
+            d->field_index_count = 1;
             continue;
         }
         memcpy(btree_fields[btree_count], names[i], 256);
@@ -3032,7 +3042,7 @@ int cmd_add_indexes(const char *db_root, const char *object,
             actual_count++;
         }
 
-        if (actual_count > 0 && descs) {
+        if (actual_count > 0) {
             for (int i = 0; i < actual_count; i++) {
                 int fi_t = typed_field_index(ts_for_idx, actual_fields[i]);
                 MFFieldDesc *d = &descs[n_desc++];
@@ -3052,6 +3062,11 @@ int cmd_add_indexes(const char *db_root, const char *object,
                             d->field_indices[d->field_index_count++] = ci;
                     }
                 } else {
+                    if (fi_t < 0) {
+                        OUT("{\"error\":\"add-indexes: unknown field \\\"%s\\\"\"}\n", actual_fields[i]);
+                        free(descs);
+                        return -1;
+                    }
                     d->field_indices[0] = fi_t;
                     d->field_index_count = 1;
                 }
@@ -3426,6 +3441,10 @@ static void mf_append_field(MFWorkerField *f, const MFFieldDesc *d,
     if (d->is_composite) {
         char cat[4096]; int cpos = 0; int ok = 1;
         for (int i = 0; i < d->field_index_count; i++) {
+            /* Pre-check remaining scratch space before the write: the
+               field's max encoded key length is its on-disk size. */
+            if ((size_t)ts->fields[d->field_indices[i]].size >
+                sizeof(cat) - (size_t)cpos) { ok = 0; break; }
             size_t blen = 0;
             typed_field_to_index_key(ts, value, d->field_indices[i],
                                       (uint8_t *)cat + cpos, &blen);
@@ -3440,6 +3459,7 @@ static void mf_append_field(MFWorkerField *f, const MFFieldDesc *d,
     } else {
         int fidx = d->field_indices[0];
         if (fidx < 0) return;
+        if ((size_t)ts->fields[fidx].size > sizeof(kb)) return;
         typed_field_to_index_key(ts, value, fidx, kb, &kl);
         if (kl == 0) return;
     }
