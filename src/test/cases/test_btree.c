@@ -199,6 +199,46 @@ static int test_btree_run(void) {
     for (int i = 0; i < nbulk; i++) free((char *)entries[i].value);
     free(entries);
     unlink(path);
+
+    /* Oversized index-key guard (CID 1699814 + best-effort parity):
+       btree_bulk_build skips entries with vlen > BT_MAX_VAL_LEN instead
+       of overflowing the prefix-compression buffer, and btree_delete
+       rejects them outright (the insert side already refuses them, so no
+       legitimate delete can ever carry such a key). */
+    {
+        BtEntry skip_entries[3];
+        char *long_key = malloc(1280);
+        memset(long_key, 'L', 1280);
+        char smalls1[] = "alpha", smalls2[] = "beta";
+        memset(skip_entries[0].hash, 0x11, 16);
+        memset(skip_entries[1].hash, 0x22, 16);
+        memset(skip_entries[2].hash, 0x33, 16);
+        skip_entries[0].value = long_key; skip_entries[0].vlen = 1280;
+        skip_entries[1].value = smalls1;  skip_entries[1].vlen = 5;
+        skip_entries[2].value = smalls2;  skip_entries[2].vlen = 4;
+        ASSERT_EQ_INT(btree_bulk_build(path, skip_entries, 3), 0,
+                      "bulk build with oversized entry still succeeds");
+        g_bt_count = 0;
+        btree_search(path, "alpha", 5, bt_count_cb, NULL);
+        ASSERT_EQ_INT(g_bt_count, 1, "small entries present after oversized skip");
+        g_bt_count = 0;
+        btree_search(path, "beta", 4, bt_count_cb, NULL);
+        ASSERT_EQ_INT(g_bt_count, 1, "second small entry present");
+        /* entry_count must reflect only the stored entries, or the next
+           merge's extract-all fails with EINVAL (count != entry_count). */
+        ASSERT_EQ_INT(btree_bulk_build(path, skip_entries, 3), 0,
+                      "rebuild over tree with skipped entries (extract-all intact)");
+        g_bt_count = 0;
+        btree_search(path, "alpha", 5, bt_count_cb, NULL);
+        ASSERT_EQ_INT(g_bt_count, 1, "small entries survive the second merge");
+        errno = 0;
+        ASSERT_EQ_INT(btree_delete(path, long_key, 1280, skip_entries[0].hash),
+                      -1, "oversized delete rejected");
+        ASSERT_EQ_INT(errno, EINVAL, "oversized delete errno EINVAL");
+        free(long_key);
+        unlink(path);
+    }
+
     bt_cache_shutdown();
     unlink(path);
     ASSERT_EQ_INT(rmdir(root), 0, "btree test temporary root cleaned");

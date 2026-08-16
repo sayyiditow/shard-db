@@ -1034,11 +1034,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         int as_table = (fmt && strcmp(fmt, "table") == 0);
         free(fmt);
 
-        int uc_used = 0, uc_total = 0; size_t uc_bytes = 0;
         int bc_used = 0, bc_total = 0; size_t bc_bytes = 0;
         bt_cache_stats(&bc_used, &bc_total, &bc_bytes);
-        uint64_t u_hits   = 0;
-        uint64_t u_miss   = 0;
         uint64_t b_hits   = __atomic_load_n(&g_bt_cache_hits,  __ATOMIC_RELAXED);
         uint64_t b_miss   = __atomic_load_n(&g_bt_cache_misses,__ATOMIC_RELAXED);
         uint64_t slow_n   = __atomic_load_n(&g_slow_query_count,__ATOMIC_RELAXED);
@@ -1053,14 +1050,11 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         int at = active_threads > 0 ? active_threads - 1 : 0;
 
         if (as_table) {
-            double u_hit_pct = (u_hits + u_miss) ? 100.0 * u_hits / (u_hits + u_miss) : 0.0;
             double b_hit_pct = (b_hits + b_miss) ? 100.0 * b_hits / (b_hits + b_miss) : 0.0;
             OUT("uptime          %.1fs\n", uptime / 1000.0);
             OUT("marker_recovery_ran %d\n", g_marker_recovery_ran);
             OUT("active_threads  %d\n", at);
             OUT("in_flight_wr    %d\n", in_flight_writes);
-            OUT("ucache          used=%d/%d bytes=%zu hit=%.1f%% (%lu/%lu)\n",
-                uc_used, uc_total, uc_bytes, u_hit_pct, u_hits, u_miss);
             OUT("bt_cache        used=%d/%d bytes=%zu hit=%.1f%% (%lu/%lu)\n",
                 bc_used, bc_total, bc_bytes, b_hit_pct, b_hits, b_miss);
             OUT("slow_query      count=%lu threshold=%dms\n", slow_n, g_slow_query_ms);
@@ -1078,13 +1072,11 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 commit_n, commit_hold_avg, commit_sync_avg, commit_hold_us, commit_sync_us);
         } else {
             OUT("{\"uptime_ms\":%lu,\"marker_recovery_ran\":%d,\"active_threads\":%d,\"in_flight_writes\":%d,"
-                "\"ucache\":{\"used\":%d,\"total\":%d,\"bytes\":%zu,\"hits\":%lu,\"misses\":%lu},"
                 "\"bt_cache\":{\"used\":%d,\"total\":%d,\"bytes\":%zu,\"hits\":%lu,\"misses\":%lu},"
                 "\"commit\":{\"count\":%lu,\"lock_hold_us_total\":%lu,\"lock_hold_us_avg\":%lu,"
                 "\"sync_us_total\":%lu,\"sync_us_avg\":%lu},"
                 "\"slow_query\":{\"threshold_ms\":%d,\"count\":%lu,\"recent\":[",
                 uptime, g_marker_recovery_ran, at, in_flight_writes,
-                uc_used, uc_total, uc_bytes, u_hits, u_miss,
                 bc_used, bc_total, bc_bytes, b_hits, b_miss,
                 commit_n, commit_hold_us, commit_hold_avg, commit_sync_us, commit_sync_avg,
                 g_slow_query_ms, slow_n);
@@ -1118,11 +1110,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
        Same atomics, different formatter. Counter names follow Prom conventions:
        _total suffix on monotonic counters, units in name (_seconds, _bytes), snake_case. */
     if (mode && strcmp(mode, "stats-prom") == 0) {
-        int uc_used = 0, uc_total = 0; size_t uc_bytes = 0;
         int bc_used = 0, bc_total = 0; size_t bc_bytes = 0;
         bt_cache_stats(&bc_used, &bc_total, &bc_bytes);
-        uint64_t u_hits   = 0;
-        uint64_t u_miss   = 0;
         uint64_t b_hits   = __atomic_load_n(&g_bt_cache_hits,  __ATOMIC_RELAXED);
         uint64_t b_miss   = __atomic_load_n(&g_bt_cache_misses,__ATOMIC_RELAXED);
         uint64_t slow_n   = __atomic_load_n(&g_slow_query_count,__ATOMIC_RELAXED);
@@ -1140,22 +1129,6 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         OUT("# HELP shard_db_in_flight_writes Write/schema requests currently executing.\n");
         OUT("# TYPE shard_db_in_flight_writes gauge\n");
         OUT("shard_db_in_flight_writes %d\n", in_flight_writes);
-
-        OUT("# HELP shard_db_ucache_used Currently occupied ucache slots.\n");
-        OUT("# TYPE shard_db_ucache_used gauge\n");
-        OUT("shard_db_ucache_used %d\n", uc_used);
-        OUT("# HELP shard_db_ucache_capacity Total ucache slot capacity.\n");
-        OUT("# TYPE shard_db_ucache_capacity gauge\n");
-        OUT("shard_db_ucache_capacity %d\n", uc_total);
-        OUT("# HELP shard_db_ucache_bytes Bytes of memory mapped by ucache.\n");
-        OUT("# TYPE shard_db_ucache_bytes gauge\n");
-        OUT("shard_db_ucache_bytes %zu\n", uc_bytes);
-        OUT("# HELP shard_db_ucache_hits_total Cumulative ucache hits.\n");
-        OUT("# TYPE shard_db_ucache_hits_total counter\n");
-        OUT("shard_db_ucache_hits_total %lu\n", u_hits);
-        OUT("# HELP shard_db_ucache_misses_total Cumulative ucache misses.\n");
-        OUT("# TYPE shard_db_ucache_misses_total counter\n");
-        OUT("shard_db_ucache_misses_total %lu\n", u_miss);
 
         OUT("# HELP shard_db_bt_cache_used Currently occupied B+ tree cache slots.\n");
         OUT("# TYPE shard_db_bt_cache_used gauge\n");

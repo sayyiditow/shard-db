@@ -183,11 +183,13 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_bare_shapes.c \
     src/test/cases/test_list_files.c \
     src/test/cases/test_bulk_update_json.c \
+    src/test/cases/test_bulk_update_json_oom.c \
     src/test/cases/test_bulk_update_delimited.c \
     src/test/cases/test_remove_field.c \
     src/test/cases/test_length_ops.c \
     src/test/cases/test_unknown_field_validation.c \
     src/test/cases/test_idx_cache_tenants.c \
+    src/test/cases/test_index_oversized_varchar.c \
     src/test/cases/test_odirect_single_shot.c \
     src/test/cases/test_cursor_with_total.c \
     src/test/cases/test_small_prefilter_orderby.c \
@@ -297,6 +299,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_removed_storage_surfaces.c \
     src/test/cases/test_keyset.c \
     src/test/cases/test_objlock_unit.c \
+    src/test/cases/test_query_plan_in_oom.c \
     src/test/cases/test_parallel.c \
     src/test/cases/test_planner_edge_cases.c \
     src/test/cases/test_signal_handling.c \

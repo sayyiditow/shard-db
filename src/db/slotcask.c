@@ -655,7 +655,7 @@ retry_kfcache_acquire:
     e->capacity = (sz - SLOTCASK_KF_HDR_SIZE) / sizeof(SlotcaskKfEntry);
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
-    e->used = 1;
+    atomic_store_explicit(&e->used, 1, memory_order_release);
     e->last_access = __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
     e->file_dev = dev;
     e->file_ino = ino;
@@ -682,6 +682,8 @@ retry_kfcache_acquire:
 
     h->slot = slot;
     kf_handle_from_entry(h, e);
+    /* coverity[missing_unlock] intentional: returning with the per-slot
+       rwlock held; caller releases via kfcache_release. */
     return 0;
 }
 
@@ -1459,32 +1461,22 @@ static int segcache_probe(const char *path, int *out_found) {
 
 /* Mirrors kfcache_invalidate_prefix -- drop every cached segment under a
    given path prefix while holding only the matching entry rwlock. */
+static int segcache_drop_slot(int slot, CacheDropReason reason, int wait);
+
 static void segcache_invalidate_prefix(const char *prefix) {
     if (!g_segcache || !prefix || !prefix[0]) return;
     size_t pl = strlen(prefix);
+    pthread_mutex_lock(&g_segcache_lock);
     for (int i = 0; i < g_segcache_slots; i++) {
         SegCacheEntry *e = &g_segcache[i];
         if (!atomic_load_explicit(&e->used, memory_order_acquire)) continue;
         if (strncmp(e->path, prefix, pl) != 0) continue;
-        pthread_rwlock_wrlock(&e->rwlock);
-        if (atomic_load_explicit(&e->used, memory_order_acquire) &&
-            strncmp(e->path, prefix, pl) == 0) {
-            /* Structural discard: the caller is deleting or has already
-               durably published a replacement under the object wrlock. */
-            if (e->map) munmap(e->map, e->map_size);
-            if (e->fd >= 0) close(e->fd);
-            e->map = NULL;
-            e->fd = -1;
-            e->map_size = 0;
-            e->path[0] = '\0';
-            atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
-            atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
-            atomic_fetch_add_explicit(&e->gen, 1, memory_order_release);
-            atomic_store_explicit(&e->used, 0, memory_order_release);
-            __sync_fetch_and_sub(&g_segcache_count, 1);
-        }
-        pthread_rwlock_unlock(&e->rwlock);
+        /* segcache_drop_slot re-verifies identity under the entry wrlock
+           and returns with g_segcache_lock held (entry -> table order,
+           mirroring kfcache_invalidate_slot_if_prefix). */
+        segcache_drop_slot(i, CACHE_DROP_DISCARD, 1);
     }
+    pthread_mutex_unlock(&g_segcache_lock);
 }
 
 /* Caller holds g_segcache_lock. Returns with it held. See the kf-cache

@@ -68,11 +68,6 @@ static int test_stats_prom_run(void) {
         "shard_db_uptime_seconds",
         "shard_db_active_threads",
         "shard_db_in_flight_writes",
-        "shard_db_ucache_used",
-        "shard_db_ucache_capacity",
-        "shard_db_ucache_bytes",
-        "shard_db_ucache_hits_total",
-        "shard_db_ucache_misses_total",
         "shard_db_bt_cache_used",
         "shard_db_bt_cache_capacity",
         "shard_db_bt_cache_bytes",
@@ -98,39 +93,20 @@ static int test_stats_prom_run(void) {
     }
 
     /* Type discipline. */
-    ASSERT_CONTAINS(resp, "# TYPE shard_db_ucache_hits_total counter",
-                    "ucache_hits_total typed counter");
-    ASSERT_CONTAINS(resp, "# TYPE shard_db_ucache_misses_total counter",
-                    "ucache_misses_total typed counter");
     ASSERT_CONTAINS(resp, "# TYPE shard_db_bt_cache_hits_total counter",
                     "bt_cache_hits_total typed counter");
     ASSERT_CONTAINS(resp, "# TYPE shard_db_slow_query_total counter",
                     "slow_query_total typed counter");
     ASSERT_CONTAINS(resp, "# TYPE shard_db_uptime_seconds gauge",
                     "uptime_seconds typed gauge");
-    ASSERT_CONTAINS(resp, "# TYPE shard_db_ucache_capacity gauge",
-                    "ucache_capacity typed gauge");
 
     /* Not JSON. */
     ASSERT_TRUE(resp[0] != '{', "output does not start with '{'");
-
-    long used_before = sample_value(resp, "shard_db_ucache_used");
-    long cap_before   = sample_value(resp, "shard_db_ucache_capacity");
-    long bytes_before = sample_value(resp, "shard_db_ucache_bytes");
-    long hits_before  = sample_value(resp, "shard_db_ucache_hits_total");
-    long miss_before  = sample_value(resp, "shard_db_ucache_misses_total");
     free(resp); resp = NULL;
 
-    ASSERT_TRUE(used_before == 0, "ucache_used is exactly 0 (pre-traffic)");
-    ASSERT_TRUE(cap_before == 0, "ucache_capacity is exactly 0 (pre-traffic)");
-    ASSERT_TRUE(bytes_before == 0, "ucache_bytes is exactly 0 (pre-traffic)");
-    ASSERT_TRUE(hits_before == 0, "ucache_hits_total is exactly 0 (pre-traffic)");
-    ASSERT_TRUE(miss_before == 0, "ucache_misses_total is exactly 0 (pre-traffic)");
-
-    /* Generate traffic — slotcask uses kfcache/segcache, not ucache. ucache
-       is dead on v2 (Task 3, this plan); every one of its stats fields is
-       now a hardcoded literal 0, retained only so existing dashboards
-       parsing these field/counter names don't break. */
+    /* Generate traffic — slotcask uses kfcache/segcache; ucache was removed
+       with the v2 storage migration (2026.08.1), so only bt_cache and the
+       request counters move here. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"prom_test\","
         "\"fields\":[\"name:varchar:32\"],\"splits\":16}", &resp); free(resp); resp = NULL;
@@ -144,24 +120,13 @@ static int test_stats_prom_run(void) {
 
     tc_request(tc, "{\"mode\":\"stats-prom\"}", &resp);
     ASSERT_NOT_NULL(resp, "stats-prom (post-traffic) returned output");
-    long used_after  = sample_value(resp, "shard_db_ucache_used");
-    long cap_after   = sample_value(resp, "shard_db_ucache_capacity");
-    long bytes_after = sample_value(resp, "shard_db_ucache_bytes");
-    long hits_after  = sample_value(resp, "shard_db_ucache_hits_total");
-    long miss_after  = sample_value(resp, "shard_db_ucache_misses_total");
     long up_before = sample_value(resp, "shard_db_uptime_seconds");
-
-    ASSERT_TRUE(used_after == 0, "ucache_used is exactly 0 (post-traffic)");
-    ASSERT_TRUE(cap_after == 0, "ucache_capacity is exactly 0 (post-traffic)");
-    ASSERT_TRUE(bytes_after == 0, "ucache_bytes is exactly 0 (post-traffic)");
-    ASSERT_TRUE(hits_after == 0, "ucache_hits_total is exactly 0 (post-traffic)");
-    ASSERT_TRUE(miss_after == 0, "ucache_misses_total is exactly 0 (post-traffic)");
 
     /* Counter samples are integer — no decimal point on hits_total sample
        line (start-of-line, not the HELP/TYPE comment lines that contain the
        metric name as a substring). */
     {
-        const char *needle = "shard_db_ucache_hits_total ";
+        const char *needle = "shard_db_bt_cache_hits_total ";
         size_t nlen = strlen(needle);
         const char *p = resp;
         const char *sample = NULL;
@@ -171,7 +136,7 @@ static int test_stats_prom_run(void) {
             if (!line_end) break;
             p = line_end + 1;
         }
-        ASSERT_NOT_NULL(sample, "hits_total sample line present");
+        ASSERT_NOT_NULL(sample, "bt_cache_hits_total sample line present");
         if (sample) {
             const char *q = sample + nlen;
             int has_dot = 0;
