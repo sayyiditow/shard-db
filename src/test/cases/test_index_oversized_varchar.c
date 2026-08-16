@@ -22,9 +22,23 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Appends at buf+off, clamping the returned offset to cap so a later
+   call's `cap - off` can never underflow. */
+static size_t safe_append(char *buf, size_t cap, size_t off, const char *fmt, ...) {
+    if (off >= cap) return cap;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, cap - off, fmt, ap);
+    va_end(ap);
+    if (n < 0) return off;
+    size_t written = (size_t)n;
+    return written >= cap - off ? cap : off + written;
+}
 
 static int test_index_oversized_varchar_run(void) {
     TestEnv env = {0};
@@ -52,14 +66,14 @@ static int test_index_oversized_varchar_run(void) {
     char *tagv = malloc(600);
     memset(tagv, 'x', 580); tagv[580] = '\0';
     size_t off = 0;
-    off += (size_t)snprintf(buf + off, 512 * 1024 - off,
+    off = safe_append(buf, 512 * 1024, off,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ovz_t\",\"records\":[");
     for (int i = 0; i < 50; i++) {
-        off += (size_t)snprintf(buf + off, 512 * 1024 - off,
+        off = safe_append(buf, 512 * 1024, off,
             "%s{\"key\":\"k%d\",\"value\":{\"tag\":\"%s\"}}",
             i ? "," : "", i, tagv);
     }
-    off += (size_t)snprintf(buf + off, 512 * 1024 - off, "]}");
+    off = safe_append(buf, 512 * 1024, off, "]}");
     tc_request(tc, buf, &resp);
     ASSERT_TRUE(strstr(resp, "\"error\"") == NULL, "bulk-insert oversized values succeeds");
     free(resp); resp = NULL;
@@ -84,14 +98,14 @@ static int test_index_oversized_varchar_run(void) {
        skipped — the write must not report failure. */
     memset(tagv, 'y', 590); tagv[590] = '\0';
     off = 0;
-    off += (size_t)snprintf(buf + off, 512 * 1024 - off,
+    off = safe_append(buf, 512 * 1024, off,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ovz_t\",\"records\":[");
     for (int i = 0; i < 50; i++) {
-        off += (size_t)snprintf(buf + off, 512 * 1024 - off,
+        off = safe_append(buf, 512 * 1024, off,
             "%s{\"key\":\"k%d\",\"value\":{\"tag\":\"%s\"}}",
             i ? "," : "", i, tagv);
     }
-    off += (size_t)snprintf(buf + off, 512 * 1024 - off, "]}");
+    off = safe_append(buf, 512 * 1024, off, "]}");
     tc_request(tc, buf, &resp);
     ASSERT_TRUE(strstr(resp, "\"error\"") == NULL,
                 "upsert with oversized old+new values succeeds");
@@ -104,13 +118,13 @@ static int test_index_oversized_varchar_run(void) {
     /* Bulk-delete: each record carries an oversized old tag; the index
        deletes must be no-ops, and the deletes themselves must succeed. */
     off = 0;
-    off += (size_t)snprintf(buf + off, 512 * 1024 - off,
+    off = safe_append(buf, 512 * 1024, off,
         "{\"mode\":\"bulk-delete\",\"dir\":\"default\",\"object\":\"ovz_t\",\"keys\":[");
     for (int i = 0; i < 50; i++) {
-        off += (size_t)snprintf(buf + off, 512 * 1024 - off,
+        off = safe_append(buf, 512 * 1024, off,
             "%s\"k%d\"", i ? "," : "", i);
     }
-    off += (size_t)snprintf(buf + off, 512 * 1024 - off, "]}");
+    off = safe_append(buf, 512 * 1024, off, "]}");
     tc_request(tc, buf, &resp);
     ASSERT_TRUE(strstr(resp, "\"error\"") == NULL, "bulk-delete oversized records succeeds");
     free(resp); resp = NULL;
@@ -136,14 +150,14 @@ static int test_index_oversized_varchar_run(void) {
     memset(bigv, 'z', 4500); bigv[4500] = '\0';
     memset(abv, 'q', 3000); abv[3000] = '\0';
     off = 0;
-    off += (size_t)snprintf(buf + off, 512 * 1024 - off,
+    off = safe_append(buf, 512 * 1024, off,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ovz_big\",\"records\":[");
     for (int i = 0; i < 20; i++) {
-        off += (size_t)snprintf(buf + off, 512 * 1024 - off,
+        off = safe_append(buf, 512 * 1024, off,
             "%s{\"key\":\"b%d\",\"value\":{\"big\":\"%s\",\"a\":\"%s\",\"b\":\"%s\"}}",
             i ? "," : "", i, bigv, abv, abv);
     }
-    off += (size_t)snprintf(buf + off, 512 * 1024 - off, "]}");
+    off = safe_append(buf, 512 * 1024, off, "]}");
     tc_request(tc, buf, &resp);
     ASSERT_TRUE(strstr(resp, "\"error\"") == NULL, "bulk-insert big-field records succeeds");
     free(resp); resp = NULL;

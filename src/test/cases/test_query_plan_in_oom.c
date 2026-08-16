@@ -14,6 +14,7 @@
 #include "test_runner.h"
 #include "test_assert.h"
 #include "../db/types.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -21,10 +22,23 @@ extern void query_plan_test_set_fail_grow(int fail_n);
 
 #define IN_ELEMS 66
 
+/* Appends at buf+off, clamping the returned offset to cap so a later
+   call's `cap - off` can never underflow. */
+static size_t safe_append(char *buf, size_t cap, size_t off, const char *fmt, ...) {
+    if (off >= cap) return cap;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, cap - off, fmt, ap);
+    va_end(ap);
+    if (n < 0) return off;
+    size_t written = (size_t)n;
+    return written >= cap - off ? cap : off + written;
+}
+
 static int run_one(const char *label, const char *value_form) {
     char json[8192];
     size_t off = 0;
-    off += (size_t)snprintf(json + off, sizeof(json) - off,
+    off = safe_append(json, sizeof(json), off,
         "[{\"field\":\"f\",\"op\":\"in\",\"value\":%s}]", value_form);
 
     SearchCriterion *crit = NULL;
@@ -52,27 +66,27 @@ static int test_query_plan_in_oom_run(void) {
 
     /* Form 1: JSON array of quoted elements  -> quoted grow site. */
     off = 0;
-    off += (size_t)snprintf(quoted + off, sizeof(quoted) - off, "[");
+    off = safe_append(quoted, sizeof(quoted), off, "[");
     for (int i = 0; i < IN_ELEMS; i++)
-        off += (size_t)snprintf(quoted + off, sizeof(quoted) - off,
+        off = safe_append(quoted, sizeof(quoted), off,
             "%s\"e%d\"", i ? "," : "", i);
-    off += (size_t)snprintf(quoted + off, sizeof(quoted) - off, "]");
+    off = safe_append(quoted, sizeof(quoted), off, "]");
 
     /* Form 2: JSON array of bare (unquoted) elements -> bare grow site. */
     off = 0;
-    off += (size_t)snprintf(unquoted + off, sizeof(unquoted) - off, "[");
+    off = safe_append(unquoted, sizeof(unquoted), off, "[");
     for (int i = 0; i < IN_ELEMS; i++)
-        off += (size_t)snprintf(unquoted + off, sizeof(unquoted) - off,
+        off = safe_append(unquoted, sizeof(unquoted), off,
             "%se%d", i ? "," : "", i);
-    off += (size_t)snprintf(unquoted + off, sizeof(unquoted) - off, "]");
+    off = safe_append(unquoted, sizeof(unquoted), off, "]");
 
     /* Form 3: bare CSV string value -> comma-token grow site. */
     off = 0;
-    off += (size_t)snprintf(bare + off, sizeof(bare) - off, "\"");
+    off = safe_append(bare, sizeof(bare), off, "\"");
     for (int i = 0; i < IN_ELEMS; i++)
-        off += (size_t)snprintf(bare + off, sizeof(bare) - off,
+        off = safe_append(bare, sizeof(bare), off,
             "%se%d", i ? "," : "", i);
-    off += (size_t)snprintf(bare + off, sizeof(bare) - off, "\"");
+    off = safe_append(bare, sizeof(bare), off, "\"");
 
     if (run_one("quoted-array form", quoted) != 0) return 1;
     if (run_one("unquoted-array form", unquoted) != 0) return 1;
