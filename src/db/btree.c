@@ -552,7 +552,7 @@ static int bt_cache_evict_slot(int slot, CacheDropReason reason, int wait,
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     atomic_store_explicit(&e->validated_publish_generation, 0,
                           memory_order_relaxed);
-    e->used = BT_CACHE_TOMBSTONE;
+    atomic_store_explicit(&e->used, BT_CACHE_TOMBSTONE, memory_order_relaxed);
     e->path[0] = '\0';
     bt_cache_count--;
     pthread_rwlock_unlock(&e->rwlock);
@@ -1010,7 +1010,7 @@ retry_bt_acquire:
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     atomic_store_explicit(&e->validated_publish_generation,
                           opened_generation, memory_order_release);
-    e->used = BT_CACHE_LIVE;
+    atomic_store_explicit(&e->used, BT_CACHE_LIVE, memory_order_relaxed);
     e->last_access = __atomic_add_fetch(&bt_cache_clock, 1, __ATOMIC_RELAXED);
     bt_cache_count++;
     pthread_rwlock_t *lock = &e->rwlock;

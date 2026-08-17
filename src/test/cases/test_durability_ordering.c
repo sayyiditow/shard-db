@@ -688,6 +688,104 @@ static int test_durability_sigkill_marker_after_write_recovers(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+/* 3) A marker file surviving crash recovery with a corrupted (out-of-range)
+   kf_slot must be rejected safely by the UPDATE replay path, not used to
+   index kh->map out of bounds. Regression test for the missing bounds
+   check in kf_marker_replay_upsert_entry_locked's has_old branch
+   (src/db/slotcask.c). Distinct from test_durability_corrupt_marker_policy
+   below: this marker has a VALID magic/checksum (kf_marker_write
+   recomputes it), so it passes fail-closed startup validation and reaches
+   replay — only kf_slot itself is semantically out of range. */
+static int test_durability_corrupt_update_marker_kf_slot_rejected(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) return 1;
+    int saved_port = env.port;
+    char saved_db_root[256];
+    snprintf(saved_db_root, sizeof(saved_db_root), "%s", env.db_root);
+
+    const char *object = "durabcorruptslot";
+    ASSERT_EQ_INT(create_indexed_object_with_records(&env, object, 20), 0,
+                  "create indexed fixture for corrupt-marker test");
+    test_env_stop_keep(&env);
+
+    char clean_flag[PATH_MAX];
+    snprintf(clean_flag, sizeof(clean_flag), "%s/.shard-db.clean", saved_db_root);
+    ASSERT_EQ_INT(access(clean_flag, F_OK), 0,
+                  "clean flag present after graceful stop");
+
+    ASSERT_EQ_INT(append_durability_pause_config(saved_db_root, "marker-after-write"), 0,
+                  "enable deterministic marker-after-write pause");
+    ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
+                  "restart with pause hook enabled");
+    if (env.daemon_pid <= 0) return 1;
+
+    /* Update an EXISTING key (item0005 from the fixture) so the commit
+       takes the has_old=1 / UPDATE branch, not the insert/has_old=0 one. */
+    pid_t update_pid = trigger_insert(&env, object, "item0005", 777);
+    ASSERT_TRUE(update_pid > 0, "spawn update request that will pause mid-commit");
+
+    char marker[PATH_MAX];
+    snprintf(marker, sizeof(marker),
+             "%s/default/%s/.durability-test-marker-after-write.active",
+             saved_db_root, object);
+    ASSERT_EQ_INT(wait_for_path(marker, 20000), 0,
+                  "update reaches deterministic marker-after-write pause");
+    test_env_kill(&env);
+    unlink(marker);
+    if (update_pid > 0) waitpid(update_pid, NULL, 0);
+
+    /* Corrupt the real, just-written marker's kf_slot to an out-of-range
+       value before recovery runs. Any of the object's 8 kf shards could
+       hold the marker; find it and mutate it in place. */
+    int corrupted = 0;
+    for (int sid = 0; sid < 8 && !corrupted; sid++) {
+        char data_dir[PATH_MAX];
+        snprintf(data_dir, sizeof(data_dir), "%s/default/%s",
+                 saved_db_root, object);
+        KfMarkerSlot slot;
+        if (kf_marker_read(data_dir, sid, &slot) == 0) {
+            ASSERT_EQ_INT(slot.has_old, 1,
+                          "captured marker is the UPDATE we triggered");
+            slot.kf_slot = 0x7FFFFFFF; /* far beyond any real kf capacity */
+            ASSERT_EQ_INT(kf_marker_write(data_dir, sid, &slot), 0,
+                          "rewrite marker with corrupted kf_slot");
+            corrupted = 1;
+        }
+    }
+    ASSERT_TRUE(corrupted, "found and corrupted the pending update marker");
+
+    /* Recovery sweep must reject the corrupted marker without crashing or
+       corrupting kh->map — under ASan this is where an unchecked
+       kf_repoint_at_slot would show a heap-buffer-overflow. It must NOT
+       silently skip the bad marker and keep serving, though: this
+       codebase's documented crash-safety policy is fail-closed on
+       corrupt/mismatched recovery evidence (see AGENTS.md), so the
+       correct, safe outcome is a clean refusal to start. */
+    int start_rc = test_env_start_at(&env, saved_db_root, saved_port);
+    ASSERT_TRUE(start_rc != 0,
+                "daemon refuses to start over a corrupted marker (fail-closed)");
+
+    /* Prove the fail-closed state is operator-recoverable: clearing the
+       rejected marker lets a subsequent restart succeed and recover the
+       other 19 untouched fixture records — nothing was corrupted or
+       fabricated, only the crashed update itself was never applied. The
+       restart below succeeding on the same port/db_root is itself proof
+       no daemon was left running after the fail-closed refusal above. */
+    for (int sid = 0; sid < 8; sid++) {
+        char data_dir[PATH_MAX];
+        snprintf(data_dir, sizeof(data_dir), "%s/default/%s", saved_db_root, object);
+        kf_marker_clear(data_dir, sid);
+    }
+    ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
+                  "restart succeeds once the corrupted marker is cleared");
+    if (env.daemon_pid > 0) {
+        ASSERT_EQ_INT(request_count(&env, object), 20,
+                      "all fixture records intact after clearing the bad marker");
+        test_env_stop(&env);
+    }
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
 /* 3) Corrupt-marker policy: a non-empty marker with an invalid
    magic/checksum must fail startup closed (marker retained, listener
    never binds); a zero-byte marker (torn create before fsync) is benign
@@ -1455,6 +1553,7 @@ TEST_REGISTER("test-ordering-marker-clean-after-crud", test_ordering_marker_clea
 TEST_REGISTER("test-ordering-delete-marker-free", test_ordering_delete_marker_free)
 TEST_REGISTER("test-durability-clean-shutdown-skips-recovery", test_durability_clean_shutdown_skips_recovery)
 TEST_REGISTER("test-durability-sigkill-marker-after-write-recovers", test_durability_sigkill_marker_after_write_recovers)
+TEST_REGISTER("test-durability-corrupt-update-marker-kf-slot-rejected", test_durability_corrupt_update_marker_kf_slot_rejected)
 TEST_REGISTER("test-durability-corrupt-marker-policy", test_durability_corrupt_marker_policy)
 TEST_REGISTER("test-durability-bulk-marker-recovers", test_durability_bulk_marker_recovers)
 TEST_REGISTER("test-durability-bulk-window-prepared-recovers", test_durability_bulk_window_prepared_recovers)

@@ -245,7 +245,7 @@ static int kfcache_drop_slot(int slot, CacheDropReason reason, int wait) {
     e->capacity = 0;
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
-    e->used = 0;
+    atomic_store_explicit(&e->used, 0, memory_order_relaxed);
     e->path[0] = '\0';
     /* Increment gen under g_kfcache_lock (caller always holds it).
        Any SlotRef pointing at this slot will fail its gen check after
@@ -538,15 +538,12 @@ retry_kfcache_acquire:
             __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
         pthread_rwlock_t *lock = &g_kfcache[slot].rwlock;
         pthread_mutex_unlock(&g_kfcache_lock);
+        /* nonblocking is unreachable here: the miss-path gate above
+           (line ~524) already returns -1 for nonblocking before
+           kf_open_file() is ever called, so nonblocking is always 0
+           by this point (Coverity CID 1700136, occurrence 1 of 2). */
         if (writer) {
             pthread_rwlock_wrlock(lock);
-        } else if (nonblocking) {
-            if (pthread_rwlock_tryrdlock(lock) != 0) {
-                munmap(base, sz);
-                close(fd);
-                errno = EBUSY;
-                return -1;
-            }
         } else {
             pthread_rwlock_rdlock(lock);
         }
@@ -666,10 +663,11 @@ retry_kfcache_acquire:
        mapping; identity verification detects that and retries safely. */
     pthread_rwlock_t *lock = &e->rwlock;
     pthread_mutex_unlock(&g_kfcache_lock);
+    /* nonblocking is unreachable here for the same reason as the re-probe
+       branch above: the miss-path gate already returned -1 for nonblocking
+       before we ever reached the open+install code (CID 1700136, 2 of 2). */
     if (writer) {
         pthread_rwlock_wrlock(lock);
-    } else if (nonblocking) {
-        if (pthread_rwlock_tryrdlock(lock) != 0) { errno = EBUSY; return -1; }
     } else {
         pthread_rwlock_rdlock(lock);
     }
@@ -2919,10 +2917,14 @@ static int kf_marker_replay_upsert_entry_locked(const char *eff_root, const char
     if (marker->has_old) {
         /* Update: repoint to new record. */
         size_t slot = (size_t)marker->kf_slot;
-        kf_repoint_at_slot(kh, slot, marker->new_stream_id,
-                          marker->new_file_id, marker->new_offset);
-        size_t slots[] = { slot };
-        if (kfcache_sync_slots_locked(kh, slots, 1, 0) != 0) step3_rc = -1;
+        if (marker->kf_slot >= kh->capacity) {
+            step3_rc = -1;
+        } else {
+            kf_repoint_at_slot(kh, slot, marker->new_stream_id,
+                              marker->new_file_id, marker->new_offset);
+            size_t slots[] = { slot };
+            if (kfcache_sync_slots_locked(kh, slots, 1, 0) != 0) step3_rc = -1;
+        }
     } else {
         /* Insert: place the new record into kf if it isn't already there
            (idempotent — a prior partial replay may have already inserted
