@@ -780,25 +780,99 @@ typedef struct {
     uint8_t *val;               /* heap-owned bytes (index-key encoding); freed by caller */
     size_t vlen;
     const uint8_t *hash16;
-    int sync_after;
     int out_error;
     int out_errno;
 } IndexThreadArg;
+
+/* Flush the (field, idx-shard) files one record's index mutations touched —
+   for a single record that is exactly one file per non-bitmap field — and
+   issue the flushes in parallel: they target distinct files, so they are
+   independent, and this collapses N serialized flush latencies into ~one.
+   Must complete before the calling commit hook returns (invariant I1: index
+   durable before marker clear). Bitmap fields are the caller's
+   responsibility (bm_sync runs inside the bitmap apply paths while the
+   writer handle is open) — callers must filter them out.
+   Callers must pass only fields that actually received entries this op:
+   bt_acquire(writer) O_CREATs missing files, so syncing a never-written
+   field would materialize an empty .idx/.tg.
+   Returns 0, or -1 if any flush failed — errno is set on the calling
+   thread to the failing flush's real errno (or EIO if none was captured)
+   before returning, since errno is thread-local and the flushes may have
+   run on worker threads. */
+typedef struct {
+    char path[PATH_MAX];
+    int rc;
+    int err;
+} IdxSyncArg;
+
+static void *idx_sync_thread_fn(void *p) {
+    IdxSyncArg *a = (IdxSyncArg *)p;
+    a->rc = btree_sync_path(a->path);
+    a->err = a->rc != 0 ? errno : 0;
+    return NULL;
+}
+
+int index_sync_record_fields(const char *db_root, const char *object, int splits,
+                             const uint8_t hash16[16],
+                             const char *const *fields,
+                             const enum IndexType *types, int nfields) {
+    if (nfields <= 0 || !fields) return 0;
+    IdxSyncArg *args = malloc((size_t)nfields * sizeof(*args));
+    if (!args) {
+        /* OOM: serial fallback — same files, same ordering, no dispatch. */
+        int rc = 0, saved_err = 0;
+        for (int i = 0; i < nfields; i++) {
+            if (types && types[i] == IT_BITMAP) continue;
+            char path[PATH_MAX];
+            int shard = idx_shard_for_hash(hash16, splits);
+            if (types && types[i] == IT_TRIGRAM)
+                tg_build_path(path, sizeof(path), db_root, object, fields[i], shard);
+            else
+                build_idx_path(path, sizeof(path), db_root, object, fields[i], shard);
+            if (btree_sync_path(path) != 0) {
+                if (!saved_err) saved_err = errno;
+                rc = -1;
+            }
+        }
+        if (rc != 0) errno = saved_err ? saved_err : EIO;
+        return rc;
+    }
+    int n = 0;
+    for (int i = 0; i < nfields; i++) {
+        if (types && types[i] == IT_BITMAP) continue;
+        int shard = idx_shard_for_hash(hash16, splits);
+        if (types && types[i] == IT_TRIGRAM)
+            tg_build_path(args[n].path, sizeof(args[n].path), db_root, object,
+                          fields[i], shard);
+        else
+            build_idx_path(args[n].path, sizeof(args[n].path), db_root, object,
+                           fields[i], shard);
+        args[n].rc = 0;
+        args[n].err = 0;
+        n++;
+    }
+    int rc = 0;
+    if (n == 1) {
+        idx_sync_thread_fn(&args[0]);   /* skip dispatch for the common case */
+    } else if (n > 1) {
+        parallel_for(idx_sync_thread_fn, args, n, sizeof(IdxSyncArg));
+    }
+    int saved_err = 0;
+    for (int i = 0; i < n; i++)
+        if (args[i].rc != 0) {
+            rc = -1;
+            if (!saved_err) saved_err = args[i].err;
+        }
+    free(args);
+    if (rc != 0) errno = saved_err ? saved_err : EIO;
+    return rc;
+}
 
 void *index_thread_fn(void *arg) {
     IndexThreadArg *a = (IndexThreadArg *)arg;
     a->out_error = write_index_entry(a->db_root, a->object, a->field,
                                      a->splits, a->val, a->vlen, a->hash16);
     a->out_errno = a->out_error ? errno : 0;
-    if (!a->out_error && a->sync_after) {
-        int shard = idx_shard_for_hash(a->hash16, a->splits);
-        char idx_path[PATH_MAX];
-        build_idx_path(idx_path, sizeof(idx_path), a->db_root, a->object, a->field, shard);
-        if (btree_sync_path(idx_path) != 0) {
-            a->out_error = -2;
-            a->out_errno = errno;
-        }
-    }
     if (!a->out_error && index_test_should_fail_after_success()) {
         a->out_error = -2;
         a->out_errno = EIO;
@@ -870,7 +944,7 @@ char *build_composite_value(const char *field_name, const char *json_value) {
 int index_parallel(const char *db_root, const char *object, int splits,
                    const char *value, const uint8_t hash16[16],
                    char fields[][256], int nfields,
-                   const enum IndexType *types, int sync_after) {
+                   const enum IndexType *types) {
     if (nfields <= 0) return 0;
 
     TypedSchema *ts = load_typed_schema(db_root, object);
@@ -1024,7 +1098,6 @@ int index_parallel(const char *db_root, const char *object, int splits,
         args[tcount].val = key_buf;
         args[tcount].vlen = key_len;
         args[tcount].hash16 = hash16;
-        args[tcount].sync_after = sync_after;
         args[tcount].out_error = 0;
         args[tcount].out_errno = 0;
         tcount++;
@@ -1040,6 +1113,27 @@ int index_parallel(const char *db_root, const char *object, int splits,
             saved_errno = args[i].out_errno;
         }
         free(idx_keys[i]);
+    }
+    if (tcount > 0) {
+        /* Flush only the files this call actually wrote. Syncing a
+           never-written field would O_CREAT an empty .idx via the writer
+           acquire path. */
+        const char *sync_fields[MAX_FIELDS];
+        enum IndexType sync_types[MAX_FIELDS];
+        for (int i = 0; i < tcount; i++) {
+            sync_fields[i] = args[i].field;
+            sync_types[i] = IT_BTREE;
+        }
+        if (index_sync_record_fields(db_root, object, splits, hash16,
+                                     sync_fields, sync_types, tcount) != 0) {
+            /* Capture the flush's real errno (e.g. ENOSPC) so the
+               rc != 0 handler below doesn't mask it to generic EIO — but
+               never overwrite a prior mutation error already in
+               saved_errno. Diagnostics only; failure fails closed either
+               way. */
+            if (!saved_errno) saved_errno = errno;
+            rc = -1;
+        }
     }
     for (int i = 0; i < unique_count; i++) free(extracted[i]);
     for (int i = 0; i < unique_count; i++) {
@@ -2922,7 +3016,14 @@ int cmd_add_indexes(const char *db_root, const char *object,
     int btree_count = 0;
     char btree_fields[MAX_FIELDS][256];
     /* total_fields > 0 always holds here: the nfields==0 case already
-       returned above, and nothing between there and here modifies nfields. */
+       returned above, and nothing between there and here modifies nfields.
+       The explicit guard is for the compiler, not the caller — without it,
+       a hypothetically negative int widens to a near-SIZE_MAX size_t and
+       trips -Walloc-size-larger-than under ASan builds. */
+    if (total_fields <= 0) {
+        OUT("{\"error\":\"cannot allocate index build descriptors\"}\n");
+        return -1;
+    }
     MFFieldDesc *descs = calloc((size_t)total_fields, sizeof(MFFieldDesc));
     if (!descs) {
         OUT("{\"error\":\"cannot allocate index build descriptors\"}\n");

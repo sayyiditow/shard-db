@@ -793,8 +793,18 @@ uint32_t bm_max_values(const BitmapShard *bm) {
     return bm ? bm->hdr.max_values : 0;
 }
 
+#ifdef TEST_BUILD
+#include <stdatomic.h>
+static _Atomic int g_test_bm_sync_count;
+void bm_test_sync_reset(void) { atomic_store(&g_test_bm_sync_count, 0); }
+int  bm_test_sync_count(void) { return atomic_load(&g_test_bm_sync_count); }
+#endif
+
 int bm_sync(BitmapShard *bm) {
     if (!bm || !bm->writer || bm->fd < 0) { errno = EINVAL; return -1; }
+#ifdef TEST_BUILD
+    atomic_fetch_add(&g_test_bm_sync_count, 1);
+#endif
     return fdatasync(bm->fd);
 }
 

@@ -581,6 +581,8 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
            to ~1µs parallel (limited by core count). */
         char *old_json = typed_decode(c->idx_ts, old->value, (uint32_t)old->vlen);
         UpdateIdxArg args[MAX_FIELDS];
+        const char *ch_fields[MAX_FIELDS];
+        enum IndexType ch_types[MAX_FIELDS];
         int n_args = 0;
         for (int i = 0; i < c->nfields; i++) {
             uint8_t *new_key = NULL, *old_key = NULL;
@@ -635,7 +637,12 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                 args[n_args].kf_shard = c->kf_shard;
                 args[n_args].kf_slot  = c->kf_slot;
                 args[n_args].bm_max_values = 0;  /* default cap — header wins on existing */
-                args[n_args].sync_after = 1;
+                ch_fields[n_args] = c->fields[i];
+                ch_types[n_args] = c->idx_types ? c->idx_types[i] : IT_BTREE;
+                /* Bitmap keeps sync_after=1 so bm_sync fires inside
+                   bitmap_update under its open writer handle (I3);
+                   btree/trigram durability moves to the collector below. */
+                args[n_args].sync_after = (ch_types[n_args] == IT_BITMAP) ? 1 : 0;
                 n_args++;
             } else {
                 /* Unchanged — free immediately, nothing to dispatch. */
@@ -654,6 +661,11 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                 free(args[i].old_key);
             }
         }
+        if (n_args > 0 &&
+            index_sync_record_fields(c->db_root, c->object, c->splits,
+                                     c->hash, ch_fields, ch_types,
+                                     n_args) != 0)
+            idx_failed = 1;
         free(old_json);
         bm_flush_thread_bitmap_cache();
         if (idx_failed) return -1;
@@ -768,11 +780,14 @@ static int v2_insert_apply_commit(const uint8_t *new_value, size_t new_vlen,
                                   uint32_t planned_kf_slot, void *ctx_ptr) {
     (void)new_value; (void)new_vlen; (void)planned_kf_slot;
     V2InsertCtx *c = (V2InsertCtx *)ctx_ptr;
+    UpdateIdxArg tg_args[MAX_FIELDS];
+    const char *tg_fields[MAX_FIELDS];
+    int n_tg = 0;
     if (c->nfields == 0) return 0;
 
     if (index_parallel(c->db_root, c->object, c->splits,
                        c->value_json, c->hash, c->fields, c->nfields,
-                       c->idx_types, /*sync_after=*/1) != 0) {
+                       c->idx_types) != 0) {
         snprintf(c->err_buf, sizeof(c->err_buf),
                  "btree index update failed during insert: %s",
                  strerror(errno));
@@ -787,8 +802,6 @@ static int v2_insert_apply_commit(const uint8_t *new_value, size_t new_vlen,
            path (no per-file cap). update_idx_fn's IT_TRIGRAM branch
            extracts distinct trigrams from new_key and writes one .tg
            leaf entry per (trigram, record hash). */
-        UpdateIdxArg tg_args[MAX_FIELDS];
-        int n_tg = 0;
         for (int i = 0; i < c->nfields; i++) {
             if (c->idx_types[i] != IT_TRIGRAM) continue;
             if (strchr(c->fields[i], '+')) continue;  /* composite + trigram = rejected upstream */
@@ -819,6 +832,9 @@ static int v2_insert_apply_commit(const uint8_t *new_value, size_t new_vlen,
             tg_args[n_tg].kf_shard = c->kf_shard;
             tg_args[n_tg].kf_slot  = c->kf_slot;
             tg_args[n_tg].bm_max_values = 0;
+            tg_args[n_tg].sync_after = 0;  /* was uninitialized stack garbage;
+                                              durability moves to index_sync_record_fields */
+            tg_fields[n_tg] = c->fields[i];
             n_tg++;
         }
         if (n_tg > 0) {
@@ -841,6 +857,14 @@ static int v2_insert_apply_commit(const uint8_t *new_value, size_t new_vlen,
         bitmap_prepare_set_free(&c->bm_prep);
         v2_insert_bm_owned_free(c);
         bm_flush_thread_bitmap_cache();
+    }
+    if (n_tg > 0) {
+        enum IndexType tg_types[MAX_FIELDS];
+        for (int i = 0; i < n_tg; i++) tg_types[i] = IT_TRIGRAM;
+        if (index_sync_record_fields(c->db_root, c->object, c->splits,
+                                     c->hash, tg_fields, tg_types,
+                                     n_tg) != 0)
+            idx_failed = 1;
     }
     return idx_failed ? -1 : 0;
 }
@@ -1280,6 +1304,8 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
     size_t arena_bytes = (size_t)a->nidx * (size_t)(2 * INDEX_KEY_MAX);
     uint8_t *arena = malloc(arena_bytes);
     UpdateIdxArg args[MAX_FIELDS];
+    const char *ch_fields[MAX_FIELDS];
+    enum IndexType ch_types[MAX_FIELDS];
     uint8_t *fb_bufs[2 * MAX_FIELDS]; int n_fb = 0;
     int n_args = 0;
 
@@ -1353,7 +1379,11 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
             args[n_args].kf_shard = a->kf_shard;
             args[n_args].kf_slot  = a->kf_slot;
             args[n_args].bm_max_values = 0;
-            args[n_args].sync_after = 1;
+            ch_fields[n_args] = a->idx_fields[i];
+            ch_types[n_args] = a->idx_types ? a->idx_types[i] : IT_BTREE;
+            /* Bitmap keeps sync_after=1 (I3); btree/trigram move to the
+               collector below. */
+            args[n_args].sync_after = (ch_types[n_args] == IT_BITMAP) ? 1 : 0;
             n_args++;
         }
     }
@@ -1367,6 +1397,11 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
                 idx_failed = 1;
         }
     }
+    if (n_args > 0 &&
+        index_sync_record_fields(a->db_root, a->object, a->splits,
+                                 a->hash, ch_fields, ch_types,
+                                 n_args) != 0)
+        idx_failed = 1;
     for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
     free(arena);
     bm_flush_thread_bitmap_cache();
@@ -1672,6 +1707,8 @@ static int v2_delete_apply_commit(const SlotcaskOldRecord *old,
     size_t arena_bytes = (size_t)c->nidx * (size_t)INDEX_KEY_MAX;
     uint8_t *arena = malloc(arena_bytes);
     UpdateIdxArg args[MAX_FIELDS];
+    const char *ch_fields[MAX_FIELDS];
+    enum IndexType ch_types[MAX_FIELDS];
     uint8_t *fb_bufs[MAX_FIELDS]; int n_fb = 0;
     int n_args = 0;
 
@@ -1711,6 +1748,13 @@ static int v2_delete_apply_commit(const SlotcaskOldRecord *old,
         args[n_args].kf_shard = c->kf_shard;
         args[n_args].kf_slot  = kf_slot;
         args[n_args].bm_max_values = 0;
+        ch_fields[n_args] = c->idx_fields[i];
+        ch_types[n_args] = c->idx_types ? c->idx_types[i] : IT_BTREE;
+        /* sync_after was UNINITIALIZED stack garbage (bug: deletes on
+           btree/trigram fields synced only if garbage said so). Bitmap
+           keeps 1 so bm_sync fires inside bitmap_update (I3); the rest
+           move to the collector below. */
+        args[n_args].sync_after = (ch_types[n_args] == IT_BITMAP) ? 1 : 0;
         n_args++;
     }
 
@@ -1723,6 +1767,11 @@ static int v2_delete_apply_commit(const SlotcaskOldRecord *old,
                 idx_failed = 1;
         }
     }
+    if (n_args > 0 &&
+        index_sync_record_fields(c->db_root, c->object, c->splits,
+                                 c->hash, ch_fields, ch_types,
+                                 n_args) != 0)
+        idx_failed = 1;
     for (int i = 0; i < n_fb; i++) free(fb_bufs[i]);
     free(arena);
     bm_flush_thread_bitmap_cache();

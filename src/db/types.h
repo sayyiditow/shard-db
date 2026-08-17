@@ -1002,7 +1002,7 @@ int delete_index_entry(const char *db_root, const char *object, const char *fiel
 int index_parallel(const char *db_root, const char *object, int splits,
                    const char *value, const uint8_t hash16[16],
                    char fields[][256], int nfields,
-                   const enum IndexType *types, int sync_after);
+                   const enum IndexType *types);
 int cmd_add_index(const char *db_root, const char *object, const char *field, int force);
 int cmd_add_indexes(const char *db_root, const char *object, const char *fields_json, int force);
 
@@ -1488,6 +1488,16 @@ typedef struct {
                                      reindex leave this 0. */
 } UpdateIdxArg;
 void *update_idx_fn(void *arg);
+
+/* Flush the touched (field, idx-shard) files for one record's index
+   mutations, in parallel. Commit hooks call this after applying mutations,
+   before returning (index durable before marker clear). Bitmap fields must
+   be filtered out by the caller, and only fields that actually received
+   entries may be passed (writer acquire creates missing files). */
+int index_sync_record_fields(const char *db_root, const char *object, int splits,
+                             const uint8_t hash16[16],
+                             const char *const *fields,
+                             const enum IndexType *types, int nfields);
 
 /* ── Bitmap prepare/apply split ──────────────────────────────────────────
    Closes the cap-check-then-apply race without transferring rwlock-owned

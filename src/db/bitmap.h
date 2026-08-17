@@ -146,6 +146,11 @@ void bm_test_fail_reset(void);
    writer=1. Used by the marker-governed CRUD path. */
 int bm_sync(BitmapShard *bm);
 
+#ifdef TEST_BUILD
+void bm_test_sync_reset(void);
+int  bm_test_sync_count(void);
+#endif
+
 /* Non-mutating cap preflight: would inserting `value` (if it isn't already
    in the dict) push n_values past max_values? `bm` must be a writer handle
    (same-thread ownership requirement mirrors bm_set/bm_clear). Returns 1 if
