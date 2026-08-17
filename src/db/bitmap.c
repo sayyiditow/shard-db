@@ -195,7 +195,7 @@ static int bm_cache_drop_slot(int slot, int wait) {
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     atomic_store_explicit(&e->validated_publish_generation, 0,
                           memory_order_relaxed);
-    e->used = 0;
+    atomic_store_explicit(&e->used, 0, memory_order_relaxed);
     e->path[0] = '\0';
     g_bm_cache_count--;
     pthread_rwlock_unlock(&e->rwlock);
@@ -612,7 +612,14 @@ retry_bm_acquire:;
                 atomic_store_explicit(&e->validated_publish_generation,
                                       current_generation, memory_order_release);
             }
-            /* Hand the rwlock + cached map to caller. */
+            /* Hand the rwlock + cached map to caller. bm_close() is the
+               matched unlock. The verify-retry loop above already
+               eliminates the evict-during-rwlock-wait window (used +
+               path re-checked under rwlock), so slot stability here is
+               guaranteed by the rwlock hold, mirroring bt_acquire_impl
+               (see btree.c:838-851).
+               coverity[missing_unlock] rwlock handoff to caller is intentional
+               coverity[atomicity] slot stability guaranteed by rwlock + verify */
             BitmapShard *bm = calloc(1, sizeof(*bm));
             if (!bm) { pthread_rwlock_unlock(lock); return NULL; }
             bm->slot = slot;
@@ -730,7 +737,7 @@ retry_bm_acquire:;
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     atomic_store_explicit(&e->validated_publish_generation,
                           opened_generation, memory_order_release);
-    e->used = 1;
+    atomic_store_explicit(&e->used, 1, memory_order_relaxed);
     e->last_access = __atomic_add_fetch(&g_bm_cache_clock, 1, __ATOMIC_RELAXED);
     g_bm_cache_count++;
     pthread_rwlock_t *lock = &e->rwlock;
@@ -765,6 +772,11 @@ retry_bm_acquire:;
         bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
         memcpy(bm->mmap_ptr, &bm->hdr, sizeof(struct BmHeader));
     }
+    /* Hand the rwlock + freshly-opened map to caller. bm_close() is the
+       matched unlock, mirroring bt_acquire_impl's cache-miss-fill return
+       (see btree.c:1056-1058).
+       coverity[missing_unlock] rwlock handoff to caller is intentional
+       coverity[atomicity] slot stability guaranteed by rwlock + verify */
     return bm;
 }
 

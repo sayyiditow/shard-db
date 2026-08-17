@@ -2921,10 +2921,10 @@ int cmd_add_indexes(const char *db_root, const char *object,
     int total_fields = nfields;  /* preserved across the btree-only reduction below */
     int btree_count = 0;
     char btree_fields[MAX_FIELDS][256];
-    MFFieldDesc *descs = total_fields > 0
-                       ? calloc((size_t)total_fields, sizeof(MFFieldDesc))
-                       : NULL;
-    if (total_fields > 0 && !descs) {
+    /* total_fields > 0 always holds here: the nfields==0 case already
+       returned above, and nothing between there and here modifies nfields. */
+    MFFieldDesc *descs = calloc((size_t)total_fields, sizeof(MFFieldDesc));
+    if (!descs) {
         OUT("{\"error\":\"cannot allocate index build descriptors\"}\n");
         return -1;
     }
