@@ -2151,6 +2151,11 @@ static int btree_test_delete_gate_is_bypassed(void) {
     pthread_mutex_unlock(&g_btree_test_delete_gate_lock);
     return bypass;
 }
+
+#include <stdatomic.h>
+static _Atomic int g_test_btree_sync_count;
+void btree_test_sync_reset(void) { atomic_store(&g_test_btree_sync_count, 0); }
+int  btree_test_sync_count(void) { return atomic_load(&g_test_btree_sync_count); }
 #endif
 
 int btree_delete(const char *path, const char *value, size_t vlen,
@@ -2174,6 +2179,9 @@ int btree_delete(const char *path, const char *value, size_t vlen,
 }
 
 int btree_sync_path(const char *path) {
+#ifdef TEST_BUILD
+    atomic_fetch_add(&g_test_btree_sync_count, 1);
+#endif
     BtFile bt;
     if (bt_acquire(&bt, path, 1) != 0) return -1;
     int rc = fdatasync(bt.fd);

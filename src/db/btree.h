@@ -128,6 +128,11 @@ int btree_delete(const char *path, const char *value, size_t vlen,
    marker clear. Not used by index builds/reindex. */
 int btree_sync_path(const char *path);
 
+#ifdef TEST_BUILD
+void btree_test_sync_reset(void);
+int  btree_test_sync_count(void);
+#endif
+
 /* Search for all entries matching value exactly. Calls cb for each. */
 void btree_search(const char *path, const char *value, size_t vlen,
                   bt_result_cb cb, void *ctx);
