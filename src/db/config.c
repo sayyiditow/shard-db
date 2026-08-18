@@ -2124,9 +2124,13 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
    encode_field_for_index would for equivalent text input. Skips the
    typed→ASCII render step on integer/date/numeric fields. */
 void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
-                              int field_idx, uint8_t *out, size_t *out_len) {
+                              size_t data_len, int field_idx,
+                              uint8_t *out, size_t *out_len) {
     const TypedField *f = &ts->fields[field_idx];
-    const uint8_t *src = data + f->offset;
+    static const uint8_t zero_field[65537];
+    const uint8_t *src = ((size_t)f->offset + (size_t)f->size > data_len)
+        ? zero_field
+        : data + f->offset;
     switch (f->type) {
     case FT_VARCHAR: {
         /* Stored as [uint16 BE length][content]. Index key = raw content. */
@@ -3150,14 +3154,14 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
     const uint8_t *src = (data_len >= 0 &&
                             (size_t)f->offset + (size_t)f->size > (size_t)data_len)
         ? zero_field
-        : data;
+        : data + f->offset;
 
     char buf[512];
     int len;
 
     switch (f->type) {
     case FT_VARCHAR: {
-        const uint8_t *p = src + f->offset;
+        const uint8_t *p = src;
         int slen = ((int)p[0] << 8) | (int)p[1];
         int content_max = f->size - 2;
         if (slen > content_max) slen = content_max;
@@ -3168,9 +3172,9 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         return out;
     }
     case FT_BOOL:
-        return strdup(src[f->offset] ? "true" : "false");
+        return strdup(src[0] ? "true" : "false");
     case FT_DATE: {
-        const uint8_t *d = src + f->offset;
+        const uint8_t *d = src;
         int32_t v = ((int32_t)d[0] << 24) | ((int32_t)d[1] << 16) |
                     ((int32_t)d[2] << 8) | d[3];
         if (v == 0) return NULL;
@@ -3179,7 +3183,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         return out;
     }
     case FT_DATETIME: {
-        const uint8_t *d = src + f->offset;
+        const uint8_t *d = src;
         int32_t dv = ((int32_t)d[0] << 24) | ((int32_t)d[1] << 16) |
                      ((int32_t)d[2] << 8) | d[3];
         uint16_t t = ((uint16_t)d[4] << 8) | d[5];
@@ -3190,7 +3194,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         return out;
     }
     case FT_DATETIMEMS: {
-        const uint8_t *d = src + f->offset;
+        const uint8_t *d = src;
         int32_t dv = ((int32_t)d[0] << 24) | ((int32_t)d[1] << 16) |
                      ((int32_t)d[2] << 8) | d[3];
         uint32_t ms = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) |
@@ -3207,7 +3211,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         return out;
     }
     case FT_TIME: {
-        const uint8_t *d = src + f->offset;
+        const uint8_t *d = src;
         uint32_t secs = ((uint32_t)d[0] << 16) | ((uint32_t)d[1] << 8) | d[2];
         if (secs == 0 && d[0]==0 && d[1]==0 && d[2]==0) return NULL;
         int hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
@@ -3216,14 +3220,14 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         return out;
     }
     case FT_UUID: {
-        const uint8_t *b = src + f->offset;
+        const uint8_t *b = src;
         if (uuid_is_zero(b)) return NULL;
         char *out = malloc(37);
         uuid_format_canonical(out, 37, b);
         return out;
     }
     case FT_IPV4: {
-        const uint8_t *ip = src + f->offset;
+        const uint8_t *ip = src;
         if (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0)
             return NULL;
         char *out = malloc(INET_ADDRSTRLEN);
@@ -3239,7 +3243,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         return out;
     }
     case FT_IPV6: {
-        const uint8_t *ip = src + f->offset;
+        const uint8_t *ip = src;
         int allzero = 1;
         for (int bi = 0; bi < 16; bi++) if (ip[bi] != 0) { allzero = 0; break; }
         if (allzero) return NULL;
@@ -3262,9 +3266,9 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
            themselves. */
         if (!f->enum_values || f->n_enum_values <= 0) return NULL;
         int idx = (f->enum_width == 2)
-                    ? (int)(((uint16_t)src[f->offset] << 8) |
-                            (uint16_t)src[f->offset + 1])
-                    : (int)src[f->offset];
+                    ? (int)(((uint16_t)src[0] << 8) |
+                            (uint16_t)src[1])
+                    : (int)src[0];
         if (idx < 0 || idx >= f->n_enum_values)
             return strdup("");
         return strdup(f->enum_values[idx] ? f->enum_values[idx] : "");
@@ -3281,11 +3285,11 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
            Make that text the raw value returned by this API, rather than
            allowing projection callers to receive a JSON fragment or quote
            the number as a string. */
-        len = decode_field_to_buf(f, src + f->offset, buf, sizeof(buf));
+        len = decode_field_to_buf(f, src, buf, sizeof(buf));
         if (len <= 0) return NULL;
         return strdup(buf);
     default:
-        len = decode_field_to_buf(f, src + f->offset, buf, sizeof(buf));
+        len = decode_field_to_buf(f, src, buf, sizeof(buf));
         if (len <= 0) return NULL;
         return strdup(buf);
     }

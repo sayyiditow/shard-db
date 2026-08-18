@@ -194,7 +194,7 @@ int resolve_joins(JoinSpec *joins, int n, const char *db_root,
 /* Extract the local field value from a driver record into buf.
    Handles composite (a+b → concat values). Returns written length (0 = empty). */
 int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
-                             const TypedSchema *driver_ts,
+                             size_t driver_len, const TypedSchema *driver_ts,
                              char *buf, size_t bufsz) {
     if (j->local_is_composite) {
         char fb[256]; strncpy(fb, j->local_field, 255); fb[255] = '\0';
@@ -205,7 +205,7 @@ int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
             int idx = driver_ts ? typed_field_index(driver_ts, tok) : -1;
             if (idx < 0) { tok = strtok_r(NULL, "+", &save); continue; }
             size_t blen = 0;
-            typed_field_to_index_key(driver_ts, driver_raw, idx,
+            typed_field_to_index_key(driver_ts, driver_raw, driver_len, idx,
                                       (uint8_t *)buf + pos, &blen);
             if (blen == 0) { tok = strtok_r(NULL, "+", &save); continue; }
             if (pos + (int)blen < (int)bufsz) { pos += (int)blen; }
@@ -215,8 +215,11 @@ int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
         return pos;
     }
     if (j->local_tf) {
-        return typed_field_to_buf_raw(j->local_tf,
-                                      driver_raw + j->local_tf->offset,
+        const TypedField *tf = j->local_tf;
+        const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > driver_len)
+            ? g_zero_field_65537
+            : driver_raw + tf->offset;
+        return typed_field_to_buf_raw(tf, fp,
                                       buf, bufsz);
     }
     return 0;
@@ -362,7 +365,7 @@ static int buf_field_value(const TypedField *tf, const uint8_t *field_ptr,
 
 /* Write one join's contribution (,val,val,...) to buf. remote_raw NULL → nulls.
    Returns bytes written; always < bufsz (see snprintf_bounded above). */
-int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw,
+int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw, size_t remote_len,
                            char *buf, size_t bufsz) {
     int pos = 0;
     if (j->include_remote_key) {
@@ -374,17 +377,21 @@ int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw,
         pos += snprintf_bounded(buf + pos, bufsz - pos, ",");
         if (!remote_raw || !j->proj_tfs[k])
             pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
-        else
-            pos += buf_field_value(j->proj_tfs[k],
-                                   remote_raw + j->proj_tfs[k]->offset,
+        else {
+            const TypedField *tf = j->proj_tfs[k];
+            const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > remote_len)
+                ? g_zero_field_65537
+                : remote_raw + tf->offset;
+            pos += buf_field_value(tf, fp,
                                    buf + pos, bufsz - pos);
+        }
     }
     return pos;
 }
 
 /* Write driver-side row values (,val,val,...) after the key.
    Returns bytes written; always < bufsz (see snprintf_bounded above). */
-int buf_driver_values(const uint8_t *driver_raw, FieldSchema *driver_fs,
+int buf_driver_values(const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs,
                              const char **driver_proj, int driver_proj_count,
                              char *buf, size_t bufsz) {
     int pos = 0;
@@ -395,8 +402,11 @@ int buf_driver_values(const uint8_t *driver_raw, FieldSchema *driver_fs,
             if (driver_fs && driver_fs->ts) {
                 int idx = typed_field_index(driver_fs->ts, driver_proj[i]);
                 if (idx >= 0) {
-                    pos += buf_field_value(&driver_fs->ts->fields[idx],
-                                           driver_raw + driver_fs->ts->fields[idx].offset,
+                    const TypedField *tf = &driver_fs->ts->fields[idx];
+                    const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > driver_len)
+                        ? g_zero_field_65537
+                        : driver_raw + tf->offset;
+                    pos += buf_field_value(tf, fp,
                                            buf + pos, bufsz - pos);
                     continue;
                 }
@@ -408,8 +418,11 @@ int buf_driver_values(const uint8_t *driver_raw, FieldSchema *driver_fs,
             if (driver_fs->ts->fields[i].removed) continue;
             if (pos >= (int)bufsz - 1) break;
             pos += snprintf_bounded(buf + pos, bufsz - pos, ",");
-            pos += buf_field_value(&driver_fs->ts->fields[i],
-                                   driver_raw + driver_fs->ts->fields[i].offset,
+            const TypedField *tf = &driver_fs->ts->fields[i];
+            const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > driver_len)
+                ? g_zero_field_65537
+                : driver_raw + tf->offset;
+            pos += buf_field_value(tf, fp,
                                    buf + pos, bufsz - pos);
         }
     }
@@ -449,10 +462,11 @@ static size_t csv_cell_to_buf(const char *val, char delim, char *out, size_t out
 /* Build one joined-query CSV row "<key><d>v1<d>v2<d>j1.a<d>...\n" into buf.
    Joins with no remote match emit empty cells. Returns chars written. */
 size_t build_joined_csv_row(const char *key,
-                                   const uint8_t *driver_raw, FieldSchema *driver_fs,
+                                   const uint8_t *driver_raw, size_t driver_len,
+                                   FieldSchema *driver_fs,
                                    const char **proj_fields, int proj_count,
                                    const JoinSpec *joins, int njoins,
-                                   const uint8_t **jraws,
+                                   const RecordRef *jrefs,
                                    char csv_delim,
                                    char *buf, size_t bufsz) {
     size_t pos = 0;
@@ -465,7 +479,7 @@ size_t build_joined_csv_row(const char *key,
             if (pos < bufsz - 1) buf[pos++] = csv_delim;
             int idx = typed_field_index(driver_fs->ts, proj_fields[i]);
             char *v = (idx >= 0)
-                ? typed_get_field_str(driver_fs->ts, driver_raw, driver_fs->ts->total_size, idx)
+                ? typed_get_field_str(driver_fs->ts, driver_raw, (int)driver_len, idx)
                 : NULL;
             (void)tmp;
             pos += csv_cell_to_buf(v, csv_delim, buf + pos, bufsz - pos);
@@ -475,7 +489,7 @@ size_t build_joined_csv_row(const char *key,
         for (int i = 0; i < driver_fs->ts->nfields; i++) {
             if (driver_fs->ts->fields[i].removed) continue;
             if (pos < bufsz - 1) buf[pos++] = csv_delim;
-            char *v = typed_get_field_str(driver_fs->ts, driver_raw, driver_fs->ts->total_size, i);
+            char *v = typed_get_field_str(driver_fs->ts, driver_raw, (int)driver_len, i);
             pos += csv_cell_to_buf(v, csv_delim, buf + pos, bufsz - pos);
             free(v);
         }
@@ -484,7 +498,8 @@ size_t build_joined_csv_row(const char *key,
     /* Joined fields — one column per (join.proj_field), prefixed with as_name in the header. */
     for (int i = 0; i < njoins; i++) {
         const JoinSpec *j = &joins[i];
-        const uint8_t *rraw = jraws ? jraws[i] : NULL;
+        const uint8_t *rraw = jrefs ? jrefs[i].val : NULL;
+        size_t rlen = jrefs ? jrefs[i].vlen : 0;
         if (j->include_remote_key) {
             if (pos < bufsz - 1) buf[pos++] = csv_delim;
             /* Empty cell — local field carries the value (matches JSON's null). */
@@ -492,8 +507,11 @@ size_t build_joined_csv_row(const char *key,
         for (int k = 0; k < j->proj_count; k++) {
             if (pos < bufsz - 1) buf[pos++] = csv_delim;
             if (!rraw || !j->proj_tfs[k]) continue;
-            int n = typed_field_to_buf_raw(j->proj_tfs[k],
-                                           rraw + j->proj_tfs[k]->offset,
+            const TypedField *rtf = j->proj_tfs[k];
+            const uint8_t *rfp = ((size_t)rtf->offset + (size_t)rtf->size > rlen)
+                ? g_zero_field_65537
+                : rraw + rtf->offset;
+            int n = typed_field_to_buf_raw(rtf, rfp,
                                            tmp, sizeof(tmp));
             if (n > 0) pos += csv_cell_to_buf(tmp, csv_delim, buf + pos, bufsz - pos);
         }
@@ -597,6 +615,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
             for (int i = 0; i < sc->njoins; i++) {
                 char lk[1024];
                 int llen = extract_local_key(&sc->joins[i], (const uint8_t *)raw,
+                                             (size_t)hdr->value_len,
                                              sc->fs ? sc->fs->ts : NULL, lk, sizeof(lk));
                 int found = 0;
                 if (llen > 0) {
@@ -628,9 +647,9 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                     /* CSV joined row: <key><delim>v1<delim>...<delim>j1.a<delim>...\n */
                     char row[16384];
                     size_t n = build_joined_csv_row(
-                        key, (const uint8_t *)raw, sc->fs,
+                        key, (const uint8_t *)raw, (size_t)hdr->value_len, sc->fs,
                         sc->proj_count > 0 ? sc->proj_fields : NULL, sc->proj_count,
-                        sc->joins, sc->njoins, join_raws, sc->csv_delim,
+                        sc->joins, sc->njoins, join_refs, sc->csv_delim,
                         row, sizeof(row));
                     OUT("%.*s", (int)n, row);
                 } else if (sc->njoins > 0) {
@@ -638,12 +657,12 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                     char row[16384];
                     int pos = snprintf_bounded(row, sizeof(row), "%s[\"%s\"",
                                        sc->printed ? "," : "", key);
-                    pos += buf_driver_values((const uint8_t *)raw, sc->fs,
+                    pos += buf_driver_values((const uint8_t *)raw, (size_t)hdr->value_len, sc->fs,
                                              sc->proj_count > 0 ? sc->proj_fields : NULL,
                                              sc->proj_count,
                                              row + pos, sizeof(row) - pos);
                     for (int i = 0; i < sc->njoins && pos < (int)sizeof(row) - 2; i++)
-                        pos += buf_join_values(&sc->joins[i], join_raws[i],
+                        pos += buf_join_values(&sc->joins[i], join_raws[i], join_refs[i].vlen,
                                                row + pos, sizeof(row) - pos);
                     snprintf_bounded(row + pos, sizeof(row) - pos, "]");
                     OUT("%s", row);

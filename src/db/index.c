@@ -1166,7 +1166,7 @@ int cmp_str_numeric(const void *a, const void *b) {
    path — the per-call alloc/free pair the malloc'd variant pays is
    what makes this useful for hot pre_commit hooks. */
 int build_index_key_from_record_into(const TypedSchema *ts, const uint8_t *record,
-                                      const char *spec,
+                                      size_t record_len, const char *spec,
                                       uint8_t *out, size_t out_cap,
                                       size_t *out_len) {
     if (!ts || !record || !spec || !out || !out_len) return 0;
@@ -1180,7 +1180,7 @@ int build_index_key_from_record_into(const TypedSchema *ts, const uint8_t *recor
             int fi = typed_field_index(ts, tok);
             if (fi < 0) return 0;
             size_t blen = 0;
-            typed_field_to_index_key(ts, record, fi, out + cp, &blen);
+            typed_field_to_index_key(ts, record, record_len, fi, out + cp, &blen);
             if (blen == 0) return 0;
             if (cp + blen > out_cap) return -1;
             cp += (int)blen;
@@ -1197,14 +1197,14 @@ int build_index_key_from_record_into(const TypedSchema *ts, const uint8_t *recor
     size_t cap = (size_t)(f->size > 8 ? f->size : 8);
     if (cap > out_cap) return -1;
     size_t blen = 0;
-    typed_field_to_index_key(ts, record, fi, out, &blen);
+    typed_field_to_index_key(ts, record, record_len, fi, out, &blen);
     if (blen == 0) return 0;
     *out_len = blen;
     return 1;
 }
 
 int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
-                                const char *spec,
+                                size_t record_len, const char *spec,
                                 uint8_t **out_val, size_t *out_len) {
     if (!ts || !record || !spec || !out_val || !out_len) return 0;
     *out_val = NULL;
@@ -1219,7 +1219,7 @@ int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
             int fi = typed_field_index(ts, tok);
             if (fi < 0) { ok = 0; break; }
             size_t blen = 0;
-            typed_field_to_index_key(ts, record, fi, (uint8_t *)cat + cp, &blen);
+            typed_field_to_index_key(ts, record, record_len, fi, (uint8_t *)cat + cp, &blen);
             if (blen == 0) { ok = 0; break; }
             if (cp + (int)blen < (int)sizeof(cat)) { cp += (int)blen; }
             else { ok = 0; break; }
@@ -1239,7 +1239,7 @@ int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
     size_t cap = (size_t)(f->size > 8 ? f->size : 8);
     uint8_t *buf = malloc(cap);
     size_t blen = 0;
-    typed_field_to_index_key(ts, record, fi, buf, &blen);
+    typed_field_to_index_key(ts, record, record_len, fi, buf, &blen);
     if (blen == 0) { free(buf); return 0; }
     *out_val = buf;
     *out_len = blen;
@@ -3547,7 +3547,7 @@ static void mf_append_field(MFWorkerField *f, const MFFieldDesc *d,
             if ((size_t)ts->fields[d->field_indices[i]].size >
                 sizeof(cat) - (size_t)cpos) { ok = 0; break; }
             size_t blen = 0;
-            typed_field_to_index_key(ts, value, d->field_indices[i],
+            typed_field_to_index_key(ts, value, (size_t)ts->total_size, d->field_indices[i],
                                       (uint8_t *)cat + cpos, &blen);
             if (blen == 0) { ok = 0; break; }
             if (cpos + (int)blen < (int)sizeof(cat)) cpos += (int)blen;
@@ -3561,7 +3561,7 @@ static void mf_append_field(MFWorkerField *f, const MFFieldDesc *d,
         int fidx = d->field_indices[0];
         if (fidx < 0) return;
         if ((size_t)ts->fields[fidx].size > sizeof(kb)) return;
-        typed_field_to_index_key(ts, value, fidx, kb, &kl);
+        typed_field_to_index_key(ts, value, (size_t)ts->total_size, fidx, kb, &kl);
         if (kl == 0) return;
     }
     if (f->pair_count + 1 > f->pairs_cap || f->arena_used + kl > f->arena_cap)

@@ -709,6 +709,8 @@ int json_escape_into(char *dst, size_t dst_cap,
     return (int)out;
 }
 
+const uint8_t g_zero_field_65537[65537];
+
 /* ========== FT_UUID helpers ==========
  * Shared by config.c (decode_field_to_buf, typed_get_field_str) and
  * query.c (typed_field_to_buf_raw, decode_idx_to_buf). The all-zero

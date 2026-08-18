@@ -402,21 +402,22 @@ void free_joins(JoinSpec *arr, int n);
 int resolve_joins(JoinSpec *joins, int n, const char *db_root,
                   const char *driver_object, FieldSchema *driver_fs);
 int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
+                      size_t driver_len,
                       const TypedSchema *driver_ts,
                       char *buf, size_t bufsz);
 int lookup_remote(const JoinSpec *j, const char *db_root,
                   const char *local_key, size_t local_len,
                   RecordRef *out_rr);
-int buf_driver_values(const uint8_t *driver_raw, FieldSchema *driver_fs,
+int buf_driver_values(const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs,
                       const char **driver_proj, int driver_proj_count,
                       char *buf, size_t bufsz);
-int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw,
+int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw, size_t remote_len,
                     char *buf, size_t bufsz);
 size_t build_joined_csv_row(const char *key,
-                            const uint8_t *driver_raw, FieldSchema *driver_fs,
+                            const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs,
                             const char **proj_fields, int proj_count,
                             const JoinSpec *joins, int njoins,
-                            const uint8_t **jraws,
+                            const RecordRef *jrefs,
                             char csv_delim,
                             char *buf, size_t bufsz);
 void emit_joined_csv_header(const char *driver_object,

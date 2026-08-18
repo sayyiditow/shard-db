@@ -820,6 +820,7 @@ void  typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
    trim-encoded records). Fields beyond data_len return NULL (== empty/default). */
 char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
                            int data_len, int field_idx);
+extern const uint8_t g_zero_field_65537[65537];
 void encode_field(const TypedField *f, const char *val, uint8_t *out);
 void encode_field_len(const TypedField *f, const char *val, size_t vlen, uint8_t *out);
 /* Produce the "now" string for an auto_create / auto_update timestamp field
@@ -843,7 +844,8 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
    Used by index scan paths that already hold typed binary records and want
    to skip the typed→ASCII→index-bytes roundtrip. */
 void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
-                              int field_idx, uint8_t *out, size_t *out_len);
+                              size_t data_len, int field_idx,
+                              uint8_t *out, size_t *out_len);
 
 /* Build an index key from a typed record for a (possibly composite) spec.
    Single-field: binary-encoded bytes (typed_field_to_index_key).
@@ -852,7 +854,7 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
    Returns 1 on success with malloc'd *out_val and *out_len set; caller frees.
    Returns 0 if any sub-field is missing/empty or spec is unknown. */
 int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
-                                const char *spec,
+                                size_t record_len, const char *spec,
                                 uint8_t **out_val, size_t *out_len);
 
 /* Build an index key from a JSON object for a (possibly composite) spec.
@@ -1451,10 +1453,10 @@ int cmp_btentry_fn(const void *a, const void *b);
 /* index.c — index-key extractors (out_val alloc'd, caller frees; _into
    variant writes into out of capacity out_cap and returns -1 on overflow). */
 int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
-                                const char *spec,
+                                size_t record_len, const char *spec,
                                 uint8_t **out_val, size_t *out_len);
 int build_index_key_from_record_into(const TypedSchema *ts, const uint8_t *record,
-                                      const char *spec,
+                                      size_t record_len, const char *spec,
                                       uint8_t *out, size_t out_cap,
                                       size_t *out_len);
 

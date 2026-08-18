@@ -4451,7 +4451,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                     } else {
                         for (int i = 0; i < njoins; i++) {
                             char lk[1024];
-                            int llen = extract_local_key(&joins[i], raw,
+                            int llen = extract_local_key(&joins[i], raw, (size_t)value_len,
                                                          fs ? fs->ts : NULL, lk, sizeof(lk));
                             int jfound = 0;
                             if (llen > 0) {
@@ -4470,9 +4470,9 @@ static int keyset_emit_find(const char *db_root, const char *object,
                         if (njoins > 0 && csv_delim) {
                             char buf[16384];
                             size_t n = build_joined_csv_row(
-                                keybuf, raw, fs,
+                                keybuf, raw, (size_t)value_len, fs,
                                 proj_count > 0 ? proj_fields : NULL, proj_count,
-                                joins, njoins, jraws, csv_delim,
+                                joins, njoins, jrr, csv_delim,
                                 buf, sizeof(buf));
                             OUT("%.*s", (int)n, buf);
                         } else if (njoins > 0) {
@@ -4480,7 +4480,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             size_t pos = 0;
                             SB_APPEND(buf, pos, sizeof(buf), "[\"%s\"", keybuf);
                             size_t wrote = buf_driver_values(
-                                                raw, fs,
+                                                raw, (size_t)value_len, fs,
                                                 proj_count > 0 ? proj_fields : NULL,
                                                 proj_count,
                                                 buf + pos, sizeof(buf) - pos);
@@ -4496,7 +4496,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                                     for (int k = 0; k < ncols; k++)
                                         SB_APPEND(buf, pos, sizeof(buf), ",null");
                                 } else {
-                                    wrote = buf_join_values(&joins[i], jraws[i],
+                                    wrote = buf_join_values(&joins[i], jraws[i], jrr[i].vlen,
                                                             buf + pos, sizeof(buf) - pos);
                                     pos += wrote;
                                     if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
@@ -5928,7 +5928,7 @@ static int d2_batch_cb(const uint8_t hash16[16],
        Compaction happens after all callbacks complete (see call site). */
     ctx->passed[i] = 1;
     __sync_fetch_and_add(ctx->n_kept, 1);
-    typed_field_to_index_key(ctx->ts, (const uint8_t *)value,
+    typed_field_to_index_key(ctx->ts, (const uint8_t *)value, vlen,
                              ctx->order_field_idx,
                              ctx->rows[i].sort_key,
                              &ctx->rows[i].sort_key_len);
@@ -6016,7 +6016,7 @@ static int cursor_fetch_cb(const uint8_t hash[16],
     }
     SmallPrefilterRow *row = &ctx->results[ctx->result_count++];
     memcpy(row->hash, hash, 16);
-    typed_field_to_index_key(ctx->ts, (const uint8_t *)value,
+    typed_field_to_index_key(ctx->ts, (const uint8_t *)value, vlen,
                              ctx->order_field_idx,
                              row->sort_key, &row->sort_key_len);
     pthread_mutex_unlock(&ctx->lock);
@@ -6233,7 +6233,7 @@ static int fetch_sort_batch_cb(const uint8_t hash16[16],
 
     SmallPrefilterRow cur;
     memcpy(cur.hash, hash16, 16);
-    typed_field_to_index_key(c->fs->ts, (const uint8_t *)value,
+    typed_field_to_index_key(c->fs->ts, (const uint8_t *)value, vlen,
                              c->order_field_idx,
                              cur.sort_key, &cur.sort_key_len);
 
@@ -7165,7 +7165,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                                 memcpy(sp_rows[n_kept].hash, sp_rows[i].hash, 16);
                             typed_field_to_index_key(driver_fs.ts,
                                                      (const uint8_t *)rr.val,
-                                                     order_field_idx,
+                                                     rr.vlen, order_field_idx,
                                                      sp_rows[n_kept].sort_key,
                                                      &sp_rows[n_kept].sort_key_len);
                             n_kept++;
@@ -7748,7 +7748,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                                 memcpy(rows[n_kept].hash, rows[i].hash, 16);
                             typed_field_to_index_key(driver_fs.ts,
                                                      (const uint8_t *)rr.val,
-                                                     order_field_idx,
+                                                     rr.vlen, order_field_idx,
                                                      rows[n_kept].sort_key,
                                                      &rows[n_kept].sort_key_len);
                             n_kept++;

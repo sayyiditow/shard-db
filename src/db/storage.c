@@ -1184,8 +1184,17 @@ static int v2_update_new_from_old(const SlotcaskOldRecord *old,
        callback, after OLD has been received. Reports under_kf_wrlock == 1. */
     slotcask_test_after_old(1);
 #endif
+    if ((size_t)c->idx_ts->total_size > out_capacity) return -1;
     memcpy(out_value, old->value, old->vlen);
-    *out_vlen = old->vlen;
+    /* old->value may be a trim-compacted record shorter than
+       idx_ts->total_size (trailing default-valued fields dropped on the
+       prior write). Zero-fill the untouched tail before applying field
+       writes below so fields beyond old->vlen are defined and the caller's
+       trim pass sees the complete field region. */
+    size_t full_len = (size_t)c->idx_ts->total_size;
+    if (full_len > old->vlen)
+        memset(out_value + old->vlen, 0, full_len - old->vlen);
+    *out_vlen = full_len;
 
     /* Build new typed buffer = copy of old, with partial fields applied. */
     const char *field_names[MAX_FIELDS];
@@ -1293,7 +1302,9 @@ typedef struct {
     uint32_t kf_slot;
     TypedSchema *idx_ts;
     const uint8_t *old_value;
+    size_t old_vlen;
     const uint8_t *new_value;
+    size_t new_vlen;
     char *err_buf;
     size_t err_buf_len;
 } IndexDiffApplyArgs;
@@ -1318,12 +1329,12 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
 
         if (arena) {
             int ro = a->old_value
-                ? build_index_key_from_record_into(a->idx_ts, a->old_value,
+                ? build_index_key_from_record_into(a->idx_ts, a->old_value, a->old_vlen,
                                                    a->idx_fields[i],
                                                    old_slot, INDEX_KEY_MAX, &old_len)
                 : 0;
             int rn = a->new_value
-                ? build_index_key_from_record_into(a->idx_ts, a->new_value,
+                ? build_index_key_from_record_into(a->idx_ts, a->new_value, a->new_vlen,
                                                    a->idx_fields[i],
                                                    new_slot, INDEX_KEY_MAX, &new_len)
                 : 0;
@@ -1333,14 +1344,14 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
             new_buf = have_new ? new_slot : NULL;
             if (ro == -1) {
                 have_old = a->old_value
-                    ? build_index_key_from_record(a->idx_ts, a->old_value,
+                    ? build_index_key_from_record(a->idx_ts, a->old_value, a->old_vlen,
                                                   a->idx_fields[i], &old_buf, &old_len)
                     : 0;
                 if (have_old) fb_bufs[n_fb++] = old_buf;
             }
             if (rn == -1) {
                 have_new = a->new_value
-                    ? build_index_key_from_record(a->idx_ts, a->new_value,
+                    ? build_index_key_from_record(a->idx_ts, a->new_value, a->new_vlen,
                                                   a->idx_fields[i], &new_buf,
                                                   &new_len)
                     : 0;
@@ -1348,11 +1359,11 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
             }
         } else {
             if (a->old_value)
-                have_old = build_index_key_from_record(a->idx_ts, a->old_value,
+                have_old = build_index_key_from_record(a->idx_ts, a->old_value, a->old_vlen,
                                                        a->idx_fields[i], &old_buf, &old_len);
             if (a->new_value)
                 have_new = build_index_key_from_record(a->idx_ts,
-                                                       a->new_value,
+                                                       a->new_value, a->new_vlen,
                                                        a->idx_fields[i],
                                                        &new_buf, &new_len);
             if (have_old) fb_bufs[n_fb++] = old_buf;
@@ -1419,7 +1430,6 @@ static int storage_recovery_index_diff(const char *db_root, const char *object,
                                        const uint8_t *old_value, size_t old_vlen,
                                        const uint8_t *new_value, size_t new_vlen,
                                        char *err_buf, size_t err_buf_len) {
-    (void)old_vlen; (void)new_vlen;
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     if (nidx <= 0) return 0;
@@ -1437,7 +1447,8 @@ static int storage_recovery_index_diff(const char *db_root, const char *object,
         .nidx = nidx, .idx_fields = idx_fields, .idx_types = idx_types,
         .splits = sc.splits, .hash = hash,
         .kf_shard = kf_shard, .kf_slot = kf_slot, .idx_ts = ts,
-        .old_value = old_value, .new_value = new_value,
+        .old_value = old_value, .old_vlen = old_vlen,
+        .new_value = new_value, .new_vlen = new_vlen,
         .err_buf = err_buf, .err_buf_len = err_buf_len,
     };
     return apply_index_diff(&args);
@@ -1451,7 +1462,7 @@ static void storage_register_recovery_callback(void) {
 static int v2_update_pre_commit(const SlotcaskOldRecord *old,
                                 const uint8_t *new_value, size_t new_vlen,
                                 int is_update, void *ctx_ptr) {
-    (void)new_vlen; (void)is_update;
+    (void)is_update;
     V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
     if (!old || c->nidx == 0) return 0;
     IndexDiffApplyArgs args = {
@@ -1460,7 +1471,8 @@ static int v2_update_pre_commit(const SlotcaskOldRecord *old,
         .idx_types = c->idx_types, .splits = c->splits,
         .hash = c->hash, .kf_shard = c->kf_shard,
         .kf_slot = c->kf_slot, .idx_ts = c->idx_ts,
-        .old_value = old->value, .new_value = new_value,
+        .old_value = old->value, .old_vlen = old->vlen,
+        .new_value = new_value, .new_vlen = new_vlen,
         .err_buf = c->err_buf, .err_buf_len = sizeof(c->err_buf),
     };
     return apply_index_diff(&args);
@@ -1477,7 +1489,7 @@ static int v2_update_prepare_commit(const uint8_t *new_value, size_t new_vlen,
 
 static int v2_update_apply_commit(const uint8_t *new_value, size_t new_vlen,
                                   uint32_t kf_slot, void *ctx_ptr) {
-    (void)new_vlen; (void)kf_slot;
+    (void)kf_slot;
     V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
     if (c->nidx == 0 || !c->saved_old_value) return 0;
     IndexDiffApplyArgs args = {
@@ -1486,7 +1498,8 @@ static int v2_update_apply_commit(const uint8_t *new_value, size_t new_vlen,
         .idx_types = c->idx_types, .splits = c->splits,
         .hash = c->hash, .kf_shard = c->kf_shard,
         .kf_slot = c->kf_slot, .idx_ts = c->idx_ts,
-        .old_value = c->saved_old_value, .new_value = new_value,
+        .old_value = c->saved_old_value, .old_vlen = c->saved_old_vlen,
+        .new_value = new_value, .new_vlen = new_vlen,
         .err_buf = c->err_buf, .err_buf_len = sizeof(c->err_buf),
     };
     return apply_index_diff(&args);
@@ -1718,18 +1731,18 @@ static int v2_delete_apply_commit(const SlotcaskOldRecord *old,
         int have = 0;
         if (arena) {
             uint8_t *slot = arena + (size_t)i * INDEX_KEY_MAX;
-            int rc = build_index_key_from_record_into(c->idx_ts, old->value,
+            int rc = build_index_key_from_record_into(c->idx_ts, old->value, old->vlen,
                                                        c->idx_fields[i],
                                                        slot, INDEX_KEY_MAX, &ilen);
             if (rc == 1) { ikey = slot; have = 1; }
             else if (rc == -1) {
-                have = build_index_key_from_record(c->idx_ts, old->value,
+                have = build_index_key_from_record(c->idx_ts, old->value, old->vlen,
                                                    c->idx_fields[i],
                                                    &ikey, &ilen);
                 if (have) fb_bufs[n_fb++] = ikey;
             }
         } else {
-            have = build_index_key_from_record(c->idx_ts, old->value,
+            have = build_index_key_from_record(c->idx_ts, old->value, old->vlen,
                                                c->idx_fields[i],
                                                &ikey, &ilen);
             if (have) fb_bufs[n_fb++] = ikey;

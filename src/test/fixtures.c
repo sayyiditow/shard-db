@@ -326,7 +326,11 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
     if (child_ctl_fd >= 0) close(child_ctl_fd);
     env->daemon_pid = pid;
 
-    if (wait_daemon_ready(env->port, 5000) != 0) {
+    /* Sanitizer builds make daemon startup much slower (TSan especially,
+       ~5-15x); a full-parallel run-all burst of concurrent daemon spawns
+       widens this further. Match test_env_start_at's restart-path wait,
+       which already accounts for this. */
+    if (wait_daemon_ready(env->port, 30000) != 0) {
         fprintf(stderr,
             "wait_daemon_ready: timeout on port %d (last_step=%d errno=%d %s)\n",
             env->port, g_wait_last_step, g_wait_last_errno,

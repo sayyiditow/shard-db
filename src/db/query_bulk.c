@@ -618,20 +618,20 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                 if (rctx->old_arena) {
                     uint8_t *slot = rctx->old_arena + (size_t)fi * rctx->old_arena_slot;
                     int rc = build_index_key_from_record_into(
-                        sw->ts, old->value, sw->idx_fields[fi],
+                        sw->ts, old->value, old->vlen, sw->idx_fields[fi],
                         slot, rctx->old_arena_slot, &old_idx_lens[fi]);
                     if (rc == 1) {
                         old_idx_bufs[fi] = slot;
                         old_idx_have[fi] = 1;
                     } else if (rc == -1) {
                         old_idx_have[fi] = build_index_key_from_record(
-                            sw->ts, old->value, sw->idx_fields[fi],
+                            sw->ts, old->value, old->vlen, sw->idx_fields[fi],
                             &old_idx_bufs[fi], &old_idx_lens[fi]);
                         old_idx_owned[fi] = old_idx_have[fi];
                     }
                 } else {
                     old_idx_have[fi] = build_index_key_from_record(
-                        sw->ts, old->value, sw->idx_fields[fi],
+                        sw->ts, old->value, old->vlen, sw->idx_fields[fi],
                         &old_idx_bufs[fi], &old_idx_lens[fi]);
                     old_idx_owned[fi] = old_idx_have[fi];
                 }
@@ -663,7 +663,7 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                     if ((size_t)sw->ts->fields[tidx].size >
                         sizeof(cat) - (size_t)cp) { ok = 0; break; }
                     size_t blen = 0;
-                    typed_field_to_index_key(sw->ts, new_value, tidx,
+                    typed_field_to_index_key(sw->ts, new_value, rec->vlen, tidx,
                                               (uint8_t *)cat + cp, &blen);
                     if (blen == 0) { ok = 0; break; }
                     if (cp + (int)blen < (int)sizeof(cat)) { cp += (int)blen; }
@@ -680,7 +680,7 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                     const TypedField *f = &sw->ts->fields[tidx];
                     size_t cap = (size_t)(f->size > 8 ? f->size : 8);
                     key_buf = malloc(cap);
-                    typed_field_to_index_key(sw->ts, new_value, tidx,
+                    typed_field_to_index_key(sw->ts, new_value, rec->vlen, tidx,
                                               key_buf, &key_len);
                     if (key_len == 0) { free(key_buf); key_buf = NULL; }
                 }
@@ -2590,7 +2590,7 @@ static int v2_bulk_del_apply_window(SlotcaskBulkRec *recs,
 
         for (int fi = 0; fi < sw->nidx; fi++) {
             uint8_t *buf = NULL; size_t blen = 0;
-            if (!build_index_key_from_record(sw->ts, r->old_value,
+            if (!build_index_key_from_record(sw->ts, r->old_value, r->old_vlen,
                                               sw->idx_fields[fi],
                                               &buf, &blen))
                 continue;
@@ -3102,18 +3102,18 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
 
         if (ctx->old_arena) {
             uint8_t *slot = ctx->old_arena + (size_t)fi * ctx->arena_slot;
-            int rc = build_index_key_from_record_into(w->ts, old->value,
+            int rc = build_index_key_from_record_into(w->ts, old->value, old->vlen,
                                                        w->idx_fields[fi],
                                                        slot, ctx->arena_slot, &old_len);
             if (rc == 1) { old_buf = slot; have_old = 1; }
             else if (rc == -1) {
-                have_old = build_index_key_from_record(w->ts, old->value,
+                have_old = build_index_key_from_record(w->ts, old->value, old->vlen,
                                                        w->idx_fields[fi],
                                                        &old_buf, &old_len);
                 if (have_old) fb_bufs[n_fb++] = old_buf;
             }
         } else {
-            have_old = build_index_key_from_record(w->ts, old->value,
+            have_old = build_index_key_from_record(w->ts, old->value, old->vlen,
                                                    w->idx_fields[fi],
                                                    &old_buf, &old_len);
             if (have_old) fb_bufs[n_fb++] = old_buf;
@@ -3121,18 +3121,18 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
 
         if (ctx->new_arena) {
             uint8_t *slot = ctx->new_arena + (size_t)fi * ctx->arena_slot;
-            int rc = build_index_key_from_record_into(w->ts, new_value,
+            int rc = build_index_key_from_record_into(w->ts, new_value, rec->vlen,
                                                        w->idx_fields[fi],
                                                        slot, ctx->arena_slot, &new_len);
             if (rc == 1) { new_buf = slot; have_new = 1; }
             else if (rc == -1) {
-                have_new = build_index_key_from_record(w->ts, new_value,
+                have_new = build_index_key_from_record(w->ts, new_value, rec->vlen,
                                                        w->idx_fields[fi],
                                                        &new_buf, &new_len);
                 if (have_new) fb_bufs[n_fb++] = new_buf;
             }
         } else {
-            have_new = build_index_key_from_record(w->ts, new_value,
+            have_new = build_index_key_from_record(w->ts, new_value, rec->vlen,
                                                    w->idx_fields[fi],
                                                    &new_buf, &new_len);
             if (have_new) fb_bufs[n_fb++] = new_buf;
@@ -3205,18 +3205,18 @@ static int v2_bulk_upd_apply_window(SlotcaskBulkRec *recs,
 
             if (uctx->old_arena) {
                 uint8_t *slot = uctx->old_arena + (size_t)fi * uctx->arena_slot;
-                int rc = build_index_key_from_record_into(w->ts, r->old_value,
+                int rc = build_index_key_from_record_into(w->ts, r->old_value, r->old_vlen,
                                                            w->idx_fields[fi],
                                                            slot, uctx->arena_slot, &old_len);
                 if (rc == 1) { old_buf = slot; have_old = 1; }
                 else if (rc == -1) {
-                    have_old = build_index_key_from_record(w->ts, r->old_value,
+                    have_old = build_index_key_from_record(w->ts, r->old_value, r->old_vlen,
                                                            w->idx_fields[fi],
                                                            &old_buf, &old_len);
                     if (have_old) fb_bufs[n_fb++] = old_buf;
                 }
             } else {
-                have_old = build_index_key_from_record(w->ts, r->old_value,
+                have_old = build_index_key_from_record(w->ts, r->old_value, r->old_vlen,
                                                        w->idx_fields[fi],
                                                        &old_buf, &old_len);
                 if (have_old) fb_bufs[n_fb++] = old_buf;
@@ -3224,18 +3224,18 @@ static int v2_bulk_upd_apply_window(SlotcaskBulkRec *recs,
 
             if (uctx->new_arena) {
                 uint8_t *slot = uctx->new_arena + (size_t)fi * uctx->arena_slot;
-                int rc = build_index_key_from_record_into(w->ts, r->value,
+                int rc = build_index_key_from_record_into(w->ts, r->value, r->vlen,
                                                            w->idx_fields[fi],
                                                            slot, uctx->arena_slot, &new_len);
                 if (rc == 1) { new_buf_p = slot; have_new = 1; }
                 else if (rc == -1) {
-                    have_new = build_index_key_from_record(w->ts, r->value,
+                    have_new = build_index_key_from_record(w->ts, r->value, r->vlen,
                                                            w->idx_fields[fi],
                                                            &new_buf_p, &new_len);
                     if (have_new) fb_bufs[n_fb++] = new_buf_p;
                 }
             } else {
-                have_new = build_index_key_from_record(w->ts, r->value,
+                have_new = build_index_key_from_record(w->ts, r->value, r->vlen,
                                                        w->idx_fields[fi],
                                                        &new_buf_p, &new_len);
                 if (have_new) fb_bufs[n_fb++] = new_buf_p;
@@ -3594,10 +3594,10 @@ static int v2_bulk_upd_delim_pre_commit_bulk(const SlotcaskOldRecord *old,
     for (int fi = 0; fi < w->nidx; fi++) {
         uint8_t *old_buf = NULL, *new_buf = NULL;
         size_t   old_len = 0,   new_len = 0;
-        int have_old = build_index_key_from_record(w->ts, old->value,
+        int have_old = build_index_key_from_record(w->ts, old->value, old->vlen,
                                                     w->idx_fields[fi],
                                                     &old_buf, &old_len);
-        int have_new = build_index_key_from_record(w->ts, new_value,
+        int have_new = build_index_key_from_record(w->ts, new_value, rec->vlen,
                                                     w->idx_fields[fi],
                                                     &new_buf, &new_len);
         int changed = 0;
@@ -3658,10 +3658,10 @@ static int v2_bulk_upd_delim_apply_window(SlotcaskBulkRec *recs,
         for (int fi = 0; fi < w->nidx; fi++) {
             uint8_t *old_buf = NULL, *new_buf = NULL;
             size_t   old_len = 0,   new_len = 0;
-            int have_old = build_index_key_from_record(w->ts, r->old_value,
+            int have_old = build_index_key_from_record(w->ts, r->old_value, r->old_vlen,
                                                         w->idx_fields[fi],
                                                         &old_buf, &old_len);
-            int have_new = build_index_key_from_record(w->ts, r->value,
+            int have_new = build_index_key_from_record(w->ts, r->value, r->vlen,
                                                         w->idx_fields[fi],
                                                         &new_buf, &new_len);
             int changed = 0;
@@ -4162,10 +4162,10 @@ static int v2_bulk_upd_json_pre_commit_bulk(const SlotcaskOldRecord *old,
     for (int fi = 0; fi < w->nidx; fi++) {
         uint8_t *old_buf = NULL, *new_buf = NULL;
         size_t   old_len = 0,   new_len = 0;
-        int have_old = build_index_key_from_record(w->ts, old->value,
+        int have_old = build_index_key_from_record(w->ts, old->value, old->vlen,
                                                     w->idx_fields[fi],
                                                     &old_buf, &old_len);
-        int have_new = build_index_key_from_record(w->ts, new_value,
+        int have_new = build_index_key_from_record(w->ts, new_value, rec->vlen,
                                                     w->idx_fields[fi],
                                                     &new_buf, &new_len);
         int changed = 0;
@@ -4223,10 +4223,10 @@ static int v2_bulk_upd_json_apply_window(SlotcaskBulkRec *recs,
         for (int fi = 0; fi < w->nidx; fi++) {
             uint8_t *old_buf = NULL, *new_buf = NULL;
             size_t   old_len = 0,   new_len = 0;
-            int have_old = build_index_key_from_record(w->ts, r->old_value,
+            int have_old = build_index_key_from_record(w->ts, r->old_value, r->old_vlen,
                                                         w->idx_fields[fi],
                                                         &old_buf, &old_len);
-            int have_new = build_index_key_from_record(w->ts, r->value,
+            int have_new = build_index_key_from_record(w->ts, r->value, r->vlen,
                                                         w->idx_fields[fi],
                                                         &new_buf, &new_len);
             int changed = 0;
@@ -5154,7 +5154,7 @@ static int v2_bulk_del_crit_apply_window(SlotcaskBulkRec *recs,
 
         for (int fi = 0; fi < w->nidx; fi++) {
             uint8_t *buf = NULL; size_t blen = 0;
-            if (!build_index_key_from_record(w->ts, r->old_value,
+            if (!build_index_key_from_record(w->ts, r->old_value, r->old_vlen,
                                               w->idx_fields[fi], &buf, &blen))
                 continue;
             enum IndexType itype = w->idx_types ? w->idx_types[fi] : IT_BTREE;

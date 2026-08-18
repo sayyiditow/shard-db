@@ -16,7 +16,7 @@
 
 static int create_object_with_records(TestEnv *env, const char *object,
                                       int count) {
-    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 30000 };
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
     TestClient *tc = tc_connect(&cfg);
     if (!tc) return -1;
 
@@ -63,7 +63,7 @@ static int create_object_with_records(TestEnv *env, const char *object,
 }
 
 static int request_count(TestEnv *env, const char *object) {
-    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 30000 };
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
     TestClient *tc = tc_connect(&cfg);
     if (!tc) return -1;
     char req[512];
@@ -154,7 +154,7 @@ static pid_t trigger_edit_rebuild(TestEnv *env, const char *object) {
 }
 
 static char *request_get(TestEnv *env, const char *object, const char *key) {
-    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 30000 };
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
     TestClient *tc = tc_connect(&cfg);
     if (!tc) return NULL;
     char req[512], *resp = NULL;

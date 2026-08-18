@@ -164,6 +164,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/test_client.c \
     src/test/test_runner.c \
     src/test/fixtures.c \
+    src/test/cases/test_bool_literal_update_roundtrip.c \
+    src/test/cases/test_trim_compact_oob_fields.c \
     src/test/cases/test_or_logic.c \
     src/test/cases/test_crash_safety.c \
     src/test/cases/test_rename_field.c \

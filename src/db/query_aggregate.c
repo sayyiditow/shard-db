@@ -2021,8 +2021,12 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
     for (int i = 0; i < ctx->ngroups; i++) {
         gbuf[i][0] = '\0';
         if (ctx->group_tfs[i]) {
-            typed_field_to_buf_raw(ctx->group_tfs[i],
-                                   raw + ctx->group_tfs[i]->offset,
+            const TypedField *gtf = ctx->group_tfs[i];
+            const uint8_t *fp = ((size_t)gtf->offset + (size_t)gtf->size >
+                                  (size_t)hdr->value_len)
+                ? g_zero_field_65537
+                : raw + gtf->offset;
+            typed_field_to_buf_raw(gtf, fp,
                                    gbuf[i], sizeof(gbuf[i]));
         } else {
             /* Composite/unknown — fallback to decode_field */
@@ -2051,8 +2055,12 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         int kp = 0;
         for (int i = 0; i < ctx->ngroups && kp < AGG_INT_KEY_CAP; i++) {
             if (ctx->group_tfs[i]) {
-                int len = typed_field_to_raw(ctx->group_tfs[i],
-                                             raw + ctx->group_tfs[i]->offset,
+                const TypedField *gtf = ctx->group_tfs[i];
+                const uint8_t *fp = ((size_t)gtf->offset + (size_t)gtf->size >
+                                     (size_t)hdr->value_len)
+                    ? g_zero_field_65537
+                    : raw + gtf->offset;
+                int len = typed_field_to_raw(gtf, fp,
                                              raw_key + kp,
                                              (size_t)(AGG_INT_KEY_CAP - kp));
                 if (len > 0) kp += len;

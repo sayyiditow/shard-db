@@ -65,7 +65,7 @@ static int test_coverity_join_buf_overflow_run(void) {
     if (!region) { free(raw); return 1; }
     memset(region + BUF_SZ, 0xAB, CANARY_SZ);
 
-    int pos = buf_driver_values(raw, &fs, NULL, 0, region, BUF_SZ);
+    int pos = buf_driver_values(raw, (size_t)ts.total_size, &fs, NULL, 0, region, BUF_SZ);
 
     ASSERT_TRUE(pos >= 0 && (size_t)pos < BUF_SZ, "returned pos stays within bufsz");
 
