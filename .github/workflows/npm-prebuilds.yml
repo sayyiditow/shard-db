@@ -36,12 +36,20 @@ jobs:
 
       - name: Install dependencies (Linux x64)
         if: matrix.os == 'ubuntu-latest' && !matrix.cross
+        timeout-minutes: 5
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
         run: |
           sudo apt-get update -q
           sudo apt-get install -y python3 make g++
 
       - name: Install cross-compile tools (Linux arm64)
         if: matrix.cross
+        timeout-minutes: 5
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
         run: |
           sudo apt-get update -q
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
