@@ -50,6 +50,13 @@ typedef struct {
     ino_t    file_ino;      /* detects rename-away-and-recreate at `path` */
 } KfCacheEntry;
 
+/* slotcask.c — kf_open_file() single-flight guard */
+#define KF_OPEN_INFLIGHT_SLOTS 256
+typedef struct {
+    char path[PATH_MAX];
+    int used;
+} KfOpenInflight;
+
 /* slotcask.c — segcache */
 typedef struct {
     char     path[PATH_MAX];
@@ -247,6 +254,7 @@ struct ShardDb {
     int durability_sync_ms;
     int warmup_explicit;          /* a valid WARMUP= was present in db.env */
     int kfcache_test_hold_ms; /* test-only; 0 = off in production */
+    int kf_open_create_test_hold_ms; /* test-only; 0 = off in production. */
     int warmup_test_delay_ms; /* test-only; 0 = off in production */
     int warmup_test_prelock_delay_ms; /* test-only; 0 = off in production */
     int schema_wrlock_test_delay_ms; /* test-only; 0 = off in production */
@@ -327,6 +335,9 @@ struct ShardDb {
     int                  kfcache_count;
     pthread_mutex_t      kfcache_lock;
     volatile uint64_t    kfcache_clock;
+    KfOpenInflight       kf_open_inflight[KF_OPEN_INFLIGHT_SLOTS];
+    pthread_cond_t       kf_open_inflight_cond;
+    uint64_t             kf_open_file_call_count;
 
     /* slotcask segcache */
     SegCacheEntry       *segcache;
@@ -470,6 +481,10 @@ extern ShardDb *g_shard_db_instance;
 #define g_kfcache_count             (g_db->kfcache_count)
 #define g_kfcache_lock              (g_db->kfcache_lock)
 #define g_kfcache_clock             (g_db->kfcache_clock)
+#define g_kf_open_create_test_hold_ms (g_db->kf_open_create_test_hold_ms)
+#define g_kf_open_inflight          (g_db->kf_open_inflight)
+#define g_kf_open_inflight_cond     (g_db->kf_open_inflight_cond)
+#define g_kf_open_file_call_count   (g_db->kf_open_file_call_count)
 #define g_segcache                  (g_db->segcache)
 #define g_segcache_slots            (g_db->segcache_slots)
 #define g_segcache_count            (g_db->segcache_count)

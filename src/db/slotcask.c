@@ -329,6 +329,10 @@ static void kfcache_invalidate_prefix(const char *prefix) {
     }
 }
 
+/* Bounded fallback for the uncoordinated inflight-table-full path. */
+#define KF_OPEN_MAGIC_WAIT_ATTEMPTS    100
+#define KF_OPEN_MAGIC_WAIT_INTERVAL_MS 2
+
 /* Open + size + mmap a keyfile shard. Caller may NOT hold g_kfcache_lock when
    the file system call could block, so we do the heavy lifting outside the
    table mutex (matching bt_open_file's contract in btree.c). */
@@ -337,6 +341,7 @@ static int kf_open_file(const char *path, size_t slots_capacity, int writer,
                         dev_t *out_dev, ino_t *out_ino) {
     int fd;
     int created_fresh = 0;  /* track first-time creation for header init */
+    if (g_db) __atomic_fetch_add(&g_kf_open_file_call_count, 1, __ATOMIC_RELAXED);
     if (writer) {
         char dir[PATH_MAX];
         snprintf(dir, sizeof(dir), "%s", path);
@@ -385,16 +390,39 @@ static int kf_open_file(const char *path, size_t slots_capacity, int writer,
 
     SlotcaskKfHeader *hdr = (SlotcaskKfHeader *)m;
     if (created_fresh) {
-        /* Stamp magic + version; counters start at 0. */
-        hdr->magic = SLOTCASK_KF_MAGIC;
+        if (g_db && g_kf_open_create_test_hold_ms > 0) {
+            struct timespec hold_ts = {
+                g_kf_open_create_test_hold_ms / 1000,
+                (long)(g_kf_open_create_test_hold_ms % 1000) * 1000000L
+            };
+            int hold_rc;
+            do {
+                hold_rc = nanosleep(&hold_ts, &hold_ts);
+            } while (hold_rc != 0 && errno == EINTR);
+        }
+        /* Stamp version/counters first, magic last, and publish magic with
+           release semantics for the bounded fallback reader below. */
         hdr->version = SLOTCASK_KF_VERSION;
         hdr->total = 0;
         hdr->deleted = 0;
+        __atomic_store_n(&hdr->magic, SLOTCASK_KF_MAGIC, __ATOMIC_RELEASE);
         msync(m, SLOTCASK_KF_HDR_SIZE, MS_ASYNC);
-    } else if (hdr->magic != SLOTCASK_KF_MAGIC) {
-        /* Magic missing/wrong — pre-release we don't migrate. */
-        munmap(m, want); close(fd);
-        return -1;
+    } else if (__atomic_load_n(&hdr->magic, __ATOMIC_ACQUIRE) != SLOTCASK_KF_MAGIC) {
+        int attempt;
+        for (attempt = 0; attempt < KF_OPEN_MAGIC_WAIT_ATTEMPTS; attempt++) {
+            struct timespec wait_ts = { 0, KF_OPEN_MAGIC_WAIT_INTERVAL_MS * 1000000L };
+            int wait_rc;
+            do {
+                wait_rc = nanosleep(&wait_ts, &wait_ts);
+            } while (wait_rc != 0 && errno == EINTR);
+            if (__atomic_load_n(&hdr->magic, __ATOMIC_ACQUIRE) == SLOTCASK_KF_MAGIC)
+                break;
+        }
+        if (__atomic_load_n(&hdr->magic, __ATOMIC_ACQUIRE) != SLOTCASK_KF_MAGIC) {
+            munmap(m, want); close(fd);
+            errno = EILSEQ;
+            return -1;
+        }
     }
 
     *out_fd = fd;
@@ -423,6 +451,15 @@ static inline void kf_handle_from_uncached(SlotcaskKfHandle *h,
     h->map = (SlotcaskKfEntry *)(base + SLOTCASK_KF_HDR_SIZE);
     h->map_size = sz;
     h->capacity = (sz - SLOTCASK_KF_HDR_SIZE) / sizeof(SlotcaskKfEntry);
+}
+
+static void kf_open_inflight_release(int *slot_ptr) {
+    if (*slot_ptr < 0) return;
+    pthread_mutex_lock(&g_kfcache_lock);
+    g_kf_open_inflight[*slot_ptr].used = 0;
+    pthread_cond_broadcast(&g_kf_open_inflight_cond);
+    pthread_mutex_unlock(&g_kfcache_lock);
+    *slot_ptr = -1;
 }
 
 static int kfcache_acquire_ex(SlotcaskKfHandle *h, const char *path,
@@ -525,6 +562,31 @@ retry_kfcache_acquire:
         pthread_mutex_unlock(&g_kfcache_lock);
         errno = EBUSY;
         return -1;
+    }
+
+    int kf_open_inflight_found = -1;
+    for (int i = 0; i < KF_OPEN_INFLIGHT_SLOTS; i++) {
+        if (g_kf_open_inflight[i].used &&
+            strcmp(g_kf_open_inflight[i].path, path) == 0) {
+            kf_open_inflight_found = i;
+            break;
+        }
+    }
+    if (kf_open_inflight_found >= 0) {
+        pthread_cond_wait(&g_kf_open_inflight_cond, &g_kfcache_lock);
+        pthread_mutex_unlock(&g_kfcache_lock);
+        goto retry_kfcache_acquire;
+    }
+
+    int kf_inflight_slot __attribute__((cleanup(kf_open_inflight_release))) = -1;
+    for (int i = 0; i < KF_OPEN_INFLIGHT_SLOTS; i++) {
+        if (!g_kf_open_inflight[i].used) {
+            g_kf_open_inflight[i].used = 1;
+            strncpy(g_kf_open_inflight[i].path, path, PATH_MAX - 1);
+            g_kf_open_inflight[i].path[PATH_MAX - 1] = '\0';
+            kf_inflight_slot = i;
+            break;
+        }
     }
     pthread_mutex_unlock(&g_kfcache_lock);
     int fd; uint8_t *base; size_t sz; dev_t dev; ino_t ino;
@@ -675,6 +737,7 @@ retry_kfcache_acquire:
     if (!e->used || strcmp(e->path, path) != 0 || e->file_dev != dev ||
         e->file_ino != ino) {
         pthread_rwlock_unlock(lock);
+        kf_open_inflight_release(&kf_inflight_slot);
         return kfcache_acquire_ex(h, path, slots_capacity, writer, nonblocking);
     }
 
