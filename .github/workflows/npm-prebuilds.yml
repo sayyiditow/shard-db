@@ -36,23 +36,39 @@ jobs:
 
       - name: Install dependencies (Linux x64)
         if: matrix.os == 'ubuntu-latest' && !matrix.cross
-        timeout-minutes: 5
+        timeout-minutes: 6
         env:
           DEBIAN_FRONTEND: noninteractive
           NEEDRESTART_MODE: a
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y python3 make g++
+          apt_retry() {
+            for i in 1 2; do
+              if timeout 90 "$@"; then return 0; fi
+              echo "::warning::attempt $i of '$*' timed out or failed, retrying"
+              sleep 5
+            done
+            return 1
+          }
+          apt_retry sudo apt-get update -q
+          apt_retry sudo apt-get install -y python3 make g++
 
       - name: Install cross-compile tools (Linux arm64)
         if: matrix.cross
-        timeout-minutes: 5
+        timeout-minutes: 6
         env:
           DEBIAN_FRONTEND: noninteractive
           NEEDRESTART_MODE: a
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          apt_retry() {
+            for i in 1 2; do
+              if timeout 90 "$@"; then return 0; fi
+              echo "::warning::attempt $i of '$*' timed out or failed, retrying"
+              sleep 5
+            done
+            return 1
+          }
+          apt_retry sudo apt-get update -q
+          apt_retry sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
       - name: npm install
         working-directory: npm
