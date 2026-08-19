@@ -12,6 +12,7 @@ jobs:
     permissions:
       contents: read
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -41,6 +42,15 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
           NEEDRESTART_MODE: a
         run: |
+          missing=""
+          for bin in python3 make g++; do
+            command -v "$bin" >/dev/null 2>&1 || missing="$missing $bin"
+          done
+          if [ -z "$missing" ]; then
+            echo "python3, make, g++ already present on the runner image; skipping apt-get"
+            exit 0
+          fi
+          echo "installing missing tools:$missing"
           apt_retry() {
             for i in 1 2; do
               if timeout 90 "$@"; then return 0; fi
@@ -54,14 +64,14 @@ jobs:
 
       - name: Install cross-compile tools (Linux arm64)
         if: matrix.cross
-        timeout-minutes: 6
+        timeout-minutes: 10
         env:
           DEBIAN_FRONTEND: noninteractive
           NEEDRESTART_MODE: a
         run: |
           apt_retry() {
-            for i in 1 2; do
-              if timeout 90 "$@"; then return 0; fi
+            for i in 1 2 3; do
+              if timeout 120 "$@"; then return 0; fi
               echo "::warning::attempt $i of '$*' timed out or failed, retrying"
               sleep 5
             done
