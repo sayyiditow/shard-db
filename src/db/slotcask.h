@@ -258,6 +258,8 @@ typedef struct SlotcaskDb {
     int     slot_size;       /* max slot size; for varlen = 24 + max_key + max_value */
     size_t  slots_per_shard; /* per-shard kf capacity floor; individual
                                 shards may have grown larger via auto-resplit */
+    int     bulk_commit_window; /* records per commit window; 0 = default
+                                   (1024). db.env BULK_COMMIT_WINDOW. */
 
     SlotcaskStream *streams;
 
@@ -358,39 +360,11 @@ typedef struct __attribute__((packed)) {
 
 /* ============================================================ Public CRUD */
 
-/* Insert a NEW key. Returns 0 on success, -2 if key already exists, -1 on error.
-   stream_id_hint < 0 routes by hash; otherwise must be < num_streams. */
-int slotcask_insert(SlotcaskDb *db, int stream_id_hint,
-                    const void *key, size_t klen,
-                    const void *value, size_t vlen);
-
-/* Update an EXISTING key (snake-game: pool-slot if available else append, then
-   tombstone old). Returns 0 on success, -1 if missing or error. */
-int slotcask_update(SlotcaskDb *db, int stream_id_hint,
-                    const void *key, size_t klen,
-                    const void *value, size_t vlen);
-
-/* Delete (tombstone) a key. Returns 0 on success, -1 if missing or error. */
-int slotcask_delete(SlotcaskDb *db,
-                    const void *key, size_t klen);
-
 /* Read. *val_out is malloc'd on success; caller frees. Returns 0 on success,
    -1 if missing or error. */
 int slotcask_get(SlotcaskDb *db,
                  const void *key, size_t klen,
                  void **val_out, size_t *vlen_out);
-
-/* Bulk update with all-or-nothing per-stream routing. Records must already
-   exist (no upsert); missing key fails the whole batch. Returns 0 on success,
-   -1 on error. */
-typedef struct {
-    const void *key;
-    size_t      klen;
-    const void *value;
-    size_t      vlen;
-} SlotcaskRecord;
-
-int slotcask_bulk_update(SlotcaskDb *db, const SlotcaskRecord *recs, size_t n);
 
 /* Stripped-down lookup. Returns 1 if the key exists (not tombstoned), 0 if
    missing, -1 on I/O error. No value copy. */
@@ -529,11 +503,9 @@ typedef struct {
        skip the entire marker path — segment-write + kf-repoint is already
        crash-safe without a third structure to reconcile. */
     int                       has_indexed_fields;
-    /* When non-NULL, set to 1 after the kf + index mutation if the
-       marker could not be deleted (kf and indexes have converged; the
-       object is safe to read but a retry or restart must clean up the
-       orphaned marker). The caller must propagate this to the wire
-       response as "durability_degraded". */
+    /* When non-NULL, set to 1 only when a published marker could not be
+       converged synchronously. The caller must return the distinct pending
+       outcome; it must not report a successful mutation. */
     int                      *out_durability_degraded;
 } SlotcaskUpsertOpts;
 
@@ -596,7 +568,7 @@ typedef int (*slotcask_bulk_value_fn)(const SlotcaskOldRecord *old,
                                        SlotcaskBulkRec *rec);
 
 /* Two-phase, window-scoped hooks for indexed bulk-insert windows
- * (BULK_COMMIT_MAX_RECORDS records per commit window).
+ * (db->bulk_commit_window records per commit window; 0 = default 1024).
  *
  * prepare_window — fires once per window, on the bulk worker thread,
  *   BEFORE the window's batch marker exists. active[] lists indices into
@@ -612,17 +584,29 @@ typedef int (*slotcask_bulk_value_fn)(const SlotcaskOldRecord *old,
  *   BEFORE kf is committed for the window's surviving records. Performs
  *   the actual index mutations for every record in active[]. A non-zero
  *   return is always a genuine failure (I/O/OOM), never a policy
- *   rejection. The primitive durably writes an abort sidecar, applies the
- *   inverse index diff, tombstones speculative NEW segments, rejects the
- *   window, and returns the original error; it never publishes Kf for that
- *   failed window or reports durability_degraded.
+ *   rejection. MUST be safe to call more than once for the same window:
+ *   forward replay after a post-marker failure may invoke it again on the
+ *   same active[]. It must not free or otherwise consume any state it
+ *   needs to redo the mutations on a subsequent call — that release is
+ *   commit_done's job, not apply_window's. It never publishes Kf for a
+ *   window whose apply never converges, and never reports
+ *   durability_degraded on its own.
+ *
+ * commit_done — fires at most once per window, AFTER the window is fully
+ *   durable (Kf published, old payloads tombstoned, marker cleared).
+ *   Releases whatever prepare_window/apply_window staged (open bitmap
+ *   writer handles, tracked buffers, queued index ops) now that no further
+ *   replay of apply_window can occur for this window. Optional; NULL is
+ *   fine for hooks that stage nothing apply_window needs to keep alive
+ *   across a possible replay.
  *
  * abort_window — fires instead of apply_window when the window's batch
  *   marker never became durable (marker alloc/open/fsync failed, or every
  *   staged record was individually rejected before or during marker
  *   write). Releases whatever prepare_window staged (open bitmap writer
  *   handles, tracked buffers, queued index ops) without performing any
- *   index mutation — apply_window will never be called for this window.
+ *   index mutation — apply_window will never be called for this window,
+ *   and neither will commit_done.
  *   Optional; NULL is fine for hooks that stage nothing durable-adjacent
  *   in prepare_window. */
 typedef int (*slotcask_bulk_prepare_window_fn)(SlotcaskBulkRec *recs,
@@ -631,6 +615,7 @@ typedef int (*slotcask_bulk_prepare_window_fn)(SlotcaskBulkRec *recs,
 typedef int (*slotcask_bulk_apply_window_fn)(SlotcaskBulkRec *recs,
                                               const size_t *active,
                                               size_t nactive, void *ctx);
+typedef void (*slotcask_bulk_commit_done_fn)(void *ctx);
 typedef void (*slotcask_bulk_abort_window_fn)(void *ctx);
 
 typedef struct {
@@ -645,6 +630,15 @@ typedef struct {
     int                          pre_commit_needs_old;
     /* Optional NEW-from-OLD compute hook — see slotcask_bulk_value_fn. */
     slotcask_bulk_value_fn       value_compute;
+    /* Set to 1 iff value_compute actually overwrites rec->value/vlen (i.e.
+       the caller's adapter wired a real new_from_old constructor, not just
+       a check predicate). When 1, the P wave cannot durably stage a payload
+       up front — the real NEW bytes aren't known until OLD is read under
+       the kf-shard wrlock — so staging is deferred entirely to the M
+       phase's per-record fallback. When 0 (check-only; value_compute is
+       still non-NULL but never touches rec->value), the caller-supplied
+       payload is already final and the P wave stages it as usual. */
+    int                          value_rewrites_payload;
     /* Two-phase window hooks — required together for a fresh indexed bulk
        insert window (has_indexed_fields=1 and pre_commit != NULL); see
        slotcask_bulk_prepare_window_fn / slotcask_bulk_apply_window_fn
@@ -652,6 +646,11 @@ typedef struct {
        the window hooks operate on the whole window at once). */
     slotcask_bulk_prepare_window_fn prepare_window;
     slotcask_bulk_apply_window_fn   apply_window;
+    /* Fires at most once, after the window is fully durable (Kf published,
+       old payloads tombstoned, marker cleared); see
+       slotcask_bulk_commit_done_fn above. NULL if apply_window/prepare_window
+       stage nothing that needs releasing after commit. */
+    slotcask_bulk_commit_done_fn    commit_done;
     slotcask_bulk_abort_window_fn   abort_window;
     void                            *bulk_hook_ctx;
     /* Gate: when 0, skip marker path entirely. Set from load_index_fields()
@@ -961,6 +960,21 @@ int slotcask_walk_one_shard_streaming(SlotcaskDb *db, int kf_shard_id,
 int slotcask_walk_live_skip(SlotcaskDb *db, int64_t skip_n,
                               SlotcaskScanCb cb, void *ctx);
 
+/* Query-side full-scan bridge. Per Kf shard, under that shard's held
+   read handle: snapshot live (stream,file,offset,hash) addresses, then
+   fetch and validate exactly those locations (segment header hash must
+   match the Kf address) before releasing the handle. Dispatches one
+   worker per shard via parallel_for_io. Returns 0 on success, -1 if any
+   shard worker failed. Raw segment enumeration must not be used as the
+   source of truth for queries — this is the scan path. */
+int slotcask_scan_live_kf(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx,
+                          int *stop_flag);
+/* Single-shard form for callers that own the parallel fan-out (the
+   query bridge needs per-worker thread state such as g_out). */
+int slotcask_scan_live_kf_one(SlotcaskDb *db, int kf_shard_id,
+                              SlotcaskScanCb cb, void *ctx,
+                              int *stop_flag);
+
 /* Count live records by walking kf entries only — no seg I/O.
    Used by cmd_recount where the caller only needs the total count,
    not the values. ~50× faster than slotcask_walk_live on a counter
@@ -978,24 +992,17 @@ int slotcask_lookup_by_hash_try(SlotcaskDb *db, const uint8_t hash16[16],
 
 /* ============================================================ Two-phase bulk fetch */
 
-/* Resolve hashes to segment file + offset locations.
-   Takes a flat array of hashes (any KF shards).
-   Buckets by shard_for_hash internally, probes each KF shard sequentially.
-   Returns malloc'd array of SlotcaskResolvedRec. *out_n = count of found records.
-   Caller free()s the returned pointer. Returns NULL on error/not found. */
-SlotcaskResolvedRec *slotcask_bulk_resolve_hashes(SlotcaskDb *db,
-                                                   const uint8_t (*hashes)[16],
-                                                   size_t n,
-                                                   size_t *out_n);
-
 /* Fetch records from pre-resolved locations.
-   Groups input by (sid, fid) and dispatches parallel_for_io across
-   unique segment files. Each segment file is opened once via segcache.
-   Records are verified via seg_rec_live_with_hash before callback.
-   Callback signature matches existing SlotcaskScanCb.
+   Partitions input by KF shard and revalidates each record's KF entry
+   under one reader per partition (a concurrent repoint between resolve
+   and fetch retires the record instead of reading a stale segment slot),
+   then groups survivors by (sid, fid) and dispatches parallel_for_io
+   across unique segment files. Each segment file is opened once via
+   segcache. Records are verified via seg_rec_live_with_hash before
+   callback. Callback signature matches existing SlotcaskScanCb.
    Returns 0 on success, -1 on error. */
 int slotcask_bulk_fetch_resolved(SlotcaskDb *db,
-                                  const SlotcaskResolvedRec *recs,
+                                  SlotcaskResolvedRec *recs,
                                   size_t n,
                                   void *ctx,
                                   SlotcaskScanCb cb);

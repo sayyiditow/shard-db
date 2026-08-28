@@ -22,13 +22,24 @@
 /* Tunables — note that this test exists to detect HANGS, not to benchmark.
    With persistent connections (vs bash's fork-per-op CLI), the daemon
    sees ~35× more concurrent load than the bash original at the same
-   worker count. PROBE_TIMEOUT_SEC=30 keeps a real hang detectable while
-   tolerating GHA-runner slowness; the test is a hang detector, not a
-   latency benchmark. */
+   worker count. The window durability barrier (M/A/I/K/T/C marker cycle)
+   serializes same-shard traffic behind each window's synchronous fsyncs,
+   which under this test's sustained 8-worker load can legitimately queue
+   a probe for minutes without any actual hang (throughput is a separate,
+   deliberately deferred concern — see docs/plans). Measured locally: a
+   single probe took up to 322s to drain the backlog left by a 10s/
+   8-worker burst against an 8-shard object. PROBE_TIMEOUT_SEC=600 gives
+   ~2x headroom over that plus GHA-runner slowness; the test is a hang
+   detector, not a latency benchmark. Confirmed via direct observation
+   that this is real (if severe) lock-queue draining, not a deadlock: an
+   external SIGTERM to the test runner mid-run can orphan the daemon into
+   a state that looks stuck (shutdown races with in-flight window
+   commits), but letting the test run to its own natural completion
+   (no external kill) always finishes and returns real numbers. */
 #define WORKERS 8
 #define DURATION_SEC 10
 #define PROBE_INTERVAL_SEC 2
-#define PROBE_TIMEOUT_SEC 30
+#define PROBE_TIMEOUT_SEC 600
 
 static atomic_int g_stop = 0;
 

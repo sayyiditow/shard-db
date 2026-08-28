@@ -2445,7 +2445,6 @@ void *worker_thread(void *arg) {
                 }
 
                 server_process_fast(wa->db_root, line, client_ip);
-
                 /* Single fflush per response: the response body, the \0
                    terminator, and the \n separator all share the FILE*
                    buffer and reach the kernel in one write() syscall.
@@ -3218,27 +3217,9 @@ int bg_threads_start(ShardDb *db, BgRuntimeMode mode) {
     db->bg_auto_vac_spawned = 0;
     db->bg_auto_reshard_spawned = 0;
     db->bg_warmup_spawned = 0;
-    db->bg_durability_spawned = 0;
     memset(&db->bg_auto_vac_tid, 0, sizeof(db->bg_auto_vac_tid));
     memset(&db->bg_auto_reshard_tid, 0, sizeof(db->bg_auto_reshard_tid));
     memset(&db->bg_warmup_tid, 0, sizeof(db->bg_warmup_tid));
-    memset(&db->bg_durability_tid, 0, sizeof(db->bg_durability_tid));
-
-    if (db->durability_sync_ms > 0) {
-        int rc = db_thread_create(&db->bg_durability_tid,
-                                  durability_sync_thread, db);
-        if (rc != 0) {
-            LOG_ERROR(LOG_SUB_DURABILITY,
-                      "required durability thread not started: %s",
-                      strerror(rc));
-            fprintf(stderr,
-                    "shard-db: required durability thread not started: %s\n",
-                    strerror(rc));
-            atomic_store_explicit(&server_running, 0, memory_order_release);
-            return -1;
-        }
-        db->bg_durability_spawned = 1;
-    }
 
     if (db->auto_vacuum_enable) {
         AutoVacuumArg *av = malloc(sizeof(*av));
@@ -3309,8 +3290,6 @@ void bg_threads_stop(ShardDb *db) {
     g_db = db;
     atomic_store_explicit(&server_running, 0, memory_order_release);
 
-    if (db->bg_durability_spawned)
-        pthread_join(db->bg_durability_tid, NULL);
     if (db->bg_auto_vac_spawned)
         pthread_join(db->bg_auto_vac_tid, NULL);
     if (db->bg_auto_reshard_spawned)
@@ -3318,11 +3297,9 @@ void bg_threads_stop(ShardDb *db) {
     if (db->bg_warmup_spawned)
         pthread_join(db->bg_warmup_tid, NULL);
 
-    db->bg_durability_spawned = 0;
     db->bg_auto_vac_spawned = 0;
     db->bg_auto_reshard_spawned = 0;
     db->bg_warmup_spawned = 0;
-    memset(&db->bg_durability_tid, 0, sizeof(db->bg_durability_tid));
     memset(&db->bg_auto_vac_tid, 0, sizeof(db->bg_auto_vac_tid));
     memset(&db->bg_auto_reshard_tid, 0, sizeof(db->bg_auto_reshard_tid));
     memset(&db->bg_warmup_tid, 0, sizeof(db->bg_warmup_tid));

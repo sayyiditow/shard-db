@@ -61,16 +61,37 @@ Each indexed field is sharded into `index_splits_for(splits)` btree files (`<obj
 
 This was the central reason for the per-shard layout. Pre-2026.05.1, a single `<field>.idx` file meant `bulk_build` (which truncates and rewrites the whole file) raced against in-flight readers holding an mmap of intermediate state. Per-file rwlocks give writers and readers proper isolation, and the parallel fan-out turns indexed lookups into N-way concurrent btree probes for free.
 
-### Ordered index-walk lock rule
+### Indexed-read lock rule: never block on kfcache while holding a btree lock
 
-`btree_idx_walk_ordered` holds the `bt_cache` read locks for its open shard
-iterators while it invokes callbacks. A callback that needs the underlying
-record must call `read_record_ref_try` through its `BtOrderedWalkHandle`; if
-the kfcache read would block, it releases the iterators, performs the normal
-blocking fetch, and lets the walk reopen after the delivered entry. Calling
-`read_record_ref` directly from an ordered-walk callback recreates the
-`bt_cache rdlock → kfcache rdlock` inverse of the write path's
-`kfcache wrlock → bt_cache wrlock` order.
+The write path takes `kfcache wrlock → bt_cache wrlock` (mutation windows run
+phase-I index apply under the held kf writer). Therefore **no btree-lock-holding
+context may block on kfcache** — that inversion AB-BA-deadlocks against any
+concurrent indexed write. Every reader executor complies with one of two
+patterns:
+
+1. **Try-then-release (ordered walks, cursor pagination):** callbacks that
+   need the record call `read_record_ref_try` through their
+   `BtOrderedWalkHandle`; on `EBUSY` they release every iterator, perform
+   the normal blocking fetch, and the walk reopens past the delivered
+   `(value,hash)`.
+2. **Owner-thread chunking (streaming find, composite key, min/max walk,
+   varlen group-by):** fan-out workers own private `BtRangeIter`s and drain
+   a bounded hash batch, **close their own iterator**, do the blocking bulk
+   fetch outside any bt lock, then reopen past the last delivered
+   entry using inclusive bounds plus the raw-hash16 tiebreak skip. Worker
+   memory stays bounded (per-worker cap derived from `QUERY_BUFFER_MB`),
+   and no cross-thread iterator state exists.
+
+Calling blocking record-fetch helpers directly from any bt-callback context
+recreates the deadlock.
+
+Related liveness rule: object-wide counter sums (`slotcask_sum_kf_totals`,
+used by counts and find-total hints) read shard headers via lock-free
+`pread` **by design** — a mutation window legitimately holds one kf wrlock
+for its entire M→C span, and taking per-shard readers there would stall
+every unrelated read for the whole window. Counter values are advisory
+metadata; each shard contributes an internally-consistent pre- or
+post-window pair.
 
 ## Writer preference on file-cache rwlocks (2026.07.x+)
 
@@ -164,11 +185,11 @@ no-overlap case — vacuum completes *entirely* before the delayed task ever
 attempts the rdlock — still leaves the daemon crash-free and the object
 correctly re-resolved to its new post-vacuum shape.
 
-## Durability-sync background thread
+## Durability: window barriers and eviction-time flush
 
-A mandatory background thread (`durability_sync_thread`, `src/db/durability.c`) wakes every `DURABILITY_SYNC_MS` (default configurable via db.env) and walks the kf/seg/bt/bm mmap caches, `msync()`-ing any entry whose `dirty` flag is set and whose `dirty_since_ms` has aged past the interval — bounding how long a dirty mmap page can sit unflushed before a crash could lose it, independent of the OS's own writeback cadence.
+Durability is bounded synchronously by the per-window M/A/I/K/T/C marker protocol (see [storage-model.md](storage-model.md)), not by a periodic background sweep — a mutation's durability point is the fsync'd marker write, not a subsequent timed flush. There is no longer a mandatory background durability-sync thread; each cache entry's `dirty`/`dirty_since_ms` fields (`_Atomic`, on every kf/seg/bt/bm cache entry) are only consumed synchronously, at cache-eviction time.
 
-Each cache entry's `base`/`map` pointer is walked **live**, not snapshotted: `durability_sync_one_pass` iterates `db->kfcache[i]` etc. and passes `&e->base`/`&e->map` (a pointer *into* the struct) down to `durability_sync_entry`, which only dereferences it after taking `e->rwlock`. This is required, not incidental — the entry's mapping can be replaced (growth/remap on `kfcache_acquire`) or torn down (`kfcache_invalidate_prefix`/`segcache_invalidate_prefix` under a concurrent vacuum/rebuild) at any point before the lock is taken. An earlier version of this code read `*map_ptr` before acquiring the lock and passed that stale/local copy to `durability_msync()` while still clearing the *live* entry's dirty flag — syncing the wrong (possibly already-unmapped) memory while marking the real dirty data as clean. Fixed by keeping the indirection through the lock instead of snapshotting.
+`durability_flush_dirty()` (`src/db/durability.c`) is called inline whenever `kfcache_acquire`/`segcache_acquire`/the bt/bm cache pick an LRU victim to evict (`bitmap.c`, `btree.c`, `slotcask.c`): before a dirty mapping is dropped from the cache, it is `msync()`-ed so a crash after eviction can't lose it. A failed sync restores the entry's dirty state (and its earliest `dirty_since_ms`, via `durability_restore_earliest`) so the next eviction attempt retries rather than silently losing the write. `durability_mark_dirty()` sets these fields at each of its call sites (`bitmap.c`, `btree.c`, `slotcask.c`) purely to feed this eviction-time flush — there is no other consumer.
 
 ## Commit semantics (v2)
 

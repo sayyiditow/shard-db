@@ -18,17 +18,15 @@
 #include <unistd.h>
 
 static int write_env(const char *env_dir, const char *db_root,
-                     const char *warmup_line, int durability_ms,
-                     int warmup_delay_ms) {
+                     const char *warmup_line, int warmup_delay_ms) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/db.env", env_dir);
     FILE *f = fopen(path, "w");
     if (!f) return -1;
     fprintf(f,
             "DB_ROOT=%s\nLOG_LEVEL=4\nTHREADS=2\nIO_THREADS=4\n"
-            "FCACHE_MAX=4096\nDURABILITY_SYNC_MS=%d\n"
-            "WARMUP_TEST_DELAY_MS=%d\n",
-            db_root, durability_ms, warmup_delay_ms);
+            "FCACHE_MAX=4096\nWARMUP_TEST_DELAY_MS=%d\n",
+            db_root, warmup_delay_ms);
     if (warmup_line) fprintf(f, "WARMUP=%s\n", warmup_line);
     return fclose(f);
 }
@@ -74,17 +72,6 @@ static int run_harness(const char *env_dir, const char *db_root,
     return -1;
 }
 
-static int cycle_contains(const char *log, int cycle, const char *needle) {
-    char start_marker[64], end_marker[64];
-    snprintf(start_marker, sizeof(start_marker), "=== cycle %d start ===", cycle);
-    snprintf(end_marker, sizeof(end_marker), "=== cycle %d end ===", cycle);
-    const char *start = strstr(log, start_marker);
-    if (!start) return 0;
-    const char *end = strstr(start, end_marker);
-    const char *match = strstr(start, needle);
-    return match && (!end || match < end);
-}
-
 static int test_embedded_bg_threads_run(void) {
     char base[256], db_root[300], callback[320];
     snprintf(base, sizeof(base), "/tmp/shard-db-ebg-%d", (int)getpid());
@@ -93,30 +80,17 @@ static int test_embedded_bg_threads_run(void) {
     mkdir(base, 0755);
     mkdir(db_root, 0755);
 
-    ASSERT_EQ_INT(write_env(base, db_root, "off", 100, 0), 0,
+    ASSERT_EQ_INT(write_env(base, db_root, "off", 0), 0,
                   "write embedded durability config");
     snprintf(callback, sizeof(callback), "%s/core.log", base);
     int timed_out = 0;
     ASSERT_EQ_INT(run_harness(base, db_root, 400, 2, callback, &timed_out), 0,
                   "embedded open-close-open harness exits cleanly");
     ASSERT_EQ_INT(timed_out, 0, "embedded lifecycle completes before timeout");
-    char *core_log = tu_read_file(callback);
-    ASSERT_NOT_NULL(core_log, "read embedded callback log");
-    if (core_log) {
-        ASSERT_TRUE(cycle_contains(core_log, 1, "DURABILITY-SYNC tick:"),
-                    "first open lifetime emits durability tick");
-        ASSERT_TRUE(cycle_contains(core_log, 1, "failed=0"),
-                    "first open durability tick succeeds");
-        ASSERT_TRUE(cycle_contains(core_log, 2, "DURABILITY-SYNC tick:"),
-                    "second open lifetime emits durability tick");
-        ASSERT_TRUE(cycle_contains(core_log, 2, "failed=0"),
-                    "second open durability tick succeeds");
-    }
-    free(core_log);
 
     /* A third process opens and reads the same record after cycle 2 closed,
        proving the second shutdown left reusable, readable state. */
-    ASSERT_EQ_INT(write_env(base, db_root, "off", 0, 0), 0,
+    ASSERT_EQ_INT(write_env(base, db_root, "off", 0), 0,
                   "disable background work for post-close read");
     snprintf(callback, sizeof(callback), "%s/reopen.log", base);
     timed_out = 0;
@@ -124,7 +98,7 @@ static int test_embedded_bg_threads_run(void) {
                   "data remains readable after second close");
 
     /* No WARMUP= line: embedded mode must keep its resolved default off. */
-    ASSERT_EQ_INT(write_env(base, db_root, NULL, 0, 300), 0,
+    ASSERT_EQ_INT(write_env(base, db_root, NULL, 300), 0,
                   "write embedded config without WARMUP");
     snprintf(callback, sizeof(callback), "%s/warmup-default.log", base);
     timed_out = 0;
@@ -141,7 +115,7 @@ static int test_embedded_bg_threads_run(void) {
     free(default_log);
 
     /* Explicit async is opt-in and remains joinable through close. */
-    ASSERT_EQ_INT(write_env(base, db_root, "async", 0, 300), 0,
+    ASSERT_EQ_INT(write_env(base, db_root, "async", 300), 0,
                   "write explicit embedded async warmup config");
     snprintf(callback, sizeof(callback), "%s/warmup-async.log", base);
     timed_out = 0;

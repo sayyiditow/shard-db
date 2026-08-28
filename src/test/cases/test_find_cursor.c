@@ -98,7 +98,7 @@ static int test_find_cursor_run(void) {
     /* k3 should not appear in rows[]. The cursor emits cursor.key=k6, so
        we're allowed to see k3 only inside "cursor":{...}. We need a more
        careful check — look in the rows array specifically. */
-    {
+    if (resp) {
         const char *rows = SAFE_STRSTR(resp, "\"rows\":");
         const char *cursor_obj = SAFE_STRSTR(resp, "\"cursor\":{");
         const char *rows_end = cursor_obj ? cursor_obj : resp + strlen(resp);
@@ -136,7 +136,7 @@ static int test_find_cursor_run(void) {
     ASSERT_CONTAINS(resp, "\"key\":\"k7\"", "desc page 2 starts at k7");
     ASSERT_CONTAINS(resp, "\"key\":\"k6\"", "desc page 2 includes k6");
     /* Check k8 not in rows. */
-    {
+    if (resp) {
         const char *rows = SAFE_STRSTR(resp, "\"rows\":");
         const char *cursor_obj = SAFE_STRSTR(resp, "\"cursor\":");
         const char *rows_end = cursor_obj ? cursor_obj : resp + strlen(resp);
@@ -272,7 +272,7 @@ static int test_find_cursor_run(void) {
     ASSERT_CONTAINS(resp, "\"key\":\"c6\"", "cursor+filter page 2 has c6");
     ASSERT_CONTAINS(resp, "\"key\":\"c8\"", "cursor+filter page 2 has c8");
     /* c4 must not be in rows. */
-    {
+    if (resp) {
         const char *rows = SAFE_STRSTR(resp, "\"rows\":");
         const char *cursor_obj = SAFE_STRSTR(resp, "\"cursor\":");
         const char *rows_end = cursor_obj ? cursor_obj : resp + strlen(resp);
@@ -293,7 +293,7 @@ static int test_find_cursor_run(void) {
         "\"cursor\":{\"n\":\"50\",\"key\":\"k5\"}}", &resp);
     ASSERT_CONTAINS(resp, "\"key\":\"k6\"", "cursor past deleted k5 yields k6");
     /* k5 should not appear in rows[]. */
-    {
+    if (resp) {
         const char *rows = SAFE_STRSTR(resp, "\"rows\":");
         const char *cursor_obj = SAFE_STRSTR(resp, "\"cursor\":");
         const char *rows_end = cursor_obj ? cursor_obj : resp + strlen(resp);

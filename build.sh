@@ -29,7 +29,9 @@ esac
 # BUILD_MODE selects compilation flavour. Default `release` is what ships;
 # the others are for CI sanitizer runs and never produce a stripped binary.
 #   release - -O2 -flto, stripped (default; what users get)
-#   asan    - -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+#   asan    - -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined
+#             -fno-omit-frame-pointer. UBSan errors abort at the point of
+#             error (baked-in strictness: no env options needed at the gate).
 #   tsan    - -O1 -g -fsanitize=thread        -fno-omit-frame-pointer
 #   debug   - -O0 -g (no sanitizers; just for stepping in gdb)
 # The sanitizer modes use -O1 (not -O2) because aggressive optimisation
@@ -68,7 +70,7 @@ case "$BUILD_MODE" in
         DO_STRIP=${DO_STRIP:-1}
         ;;
     asan)
-        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-PIE -no-pie $WARN_CFLAGS"
+        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-PIE -no-pie $WARN_CFLAGS"
         MODE_LDFLAGS="-fsanitize=address,undefined -no-pie"
         DO_STRIP=0
         ;;
@@ -243,7 +245,6 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_auto_reshard_shutdown_race.c \
     src/test/cases/test_warmup_vacuum_race.c \
     src/test/cases/test_warmup_vacuum_norace.c \
-    src/test/cases/test_durability_sync.c \
     src/test/cases/test_bench_stats.c \
     src/test/cases/test_durability_ordering.c \
     src/test/cases/test_durability_sync_failures.c \
@@ -380,6 +381,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_varlen_compact_donor_preserved_on_desync.c \
     src/test/cases/test_version_startup_paths.c \
     src/test/cases/test_varlen_compact_crash_mid_migration.c \
+    src/test/cases/test_bt_kf_inversion_stream_find.c \
+    src/test/cases/test_stream_find_chunk_resume.c \
     src/db/util.c \
     src/db/durability.c \
     src/bench/bench_stats.c \
@@ -512,6 +515,8 @@ export IO_THREADS=0
 # and should retry. Lower to leave more headroom for OS page cache;
 # raise on a beefy box with many short-lived queries.
 export MAX_CONCURRENT_QUERIES=0
+# Record count per synchronous indexed durability window.
+export BULK_COMMIT_WINDOW=1024
 
 # Request + query limits
 export GLOBAL_LIMIT=100000
@@ -531,11 +536,6 @@ export FCACHE_MAX=4096
 # field still runs alone. Crank up on big-RAM hosts to fit more fields per
 # pass (faster) or down on small VPS to cap peak.
 export INDEX_BUILD_BUDGET_MB=1024
-
-# Periodic blocking sync for dirty mmap-backed cache entries. This is a
-# target dirty-age/attempt interval, not a transactional durability bound.
-# Set 0 to disable; nonzero values must be at least 50 milliseconds.
-export DURABILITY_SYNC_MS=1000
 
 # Full-scan O_DIRECT chunk size (MB). Each parallel worker reads shard data
 # in chunks of this size using O_DIRECT (cache-bypassing pread). Larger chunks

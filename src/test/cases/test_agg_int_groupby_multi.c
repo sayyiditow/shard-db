@@ -79,7 +79,7 @@ static int test_agg_int_groupby_multi_run(void) {
         "\"group_by\":[\"a\",\"b\"],"
         "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}]}", &resp);
     int n_buckets = 0;
-    for (const char *p = resp; (p = strchr(p, '{')) != NULL; p++) n_buckets++;
+    for (const char *p = resp; p && (p = strchr(p, '{')) != NULL; p++) n_buckets++;
     ASSERT_EQ_INT(n_buckets, 3, "case1: JSON shape has 3 buckets");
     free(resp); resp = NULL;
 

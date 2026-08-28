@@ -20,6 +20,21 @@ uint64_t now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
 }
 
+static int parse_bulk_commit_window(const char *text, int *out) {
+    char *end = NULL;
+    long value;
+
+    errno = 0;
+    value = strtol(text, &end, 10);
+    while (end && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
+        end++;
+    if (errno == ERANGE || end == text || !end || *end != '\0' ||
+        value < 16 || value > 16384)
+        return -1;
+    *out = (int)value;
+    return 0;
+}
+
 /* Coarse clock: ~1-4ms granularity, essentially free (vDSO, no syscall)
    on Linux via CLOCK_MONOTONIC_COARSE. macOS has no equivalent — it
    falls back to plain CLOCK_MONOTONIC which is still cheap (~50 ns).
@@ -415,25 +430,17 @@ int load_db_root(char *out, size_t outlen) {
             if (g_db) g_log_level = atoi(p + 10);
         } else if (strncmp(p, "LOG_RETAIN_DAYS=", 16) == 0) {
             if (g_db) g_log_retain_days = atoi(p + 16);
-        } else if (strncmp(p, "DURABILITY_SYNC_MS=", 19) == 0) {
+        } else if (strncmp(p, "BULK_COMMIT_WINDOW=", 19) == 0) {
             char *v = p + 19;
-            char *end = NULL;
-            errno = 0;
-            long n = strtol(v, &end, 10);
-            int no_digits = (end == v);
-            while (end && (*end == ' ' || *end == '\t' ||
-                           *end == '\r' || *end == '\n')) {
-                end++;
-            }
-            if (errno == ERANGE || !end || no_digits || *end != '\0' ||
-                n < 0 || n > INT_MAX || (n > 0 && n < 50)) {
+            int n = 0;
+            if (parse_bulk_commit_window(v, &n) == 0) {
+                if (g_db) g_bulk_commit_window = n;
+            } else {
                 fprintf(stderr,
-                        "config: DURABILITY_SYNC_MS=\"%.*s\" must be 0 or >=50; "
-                        "keeping current value (%d)\n",
+                        "config: BULK_COMMIT_WINDOW=\"%.*s\" must be an integer "
+                        "in [16,16384]; keeping current value (%d)\n",
                         (int)strcspn(v, "\r\n"), v,
-                        g_db ? g_durability_sync_ms : 1000);
-            } else if (g_db) {
-                g_durability_sync_ms = (int)n;
+                        g_db ? g_bulk_commit_window : 1024);
             }
         } else if (strncmp(p, "INDEX_PAGE_SIZE=", 16) == 0) {
             int ps = atoi(p + 16);
@@ -2499,9 +2506,12 @@ int format_wire_key(const Schema *sc, const char *key, size_t klen,
             LOG_WARN(LOG_SUB_CONFIG, "format_wire_key: AK_SEQ key length mismatch (klen=%zu, outcap=%zu)", klen, outcap);
             return -1;
         }
-        int64_t v = 0;
+        uint64_t u = 0;
         for (int i = 0; i < 8; i++)
-            v = (v << 8) | (uint8_t)key[i];
+            u = (u << 8) | (uint8_t)key[i];
+        int64_t v = (int64_t)u;   /* two's-complement wrap, well-defined on
+                                     our targets; shifting the signed value
+                                     was UB once the top bit was set */
         format_seq_key(v, out);
         return (int)strlen(out);
     }
@@ -2840,10 +2850,13 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         return 2 + esc;
     }
     case FT_LONG: {
-        int64_t v = ((int64_t)data[0] << 56) | ((int64_t)data[1] << 48) |
-                    ((int64_t)data[2] << 40) | ((int64_t)data[3] << 32) |
-                    ((int64_t)data[4] << 24) | ((int64_t)data[5] << 16) |
-                    ((int64_t)data[6] << 8) | data[7];
+        uint64_t u = ((uint64_t)data[0] << 56) | ((uint64_t)data[1] << 48) |
+                     ((uint64_t)data[2] << 40) | ((uint64_t)data[3] << 32) |
+                     ((uint64_t)data[4] << 24) | ((uint64_t)data[5] << 16) |
+                     ((uint64_t)data[6] << 8) | data[7];
+        int64_t v = (int64_t)u;   /* unsigned accumulate: shifting a signed
+                                     value into its sign bit was UB for
+                                     negative fields (strict gate) */
         if (v == 0) return 0; /* skip zero */
         return snprintf(buf, buflen, "%lld", (long long)v);
     }
@@ -2857,16 +2870,18 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
            0 epoch-ms is exotic enough that the existing emit-as-empty
            is acceptable). Callers needing strict "0 is valid" can
            inspect raw bytes via typed_get_field_str. */
-        int64_t v = ((int64_t)data[0] << 56) | ((int64_t)data[1] << 48) |
-                    ((int64_t)data[2] << 40) | ((int64_t)data[3] << 32) |
-                    ((int64_t)data[4] << 24) | ((int64_t)data[5] << 16) |
-                    ((int64_t)data[6] << 8) | data[7];
+        uint64_t u = ((uint64_t)data[0] << 56) | ((uint64_t)data[1] << 48) |
+                     ((uint64_t)data[2] << 40) | ((uint64_t)data[3] << 32) |
+                     ((uint64_t)data[4] << 24) | ((uint64_t)data[5] << 16) |
+                     ((uint64_t)data[6] << 8) | data[7];
+        int64_t v = (int64_t)u;   /* see FT_LONG: unsigned accumulate */
         if (v == 0) return 0;
         return snprintf(buf, buflen, "%lld", (long long)v);
     }
     case FT_INT: {
-        int32_t v = ((int32_t)data[0] << 24) | ((int32_t)data[1] << 16) |
-                    ((int32_t)data[2] << 8) | data[3];
+        uint32_t u = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+                     ((uint32_t)data[2] << 8) | data[3];
+        int32_t v = (int32_t)u;   /* see FT_LONG: unsigned accumulate */
         return snprintf(buf, buflen, "%d", v);
     }
     case FT_SHORT: {
@@ -2892,10 +2907,11 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         return snprintf(buf, buflen, "%u", data[0]);
     }
     case FT_NUMERIC: {
-        int64_t v = ((int64_t)data[0] << 56) | ((int64_t)data[1] << 48) |
-                    ((int64_t)data[2] << 40) | ((int64_t)data[3] << 32) |
-                    ((int64_t)data[4] << 24) | ((int64_t)data[5] << 16) |
-                    ((int64_t)data[6] << 8) | data[7];
+        uint64_t u = ((uint64_t)data[0] << 56) | ((uint64_t)data[1] << 48) |
+                     ((uint64_t)data[2] << 40) | ((uint64_t)data[3] << 32) |
+                     ((uint64_t)data[4] << 24) | ((uint64_t)data[5] << 16) |
+                     ((uint64_t)data[6] << 8) | data[7];
+        int64_t v = (int64_t)u;   /* see FT_LONG: unsigned accumulate (UB gate) */
         if (v == 0) return snprintf(buf, buflen, "0");
         int64_t scale = f->numeric_scale_mult;
         int64_t whole = v / scale;
@@ -2909,14 +2925,16 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
                         (long long)whole, f->numeric_scale, (long long)frac);
     }
     case FT_DATE: {
-        int32_t v = ((int32_t)data[0] << 24) | ((int32_t)data[1] << 16) |
-                    ((int32_t)data[2] << 8) | data[3];
+        uint32_t u = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+                     ((uint32_t)data[2] << 8) | data[3];
+        int32_t v = (int32_t)u;   /* see FT_LONG: unsigned accumulate (UB gate) */
         if (v == 0) return 0;
         return snprintf(buf, buflen, "\"%08d\"", v); /* "yyyyMMdd" */
     }
     case FT_DATETIME: {
-        int32_t d = ((int32_t)data[0] << 24) | ((int32_t)data[1] << 16) |
-                    ((int32_t)data[2] << 8) | data[3];
+        uint32_t ud = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+                      ((uint32_t)data[2] << 8) | data[3];
+        int32_t d = (int32_t)ud;   /* see FT_LONG: unsigned accumulate (UB gate) */
         uint16_t t = ((uint16_t)data[4] << 8) | data[5];
         if (d == 0 && t == 0) return 0;
         int hh = t / 3600;
@@ -2925,8 +2943,9 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         return snprintf(buf, buflen, "\"%08d%02d%02d%02d\"", d, hh, mm, ss); /* "yyyyMMddHHmmss" */
     }
     case FT_DATETIMEMS: {
-        int32_t d = ((int32_t)data[0] << 24) | ((int32_t)data[1] << 16) |
-                    ((int32_t)data[2] << 8) | data[3];
+        uint32_t ud = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+                      ((uint32_t)data[2] << 8) | data[3];
+        int32_t d = (int32_t)ud;   /* see FT_LONG: unsigned accumulate (UB gate) */
         uint32_t ms = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
                       ((uint32_t)data[6] << 8) | data[7];
         if (d == 0 && ms == 0) return 0;

@@ -90,19 +90,22 @@ static int append_requestf(char *buf, size_t cap, size_t *off,
     return 0;
 }
 
-/* The wait budgets below (20s/40s) are calibrated for uninstrumented
-   execution: 5s thread-startup delay + a 1.05M-record bulk-insert +
-   a full kf/segment rebuild, all comfortably inside budget on plain builds.
-   ASan/TSan instrumentation materially slows the same rebuild under the
-   all-CPU test runner, which can push it past the un-scaled budget without
-   any functional problem -- the reshard still runs and still reaches the
+/* The wait budgets below (20s/40s) are scaled up from their original
+   uninstrumented-execution baseline (5s thread-startup delay + a
+   1.05M-record bulk-insert + a full kf/segment rebuild). The window
+   durability barrier (M/A/I/K/T/C marker cycle, each window carrying its
+   own synchronous fsync) makes the same bulk-insert + rebuild take
+   noticeably longer even on plain (non-sanitizer) builds than it did
+   under the old async-flush design, on top of the further slowdown ASan/
+   TSan instrumentation adds under the all-CPU test runner. None of this
+   is a functional problem -- the reshard still runs and still reaches the
    right target, just slower. Scale the *wait*, not the assertion: the
    correctness check (did it reshape / reach the right target) is unchanged
    either way. */
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define RESHARD_WAIT_SCALE 6
 #else
-#define RESHARD_WAIT_SCALE 1
+#define RESHARD_WAIT_SCALE 3
 #endif
 
 /* Poll `<base>/logs/<date_str>-info.log` for a line containing `tag`. LOG_WARN
@@ -251,7 +254,14 @@ static int test_auto_reshard_run(void) {
     ASSERT_TRUE(ready, "daemon ready with AUTO_RESHARD_ENABLE=1");
     if (!ready) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
-    TestClientCfg cfg = { .port = port, .io_timeout_ms = 30000 };
+    /* io_timeout_ms is generous: this client's later count/describe-object
+       requests can queue behind the reshard rebuild's and the writer
+       thread's own window-durability fsyncs (M/A/I/K/T/C marker cycle per
+       window) on the same kf shard, well past a plain request's normal
+       latency. A short timeout here doesn't just fail the read — the late
+       reply then desyncs framing for every subsequent request on this
+       persistent connection. */
+    TestClientCfg cfg = { .port = port, .io_timeout_ms = 600000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
@@ -351,9 +361,12 @@ static int test_auto_reshard_run(void) {
     /* Wait for the thread's first hour-matching tick. auto_reshard_thread
        sleeps 5s on startup (Task 3) before its first wall-clock check,
        specifically so this setup above always finishes first — then it
-       sleeps in 1s increments and checks the wall clock each tick. 20s
-       gives generous slack on top of the 5s startup delay for slow CI. */
-    TAP_DIAG("# auto-reshard: waiting up to 20s for the first thread tick...\n");
+       sleeps in 1s increments and checks the wall clock each tick. The
+       scaled window gives generous slack on top of the 5s startup delay,
+       both for slow CI and for the window-durability barrier's per-window
+       fsyncs slowing the rebuild (see RESHARD_WAIT_SCALE above). */
+    TAP_DIAG("# auto-reshard: waiting up to %ds for the first thread tick...\n",
+             20 * RESHARD_WAIT_SCALE);
     fflush(_TAP_OUT);
     int grown_reshaped = 0;
     for (int i = 0; i < 40 * RESHARD_WAIT_SCALE; i++) {
@@ -362,7 +375,7 @@ static int test_auto_reshard_run(void) {
         if (resp && SAFE_STRSTR(resp, "\"splits\":16")) { grown_reshaped = 1; free(resp); resp = NULL; break; }
         free(resp); resp = NULL;
     }
-    ASSERT_TRUE(grown_reshaped, "grown reshaped from splits=8 to splits=16 within 20s");
+    ASSERT_TRUE(grown_reshaped, "grown reshaped from splits=8 to splits=16 within wait budget");
 
     /* Post-reshard writer: hammer inserts to verify the rebuilt object
        accepts writes without errors and every successful insert persists.
@@ -412,7 +425,7 @@ static int test_auto_reshard_run(void) {
     int huge_target_logged = wait_for_log_line(base, date_str,
         "AUTO-RESHARD default/huge: starting 8 -> 2048", 20 * RESHARD_WAIT_SCALE);
     ASSERT_TRUE(huge_target_logged,
-        "huge (live=3,000,000,000, past INT_MAX) computed target=2048 within 20s "
+        "huge (live=3,000,000,000, past INT_MAX) computed target=2048 within wait budget "
         "-- regression check for get_live_count()'s int-truncation bug "
         "(rebuild itself is expected to fail against the fabricated total)");
 
@@ -599,7 +612,14 @@ static int test_auto_reshard_throttle_run(void) {
        date the test happens to check it). */
     time_t reshard_start_ts = time(NULL);
 
-    TestClientCfg cfg = { .port = port, .io_timeout_ms = 30000 };
+    /* io_timeout_ms is generous: this client's later count/describe-object
+       requests can queue behind the reshard rebuild's and the writer
+       thread's own window-durability fsyncs (M/A/I/K/T/C marker cycle per
+       window) on the same kf shard, well past a plain request's normal
+       latency. A short timeout here doesn't just fail the read — the late
+       reply then desyncs framing for every subsequent request on this
+       persistent connection. */
+    TestClientCfg cfg = { .port = port, .io_timeout_ms = 600000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }

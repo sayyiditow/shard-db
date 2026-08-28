@@ -28,7 +28,7 @@ static int test_slotcask_api_run(void) {
 
     const char *k1 = "key1";
     const char *v1 = "value1";
-    ret = slotcask_insert(&db, -1, k1, 4, v1, 6);
+    ret = slotcask_insert_with_hooks(&db, -1, k1, 4, v1, 6, NULL, NULL);
     ASSERT_EQ_INT(ret, 0, "insert key1");
 
     ret = slotcask_sum_kf_totals(&db, &total, &deleted);
@@ -51,7 +51,7 @@ static int test_slotcask_api_run(void) {
     ret = slotcask_exists(&db, "nonexistent", 11);
     ASSERT_EQ_INT(ret, 0, "exists nonexistent");
 
-    ret = slotcask_delete(&db, k1, 4);
+    ret = slotcask_delete_with_hooks(&db, k1, 4, NULL, NULL);
     ASSERT_EQ_INT(ret, 0, "delete key1");
 
     ret = slotcask_exists(&db, k1, 4);
@@ -62,18 +62,21 @@ static int test_slotcask_api_run(void) {
     ret = slotcask_open(&db, g_tmpdir, 8, 4, 64);
     ASSERT_EQ_INT(ret, 0, "reopen");
 
-    SlotcaskRecord recs[2];
     const char *k2 = "key2", *v2 = "val2", *k3 = "key3", *v3 = "val3";
-    recs[0].key = k2; recs[0].klen = 4; recs[0].value = v2; recs[0].vlen = 4;
-    recs[1].key = k3; recs[1].klen = 4; recs[1].value = v3; recs[1].vlen = 4;
-    ret = slotcask_bulk_update(&db, recs, 2);
-    ASSERT_EQ_INT(ret, -1, "bulk_update missing keys");
+    SlotcaskUpsertOpts update_only;
+    memset(&update_only, 0, sizeof(update_only));
+    update_only.require_existing = 1;
 
-    slotcask_insert(&db, -1, k2, 4, v2, 4);
-    slotcask_insert(&db, -1, k3, 4, v3, 4);
-    recs[0].value = v2; recs[0].vlen = 4;
-    recs[1].value = v3; recs[1].vlen = 4;
-    ret = slotcask_bulk_update(&db, recs, 2);
+    ret = slotcask_upsert_with_hooks(&db, -1, k2, 4, v2, 4, &update_only, NULL);
+    if (ret == 0)
+        ret = slotcask_upsert_with_hooks(&db, -1, k3, 4, v3, 4, &update_only, NULL);
+    ASSERT_TRUE(ret != 0, "bulk_update missing keys");
+
+    slotcask_insert_with_hooks(&db, -1, k2, 4, v2, 4, NULL, NULL);
+    slotcask_insert_with_hooks(&db, -1, k3, 4, v3, 4, NULL, NULL);
+    ret = slotcask_upsert_with_hooks(&db, -1, k2, 4, v2, 4, &update_only, NULL);
+    if (ret == 0)
+        ret = slotcask_upsert_with_hooks(&db, -1, k3, 4, v3, 4, &update_only, NULL);
     ASSERT_EQ_INT(ret, 0, "bulk_update existing");
 
     ret = slotcask_compact_kf(&db);

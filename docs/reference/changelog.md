@@ -4,6 +4,40 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## Unreleased
+
+**Fixed: btree↔kfcache lock-order inversion (production deadlock).** The
+limit-bound streaming find, composite-key exact scan, aggregate MIN/MAX
+batched walk, and varchar-streaming group-by all fetched records via
+blocking kf-lock acquires while holding per-shard idx-file rdlocks — the
+inverse of the mutation window's `kf wrlock → bt wrlock` ordering. Under a
+concurrent indexed write these reads wedged permanently. All four executors
+now close their worker-owned iterators before every blocking fetch and
+reopen past the last delivered `(value,hash)`; result parity is pinned by
+new regression tests (`test-bt-kf-inversion-stream-find`,
+`test-stream-find-chunk-resume`).
+
+**Fixed: window-spanning counter stall.** `slotcask_sum_kf_totals` took a
+kf reader per shard, so any mid-window commit stalled *every* object-wide
+count and find-total hint for the whole window duration. Header counters
+are now read via lock-free `pread`; values remain advisory per-shard
+pre-or-post pairs (documented in docs/concepts/concurrency.md).
+
+**Hardened:** `slotcask_bulk_fetch_resolved` now validates each resolved
+address AND copies the segment bytes under one continuously-held kf reader
+(per the 2026-08-21 visibility contract), eliminating a torn-read window
+against same-key segment reuse. Callback delivery order is per-shard-grouped;
+no consumer depends on global ordering.
+
+Indexed-write crash recovery is now forward-replay-only: the abort-sidecar
+mechanism introduced in 2026.08.1 (persist-sidecar-then-roll-back on
+post-marker index-apply failure) is removed. All mutations (single and bulk)
+publish a KFM2 batch commit-intent marker via `bulk_publish_window_marker_locked`;
+recovery always forward-replays a durable marker to completion rather than
+inverting it. Upgrading onto this release requires the data directory to
+already be in a clean, recovery-complete state — this code does not interpret
+a prior release's abort-sidecar files.
+
 ## 2026.08.2
 
 Breaking storage boundary: new segments are VARIABLE-only and startup performs

@@ -562,16 +562,6 @@ void log_slow_query(const char *mode, const char *dir, const char *object,
                     const char *query, uint32_t duration_ms);
 int bt_cache_stats(int *used_slots, int *total_slots, size_t *total_bytes);
 
-typedef struct {
-    int kf_synced;
-    int seg_synced;
-    int bt_synced;
-    int bm_synced;
-    int failed;
-    int skipped;
-    int escalated;
-} DurabilitySyncStats;
-
 typedef enum {
     CACHE_DROP_EVICT,
     CACHE_DROP_DISCARD
@@ -589,7 +579,6 @@ int durability_flush_dirty(_Atomic int *dirty,
                            _Atomic uint64_t *dirty_since_ms,
                            void *addr, size_t len);
 int durability_same_open_inode(int fd, const char *path);
-void *durability_sync_thread(void *arg);
 int durability_fsync(int fd);
 /* Runs immediately after the rename (before the parent-directory sync) so
    cache layers can advance their publication generation while a target
@@ -610,8 +599,6 @@ void durability_test_msync_reset(void);
 void durability_test_msync_fail_next(int count, int err);
 void durability_test_msync_fail_on_call(int call_number, int err);
 void durability_test_msync_counts(int *succeeded, int *failed);
-void durability_test_sync_one_pass(struct ShardDb *db, int interval_ms,
-                                   DurabilitySyncStats *stats);
 void durability_test_fsync_reset(void);
 void durability_test_fsync_fail_on_call(int call_number, int err);
 void index_test_spill_open_fail_errno(int err);

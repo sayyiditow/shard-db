@@ -88,7 +88,7 @@ static int test_bare_shapes_run(void) {
 
     /* size → bare disk bytes (positive integer) */
     tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"shape_t\"}", &resp);
-    ASSERT_TRUE(atoll(resp) > 0, "size > 0 (disk bytes)");
+    ASSERT_TRUE(resp && atoll(resp) > 0, "size > 0 (disk bytes)");
     free(resp); resp = NULL;
 
     /* delete + orphaned → bare deleted count */

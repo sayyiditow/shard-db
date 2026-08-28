@@ -188,7 +188,8 @@ static int test_seg_scan_bit_equality(void) {
         snprintf(key, sizeof(key), "key_%04d", i);
         int vlen = 32 + (i % 64);
         for (int j = 0; j < vlen; j++) val[j] = (char)('A' + ((i + j) % 26));
-        if (slotcask_insert(&db, -1, key, strlen(key), val, (size_t)vlen) == 0)
+        if (slotcask_insert_with_hooks(&db, -1, key, strlen(key), val,
+                                        (size_t)vlen, NULL, NULL) == 0)
             inserted++;
     }
     ASSERT_EQ_INT(inserted, N, "all 100 records inserted");
@@ -198,7 +199,7 @@ static int test_seg_scan_bit_equality(void) {
     for (int i = 0; i < 10; i++) {
         char key[32];
         snprintf(key, sizeof(key), "key_%04d", i * 7 % N);
-        if (slotcask_delete(&db, key, strlen(key)) == 0)
+        if (slotcask_delete_with_hooks(&db, key, strlen(key), NULL, NULL) == 0)
             deleted++;
     }
     /* deleted may be < 10 if some keys collided; we just assert > 0. */
