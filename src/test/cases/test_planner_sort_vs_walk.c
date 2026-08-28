@@ -18,6 +18,39 @@ extern const char *plan_filter_kind_for_test(const char *db_root, const char *ob
         char *out_field, size_t fsz, char *out_order, size_t osz,
         int *out_total_cheap);
 
+/* Seed N records (5 rare, N-5 common) in ONE bulk-insert request. Each
+   individual insert is now a fully durable M→A→I→K→T→C window, so 2000
+   single-row seeds blew the CI runner's 180 s watchdog before the first
+   assertion. One bulk request produces ~one window per kf shard and keeps
+   the planner boundary: with N=205 and limit 25, prefer_fetch_sort picks
+   sort for the rare set (5² < 25×205) and walk for the common set
+   (200² ≥ 25×205). num_field is the integer ordering field's name in the
+   case's schema (t / score). */
+static int seed_sort_walk_fixture(TestClient *tc, const char *dir,
+                                  const char *obj, const char *str_field,
+                                  const char *num_field, int n,
+                                  const char *what) {
+    char *req = malloc(65536); char *resp = NULL;
+    ASSERT_NOT_NULL(req, "seed alloc");
+    size_t off = (size_t)snprintf(req, 65536,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"%s\",\"object\":\"%s\",\"records\":[",
+        dir, obj);
+    for (int i = 0; i < n; i++) {
+        const char *cat = (i < 5) ? "rare" : "common";
+        off += (size_t)snprintf(req + off, 65536 - off,
+            "%s{\"key\":\"k%04d\",\"value\":{\"%s\":\"%s\",\"%s\":%d}}",
+            i ? "," : "", i, str_field, cat, num_field, i);
+    }
+    snprintf(req + off, 65536 - off, "]}");
+    tc_request(tc, req, &resp);
+    free(req);
+    char expect[64];
+    snprintf(expect, sizeof(expect), "\"inserted\":%d", n);
+    ASSERT_CONTAINS(resp, expect, what);
+    free(resp);
+    return 0;
+}
+
 static int test_planner_sort_vs_walk(void) {
     TestEnv env = {0};
     TestClient *tc = NULL; char *resp = NULL;
@@ -32,15 +65,8 @@ static int test_planner_sort_vs_walk(void) {
         "\"indexes\":[\"cat\",\"t\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create"); free(resp); resp=NULL;
 
-    for (int i = 0; i < 2000; i++) {
-        char req[256];
-        /* 5 rare rows (k≈5), 1995 common rows */
-        const char *cat = (i < 5) ? "rare" : "common";
-        snprintf(req, sizeof(req),
-            "{\"mode\":\"insert\",\"dir\":\"sw\",\"object\":\"swobj\",\"key\":\"k%04d\","
-            "\"value\":{\"cat\":\"%s\",\"t\":%d}}", i, cat, i);
-        tc_request(tc, req, &resp); free(resp); resp=NULL;
-    }
+    if (seed_sort_walk_fixture(tc, "sw", "swobj", "cat", "t", 205,
+                               "bulk seed 205 (5 rare)")) return 1;
 
     char order[64];
 
@@ -78,15 +104,10 @@ static int test_cursor_fetch_sort(void) {
         "\"indexes\":[\"kind\",\"score\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create"); free(resp); resp=NULL;
 
-    /* 5 "rare" rows (k≈5), 1995 "common" rows — sparse in score. */
-    for (int i = 0; i < 2000; i++) {
-        char req[256];
-        const char *kind = (i < 5) ? "rare" : "common";
-        snprintf(req, sizeof(req),
-            "{\"mode\":\"insert\",\"dir\":\"cf\",\"object\":\"cfobj\",\"key\":\"k%04d\","
-            "\"value\":{\"kind\":\"%s\",\"score\":%d}}", i, kind, i);
-        tc_request(tc, req, &resp); free(resp); resp=NULL;
-    }
+    /* 5 "rare" rows (k≈5), 200 "common" rows — sparse in score. One bulk
+       request; see seed_sort_walk_fixture for the watchdog rationale. */
+    if (seed_sort_walk_fixture(tc, "cf", "cfobj", "kind", "score", 205,
+                               "bulk seed 205 (5 rare)")) return 1;
 
     /* Page 1: limit=3 on rare set. Expect 3 rows, non-null cursor. */
     tc_request(tc,

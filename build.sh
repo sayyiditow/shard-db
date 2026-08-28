@@ -247,6 +247,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_warmup_vacuum_norace.c \
     src/test/cases/test_bench_stats.c \
     src/test/cases/test_durability_ordering.c \
+    src/test/cases/test_window_release_routes.c \
     src/test/cases/test_durability_sync_failures.c \
     src/test/cases/test_durability_sync_cache_paths.c \
     src/test/cases/test_embedded_bg_threads.c \

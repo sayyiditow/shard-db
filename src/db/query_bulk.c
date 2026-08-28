@@ -951,6 +951,16 @@ static void v2_bulk_ins_commit_done(void *ctx) {
     v2_bulk_ins_window_release((BulkInsShardWork *)ctx);
 }
 
+/* Post-M unresolved exit (EINPROGRESS): identical release body to
+   commit_done/abort_window. The retained marker now owns durable recovery
+   and gate/startup replay re-derives every mutation from disk, so the
+   staged state must be released now even though durability never
+   confirmed. Kept as a distinct name so the SlotcaskBulkOpts.release_window
+   wiring reads honestly. */
+static void v2_bulk_ins_release_window(void *ctx) {
+    v2_bulk_ins_window_release((BulkInsShardWork *)ctx);
+}
+
 static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
     uint64_t t_worker_start = now_ms_coarse();
 
@@ -1044,6 +1054,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         .prepare_window       = sw->nidx > 0 ? v2_bulk_ins_prepare_window : NULL,
         .apply_window         = sw->nidx > 0 ? v2_bulk_ins_apply_window  : NULL,
         .commit_done          = sw->nidx > 0 ? v2_bulk_ins_commit_done  : NULL,
+        .release_window       = sw->nidx > 0 ? v2_bulk_ins_release_window : NULL,
         .abort_window         = sw->nidx > 0 ? v2_bulk_ins_abort_window  : NULL,
         .bulk_hook_ctx         = sw,
         /* OLD value only needed when there are indexes to update; otherwise

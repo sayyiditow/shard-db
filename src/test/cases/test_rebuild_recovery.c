@@ -60,7 +60,12 @@ static int test_rebuild_recovery_run(void) {
     char saved_db_root[256];
     snprintf(saved_db_root, sizeof(saved_db_root), "%s", env.db_root);
 
-    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
+    /* 600s: the vacuum/rebuild round-trip is fsync-bound and the shared
+       CI runners make it scale badly — it exceeded 30s under --jobs 2
+       ASan contention (2026-08-28), then 120s under TSan contention
+       (same day, second round) while passing locally and in the ASan leg.
+       Same ceiling test-auto-reshard uses under TSan. */
+    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 600000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }

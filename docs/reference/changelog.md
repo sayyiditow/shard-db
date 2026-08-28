@@ -6,6 +6,44 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**Fixed: window release hooks never fired (per-call staging leak).** The
+window coordinator (`bulk_commit_one_kf_window`) never invoked the
+`commit_done`/`abort_window` hooks that indexed bulk inserts wired in, so
+every successful indexed bulk window leaked its staged index state (bitmap
+ops, queued trigram/btree ops, idx-pair keys). The coordinator now routes
+exactly one release per staged window, chosen by on-disk truth: no marker
+evidence → `abort_window` (including windows whose every record was
+policy-rejected — those were never committed even though the batch reports
+success); marker durable + success → `commit_done`; marker durable + failed
+replay → the new `release_window` (durable recovery is owned by the marker;
+gate/startup replay re-derives from disk). A failed `prepare_window` remains
+self-cleaning and fires no route; the single-record two-phase adapter now
+runs `abort_commit` when `prepare_commit` fails, so that contract holds for
+every consumer. Pinned by `test-window-release-routes`.
+
+**Fixed: macOS build.** The (dead) `IdxTouchSet` growth path used
+`reallocarray`, which macOS doesn't declare under the build's strict feature
+macros; replaced with an overflow-checked `realloc`.
+
+**Changed: CI.** The two planner/cursor test fixtures now seed 205 rows via
+one bulk-insert request instead of 2,000 individually-durable inserts
+(post-durability-merge, those blew the 180 s per-case watchdog on shared CI
+runners); `test-rebuild-recovery` and `test-rebuild-validation` client
+budgets are 30 s → 600 s (the fsync-bound vacuum round-trip times out
+under `--jobs 2` sanitizer contention on shared runners — exceeded 30 s
+under ASan, then 120 s under TSan, while passing locally and in the ASan
+leg); the per-case watchdog is runner-configured (600 s
+CI, 900 s sanitizer legs) since ASan/TSan plus shared-runner fsync latency
+genuinely exceeds 180 s on durability-heavy cases; the sanitizer workflows'
+log-scan backstop now runs with `if: always()` and also scans the captured
+runner output using strict report signatures only — a finding can no longer
+escape behind an unrelated failing step, and benign test names (e.g.
+`test-ordered-walk-kfcache-deadlock`) no longer trip it. The macOS CI leg
+now builds (portable alloc), which exposed a pre-existing macOS-arm64-only
+`test-binary-index` numeric-BETWEEN failure
+(docs/plans/2026-08-28-macos-arm64-numeric-between.md) excluded from the PR
+gate pending root-cause.
+
 **Fixed: btree↔kfcache lock-order inversion (production deadlock).** The
 limit-bound streaming find, composite-key exact scan, aggregate MIN/MAX
 batched walk, and varchar-streaming group-by all fetched records via

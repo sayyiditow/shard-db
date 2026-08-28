@@ -46,6 +46,11 @@ jobs:
       # sub-run internally, unrelated to the --jobs 2 outer setting below.
       # This runner is too weak for that nested width; narrow it to 2.
       SHARD_TEST_RUNNER_PARALLEL_JOBS: "2"
+      # ASan + the shared runner's slow fsyncs make durability-heavy cases
+      # (rebuild family: walk + abort-restore, fsync per barrier) exceed
+      # the 180s default per-case watchdog. The 35-minute job timeout
+      # still bounds genuine hangs.
+      SHARD_TEST_WATCHDOG_SEC: "900"
       SHARD_TEST_EXCLUDE: "test-auto-reshard-throttle,test-auto-reshard,test-auto-vacuum,test-startup-refuses-unreadable-kf-maintenance,test-startup-refuses-unreadable-kf-count,test-rebuild-legacy-ambiguous-refuses-start,test-parallel-index-integrity,test-durability-corrupt-marker-policy,test-auto-reshard-shutdown-race,test-rebuild-txn-crash-after-walk,test-topn-stream-count-no-criteria,test-runner-parallel"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,17 +62,29 @@ jobs:
         # --jobs pinned low: ASan/UBSan instrumentation is CPU/memory
         # heavy per test case, and this runner is shared/weak — full-nproc
         # default parallelism caused contention-driven request timeouts.
-        run: ./build/bin/shard-db-test run-all --exclude "$SHARD_TEST_EXCLUDE" --jobs 2
+        # tee: embedded-harness findings print to the runner log, not the
+        # daemon log dir — capture them for the scan step below.
+        run: |
+          set -eo pipefail
+          ./build/bin/shard-db-test run-all --exclude "$SHARD_TEST_EXCLUDE" --jobs 2 2>&1 | tee /tmp/suite-output.log
 
       # Defensive backstop: daemon findings fail their case via nonzero
       # exits now, but grep the daemon logs once everything's done anyway
       # so a report that somehow didn't fail a case still fails the
       # workflow. Tests run in /tmp so check there.
       - name: Fail if any sanitizer findings escaped
+        # always(): the backstop must run even when the suite step above
+        # failed — 2026-08-28: a LeakSanitizer report escaped exactly this
+        # way (suite red on an unrelated assertion → scan skipped).
+        # Patterns are report SIGNATURES only: every real ASan/LSan/UBSan
+        # report carries a "WARNING: <Tool>" or "SUMMARY: <Tool>" prefix
+        # (UBSan a "runtime error:" phrase), so bare tool names or
+        # "SUMMARY: " can't false-positive on test names or TAP output.
+        if: always()
         run: |
-          if grep -Erq "AddressSanitizer|UndefinedBehaviorSanitizer|runtime error|SUMMARY: " /tmp/shard-db_*/logs/ 2>/dev/null; then
-            echo "::error::Sanitizer findings detected in daemon logs"
-            grep -Er "AddressSanitizer|UndefinedBehaviorSanitizer|runtime error|SUMMARY: " /tmp/shard-db_*/logs/ | head -50
+          if grep -Erq "WARNING: AddressSanitizer|WARNING: LeakSanitizer|WARNING: UndefinedBehaviorSanitizer|SUMMARY: AddressSanitizer|SUMMARY: LeakSanitizer|runtime error:" /tmp/shard-db_*/logs/ /tmp/suite-output.log 2>/dev/null; then
+            echo "::error::Sanitizer findings detected in daemon logs or runner output"
+            grep -Er "WARNING: AddressSanitizer|WARNING: LeakSanitizer|WARNING: UndefinedBehaviorSanitizer|SUMMARY: AddressSanitizer|SUMMARY: LeakSanitizer|runtime error:" /tmp/shard-db_*/logs/ /tmp/suite-output.log | head -50
             exit 1
           fi
           echo "No sanitizer findings."

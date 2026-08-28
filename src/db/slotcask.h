@@ -608,7 +608,22 @@ typedef int (*slotcask_bulk_value_fn)(const SlotcaskOldRecord *old,
  *   index mutation — apply_window will never be called for this window,
  *   and neither will commit_done.
  *   Optional; NULL is fine for hooks that stage nothing durable-adjacent
- *   in prepare_window. */
+ *   in prepare_window.
+ *
+ * Exactly one of {commit_done, abort_window, release_window} fires per
+ * window whose prepare_window ran, after the coordinator's last possible
+ * re-entry into apply_window for that window: commit_done on success
+ * (direct or via forward replay), abort_window whenever no durable marker
+ * evidence exists (a pre-M publication failure, or a window that planned
+ * zero active records so M was skipped entirely — such a window was never
+ * committed, even though the batch call may report success), release_window
+ * on a post-M unresolved (EINPROGRESS) exit. A window that planned zero
+ * active records routes to abort_window, never commit_done.
+ *
+ * A non-zero return from prepare_window is self-cleaning: the hook must
+ * have fully released everything it staged before returning non-zero (and
+ * after rejecting every active record). The coordinator fires no release
+ * route after a failed prepare_window. */
 typedef int (*slotcask_bulk_prepare_window_fn)(SlotcaskBulkRec *recs,
                                                 const size_t *active,
                                                 size_t nactive, void *ctx);
@@ -651,6 +666,18 @@ typedef struct {
        slotcask_bulk_commit_done_fn above. NULL if apply_window/prepare_window
        stage nothing that needs releasing after commit. */
     slotcask_bulk_commit_done_fn    commit_done;
+    /* Fires at most once, on the post-M UNRESOLVED exit: the window's marker
+       is (or may be) durable but the coordinator's in-process forward replay
+       failed to converge, so the outcome is pending (EINPROGRESS). Durable
+       recovery is owned by the on-disk marker from here on —
+       kf_shard_marker_gate and startup replay re-derive every index mutation
+       from marker + segment bytes and never re-enter this process's hooks —
+       so the caller's process-local staging must be released now, exactly as
+       commit_done would, without claiming the window reached durability.
+       Distinct from abort_window: that name is contractually reserved for
+       the pre-M case where no durable evidence exists. Optional; NULL is
+       fine for hooks that stage nothing. */
+    slotcask_bulk_commit_done_fn    release_window;
     slotcask_bulk_abort_window_fn   abort_window;
     void                            *bulk_hook_ctx;
     /* Gate: when 0, skip marker path entirely. Set from load_index_fields()

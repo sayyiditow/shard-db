@@ -41,6 +41,11 @@ jobs:
       # sub-run internally, unrelated to the --jobs 2 outer setting below.
       # This runner is too weak for that nested width; narrow it to 2.
       SHARD_TEST_RUNNER_PARALLEL_JOBS: "2"
+      # TSan slows every case several-fold and the shared runner adds
+      # contention; the 180s default per-case watchdog false-fires on
+      # fsync-heavy cases (rebuild family). The job timeout still bounds
+      # genuine hangs.
+      SHARD_TEST_WATCHDOG_SEC: "900"
       SHARD_TEST_EXCLUDE: "test-auto-reshard-throttle,test-auto-reshard,test-auto-vacuum,test-startup-refuses-unreadable-kf-maintenance,test-startup-refuses-unreadable-kf-count,test-rebuild-legacy-ambiguous-refuses-start,test-parallel-index-integrity,test-durability-corrupt-marker-policy,test-auto-reshard-shutdown-race,test-runner-parallel,test-warmup-vacuum-norace"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,13 +54,24 @@ jobs:
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
       - name: Run full C test suite under TSan
-        run: ./build/bin/shard-db-test run-all --exclude "$SHARD_TEST_EXCLUDE" --jobs 2
+        # tee: embedded-harness findings print to the runner log, not the
+        # daemon log dir — capture them for the scan step below.
+        run: |
+          set -eo pipefail
+          ./build/bin/shard-db-test run-all --exclude "$SHARD_TEST_EXCLUDE" --jobs 2 2>&1 | tee /tmp/suite-output.log
 
       - name: Fail if any TSan findings escaped
+        # always(): this backstop must run even when the suite step fails.
+        # Patterns are report SIGNATURES only — bare words like "deadlock"
+        # or "WARNING:" false-positive on legitimate test names and TAP
+        # lines in the runner output (e.g. test-ordered-walk-kfcache-
+        # deadlock). Every real TSan report carries one of the two
+        # ThreadSanitizer report prefixes.
+        if: always()
         run: |
-          if grep -Erq "ThreadSanitizer|WARNING:|data race|deadlock" /tmp/shard-db_*/logs/ 2>/dev/null; then
-            echo "::error::TSan findings detected in daemon logs"
-            grep -Er "ThreadSanitizer|WARNING:|data race|deadlock" /tmp/shard-db_*/logs/ | head -50
+          if grep -Erq "WARNING: ThreadSanitizer|SUMMARY: ThreadSanitizer" /tmp/shard-db_*/logs/ /tmp/suite-output.log 2>/dev/null; then
+            echo "::error::TSan findings detected in daemon logs or runner output"
+            grep -Er "WARNING: ThreadSanitizer|SUMMARY: ThreadSanitizer" /tmp/shard-db_*/logs/ /tmp/suite-output.log | head -50
             exit 1
           fi
           echo "No TSan findings."
