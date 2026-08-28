@@ -59,12 +59,11 @@ static int test_rebuild_validation_run(void) {
     char saved_db_root[256];
     snprintf(saved_db_root, sizeof(saved_db_root), "%s", env.db_root);
 
-    /* 120s: the vacuum/rebuild round-trip exceeded 30s on shared CI
-       runners under --jobs 2 sanitizer contention (2026-08-28 TSan run:
-       vacuum returned NULL, cascading through the abort-path asserts and
-       leaving .rebuild_txn.active behind). Same treatment as
-       test-rebuild-recovery. */
-    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 120000 };
+    /* 600s: the vacuum/rebuild round-trip is fsync-bound and the shared
+       CI runners make it scale badly — it exceeded 30s under --jobs 2
+       sanitizer contention (2026-08-28 TSan run) while passing locally.
+       Same ceiling test-auto-reshard and test-rebuild-recovery use. */
+    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 600000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
