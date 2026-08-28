@@ -59,7 +59,8 @@ static int test_slotcask_resplit_run(void) {
         char k[32], v[64];
         snprintf(k, sizeof(k), "key-%05d", i);
         snprintf(v, sizeof(v), "value-%d", i);
-        ASSERT_EQ_INT(slotcask_insert(&db, -1, k, strlen(k), v, strlen(v)), 0,
+        ASSERT_EQ_INT(slotcask_insert_with_hooks(&db, -1, k, strlen(k), v,
+                                                  strlen(v), NULL, NULL), 0,
                       "pre-resplit insert");
     }
 
@@ -87,7 +88,8 @@ static int test_slotcask_resplit_run(void) {
         char k[32], v[16];
         snprintf(k, sizeof(k), "trigger-%d", i);
         snprintf(v, sizeof(v), "v%d", i);
-        slotcask_insert(&db, -1, k, strlen(k), v, strlen(v));
+        slotcask_insert_with_hooks(&db, -1, k, strlen(k), v, strlen(v),
+                                    NULL, NULL);
 
         struct stat st;
         if (stat(kf_path, &st) == 0 &&
@@ -160,7 +162,8 @@ static int test_slotcask_resplit_run(void) {
        NOT trigger another resplit since shard 0's real load is now low
        (the synthetic spike was cleared by the resplit's repopulate). */
     char k_extra[32]; snprintf(k_extra, sizeof(k_extra), "post-reopen-key");
-    rc = slotcask_insert(&db, -1, k_extra, strlen(k_extra), "ok", 2);
+    rc = slotcask_insert_with_hooks(&db, -1, k_extra, strlen(k_extra), "ok",
+                                     2, NULL, NULL);
     ASSERT_EQ_INT(rc, 0, "post-reopen insert succeeds");
     void *vv = NULL; size_t vl = 0;
     rc = slotcask_get(&db, k_extra, strlen(k_extra), &vv, &vl);

@@ -26,8 +26,8 @@ Placed in the working directory where you run shard-db (usually `build/bin/db.en
 | `BT_CACHE_MAX` | derived | **Not configurable as of 2026.05.1.** Derived as `FCACHE_MAX / 4` (so `{1024, 2048, 3072, 4096}`). Setting it in db.env emits a stderr warning and is ignored. |
 | `QUERY_BUFFER_MB` | `256` | Per-query intermediate buffer cap. With `MAX_CONCURRENT_QUERIES` bounding fan-in, worst-case RAM stays predictable. Auto-tunes upward on big-RAM hosts with low slot counts (floor: 256 MB). |
 | `INDEX_BUILD_BUDGET_MB` | `1024` | Peak per-pass memory budget for `reindex` and multi-field `add-index`. Floor 64 MB. Multi-field builds group fields into passes that fit this cap; an oversized single field still runs alone. See [Tuning → INDEX_BUILD_BUDGET_MB](../operations/tuning.md). |
-| `DURABILITY_SYNC_MS` | `1000` | Target maximum dirty age / periodic attempt interval for cached mmap writes. `0` disables periodic sync; nonzero values must be at least 50 ms. Dirty ordinary evictions sync first, failed syncs remain dirty and are retried, and failures are written to the error log. This is not a WAL, transactional durability, a hard real-time bound, or a guarantee that directory-entry metadata is durable. |
 | `DB_ODIRECT_BUF_MB` | `32` | O_DIRECT buffer size per worker in MB. Each parallel worker reads shard data in chunks of this size using cache-bypassing pread. Peak O_DIRECT RAM is approximately `2 × DB_ODIRECT_BUF_MB × IO_THREADS`. Larger chunks reduce syscall overhead on fast NVMe; smaller chunks reduce peak memory. |
+| `BULK_COMMIT_WINDOW` | `1024` | Record count per synchronous durability window (M/A/I/K/T/C marker cycle) during bulk-insert/bulk-update/bulk-delete. Integer in `[16, 16384]`. Smaller windows bound the amount of work replayed after a crash mid-window; larger windows amortize marker fsync overhead over more records. |
 | `DISABLE_LOCALHOST_TRUST` | `0` | Default: 127.0.0.1/::1 bypasses auth (assumes a trusted loopback proxy). Set to `1` for strict mode (tokens required even same-host). |
 | `TOKEN_CAP` | `1024` | Open-addressed bucket count for the token store. Bump to 4096+ if you run thousands of tokens across scopes. |
 | `SLOW_QUERY_MS` | `500` | Log queries slower than N ms to `slow-*.log` and the in-memory ring (`stats` endpoint). `0` = disable. Minimum 100 ms. |
@@ -66,7 +66,6 @@ export FCACHE_MAX=4096
 # BT_CACHE_MAX is no longer configurable — derived as FCACHE_MAX / 4
 export QUERY_BUFFER_MB=256
 export INDEX_BUILD_BUDGET_MB=1024
-export DURABILITY_SYNC_MS=1000
 export DB_ODIRECT_BUF_MB=32
 export TOKEN_CAP=1024
 export DISABLE_LOCALHOST_TRUST=0

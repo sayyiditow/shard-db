@@ -33,8 +33,7 @@ if (!db) { /* check stderr */ }
 `db_root` must be an existing, writable directory. One instance may be open at
 a time (single-instance guard enforced with an atomic flag); after close, the
 same process may open another instance. Open returns `NULL` if required
-background infrastructure, including an enabled durability thread, cannot be
-started.
+background infrastructure cannot be started.
 
 ### Query
 
@@ -65,9 +64,8 @@ Always free the result with `shard_db_free_result(out)`.
 shard_db_close(db);
 ```
 
-Stops and joins durability sync, auto-vacuum, auto-reshard, and any explicitly
-enabled async warmup before shutting down the CPU/I/O pools and flushing
-caches. After this call the pointer is invalid. A maintenance operation already
+Stops and joins auto-vacuum, auto-reshard, and any explicitly enabled async
+warmup before shutting down the CPU/I/O pools and flushing caches. After this call the pointer is invalid. A maintenance operation already
 in progress may therefore extend close latency, but it cannot race cache or
 mutex teardown.
 
@@ -103,8 +101,8 @@ thread-safe.
 
 **Timing:** set the handler after `shard_db_open` returns.  Log events that
 occur during `open` itself (schema load, recovery) are emitted before the
-handler is registered and will not be delivered. Periodic durability ticks and
-background maintenance events emitted afterward are delivered normally.
+handler is registered and will not be delivered. Background maintenance events
+emitted afterward are delivered normally.
 
 ## Configuration
 
@@ -119,18 +117,17 @@ Useful knobs for embedded mode:
 SLOW_QUERY_MS=200       # default 500 — log queries slower than this
 GLOBAL_LIMIT=10000      # default 100000 — max records returned per query
 FCACHE_MAX=4096         # default 4096 — entries each for kfcache/segcache; derives bt_cache/bm_cache at /4
-DURABILITY_SYNC_MS=1000 # 0=off; otherwise >=50ms target dirty-age/attempt interval
 TOKEN_CAP=1024          # default 1024 — token table buckets
 LOG_LEVEL=3             # default 3 — 1=ERROR 2=WARN 3=INFO 4=DEBUG
 # WARMUP=async           # embedded default is off unless explicitly configured
 ```
 
-Periodic durability sync is enabled by default. Cached mmap mutations are
-marked dirty; the background thread attempts blocking `MS_SYNC` writes on the
-configured cadence. Failed syncs stay dirty for retry and are reported through
-the log callback. The interval is a target, not a transactional or hard
-real-time guarantee: an active writer, an earlier slow sync, or storage errors
-can extend it. This does not provide WAL semantics or complete directory-entry
+Durability is synchronous, not periodic. Indexed/bulk mutations pass through
+window barriers (M/A/I/K/T/C marker cycle) that fsync before returning.
+Cached mmap mutations outside a window are marked dirty and flushed with a
+blocking `MS_SYNC` write at cache-eviction time; a failed flush restores the
+dirty state for retry on the next eviction attempt and is reported through the
+log callback. This does not provide WAL semantics or complete directory-entry
 metadata durability.
 
 Daemon warmup still defaults to `async`. Embedded mode deliberately defaults

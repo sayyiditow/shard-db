@@ -34,7 +34,9 @@ jobs:
     timeout-minutes: 150
     env:
       BUILD_MODE: tsan
-      TSAN_OPTIONS: "halt_on_error=0:second_deadlock_stack=1:print_stacktrace=1:report_signal_unsafe=0:report_atomic_races=0:suppressions=${{ github.workspace }}/.tsan.supp"
+      # No halt_on_error=0: reported errors must set the failing exit
+      # code (collect-all + fail-at-exit), never print-and-pass.
+      TSAN_OPTIONS: "second_deadlock_stack=1:print_stacktrace=1:report_signal_unsafe=0:report_atomic_races=0:suppressions=${{ github.workspace }}/.tsan.supp"
       # test-runner-parallel's own nested run-all spawns a --jobs 4
       # sub-run internally, unrelated to the --jobs 2 outer setting below.
       # This runner is too weak for that nested width; narrow it to 2.

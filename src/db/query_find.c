@@ -59,33 +59,25 @@ void scan_shards_v2_o_direct_match(SlotcaskDb *db,
                                     QueryDeadline *dl,
                                     int64_t *out_count);
 
-/* Streaming variant of scan_shards_v2 — routes through the O_DIRECT
-   seg-file path for cache pollution avoidance.  Early-stop semantics
-   are preserved: seg_scan_o_direct returns non-zero when the cb adapter
-   returns non-zero, and the shared stop_flag propagates across parallel
-   file workers so limit-bound scans bail quickly.
-   The old slotcask_walk_one_shard_streaming per-kf-shard fan-out is
-   replaced by the seg-file fan-out in scan_shards_v2_o_direct. */
+/* Streaming variant of scan_shards_v2 — routes through the Kf-driven
+   per-shard scan bridge (slotcask_scan_live_kf_one). Early-stop
+   semantics are preserved via the shared stop_flag. */
 void scan_shards_v2_streaming(SlotcaskDb *db, scan_callback cb, void *ctx) {
     scan_shards_v2_o_direct(db, cb, ctx);
 }
 
-/* ========== O_DIRECT full-scan path (FP_FULL_SCAN / Phase 1e.4) ==========
+/* ========== Kf-driven full-scan path (FP_FULL_SCAN / Phase 1e.4) ==========
  *
- * scan_shards_v2_o_direct: cache-bypassing replacement for the mmap-based
- * scan_shards_v2 / slotcask_walk_one_shard inner loop.  Enumerates every
- * .dat segment file under <data_dir>/data/streams/<s>/ for each stream
- * s in [0, num_streams) and calls seg_scan_o_direct on each file.  The
- * caller's scan_callback is invoked via a thin adapter that reconstructs
- * the (SlotHeader *, block) shape the callback expects.
+ * scan_shards_v2_o_direct: per-kf-shard fan-out over
+ * slotcask_scan_live_kf_one. Each worker owns its Kf shard read handle,
+ * snapshots the shard's live addresses, and fetches/validates exactly
+ * those locations before releasing the handle — segment flags are never
+ * the source of truth for query scans. The caller's scan_callback is
+ * invoked via v2_scan_wrap_cb, which reconstructs the (SlotHeader *,
+ * block) shape the callback expects.
  *
- * Parallelism: one parallel_for entry per segment file across all streams.
- * This matches the throughput of scan_shards_v2's per-kf-shard fan-out
- * (typically the same or better because .dat files are the actual data).
- *
- * Fallback: if O_DIRECT open fails silently (EINVAL / unsupported FS),
- * seg_scan_o_direct reverts to buffered + POSIX_FADV_DONTNEED internally —
- * the caller is unaffected.
+ * od_seg_record_cb below remains for the aggregate seg-file fan-out
+ * (query_aggregate.c) and maintenance-only raw segment scans.
  */
 
 /* Adapter: od_record_cb → v2_scan_wrap_cb (SlotcaskScanCb) → scan_callback.
@@ -114,100 +106,65 @@ int od_seg_record_cb(const uint8_t *rec, size_t vlen,
     return rc;
 }
 
-/* One entry in the per-file parallel_for array. */
-typedef struct {
-    char           seg_path[PATH_MAX];
-    int            slot_size;
-    V2ScanWrap    *wrap;
-    int           *stop_flag;
-    FILE          *parent_out;
-} OdSegFileArg;
-
-static void *od_seg_file_worker(void *raw) {
-    OdSegFileArg *arg = (OdSegFileArg *)raw;
+/* Per-kf-shard worker for the Kf-driven scan bridge. */
+static void *v2_kf_shard_worker(void *raw) {
+    V2ShardArg *arg = (V2ShardArg *)raw;
     g_out = arg->parent_out ? arg->parent_out : stdout;
     if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
-    OdSegAdapterCtx actx = { .wrap = arg->wrap, .stop_flag = arg->stop_flag };
-    seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
+    slotcask_scan_live_kf_one(arg->db, arg->kf_shard_id,
+                              arg->scb, arg->sctx, arg->stop_flag);
     return NULL;
 }
 
-/* Enumerate all .dat files under every stream directory and fan out. */
 void scan_shards_v2_o_direct(SlotcaskDb *db, scan_callback cb, void *ctx) {
-    if (!db || db->num_streams <= 0) return;
-
-    /* Collect all .dat paths into a dynamic array. */
-    OdSegFileArg *args = NULL;
-    size_t nargs = 0, cap = 0;
+    if (!db || db->num_shards <= 0) return;
 
     V2ScanWrap wrap = { cb, ctx };
     int stop_flag = 0;
     FILE *parent_out = g_out;
 
-    for (int s = 0; s < db->num_streams; s++) {
-        char stream_dir[PATH_MAX];
-        snprintf(stream_dir, sizeof(stream_dir),
-                 "%s/data/streams/%03d", db->data_dir, s);
-        DIR *dh = opendir(stream_dir);
-        if (!dh) continue;
-        struct dirent *de;
-        while ((de = readdir(dh)) != NULL) {
-            size_t nlen = strlen(de->d_name);
-            if (nlen < 4 || strcmp(de->d_name + nlen - 4, ".dat") != 0)
-                continue;
-            /* Grow array if needed. */
-            if (nargs >= cap) {
-                size_t newcap = cap ? cap * 2 : 64;
-                OdSegFileArg *t = realloc(args, newcap * sizeof(OdSegFileArg));
-                if (!t) { closedir(dh); goto run; }
-                args = t;
-                cap = newcap;
-            }
-            snprintf(args[nargs].seg_path, PATH_MAX,
-                     "%s/%s", stream_dir, de->d_name);
-            args[nargs].slot_size  = db->slot_size;
-            args[nargs].wrap       = &wrap;
-            args[nargs].stop_flag  = &stop_flag;
-            args[nargs].parent_out = parent_out;
-            nargs++;
-        }
-        closedir(dh);
+    V2ShardArg *args = calloc((size_t)db->num_shards, sizeof(*args));
+    if (!args) {
+        /* Allocation failure — run shards sequentially, one at a time. */
+        for (int s = 0; s < db->num_shards && !stop_flag; s++)
+            slotcask_scan_live_kf_one(db, s, v2_scan_wrap_cb, &wrap,
+                                      &stop_flag);
+        return;
     }
-
-run:
-    if (nargs == 0) { free(args); return; }
+    for (int s = 0; s < db->num_shards; s++) {
+        args[s].db = db;
+        args[s].kf_shard_id = s;
+        args[s].scb = v2_scan_wrap_cb;
+        args[s].sctx = &wrap;
+        args[s].stop_flag = &stop_flag;
+        args[s].parent_out = parent_out;
+    }
     g_scan_stop = 0;
-    parallel_for_io(od_seg_file_worker, args, (int)nargs, sizeof(OdSegFileArg));
+    parallel_for_io(v2_kf_shard_worker, args, db->num_shards, sizeof(*args));
     free(args);
 }
 
 /* ── inline-match scan dispatcher (zero-callback, direct match_typed) ── */
 
-/* One entry in the per-file parallel_for array for the match path. */
-/* Match callback context for varlen inline-match scans. */
+/* Match callback for the Kf-driven inline-match scan. The value pointer
+   comes validated from the Kf-address fetch, so this only runs the
+   criteria. A nonzero return stops the shard scan (deadline trip). */
 typedef struct {
-    int64_t            *count;
-    FieldSchema        *fs;
+    FieldSchema             *fs;
     const CompiledCriterion *single_cc;
-    const CriteriaNode  *tree;
-    QueryDeadline       *dl;
-    int                  dl_counter;
-} VarlenMatchCtx;
+    const CriteriaNode      *tree;
+    QueryDeadline           *dl;
+    int                      dl_counter;
+    int64_t                  count;
+} KfMatchCtx;
 
-/* od_record_cb wrapper for varlen match scanning.  Extracts the value
-   from the record and runs match_typed / criteria_match_tree directly.
-   A nonzero return tells seg_scan_o_direct to stop scanning immediately
-   (see its cb() call sites) — used here to bail out promptly once the
-   per-request deadline trips. */
-static int varlen_match_cb(const uint8_t *rec, size_t vlen,
-                            const uint8_t hash16[16], void *raw) {
-    VarlenMatchCtx *mc = (VarlenMatchCtx *)raw;
-    (void)hash16;
+static int kf_live_match_cb(const uint8_t hash16[16],
+                            const void *key, size_t klen,
+                            const void *value, size_t vlen,
+                            void *raw) {
+    (void)hash16; (void)key; (void)klen; (void)vlen;
+    KfMatchCtx *mc = (KfMatchCtx *)raw;
     if (query_deadline_tick(mc->dl, &mc->dl_counter)) return 1;
-    uint16_t klen;
-    memcpy(&klen, rec + 16, 2);
-    const uint8_t *value = rec + 24 + (size_t)klen;
-
     int matched = 0;
     if (mc->single_cc) {
         if (match_typed(value, mc->single_cc, mc->fs) > 0)
@@ -216,39 +173,39 @@ static int varlen_match_cb(const uint8_t *rec, size_t vlen,
         if (criteria_match_tree(value, mc->tree, mc->fs))
             matched = 1;
     }
-    if (matched && mc->count) (*mc->count)++;
+    if (matched) mc->count++;
     return 0;
 }
 
 typedef struct {
-    char                seg_path[PATH_MAX];
-    int                 slot_size;
-    FieldSchema        *fs;
+    SlotcaskDb             *db;
+    int                     kf_shard_id;
+    int                    *stop_flag;
+    FILE                   *parent_out;
+    FieldSchema            *fs;
     const CompiledCriterion *single_cc;
-    const CriteriaNode  *tree;
-    QueryDeadline      *dl;
-    int64_t            *out_count;
-} OdMatchFileArg;
+    const CriteriaNode      *tree;
+    QueryDeadline          *dl;
+    int64_t                *out_count;
+} KfMatchShardArg;
 
-static void *od_match_file_worker(void *raw) {
-    OdMatchFileArg *arg = (OdMatchFileArg *)raw;
-    int64_t local_count = 0;
-
-    VarlenMatchCtx mc = {
-        .count = &local_count, .fs = arg->fs,
-        .single_cc = arg->single_cc, .tree = arg->tree,
-        .dl = arg->dl,
+static void *kf_match_shard_worker(void *raw) {
+    KfMatchShardArg *arg = (KfMatchShardArg *)raw;
+    g_out = arg->parent_out ? arg->parent_out : stdout;
+    if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
+    KfMatchCtx mc = {
+        .fs = arg->fs, .single_cc = arg->single_cc, .tree = arg->tree,
+        .dl = arg->dl, .dl_counter = 0, .count = 0,
     };
-    seg_scan_o_direct(arg->seg_path, arg->slot_size, varlen_match_cb, &mc);
-
-    if (local_count > 0)
-        __atomic_add_fetch(arg->out_count,
-                           local_count, __ATOMIC_RELAXED);
+    slotcask_scan_live_kf_one(arg->db, arg->kf_shard_id,
+                              kf_live_match_cb, &mc, arg->stop_flag);
+    if (mc.count > 0)
+        __atomic_add_fetch(arg->out_count, mc.count, __ATOMIC_RELAXED);
     return NULL;
 }
 
-/* Enumerate all .dat files under every stream directory and fan out,
-   counting matches via the inline match path (no callback indirection). */
+/* Kf-driven inline-match count: one worker per Kf shard, matches the
+   criteria against validated values, sums per-shard counts. */
 void scan_shards_v2_o_direct_match(SlotcaskDb *db,
                                     FieldSchema *fs,
                                     const CompiledCriterion *single_cc,
@@ -256,46 +213,37 @@ void scan_shards_v2_o_direct_match(SlotcaskDb *db,
                                     QueryDeadline *dl,
                                     int64_t *out_count)
 {
-    if (!db || db->num_streams <= 0) return;
+    if (!db || db->num_shards <= 0) return;
     *out_count = 0;
 
-    OdMatchFileArg *args = NULL;
-    size_t nargs = 0, cap = 0;
+    int stop_flag = 0;
+    FILE *parent_out = g_out;
 
-    for (int s = 0; s < db->num_streams; s++) {
-        char stream_dir[PATH_MAX];
-        snprintf(stream_dir, sizeof(stream_dir),
-                 "%s/data/streams/%03d", db->data_dir, s);
-        DIR *dh = opendir(stream_dir);
-        if (!dh) continue;
-        struct dirent *de;
-        while ((de = readdir(dh)) != NULL) {
-            size_t nlen = strlen(de->d_name);
-            if (nlen < 4 || strcmp(de->d_name + nlen - 4, ".dat") != 0)
-                continue;
-            if (nargs >= cap) {
-                size_t newcap = cap ? cap * 2 : 64;
-                OdMatchFileArg *t = realloc(args, newcap * sizeof(OdMatchFileArg));
-                if (!t) { closedir(dh); goto run_match; }
-                args = t;
-                cap = newcap;
-            }
-            snprintf(args[nargs].seg_path, PATH_MAX,
-                     "%s/%s", stream_dir, de->d_name);
-            args[nargs].slot_size  = db->slot_size;
-            args[nargs].fs         = fs;
-            args[nargs].single_cc  = single_cc;
-            args[nargs].tree       = tree;
-            args[nargs].dl         = dl;
-            args[nargs].out_count  = out_count;
-            nargs++;
+    KfMatchShardArg *args = calloc((size_t)db->num_shards, sizeof(*args));
+    if (!args) {
+        for (int s = 0; s < db->num_shards && !stop_flag; s++) {
+            KfMatchCtx mc = {
+                .fs = fs, .single_cc = single_cc, .tree = tree,
+                .dl = dl, .dl_counter = 0, .count = 0,
+            };
+            slotcask_scan_live_kf_one(db, s, kf_live_match_cb, &mc, &stop_flag);
+            *out_count += mc.count;
         }
-        closedir(dh);
+        return;
     }
-
-run_match:
-    if (nargs == 0) { free(args); return; }
-    parallel_for_io(od_match_file_worker, args, (int)nargs, sizeof(OdMatchFileArg));
+    for (int s = 0; s < db->num_shards; s++) {
+        args[s].db = db;
+        args[s].kf_shard_id = s;
+        args[s].stop_flag = &stop_flag;
+        args[s].parent_out = parent_out;
+        args[s].fs = fs;
+        args[s].single_cc = single_cc;
+        args[s].tree = tree;
+        args[s].dl = dl;
+        args[s].out_count = out_count;
+    }
+    parallel_for_io(kf_match_shard_worker, args, db->num_shards,
+                    sizeof(*args));
     free(args);
 }
 
@@ -783,8 +731,10 @@ void transform_field_value(const TypedField *old_f,
     case FT_INT:
     case FT_LONG:
     case FT_SHORT: {
-        int64_t v = (src[0] & 0x80) ? -1 : 0;  /* sign extend */
-        for (int i = 0; i < old_f->size; i++) v = (v << 8) | src[i];
+        uint64_t u = 0;
+        for (int i = 0; i < old_f->size; i++) u = (u << 8) | src[i];
+        unsigned sext = (unsigned)(64 - old_f->size * 8);
+        int64_t v = (int64_t)(u << sext) >> sext;  /* sign extend (arith >>) */
         for (int i = new_f->size; i-- > 0; ) {
             dst[i] = (uint8_t)(v & 0xFF);
             v >>= 8;
@@ -792,8 +742,10 @@ void transform_field_value(const TypedField *old_f,
         return;
     }
     case FT_NUMERIC: {
-        int64_t v = (src[0] & 0x80) ? -1 : 0;
-        for (int i = 0; i < old_f->size; i++) v = (v << 8) | src[i];
+        uint64_t u = 0;
+        for (int i = 0; i < old_f->size; i++) u = (u << 8) | src[i];
+        unsigned sext = (unsigned)(64 - old_f->size * 8);
+        int64_t v = (int64_t)(u << sext) >> sext;  /* sign extend (arith >>) */
         int delta = new_f->numeric_scale - old_f->numeric_scale;
         if (delta > 0) {
             int64_t mult = 1;
@@ -867,7 +819,8 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
     if (!ctx->slot_changed) {
         /* Layout unchanged (e.g., splits-only resplit). Re-insert the
            record bytes verbatim. */
-        if (slotcask_insert(ctx->new_db, -1, key, klen, value, vlen) != 0) {
+        if (slotcask_insert_with_hooks(ctx->new_db, -1, key, klen, value, vlen,
+                                        NULL, NULL) != 0) {
             LOG_ERROR(LOG_SUB_CONFIG,
                       "rebuild_v2: insert failed at copied record %llu (klen=%zu)",
                       (unsigned long long)(ctx->live_count + 1u), klen);
@@ -972,8 +925,9 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
             memcpy(buf + nf->offset, (const uint8_t *)value + off, sz);
         }
     }
-    int rc = slotcask_insert(ctx->new_db, -1, key, klen,
-                              buf, ctx->new_ts->total_size);
+    int rc = slotcask_insert_with_hooks(ctx->new_db, -1, key, klen,
+                                         buf, ctx->new_ts->total_size,
+                                         NULL, NULL);
     free(buf);
     if (rc != 0) {
         LOG_ERROR(LOG_SUB_CONFIG,

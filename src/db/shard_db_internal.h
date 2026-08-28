@@ -234,7 +234,7 @@ struct ShardDb {
        and commit_lock_hold_us_total cover single-record upsert/insert
        commits and each bulk commit window; commit_sync_us_total covers
        time spent specifically inside the marker fsync / kf-slot-sync
-       primitives (kf_marker_write/clear, kf_batch_marker_write/clear,
+       primitives (KFM2 publication/clear,
        kfcache_sync_slots_locked) — a subset of the lock-hold total, kept
        separate so the marker-fsync cost can be reported on its own. */
     uint64_t commit_count;
@@ -251,7 +251,7 @@ struct ShardDb {
     int auto_reshard_enable;
     int auto_reshard_hour;
     int auto_reshard_throttle_ms;
-    int durability_sync_ms;
+    int bulk_commit_window;
     int warmup_explicit;          /* a valid WARMUP= was present in db.env */
     int kfcache_test_hold_ms; /* test-only; 0 = off in production */
     int kf_open_create_test_hold_ms; /* test-only; 0 = off in production. */
@@ -273,8 +273,6 @@ struct ShardDb {
     int       bg_auto_reshard_spawned;
     pthread_t bg_warmup_tid;
     int       bg_warmup_spawned;
-    pthread_t bg_durability_tid;
-    int       bg_durability_spawned;
 
     /* slow query ring */
     SlowQueryEntry slow_queries[SLOW_QUERY_RING];
@@ -424,7 +422,7 @@ extern ShardDb *g_shard_db_instance;
 #define g_auto_reshard_enable       (g_db->auto_reshard_enable)
 #define g_auto_reshard_hour         (g_db->auto_reshard_hour)
 #define g_auto_reshard_throttle_ms  (g_db->auto_reshard_throttle_ms)
-#define g_durability_sync_ms        (g_db->durability_sync_ms)
+#define g_bulk_commit_window        (g_db->bulk_commit_window)
 #define g_kfcache_test_hold_ms      (g_db->kfcache_test_hold_ms)
 #define g_warmup_test_delay_ms      (g_db->warmup_test_delay_ms)
 #define g_warmup_test_prelock_delay_ms (g_db->warmup_test_prelock_delay_ms)
@@ -522,42 +520,17 @@ void shard_db_destroy_after_storage(ShardDb *db);
    Pool workers and the log thread bind their thread-local g_db to this. */
 extern ShardDb *g_shard_db_instance;
 
-/* ── Durable abort evidence (indexed-write atomicity) ── */
-
-/* Fixed on-disk abort sidecar header (24 B, no trailing bytes). There is one
-   sidecar per commit-intent marker: kind distinguishes the single-record
-   %03x_marker_abort.dat from the batch %03x_batch_%u_abort.dat producer.
-   A sidecar is the durable, ordered decision that its paired marker must be
-   ABORTED (index inverse diff applied, speculative segment tombstoned where
-   one exists) rather than forward-replayed. */
-enum { KF_ABORT_MAGIC = 0x4b464142u, KF_ABORT_VERSION = 1 };
-enum { KF_ABORT_SINGLE = 1, KF_ABORT_BATCH = 2 };
-
-typedef struct {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t kind;
-    uint32_t kf_shard;
-    uint32_t batch_id;       /* 0 for KF_ABORT_SINGLE */
-    uint32_t marker_count;   /* exactly 1 for KF_ABORT_SINGLE */
-    uint32_t checksum;       /* XXH32 through marker_count */
-} KfAbortHeader;
-
-_Static_assert(sizeof(KfAbortHeader) == 24,
-               "abort sidecar header is a fixed on-disk format");
-
 /* ── Marker file (durability write-ordering) ── */
 
-#define KF_MARKER_MAGIC 0x4B464D31u /* "KFM1" */
+#define KF_BATCH_MARKER_ENTRY_MAGIC 0x4B464D32u /* "KFM2" */
 
 enum KfMarkerOp {
-    KF_MARKER_OP_LEGACY_UPSERT = 0, /* v1 marker writer; recover as UPSERT */
     KF_MARKER_OP_UPSERT = 1,
     KF_MARKER_OP_DELETE = 2,
 };
 
 typedef struct {
-    uint32_t magic;        /* KF_MARKER_MAGIC */
+    uint32_t magic;        /* KF_BATCH_MARKER_ENTRY_MAGIC */
     uint32_t kf_slot;      /* UPDATE/DELETE: existing slot; INSERT: UINT32_MAX */
     uint32_t old_offset;
     uint32_t new_offset;
@@ -575,9 +548,13 @@ _Static_assert(sizeof(KfMarkerSlot) == 32,
                "KfMarkerSlot must stay 32 bytes");
 
 static inline int kf_marker_op_valid(const KfMarkerSlot *marker) {
+    KfMarkerSlot m;
     if (!marker) return 0;
-    if (marker->op != KF_MARKER_OP_LEGACY_UPSERT &&
-        marker->op != KF_MARKER_OP_UPSERT &&
+    /* marker may point into a KFM2 file buffer at an unaligned offset
+     * (entry stride is 54 bytes); read members through an aligned copy. */
+    memcpy(&m, marker, sizeof(m));
+    marker = &m;
+    if (marker->op != KF_MARKER_OP_UPSERT &&
         marker->op != KF_MARKER_OP_DELETE)
         return 0;
     if (marker->reserved[0] || marker->reserved[1] ||
@@ -590,33 +567,21 @@ static inline int kf_marker_op_valid(const KfMarkerSlot *marker) {
     return marker->has_old <= 1;
 }
 
-/* Marker I/O — non-static for test access (TEST_BUILD). */
-int kf_marker_write(const char *data_dir, int kf_shard,
-                    const KfMarkerSlot *slot);
-int kf_marker_clear(const char *data_dir, int kf_shard);
-int kf_marker_read(const char *data_dir, int kf_shard, KfMarkerSlot *out);
-
-/* Abort-sidecar I/O — non-static for test access (TEST_BUILD). */
-int kf_abort_write_sidecar(const char *data_dir, uint16_t kind, int kf_shard,
-                           uint32_t batch_id, uint32_t marker_count);
-int kf_abort_read_exact(const char *path, uint16_t want_kind,
-                        uint32_t want_shard, uint32_t want_batch,
-                        uint32_t want_count, KfAbortHeader *out);
-int kf_abort_clear_after_marker(const char *abort_path, const char *kf_dir);
-
-/* Marker recovery — replays a marker's intent when kf writer lock is held.
-   eff_root/object identify the object for index-diff reconciliation
-   (steps 4-5); eff_root is the tenant dir ($DB_ROOT/<dir>), matching the
-   db_root convention used throughout config.c/storage.c.
-   Returns 0 on success (marker cleared), -1 on failure (marker retained).
-   Opaque kh pointer from slotcask.h (avoid cross-header typedef). */
-int kf_marker_replay_locked(const char *eff_root, const char *object,
-                            const char *data_dir, int kf_shard,
-                            void *kh, const KfMarkerSlot *marker);
+/* KFM2 test accessors. */
+int kf_batch_marker_corrupt_first_kf_slot_for_test(const char *data_dir,
+                                                   int kf_shard,
+                                                   uint32_t batch_id,
+                                                   uint32_t bad_kf_slot,
+                                                   int *out_has_old);
+int kf_batch_marker_read_slots_for_test(const char *data_dir, int kf_shard,
+                                        uint32_t batch_id,
+                                        KfMarkerSlot *slots_out,
+                                        size_t max_slots,
+                                        size_t *out_count);
 
 /* Recovery-time index reconciliation callback.
    slotcask.c is deliberately decoupled from schema/index logic (that lives
-   in storage.c), so kf_marker_replay_locked reaches it through this
+   in storage.c), so KFM2 replay reaches it through this
    process-wide callback rather than a direct call. Registered once by
    storage.c via an __attribute__((constructor)) initializer, so it is set
    before any recovery sweep can run. NULL (unregistered) is a silent
@@ -637,8 +602,6 @@ int clean_flag_exists(const char *data_dir);
 int clean_flag_remove(const char *data_dir);
 
 /* Bulk marker I/O. */
-int kf_batch_marker_write(const char *data_dir, int kf_shard, uint32_t batch_id,
-                          const KfMarkerSlot *markers, size_t count);
 int kf_batch_marker_clear(const char *data_dir, int kf_shard, uint32_t batch_id);
 
 /* Startup recovery sweep. Caller must hold objlock_wrlock(data_dir's
@@ -650,8 +613,8 @@ int kf_batch_marker_clear(const char *data_dir, int kf_shard, uint32_t batch_id)
 int marker_recovery_sweep_object(const char *eff_root, const char *data_dir, const char *object_name,
                                   int *out_replayed);
 
-/* Returns 1 if this object's data/kf/ still has a single-record or batch
-   marker file, 0 if none, -1 on a directory I/O error. Non-replaying (no
+/* Returns 1 if this object's data/kf/ still has a KFM2 batch marker file,
+   0 if none, -1 on a directory I/O error. Non-replaying (no
    lock required) — used by graceful shutdown to decide whether writing
    .shard-db.clean is safe, without walking every marker's contents. */
 int object_has_pending_markers(const char *data_dir);

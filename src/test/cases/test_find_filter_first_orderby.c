@@ -104,7 +104,7 @@ static int test_find_filter_first_orderby_run(void) {
         "\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"age\"]}",
         &resp);
     ASSERT_NOT_NULL(resp, "case1: response received");
-    ASSERT_TRUE(strcmp(resp, "[]\n") == 0 || strcmp(resp, "[]") == 0,
+    ASSERT_TRUE(resp && (strcmp(resp, "[]\n") == 0 || strcmp(resp, "[]") == 0),
         "case1: trigram 0-match + order_by returns []");
     free(resp); resp = NULL;
 
@@ -136,7 +136,7 @@ static int test_find_filter_first_orderby_run(void) {
         "\"order_by\":\"age\",\"order\":\"desc\",\"limit\":10,\"fields\":[\"age\"]}",
         &resp);
     ASSERT_NOT_NULL(resp, "case3: response received");
-    ASSERT_TRUE(strcmp(resp, "[]\n") == 0 || strcmp(resp, "[]") == 0,
+    ASSERT_TRUE(resp && (strcmp(resp, "[]\n") == 0 || strcmp(resp, "[]") == 0),
         "case3: btree-eq 0-match + order_by returns []");
     free(resp); resp = NULL;
 

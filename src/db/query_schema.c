@@ -48,11 +48,15 @@ typedef struct {
     int failed;
 } EditPreflightCtx;
 
-/* Decode a signed BE integer of `sz` bytes into int64. */
+/* Accumulate BE bytes unsigned, then sign-extend: left-shifting the
+   seeded negative accumulator was UB (strict UBSan gate, 2026-08-28 —
+   edit-field int→long aborts the daemon on negative values). The
+   arithmetic >> on the re-signed value is the canonical extension. */
 static int64_t decode_be_signed(const uint8_t *src, int sz) {
-    int64_t v = (src[0] & 0x80) ? -1 : 0;
-    for (int i = 0; i < sz; i++) v = (v << 8) | src[i];
-    return v;
+    uint64_t u = 0;
+    for (int i = 0; i < sz; i++) u = (u << 8) | src[i];
+    unsigned sext = (unsigned)(64 - sz * 8);
+    return (int64_t)(u << sext) >> sext;
 }
 
 /* Return 1 if value will fit the new field's bounds; 0 otherwise. Writes

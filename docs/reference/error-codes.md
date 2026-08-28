@@ -21,6 +21,7 @@ Clients should match on the `error` string, not on the full message.
 | `Request too large (max N bytes)` | JSON request exceeded `MAX_REQUEST_SIZE`. | Split into smaller requests, or raise `MAX_REQUEST_SIZE`. |
 | `query_timeout` | Query exceeded `TIMEOUT` (db.env) or per-request `timeout_ms`. | Add filters, add an index, raise the timeout. |
 | `query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor` | Query intermediate buffers crossed `QUERY_BUFFER_MB`. | Narrow `criteria`, add `limit`, or stream via `fetch` + cursor. |
+| `durability outcome pending; do not retry blindly` | The server durably published an indexed mutation marker but could not synchronously converge it. | Do not retry the mutation. The retained marker blocks later writes on that shard until synchronous replay or startup recovery completes. |
 
 ### Validation
 

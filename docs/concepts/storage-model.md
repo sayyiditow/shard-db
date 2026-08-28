@@ -161,15 +161,22 @@ The slotcask engine is "commit on atomic 8B store" — every other byte may be i
 
 On startup, the daemon's `validate_metadata` pass sweeps `.shard-db.lock` (refuses two daemons on one root), validates that every object in `schema.conf` has a `fields.conf` + `data/` tree, and unlinks stale `.new`/`.old` rebuild artifacts.
 
-Indexed writes add a durable commit-intent marker in `data/kf/` before applying
-secondary-index changes. If the process dies before Kf publication, startup
-forward-replays the marker and clears it. If an index apply fails after the
-marker is durable, the writer first persists a matching `*_abort.dat` sidecar;
-recovery then applies the inverse index diff, tombstones speculative NEW segment
-data for upserts, and leaves the OLD record live. Cleanup is ordered marker
-unlink + directory sync, then sidecar unlink + directory sync. A valid orphan
-sidecar is therefore only cleared after its marker is already gone; corrupt or
-mismatched evidence remains in place and fails closed.
+Indexed writes add a durable KFM2 batch commit-intent marker in `data/kf/`
+before applying secondary-index changes, published via
+`bulk_publish_window_marker_locked` for both single and bulk mutations. If the
+process dies at any point after the marker is durable, startup forward-replays
+it — driving the M/A/I/K/T/C window (plan → publish → activate → index apply →
+kf commit → tombstone old → clear marker) through to completion — and then
+clears it. There is no abort-sidecar path: recovery never rolls a marker back.
+Marker cleanup (unlink + directory sync) is the sole cleanup step; corrupt or
+unparseable marker evidence fails closed rather than being guessed at.
+
+A prior release (2026.08.1) persisted a matching abort sidecar on post-marker
+index-apply failure and rolled the mutation back on recovery. That mechanism
+was removed for this release: upgrading onto this version requires the data
+directory to already be in a good, recovery-clean state (see
+[release notes](../release-notes/) for the upgrade runbook) — this code no
+longer interprets a prior release's abort-sidecar files.
 
 ## Caches
 

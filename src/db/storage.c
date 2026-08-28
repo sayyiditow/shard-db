@@ -519,6 +519,14 @@ typedef struct {
     BitmapPrepareSet  bm_prep;
     uint8_t          *bm_owned_keys[MAX_FIELDS];
     int               n_bm_owned;
+    /* Update-resolved path only: set by v2_insert_pre_commit from the
+       hook's is_update argument. The per-field index diff is computed (in
+       memory only) in pre_commit and staged here; v2_insert_apply_commit
+       applies it durably after the commit-intent marker is published, and
+       v2_insert_abort_commit frees it unapplied if the marker write fails. */
+    int               is_update;
+    UpdateIdxArg      upd_args[MAX_FIELDS];
+    int               n_upd_args;
 } V2InsertCtx;
 
 static void v2_insert_bm_owned_free(V2InsertCtx *c) {
@@ -559,30 +567,31 @@ static int capture_index_update_error(char *err_buf, size_t err_cap,
     return 1;
 }
 
-/* Update-resolved runtime path only — see slotcask.h's
-   slotcask_prepare_commit_fn / slotcask_apply_commit_fn doc comment. A
-   fresh-key insert never reaches this hook; it goes through
-   v2_insert_prepare_commit / v2_insert_apply_commit instead, since only
-   a fresh insert has a not-yet-durable kf slot that a legitimate
-   rejection (e.g. bitmap cap) can still safely fall back on. */
+/* Fires for both fresh-insert and update-resolved records, before the
+   commit-intent marker exists (see slotcask.h's slotcask_pre_commit_fn doc
+   comment). Fresh inserts do nothing here — they're entirely handled by
+   v2_insert_prepare_commit / v2_insert_apply_commit. Update-resolved
+   records compute their per-field index diff here (cheap, in-memory only:
+   no index file is touched) and stage it in c->upd_args for
+   v2_insert_apply_commit to apply durably once the marker is published —
+   see AGENTS.md's "indexed mutations persist a commit-intent marker before
+   secondary-index apply" invariant. */
 static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                                 const uint8_t *new_value, size_t new_vlen,
                                 int is_update, void *ctx_ptr) {
     (void)new_value; (void)new_vlen;
     V2InsertCtx *c = (V2InsertCtx *)ctx_ptr;
+    c->is_update = is_update;
     if (c->nfields == 0) return 0;
 
     if (is_update && old) {
-        /* Per-field diff: write/delete only entries that changed.
-           Phase 1 (serial): build all (new_key, old_key) pairs, decide
-           which fields changed. Phase 2 (parallel): apply the changes
-           via parallel_for. For 12-index workloads with N changed fields,
-           this drops the index-update wall time from N×~1µs sequential
-           to ~1µs parallel (limited by core count). */
+        /* Per-field diff: stage only entries that changed. Phase 1
+           (serial, here): build all (new_key, old_key) pairs, decide which
+           fields changed. Phase 2 (parallel, in v2_insert_apply_commit):
+           apply the changes via parallel_for. For 12-index workloads with
+           N changed fields, this drops the index-update wall time from
+           N×~1µs sequential to ~1µs parallel (limited by core count). */
         char *old_json = typed_decode(c->idx_ts, old->value, (uint32_t)old->vlen);
-        UpdateIdxArg args[MAX_FIELDS];
-        const char *ch_fields[MAX_FIELDS];
-        enum IndexType ch_types[MAX_FIELDS];
         int n_args = 0;
         for (int i = 0; i < c->nfields; i++) {
             uint8_t *new_key = NULL, *old_key = NULL;
@@ -596,9 +605,10 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
             if (have_new < 0 || have_old < 0) {
                 free(new_key); free(old_key);
                 for (int j = 0; j < n_args; j++) {
-                    free(args[j].new_key);
-                    free(args[j].old_key);
+                    free(c->upd_args[j].new_key);
+                    free(c->upd_args[j].old_key);
                 }
+                c->n_upd_args = 0;
                 free(old_json);
                 snprintf(c->err_buf, sizeof(c->err_buf),
                          "index-key decode failed during insert/update: %s",
@@ -619,56 +629,39 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                 changed = 1;
             }
             if (changed) {
-                args[n_args].db_root = c->db_root;
-                args[n_args].object  = c->object;
-                args[n_args].field   = c->fields[i];
-                args[n_args].splits  = c->splits;
+                UpdateIdxArg *arg = &c->upd_args[n_args];
+                *arg = (UpdateIdxArg){0};
+                arg->db_root = c->db_root;
+                arg->object  = c->object;
+                arg->field   = c->fields[i];
+                arg->splits  = c->splits;
                 /* update_idx_fn treats NULL keys as "skip" — so a
                    delete-only op (have_old, !have_new) gets new_key=NULL
                    and old_key=old_key, an insert-only op (have_new,
                    !have_old) gets new_key=new_key and old_key=NULL,
                    and a real update gets both. */
-                args[n_args].new_key = have_new ? new_key : NULL;
-                args[n_args].new_len = new_len;
-                args[n_args].old_key = have_old ? old_key : NULL;
-                args[n_args].old_len = old_len;
-                args[n_args].hash    = c->hash;
-                args[n_args].type    = c->idx_types ? c->idx_types[i] : IT_BTREE;
-                args[n_args].kf_shard = c->kf_shard;
-                args[n_args].kf_slot  = c->kf_slot;
-                args[n_args].bm_max_values = 0;  /* default cap — header wins on existing */
-                ch_fields[n_args] = c->fields[i];
-                ch_types[n_args] = c->idx_types ? c->idx_types[i] : IT_BTREE;
+                arg->new_key = have_new ? new_key : NULL;
+                arg->new_len = new_len;
+                arg->old_key = have_old ? old_key : NULL;
+                arg->old_len = old_len;
+                arg->hash    = c->hash;
+                arg->type    = c->idx_types ? c->idx_types[i] : IT_BTREE;
+                arg->kf_shard = c->kf_shard;
+                arg->kf_slot  = c->kf_slot;
+                arg->bm_max_values = 0;  /* default cap — header wins on existing */
                 /* Bitmap keeps sync_after=1 so bm_sync fires inside
                    bitmap_update under its open writer handle (I3);
-                   btree/trigram durability moves to the collector below. */
-                args[n_args].sync_after = (ch_types[n_args] == IT_BITMAP) ? 1 : 0;
+                   btree/trigram durability moves to the collector in
+                   v2_insert_apply_commit. */
+                arg->sync_after = (arg->type == IT_BITMAP) ? 1 : 0;
                 n_args++;
             } else {
-                /* Unchanged — free immediately, nothing to dispatch. */
+                /* Unchanged — free immediately, nothing to stage. */
                 free(new_key); free(old_key);
             }
         }
-        int idx_failed = 0;
-        if (n_args > 0) {
-            parallel_for(update_idx_fn, args, n_args, sizeof(UpdateIdxArg));
-            for (int i = 0; i < n_args; i++) {
-                if (capture_index_update_error(c->err_buf,
-                                               sizeof(c->err_buf), &args[i],
-                                               "insert/update"))
-                    idx_failed = 1;
-                free(args[i].new_key);
-                free(args[i].old_key);
-            }
-        }
-        if (n_args > 0 &&
-            index_sync_record_fields(c->db_root, c->object, c->splits,
-                                     c->hash, ch_fields, ch_types,
-                                     n_args) != 0)
-            idx_failed = 1;
+        c->n_upd_args = n_args;
         free(old_json);
-        bm_flush_thread_bitmap_cache();
-        if (idx_failed) return -1;
     } else {
         /* Fresh insert: entirely handled by v2_insert_prepare_commit /
            v2_insert_apply_commit instead — see the doc comment above. */
@@ -693,6 +686,10 @@ static int v2_insert_prepare_commit(const uint8_t *new_value, size_t new_vlen,
     (void)new_value; (void)new_vlen;
     V2InsertCtx *c = (V2InsertCtx *)ctx_ptr;
     c->kf_slot = planned_kf_slot;
+    /* Update-resolved: the diff was already staged (non-durably) by
+       v2_insert_pre_commit; v2_insert_apply_commit applies it post-marker.
+       No bitmap cap-check staging is needed here for updates. */
+    if (c->is_update) return 0;
     if (c->nfields == 0 || !c->idx_types) return 0;
 
     if (bitmap_prepare_set_init(&c->bm_prep, MAX_FIELDS) != 0) {
@@ -761,13 +758,19 @@ static int v2_insert_prepare_commit(const uint8_t *new_value, size_t new_vlen,
     return 0;
 }
 
-/* Rare path: prepare_commit staged bitmap writer handles but the marker
-   write itself then failed, so apply_commit never ran. Release what was
-   staged without applying it. */
+/* Rare path: prepare_commit staged bitmap writer handles (fresh insert) or
+   pre_commit staged an index diff (update) but the marker write itself
+   then failed, so apply_commit never ran. Release what was staged without
+   applying it. */
 static void v2_insert_abort_commit(void *ctx_ptr) {
     V2InsertCtx *c = (V2InsertCtx *)ctx_ptr;
     bitmap_prepare_set_free(&c->bm_prep);
     v2_insert_bm_owned_free(c);
+    for (int i = 0; i < c->n_upd_args; i++) {
+        free(c->upd_args[i].new_key);
+        free(c->upd_args[i].old_key);
+    }
+    c->n_upd_args = 0;
 }
 
 /* Fresh-insert apply phase — fires after the commit-intent marker is
@@ -780,10 +783,50 @@ static int v2_insert_apply_commit(const uint8_t *new_value, size_t new_vlen,
                                   uint32_t planned_kf_slot, void *ctx_ptr) {
     (void)new_value; (void)new_vlen; (void)planned_kf_slot;
     V2InsertCtx *c = (V2InsertCtx *)ctx_ptr;
+    if (c->nfields == 0) return 0;
+
+    if (c->is_update) {
+        /* Update-resolved durable index apply — the post-marker
+           counterpart to the diff v2_insert_pre_commit staged (in-memory
+           only) before the commit-intent marker existed. */
+        if (c->n_upd_args == 0) return 0;
+        const char *ch_fields[MAX_FIELDS];
+        enum IndexType ch_types[MAX_FIELDS];
+        int idx_failed = 0;
+        /* v2_insert_pre_commit staged these args before kf_slot was known
+           (it fires before segment/slot reservation — see its doc comment);
+           c->kf_slot is only valid from here on, set by
+           v2_insert_prepare_commit which always runs before apply_commit.
+           Patch both fields now so update_idx_fn's IT_BITMAP dispatch gets
+           the record's real location instead of the stale pre_commit-time
+           value. */
+        for (int i = 0; i < c->n_upd_args; i++) {
+            c->upd_args[i].kf_shard = c->kf_shard;
+            c->upd_args[i].kf_slot  = c->kf_slot;
+        }
+        parallel_for(update_idx_fn, c->upd_args, c->n_upd_args, sizeof(UpdateIdxArg));
+        for (int i = 0; i < c->n_upd_args; i++) {
+            ch_fields[i] = c->upd_args[i].field;
+            ch_types[i]  = c->upd_args[i].type;
+            if (capture_index_update_error(c->err_buf, sizeof(c->err_buf),
+                                           &c->upd_args[i], "insert/update"))
+                idx_failed = 1;
+            free(c->upd_args[i].new_key);
+            free(c->upd_args[i].old_key);
+        }
+        int n_applied = c->n_upd_args;
+        c->n_upd_args = 0;
+        if (index_sync_record_fields(c->db_root, c->object, c->splits,
+                                     c->hash, ch_fields, ch_types,
+                                     n_applied) != 0)
+            idx_failed = 1;
+        bm_flush_thread_bitmap_cache();
+        return idx_failed ? -1 : 0;
+    }
+
     UpdateIdxArg tg_args[MAX_FIELDS];
     const char *tg_fields[MAX_FIELDS];
     int n_tg = 0;
-    if (c->nfields == 0) return 0;
 
     if (index_parallel(c->db_root, c->object, c->splits,
                        c->value_json, c->hash, c->fields, c->nfields,
@@ -1032,6 +1075,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         .crit = crit, .ncrit = ncrit,
     };
     compute_hash_raw(key, klen, ctx.hash);
+    int durability_pending = 0;
 
     SlotcaskUpsertOpts opts = {
         .if_not_exists  = if_not_exists,
@@ -1052,6 +1096,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         .out_kf_shard   = &ctx.kf_shard,
         .out_kf_slot    = &ctx.kf_slot,
         .has_indexed_fields = nfields > 0,
+        .out_durability_degraded = &durability_pending,
     };
     SlotcaskUpsertResult result = {0};
     int rc;
@@ -1092,6 +1137,14 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         } else {
             OUT("{\"error\":\"upsert failed\"}\n");
         }
+        return 1;
+    }
+
+    if (durability_pending) {
+        free(result.current_value);
+        free_criteria(crit, ncrit);
+        free(typed_buf);
+        OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
         return 1;
     }
 
@@ -1419,7 +1472,7 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
     return idx_failed ? -1 : 0;
 }
 
-/* Recovery-time counterpart to v2_update_pre_commit — reconciles index
+/* Recovery-time counterpart to v2_update_apply_commit — reconciles index
    state for a marker replayed at crash-recovery time (see
    kf_marker_replay_locked, slotcask.c). Registered onto
    g_recovery_index_diff_fn below so slotcask.c can reach apply_index_diff
@@ -1459,25 +1512,6 @@ static void storage_register_recovery_callback(void) {
     g_recovery_index_diff_fn = storage_recovery_index_diff;
 }
 
-static int v2_update_pre_commit(const SlotcaskOldRecord *old,
-                                const uint8_t *new_value, size_t new_vlen,
-                                int is_update, void *ctx_ptr) {
-    (void)is_update;
-    V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
-    if (!old || c->nidx == 0) return 0;
-    IndexDiffApplyArgs args = {
-        .db_root = c->db_root, .object = c->object,
-        .nidx = c->nidx, .idx_fields = c->idx_fields,
-        .idx_types = c->idx_types, .splits = c->splits,
-        .hash = c->hash, .kf_shard = c->kf_shard,
-        .kf_slot = c->kf_slot, .idx_ts = c->idx_ts,
-        .old_value = old->value, .old_vlen = old->vlen,
-        .new_value = new_value, .new_vlen = new_vlen,
-        .err_buf = c->err_buf, .err_buf_len = sizeof(c->err_buf),
-    };
-    return apply_index_diff(&args);
-}
-
 /* Two-phase update hooks: prepare_commit is a no-op (no bitmap staging
    needed for updates), apply_commit fires the index diff after the
    commit-intent marker is durable, abort_commit is a no-op. */
@@ -1489,15 +1523,20 @@ static int v2_update_prepare_commit(const uint8_t *new_value, size_t new_vlen,
 
 static int v2_update_apply_commit(const uint8_t *new_value, size_t new_vlen,
                                   uint32_t kf_slot, void *ctx_ptr) {
-    (void)kf_slot;
     V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
     if (c->nidx == 0 || !c->saved_old_value) return 0;
+    /* kf_slot is delivered live by the bulk-mutation coordinator at
+       apply-window time; c->kf_slot (populated via out_kf_slot) is only
+       written after the whole transaction returns, i.e. after this hook
+       already ran, so it must not be used here. c->kf_shard is fine — it's
+       published early by slotcask_upsert_with_hooks, before any hook fires,
+       since it's a pure hash-routing constant. */
     IndexDiffApplyArgs args = {
         .db_root = c->db_root, .object = c->object,
         .nidx = c->nidx, .idx_fields = c->idx_fields,
         .idx_types = c->idx_types, .splits = c->splits,
         .hash = c->hash, .kf_shard = c->kf_shard,
-        .kf_slot = c->kf_slot, .idx_ts = c->idx_ts,
+        .kf_slot = kf_slot, .idx_ts = c->idx_ts,
         .old_value = c->saved_old_value, .old_vlen = c->saved_old_vlen,
         .new_value = new_value, .new_vlen = new_vlen,
         .err_buf = c->err_buf, .err_buf_len = sizeof(c->err_buf),
@@ -1609,6 +1648,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
         .crit = crit, .ncrit = ncrit,
     };
     compute_hash_raw(key, klen, ctx.hash);
+    int durability_pending = 0;
 
     SlotcaskUpsertOpts opts = {
         .require_existing = 1,
@@ -1616,14 +1656,14 @@ static int cmd_update_v2(const char *db_root, const char *object,
         .check_ctx        = &ctx,
         .new_from_old     = v2_update_new_from_old,
         .new_from_old_ctx = &ctx,
-        .pre_commit       = v2_update_pre_commit,
-        .pre_commit_ctx   = &ctx,
         .prepare_commit   = v2_update_prepare_commit,
         .apply_commit     = v2_update_apply_commit,
         .abort_commit     = v2_update_abort_commit,
+        .pre_commit_ctx   = &ctx,
         .out_kf_shard     = &ctx.kf_shard,
         .out_kf_slot      = &ctx.kf_slot,
         .has_indexed_fields = nidx > 0,
+        .out_durability_degraded = &durability_pending,
     };
     SlotcaskUpsertResult result = {0};
     uint64_t _commit_t0 = now_us();
@@ -1657,6 +1697,12 @@ static int cmd_update_v2(const char *db_root, const char *object,
         } else {
             OUT("{\"error\":\"update failed\"}\n");
         }
+        return 1;
+    }
+    if (durability_pending) {
+        free(result.current_value);
+        free_criteria(crit, ncrit);
+        OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
         return 1;
     }
     free_criteria(crit, ncrit);
@@ -1933,11 +1979,11 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     LOG_INFO(LOG_SUB_SLOTCASK, "DELETE %s.%s (slotcask)", object, wire_key);
     free(result.current_value);
     free_criteria(crit, ncrit);
-    if (durability_degraded)
-        OUT("{\"status\":\"deleted\",\"key\":\"%s\",\"durability_degraded\":true}\n",
-            wire_key);
-    else
-        OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", wire_key);
+    if (durability_degraded) {
+        OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
+        return 1;
+    }
+    OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", wire_key);
     return 0;
 }
 

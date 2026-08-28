@@ -919,6 +919,15 @@ static void *rsc_continuous_reader_thread(void *arg) {
         if (!resp || strstr(resp, "\"error\"")) atomic_store(r->failed, 1);
         free(resp);
         atomic_fetch_add(r->completed, 1);
+        /* objlock's per-object rwlock is deliberately reader-preferring (see
+           docs/plans/2026-07-29-cache-rwlock-writer-preference.md), so a
+           zero-gap back-to-back reader loop can starve reindex's write-lock
+           request indefinitely (confirmed: >12 min with no progress). No
+           real client issues requests with zero gap across 4 threads in
+           lockstep, so this small pause keeps the concurrency coverage
+           (readers genuinely overlap reindex + the online bulk insert)
+           while giving the writer a real chance to be granted. */
+        usleep(1 * 1000);
     }
     return NULL;
 }

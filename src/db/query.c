@@ -1377,9 +1377,173 @@ static void batch_buf_destroy(BatchFetchBuf *b) {
 }
 
 /* ============================================================
+   Chunked-resumable btree walkers (kf-lock-safe indexed fetch).
+
+   A thread holding a btree file's bt_cache rdlock must never block on a
+   kf-shard lock: writers hold the kf WRLOCK through the durability
+   window's phase I, which itself takes the bt WRLOCK (docs/plans/
+   2026-08-27-bt-kf-lock-inversion-chunked-fetch.md). So these walkers
+   give every fan-out worker a PRIVATE BtRangeIter and let it drain its
+   own bounded hash batch before any blocking fetch:
+
+     open iter -> pull up to cap entries into private batch
+       -> CLOSE iter (releases this shard's bt rdlock)
+       -> blocking slotcask_bulk_resolve_and_fetch(batch)
+       -> reopen past the last delivered (value,hash16), repeat
+
+   Resume bounds follow the repo-wide inclusive-bound + raw-hash16
+   tiebreak skip convention (leaf order is total on (value bytes,
+   hash16) — same convention as cursor pagination's
+   cursor_find_cb skip and btree_walk_ordered_ranges' OrderedRangeResume).
+
+   Ownership rules: each worker touches only its own iterator, so no
+   cross-thread close/release protocol is needed. Memory is bounded per
+   worker by `cap` (caller derives it from QUERY_BUFFER_MB / limit /
+   shard count), replacing the shared-BatchFetchBuf condvar handoff on
+   these executors.
+   ============================================================ */
+typedef int (*chunk_filter_cb)(const char *val, size_t vlen, void *ctx);
+
+/* State shared by every per-shard worker of ONE dispatch round. */
+typedef struct {
+    SlotcaskDb    *sdb;
+    size_t         cap;            /* per-worker batch cap */
+    volatile int  *stop;           /* may be NULL */
+    SlotcaskScanCb record_cb;      /* runs OUTSIDE any bt lock */
+    void          *record_ctx;
+    chunk_filter_cb filter;        /* NULL = every entry passes */
+    void          *fctx;
+} ChunkShared;
+
+typedef struct {
+    ChunkShared *sh;
+    char         path[PATH_MAX];
+    char         lo[BT_MAX_VAL_LEN]; size_t lo_len; int lo_excl;
+    char         hi[BT_MAX_VAL_LEN]; size_t hi_len; int hi_excl;
+} ChunkWalkArg;
+
+static void *chunk_walk_worker(void *raw) {
+    ChunkWalkArg *w = (ChunkWalkArg *)raw;
+    ChunkShared *sh = w->sh;
+
+    uint8_t (*batch)[16] = malloc(sh->cap * 16);
+    if (!batch) return NULL;
+    size_t bn = 0;
+
+    char last_val[BT_MAX_VAL_LEN];
+    size_t last_len = 0;
+    uint8_t last_hash[BT_HASH_SIZE];
+    int have_last = 0;
+
+    for (;;) {
+        if (sh->stop && __atomic_load_n(sh->stop, __ATOMIC_ACQUIRE)) break;
+
+        /* Reopen bounds: original lower bound, or inclusive-at-last
+           delivered entry once a resume is in progress. */
+        const char *lo; size_t lo_len; int lo_excl;
+        char lo_buf[BT_MAX_VAL_LEN];
+        if (have_last) {
+            memcpy(lo_buf, last_val, last_len);
+            lo = lo_buf; lo_len = last_len; lo_excl = 0;
+        } else {
+            lo = w->lo; lo_len = w->lo_len; lo_excl = w->lo_excl;
+        }
+
+        BtRangeIter *it = btree_range_iter_open(w->path,
+                                                lo, lo_len, lo_excl,
+                                                w->hi, w->hi_len, w->hi_excl,
+                                                0 /* ASC */);
+        if (!it) break;
+
+        int exhausted = 0;
+        while (bn < sh->cap) {
+            const char *v; size_t vl; const uint8_t *h;
+            if (!btree_range_iter_next(it, &v, &vl, &h)) {
+                exhausted = 1;
+                break;
+            }
+            if (sh->stop &&
+                __atomic_load_n(sh->stop, __ATOMIC_ACQUIRE))
+                break;
+
+            /* Resume floor: skip the already-delivered boundary entry and
+               any older sibling sharing its value. */
+            if (have_last && vl == last_len &&
+                memcmp(v, last_val, last_len) == 0 &&
+                memcmp(h, last_hash, BT_HASH_SIZE) <= 0)
+                continue;
+
+            /* Record the resume point BEFORE the (possibly later) close. */
+            last_len = vl > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : vl;
+            memcpy(last_val, v, last_len);
+            memcpy(last_hash, h, BT_HASH_SIZE);
+            have_last = 1;
+
+            if (sh->filter && !sh->filter(v, vl, sh->fctx)) continue;
+
+            memcpy(batch[bn], h, 16);
+            bn++;
+        }
+        btree_range_iter_close(it);
+
+        if (bn > 0) {
+            /* No bt lock is held here — blocking on kfcache is safe. */
+            slotcask_bulk_resolve_and_fetch(sh->sdb, batch, bn,
+                                            sh->record_ctx, sh->record_cb);
+            bn = 0;
+        }
+        if (exhausted) break;
+    }
+
+    free(batch);
+    return NULL;
+}
+
+/* Fan one range spec out across all idx shards. Blocking record fetches
+ * happen exclusively inside chunk_walk_worker with the worker's own
+ * iterator closed. Returns after every worker drained or stopped. */
+static void chunk_walk_fanout(const ChunkShared *sh_tmpl,
+                              const char *db_root, const char *object,
+                              const char *field, int splits,
+                              const char *lo, size_t lo_len, int lo_excl,
+                              const char *hi, size_t hi_len, int hi_excl) {
+    int n = index_splits_for(splits);
+    if (n <= 0) return;
+    ChunkShared sh = *sh_tmpl;
+    ChunkWalkArg *args = calloc((size_t)n, sizeof(ChunkWalkArg));
+    if (!args) return;
+    for (int s = 0; s < n; s++) {
+        ChunkWalkArg *a = &args[s];
+        a->sh = &sh;
+        build_idx_path(a->path, sizeof(a->path), db_root, object, field, s);
+        size_t cpy = lo_len > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : lo_len;
+        memcpy(a->lo, lo, cpy); a->lo_len = cpy; a->lo_excl = lo_excl;
+        cpy = hi_len > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : hi_len;
+        memcpy(a->hi, hi, cpy); a->hi_len = cpy; a->hi_excl = hi_excl;
+    }
+    parallel_for_io(chunk_walk_worker, args, n, sizeof(ChunkWalkArg));
+    free(args);
+}
+
+/* Per-worker batch cap: derived from the caller's pending_cap budget so
+ * total worker memory stays comparable to the old shared buffer, floored
+ * to keep reopen amortization sane. */
+static size_t chunk_cap_for(size_t pending_cap, int nworkers) {
+    size_t c = pending_cap / (size_t)(nworkers > 0 ? nworkers : 1);
+    if (c < 64) c = 64;
+    if (c > 4096) c = 4096;
+    return c;
+}
+
+/* Upper-bound sentinel used across btree_dispatch's range forms. */
+static const char CHUNK_HI_SENTINEL[4] = { (char)0xff, (char)0xff,
+                                           (char)0xff, (char)0xff };
+
+/* ============================================================
    Streaming indexed find — fetch + post-filter + emit per btree match.
    Replaces collect-then-emit for the limit-bound case where post-filter
    siblings make the collect cap (= offset+limit) under-collect.
+
 
    Walk the primary leaf's btree (parallel across idx shards). For each
    btree match: the cb fetches the record, runs criteria_match_tree
@@ -1528,6 +1692,165 @@ static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, v
     return batch_buf_collect_hash(bfb, hash16);
 }
 
+/* Primary-leaf match for the chunked streaming executor — mirrors the
+ * primary-check half of stream_find_cb so both executors agree on which
+ * entries become fetch candidates. */
+static int stream_primary_filter(const char *val, size_t vlen, void *raw_ctx) {
+    StreamFindCtx *sc = (StreamFindCtx *)raw_ctx;
+    if (!sc->primary_crit || !sc->check_primary) return 1;
+    if (op_is_length(sc->primary_crit->op))
+        return match_length_vlen(vlen, sc->primary_crit) ? 1 : 0;
+
+    char tmp[1028];
+    int matched;
+    if (sc->tf) {
+        int dlen = decode_idx_to_buf(sc->tf, (const uint8_t *)val, vlen,
+                                     tmp, sizeof(tmp), 0);
+        if (dlen <= 0) return 0;
+        matched = match_criterion(tmp, sc->primary_crit);
+    } else {
+        size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
+        memcpy(tmp, val, cl); tmp[cl] = '\0';
+        matched = match_criterion_vlen(tmp, cl, sc->primary_crit);
+    }
+    return matched ? 1 : 0;
+}
+
+/* Chunked-resumable driver for btree-backed primary leaves. Replicates the
+ * lock-holding branches of btree_dispatch (query.c OP_EQUAL..OP_NOT_EQUAL)
+ * as resume-capable range specs; ops whose dispatch route holds no bt_cache
+ * lock (bitmap fast/dict paths, O_DIRECT default leaf scans) must fall back
+ * to btree_dispatch + stream_find_cb, whose inline batch flush is safe
+ * there. Returns 1 when the op was driven here, 0 when the caller must use
+ * the legacy path. */
+static int chunked_stream_dispatch(ChunkShared *sh,
+                                   const char *db_root, const char *object,
+                                   const char *field, int splits,
+                                   SearchCriterion *pc, const TypedField *tf) {
+    uint8_t buf1[1032], buf2[1032];
+    size_t len1 = 0, len2 = 0;
+
+#define CHUNK_GO(LO, LLO, LLEX, HI, HLI, HIEX) \
+    do { \
+        chunk_walk_fanout(sh, db_root, object, field, splits, \
+                          (const char *)(LO), (LLO), (LLEX), \
+                          (const char *)(HI), (HLI), (HIEX)); \
+        return 1; \
+    } while (0)
+
+    switch (pc->op) {
+        case OP_EQUAL:
+            encode_criterion_value(tf, pc->value, strlen(pc->value),
+                                   buf1, &len1);
+            if (len1 == 0) return 0;
+            memcpy(buf2, buf1, len1);
+            memset(buf2 + len1, 0xff, 4);
+            CHUNK_GO(buf1, len1, 0, buf2, len1 + 4, 0);
+        case OP_GREATER_EQ:
+            encode_criterion_value(tf, pc->value, strlen(pc->value),
+                                   buf1, &len1);
+            if (len1 == 0) return 0;
+            CHUNK_GO(buf1, len1, 0, CHUNK_HI_SENTINEL, 4, 0);
+        case OP_GREATER:
+            encode_criterion_value(tf, pc->value, strlen(pc->value),
+                                   buf1, &len1);
+            if (len1 == 0) return 0;
+            CHUNK_GO(buf1, len1, 1, CHUNK_HI_SENTINEL, 4, 0);
+        case OP_LESS_EQ:
+            encode_criterion_value(tf, pc->value, strlen(pc->value),
+                                   buf1, &len1);
+            if (len1 == 0) return 0;
+            CHUNK_GO("", 0, 0, buf1, len1, 0);
+        case OP_LESS:
+            encode_criterion_value(tf, pc->value, strlen(pc->value),
+                                   buf1, &len1);
+            if (len1 == 0) return 0;
+            CHUNK_GO("", 0, 0, buf1, len1, 1);
+        case OP_BETWEEN:
+            encode_criterion_value(tf, pc->value, strlen(pc->value),
+                                   buf1, &len1);
+            encode_criterion_value(tf, pc->value2, strlen(pc->value2),
+                                   buf2, &len2);
+            if (len1 == 0 || len2 == 0) return 0;
+            CHUNK_GO(buf1, len1, pc->min_exclusive,
+                     buf2, len2, pc->max_exclusive);
+        case OP_IN:
+            for (int iv = 0; iv < pc->in_count; iv++) {
+                encode_criterion_value(tf, pc->in_values[iv],
+                                       strlen(pc->in_values[iv]), buf1, &len1);
+                if (len1 == 0) continue;
+                memcpy(buf2, buf1, len1);
+                memset(buf2 + len1, 0xff, 4);
+                if (iv == pc->in_count - 1)
+                    CHUNK_GO(buf1, len1, 0, buf2, len1 + 4, 0);
+                else
+                    chunk_walk_fanout(sh, db_root, object, field, splits,
+                                      (const char *)buf1, len1, 0,
+                                      (const char *)buf2, len1 + 4, 0);
+                if (sh->stop &&
+                    __atomic_load_n(sh->stop, __ATOMIC_ACQUIRE)) return 1;
+            }
+            return 1;
+        case OP_STARTS_WITH: {
+            int raw_prefix = (!tf || tf->type == FT_VARCHAR);
+            size_t plen;
+            if (raw_prefix) {
+                plen = strlen(pc->value);
+                memcpy(buf1, pc->value, plen);
+            } else {
+                encode_criterion_value(tf, pc->value, strlen(pc->value),
+                                       buf1, &plen);
+            }
+            if (plen == 0) return 0;
+            memcpy(buf2, buf1, plen);
+            memset(buf2 + plen, 0xff, 4);
+            CHUNK_GO(buf1, plen, 0, buf2, plen + 4, 0);
+        }
+        case OP_LIKE: {
+            const char *pat = pc->value;
+            size_t pl = strlen(pat);
+            int lead = (pl >= 1 && pat[0] == '%');
+            int trail = (pl >= 1 && pat[pl-1] == '%');
+            int raw_prefix = (!tf || tf->type == FT_VARCHAR);
+            if (!lead && !trail && raw_prefix) {
+                encode_criterion_value(tf, pat, pl, buf1, &len1);
+                if (len1 == 0) return 0;
+                memcpy(buf2, buf1, len1);
+                memset(buf2 + len1, 0xff, 4);
+                CHUNK_GO(buf1, len1, 0, buf2, len1 + 4, 0);
+            }
+            if (!lead && trail && raw_prefix) {
+                size_t needle_len = pl - 1;
+                memcpy(buf1, pat, needle_len);
+                memcpy(buf2, buf1, needle_len);
+                memset(buf2 + needle_len, 0xff, 4);
+                CHUNK_GO(buf1, needle_len, 0, buf2, needle_len + 4, 0);
+            }
+            return 0;   /* substring/suffix/non-varchar → O_DIRECT route */
+        }
+        case OP_NOT_EQUAL:
+            if (tf && tf->type == FT_BOOL) {
+                int is_true = (pc->value[0] == 't' || pc->value[0] == 'T' ||
+                               pc->value[0] == '1');
+                uint8_t inv[1] = { (uint8_t)(is_true ? 0 : 1) };
+                memcpy(buf2, inv, 1);
+                memset(buf2 + 1, 0xff, 4);
+                CHUNK_GO(inv, 1, 0, buf2, 5, 0);
+            }
+            encode_criterion_value(tf, pc->value, strlen(pc->value),
+                                   buf1, &len1);
+            if (len1 == 0) return 0;
+            chunk_walk_fanout(sh, db_root, object, field, splits,
+                              "", 0, 0, (const char *)buf1, len1, 1);
+            if (sh->stop &&
+                __atomic_load_n(sh->stop, __ATOMIC_ACQUIRE)) return 1;
+            CHUNK_GO(buf1, len1, 1, CHUNK_HI_SENTINEL, 4, 0);
+        default:
+            return 0;
+    }
+#undef CHUNK_GO
+}
+
 /* Returns number of rows printed, or -2 on per-query buffer cap overrun
    (currently unused — streaming has no buffer growth). Caller has
    already emitted the JSON envelope opener (`[`) before calling. */
@@ -1574,10 +1897,38 @@ static int idx_find_streaming(const char *db_root, const char *object,
     sc.bfb.record_cb = stream_find_record_cb;
     sc.bfb.record_ctx = &sc;
 
-    btree_dispatch(db_root, object, primary_crit->field, sch->splits,
-                    primary_crit,
-                    resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field),
-                    stream_find_cb, &sc);
+    if (sdb && field_index_type(db_root, object, primary_crit->field)
+               == IT_BTREE) {
+        /* Lock-safe executor: per-worker chunked walkers close their own
+         * bt iterator before every blocking kf fetch (AB-BA fix,
+         * docs/plans/2026-08-27-bt-kf-lock-inversion-chunked-fetch.md).
+         * Falls through to legacy btree_dispatch when the op routes to a
+         * no-bt-lock branch anyway. */
+        ChunkShared sh = {0};
+        sh.sdb = sdb;
+        sh.stop = &sc.stop;
+        sh.record_cb = stream_find_record_cb;
+        sh.record_ctx = &sc;
+        sh.filter = stream_primary_filter;
+        sh.fctx = &sc;
+        sh.cap = chunk_cap_for(sc.bfb.pending_cap,
+                               index_splits_for(sch->splits));
+        int driven = chunked_stream_dispatch(&sh, db_root, object,
+                                             primary_crit->field,
+                                             sch->splits, primary_crit,
+                                             sc.tf);
+        if (!driven) {
+            btree_dispatch(db_root, object, primary_crit->field, sch->splits,
+                            primary_crit, sc.tf, stream_find_cb, &sc);
+        }
+    } else {
+        /* Legacy fan-out — IT_BITMAP branches and O_DIRECT leaf scans hold
+         * no bt_cache lock, so inline batch flushing stays safe there. */
+        btree_dispatch(db_root, object, primary_crit->field, sch->splits,
+                        primary_crit,
+                        resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field),
+                        stream_find_cb, &sc);
+    }
 
     batch_buf_destroy(&sc.bfb);
     pthread_mutex_destroy(&sc.lock);
@@ -2205,8 +2556,31 @@ static int find_via_composite_key(const char *db_root, const char *object,
     if (batch_buf_init(&bfb, sdb, sch->slot_size, limit) == 0) {
         bfb.record_cb = composite_prefix_record_cb;
         bfb.record_ctx = &ctx;
-        btree_idx_search(db_root, object, composite_field, sch->splits,
-                         (const char *)key, klen, batch_buf_collect_cb, &bfb);
+        if (sdb) {
+            /* Lock-safe chunked walk of the exact-key prefix range
+             * ([encoded_key, encoded_key ++ 0xff×4)) — same executor as
+             * idx_find_streaming's btree path (AB-BA fix). Falls back to
+             * the inline-flush search when no slotcask handle exists. */
+            ChunkShared sh = {0};
+            sh.sdb = sdb;
+            sh.stop = NULL;
+            sh.record_cb = composite_prefix_record_cb;
+            sh.record_ctx = &ctx;
+            sh.filter = NULL;   /* exact-prefix leaf entries all match */
+            sh.fctx = NULL;
+            sh.cap = chunk_cap_for(bfb.pending_cap,
+                                   index_splits_for(sch->splits));
+            uint8_t hi[1024 + 4];
+            memcpy(hi, key, klen);
+            memset(hi + klen, 0xff, 4);
+            chunk_walk_fanout(&sh, db_root, object, composite_field,
+                              sch->splits, (const char *)key, klen, 0,
+                              (const char *)hi, klen + 4, 0);
+        } else {
+            btree_idx_search(db_root, object, composite_field, sch->splits,
+                             (const char *)key, klen, batch_buf_collect_cb,
+                             &bfb);
+        }
         batch_buf_destroy(&bfb);
     }
 
@@ -4704,20 +5078,9 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
     if (!ks) return 0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
-    /* Pure-OR (root IS the OR, OR root is a single-child AND wrapping
-       the OR — common shape from `criteria:[{"or":[...]}]` parsed as
-       AND-of-one). No AND siblings → no per-record re-match needed,
-       just return the keyset size. */
-    int is_pure_or = (tree == or_node || tree->kind == CNODE_OR ||
-                       (tree->kind == CNODE_AND && tree->n_children == 1 &&
-                        tree->children[0] == or_node));
-    if (is_pure_or) {
-        size_t n = keyset_size(ks);
-        keyset_free(ks);
-        return n;
-    }
-
-    /* Hybrid: batch-fetch keyed records and apply full tree match. */
+    /* Every union count validates through the record fetch (which
+       revalidates at the Kf reader) — the pure-OR keyset-size shortcut
+       is gone; the KeySet is a candidate producer only. */
     {
         size_t n_hashes = 0;
         for (size_t b = 0; b < ks->cap; b++)
@@ -4954,6 +5317,10 @@ void cmd_explain_tree(const char *db_root, const char *object, CriteriaNode *tre
     /* tree owned by caller — not freed here */
 }
 
+size_t idx_count_for_leaf(const char *db_root, const char *object,
+                          const Schema *sch, const FieldSchema *fs,
+                          SearchCriterion *leaf, QueryDeadline *dl);
+
 static int cmd_count_with_tree(const char *db_root, const char *object,
                                 CriteriaNode *tree) {
     Schema sch = load_schema(db_root, object);
@@ -4995,15 +5362,13 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
                                  sch.splits)) {
                 SearchCriterion pos = exists_leaf->leaf;
                 pos.op = OP_EXISTS;
-                const TypedField *pc_tf = &fs.ts->fields[fi];
-                IdxCountCtx ic = { &pos, 0, 0, &dl, 0, pc_tf };
-                btree_dispatch(db_root, object, pos.field, sch.splits,
-                               &pos, pc_tf, idx_count_cb, &ic);
+                size_t pos_n = idx_count_for_leaf(db_root, object, &sch,
+                                                  &fs, &pos, &dl);
                 if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
                 else {
                     int total = get_live_count(db_root, object);
-                    size_t neg = ((size_t)total > ic.count)
-                                  ? (size_t)total - ic.count : 0;
+                    size_t neg = ((size_t)total > pos_n)
+                                  ? (size_t)total - pos_n : 0;
                     OUT("%zu\n", neg);
                 }
                 return 0;
@@ -5049,90 +5414,19 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
         if (is_single_leaf && op_is_negatable(op)) {
             SearchCriterion pos = *pc;
             pos.op = op_invert(op);
-            size_t pos_count = 0;
-            int pos_ok = 1;
-            int pos_picked = pick_index_for_leaf(db_root, object, &pos);
-            if (pos_picked == IT_TRIGRAM) {
-                KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
-                                                           sch.splits, &pos, &dl);
-                if (tg_ks) {
-                    CollectedHash *entries = NULL;
-                    size_t n = 0;
-                    keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
-                    CriteriaNode pos_leaf = { .kind = CNODE_LEAF, .leaf = pos,
-                                              .children = NULL, .n_children = 0 };
-                    pos_count = parallel_indexed_count(db_root, object, &sch,
-                                                       entries, (int)n,
-                                                       &pos_leaf, &fs, &dl, NULL, 0);
-                    free(entries);
-                    keyset_free(tg_ks);
-                    pos_ok = !dl.timed_out;
-                } else {
-                    pos_ok = 0;
-                }
-            } else if (pos_picked == IT_BITMAP) {
-                if (pos.op == OP_EQUAL || pos.op == OP_IN) {
-                    pos_count = bm_popcount_for_crit(db_root, object, sch.splits,
-                                                      &pos, pc_tf);
-                } else {
-                    pos_count = bm_popcount_generic_for_crit(db_root, object,
-                                                              pc->field, sch.splits,
-                                                              &pos, pc_tf);
-                }
-            } else {
-                int pos_cp = op_needs_check_primary(pos.op);
-                IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0, pc_tf };
-                btree_dispatch(db_root, object, pc->field, sch.splits,
-                               &pos, pc_tf, idx_count_cb, &ic);
-                pos_count = ic.count;
-                pos_ok = !dl.timed_out;
-            }
-            if (!pos_ok) OUT("{\"error\":\"query_timeout\"}\n");
+            size_t pos_count = idx_count_for_leaf(db_root, object, &sch,
+                                                  &fs, &pos, &dl);
+            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else {
                 int total = get_live_count(db_root, object);
                 size_t neg = ((size_t)total > pos_count) ? (size_t)total - pos_count : 0;
                 OUT("%zu\n", neg);
             }
         } else if (is_single_leaf) {
-            int picked = pick_index_for_leaf(db_root, object, pc);
-            if (picked == IT_TRIGRAM) {
-                KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
-                                                           sch.splits, pc, &dl);
-                if (tg_ks) {
-                    CollectedHash *entries = NULL;
-                    size_t n = 0;
-                    keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
-                    size_t count = parallel_indexed_count(db_root, object, &sch,
-                                                          entries, (int)n,
-                                                          tree, &fs, &dl, &fp, 1);
-                    if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-                    else OUT("%zu\n", count);
-                    free(entries);
-                    keyset_free(tg_ks);
-                    return 0;
-                }
-                OUT("0\n");
-                return 0;
-            }
-            if (picked == IT_BITMAP) {
-                size_t total;
-                if (op == OP_EQUAL || op == OP_IN) {
-                    total = bm_popcount_for_crit(db_root, object,
-                                                  sch.splits, pc, pc_tf);
-                } else {
-                    total = bm_popcount_generic_for_crit(db_root, object,
-                                                          pc->field, sch.splits,
-                                                          pc, pc_tf);
-                }
-                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-                else OUT("%zu\n", total);
-            } else {
-                IdxCountCtx ic = { pc, check_primary, 0, &dl, 0, pc_tf };
-                btree_dispatch(db_root, object, pc->field, sch.splits,
-                               pc, pc_tf, idx_count_cb, &ic);
-                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-                else OUT("%zu\n", ic.count);
-            }
+            size_t count = idx_count_for_leaf(db_root, object, &sch,
+                                              &fs, pc, &dl);
+            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            else OUT("%zu\n", count);
         } else {
             int picked = pick_index_for_leaf(db_root, object, pc);
             if (picked == IT_TRIGRAM) {
@@ -5179,25 +5473,10 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
             collect_ctx_destroy(&cc);
         }
     } else if (fp.kind == FP_INTERSECT) {
-        if (fp.source_is_bitmap && fp.n_postfilter == 0) {
-            int all_supported = 1;
-            for (int i = 0; i < fp.n_source; i++) {
-                if (fp.source_leaves[i]->op != OP_EQUAL &&
-                    fp.source_leaves[i]->op != OP_IN) {
-                    all_supported = 0; break;
-                }
-            }
-            if (all_supported) {
-                size_t total = bm_popcount_intersect(db_root, object,
-                                                      sch.splits,
-                                                      fp.source_leaves,
-                                                      fp.n_source,
-                                                      fs.ts, &dl);
-                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-                else OUT("%zu\n", total);
-                return 0;
-            }
-        }
+        /* The bitmap popcount shortcut is gone: every intersect count
+           validates its candidates through parallel_indexed_count, whose
+           record fetch revalidates at the Kf reader. The KeySet is a
+           candidate producer, never the answer. */
         int small_primary = 0;
         KeySet *result = intersect_indexed_leaves(db_root, object, sch.splits,
                                                   fp.source_leaves, fp.n_source,
@@ -5205,11 +5484,6 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
         if (!result) {
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("0\n");
-        } else if (!small_primary && fp.n_postfilter == 0) {
-            size_t n = keyset_size(result);
-            keyset_free(result);
-            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-            else OUT("%zu\n", n);
         } else {
             CollectedHash *batch = NULL;
             size_t batch_count = 0;
@@ -5308,55 +5582,73 @@ int cmd_count_tree(const char *db_root, const char *object, CriteriaNode *tree) 
      IT_TRIGRAM  → trigram KeySet + parallel_indexed_count
      IT_BITMAP   → bm_popcount_for_crit / bm_popcount_generic_for_crit
      IT_BTREE    → btree_dispatch + idx_count_cb  */
-static size_t idx_count_for_leaf(const char *db_root, const char *object,
-                                 const Schema *sch, const FieldSchema *fs,
-                                 SearchCriterion *leaf, QueryDeadline *dl) {
+size_t idx_count_for_leaf(const char *db_root, const char *object,
+                          const Schema *sch, const FieldSchema *fs,
+                          SearchCriterion *leaf, QueryDeadline *dl) {
     int picked = pick_index_for_leaf(db_root, object, leaf);
     const TypedField *tf = resolve_idx_field(fs->ts, leaf->field);
 
-    if (picked == IT_TRIGRAM) {
-        KeySet *tg_ks = build_keyset_from_trigram(db_root, object,
-                                                   sch->splits, leaf, dl);
-        if (!tg_ks) return 0;
-        CollectedHash *entries = NULL;
-        size_t n = 0;
-        keyset_to_collected_hashes(tg_ks, sch->splits, &entries, &n);
-        /* Build a single-leaf criteria node around `leaf` so
-           parallel_indexed_count verifies only that leaf (no tree).
-           Must compile it (compile_one) before use: parallel_indexed_count's
-           per-record verification checks node->compiled and treats NULL as
-           "never matches", so an uncompiled node here silently zeroes every
-           count. Heap-allocate cc: free_compiled_criteria() calls free() on
-           the array pointer itself (not just inner buffers), so it must be
-           paired with calloc, never a stack variable. */
-        CompiledCriterion *cc = calloc(1, sizeof(CompiledCriterion));
-        compile_one(cc, leaf, fs->ts);
-        CriteriaNode leaf_node = { .kind = CNODE_LEAF, .leaf = *leaf,
-                                   .compiled = cc,
-                                   .children = NULL, .n_children = 0 };
-        size_t cnt = parallel_indexed_count(db_root, object, sch,
-                                            entries, (int)n,
-                                            &leaf_node, (FieldSchema *)fs, dl, NULL, 1);
+    /* Build a single-leaf criteria node around `leaf` so
+       parallel_indexed_count verifies only that leaf (no tree).
+       Must compile it (compile_one) before use: parallel_indexed_count's
+       per-record verification checks node->compiled and treats NULL as
+       "never matches", so an uncompiled node here silently zeroes every
+       count. Heap-allocate cc: free_compiled_criteria() calls free() on
+       the array pointer itself (not just inner buffers), so it must be
+       paired with calloc, never a stack variable. */
+    CompiledCriterion *cc = calloc(1, sizeof(CompiledCriterion));
+    compile_one(cc, leaf, fs->ts);
+    CriteriaNode leaf_node = { .kind = CNODE_LEAF, .leaf = *leaf,
+                               .compiled = cc,
+                               .children = NULL, .n_children = 0 };
+    size_t cnt = 0;
+
+    if (picked == IT_TRIGRAM || picked == IT_BITMAP) {
+        /* Candidate producer only: the trigram/bitmap match set feeds
+           parallel_indexed_count, whose record fetch revalidates every
+           candidate at the Kf reader — the raw popcount success paths
+           are gone. */
+        KeySet *ks = (picked == IT_TRIGRAM)
+            ? build_keyset_from_trigram(db_root, object, sch->splits, leaf, dl)
+            : build_keyset_from_bitmap(db_root, object, sch->splits, leaf, tf, dl);
+        if (ks) {
+            CollectedHash *entries = NULL;
+            size_t n = 0;
+            keyset_to_collected_hashes(ks, sch->splits, &entries, &n);
+            cnt = parallel_indexed_count(db_root, object, sch,
+                                         entries, (int)n,
+                                         &leaf_node, (FieldSchema *)fs, dl, NULL, 1);
+            free(entries);
+            keyset_free(ks);
+        }
         free_compiled_criteria(cc, 1);
-        free(entries);
-        keyset_free(tg_ks);
         return cnt;
     }
 
-    if (picked == IT_BITMAP) {
-        if (leaf->op == OP_EQUAL || leaf->op == OP_IN)
-            return bm_popcount_for_crit(db_root, object, sch->splits, leaf, tf);
-        return bm_popcount_generic_for_crit(db_root, object,
-                                             leaf->field, sch->splits, leaf, tf);
+    /* IT_BTREE (default): collect candidate hashes, then validate+count
+       through the Kf boundary instead of counting btree visits. */
+    {
+        CollectCtx col;
+        collect_ctx_init(&col);
+        col.splits = sch->splits;
+        col.primary_crit = leaf;
+        col.check_primary = op_needs_check_primary(leaf->op);
+        col.deadline = dl;
+        col.tf = tf;
+        btree_dispatch(db_root, object, leaf->field, sch->splits,
+                       leaf, tf, collect_hash_cb, &col);
+        if (col.budget_exceeded) {
+            collect_ctx_destroy(&col);
+            free_compiled_criteria(cc, 1);
+            return 0;
+        }
+        cnt = parallel_indexed_count(db_root, object, sch,
+                                     col.entries, (int)col.count,
+                                     &leaf_node, (FieldSchema *)fs, dl, NULL, 1);
+        collect_ctx_destroy(&col);
     }
-
-    /* IT_BTREE (default) */
-    int check_primary = op_needs_check_primary(leaf->op);
-    IdxCountCtx ic = { leaf, check_primary, 0, dl, 0, tf };
-    btree_dispatch(db_root, object, leaf->field, sch->splits,
-                   leaf, tf, idx_count_cb, &ic);
-    idx_count_cb_flush_thread();
-    return ic.count;
+    free_compiled_criteria(cc, 1);
+    return cnt;
 }
 
 /* find <object> <criteria_json> [offset] [limit] [fields]
@@ -8133,24 +8425,13 @@ static int cmd_find_do(const char *db_root, const char *object,
         if (want_total && !dl.timed_out &&
             (fp.order == FP_ORDER_NONE || fp.order == FP_ORDER_SORT)) {
             if (fp.kind == FP_BITMAP_SMALLER) {
-                /* Bitmap smaller path: use bitmap popcount (same as cmd_count) */
-                int picked_bm = pick_index_for_leaf(db_root, object, pc);
-                if (picked_bm == IT_BITMAP) {
-                    const TypedField *bm_tf = resolve_idx_field(driver_fs.ts, pc->field);
-                    if (pc->op == OP_EQUAL || pc->op == OP_IN)
-                        find_total = bm_popcount_for_crit(db_root, object,
-                                                          sch.splits, pc, bm_tf);
-                    else
-                        find_total = bm_popcount_generic_for_crit(db_root, object,
-                                                                   pc->field, sch.splits,
-                                                                   pc, bm_tf);
-                    if (!dl.timed_out) find_total_null = 0;
-                } else {
-                    /* Fell through without bitmap (unusual but defensive): count via leaf */
-                    find_total = idx_count_for_leaf(db_root, object, &sch,
-                                                    &driver_fs, pc, &dl);
-                    if (!dl.timed_out) find_total_null = 0;
-                }
+                /* Observable totals validate at the Kf boundary:
+                   idx_count_for_leaf routes bitmap candidates through
+                   the record-fetch revalidation; raw popcount is not a
+                   count answer. */
+                find_total = idx_count_for_leaf(db_root, object, &sch,
+                                                &driver_fs, pc, &dl);
+                if (!dl.timed_out) find_total_null = 0;
             } else {
                 /* FP_PRIMARY_LEAF: idx_count_for_leaf on the seed */
                 find_total = idx_count_for_leaf(db_root, object, &sch,

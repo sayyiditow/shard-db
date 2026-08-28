@@ -302,9 +302,11 @@ typedef struct {
     const int      *idx_is_composite;
     const enum IndexType *idx_types;  /* [nidx] — IT_BTREE / IT_BITMAP / IT_TRIGRAM */
     /* Two-phase window state for indexed bulk inserts. Populated by
-       v2_bulk_ins_prepare_window (before the window's kf marker exists)
-       and consumed/torn down by v2_bulk_ins_apply_window (after the
-       marker is durable, before kf is committed for surviving records).
+       v2_bulk_ins_prepare_window (before the window's kf marker exists),
+       consumed (possibly more than once, on replay) by
+       v2_bulk_ins_apply_window (after the marker is durable, before kf is
+       committed for surviving records), and torn down exactly once by
+       v2_bulk_ins_commit_done (after the window is fully durable).
        Bitmap cap rejection happens inside bitmap_prepare_window_add,
        synchronously, so it can reject an individual record before any
        marker exists — closing both the daemon-abort bug (rejection after
@@ -866,7 +868,15 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
  * surviving records indexed and others not. A non-zero return is always
  * a genuine I/O/OOM failure and is routed by the caller through the
  * existing degraded/replay path — the marker is retained, never a
- * policy rejection (those are handled entirely in prepare_window). */
+ * policy rejection (those are handled entirely in prepare_window).
+ *
+ * MUST be safe to call more than once: forward replay after a post-marker
+ * failure re-invokes this on the same staged state, so it never frees or
+ * resets sw->tg_ops / sw->bt_del_ops / sw->idx_pairs / sw->bw_window —
+ * re-running update_idx_fn/delete_index_entry/idx_build_field_worker on
+ * already-converged entries is a no-op by construction of those
+ * primitives. Release of the staged state happens once, later, in
+ * v2_bulk_ins_commit_done — never here. */
 static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
                                      size_t nactive, void *ctx) {
     BulkInsShardWork *sw = (BulkInsShardWork *)ctx;
@@ -880,8 +890,6 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
         update_idx_fn(&sw->tg_ops[i]);
         if (sw->tg_ops[i].out_error) rc = -1;
     }
-    free(sw->tg_ops);
-    sw->tg_ops = NULL; sw->tg_nops = sw->tg_cap = 0;
 
     for (size_t i = 0; i < sw->bt_del_nops; i++) {
         BtDeleteOp *op = &sw->bt_del_ops[i];
@@ -890,8 +898,6 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
             rc = -1;
         bt_field_touched[op->fi] = 1;
     }
-    free(sw->bt_del_ops);
-    sw->bt_del_ops = NULL; sw->bt_del_nops = sw->bt_del_cap = 0;
 
     for (int fi = 0; fi < sw->nidx; fi++) {
         size_t count = sw->idx_pair_counts[fi];
@@ -902,8 +908,6 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
         fa.new_entries = sw->idx_pairs[fi]; fa.new_count = count;
         idx_build_field_worker(&fa);
         if (fa.out_error) rc = -1;
-        for (size_t k = 0; k < count; k++) free((void *)sw->idx_pairs[fi][k].value);
-        sw->idx_pair_counts[fi] = 0;
         bt_field_touched[fi] = 1;
     }
 
@@ -924,8 +928,6 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
     }
 
     if (bitmap_prepare_window_apply(&sw->bw_window) != 0) rc = -1;
-    bitmap_prepare_window_free(&sw->bw_window);
-    bw_free_bufs(sw);
     return rc;
 }
 
@@ -936,6 +938,16 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
  * exactly; kept as a separate name for the SlotcaskBulkOpts.abort_window
  * wiring so the call site reads as "abort", not "release". */
 static void v2_bulk_ins_abort_window(void *ctx) {
+    v2_bulk_ins_window_release((BulkInsShardWork *)ctx);
+}
+
+/* Fires at most once, after the window is fully durable (kf published, old
+ * payloads tombstoned, marker cleared) — no further apply_window replay can
+ * occur for this window past this point, so it is now safe to release what
+ * prepare_window/apply_window staged. Mirrors v2_bulk_ins_window_release
+ * exactly; kept as a separate name for the SlotcaskBulkOpts.commit_done
+ * wiring so the call site reads as "commit done", not "release". */
+static void v2_bulk_ins_commit_done(void *ctx) {
     v2_bulk_ins_window_release((BulkInsShardWork *)ctx);
 }
 
@@ -1031,6 +1043,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
            prepare_window/apply_window uniformly for this call site. */
         .prepare_window       = sw->nidx > 0 ? v2_bulk_ins_prepare_window : NULL,
         .apply_window         = sw->nidx > 0 ? v2_bulk_ins_apply_window  : NULL,
+        .commit_done          = sw->nidx > 0 ? v2_bulk_ins_commit_done  : NULL,
         .abort_window         = sw->nidx > 0 ? v2_bulk_ins_abort_window  : NULL,
         .bulk_hook_ctx         = sw,
         /* OLD value only needed when there are indexes to update; otherwise
@@ -1039,6 +1052,12 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         .pre_commit_needs_old = sw->nidx > 0,
         .has_indexed_fields   = sw->nidx > 0,
         .value_compute        = has_ac ? v2_bulk_ins_ac_value_compute : NULL,
+        /* v2_bulk_ins_ac_value_compute patches the auto_create field's
+           bytes from OLD only after the P wave has already staged phase 1's
+           payload; without this flag the P-wave's earlier write wins and the
+           correction is silently dropped (see the flag's definition site in
+           slotcask.h and its consumer in bulk_stage_one_shard). */
+        .value_rewrites_payload = has_ac,
     };
     for (int s = 0; s < splits; s++) {
         if (counts[s] == 0) continue;
@@ -2842,12 +2861,12 @@ static int bulk_delete_run(const char *db_root, const char *object,
     }
 
     if (any_durability_degraded)
-        OUT("{\"deleted\":%d,\"durability_degraded\":true}\n", total_deleted);
+        OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
     else
         OUT("{\"deleted\":%d}\n", total_deleted);
     for (int i = 0; i < key_count; i++) free(keys[i]);
     free(keys); free(hashes); free(shard_ids); free(start_slots); free(raw);
-    return 0;
+    return any_durability_degraded ? 1 : 0;
 }
 
 int cmd_bulk_delete(const char *db_root, const char *object, const char *input) {
@@ -3325,6 +3344,10 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
         .require_existing     = 1,
         .has_indexed_fields   = w->nidx > 0,
         .value_compute        = v2_bulk_upd_value_compute,
+        /* NEW bytes are only final after value_compute derives them from
+           OLD; without this the P wave's placeholder write wins and the
+           derived value is silently dropped. */
+        .value_rewrites_payload = 1,
     };
     if (w->nidx > 0) {
         opts.prepare_window   = v2_bulk_upd_noop_prepare;
@@ -3809,6 +3832,10 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
         .require_existing     = 1,
         .has_indexed_fields   = w->nidx > 0,
         .value_compute        = v2_bulk_upd_delim_value_compute,
+        /* NEW bytes are only final after value_compute derives them from
+           OLD; without this the P wave's placeholder write wins and the
+           derived value is silently dropped. */
+        .value_rewrites_payload = 1,
     };
     if (w->nidx > 0) {
         opts.prepare_window   = v2_bulk_upd_noop_prepare;
@@ -4366,6 +4393,10 @@ static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
         .require_existing     = 1,
         .has_indexed_fields   = w->nidx > 0,
         .value_compute        = v2_bulk_upd_json_value_compute,
+        /* NEW bytes are only final after value_compute derives them from
+           OLD; without this the P wave's placeholder write wins and the
+           derived value is silently dropped. */
+        .value_rewrites_payload = 1,
     };
     if (w->nidx > 0) {
         opts.prepare_window   = v2_bulk_upd_noop_prepare;
@@ -5420,8 +5451,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     LOG_INFO(LOG_SUB_QUERY, "BULK-DELETE %s matched=%d deleted=%d skipped=%d (v2)",
              object, matched, deleted, skipped);
     if (any_durability_degraded)
-        OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d,\"durability_degraded\":true}\n",
-            matched, deleted, skipped);
+        OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
     else
         OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d}\n",
             matched, deleted, skipped);
@@ -5429,7 +5459,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     if (cas_crit) free_criteria(cas_crit, cas_ncrit);
     for (int i = 0; i < matched; i++) free(ctx.keys[i]);
     free(ctx.keys); free_criteria_tree(tree);
-    return 0;
+    return any_durability_degraded ? 1 : 0;
 }
 
 /* ========== VACUUM ========== */

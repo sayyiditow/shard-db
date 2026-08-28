@@ -34,12 +34,14 @@ jobs:
     timeout-minutes: 35
     env:
       BUILD_MODE: asan
-      # halt_on_error=0 so we collect all findings instead of stopping at
-      # the first one; abort_on_error=0 lets the daemon survive (else any
-      # finding aborts the process and the test wrapper reports failure
-      # for the wrong reason).
-      ASAN_OPTIONS: "halt_on_error=0:detect_leaks=1:abort_on_error=0:print_stacktrace=1:log_exe_name=1"
-      UBSAN_OPTIONS: "halt_on_error=0:print_stacktrace=1"
+      # No halt_on_error anywhere: findings must FAIL the run instead of
+      # printing and continuing (a collect-all gate masks leaks/runtime
+      # errors behind tolerated child exit codes — 2026-08-27 lesson).
+      # abort_on_error=0 keeps failures as clean nonzero exits rather
+      # than SIGABRT. UBSan halts on its first runtime error for the
+      # same reason; its default recover mode would only print.
+      ASAN_OPTIONS: "detect_leaks=1:abort_on_error=0:print_stacktrace=1:log_exe_name=1"
+      UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
       # test-runner-parallel's own nested run-all spawns a --jobs 4
       # sub-run internally, unrelated to the --jobs 2 outer setting below.
       # This runner is too weak for that nested width; narrow it to 2.
@@ -57,11 +59,10 @@ jobs:
         # default parallelism caused contention-driven request timeouts.
         run: ./build/bin/shard-db-test run-all --exclude "$SHARD_TEST_EXCLUDE" --jobs 2
 
-      # If ASan/UBSan finds anything, it prints to stderr; each test case's
-      # daemon-startup capture catches it. Grep the daemon logs once
-      # everything's done as a defensive backstop — if a sanitizer error
-      # fired but the test still passed (e.g. via halt_on_error=0), we
-      # still want to fail the workflow. Tests run in /tmp so check there.
+      # Defensive backstop: daemon findings fail their case via nonzero
+      # exits now, but grep the daemon logs once everything's done anyway
+      # so a report that somehow didn't fail a case still fails the
+      # workflow. Tests run in /tmp so check there.
       - name: Fail if any sanitizer findings escaped
         run: |
           if grep -Erq "AddressSanitizer|UndefinedBehaviorSanitizer|runtime error|SUMMARY: " /tmp/shard-db_*/logs/ 2>/dev/null; then

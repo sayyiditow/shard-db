@@ -97,7 +97,8 @@ static int test_variable_length_run(void) {
         snprintf(key, sizeof(key), "key_%03d", i);
         int vlen = 20 + (i * 7) % 120;
         for (int j = 0; j < vlen; j++) val[j] = (char)('A' + ((i + j) % 26));
-        if (slotcask_insert(&db, -1, key, strlen(key), val, vlen) == 0) inserted++;
+        if (slotcask_insert_with_hooks(&db, -1, key, strlen(key), val, vlen,
+                                        NULL, NULL) == 0) inserted++;
     }
     ASSERT_EQ_INT(inserted, 10, "10 inserts succeed");
 
@@ -155,7 +156,8 @@ static int test_variable_length_run(void) {
         snprintf(key, sizeof(key), "vkey_%03d", i);
         int vlen = 30 + (i * 13) % 90;
         for (int j = 0; j < vlen; j++) val[j] = (char)('a' + ((i * 3 + j) % 26));
-        if (slotcask_insert(&db, -1, key, strlen(key), val, vlen) == 0) inserted++;
+        if (slotcask_insert_with_hooks(&db, -1, key, strlen(key), val, vlen,
+                                        NULL, NULL) == 0) inserted++;
     }
     ASSERT_EQ_INT(inserted, 5, "5 varlen inserts succeed");
 
@@ -176,7 +178,11 @@ static int test_variable_length_run(void) {
     /* ---------------------------------------------------------------
      * Phase 5: update an existing key and verify VARIABLE behavior.
      * ------------------------------------------------------------- */
-    rc = slotcask_update(&db, -1, "key_003", 7, "UPDATED_VARLEN", 14);
+    SlotcaskUpsertOpts update_only;
+    memset(&update_only, 0, sizeof(update_only));
+    update_only.require_existing = 1;
+    rc = slotcask_upsert_with_hooks(&db, -1, "key_003", 7, "UPDATED_VARLEN",
+                                     14, &update_only, NULL);
     ASSERT_EQ_INT(rc, 0, "update existing key in VARIABLE mode succeeds");
     void *v = NULL; size_t vl = 0;
     rc = slotcask_get(&db, "key_003", 7, &v, &vl);
@@ -188,7 +194,7 @@ static int test_variable_length_run(void) {
     /* ---------------------------------------------------------------
      * Phase 6: delete a varlen-inserted key; verify pool reuse.
      * ------------------------------------------------------------- */
-    rc = slotcask_delete(&db, "vkey_101", 8);
+    rc = slotcask_delete_with_hooks(&db, "vkey_101", 8, NULL, NULL);
     ASSERT_EQ_INT(rc, 0, "delete varlen-inserted key succeeds");
 
     v = NULL; vl = 0;
@@ -197,7 +203,8 @@ static int test_variable_length_run(void) {
     if (v) free(v);
 
     /* Insert new key — should reuse the freed slot. */
-    rc = slotcask_insert(&db, -1, "new_reuse", 9, "REUSED", 6);
+    rc = slotcask_insert_with_hooks(&db, -1, "new_reuse", 9, "REUSED", 6,
+                                     NULL, NULL);
     ASSERT_EQ_INT(rc, 0, "insert after delete in varlen mode succeeds (pool reuse)");
     v = NULL; vl = 0;
     rc = slotcask_get(&db, "new_reuse", 9, &v, &vl);

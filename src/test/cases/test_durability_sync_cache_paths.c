@@ -118,8 +118,6 @@ static int test_durability_cache_paths_run(void) {
                       "populate tracked keyfile cache slot");
     }
 
-    DurabilitySyncStats stats = {0};
-    durability_test_sync_one_pass(g_db, 1000, &stats);
     int oldest_slot = find_kf_slot(paths[0]);
     ASSERT_TRUE(oldest_slot >= 0, "oldest keyfile entry is cached");
     if (oldest_slot < 0) {
@@ -194,8 +192,6 @@ static int test_durability_cache_paths_run(void) {
                   "writer tries each distinct dirty victim before failing");
 
     durability_test_msync_reset();
-    memset(&stats, 0, sizeof(stats));
-    durability_test_sync_one_pass(g_db, 1000, &stats);
 
     int held_slots[64];
     int held_count = 0;

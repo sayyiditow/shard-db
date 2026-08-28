@@ -312,7 +312,8 @@ static int test_bulk_cas_run(void) {
     tc_request(tc, "{\"mode\":\"size\",\"dir\":\"default\",\"object\":\"castest\"}", &resp);
     {
         const char *p = resp; while (p && (*p == ' ' || *p == '\n')) p++;
-        char after[64]; snprintf(after, sizeof(after), "%lld", (long long)atoll(p));
+        char after[64]; snprintf(after, sizeof(after), "%lld",
+                             p ? (long long)atoll(p) : 0LL);
         ASSERT_TRUE(strcmp(size_before, after) == 0, "size unchanged after dry runs");
     }
     free(resp); resp = NULL;

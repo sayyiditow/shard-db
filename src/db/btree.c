@@ -816,7 +816,6 @@ retry_bt_acquire:
         bt_cache[slot].last_access = __atomic_add_fetch(&bt_cache_clock, 1, __ATOMIC_RELAXED);
         pthread_rwlock_t *lock = &bt_cache[slot].rwlock;
         pthread_mutex_unlock(&bt_cache_lock);
-
 #ifdef TEST_BUILD
         if (writer) {
             bt_test_writer_pending_begin();
@@ -831,7 +830,6 @@ retry_bt_acquire:
         if (writer) pthread_rwlock_wrlock(lock);
         else        pthread_rwlock_rdlock(lock);
 #endif
-
         BtCacheEntry *e = &bt_cache[slot];
         if (e->used == BT_CACHE_LIVE && strcmp(e->path, path) == 0) {
             /* Confirmed cache hit. Two things going on:
@@ -2193,7 +2191,6 @@ void btree_search(const char *path, const char *value, size_t vlen,
                   bt_result_cb cb, void *ctx) {
     BtFile bt;
     if (bt_acquire(&bt, path, 0) != 0) return;
-
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
     /* Traverse to leaf */
@@ -2233,7 +2230,6 @@ void btree_range_ex(const char *path,
                     bt_result_cb cb, void *ctx) {
     BtFile bt;
     if (bt_acquire(&bt, path, 0) != 0) return;
-
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
     /* Traverse to leaf for min_val */
@@ -2683,8 +2679,12 @@ BtRangeIter *btree_range_iter_open(const char *path,
     it->desc = desc;
     if (min_len > BT_MAX_VAL_LEN) min_len = BT_MAX_VAL_LEN;
     if (max_len > BT_MAX_VAL_LEN) max_len = BT_MAX_VAL_LEN;
-    memcpy(it->min_val, min_val, min_len); it->min_len = min_len;
-    memcpy(it->max_val, max_val, max_len); it->max_len = max_len;
+    if (min_len > 0)           /* open bound: callers may pass NULL,0 */
+        memcpy(it->min_val, min_val, min_len);
+    it->min_len = min_len;
+    if (max_len > 0)
+        memcpy(it->max_val, max_val, max_len);
+    it->max_len = max_len;
     it->min_exclusive = min_exclusive;
     it->max_exclusive = max_exclusive;
 

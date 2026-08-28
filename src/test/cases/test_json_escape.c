@@ -143,7 +143,7 @@ static int test_json_escape_run(void) {
        mid-body and the outer record's closing brace was lost. */
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"big\",\"object\":\"posts\",\"key\":\"p1\"}", &resp);
     {
-        size_t rl = strlen(resp);
+        size_t rl = resp ? strlen(resp) : 0;   /* NULL resp = request failed */
         while (rl > 0 && (resp[rl - 1] == '\n' || resp[rl - 1] == ' ')) rl--;
         ASSERT_TRUE(rl > 0 && resp[rl - 1] == '}', "large body: response closes with }");
     }
@@ -164,7 +164,7 @@ static int test_json_escape_run(void) {
         "{\"mode\":\"find\",\"dir\":\"big\",\"object\":\"posts\","
         "\"criteria\":[],\"limit\":10,\"format\":\"dict\"}", &resp);
     {
-        size_t rl = strlen(resp);
+        size_t rl = resp ? strlen(resp) : 0;   /* NULL resp = request failed */
         while (rl > 0 && (resp[rl - 1] == '\n' || resp[rl - 1] == ' ')) rl--;
         ASSERT_TRUE(rl > 0 && resp[rl - 1] == '}', "find dict: response closes with }");
     }
@@ -248,7 +248,7 @@ static int test_json_escape_agg_file_run(void) {
         "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
         "\"group_by\":[\"category\"],\"order_by\":\"n\",\"limit\":10,"
         "\"format\":\"csv\"}", &resp);
-    ASSERT_TRUE(resp[0] != '[' && resp[0] != '{',
+    ASSERT_TRUE(resp && resp[0] != '[' && resp[0] != '{',
                 "agg top-N + format=csv: response is not JSON");
     ASSERT_CONTAINS(resp, "category,n", "agg top-N + format=csv: CSV header row present");
     ASSERT_CONTAINS(resp, "\"Widgets, Inc.\",",

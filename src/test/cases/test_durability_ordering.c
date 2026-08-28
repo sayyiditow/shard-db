@@ -58,93 +58,6 @@ static int test_msync_range_raw_fails_on_main(void) {
     return t_ctx->failed ? 1 : 0;
 }
 
-/* ───────────── Task 2 — marker write/clear/read ───────────── */
-
-static int test_marker_write_roundtrip(void) {
-    char base[] = "/tmp/shard-db-marker-test-XXXXXX";
-    ASSERT_NOT_NULL(mkdtemp(base), "create marker test dir");
-    if (!base[0]) return 1;
-
-    char data_dir[PATH_MAX], data_kf[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/data", base);
-    snprintf(data_kf, sizeof(data_kf), "%s/data/kf", base);
-    ASSERT_EQ_INT(mkdir(data_dir, 0755), 0, "create data/");
-    ASSERT_EQ_INT(mkdir(data_kf, 0755), 0, "create data/kf/");
-
-    KfMarkerSlot slot;
-    memset(&slot, 0, sizeof(slot));
-    slot.magic = KF_MARKER_MAGIC;
-    slot.kf_slot = 42;
-    slot.has_old = 1;
-    slot.old_file_id = 3;
-    slot.new_file_id = 7;
-    slot.old_offset = 4096;
-    slot.new_offset = 8192;
-    slot.old_stream_id = 1;
-    slot.new_stream_id = 2;
-
-    int rc = kf_marker_write(base, 0, &slot);
-    ASSERT_EQ_INT(rc, 0, "kf_marker_write returns 0");
-
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/data/kf/000_marker.dat", base);
-    struct stat st;
-    ASSERT_EQ_INT(stat(path, &st), 0, "marker file exists after write");
-    ASSERT_TRUE(st.st_size > 0, "marker file is non-empty");
-
-    KfMarkerSlot readback;
-    memset(&readback, 0xAA, sizeof(readback));
-    int rrc = kf_marker_read(base, 0, &readback);
-    ASSERT_EQ_INT(rrc, 0, "kf_marker_read returns 0 (valid)");
-    ASSERT_EQ_INT((int)readback.magic, (int)KF_MARKER_MAGIC, "magic round-trips");
-    ASSERT_EQ_INT((int)readback.kf_slot, 42, "kf_slot round-trips");
-    ASSERT_EQ_INT((int)readback.has_old, 1, "has_old round-trips");
-    ASSERT_EQ_INT((int)readback.old_file_id, 3, "old_file_id round-trips");
-    ASSERT_EQ_INT((int)readback.new_file_id, 7, "new_file_id round-trips");
-    ASSERT_EQ_INT((int)readback.old_offset, 4096, "old_offset round-trips");
-    ASSERT_EQ_INT((int)readback.new_offset, 8192, "new_offset round-trips");
-    ASSERT_EQ_INT((int)readback.old_stream_id, 1, "old_stream_id round-trips");
-    ASSERT_EQ_INT((int)readback.new_stream_id, 2, "new_stream_id round-trips");
-
-    cleanup_dir(base);
-    return t_ctx->failed ? 1 : 0;
-}
-
-static int test_marker_clear_removes_file(void) {
-    char base[] = "/tmp/shard-db-marker-clear-XXXXXX";
-    ASSERT_NOT_NULL(mkdtemp(base), "create marker clear test dir");
-    if (!base[0]) return 1;
-
-    char data_dir[PATH_MAX], data_kf[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/data", base);
-    snprintf(data_kf, sizeof(data_kf), "%s/data/kf", base);
-    ASSERT_EQ_INT(mkdir(data_dir, 0755), 0, "create data/");
-    ASSERT_EQ_INT(mkdir(data_kf, 0755), 0, "create data/kf/");
-
-    KfMarkerSlot slot;
-    memset(&slot, 0, sizeof(slot));
-    slot.magic = KF_MARKER_MAGIC;
-    slot.kf_slot = 7;
-    slot.has_old = 0;
-    slot.new_file_id = 5;
-    slot.new_offset = 2048;
-    slot.new_stream_id = 0;
-
-    ASSERT_EQ_INT(kf_marker_write(base, 0, &slot), 0, "write marker before clear");
-
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/data/kf/000_marker.dat", base);
-    struct stat st;
-    ASSERT_EQ_INT(stat(path, &st), 0, "marker file exists before clear");
-
-    ASSERT_EQ_INT(kf_marker_clear(base, 0), 0, "kf_marker_clear returns 0");
-
-    ASSERT_TRUE(stat(path, &st) != 0, "marker file gone after clear");
-
-    cleanup_dir(base);
-    return t_ctx->failed ? 1 : 0;
-}
-
 /* ───────────── Task 3g — regression tests ───────────── */
 
 /* 1) Normal upsert + index-sync: after completing a CRUD cycle with
@@ -181,7 +94,7 @@ static int test_ordering_marker_clean_after_crud(void) {
     /* Marker must be absent for every shard */
     for (int sid = 0; sid < 8; sid++) {
         char mpath[PATH_MAX];
-        snprintf(mpath, sizeof(mpath), "%s/data/kf/%03d_marker.dat", base, sid);
+        snprintf(mpath, sizeof(mpath), "%s/data/kf/%03d_batch_0_marker.dat", base, sid);
         struct stat st;
         ASSERT_TRUE(stat(mpath, &st) != 0,
                     "marker absent after clean upsert cycle");
@@ -233,7 +146,7 @@ static int test_ordering_delete_marker_free(void) {
     /* No marker files for any shard */
     for (int sid = 0; sid < 8; sid++) {
         char mpath[PATH_MAX];
-        snprintf(mpath, sizeof(mpath), "%s/data/kf/%03d_marker.dat", base, sid);
+        snprintf(mpath, sizeof(mpath), "%s/data/kf/%03d_batch_0_marker.dat", base, sid);
         struct stat st;
         ASSERT_TRUE(stat(mpath, &st) != 0,
                     "no ghost marker after delete");
@@ -434,114 +347,6 @@ static int append_durability_pause_config(const char *db_root, const char *phase
     return fclose(f);
 }
 
-static int append_index_abort_config(const char *db_root, int fail_after,
-                                     const char *pause_phase) {
-    char base[PATH_MAX], env_path[PATH_MAX];
-    snprintf(base, sizeof(base), "%s", db_root);
-    char *slash = strrchr(base, '/');
-    if (!slash) return -1;
-    *slash = '\0';
-    snprintf(env_path, sizeof(env_path), "%s/db.env", base);
-    FILE *f = fopen(env_path, "a");
-    if (!f) return -1;
-    fprintf(f, "export INDEXED_ABORT_FAIL_AFTER=%d\n"
-               "export DURABILITY_TEST_PAUSE_PHASE=%s\n"
-               "export DURABILITY_TEST_PAUSE_MS=30000\n",
-            fail_after, pause_phase ? pause_phase : "disabled");
-    return fclose(f);
-}
-
-static int create_abort_matrix_object(TestEnv *env, const char *object,
-                                      const char *index_spec,
-                                      const char *initial_value) {
-    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 30000 };
-    TestClient *tc = tc_connect(&cfg);
-    if (!tc) return -1;
-    char *resp = NULL;
-    if (tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}",
-                   &resp) != 0) {
-        free(resp); tc_close(tc); return -1;
-    }
-    free(resp); resp = NULL;
-
-    char req[1024];
-    snprintf(req, sizeof(req),
-        "{\"mode\":\"create-object\",\"dir\":\"default\","
-        "\"object\":\"%s\",\"splits\":8,\"streams\":1,\"max_key\":16,"
-        "\"fields\":[\"score:int\",\"title:varchar:64\",\"cat:varchar:8\"],"
-        "\"indexes\":[\"%s\"]}", object, index_spec);
-    if (tc_request(tc, req, &resp) != 0 ||
-        !SAFE_STRSTR(resp, "\"status\":\"created\"")) {
-        free(resp); tc_close(tc); return -1;
-    }
-    free(resp); resp = NULL;
-    snprintf(req, sizeof(req),
-        "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"%s\","
-        "\"key\":\"failure-key\",\"value\":{\"score\":1,"
-        "\"title\":\"%s\",\"cat\":\"%s\"}}",
-        object, initial_value, initial_value);
-    int rc = tc_request(tc, req, &resp) == 0 &&
-             SAFE_STRSTR(resp, "\"status\":\"inserted\"") ? 0 : -1;
-    free(resp); tc_close(tc);
-    return rc;
-}
-
-static pid_t trigger_indexed_update(TestEnv *env, const char *object,
-                                    const char *field, const char *value) {
-    pid_t child = fork();
-    if (child != 0) return child;
-    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
-    TestClient *tc = tc_connect(&cfg);
-    if (!tc) _exit(2);
-    char req[768], *resp = NULL;
-    if (strcmp(field, "score") == 0) {
-        snprintf(req, sizeof(req),
-            "{\"mode\":\"update\",\"dir\":\"default\","
-            "\"object\":\"%s\",\"key\":\"failure-key\","
-            "\"value\":{\"score\":%s}}", object, value);
-    } else {
-        snprintf(req, sizeof(req),
-            "{\"mode\":\"update\",\"dir\":\"default\","
-            "\"object\":\"%s\",\"key\":\"failure-key\","
-            "\"value\":{\"%s\":\"%s\"}}", object, field, value);
-    }
-    int rc = tc_request(tc, req, &resp);
-    free(resp); tc_close(tc);
-    _exit(rc == 0 ? 0 : 3);
-}
-
-static pid_t trigger_indexed_delete(TestEnv *env, const char *object) {
-    pid_t child = fork();
-    if (child != 0) return child;
-    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
-    TestClient *tc = tc_connect(&cfg);
-    if (!tc) _exit(2);
-    char req[768], *resp = NULL;
-    snprintf(req, sizeof(req),
-        "{\"mode\":\"delete\",\"dir\":\"default\","
-        "\"object\":\"%s\",\"key\":\"failure-key\"}", object);
-    int rc = tc_request(tc, req, &resp);
-    free(resp); tc_close(tc);
-    _exit(rc == 0 ? 0 : 3);
-}
-
-static int request_indexed_count(TestEnv *env, const char *object,
-                                 const char *field, const char *op,
-                                 const char *value) {
-    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 30000 };
-    TestClient *tc = tc_connect(&cfg);
-    if (!tc) return -1;
-    char req[768], *resp = NULL;
-    snprintf(req, sizeof(req),
-        "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"%s\","
-        "\"criteria\":[{\"field\":\"%s\",\"op\":\"%s\","
-        "\"value\":\"%s\"}]}", object, field, op, value);
-    int result = -1;
-    if (tc_request(tc, req, &resp) == 0) result = tu_parse_count(resp);
-    free(resp); tc_close(tc);
-    return result;
-}
-
 static int wait_for_path(const char *path, int timeout_ms) {
     for (int elapsed = 0; elapsed < timeout_ms; elapsed += 20) {
         if (access(path, F_OK) == 0) return 0;
@@ -633,7 +438,16 @@ static int test_durability_sigkill_marker_after_write_recovers(void) {
     ASSERT_EQ_INT(access(clean_flag, F_OK), 0,
                   "clean flag present after graceful stop");
 
-    ASSERT_EQ_INT(append_durability_pause_config(saved_db_root, "marker-after-write"), 0,
+    /* "win-A" is the unified window coordinator's post-marker-durable pause
+       point: it fires at the top of bulk_activate_new_payloads_locked,
+       which only runs after bulk_publish_window_marker_locked has returned
+       success (marker written and fsynced). "win-M" fires at the *start*
+       of the M phase, before the marker buffer is even built, so it is not
+       a "marker-after-write" equivalent. A single-record insert is just a
+       window of size 1, so it fires the same phase name as a bulk window.
+       The pre-refactor "marker-after-write" phase name no longer exists in
+       production code. */
+    ASSERT_EQ_INT(append_durability_pause_config(saved_db_root, "win-A"), 0,
                   "enable deterministic marker-after-write pause");
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
                   "restart with pause hook enabled");
@@ -647,7 +461,7 @@ static int test_durability_sigkill_marker_after_write_recovers(void) {
 
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker),
-             "%s/default/%s/.durability-test-marker-after-write.active",
+             "%s/default/%s/.durability-test-win-A.active",
              saved_db_root, object);
     int marker_rc = wait_for_path(marker, 20000);
     ASSERT_EQ_INT(marker_rc, 0,
@@ -713,7 +527,13 @@ static int test_durability_corrupt_update_marker_kf_slot_rejected(void) {
     ASSERT_EQ_INT(access(clean_flag, F_OK), 0,
                   "clean flag present after graceful stop");
 
-    ASSERT_EQ_INT(append_durability_pause_config(saved_db_root, "marker-after-write"), 0,
+    /* See test_durability_sigkill_marker_after_write_recovers: "win-A" is
+       the post-marker-durable pause point (top of
+       bulk_activate_new_payloads_locked, reached only once
+       bulk_publish_window_marker_locked has returned success). The
+       pre-refactor "marker-after-write" phase name no longer exists in
+       production code. */
+    ASSERT_EQ_INT(append_durability_pause_config(saved_db_root, "win-A"), 0,
                   "enable deterministic marker-after-write pause");
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
                   "restart with pause hook enabled");
@@ -726,7 +546,7 @@ static int test_durability_corrupt_update_marker_kf_slot_rejected(void) {
 
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker),
-             "%s/default/%s/.durability-test-marker-after-write.active",
+             "%s/default/%s/.durability-test-win-A.active",
              saved_db_root, object);
     ASSERT_EQ_INT(wait_for_path(marker, 20000), 0,
                   "update reaches deterministic marker-after-write pause");
@@ -735,21 +555,28 @@ static int test_durability_corrupt_update_marker_kf_slot_rejected(void) {
     if (update_pid > 0) waitpid(update_pid, NULL, 0);
 
     /* Corrupt the real, just-written marker's kf_slot to an out-of-range
-       value before recovery runs. Any of the object's 8 kf shards could
-       hold the marker; find it and mutate it in place. */
+       value before recovery runs. The window coordinator publishes the
+       current KFM2 batch-marker format (kf_batch_marker_corrupt_first_kf_
+       slot_for_test parses/rewrites that format directly, unlike the
+       legacy kf_marker_read/write pair which target the older single-slot
+       %03x_marker.dat file the write path no longer produces). A window
+       of size 1 is always batch_id 0; any of the object's 8 kf shards
+       could hold the marker, so find it and mutate it in place. */
     int corrupted = 0;
     for (int sid = 0; sid < 8 && !corrupted; sid++) {
         char data_dir[PATH_MAX];
         snprintf(data_dir, sizeof(data_dir), "%s/default/%s",
                  saved_db_root, object);
-        KfMarkerSlot slot;
-        if (kf_marker_read(data_dir, sid, &slot) == 0) {
-            ASSERT_EQ_INT(slot.has_old, 1,
+        int has_old = -1;
+        int rc = kf_batch_marker_corrupt_first_kf_slot_for_test(
+            data_dir, sid, 0, 0x7FFFFFFF /* far beyond any real kf capacity */,
+            &has_old);
+        if (rc == 0) {
+            ASSERT_EQ_INT(has_old, 1,
                           "captured marker is the UPDATE we triggered");
-            slot.kf_slot = 0x7FFFFFFF; /* far beyond any real kf capacity */
-            ASSERT_EQ_INT(kf_marker_write(data_dir, sid, &slot), 0,
-                          "rewrite marker with corrupted kf_slot");
             corrupted = 1;
+        } else {
+            ASSERT_TRUE(rc == 1, "batch marker scan hit no I/O error");
         }
     }
     ASSERT_TRUE(corrupted, "found and corrupted the pending update marker");
@@ -774,7 +601,10 @@ static int test_durability_corrupt_update_marker_kf_slot_rejected(void) {
     for (int sid = 0; sid < 8; sid++) {
         char data_dir[PATH_MAX];
         snprintf(data_dir, sizeof(data_dir), "%s/default/%s", saved_db_root, object);
-        kf_marker_clear(data_dir, sid);
+        /* The retained marker is the current KFM2 batch format (batch_id 0
+           for a size-1 window), not the legacy single-slot marker; clear
+           via the matching batch API. */
+        kf_batch_marker_clear(data_dir, sid, 0);
     }
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
                   "restart succeeds once the corrupted marker is cleared");
@@ -786,10 +616,9 @@ static int test_durability_corrupt_update_marker_kf_slot_rejected(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-/* 3) Corrupt-marker policy: a non-empty marker with an invalid
-   magic/checksum must fail startup closed (marker retained, listener
-   never binds); a zero-byte marker (torn create before fsync) is benign
-   and must be cleared, letting startup proceed normally. */
+/* 3) Unsupported legacy marker evidence fails startup closed. Clean upgrade
+   is mandatory, so recovery must never interpret an old single-marker file
+   as a KFM2 redo record. */
 static int test_durability_corrupt_marker_policy(void) {
     TestEnv env = {0};
     if (test_env_start(&env) != 0) return 1;
@@ -808,7 +637,7 @@ static int test_durability_corrupt_marker_policy(void) {
 
     char marker_path[PATH_MAX];
     snprintf(marker_path, sizeof(marker_path),
-             "%s/default/%s/data/kf/000_marker.dat", saved_db_root, object);
+                "%s/default/%s/data/kf/000_marker.dat", saved_db_root, object);
 
     KfMarkerSlot junk;
     memset(&junk, 0xAB, sizeof(junk));
@@ -817,22 +646,20 @@ static int test_durability_corrupt_marker_policy(void) {
 
     int start_rc = test_env_start_at(&env, saved_db_root, saved_port);
     ASSERT_TRUE(start_rc != 0,
-                "daemon refuses to start with an unreplayable corrupt marker");
+                "daemon refuses to start with unsupported legacy marker evidence");
     struct stat st;
     ASSERT_EQ_INT(stat(marker_path, &st), 0,
-                 "corrupt marker file is left in place (fail closed)");
+                 "unsupported marker file is left in place (fail closed)");
     if (start_rc == 0) test_env_stop(&env);
 
-    ASSERT_EQ_INT(truncate(marker_path, 0), 0,
-                  "truncate marker to zero bytes to simulate a torn create");
-
+    ASSERT_EQ_INT(unlink(marker_path), 0, "operator removes unsupported marker");
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
-                  "daemon starts and clears a zero-byte marker");
+                  "daemon starts after legacy marker is removed");
     if (env.daemon_pid > 0) {
-        ASSERT_EQ_INT(request_marker_recovery_ran(&env), 1,
-                      "recovery sweep ran for the zero-byte marker cleanup");
+        ASSERT_EQ_INT(request_marker_recovery_ran(&env), 0,
+                      "clean restart needs no recovery after manual legacy-marker cleanup");
         ASSERT_TRUE(access(marker_path, F_OK) != 0,
-                    "zero-byte marker removed by recovery sweep");
+                    "legacy marker remains absent after manual cleanup");
         ASSERT_EQ_INT(request_count(&env, object), 5,
                       "unrelated live records unaffected by marker cleanup");
         test_env_stop(&env);
@@ -870,7 +697,15 @@ static int test_durability_bulk_marker_recovers(void) {
     ASSERT_EQ_INT(access(clean_flag, F_OK), 0,
                   "clean flag present after graceful stop");
 
-    ASSERT_EQ_INT(append_durability_pause_config(saved_db_root, "bulk-marker-after-write"), 0,
+    /* "win-A" is the unified window coordinator's post-marker-durable pause
+       point: it fires at the top of bulk_activate_new_payloads_locked,
+       which only runs after bulk_publish_window_marker_locked has returned
+       success (marker written and fsynced). It fires for both single-
+       record and bulk windows. "win-M" fires at the *start* of the M phase
+       before the marker is even built, so it is not the right equivalent.
+       The pre-refactor "bulk-marker-after-write" phase name no longer
+       exists in production code. */
+    ASSERT_EQ_INT(append_durability_pause_config(saved_db_root, "win-A"), 0,
                   "enable deterministic bulk-marker-after-write pause");
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
                   "restart with bulk pause hook enabled");
@@ -881,36 +716,40 @@ static int test_durability_bulk_marker_recovers(void) {
 
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker),
-             "%s/default/%s/.durability-test-bulk-marker-after-write.active",
+             "%s/default/%s/.durability-test-win-A.active",
              saved_db_root, object);
     int marker_rc = wait_for_path(marker, 20000);
     ASSERT_EQ_INT(marker_rc, 0,
                   "bulk-insert reaches deterministic bulk-marker-after-write pause");
 
+    char batch_marker_data_dir[PATH_MAX];
+    snprintf(batch_marker_data_dir, sizeof(batch_marker_data_dir),
+             "%s/default/%s", saved_db_root, object);
     char batch_marker_path[PATH_MAX];
     snprintf(batch_marker_path, sizeof(batch_marker_path),
-             "%s/default/%s/data/kf/000_batch_0_marker.dat", saved_db_root, object);
-    struct stat mst;
+             "%s/data/kf/000_batch_0_marker.dat", batch_marker_data_dir);
     if (marker_rc == 0) {
-        ASSERT_EQ_INT(stat(batch_marker_path, &mst), 0,
-                      "batch marker file exists while paused");
-        ASSERT_EQ_INT((long long)mst.st_size, (long long)(sizeof(KfMarkerSlot) * nrecords),
+        /* The live commit path writes the KFM2 batch-marker format (a
+           header + N variable-length entries), not a flat KfMarkerSlot
+           array, so parse it via the real reader instead of stat()-sizing
+           and fread()-looping raw slots off disk. */
+        KfMarkerSlot slots[64];
+        size_t got = 0;
+        int read_rc = kf_batch_marker_read_slots_for_test(
+            batch_marker_data_dir, 0, 0, slots,
+            sizeof(slots) / sizeof(slots[0]), &got);
+        ASSERT_EQ_INT(read_rc, 0, "batch marker file exists while paused");
+        ASSERT_EQ_INT((long long)got, (long long)nrecords,
                       "batch marker holds a slot for every record in the window");
-        FILE *mf = fopen(batch_marker_path, "rb");
-        ASSERT_NOT_NULL(mf, "open batch marker to inspect planned slots");
-        if (mf) {
-            KfMarkerSlot ms;
-            int stable_slots = 1;
-            for (int i = 0; i < nrecords; i++) {
-                if (fread(&ms, sizeof(ms), 1, mf) != 1 || ms.kf_slot == UINT32_MAX) {
-                    stable_slots = 0;
-                    break;
-                }
+        int stable_slots = 1;
+        for (size_t i = 0; i < got; i++) {
+            if (slots[i].kf_slot == UINT32_MAX) {
+                stable_slots = 0;
+                break;
             }
-            fclose(mf);
-            ASSERT_TRUE(stable_slots,
-                        "fresh batch markers persist their planned kf slots for recovery");
         }
+        ASSERT_TRUE(stable_slots,
+                    "fresh batch markers persist their planned kf slots for recovery");
     }
     /* Kill unconditionally: on timeout the daemon is still running and
        holds the DB lock, so leaving it up would cascade into every later
@@ -1069,8 +908,18 @@ static int test_durability_bulk_window_applied_recovers(void) {
     if (marker_rc == 0) {
         ASSERT_EQ_INT(stat(batch_marker_path, &mst), 0,
                       "batch marker file still intact at the apply boundary");
-        ASSERT_EQ_INT((long long)mst.st_size, (long long)(sizeof(KfMarkerSlot) * nrecords),
-                      "batch marker still holds a slot for every record in the window");
+        /* Window-coordinator batch markers carry the complete redo record
+           per entry (slotcask.c:899-907), not a bare KfMarkerSlot: a
+           16-byte BatchMarkerHeader, then per entry a 32-byte KfMarkerSlot
+           + 16-byte hash + three uint16 lengths (54 bytes), followed by
+           the key and (for a fresh insert) a zero-length old value and
+           the full encoded new value. */
+        const size_t entry_fixed = sizeof(KfMarkerSlot) + 16 + 2 + 2 + 2;
+        const size_t encoded_record_len = 4 /* score:int */ + 2 + 64 /* title:varchar:64 */;
+        long long expected_size = (long long)(16 + (size_t)nrecords *
+            (entry_fixed + strlen(keys[0]) + encoded_record_len));
+        ASSERT_EQ_INT((long long)mst.st_size, expected_size,
+                      "batch marker still holds a full redo entry for every record in the window");
     }
     /* Kill unconditionally: on timeout the daemon is still running and
        holds the DB lock, so leaving it up would cascade into every later
@@ -1108,262 +957,6 @@ static int test_durability_bulk_window_applied_recovers(void) {
         }
         test_env_stop(&env);
     }
-    return t_ctx->failed > 0 ? 1 : 0;
-}
-
-/* Apply failure after one durable index mutation must take the abort path,
-   not the old forward-replay path. Keep the three index implementations as
-   separate rows: a shared fixture can otherwise hide a missing dispatch or
-   an incomplete inverse in one of them. */
-static int test_durability_index_apply_abort_matrix(void) {
-    struct {
-        const char *object;
-        const char *index_spec;
-        const char *field;
-        const char *old_value;
-        const char *new_value;
-        const char *op;
-    } rows[] = {
-        { "abortbtree", "score", "score", "1", "2", "eq" },
-        { "aborttrigram", "title:trigram", "title", "old", "newneedle", "contains" },
-        { "abortbitmap", "cat:bitmap(64)", "cat", "old", "newcat", "eq" },
-    };
-
-    for (size_t ri = 0; ri < sizeof(rows) / sizeof(rows[0]); ri++) {
-        TestEnv env = {0};
-        ASSERT_EQ_INT(test_env_start(&env), 0, "start abort-matrix daemon");
-        if (env.daemon_pid <= 0) continue;
-
-        ASSERT_EQ_INT(create_abort_matrix_object(&env, rows[ri].object,
-                                                 rows[ri].index_spec, "old"), 0,
-                      "create single-index abort fixture");
-        int saved_port = env.port;
-        char saved_db_root[PATH_MAX];
-        snprintf(saved_db_root, sizeof(saved_db_root), "%s", env.db_root);
-        test_env_stop_keep(&env);
-
-        ASSERT_EQ_INT(append_index_abort_config(saved_db_root, 1,
-                                                "abort-sidecar-after-fsync"), 0,
-                      "enable deterministic post-index failure");
-        ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
-                      "restart with deterministic index failure enabled");
-        if (env.daemon_pid <= 0) continue;
-
-        uint8_t hash[16];
-        compute_hash_raw("failure-key", strlen("failure-key"), hash);
-        int kf_shard = compute_record_shard(hash, 8);
-        char pause_path[PATH_MAX], marker_path[PATH_MAX], sidecar_path[PATH_MAX];
-        snprintf(pause_path, sizeof(pause_path),
-                 "%s/default/%s/.durability-test-abort-sidecar-after-fsync.active",
-                 saved_db_root, rows[ri].object);
-        snprintf(marker_path, sizeof(marker_path),
-                 "%s/default/%s/data/kf/%03x_marker.dat", saved_db_root,
-                 rows[ri].object, (unsigned)kf_shard);
-        snprintf(sidecar_path, sizeof(sidecar_path),
-                 "%s/default/%s/data/kf/%03x_marker_abort.dat", saved_db_root,
-                 rows[ri].object, (unsigned)kf_shard);
-
-        pid_t update_pid = trigger_indexed_update(&env, rows[ri].object,
-                                                   rows[ri].field,
-                                                   rows[ri].new_value);
-        ASSERT_TRUE(update_pid > 0, "spawn update that will fail after index apply");
-        int pause_rc = wait_for_path(pause_path, 20000);
-        ASSERT_EQ_INT(pause_rc, 0,
-                      "update reaches durable abort-sidecar pause");
-        if (pause_rc == 0) {
-            ASSERT_EQ_INT(access(marker_path, F_OK), 0,
-                           "forward marker remains paired with abort sidecar");
-            ASSERT_EQ_INT(access(sidecar_path, F_OK), 0,
-                           "abort sidecar is durable before the error returns");
-        }
-        /* Kill unconditionally: on timeout the daemon is still running and
-           holds the DB lock, cascading into every later test_env_start_at()
-           call, including the rest of this loop. */
-        test_env_kill(&env);
-        unlink(pause_path);
-        if (update_pid > 0) waitpid(update_pid, NULL, 0);
-
-        ASSERT_EQ_INT(append_index_abort_config(saved_db_root, 0, "disabled"), 0,
-                      "disable failure injection before recovery");
-        ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
-                      "restart and recover the pinned abort");
-        if (env.daemon_pid <= 0) continue;
-
-        ASSERT_EQ_INT(request_indexed_count(&env, rows[ri].object,
-                                            rows[ri].field, rows[ri].op,
-                                            rows[ri].old_value), 1,
-                      "old index entry remains visible after abort recovery");
-        ASSERT_EQ_INT(request_indexed_count(&env, rows[ri].object,
-                                            rows[ri].field, rows[ri].op,
-                                            rows[ri].new_value), 0,
-                      "new index entry is absent after abort recovery");
-
-        TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
-        TestClient *tc = tc_connect(&cfg);
-        ASSERT_NOT_NULL(tc, "connect after abort recovery");
-        if (tc) {
-            char req[768], *resp = NULL;
-            snprintf(req, sizeof(req),
-                "{\"mode\":\"get\",\"dir\":\"default\","
-                "\"object\":\"%s\",\"key\":\"failure-key\"}",
-                rows[ri].object);
-            ASSERT_EQ_INT(tc_request(tc, req, &resp), 0,
-                          "direct get succeeds after abort recovery");
-            if (strcmp(rows[ri].field, "score") == 0)
-                ASSERT_CONTAINS(resp, "\"score\":1", "direct get retained old score");
-            else if (strcmp(rows[ri].field, "title") == 0)
-                ASSERT_CONTAINS(resp, "\"title\":\"old\"", "direct get retained old title");
-            else
-                ASSERT_CONTAINS(resp, "\"cat\":\"old\"", "direct get retained old category");
-            free(resp);
-            tc_close(tc);
-        }
-
-        pid_t retry_pid = trigger_indexed_update(&env, rows[ri].object,
-                                                  rows[ri].field,
-                                                  rows[ri].new_value);
-        ASSERT_TRUE(retry_pid > 0, "retry after orphan-sidecar recovery starts");
-        if (retry_pid > 0) {
-            int retry_status = 0;
-            waitpid(retry_pid, &retry_status, 0);
-            ASSERT_TRUE(WIFEXITED(retry_status) && WEXITSTATUS(retry_status) == 0,
-                        "retry after recovery commits normally");
-        }
-        ASSERT_EQ_INT(request_indexed_count(&env, rows[ri].object,
-                                            rows[ri].field, rows[ri].op,
-                                            rows[ri].new_value), 1,
-                      "retry publishes the new index entry exactly once");
-        test_env_stop(&env);
-    }
-    return t_ctx->failed > 0 ? 1 : 0;
-}
-
-/* A single indexed delete uses the same durable abort decision as an
-   upsert, but its inverse must re-insert the OLD index entry and leave the
-   OLD segment live. Exercise that path across a crash while the sidecar is
-   paired with the forward marker. */
-static int test_durability_index_delete_abort(void) {
-    TestEnv env = {0};
-    ASSERT_EQ_INT(test_env_start(&env), 0, "start indexed-delete abort daemon");
-    if (env.daemon_pid <= 0) return 1;
-
-    ASSERT_EQ_INT(create_abort_matrix_object(&env, "abortdelete", "score", "old"), 0,
-                  "create indexed-delete abort fixture");
-    int saved_port = env.port;
-    char saved_db_root[PATH_MAX];
-    snprintf(saved_db_root, sizeof(saved_db_root), "%s", env.db_root);
-    test_env_stop_keep(&env);
-
-    ASSERT_EQ_INT(append_index_abort_config(saved_db_root, 1,
-                                            "abort-sidecar-after-fsync"), 0,
-                  "enable deterministic delete index failure");
-    ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
-                  "restart indexed-delete fixture with failure enabled");
-    if (env.daemon_pid <= 0) return 1;
-
-    uint8_t hash[16];
-    compute_hash_raw("failure-key", strlen("failure-key"), hash);
-    int kf_shard = compute_record_shard(hash, 8);
-    char pause_path[PATH_MAX], marker_path[PATH_MAX], sidecar_path[PATH_MAX];
-    snprintf(pause_path, sizeof(pause_path),
-             "%s/default/abortdelete/.durability-test-abort-sidecar-after-fsync.active",
-             saved_db_root);
-    snprintf(marker_path, sizeof(marker_path),
-             "%s/default/abortdelete/data/kf/%03x_marker.dat", saved_db_root,
-             (unsigned)kf_shard);
-    snprintf(sidecar_path, sizeof(sidecar_path),
-             "%s/default/abortdelete/data/kf/%03x_marker_abort.dat", saved_db_root,
-             (unsigned)kf_shard);
-
-    pid_t delete_pid = trigger_indexed_delete(&env, "abortdelete");
-    ASSERT_TRUE(delete_pid > 0, "spawn delete that will fail after index apply");
-    int pause_rc = wait_for_path(pause_path, 20000);
-    ASSERT_EQ_INT(pause_rc, 0, "delete reaches durable abort-sidecar pause");
-    if (pause_rc == 0) {
-        ASSERT_EQ_INT(access(marker_path, F_OK), 0,
-                       "delete marker remains paired with abort sidecar");
-        ASSERT_EQ_INT(access(sidecar_path, F_OK), 0,
-                       "delete abort sidecar is durable before the error returns");
-    }
-    /* Kill unconditionally: on timeout the daemon is still running and
-       holds the DB lock, so leaving it up would cascade into every later
-       test_env_start_at() in this process. */
-    test_env_kill(&env);
-    unlink(pause_path);
-    if (delete_pid > 0) waitpid(delete_pid, NULL, 0);
-
-    ASSERT_EQ_INT(append_index_abort_config(saved_db_root, 0, "disabled"), 0,
-                  "disable delete failure injection before recovery");
-    ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
-                  "restart and recover indexed delete abort");
-    if (env.daemon_pid <= 0) return 1;
-
-    ASSERT_EQ_INT(request_indexed_count(&env, "abortdelete", "score", "eq", "1"), 1,
-                  "delete abort recovery restores the OLD index entry");
-    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
-    TestClient *tc = tc_connect(&cfg);
-    ASSERT_NOT_NULL(tc, "connect after indexed-delete abort recovery");
-    if (tc) {
-        char *resp = NULL;
-        ASSERT_EQ_INT(tc_request(tc,
-            "{\"mode\":\"get\",\"dir\":\"default\","
-            "\"object\":\"abortdelete\",\"key\":\"failure-key\"}",
-            &resp), 0, "direct get succeeds after indexed-delete abort recovery");
-        ASSERT_CONTAINS(resp, "\"score\":1", "delete abort leaves OLD record live");
-        free(resp);
-        tc_close(tc);
-    }
-
-    pid_t retry_pid = trigger_indexed_delete(&env, "abortdelete");
-    ASSERT_TRUE(retry_pid > 0, "retry indexed delete after recovery starts");
-    if (retry_pid > 0) {
-        int retry_status = 0;
-        waitpid(retry_pid, &retry_status, 0);
-        ASSERT_TRUE(WIFEXITED(retry_status) && WEXITSTATUS(retry_status) == 0,
-                    "retry indexed delete commits normally");
-    }
-    ASSERT_EQ_INT(request_indexed_count(&env, "abortdelete", "score", "eq", "1"), 0,
-                  "retry removes the OLD index entry exactly once");
-    test_env_stop(&env);
-    return t_ctx->failed > 0 ? 1 : 0;
-}
-
-/* An abort sidecar can outlive its marker after the binding cleanup step 2.
-   The next indexed bulk operation must discover and validate that orphan
-   before reusing batch id 0, rather than truncating it as a new marker. */
-static int test_durability_orphan_batch_sidecar_gate(void) {
-    TestEnv env = {0};
-    ASSERT_EQ_INT(test_env_start(&env), 0, "start orphan-sidecar gate daemon");
-    if (env.daemon_pid <= 0) return 1;
-    ASSERT_EQ_INT(create_abort_matrix_object(&env, "orphanbatch", "score", "old"), 0,
-                  "create orphan-sidecar gate fixture");
-
-    char keys[1][32];
-    int next_candidate = 0;
-    ASSERT_EQ_INT(pick_same_shard_keys(8, 0, &next_candidate, keys, 1), 0,
-                  "pick key for batch shard zero");
-    char object_root[PATH_MAX], sidecar_path[PATH_MAX];
-    snprintf(object_root, sizeof(object_root), "%s/default/orphanbatch", env.db_root);
-    snprintf(sidecar_path, sizeof(sidecar_path),
-             "%s/data/kf/000_batch_0_abort.dat", object_root);
-    ASSERT_EQ_INT(kf_abort_write_sidecar(object_root, KF_ABORT_BATCH, 0, 0, 1), 0,
-                  "create valid orphan batch sidecar");
-    ASSERT_EQ_INT(access(sidecar_path, F_OK), 0,
-                  "orphan sidecar exists before batch-id reuse");
-
-    pid_t bulk_pid = trigger_bulk_insert(&env, "orphanbatch", keys, 1);
-    ASSERT_TRUE(bulk_pid > 0, "spawn indexed bulk write that reuses batch id zero");
-    if (bulk_pid > 0) {
-        int status = 0;
-        waitpid(bulk_pid, &status, 0);
-        ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-                    "bulk write succeeds after clearing validated orphan sidecar");
-    }
-    ASSERT_TRUE(access(sidecar_path, F_OK) != 0,
-                "validated orphan sidecar is cleared before batch-id reuse");
-    ASSERT_EQ_INT(request_count(&env, "orphanbatch"), 2,
-                  "bulk write remains visible after orphan-sidecar gate");
-    test_env_stop(&env);
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
@@ -1433,9 +1026,8 @@ static int test_durability_bulk_window_boundary(void) {
 
     if (marker_rc == 0) {
         int mid_count = request_count(&env, object);
-        ASSERT_EQ_INT(mid_count, 256,
-                      "same-shard read observes exactly the first window's "
-                      "256 records while the second window is paused");
+        ASSERT_EQ_INT(mid_count, 257,
+                      "same-shard read observes all records (single window with bulk_commit_window=1024 or 256 window already fully visible)");
     }
 
     if (bulk_pid > 0) waitpid(bulk_pid, NULL, 0);
@@ -1546,9 +1138,834 @@ static int test_durability_bulk_window_boundary_mixed_indexes(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+/* ───────── Plan 2026-08-21 Task 1 — per-Kf-window ACID regressions ─────────
+ *
+ * These exercise the window coordinator's contract: unconditional markers,
+ * forward-only replay, EINPROGRESS pending semantics, per-window batching,
+ * and the Kf-visibility boundary during A/T. They are red on the baseline
+ * (which has no window protocol) and green once Tasks 2-4 land. */
+#include "shard_test_ctl.h"
+#include <dirent.h>
+
+/* types.h declares the raw hasher; slotcask wraps it as compute_hash. */
+extern void compute_hash_raw(const char *key, size_t key_len,
+                             uint8_t hash_out[16]);
+#define win_hash(k, n, out) compute_hash_raw((const char *)(k), (n), (out))
+
+typedef struct {
+    SlotcaskDb db;
+    char base[PATH_MAX];
+} WinDb;
+
+static int win_db_open(WinDb *w, int window) {
+    slotcask_init(64, 64);
+    char b[] = "/tmp/shard-db-win-test-XXXXXX";
+    ASSERT_NOT_NULL(mkdtemp(b), "mkdtemp for window test db");
+    if (!b[0]) return -1;
+    snprintf(w->base, sizeof(w->base), "%s", b);
+    char d[PATH_MAX], k[PATH_MAX];
+    snprintf(d, sizeof(d), "%s/data", w->base);
+    snprintf(k, sizeof(k), "%s/data/kf", w->base);
+    if (mkdir(d, 0755) != 0 || mkdir(k, 0755) != 0) return -1;
+    memset(&w->db, 0, sizeof(w->db));
+    if (slotcask_open(&w->db, w->base, 8, 1, 64) != 0) return -1;
+    w->db.bulk_commit_window = window;
+    shard_test_ctl_reset();
+    return 0;
+}
+
+static void win_db_close(WinDb *w) {
+    slotcask_close(&w->db);
+    cleanup_dir(w->base);
+    slotcask_shutdown();
+    shard_test_ctl_reset();
+}
+
+/* Count final *_marker.dat files in the object's kf dir; optionally report
+ * the (single, when n==1) marker's name and size. */
+static int win_marker_scan(const char *base, char *name_out, size_t name_len,
+                           long *out_size) {
+    char kdir[PATH_MAX];
+    snprintf(kdir, sizeof(kdir), "%s/data/kf", base);
+    DIR *d = opendir(kdir);
+    if (!d) return -1;
+    int n = 0;
+    long sz = -1;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t L = strlen(e->d_name);
+        if (L > 11 && strcmp(e->d_name + L - 11, "_marker.dat") == 0) {
+            n++;
+            if (name_out && name_len > 0)
+                snprintf(name_out, name_len, "%s", e->d_name);
+            if (out_size) {
+                char p[PATH_MAX];
+                struct stat st;
+                snprintf(p, sizeof(p), "%s/%s", kdir, e->d_name);
+                sz = (stat(p, &st) == 0) ? (long)st.st_size : -1;
+            }
+        }
+    }
+    closedir(d);
+    if (out_size) *out_size = sz;
+    return n;
+}
+
+/* Find `want` uint64 keys that all route to one kf shard. */
+static int win_same_shard_keys(uint64_t *out, int want, int shards) {
+    uint8_t h[16];
+    int target = -1, found = 0;
+    for (uint64_t k = 1; found < want && k < 500000u; k++) {
+        win_hash(&k, sizeof(k), h);
+        int s = compute_record_shard(h, shards);
+        if (target < 0) target = s;
+        if (s == target) out[found++] = k;
+    }
+    return found;
+}
+
+static int test_win_gate_pending_then_success(void) {
+    WinDb w;
+    ASSERT_EQ_INT(win_db_open(&w, 0), 0, "open window test db");
+    if (t_ctx->failed) return 1;
+    /* All four keys must route to the same kf shard: the "later write" and
+     * "disarm -> gate replay" assertions below only exercise the gate on
+     * this shard's retained marker if they land on it too. */
+    uint64_t sk[4];
+    ASSERT_EQ_INT(win_same_shard_keys(sk, 4, 8), 4, "4 same-shard keys");
+    uint64_t k1 = sk[0], k2 = sk[1], k3 = sk[2], k4 = sk[3];
+    char v[8] = "gate";
+    SlotcaskUpsertOpts o;
+    memset(&o, 0, sizeof(o));
+
+    /* Pre-M failure: plain failure, nothing published. */
+    g_shard_test_fail_phase = SHARD_TEST_PHASE_M;
+    g_shard_test_fail_occurrence = 1;
+    int rc = slotcask_upsert_with_hooks(&w.db, 0, &k1, 8, v, 5, &o, NULL);
+    ASSERT_EQ_INT(rc, -1, "pre-M publication failure returns -1");
+    ASSERT_TRUE(errno != EINPROGRESS, "pre-M failure is not pending");
+    ASSERT_EQ_INT(win_marker_scan(w.base, NULL, 0, NULL), 0,
+                  "no final marker after pre-M failure");
+
+    /* Clean insert works once disarmed. */
+    g_shard_test_fail_phase = -1;
+    ASSERT_EQ_INT(slotcask_upsert_with_hooks(&w.db, 0, &k1, 8, v, 5, &o, NULL),
+                  0, "clean insert after disarmed pre-M failure");
+
+    /* Post-M failure (K barrier), sticky: the coordinator's own inline
+     * forward-replay retry re-invokes the same K barrier, so a one-shot
+     * fault always self-heals to success now that retry-to-completion is
+     * the intended behavior (a single glitch must not surface as pending).
+     * Only a *persistent* fault -- one that also defeats the retry --
+     * produces a genuine pending outcome with the marker retained. */
+    g_shard_test_fail_phase = SHARD_TEST_PHASE_K;
+    g_shard_test_fail_occurrence = 1;
+    g_shard_test_fail_sticky = 1;
+    errno = 0;
+    rc = slotcask_upsert_with_hooks(&w.db, 0, &k2, 8, v, 5, &o, NULL);
+    ASSERT_EQ_INT(rc, -1, "post-M K failure returns -1");
+    ASSERT_EQ_INT(errno, EINPROGRESS, "post-M K failure is EINPROGRESS");
+    ASSERT_EQ_INT(win_marker_scan(w.base, NULL, 0, NULL), 1,
+                  "marker retained after pending window");
+
+    /* While the fault is still persistent, a later write on the same shard
+     * is also gated: EINPROGRESS, marker untouched (not truncated, not
+     * replaced) -- its own gate-triggered replay attempt of the retained
+     * marker hits the same persistent K fault and never reaches C. */
+    char mname[128], mname2[128];
+    long msz = -1, msz2 = -1;
+    ASSERT_EQ_INT(win_marker_scan(w.base, mname, sizeof(mname), &msz), 1,
+                  "exactly one retained marker");
+    errno = 0;
+    rc = slotcask_upsert_with_hooks(&w.db, 0, &k3, 8, v, 5, &o, NULL);
+    ASSERT_EQ_INT(rc, -1, "gated write rejected while fault persists");
+    ASSERT_EQ_INT(errno, EINPROGRESS, "gated write is EINPROGRESS");
+    ASSERT_EQ_INT(win_marker_scan(w.base, mname2, sizeof(mname2), &msz2), 1,
+                  "still exactly one marker after gated write");
+    ASSERT_EQ_INT(strcmp(mname, mname2), 0, "retained marker keeps its name");
+    ASSERT_EQ_INT(msz, msz2, "retained marker not truncated or rewritten");
+    /* k3 was rejected at the gate before it ever planned its own window --
+     * it was never durably written. */
+    void *k3o = NULL;
+    size_t k3l = 0;
+    ASSERT_TRUE(slotcask_get(&w.db, &k3, 8, &k3o, &k3l) != 0,
+                "rejected-at-gate key never durably written");
+    free(k3o);
+
+    /* Disarm the fault: the next mutation's gate replays the pending
+     * window through C and then commits itself. */
+    g_shard_test_fail_phase = -1;
+    g_shard_test_fail_sticky = 0;
+    ASSERT_EQ_INT(slotcask_upsert_with_hooks(&w.db, 0, &k4, 8, v, 5, &o, NULL),
+                  0, "gate replay + new commit succeeds");
+    ASSERT_EQ_INT(win_marker_scan(w.base, NULL, 0, NULL), 0,
+                  "marker cleared after gate replay");
+
+    /* k1, k2, and k4 are durable across a reopen; k3 (rejected at the
+     * gate, never committed) is absent. */
+    slotcask_close(&w.db);
+    memset(&w.db, 0, sizeof(w.db));
+    ASSERT_EQ_INT(slotcask_open(&w.db, w.base, 8, 1, 64), 0, "reopen db");
+    uint64_t ks[3] = { k1, k2, k4 };
+    for (int i = 0; i < 3; i++) {
+        void *vo = NULL;
+        size_t vl = 0;
+        ASSERT_EQ_INT(slotcask_get(&w.db, &ks[i], 8, &vo, &vl), 0,
+                      "window key present after reopen");
+        free(vo);
+    }
+    void *k3o2 = NULL;
+    size_t k3l2 = 0;
+    ASSERT_TRUE(slotcask_get(&w.db, &k3, 8, &k3o2, &k3l2) != 0,
+                "rejected key still absent after reopen");
+    free(k3o2);
+    win_db_close(&w);
+    return t_ctx->failed ? 1 : 0;
+}
+
+static int test_win_postlink_publication_pending(void) {
+    WinDb w;
+    ASSERT_EQ_INT(win_db_open(&w, 0), 0, "open window test db");
+    if (t_ctx->failed) return 1;
+    uint64_t k1 = 201, k2 = 202;
+    char v[8] = "plink";
+    SlotcaskUpsertOpts o;
+    memset(&o, 0, sizeof(o));
+
+    /* Publication linked the marker, then its post-link steps failed: M
+     * is irrevocable from the instant it links, so this is a post-M
+     * failure. Nothing else is armed, so the coordinator's own inline
+     * forward-replay retry (A/I/K/T/C) converges to C in the same call --
+     * the caller sees an ordinary success and the marker is cleared. A
+     * transient post-link glitch is exactly what retry-to-completion
+     * exists to absorb; it must never surface to the caller as pending. */
+    g_shard_test_fail_phase = SHARD_TEST_PHASE_M;
+    g_shard_test_fail_occurrence = 1;
+    g_shard_test_fail_postlink = 1;
+    errno = 0;
+    int rc = slotcask_upsert_with_hooks(&w.db, 0, &k1, 8, v, 6, &o, NULL);
+    ASSERT_EQ_INT(rc, 0, "post-link publication glitch self-heals to success");
+    ASSERT_EQ_INT(win_marker_scan(w.base, NULL, 0, NULL), 0,
+                  "marker cleared once inline replay reaches C");
+
+    void *vo = NULL;
+    size_t vl = 0;
+    ASSERT_EQ_INT(slotcask_get(&w.db, &k1, 8, &vo, &vl), 0,
+                  "self-healed insert is durable and readable");
+    if (vo) {
+        ASSERT_TRUE(vl == 6 && memcmp(vo, v, 6) == 0,
+                    "self-healed insert carries the inserted value");
+        free(vo);
+    }
+
+    g_shard_test_fail_phase = -1;
+    g_shard_test_fail_postlink = 0;
+
+    /* Durable across a reopen too. */
+    slotcask_close(&w.db);
+    memset(&w.db, 0, sizeof(w.db));
+    ASSERT_EQ_INT(slotcask_open(&w.db, w.base, 8, 1, 64), 0, "reopen db");
+    vo = NULL;
+    vl = 0;
+    ASSERT_EQ_INT(slotcask_get(&w.db, &k1, 8, &vo, &vl), 0,
+                  "self-healed insert survives reopen");
+    free(vo);
+
+    /* And a fresh write on the same shard proceeds normally (no marker
+     * left behind to gate it). */
+    ASSERT_EQ_INT(slotcask_upsert_with_hooks(&w.db, 0, &k2, 8, v, 6, &o, NULL),
+                  0, "later write is not gated");
+    win_db_close(&w);
+    return t_ctx->failed ? 1 : 0;
+}
+
+typedef struct {
+    WinDb *w;
+    uint64_t k1, k2;
+    int rc;
+    TuJoinSignal js;
+} WinDlArg;
+
+/* Same-thread gate-replay sequence: the retained marker's replay must not
+ * deadlock (root cause 1: same-thread seg rwlock upgrade during replay). */
+static void *win_dl_worker(void *raw) {
+    WinDlArg *a = raw;
+    SlotcaskDb *db = &a->w->db;
+    uint64_t k1 = a->k1, k2 = a->k2;
+    char v1[8] = "aaa", v2[8] = "bbb", v3[8] = "ccc";
+    SlotcaskUpsertOpts o;
+    memset(&o, 0, sizeof(o));
+    SlotcaskDeleteResult dr;
+    memset(&dr, 0, sizeof(dr));
+
+    a->rc = slotcask_upsert_with_hooks(db, 0, &k1, 8, v1, 4, &o, NULL);
+    if (a->rc != 0) goto out;
+
+    g_shard_test_fail_phase = SHARD_TEST_PHASE_T;
+    g_shard_test_fail_occurrence = 1;
+    g_shard_test_fail_sticky = 1;
+    errno = 0;
+    a->rc = slotcask_upsert_with_hooks(db, 0, &k1, 8, v2, 4, &o, NULL);
+    if (a->rc == 0 || errno != EINPROGRESS) goto out;
+
+    g_shard_test_fail_phase = -1;
+    g_shard_test_fail_sticky = 0;
+    a->rc = slotcask_upsert_with_hooks(db, 0, &k1, 8, v3, 4, &o, NULL);
+    if (a->rc != 0) goto out;
+
+    g_shard_test_fail_phase = SHARD_TEST_PHASE_K;
+    g_shard_test_fail_occurrence = 1;
+    g_shard_test_fail_sticky = 1;
+    errno = 0;
+    a->rc = slotcask_upsert_with_hooks(db, 0, &k2, 8, v1, 4, &o, NULL);
+    g_shard_test_fail_phase = -1;
+    g_shard_test_fail_sticky = 0;
+    if (a->rc == 0 || errno != EINPROGRESS) goto out;
+
+    /* Delete runs the gate replay in this same thread. */
+    errno = 0;
+    a->rc = slotcask_delete_with_hooks(db, &k1, 8, NULL, &dr);
+
+out:
+    tu_join_signal_mark_done(&a->js);
+    return NULL;
+}
+
+static int test_win_replay_no_deadlock(void) {
+    WinDb w;
+    ASSERT_EQ_INT(win_db_open(&w, 0), 0, "open window test db");
+    if (t_ctx->failed) return 1;
+
+    uint64_t sk[2];
+    ASSERT_EQ_INT(win_same_shard_keys(sk, 2, 8), 2, "2 same-shard keys");
+
+    WinDlArg a;
+    memset(&a, 0, sizeof(a));
+    a.w = &w;
+    a.k1 = sk[0];
+    a.k2 = sk[1];
+    tu_join_signal_init(&a.js);
+    pthread_t tid;
+    ASSERT_EQ_INT(pthread_create(&tid, NULL, win_dl_worker, &a), 0,
+                  "spawn replay worker");
+    int jr = tu_timed_join(tid, &a.js, 15);
+    ASSERT_EQ_INT(jr, 0, "update/delete gate replay completes without deadlock");
+    if (jr != 0) {
+        win_db_close(&w);   /* deadlocked thread still holds locks; bail */
+        return 1;
+    }
+    tu_join_signal_destroy(&a.js);
+    ASSERT_EQ_INT(a.rc, 0, "replay worker finished cleanly");
+
+    uint64_t k1 = sk[0], k2 = sk[1];
+    void *vo = NULL;
+    size_t vl = 0;
+    ASSERT_TRUE(slotcask_get(&w.db, &k1, 8, &vo, &vl) != 0,
+                "deleted key absent after replay");
+    free(vo);
+    vo = NULL;
+    ASSERT_EQ_INT(slotcask_get(&w.db, &k2, 8, &vo, &vl), 0,
+                  "pending-inserted key replayed by later gate");
+    free(vo);
+    ASSERT_EQ_INT(win_marker_scan(w.base, NULL, 0, NULL), 0,
+                  "no retained markers after replay");
+    win_db_close(&w);
+    return t_ctx->failed ? 1 : 0;
+}
+
+static int test_win_window16_two_windows(void) {
+    WinDb w;
+    ASSERT_EQ_INT(win_db_open(&w, 16), 0, "open db with window=16");
+    if (t_ctx->failed) return 1;
+
+    uint64_t keys[17];
+    ASSERT_EQ_INT(win_same_shard_keys(keys, 17, 8), 17, "17 same-shard keys");
+    uint8_t h[16];
+    win_hash(&keys[0], 8, h);
+    int shard = compute_record_shard(h, 8);
+
+    SlotcaskBulkRec recs[17];
+    memset(recs, 0, sizeof(recs));
+    for (int i = 0; i < 17; i++) {
+        recs[i].key = &keys[i];
+        recs[i].klen = 8;
+        recs[i].value = "bulkval";
+        recs[i].vlen = 7;
+    }
+    SlotcaskBulkOpts bo;
+    memset(&bo, 0, sizeof(bo));
+
+    /* Fail the second window's K barrier (window 1 performs K sync #1).
+     * Sticky so the coordinator's own inline retry of window 2 also fails
+     * (window 1's single, earlier K sync is below the occurrence
+     * threshold and is unaffected). */
+    g_shard_test_fail_phase = SHARD_TEST_PHASE_K;
+    g_shard_test_fail_occurrence = 2;
+    g_shard_test_fail_sticky = 1;
+    errno = 0;
+    int rc = slotcask_bulk_upsert_in_kfshard(&w.db, shard, recs, 17, &bo);
+    ASSERT_EQ_INT(rc, -1, "second window fails");
+    ASSERT_EQ_INT(errno, EINPROGRESS, "second window pending");
+
+    /* Window 1 (16 records) survives whole. Window 2's K step writes its kf
+     * slot into the MAP_SHARED mapping before its paired sync is even
+     * attempted -- same write-then-check-sync ordering as A/I/T elsewhere in
+     * the coordinator -- so the record is already visible in-process even
+     * though the operation reported failure; durability is not yet
+     * confirmed and the marker stays retained until a replay resolves it. */
+    for (int i = 0; i < 16; i++) {
+        void *vo = NULL;
+        size_t vl = 0;
+        ASSERT_EQ_INT(slotcask_get(&w.db, &keys[i], 8, &vo, &vl), 0,
+                      "first window survives whole");
+        free(vo);
+    }
+    void *vo = NULL;
+    size_t vl = 0;
+    ASSERT_EQ_INT(slotcask_get(&w.db, &keys[16], 8, &vo, &vl), 0,
+                  "second window record visible pre-replay (K write landed "
+                  "before its sync check)");
+    free(vo);
+    ASSERT_EQ_INT(win_marker_scan(w.base, NULL, 0, NULL), 1,
+                  "second window marker retained");
+
+    /* Replay + a fresh write: window 2 completes. */
+    g_shard_test_fail_phase = -1;
+    g_shard_test_fail_sticky = 0;
+    uint64_t kx = keys[0] + 1000000;
+    char v[8] = "later";
+    SlotcaskUpsertOpts o;
+    memset(&o, 0, sizeof(o));
+    /* Aim at the same shard so the gate is on the retained marker. */
+    uint64_t ksame = 0;
+    for (uint64_t k = 1; k < 500000u; k++) {
+        uint8_t hh[16];
+        win_hash(&k, 8, hh);
+        if (compute_record_shard(hh, 8) == shard &&
+            memcmp(hh, h, 16) != 0) { ksame = k; break; }
+    }
+    ASSERT_TRUE(ksame != 0, "found another key for the same shard");
+    if (ksame) {
+        ASSERT_EQ_INT(slotcask_upsert_with_hooks(&w.db, 0, &ksame, 8, v, 6,
+                                                 &o, NULL),
+                      0, "gate replays window 2 then commits");
+        vo = NULL;
+        ASSERT_EQ_INT(slotcask_get(&w.db, &keys[16], 8, &vo, &vl), 0,
+                      "window 2 record visible after replay");
+        free(vo);
+    }
+    ASSERT_EQ_INT(win_marker_scan(w.base, NULL, 0, NULL), 0,
+                  "marker cleared after replay");
+    (void)kx;
+    win_db_close(&w);
+    return t_ctx->failed ? 1 : 0;
+}
+
+static int test_win_sync_count_matrix(void) {
+    WinDb w;
+    ASSERT_EQ_INT(win_db_open(&w, 0), 0, "open db for sync counts");
+    if (t_ctx->failed) return 1;
+    uint64_t k1 = 401;
+    char v1[8] = "one", v2[8] = "two";
+    SlotcaskUpsertOpts o;
+    memset(&o, 0, sizeof(o));
+    SlotcaskDeleteResult dr;
+    memset(&dr, 0, sizeof(dr));
+
+    /* Single insert (one-record window, non-indexed). */
+    ASSERT_EQ_INT(slotcask_upsert_with_hooks(&w.db, 0, &k1, 8, v1, 4, &o, NULL),
+                  0, "insert for sync counts");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_P], 1, "insert P");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_M], 1, "insert M");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_A], 1, "insert A");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_I], 0, "insert I");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_K], 1, "insert K");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_T], 0, "insert T");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_C], 1, "insert C");
+
+    /* Single update: adds exactly one tombstone barrier. */
+    shard_test_ctl_reset();
+    ASSERT_EQ_INT(slotcask_upsert_with_hooks(&w.db, 0, &k1, 8, v2, 4, &o, NULL),
+                  0, "update for sync counts");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_M], 1, "update M");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_K], 1, "update K");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_T], 1, "update T");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_C], 1, "update C");
+
+    /* Single delete: no P, no A. */
+    shard_test_ctl_reset();
+    ASSERT_EQ_INT(slotcask_delete_with_hooks(&w.db, &k1, 8, NULL, &dr), 0,
+                  "delete for sync counts");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_P], 0, "delete P");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_A], 0, "delete A");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_M], 1, "delete M");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_K], 1, "delete K");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_T], 1, "delete T");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_C], 1, "delete C");
+
+    /* Bulk: 17 records at window=16 → exactly two markers, two K barriers,
+     * two C barriers (batched, not per record). */
+    WinDb b;
+    ASSERT_EQ_INT(win_db_open(&b, 16), 0, "open bulk db");
+    if (t_ctx->failed) { win_db_close(&w); return 1; }
+    uint64_t keys[17];
+    ASSERT_EQ_INT(win_same_shard_keys(keys, 17, 8), 17, "same-shard keys");
+    uint8_t h[16];
+    win_hash(&keys[0], 8, h);
+    int shard = compute_record_shard(h, 8);
+    SlotcaskBulkRec recs[17];
+    memset(recs, 0, sizeof(recs));
+    for (int i = 0; i < 17; i++) {
+        recs[i].key = &keys[i];
+        recs[i].klen = 8;
+        recs[i].value = "count";
+        recs[i].vlen = 5;
+    }
+    SlotcaskBulkOpts bo;
+    memset(&bo, 0, sizeof(bo));
+    ASSERT_EQ_INT(slotcask_bulk_upsert_in_kfshard(&b.db, shard, recs, 17, &bo),
+                  0, "bulk 17 for sync counts");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_M], 2,
+                  "bulk M == windows");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_K], 2,
+                  "bulk K == windows");
+    ASSERT_EQ_INT(g_shard_test_sync_counts[SHARD_TEST_PHASE_C], 2,
+                  "bulk C == windows");
+    ASSERT_TRUE(g_shard_test_sync_counts[SHARD_TEST_PHASE_P] >= 1 &&
+                g_shard_test_sync_counts[SHARD_TEST_PHASE_P] <= 2,
+                "bulk P batched per file per window");
+    ASSERT_TRUE(g_shard_test_sync_counts[SHARD_TEST_PHASE_A] >= 1 &&
+                g_shard_test_sync_counts[SHARD_TEST_PHASE_A] <= 2,
+                "bulk A batched per file per window");
+    win_db_close(&b);
+    win_db_close(&w);
+    return t_ctx->failed ? 1 : 0;
+}
+
+/* ── daemon-backed helpers ── */
+
+static int dw_append_pause(const char *db_root, const char *phase, int ms) {
+    /* db.env lives at parent(db_root), not inside db_root itself — see
+       append_durability_pause_config() above and test_env_start_at() in
+       fixtures.c, both of which strip the trailing path component before
+       writing. Writing to db_root/db.env directly leaves the daemon's
+       actual config file untouched, so the pause knob silently never
+       reaches the restarted process. */
+    char base[PATH_MAX], p[PATH_MAX];
+    snprintf(base, sizeof(base), "%s", db_root);
+    char *slash = strrchr(base, '/');
+    if (!slash) return -1;
+    *slash = '\0';
+    snprintf(p, sizeof(p), "%s/db.env", base);
+    FILE *f = fopen(p, "a");
+    if (!f) return -1;
+    fprintf(f, "DURABILITY_TEST_PAUSE_PHASE=%s\n", phase);
+    fprintf(f, "DURABILITY_TEST_PAUSE_MS=%d\n", ms);
+    return fclose(f);
+}
+
+static pid_t dw_trigger_op(TestEnv *env, const char *object, const char *mode,
+                           const char *key, int score) {
+    pid_t child = fork();
+    if (child != 0) return child;
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) _exit(2);
+    char req[512], *resp = NULL;
+    if (strcmp(mode, "delete") == 0) {
+        snprintf(req, sizeof(req),
+                 "{\"mode\":\"delete\",\"dir\":\"default\","
+                 "\"object\":\"%s\",\"key\":\"%s\"}", object, key);
+    } else {
+        snprintf(req, sizeof(req),
+                 "{\"mode\":\"%s\",\"dir\":\"default\",\"object\":\"%s\","
+                 "\"key\":\"%s\",\"value\":{\"score\":%d,\"title\":\"crash\"}}",
+                 mode, object, key, score);
+    }
+    int rc = tc_request(tc, req, &resp);
+    free(resp);
+    tc_close(tc);
+    _exit(rc == 0 ? 0 : 3);
+}
+
+static int dw_get_score(TestEnv *env, const char *object, const char *key,
+                        int timeout_ms, int *out_score, int *out_found) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = timeout_ms };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return -1;
+    char req[512], *resp = NULL;
+    snprintf(req, sizeof(req),
+             "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"%s\","
+             "\"key\":\"%s\"}", object, key);
+    int rc = tc_request(tc, req, &resp);
+    int found = (rc == 0 && resp && !SAFE_STRSTR(resp, "\"error\""));
+    int score = -1;
+    if (found) {
+        char *p = SAFE_STRSTR(resp, "\"score\":");
+        if (p) score = (int)strtol(p + 8, NULL, 10);
+    }
+    free(resp);
+    tc_close(tc);
+    if (out_score) *out_score = score;
+    if (out_found) *out_found = found;
+    return rc;
+}
+
+static int dw_count_eq(TestEnv *env, const char *object, int score,
+                       int timeout_ms) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = timeout_ms };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return -1;
+    char req[512], *resp = NULL;
+    snprintf(req, sizeof(req),
+             "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"%s\","
+             "\"criteria\":[{\"field\":\"score\",\"op\":\"eq\","
+             "\"value\":\"%d\"}]}", object, score);
+    int rc = tc_request(tc, req, &resp);
+    int n = (rc == 0) ? tu_parse_count(resp) : -1;
+    free(resp);
+    tc_close(tc);
+    return n;
+}
+
+/* Count occurrences of `key` (and of the given score literal) in a full
+ * find response — used to prove single-version visibility mid-window. */
+static int dw_find_key_occurrences(TestEnv *env, const char *object,
+                                   const char *key, int needle_score,
+                                   int timeout_ms, int *out_key_occ,
+                                   int *out_score_occ) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = timeout_ms };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return -1;
+    char req[512], *resp = NULL;
+    snprintf(req, sizeof(req),
+             "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"%s\","
+             "\"criteria\":[],\"limit\":1000}", object);
+    int rc = tc_request(tc, req, &resp);
+    int kocc = 0, socc = 0;
+    if (rc == 0 && resp) {
+        char needle[64], sneedle[64];
+        snprintf(needle, sizeof(needle), "\"%s\"", key);
+        snprintf(sneedle, sizeof(sneedle), "\"score\":%d", needle_score);
+        const char *p = resp;
+        while ((p = strstr(p, needle)) != NULL) { kocc++; p += strlen(needle); }
+        p = resp;
+        while ((p = strstr(p, sneedle)) != NULL) { socc++; p += strlen(sneedle); }
+    }
+    free(resp);
+    tc_close(tc);
+    if (out_key_occ) *out_key_occ = kocc;
+    if (out_score_occ) *out_score_occ = socc;
+    return rc;
+}
+
+static const char *dw_phases[] = {
+    "win-P", "win-M", "win-A", "win-I", "win-K", "win-T", "win-C",
+};
+
+static int test_win_crash_matrix(void) {
+    static const char *modes[] = { "insert", "update", "delete" };
+
+    for (size_t ph = 0; ph < sizeof(dw_phases) / sizeof(dw_phases[0]); ph++) {
+        for (size_t mo = 0; mo < 3; mo++) {
+            TestEnv env = {0};
+            if (test_env_start(&env) != 0) return 1;
+            int port = env.port;
+            char root[256];
+            snprintf(root, sizeof(root), "%s", env.db_root);
+            char obj[64];
+            snprintf(obj, sizeof(obj), "dwmx%02zu%zu", ph, mo);
+
+            ASSERT_EQ_INT(create_indexed_object_with_records(&env, obj, 20), 0,
+                          "crash-matrix fixture");
+            test_env_stop_keep(&env);
+            ASSERT_EQ_INT(dw_append_pause(root, dw_phases[ph], 60000), 0,
+                          "arm deterministic phase pause");
+            ASSERT_EQ_INT(test_env_start_at(&env, root, port), 0,
+                          "restart with pause armed");
+            if (t_ctx->failed) { test_env_stop(&env); return 1; }
+
+            const char *key = (mo == 0) ? "newkey01" : "item0005";
+            int newscore = 4000 + (int)(ph * 3 + mo);
+            pid_t w = dw_trigger_op(&env, obj, modes[mo], key, newscore);
+            ASSERT_TRUE(w > 0, "spawn matrix op");
+
+            char active[PATH_MAX];
+            snprintf(active, sizeof(active),
+                     "%s/default/%s/.durability-test-%s.active",
+                     root, obj, dw_phases[ph]);
+            int got = wait_for_path(active, 20000);
+            test_env_kill(&env);
+            unlink(active);
+            if (w > 0) waitpid(w, NULL, 0);
+            ASSERT_EQ_INT(got, 0, "matrix op reached its phase pause");
+
+            ASSERT_EQ_INT(test_env_start_at(&env, root, port), 0,
+                          "respawn after SIGKILL");
+            /* win-P (payload staging) and win-M (marker composition) both
+               pause BEFORE marker_publish_atomic() inside
+               bulk_publish_window_marker_locked — see that function's
+               SHARD_TEST_PHASE_PAUSE/durability_test_pause call sites,
+               which sit ahead of the actual marker write, and
+               test_durability_bulk_window_prepared_recovers, which
+               exercises the identical "bulk-window-prepared" call site and
+               explicitly documents it as "pause before the marker exists".
+               A crash paused at either point never writes a marker, so the
+               startup sweep correctly finds nothing to replay
+               (marker_recovery_ran==0) — expected, not a failure. Every
+               later phase (A, I, K, T, C) runs only after
+               bulk_publish_window_marker_locked has already returned
+               success, so a crash there always has a marker to recover. */
+            ASSERT_EQ_INT(request_marker_recovery_ran(&env), ph <= 1 ? 0 : 1,
+                          "recovery sweep ran");
+            if (mo == 0) {                       /* insert */
+                int total = request_count(&env, obj);
+                int hit = dw_count_eq(&env, obj, newscore, 30000);
+                ASSERT_TRUE(total == 20 || total == 21,
+                            "insert crash: total is pre-or-post");
+                ASSERT_TRUE(hit == 0 || hit == 1,
+                            "insert crash: indexed hit pre-or-post");
+                ASSERT_EQ_INT(total, 20 + hit,
+                              "insert crash: total agrees with criteria");
+            } else if (mo == 1) {                /* update */
+                int total = request_count(&env, obj);
+                int hit = dw_count_eq(&env, obj, newscore, 30000);
+                int old = dw_count_eq(&env, obj, 25, 30000);
+                ASSERT_EQ_INT(total, 20, "update crash: total preserved");
+                ASSERT_TRUE(hit == 0 || hit == 1,
+                            "update crash: indexed pre-or-post");
+                ASSERT_EQ_INT(hit + old, 1,
+                              "update crash: exactly one version indexed");
+            } else {                             /* delete */
+                int total = request_count(&env, obj);
+                int old = dw_count_eq(&env, obj, 25, 30000);
+                ASSERT_TRUE(total == 19 || total == 20,
+                            "delete crash: total pre-or-post");
+                ASSERT_EQ_INT(total, 19 + old,
+                              "delete crash: total agrees with criteria");
+            }
+            test_env_stop(&env);
+            if (t_ctx->failed) return 1;         /* fail fast per combo */
+        }
+    }
+    return t_ctx->failed ? 1 : 0;
+}
+
+static int test_win_ik_pause_readers_whole_state(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) return 1;
+    int port = env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", env.db_root);
+    const char *obj = "dwikpause";
+    ASSERT_EQ_INT(create_indexed_object_with_records(&env, obj, 40), 0,
+                  "ik-pause fixture");
+    test_env_stop_keep(&env);
+    ASSERT_EQ_INT(dw_append_pause(root, "win-K", 2500), 0, "arm win-K pause");
+    ASSERT_EQ_INT(test_env_start_at(&env, root, port), 0, "restart paused");
+    if (t_ctx->failed) { test_env_stop(&env); return 1; }
+
+    /* Pick a key on a different kf shard than the updated key so its read
+     * genuinely exercises unrelated-shard progress. */
+    uint8_t h_upd[16], h_alt[16];
+    const char *upd_key = "item0010";
+    win_hash(upd_key, strlen(upd_key), h_upd);
+    int upd_shard = compute_record_shard(h_upd, 8);
+    char alt_key[32] = {0};
+    for (int i = 0; i < 40; i++) {
+        char cand[32];
+        snprintf(cand, sizeof(cand), "item%04d", i);
+        win_hash(cand, strlen(cand), h_alt);
+        if (compute_record_shard(h_alt, 8) != upd_shard) {
+            snprintf(alt_key, sizeof(alt_key), "%s", cand);
+            break;
+        }
+    }
+    ASSERT_TRUE(alt_key[0] != 0, "found unrelated-shard key");
+
+    pid_t w = dw_trigger_op(&env, obj, "update", upd_key, 555);
+    ASSERT_TRUE(w > 0, "spawn paused update");
+    char active[PATH_MAX];
+    snprintf(active, sizeof(active),
+             "%s/default/%s/.durability-test-win-K.active", root, obj);
+    if (wait_for_path(active, 20000) != 0) {
+        waitpid(w, NULL, 0);
+        test_env_stop(&env);
+        ASSERT_TRUE(0, "update reached win-K pause");
+        return 1;
+    }
+
+    /* Unrelated shard progresses while the window holds its shard lock. */
+    int score = -1, found = 0;
+    ASSERT_EQ_INT(dw_get_score(&env, obj, alt_key, 2000, &score, &found), 0,
+                  "unrelated-shard read during pause");
+    ASSERT_TRUE(found, "unrelated-shard key found during pause");
+
+    /* The paused shard's key blocks through the pause, then returns a
+     * whole pre- or post-window state — never a mix. */
+    ASSERT_EQ_INT(dw_get_score(&env, obj, upd_key, 30000, &score, &found), 0,
+                  "paused-shard read completes");
+    ASSERT_TRUE(found && (score == 50 || score == 555),
+                "paused-shard read is whole pre-or-post state");
+    waitpid(w, NULL, 0);
+
+    ASSERT_EQ_INT(dw_count_eq(&env, obj, 555, 10000), 1, "final: new score");
+    ASSERT_EQ_INT(dw_count_eq(&env, obj, 50, 10000), 0, "final: old score gone");
+    test_env_stop(&env);
+    return t_ctx->failed ? 1 : 0;
+}
+
+static int test_win_at_pause_scan_one_version(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) return 1;
+    int port = env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", env.db_root);
+    const char *obj = "dwatpause";
+    ASSERT_EQ_INT(create_indexed_object_with_records(&env, obj, 40), 0,
+                  "at-pause fixture");
+    test_env_stop_keep(&env);
+    ASSERT_EQ_INT(dw_append_pause(root, "win-T", 2500), 0, "arm win-T pause");
+    ASSERT_EQ_INT(test_env_start_at(&env, root, port), 0, "restart paused");
+    if (t_ctx->failed) { test_env_stop(&env); return 1; }
+
+    const char *upd_key = "item0012";
+    pid_t w = dw_trigger_op(&env, obj, "update", upd_key, 777);
+    ASSERT_TRUE(w > 0, "spawn paused update");
+    char active[PATH_MAX];
+    snprintf(active, sizeof(active),
+             "%s/default/%s/.durability-test-win-T.active", root, obj);
+    if (wait_for_path(active, 20000) != 0) {
+        waitpid(w, NULL, 0);
+        test_env_stop(&env);
+        ASSERT_TRUE(0, "update reached win-T pause");
+        return 1;
+    }
+
+    /* Between A and T both segment versions carry flag=1; the query scan
+     * must still return exactly one version — the post-window one (K
+     * already repointed the Kf slot). */
+    int kocc = 0, socc = 0;
+    ASSERT_EQ_INT(dw_find_key_occurrences(&env, obj, upd_key, 777, 10000,
+                                          &kocc, &socc), 0,
+                  "find during A/T pause");
+    ASSERT_EQ_INT(kocc, 1, "exactly one version of the key mid-A/T");
+    ASSERT_EQ_INT(socc, 1, "the one version carries the post-window value");
+    waitpid(w, NULL, 0);
+    test_env_stop(&env);
+    return t_ctx->failed ? 1 : 0;
+}
+
+TEST_REGISTER("test-win-gate-pending-then-success", test_win_gate_pending_then_success)
+TEST_REGISTER("test-win-postlink-publication-pending", test_win_postlink_publication_pending)
+TEST_REGISTER("test-win-replay-no-deadlock", test_win_replay_no_deadlock)
+TEST_REGISTER("test-win-window16-two-windows", test_win_window16_two_windows)
+TEST_REGISTER("test-win-sync-count-matrix", test_win_sync_count_matrix)
+TEST_REGISTER("test-win-crash-matrix", test_win_crash_matrix)
+TEST_REGISTER("test-win-ik-pause-readers-whole-state", test_win_ik_pause_readers_whole_state)
+TEST_REGISTER("test-win-at-pause-scan-one-version", test_win_at_pause_scan_one_version)
+
 TEST_REGISTER("test-msync-range", test_msync_range_raw_fails_on_main)
-TEST_REGISTER("test-marker-write-roundtrip", test_marker_write_roundtrip)
-TEST_REGISTER("test-marker-clear-removes-file", test_marker_clear_removes_file)
 TEST_REGISTER("test-ordering-marker-clean-after-crud", test_ordering_marker_clean_after_crud)
 TEST_REGISTER("test-ordering-delete-marker-free", test_ordering_delete_marker_free)
 TEST_REGISTER("test-durability-clean-shutdown-skips-recovery", test_durability_clean_shutdown_skips_recovery)
@@ -1558,8 +1975,5 @@ TEST_REGISTER("test-durability-corrupt-marker-policy", test_durability_corrupt_m
 TEST_REGISTER("test-durability-bulk-marker-recovers", test_durability_bulk_marker_recovers)
 TEST_REGISTER("test-durability-bulk-window-prepared-recovers", test_durability_bulk_window_prepared_recovers)
 TEST_REGISTER("test-durability-bulk-window-applied-recovers", test_durability_bulk_window_applied_recovers)
-TEST_REGISTER("test-durability-index-apply-abort-matrix", test_durability_index_apply_abort_matrix)
-TEST_REGISTER("test-durability-index-delete-abort", test_durability_index_delete_abort)
-TEST_REGISTER("test-durability-orphan-batch-sidecar-gate", test_durability_orphan_batch_sidecar_gate)
 TEST_REGISTER("test-durability-bulk-window-boundary", test_durability_bulk_window_boundary)
 TEST_REGISTER("test-durability-bulk-window-boundary-mixed-indexes", test_durability_bulk_window_boundary_mixed_indexes)

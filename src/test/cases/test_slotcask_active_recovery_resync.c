@@ -40,12 +40,16 @@ static int test_slotcask_active_recovery_resync_run(void) {
     SlotcaskDb db;
     memset(&db, 0, sizeof(db));
     ASSERT_EQ_INT(slotcask_open(&db, dir, 8, 1, 8192), 0, "open fixture db");
-    ASSERT_EQ_INT(slotcask_insert(&db, 0, "a", 1, a, sizeof(a)), 0,
+    ASSERT_EQ_INT(slotcask_insert_with_hooks(&db, 0, "a", 1, a, sizeof(a),
+                                              NULL, NULL), 0,
                   "insert large donor A");
-    ASSERT_EQ_INT(slotcask_insert(&db, 0, "c", 1, "C", 1), 0,
+    ASSERT_EQ_INT(slotcask_insert_with_hooks(&db, 0, "c", 1, "C", 1,
+                                              NULL, NULL), 0,
                   "insert live C after donor A");
-    ASSERT_EQ_INT(slotcask_delete(&db, "a", 1), 0, "delete donor A");
-    ASSERT_EQ_INT(slotcask_insert(&db, 0, "b", 1, b, sizeof(b)), 0,
+    ASSERT_EQ_INT(slotcask_delete_with_hooks(&db, "a", 1, NULL, NULL), 0,
+                  "delete donor A");
+    ASSERT_EQ_INT(slotcask_insert_with_hooks(&db, 0, "b", 1, b, sizeof(b),
+                                              NULL, NULL), 0,
                   "reuse A with smaller B and create an interior gap");
 
     const size_t c_end = rec_size(1, sizeof(a)) + rec_size(1, 1);
@@ -60,7 +64,8 @@ static int test_slotcask_active_recovery_resync_run(void) {
                 "recovery restores append frontier after C, not at the gap");
     ASSERT_TRUE(read_is(&db, "c", "C", 1), "C survives the restart");
 
-    ASSERT_EQ_INT(slotcask_insert(&db, 0, "d", 1, d, sizeof(d)), 0,
+    ASSERT_EQ_INT(slotcask_insert_with_hooks(&db, 0, "d", 1, d, sizeof(d),
+                                              NULL, NULL), 0,
                   "post-restart append crosses the old gap");
     ASSERT_TRUE(read_is(&db, "c", "C", 1),
                 "post-restart append does not overwrite C");

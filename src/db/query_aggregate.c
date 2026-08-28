@@ -1030,7 +1030,8 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
     }
     case FT_IPV6: {
         int allzero = 1;
-        for (int bi = 0; bi < 16; bi++) if (p[bi] != 0) { allzero = 0; break; }
+        for (int bi = 0; bi < 16; bi++) if (p[bi] != 0) { allzero = 0; break;
+                    }
         if (allzero) return 0;
         char ipstr[INET6_ADDRSTRLEN];
         if (!inet_ntop(AF_INET6, p, ipstr, sizeof(ipstr))) return 0;
@@ -1303,7 +1304,8 @@ int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
     }
     case FT_IPV6: {
         int allzero = 1;
-        for (int bi = 0; bi < 16; bi++) if (p[bi] != 0) { allzero = 0; break; }
+        for (int bi = 0; bi < 16; bi++) if (p[bi] != 0) { allzero = 0; break;
+                    }
         if (allzero) return 0;
         char ipstr[INET6_ADDRSTRLEN];
         if (!inet_ntop(AF_INET6, p, ipstr, sizeof(ipstr))) return 0;
@@ -1643,12 +1645,19 @@ static void *wfc_worker(void *arg) {
     char idx_path[PATH_MAX];
     build_idx_path(idx_path, sizeof(idx_path),
                    w->db_root, w->object, w->agg_field, w->shard_id);
-    BtRangeIter *it = btree_range_iter_open(
-        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, w->desc);
-    if (!it) {
-        LOG_ERROR(LOG_SUB_QUERY, "wfc_worker: btree_range_iter_open %s failed", idx_path);
-        return NULL;
-    }
+
+    /* Lock-safe resumable walker (see docs/plans/2026-08-27-bt-kf-lock-
+       inversion-chunked-fetch.md): the OLD version flushed its kf batch
+       every WFC_BATCH entries while the BtRangeIter was still open —
+       blocking kfcache acquires under a held bt rdlock, i.e. the writer
+       window's kf-WR -> bt-WR inverse. Now every full batch closes the
+       iterator FIRST, flushes outside any bt lock, then reopens past the
+       last delivered (value,hash) using the inclusive-bound + raw-hash16
+       tiebreak skip convention shared with cursor pagination. */
+    char last_val[BT_MAX_VAL_LEN];
+    size_t last_len = 0;
+    uint8_t last_hash[BT_HASH_SIZE];
+    int have_last = 0;
 
     const char *val; size_t vlen; const uint8_t *hash16;
     int walks = 0;
@@ -1665,27 +1674,74 @@ static void *wfc_worker(void *arg) {
         .mu     = PTHREAD_MUTEX_INITIALIZER,
     };
 
-    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-        if (query_deadline_tick(w->deadline, &w->dl_counter)) break;
-        if (++walks > w->budget) { w->budget_exceeded = 1; break; }
+    int exhausted = 0;
+    int dl_stop = 0;
+    for (;;) {
+        char lo_buf[BT_MAX_VAL_LEN];
+        const char *lo = "";  size_t lo_len = 0;
+        const char *hi = "\xff\xff\xff\xff"; size_t hi_len = 4;
+        int hi_excl = 0;
+        if (have_last) {
+            memcpy(lo_buf, last_val, last_len);
+            lo = lo_buf; lo_len = last_len;   /* inclusive at resume */
+            if (w->desc) {
+                /* DESC walks tighten the UPPER bound instead. */
+                hi = lo_buf; hi_len = last_len; hi_excl = 0;
+                lo = ""; lo_len = 0;
+            }
+        }
+        BtRangeIter *it = btree_range_iter_open(
+            idx_path, lo, lo_len, 0, hi, hi_len, hi_excl, w->desc);
+        if (!it) {
+            LOG_ERROR(LOG_SUB_QUERY,
+                      "wfc_worker: btree_range_iter_open %s failed",
+                      idx_path);
+            return NULL;
+        }
 
-        double v;
-        if (!decode_index_key_to_double(w->agg_tf, (const uint8_t *)val,
-                                        vlen, &v)) continue;
+        while (!exhausted && bn < WFC_BATCH) {
+            if (!btree_range_iter_next(it, &val, &vlen, &hash16)) {
+                exhausted = 1;
+                break;
+            }
+            if (query_deadline_tick(w->deadline, &w->dl_counter)) {
+                dl_stop = 1;
+                break;
+            }
+            if (++walks > w->budget) { w->budget_exceeded = 1; break;
+                    }
 
-        memcpy(batch[bn], hash16, 16);
-        bn++;
+            /* Resume floor: skip entries already delivered pre-close. */
+            if (have_last && vlen == last_len &&
+                memcmp(val, last_val, last_len) == 0) {
+                int hc = memcmp(hash16, last_hash, BT_HASH_SIZE);
+                if ((w->desc && hc >= 0) || (!w->desc && hc <= 0))
+                    continue;
+            }
 
-        if (bn >= WFC_BATCH) {
+            double v;
+            if (!decode_index_key_to_double(w->agg_tf,
+                                            (const uint8_t *)val,
+                                            vlen, &v)) continue;
+
+            last_len = vlen > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : vlen;
+            memcpy(last_val, val, last_len);
+            memcpy(last_hash, hash16, BT_HASH_SIZE);
+            have_last = 1;
+
+            memcpy(batch[bn], hash16, 16);
+            bn++;
+        }
+        btree_range_iter_close(it);
+
+        if (bn > 0) {
+            /* No bt lock is held here — blocking kf fetch is safe. */
             flush_wfc_batch(sdb, w, batch, bn, &bc);
             bn = 0;
-            if (w->found) break;   /* first batch with a match → done */
         }
+        if (w->found || w->budget_exceeded || exhausted || dl_stop) break;
     }
-    if (bn > 0 && !w->found)
-        flush_wfc_batch(sdb, w, batch, bn, &bc);
 
-    btree_range_iter_close(it);
     return NULL;
 }
 
@@ -2139,7 +2195,8 @@ static int parse_agg_specs(const char *json, AggSpec **out) {
         if (n >= cap) {
             cap *= 2;
             AggSpec *t = xrealloc_or_free(specs, cap * sizeof(*t));
-            if (!t) { specs = NULL; break; }
+            if (!t) { specs = NULL; break;
+                    }
             specs = t;
         }
         AggSpec *s = &specs[n];
@@ -2313,83 +2370,67 @@ static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
     src->total_buckets = 0;
 }
 
-/* ── O_DIRECT per-segment aggregate fan-out ─────────────────────────────
- * One AggOdSegArg per .dat file. Each worker runs seg_scan_o_direct on its
- * file, accumulating results into a private local AggCtx. After
- * parallel_for_io joins, all locals are merged into main_ctx.
- *
- * Uses the existing od_seg_record_cb / OdSegAdapterCtx adapter so the
- * per-record hot path is identical to scan_shards_v2_o_direct. */
+/* ── Kf-driven per-shard aggregate fan-out ─────────────────────────────
+ * One AggKfShardArg per Kf shard. Each worker owns its shard's Kf read
+ * handle via slotcask_scan_live_kf_one — live addresses are snapshotted
+ * under the held reader and validated at fetch, so segment flags are
+ * never the source of truth — accumulating into a private local AggCtx.
+ * After parallel_for_io joins, all locals are merged into main_ctx. */
 typedef struct {
-    char       seg_path[PATH_MAX];
-    int        slot_size;
-    AggCtx     local;         /* per-segment private accumulator */
-    V2ScanWrap wrap;          /* .cb = agg_scan_cb, .ctx = &this->local */
-    int       *stop_flag;
-    FILE      *parent_out;
-} AggOdSegArg;
+    SlotcaskDb *sdb;
+    int         kf_shard_id;
+    AggCtx      local;         /* per-shard private accumulator */
+    int        *stop_flag;
+    FILE       *parent_out;
+} AggKfShardArg;
 
-static void *agg_od_seg_worker(void *raw) {
-    AggOdSegArg *arg = (AggOdSegArg *)raw;
+/* SlotcaskScanCb adapter: key+value are contiguous in the segment
+   record, so pass the key pointer as the v1-style block. */
+static int agg_kf_scan_cb(const uint8_t hash[16],
+                          const void *key, size_t klen,
+                          const void *value, size_t vlen,
+                          void *ctx) {
+    AggCtx *ac = (AggCtx *)ctx;
+    SlotHeader hdr;
+    memcpy(hdr.hash, hash, 16);
+    hdr.flag      = 1;
+    hdr.key_len   = (uint16_t)klen;
+    hdr.value_len = (uint32_t)vlen;
+    return agg_scan_cb(&hdr, (const uint8_t *)key, ac);
+}
+
+static void *agg_kf_shard_worker(void *raw) {
+    AggKfShardArg *arg = (AggKfShardArg *)raw;
     g_out = arg->parent_out ? arg->parent_out : stdout;
     if (__atomic_load_n(arg->stop_flag, __ATOMIC_RELAXED)) return NULL;
-    OdSegAdapterCtx actx = { .wrap = &arg->wrap, .stop_flag = arg->stop_flag };
-    seg_scan_o_direct(arg->seg_path, arg->slot_size, od_seg_record_cb, &actx);
+    slotcask_scan_live_kf_one(arg->sdb, arg->kf_shard_id,
+                              agg_kf_scan_cb, &arg->local, arg->stop_flag);
     return NULL;
 }
 
 static void parallel_agg_scan_shards_o_direct(AggCtx *main_ctx,
                                                SlotcaskDb *sdb) {
-    if (!sdb || sdb->num_streams <= 0) return;
+    if (!sdb || sdb->num_shards <= 0) return;
 
-    AggOdSegArg *args = NULL;
-    size_t nargs = 0, cap = 0;
     int stop_flag = 0;
     FILE *parent_out = g_out;
 
-    for (int s = 0; s < sdb->num_streams; s++) {
-        char stream_dir[PATH_MAX];
-        snprintf(stream_dir, sizeof(stream_dir),
-                 "%s/data/streams/%03d", sdb->data_dir, s);
-        DIR *dh = opendir(stream_dir);
-        if (!dh) continue;
-        struct dirent *de;
-        while ((de = readdir(dh)) != NULL) {
-            size_t nlen = strlen(de->d_name);
-            if (nlen < 4 || strcmp(de->d_name + nlen - 4, ".dat") != 0)
-                continue;
-            if (nargs >= cap) {
-                size_t newcap = cap ? cap * 2 : 64;
-                AggOdSegArg *t = realloc(args, newcap * sizeof(AggOdSegArg));
-                if (!t) { closedir(dh); goto run; }
-                args = t;
-                cap  = newcap;
-            }
-            AggOdSegArg *a = &args[nargs];
-            memset(a, 0, sizeof(*a));
-            snprintf(a->seg_path, PATH_MAX, "%s/%s", stream_dir, de->d_name);
-            a->slot_size   = sdb->slot_size;
-            agg_ctx_clone_shared(&a->local, main_ctx);
-            a->wrap.cb     = agg_scan_cb;
-            /* wrap.ctx set in fixup pass below — realloc may move args */
-            a->stop_flag   = &stop_flag;
-            a->parent_out  = parent_out;
-            nargs++;
-        }
-        closedir(dh);
+    AggKfShardArg *args = calloc((size_t)sdb->num_shards, sizeof(*args));
+    if (!args) return;
+    for (int s = 0; s < sdb->num_shards; s++) {
+        args[s].sdb = sdb;
+        args[s].kf_shard_id = s;
+        agg_ctx_clone_shared(&args[s].local, main_ctx);
+        args[s].stop_flag  = &stop_flag;
+        args[s].parent_out = parent_out;
     }
-
-run:
-    if (nargs == 0) { free(args); return; }
-    /* Fixup: args is final — set wrap.ctx now so pointers are valid. */
-    for (size_t i = 0; i < nargs; i++)
-        args[i].wrap.ctx = &args[i].local;
     g_scan_stop = 0;
-    parallel_for_io(agg_od_seg_worker, args, (int)nargs, sizeof(AggOdSegArg));
-    for (size_t i = 0; i < nargs; i++) {
-        if (args[i].local.budget_exceeded) main_ctx->budget_exceeded = 1;
-        agg_ctx_merge(main_ctx, &args[i].local);
-        agg_ctx_free_local(&args[i].local);
+    parallel_for_io(agg_kf_shard_worker, args, sdb->num_shards,
+                    sizeof(*args));
+    for (int s = 0; s < sdb->num_shards; s++) {
+        if (args[s].local.budget_exceeded) main_ctx->budget_exceeded = 1;
+        agg_ctx_merge(main_ctx, &args[s].local);
+        agg_ctx_free_local(&args[s].local);
     }
     free(args);
 }
@@ -2924,7 +2965,8 @@ static void *igb_pass1_worker(void *arg) {
             if (multi_skip) continue;
             bkt = (struct AggBucket *)agg_find_or_create(
                     &w->local, gvals, w->local.ngroups, raw_key, raw_key_len);
-            if (!bkt) { w->aborted = 1; break; }
+            if (!bkt) { w->aborted = 1; break;
+                    }
             if (w->n_sec == 0 && vlen <= sizeof(prev_enc)) {
                 memcpy(prev_enc, val, vlen);
                 prev_enc_len = vlen;
@@ -3117,7 +3159,8 @@ static void *agg_single_shard_worker(void *raw) {
                 default: break;
             }
         }
-        break;   /* one leaf entry suffices per shard for min/max */
+        break;
+                      /* one leaf entry suffices per shard for min/max */
     }
     btree_range_iter_close(it);
     return NULL;
@@ -3137,12 +3180,36 @@ typedef struct {
     int64_t spec_count[MAX_AGG_SPECS];    /* live-value count per spec */
 } VSStaged;
 
+/* One deferred lookup: a hash16 plus the staged[] index its record feeds. */
 typedef struct {
-    VSStaged              *cur;
+    uint8_t h[BT_HASH_SIZE];
+    int     slot;
+} VSPendPair;
+
+typedef struct {
+    VSStaged              *staged;         /* base of staging array */
     const AggSpec         *specs;
     const TypedField     **spec_tfs;
     int                    nspecs;
+    const VSPendPair      *pairs;          /* sorted by hash16 */
+    size_t                 n;
+    /* Partition workers deliver concurrently; staged accums are shared
+     * per slot set, so attribution writes serialize through this mu. */
+    pthread_mutex_t        mu;
 } VSLookupCtx;
+
+/* Binary search the flushed pending set for `hash16`; -1 when absent. */
+static int vs_pair_find(const VSLookupCtx *c, const uint8_t hash16[16]) {
+    size_t lo = 0, hi = c->n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int r = memcmp(c->pairs[mid].h, hash16, BT_HASH_SIZE);
+        if (r == 0) return (int)mid;
+        if (r < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return -1;
+}
 
 /* slotcask_lookup_by_hash callback for the varchar-streaming fast path.
    Decodes every SUM/AVG/MIN/MAX spec's field from the typed record bytes
@@ -3154,8 +3221,12 @@ static int vs_lookup_cb(const uint8_t hash16[16],
                         const void *key, size_t klen,
                         const void *value, size_t vlen,
                         void *raw) {
-    (void)hash16; (void)key; (void)klen; (void)vlen;
+    (void)key; (void)klen; (void)vlen;
     VSLookupCtx *c = (VSLookupCtx *)raw;
+    int p = vs_pair_find(c, hash16);
+    if (p < 0) return 0;
+    pthread_mutex_lock(&c->mu);
+    VSStaged *cur = &c->staged[c->pairs[p].slot];
     const uint8_t *rec = (const uint8_t *)value;
     for (int i = 0; i < c->nspecs; i++) {
         enum AggFn fn = c->specs[i].fn;
@@ -3167,23 +3238,104 @@ static int vs_lookup_cb(const uint8_t hash16[16],
         switch (fn) {
         case AGG_SUM:
         case AGG_AVG:
-            c->cur->spec_sum[i] += v;
-            c->cur->spec_count[i]++;
+            cur->spec_sum[i] += v;
+            cur->spec_count[i]++;
             break;
         case AGG_MIN:
-            if (c->cur->spec_count[i] == 0 || v < c->cur->spec_min[i])
-                c->cur->spec_min[i] = v;
-            c->cur->spec_count[i]++;
+            if (cur->spec_count[i] == 0 || v < cur->spec_min[i])
+                cur->spec_min[i] = v;
+            cur->spec_count[i]++;
             break;
         case AGG_MAX:
-            if (c->cur->spec_count[i] == 0 || v > c->cur->spec_max[i])
-                c->cur->spec_max[i] = v;
-            c->cur->spec_count[i]++;
+            if (cur->spec_count[i] == 0 || v > cur->spec_max[i])
+                cur->spec_max[i] = v;
+            cur->spec_count[i]++;
             break;
         default: break;
         }
     }
-    return 1;
+    /* Batched attribution is exact via the pair map; a non-zero return
+       would abort the enclosing bulk-fetch run and drop the rest of the
+       flushed batch. */
+    pthread_mutex_unlock(&c->mu);
+    return 0;
+}
+
+
+/* Flush one batch of deferred VS lookups (see the merge loop below).
+ * Closes every open cursor FIRST so the blocking kf fetch happens with
+ * no bt_cache rdlocks held (2026-08-27 lock-inversion fix), then — when
+ * want_reopen is set — reopens each live cursor at its own cur_keys[]
+ * snapshot (head snapshots were advanced past consumed runs before the
+ * close, and leaf order is monotone ascending, so nothing redelivers). */
+static int vs_pend_cmp(const void *a, const void *b) {
+    const VSPendPair *pa = a, *pb = b;
+    return memcmp(pa->h, pb->h, BT_HASH_SIZE);
+}
+
+static void vs_flush_pending(SlotcaskDb *sdb,
+                             VSLookupCtx *lc,
+                             VSPendPair *pairs, size_t pend_n,
+                             BtRangeIter **iters, int *has_cur,
+                             char (*cur_keys)[BT_MAX_VAL_LEN + 1],
+                             size_t *cur_klens, uint8_t (*cur_hash16)[16],
+                             int n_idx_g, const char *db_root,
+                             const char *object, const char *group_field,
+                             int want_reopen) {
+    if (!sdb || pend_n == 0) return;
+
+    for (int s = 0; s < n_idx_g; s++) {
+        if (iters[s]) { btree_range_iter_close(iters[s]); iters[s] = NULL; }
+    }
+
+    qsort(pairs, pend_n, sizeof(VSPendPair), vs_pend_cmp);
+    lc->pairs = pairs;
+    lc->n     = pend_n;
+    {int hits=0; (void)hits;}
+    /* Dense parallel hash matrix for the bulk resolver (pairs stride is
+       24 B, not 16 B, so materialize contiguity explicitly). */
+    uint8_t (*dense)[16] = malloc(pend_n * 16);
+    if (!dense) return;
+    for (size_t i = 0; i < pend_n; i++)
+        memcpy(dense[i], pairs[i].h, 16);
+    slotcask_bulk_resolve_and_fetch(sdb, (const uint8_t (*)[16])dense,
+                                    pend_n, lc, vs_lookup_cb);
+    free(dense);
+
+    if (!want_reopen) return;
+    for (int s = 0; s < n_idx_g; s++) {
+        if (!has_cur[s]) continue;
+        char idx_path[PATH_MAX];
+        build_idx_path(idx_path, sizeof(idx_path), db_root, object,
+                       group_field, s);
+        iters[s] = btree_range_iter_open(
+            idx_path, cur_keys[s], cur_klens[s], 0,
+            "\xff\xff\xff\xff", 4, 0, 0);
+        if (!iters[s]) { has_cur[s] = 0; continue; }
+        /* Restore the head entry. Leaf order is monotone, so the first
+         * yield is >= the snapshot; accept anything at-or-after it. */
+        int restored = 0;
+        for (int guard = 0; guard < 4096 && !restored; guard++) {
+            const char *v; size_t vl; const uint8_t *h;
+            if (btree_range_iter_next(iters[s], &v, &vl, &h) != 1) {
+                has_cur[s] = 0;
+                break;
+            }
+            if (vl < cur_klens[s] ||
+                memcmp(v, cur_keys[s], cur_klens[s]) < 0)
+                continue;                       /* stale-ish; skip forward */
+            size_t cap = (vl > BT_MAX_VAL_LEN) ? BT_MAX_VAL_LEN : vl;
+            memcpy(cur_keys[s], v, cap);
+            cur_klens[s] = cap;
+            memcpy(cur_hash16[s], h, 16);
+            restored = 1;
+        }
+        if (!restored && iters[s]) {
+            btree_range_iter_close(iters[s]);
+            iters[s] = NULL;
+            has_cur[s] = 0;
+        }
+    }
 }
 
 /* Single-spec MIN/MAX driven by a KeySet over an indexed field.
@@ -3225,7 +3377,8 @@ static void emit_min_max_via_keyset(const char *db_root, const char *object,
                 if (!have) { best = v; have = 1; }
                 else if (desc) { if (v > best) best = v; }
                 else           { if (v < best) best = v; }
-                break; /* per-shard min/max found */
+                break;
+                    /* per-shard min/max found */
             }
         }
         btree_range_iter_close(it);
@@ -3519,7 +3672,8 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             AggSpec *sp = &specs[i];
             if (sp->fn == AGG_COUNT) {
                 if (sp->field[0]) {
-                    if (strchr(sp->field, '+')) { eligible = 0; break; }
+                    if (strchr(sp->field, '+')) { eligible = 0; break;
+                    }
                     int fi = typed_field_index(fs.ts, sp->field);
                     if (fi >= 0 && fs.ts->fields[fi].type == FT_VARCHAR) {
                         eligible = 0; break;
@@ -3749,9 +3903,11 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         int all_int = 1;
         int total_width = 0;
         for (int i = 0; i < ctx.ngroups; i++) {
-            if (!ctx.group_tfs[i]) { all_int = 0; break; }
+            if (!ctx.group_tfs[i]) { all_int = 0; break;
+                    }
             int w = typed_field_int_width(ctx.group_tfs[i]->type);
-            if (w <= 0) { all_int = 0; break; }
+            if (w <= 0) { all_int = 0; break;
+                    }
             total_width += w;
         }
         ctx.use_int_keys = (all_int && total_width <= AGG_INT_KEY_CAP);
@@ -4029,7 +4185,8 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
            Saves ~150ms on a 1M table. */
         int count_only = 1;
         for (int i = 0; i < nspecs; i++) {
-            if (specs[i].fn != AGG_COUNT) { count_only = 0; break; }
+            if (specs[i].fn != AGG_COUNT) { count_only = 0; break;
+                    }
             /* count(varchar field) needs per-record elen>0 check, which
                idx_count_cb can't do — bail to the legacy two-side path. */
             if (specs[i].field[0] && ctx.spec_tfs[i] &&
@@ -4040,18 +4197,17 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         if (count_only) {
             SearchCriterion pos = neq_leaf_node->leaf;
             pos.op = OP_EQUAL;
-            int pos_cp = op_needs_check_primary(pos.op);
-            const TypedField *pos_tf = resolve_idx_field(fs.ts, pos.field);
-            IdxCountCtx ic = { &pos, pos_cp, 0, &dl, 0, pos_tf };
-            btree_dispatch(db_root, object, pos.field, sch.splits,
-                           &pos, pos_tf, idx_count_cb, &ic);
+            /* Kf-boundary count: the eq-side count is validated through
+               the record fetch, never raw index visit counting. */
+            size_t pos_n = idx_count_for_leaf(db_root, object, &sch, &fs,
+                                              &pos, &dl);
             if (dl.timed_out) {
                 LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query deadline exceeded (NEQ split-plan position check)");
                 OUT("{\"error\":\"query_timeout\"}\n");
                 agg_free(&ctx); return -1;
             }
             int total = get_live_count(db_root, object);
-            size_t neg = ((size_t)total > ic.count) ? (size_t)total - ic.count : 0;
+            size_t neg = ((size_t)total > pos_n) ? (size_t)total - pos_n : 0;
             if (csv_delim) {
                 for (int i = 0; i < nspecs; i++) {
                     if (i > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
@@ -4193,7 +4349,8 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             AggSpec *sp = &specs[i];
             if (sp->fn == AGG_COUNT) {
                 if (sp->field[0]) {
-                    if (strchr(sp->field, '+')) { aw_eligible = 0; break; }
+                    if (strchr(sp->field, '+')) { aw_eligible = 0; break;
+                    }
                     int fi = typed_field_index(fs.ts, sp->field);
                     if (fi >= 0 && fs.ts->fields[fi].type == FT_VARCHAR) {
                         aw_eligible = 0; break;
@@ -4404,8 +4561,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     for (int i = 0; i < nspecs; i++) {
                         if (i > 0) OUT(",");
                         if (specs[i].fn == AGG_COUNT) {
-                            OUT("\"%s\":%ld", specs[i].alias, match_count);
-                        } else {
+                            OUT("\"%s\":%ld", specs[i].alias, match_count);                        } else {
                             double r = 0.0;
                             switch (specs[i].fn) {
                                 case AGG_SUM: r = sums[i]; break;
@@ -4455,6 +4611,12 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
        cheaper than millions of per-record lookups. Abort and fall
        through to IGB cleanly — nothing has been written to ctx.ht yet. */
 #define VS_RUN_HASH_CAP 16384
+/* Deferred-lookup batch cap for the same fast path. Pending hashes are
+ * flushed (cursors closed -> blocking kf fetch -> reopen) whenever they
+ * cross this, so no bt rdlock is ever held across kfcache acquires
+ * (2026-08-27 lock-inversion fix). */
+#define VS_FLUSH_CAP 4096
+#define VS_PEND_CAP   (VS_FLUSH_CAP + VS_RUN_HASH_CAP)
     /* VS path stops at `limit` entries — ctx.ht never has the full group
        count.  When the caller needs total, fall through to IGB (which builds
        the full hash table) so agg_total_groups is exact. */
@@ -4538,10 +4700,14 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             }
         }
 
-        /* Reusable per-run hash16 buffer. Stack frame is ~256 KB which is
-           well under the 8 MB default thread stack; bench / TCP worker
-           threads use the default. */
-        uint8_t run_hashes[VS_RUN_HASH_CAP][16];
+        /* Deferred-lookup pending set (see VS_FLUSH_CAP above). */
+        VSPendPair *pend = calloc(VS_PEND_CAP, sizeof(VSPendPair));
+        if (!pend) {
+            free(iters); free(cur_keys); free(cur_klens);
+            free(has_cur); free(cur_hash16); free(staged);
+            goto vs_skip;
+        }
+        size_t pend_n = 0;
         int emitted = 0;
         int aborted = 0;
         while (emitted < limit && !aborted) {
@@ -4557,7 +4723,8 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 if (c < 0 || (c == 0 && cur_klens[s] < cur_klens[min_s]))
                     min_s = s;
             }
-            if (min_s < 0) break;  /* all cursors drained */
+            if (min_s < 0) break;
+                     /* all cursors drained */
 
             /* Snapshot the winning key before advancing any cursor (some
                cursors share its memory via cur_keys[]). */
@@ -4569,16 +4736,21 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                currently sitting on this key. Collect hash16s for the
                record fetches if any spec needs lookup. */
             int64_t total_count = 0;
+            int this_slot = emitted;      /* staged row for this run */
             int hash_count = 0;
             for (int s = 0; s < n_idx_g; s++) {
                 while (has_cur[s] && cur_klens[s] == min_klen &&
                        memcmp(cur_keys[s], min_key, min_klen) == 0) {
                     if (vs_need_lookup) {
-                        if (hash_count >= VS_RUN_HASH_CAP) {
+                        if (hash_count >= VS_RUN_HASH_CAP ||
+                            pend_n >= VS_PEND_CAP) {
                             aborted = 1;
                             break;
                         }
-                        memcpy(run_hashes[hash_count++], cur_hash16[s], 16);
+                        memcpy(pend[pend_n].h, cur_hash16[s], BT_HASH_SIZE);
+                        pend[pend_n].slot = this_slot;
+                        pend_n++;
+                        hash_count++;
                     }
                     total_count++;
                     const char *v; size_t vl; const uint8_t *h;
@@ -4607,25 +4779,48 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 cur->spec_count[i] = 0;
             }
 
-            /* Lookup each hash16, decode all SUM/AVG/MIN/MAX specs from
-               the typed record in one cb invocation per record. */
-            if (vs_need_lookup) {
-                VSLookupCtx lc = {
-                    .cur     = cur,
-                    .specs   = specs,
-                    .spec_tfs = ctx.spec_tfs,
-                    .nspecs  = nspecs,
-                };
-                for (int j = 0; j < hash_count; j++) {
-                    slotcask_lookup_by_hash(vs_sdb, run_hashes[j],
-                                             vs_lookup_cb, &lc);
-                }
-            }
             emitted++;
+
+            /* Batched deferred fetch: close every cursor first so the
+               blocking kf work runs with zero bt rdlocks held, then
+               reopen at the surviving head snapshots (VS_FLUSH_CAP). */
+            if (vs_need_lookup && pend_n >= VS_FLUSH_CAP) {
+                VSLookupCtx lc = {
+                    .staged   = staged,
+                    .specs    = specs,
+                    .spec_tfs = ctx.spec_tfs,
+                    .nspecs   = nspecs,
+                };
+                pthread_mutex_init(&lc.mu, NULL);
+                vs_flush_pending(vs_sdb, &lc, pend, pend_n,
+                                 iters, has_cur, cur_keys, cur_klens,
+                                 cur_hash16, n_idx_g, db_root, object,
+                                 ctx.group_fields[0], 1 /* reopen */);
+                pthread_mutex_destroy(&lc.mu);
+                pend_n = 0;
+            }
         }
 
         for (int s = 0; s < n_idx_g; s++)
-            if (iters[s]) btree_range_iter_close(iters[s]);
+            if (iters[s]) { btree_range_iter_close(iters[s]); iters[s] = NULL; }
+
+        if (!aborted && vs_need_lookup && pend_n > 0) {
+            VSLookupCtx lc = {
+                .staged   = staged,
+                .specs    = specs,
+                .spec_tfs = ctx.spec_tfs,
+                .nspecs   = nspecs,
+            };
+            pthread_mutex_init(&lc.mu, NULL);
+            vs_flush_pending(vs_sdb, &lc, pend, pend_n,
+                             iters, has_cur, cur_keys, cur_klens,
+                             cur_hash16, n_idx_g, db_root, object,
+                             ctx.group_fields[0], 0 /* no reopen */);
+            pthread_mutex_destroy(&lc.mu);
+            pend_n = 0;
+        }
+        free(pend);
+
         free(iters); free(cur_keys); free(cur_klens);
         free(has_cur); free(cur_hash16);
 
@@ -4729,7 +4924,8 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
             if (sp->fn == AGG_COUNT) {
                 if (sp->field[0] && ctx.spec_tfs[i] &&
                     ctx.spec_tfs[i]->type == FT_VARCHAR) {
-                    igb_eligible = 0; break;  /* count(varchar): per-record elen */
+                    igb_eligible = 0; break;
+                     /* count(varchar): per-record elen */
                 }
                 continue;
             }
@@ -4847,7 +5043,8 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                     if (sc && sc->op == OP_EQUAL)
                         n_crit++;
                     else
-                        { can_slot = 0; break; }
+                        { can_slot = 0; break;
+                    }
                 }
                 if (n_crit == 0) can_slot = 0;
             }
@@ -4858,10 +5055,12 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                 for (int ci = 0; ci < n_crit; ci++) {
                     SearchCriterion *sc = igb_crit_fp.source_leaves[ci];
                     const TypedField *ctf = resolve_idx_field(fs.ts, sc->field);
-                    if (!ctf) { can_slot = 0; break; }
+                    if (!ctf) { can_slot = 0; break;
+                    }
                     encode_criterion_value(ctf, sc->value, strlen(sc->value),
                                            cvals[ci], &cvlens[ci]);
-                    if (cvlens[ci] == 0) { can_slot = 0; break; }
+                    if (cvlens[ci] == 0) { can_slot = 0; break;
+                    }
                 }
                 if (can_slot) {
                     unsigned long counts[256] = {0};
@@ -4880,7 +5079,8 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                             bm_build_path(cp, sizeof(cp), db_root, object,
                                           igb_crit_fp.source_leaves[ci]->field, s);
                             c_bms[ci] = bm_open(cp, 0, 0, 0, 0, 0);
-                            if (!c_bms[ci]) { c_ok = 0; break; }
+                            if (!c_bms[ci]) { c_ok = 0; break;
+                    }
                         }
                         if (!c_ok) {
                             for (int ci = 0; ci < n_crit; ci++)
@@ -5008,7 +5208,8 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                     char *kvp_h[1] = { display_h };
                     AggBucket *bkt_h = agg_find_or_create(&ctx, kvp_h, 1,
                                                            NULL, 0);
-                    if (!bkt_h) { bm_aborted = 1; break; }
+                    if (!bkt_h) { bm_aborted = 1; break;
+                    }
 
                     /* Walk all bitmap shards for this value; emit hash16 → hbk. */
                     BmHbkInsertCtx bx = { .hbk = &hbk_bm, .bucket = bkt_h, .actx = &ctx };
@@ -5184,7 +5385,8 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                    HashStrEntry stores value as (off, len) into local_map.arena;
                    dereference via lm->arena + he->off. */
                 for (int s = 0; s < n_idx_s && !sec_aborted; s++) {
-                    if (sw[s].aborted) { sec_aborted = 1; break; }
+                    if (sw[s].aborted) { sec_aborted = 1; break;
+                    }
                     HashStrMap *lm = &sw[s].local_map;
                     if (!lm->entries) continue;
                     for (size_t bi = 0; bi < lm->cap; bi++) {
@@ -5318,7 +5520,8 @@ sec_aborted_label:
                         } else {
                             for (int w = 0; w < n_idx_g; w++) {
                                 scatter[w] = calloc((size_t)npart, sizeof(BktArr));
-                                if (!scatter[w]) { aborted = 1; budget_exceeded = 1; break; }
+                                if (!scatter[w]) { aborted = 1; budget_exceeded = 1; break;
+                    }
                             }
                         }
                     }
@@ -5484,7 +5687,8 @@ sec_aborted_label:
                 const char *val; size_t vlen; const uint8_t *hash16;
                 prev_enc_len = 0; prev_bkt = NULL;
                 while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-                    if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break; }
+                    if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break;
+                    }
                     /* Criteria filter: skip leaf entries whose record didn't
                        match the criteria-derived KeySet. crit_ks NULL means
                        no criteria, so every entry passes. */
@@ -5535,7 +5739,8 @@ sec_aborted_label:
                         if (multi_skip) continue;
                         bkt = (struct AggBucket *)agg_find_or_create(
                                 &ctx, gvals, ctx.ngroups, raw_key, raw_key_len);
-                        if (!bkt) { aborted = 1; break; }
+                        if (!bkt) { aborted = 1; break;
+                    }
                         if (n_sec == 0 && vlen <= sizeof(prev_enc)) {
                             memcpy(prev_enc, val, vlen);
                             prev_enc_len = vlen;
@@ -5612,7 +5817,8 @@ igb_pass2:
                            invalidated on next iter_next call). */
                         while (filled < PFB) {
                             if (btree_range_iter_next(it, &val, &vlen, &hash16) != 1) break;
-                            if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break; }
+                            if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break;
+                    }
                             double v;
                             if (!decode_index_key_to_double(atf,
                                                            (const uint8_t *)val,
@@ -5712,10 +5918,12 @@ igb_skip:
         /* Validate order_by: must be a group_by field or an aggregate alias */
         int valid_order = 0;
         for (int i = 0; i < ctx.ngroups; i++)
-            if (strcmp(ctx.group_fields[i], order_by) == 0) { valid_order = 1; break; }
+            if (strcmp(ctx.group_fields[i], order_by) == 0) { valid_order = 1; break;
+                    }
         if (!valid_order)
             for (int i = 0; i < nspecs; i++)
-                if (strcmp(specs[i].alias, order_by) == 0) { valid_order = 1; break; }
+                if (strcmp(specs[i].alias, order_by) == 0) { valid_order = 1; break;
+                    }
         if (!valid_order) {
             OUT("{\"error\":\"order_by '%s' is not a group_by field or aggregate alias\"}\n",
                 order_by);
@@ -5946,7 +6154,8 @@ void group_by_csv_to_json(const char *csv, char *out, size_t out_sz) {
             if (remain <= 0) break;
             int n = snprintf(out + pos, (size_t)remain, "%s\"%.*s\"",
                              first ? "" : ",", flen, start);
-            if (n < 0 || n >= remain) break;   /* would truncate — stop here */
+            if (n < 0 || n >= remain) break;
+                      /* would truncate — stop here */
             pos += n;
             first = 0;
             if (*p == ',') p++;

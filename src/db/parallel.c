@@ -64,6 +64,17 @@ typedef struct {
     void *(*fn)(void *);
     void *arg;
     PoolGroup *group;
+    /* The submitting thread's g_db, captured at enqueue time. Workers bind
+       their own thread-local g_db to this (falling back to
+       g_shard_db_instance if the submitter had none) right before running
+       the task — per-task, not once at worker-thread creation. A one-time
+       capture at thread startup freezes whatever g_shard_db_instance held
+       at that moment for the pool's entire lifetime; since these pools are
+       persistent and lazily created on first use, a worker can be spun up
+       before any ShardDb has opened (or bound to a stale/wrong instance in
+       a multi-instance embedded process), permanently mis-binding every
+       task it ever runs. Resolving per-task fixes both. */
+    ShardDb *db;
 } PoolTask;
 
 /* Bounded queue. Capacity chosen to comfortably absorb N callers * P tasks
@@ -163,7 +174,6 @@ static void run_task_finish(PoolTask t) {
 
 static void *pool_worker(void *arg) {
     (void)arg;
-    g_db = g_shard_db_instance;
     while (1) {
         pthread_mutex_lock(&g_q_lock);
         while (g_q_count == 0 && g_pool_running)
@@ -175,6 +185,7 @@ static void *pool_worker(void *arg) {
         pthread_cond_signal(&g_q_not_full);
         pthread_mutex_unlock(&g_q_lock);
 
+        g_db = t.db ? t.db : g_shard_db_instance;
         t_in_pool_worker = 1;
         run_task_finish(t);
         t_in_pool_worker = 0;
@@ -271,7 +282,7 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
         if (end > n) end = n;
         pthread_mutex_lock(&g_q_lock);
         for (int j = i; j < end; j++) {
-            PoolTask t = { fn, (char *)args + (size_t)j * stride, &group };
+            PoolTask t = { fn, (char *)args + (size_t)j * stride, &group, g_db };
             enqueue_locked(t);
         }
         pthread_mutex_unlock(&g_q_lock);
@@ -305,7 +316,6 @@ void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
    nesting purposes, regardless of which pool it belongs to. */
 static void *io_pool_worker(void *arg) {
     (void)arg;
-    g_db = g_shard_db_instance;
     while (1) {
         pthread_mutex_lock(&g_io_q_lock);
         while (g_io_q_count == 0 && g_io_running)
@@ -316,6 +326,7 @@ static void *io_pool_worker(void *arg) {
         g_io_q_count--;
         pthread_cond_signal(&g_io_q_not_full);
         pthread_mutex_unlock(&g_io_q_lock);
+        g_db = t.db ? t.db : g_shard_db_instance;
         t_in_pool_worker = 1;
         run_task_finish(t);
         t_in_pool_worker = 0;
@@ -384,7 +395,7 @@ void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
         if (end > n) end = n;
         pthread_mutex_lock(&g_io_q_lock);
         for (int j = i; j < end; j++) {
-            PoolTask t = { fn, (char *)args + (size_t)j * stride, &group };
+            PoolTask t = { fn, (char *)args + (size_t)j * stride, &group, g_db };
             while (g_io_q_count >= IO_QUEUE_CAP)
                 pthread_cond_wait(&g_io_q_not_full, &g_io_q_lock);
             g_io_queue[g_io_q_tail] = t;

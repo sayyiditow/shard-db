@@ -70,7 +70,8 @@ static int test_slotcask_basic_run(void) {
         snprintf(key, sizeof(key), "user_%03d", i);
         int vlen = 50 + (i * 11) % 100;
         for (int j = 0; j < vlen; j++) val[j] = (char)('a' + ((i + j) % 26));
-        if (slotcask_insert(&db, -1, key, strlen(key), val, vlen) == 0) inserted++;
+        if (slotcask_insert_with_hooks(&db, -1, key, strlen(key), val, vlen,
+                                        NULL, NULL) == 0) inserted++;
     }
     ASSERT_EQ_INT(inserted, 10, "all 10 inserts succeed");
 
@@ -92,11 +93,16 @@ static int test_slotcask_basic_run(void) {
     ASSERT_EQ_INT(value_ok, 10, "all 10 values match");
 
     /* Duplicate insert returns -2 (already exists). */
-    int dup_rc = slotcask_insert(&db, -1, "user_005", 8, "xxx", 3);
+    int dup_rc = slotcask_insert_with_hooks(&db, -1, "user_005", 8, "xxx", 3,
+                                             NULL, NULL);
     ASSERT_EQ_INT(dup_rc, -2, "duplicate insert returns -2");
 
     /* Update one key; get returns the new value. */
-    rc = slotcask_update(&db, -1, "user_003", 8, "NEW_VALUE", 9);
+    SlotcaskUpsertOpts update_only;
+    memset(&update_only, 0, sizeof(update_only));
+    update_only.require_existing = 1;
+    rc = slotcask_upsert_with_hooks(&db, -1, "user_003", 8, "NEW_VALUE", 9,
+                                     &update_only, NULL);
     ASSERT_EQ_INT(rc, 0, "update succeeds");
     void *v = NULL; size_t vl = 0;
     rc = slotcask_get(&db, "user_003", 8, &v, &vl);
@@ -106,9 +112,9 @@ static int test_slotcask_basic_run(void) {
     free(v);
 
     /* Delete two keys; subsequent gets fail. */
-    rc = slotcask_delete(&db, "user_007", 8);
+    rc = slotcask_delete_with_hooks(&db, "user_007", 8, NULL, NULL);
     ASSERT_EQ_INT(rc, 0, "delete user_007 succeeds");
-    rc = slotcask_delete(&db, "user_008", 8);
+    rc = slotcask_delete_with_hooks(&db, "user_008", 8, NULL, NULL);
     ASSERT_EQ_INT(rc, 0, "delete user_008 succeeds");
 
     v = NULL; vl = 0;
@@ -117,7 +123,8 @@ static int test_slotcask_basic_run(void) {
     if (v) free(v);
 
     /* Insert a fresh key after deletes — should reuse a pool slot. */
-    rc = slotcask_insert(&db, -1, "user_999", 8, "REUSE", 5);
+    rc = slotcask_insert_with_hooks(&db, -1, "user_999", 8, "REUSE", 5,
+                                     NULL, NULL);
     ASSERT_EQ_INT(rc, 0, "insert after delete (snake-game reuse) succeeds");
     v = NULL; vl = 0;
     rc = slotcask_get(&db, "user_999", 8, &v, &vl);

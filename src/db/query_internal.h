@@ -171,6 +171,15 @@ int shard_group_batch(CollectedHash *batch, int batch_count,
                       int *group_starts, int *group_sizes,
                       int max_groups);
 
+/* query.c — Kf-boundary count for one indexed leaf: gathers candidates
+   from the leaf's index, then validates+counts through the record fetch
+   (which revalidates each candidate at the Kf reader). Raw index
+   popcounts are never the count answer. Used by count/find totals and
+   query_aggregate.c's NEQ fast path. */
+size_t idx_count_for_leaf(const char *db_root, const char *object,
+                          const Schema *sch, const FieldSchema *fs,
+                          SearchCriterion *leaf, QueryDeadline *dl);
+
 /* query_find.c — O_DIRECT scan helpers (used by query.c find/count paths) */
 int od_seg_record_cb(const uint8_t *rec, size_t vlen,
                      const uint8_t hash16[16], void *raw_ctx);

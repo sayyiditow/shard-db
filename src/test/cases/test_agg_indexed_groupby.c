@@ -205,7 +205,8 @@ static int test_agg_indexed_groupby_run(void) {
         "\"order_by\":\"n\",\"order\":\"desc\",\"limit\":2}", &resp);
     int bucket_count = 0;
     const char *p = resp;
-    while ((p = strstr(p, "\"age\":\"")) != NULL) { bucket_count++; p++; }
+    p = resp;
+    while (p && (p = strstr(p, "\"age\":\"")) != NULL) { bucket_count++; p++; }
     ASSERT_TRUE(bucket_count == 2, "order_by+limit returns 2 buckets");
     free(resp); resp = NULL;
 
