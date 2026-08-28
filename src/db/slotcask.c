@@ -4378,8 +4378,11 @@ static void __attribute__((unused)) idx_touch_record(const char *field, int idx_
     IdxTouchSet *s = tls_idx_touch;
     if (!s) return;
     if (s->n == s->cap) {
+        IdxTouch *nv;
+        /* Guard BEFORE doubling: s->cap * 2 itself must not overflow. */
+        if (s->cap > SIZE_MAX / (2 * sizeof(IdxTouch))) return;
         size_t ncap = s->cap ? s->cap * 2 : 16;
-        IdxTouch *nv = reallocarray(s->v, ncap, sizeof(*nv));
+        nv = realloc(s->v, ncap * sizeof(IdxTouch));
         if (!nv) return;
         s->v = nv; s->cap = ncap;
     }
@@ -4403,6 +4406,10 @@ typedef struct {
     IdxTouchSet        touch;
     KfInsertPlan      *abandoned;   /* reserved-but-rejected NEW-insert slots */
     size_t             nabandoned;
+    /* prepare_window ran OK: the caller's bulk_hook_ctx now owns staged
+       state that exactly one of {commit_done, abort_window, release_window}
+       must release at this window's exit (see bulk_commit_one_kf_window). */
+    int                hooks_staged;
 } BulkWindowPlan;
 
 static void bulk_window_plan_destroy(BulkWindowPlan *plan) {
@@ -4848,6 +4855,7 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
                 plan->active[n++] = i;
         if (uo->prepare_window(recs, plan->active, n,
                                uo->bulk_hook_ctx) != 0) goto hard_fail;
+        plan->hooks_staged = 1;
         /* hook may have set status=-1/-2 (policy); rebuild below */
     } else if (shard->kind == BULK_MUTATION_DELETE && txn->delete_opts &&
               txn->delete_opts->prepare_window) {
@@ -4857,6 +4865,7 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
                 plan->active[n++] = i;
         if (txn->delete_opts->prepare_window(recs, plan->active, n,
                                txn->delete_opts->bulk_hook_ctx) != 0) goto hard_fail;
+        plan->hooks_staged = 1;
     }
 
     plan->nactive = 0;
@@ -5296,6 +5305,8 @@ static int bulk_commit_one_kf_window(BulkMutationTxn *txn,
     SlotcaskKfHandle kh;
     BulkWindowPlan plan = {0};
     int prc, rc = -1;
+    int published = 0;   /* a marker file was actually created (M reached
+                            with nactive > 0): durable evidence may exist */
 
     if (kf_shard_acquire(&kh, txn->db, shard->kf_shard_id, 1) != 0)
         return -1;
@@ -5308,6 +5319,12 @@ static int bulk_commit_one_kf_window(BulkMutationTxn *txn,
     if (bulk_plan_window_locked(txn, shard, begin, end, &kh, &plan) != 0)
         goto out;
     prc = bulk_publish_window_marker_locked(txn, &kh, &plan);
+    /* publish returns 0 WITHOUT creating any marker when the window
+       planned zero active records (all records policy-rejected) — that is
+       not a commit point. Only nactive > 0 with prc >= 0 means durable
+       marker evidence exists (prc > 0: created but durability
+       unconfirmed). */
+    if (prc >= 0 && plan.nactive > 0) published = 1;
     if (prc < 0) goto out;        /* pre-M: nothing was published */
     if (prc > 0) goto replay;     /* published, durability unconfirmed */
     if (bulk_activate_new_payloads_locked(txn, &plan) != 0) goto replay;
@@ -5329,6 +5346,32 @@ replay:
         rc = -2;  /* outcome pending */
     }
 out:
+    /* Exactly one release route per staged window. No marker evidence →
+       abort_window (publish failed pre-M, or the window planned zero
+       active records and M was skipped: nothing was ever committed, even
+       when the batch rc is 0; v2's prepare already self-released the
+       all-rejected case, so this is an idempotent no-op there). Marker
+       evidence + rc==0 → commit_done (durable; no further hook re-entry).
+       Marker evidence + failure → release_window (the marker owns
+       recovery; gate and startup replay re-derive from disk and never
+       re-enter these hooks). Pointers stay const: BulkMutationShard
+       members are const-qualified. All routes NULL-guarded. */
+    if (plan.hooks_staged) {
+        const SlotcaskBulkOpts *uo = shard->upsert_opts;
+        const SlotcaskBulkDeleteOpts *dopt = shard->delete_opts;
+        if (!published) {
+            if (uo && uo->abort_window)
+                uo->abort_window(uo->bulk_hook_ctx);
+            else if (dopt && dopt->abort_window)
+                dopt->abort_window(dopt->bulk_hook_ctx);
+        } else if (rc == 0) {
+            if (uo && uo->commit_done)
+                uo->commit_done(uo->bulk_hook_ctx);
+        } else {
+            if (uo && uo->release_window)
+                uo->release_window(uo->bulk_hook_ctx);
+        }
+    }
     bulk_window_plan_destroy(&plan);
     kfcache_release(&kh);
     /* Phase-1b OLD-read scratch (bulk_read_old_values) is window-private:
@@ -5620,8 +5663,19 @@ static int upsert_adapter_prepare_window(SlotcaskBulkRec *recs,
     UpsertAdapterCtx *actx = (UpsertAdapterCtx *)ctx;
     const SlotcaskUpsertOpts *uo = actx->uo;
     if (!uo->prepare_commit) return 0;
-    return uo->prepare_commit(rec->value, rec->vlen, rec->kf_slot,
-                              uo->pre_commit_ctx) != 0 ? -1 : 0;
+    if (uo->prepare_commit(rec->value, rec->vlen, rec->kf_slot,
+                           uo->pre_commit_ctx) != 0) {
+        /* Self-clean contract (slotcask.h): a failed prepare_window must
+           release its staging before returning non-zero. Inner two-phase
+           hooks express that release as abort_commit, and the primitive
+           frees are idempotent (free+zero), so running it here is safe
+           even when prepare_commit already cleaned itself up. The
+           coordinator fires no route for this window — hooks_staged is
+           only set after a successful prepare. */
+        if (uo->abort_commit) uo->abort_commit(uo->pre_commit_ctx);
+        return -1;
+    }
+    return 0;
 }
 
 static int upsert_adapter_apply_window(SlotcaskBulkRec *recs,

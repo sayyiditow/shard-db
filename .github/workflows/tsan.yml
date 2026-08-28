@@ -49,13 +49,19 @@ jobs:
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
       - name: Run full C test suite under TSan
-        run: ./build/bin/shard-db-test run-all --exclude "$SHARD_TEST_EXCLUDE" --jobs 2
+        # tee: embedded-harness findings print to the runner log, not the
+        # daemon log dir — capture them for the scan step below.
+        run: |
+          set -eo pipefail
+          ./build/bin/shard-db-test run-all --exclude "$SHARD_TEST_EXCLUDE" --jobs 2 2>&1 | tee /tmp/suite-output.log
 
       - name: Fail if any TSan findings escaped
+        # always(): this backstop must run even when the suite step fails.
+        if: always()
         run: |
-          if grep -Erq "ThreadSanitizer|WARNING:|data race|deadlock" /tmp/shard-db_*/logs/ 2>/dev/null; then
-            echo "::error::TSan findings detected in daemon logs"
-            grep -Er "ThreadSanitizer|WARNING:|data race|deadlock" /tmp/shard-db_*/logs/ | head -50
+          if grep -Erq "ThreadSanitizer|WARNING:|data race|deadlock" /tmp/shard-db_*/logs/ /tmp/suite-output.log 2>/dev/null; then
+            echo "::error::TSan findings detected in daemon logs or runner output"
+            grep -Er "ThreadSanitizer|WARNING:|data race|deadlock" /tmp/shard-db_*/logs/ /tmp/suite-output.log | head -50
             exit 1
           fi
           echo "No TSan findings."

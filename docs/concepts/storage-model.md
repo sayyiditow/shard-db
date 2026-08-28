@@ -171,6 +171,18 @@ clears it. There is no abort-sidecar path: recovery never rolls a marker back.
 Marker cleanup (unlink + directory sync) is the sole cleanup step; corrupt or
 unparseable marker evidence fails closed rather than being guessed at.
 
+Each window's caller-facing hooks release exactly once, chosen by on-disk
+truth rather than the batch's return code: if no marker evidence exists
+(pre-marker publication failure, or a window whose every record was
+policy-rejected, so publication was skipped entirely) the coordinator fires
+`abort_window` — the window was never committed. If the marker is durable and
+the window converges, `commit_done` fires. If the marker is durable but the
+in-process replay fails to converge (`EINPROGRESS`), the new `release_window`
+fires: durable recovery belongs to the marker from that point, and both
+`kf_shard_marker_gate` and the startup sweep re-derive every index mutation
+from marker + segment bytes without ever re-entering the caller's hooks. A
+failed `prepare_window` is self-cleaning and fires no release route.
+
 A prior release (2026.08.1) persisted a matching abort sidecar on post-marker
 index-apply failure and rolled the mutation back on recovery. That mechanism
 was removed for this release: upgrading onto this version requires the data

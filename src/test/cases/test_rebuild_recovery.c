@@ -60,7 +60,11 @@ static int test_rebuild_recovery_run(void) {
     char saved_db_root[256];
     snprintf(saved_db_root, sizeof(saved_db_root), "%s", env.db_root);
 
-    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
+    /* 120s: the vacuum/rebuild round-trip exceeded 30s once on the shared
+       CI ASan runner under --jobs 2 contention (2026-08-28 run), which
+       left .rebuild_txn.active behind and cascaded through every later
+       assert. Same treatment as test-auto-reshard's 90s→600s. */
+    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 120000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
