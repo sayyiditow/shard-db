@@ -6,6 +6,28 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**Fixed: `.tsan.supp` eliminated — every suppressed finding fixed or
+restructured.** The registry UAF is closed structurally: `SlotcaskDb`
+lifetime is refcounted (`slotcask_registry_get` takes a reference,
+callers release via `slotcask_registry_put`/`SDB_REG_REF`), the table
+publishes table+caller references at install, shutdown participates in
+the protocol, and drop-object now takes the object's objlock wrlock at
+dispatch (its registry invalidate previously ran with no per-object
+lock at all). Registry and cache warm paths lazily bind the
+thread-local `g_db` from the process instance, so raw threads can use
+the low-level APIs without aliasing a garbage lock/cond table.
+`slotcask_bulk_lookup_in_kfshard` holds its kf reader across the
+segment-verify phase (the 2026-08-21 window contract; was a real
+plain-vs-plain race against window T/P steps). Segment byte-18 flag
+accesses are uniformly release-store/acquire-load, including the
+O_DIRECT scanner's previously plain loads. The `deadlock:bt_acquire`
+report never re-fired after the chunked-resumable fetch rework and is
+deleted with the documented no-nesting proof. Regression tests:
+`test-registry-uaf-invalidate`, `test-drop-object-read-wire`,
+`test-bulk-lookup-kf-held-gap`. AGENTS.md/CI gate invocations no
+longer reference a suppressions file; any new TSan report fails the
+gate and must be root-caused.
+
 **Fixed: window release hooks never fired (per-call staging leak).** The
 window coordinator (`bulk_commit_one_kf_window`) never invoked the
 `commit_done`/`abort_window` hooks that indexed bulk inserts wired in, so

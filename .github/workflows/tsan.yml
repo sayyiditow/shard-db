@@ -9,10 +9,10 @@ name: TSan (ThreadSanitizer)
 # CPU. The nested test-runner-parallel case is excluded below because its
 # own child runner is a timing-sensitive harness test, not a TSan check.
 #
-# Known, already-tracked findings are suppressed via .tsan.supp — see
-# that file for the full rationale on each. Suppressions are named and
-# documented, never blanket; anything not explicitly suppressed there
-# fails this job.
+# No suppression file: all previously suppressed findings were fixed or
+# restructured (2026-08-30) — see docs/plans/2026-08-28-eliminate-tsan-supp.md
+# for the rationale on each. Any new TSan finding fails this job and must be
+# root-caused, not suppressed.
 
 on:
   push:
@@ -36,7 +36,7 @@ jobs:
       BUILD_MODE: tsan
       # No halt_on_error=0: reported errors must set the failing exit
       # code (collect-all + fail-at-exit), never print-and-pass.
-      TSAN_OPTIONS: "second_deadlock_stack=1:print_stacktrace=1:report_signal_unsafe=0:report_atomic_races=0:suppressions=${{ github.workspace }}/.tsan.supp"
+      TSAN_OPTIONS: "second_deadlock_stack=1:print_stacktrace=1:report_signal_unsafe=0:report_atomic_races=0"
       # test-runner-parallel's own nested run-all spawns a --jobs 4
       # sub-run internally, unrelated to the --jobs 2 outer setting below.
       # This runner is too weak for that nested width; narrow it to 2.

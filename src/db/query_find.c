@@ -257,7 +257,7 @@ int scan_dispatch(const char *db_root, const char *object,
         .splits = sc->splits, .slot_size = sc->slot_size,
         .streams = sc->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "scan_dispatch: slotcask_registry_get failed for %s/%s", db_root, object);
         return -1;
@@ -305,7 +305,7 @@ int read_record_ref(const char *db_root, const char *object,
         .splits = sch->splits, .slot_size = sch->slot_size,
         .streams = sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "read_record_ref: slotcask_registry_get failed for %s/%s", db_root, object);
         return -1;
@@ -326,7 +326,7 @@ int read_record_ref_try(const char *db_root, const char *object,
         .splits = sch->splits, .slot_size = sch->slot_size,
         .streams = sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "read_record_ref_try: slotcask_registry_get failed for %s/%s", db_root, object);
         return 1;
@@ -1324,7 +1324,7 @@ int cmd_exists(const char *db_root, const char *object,
         .splits = sc.splits, .slot_size = sc.slot_size,
         .streams = sc.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) { OUT("false\n"); return 1; }
     int rc = slotcask_exists(sdb, key, klen);
     OUT("%s\n", rc == 1 ? "true" : "false");
@@ -1392,7 +1392,7 @@ int cmd_keys(const char *db_root, const char *object, int offset, int limit,
             .splits = sch.splits, .slot_size = sch.slot_size,
             .streams = sch.streams,
         };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
         if (sdb) scan_shards_v2_streaming(sdb, keys_cb, &ctx);
         else     scan_dispatch(db_root, object, &sch, data_dir, keys_cb, &ctx);
     } else {
@@ -1734,7 +1734,7 @@ static int cmd_fetch_v2(const char *db_root, const char *object,
         .splits = sch->splits, .slot_size = sch->slot_size,
         .streams = sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
 
     if (csv_delim) {
         if (want_total) {

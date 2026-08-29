@@ -606,7 +606,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
         .splits = old_sch.splits, .slot_size = old_sch.slot_size,
         .streams = old_sch.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         OUT("{\"error\":\"Failed to open slotcask for pre-flight\"}\n");
         return 1;

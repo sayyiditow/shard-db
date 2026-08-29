@@ -260,6 +260,8 @@ typedef struct SlotcaskDb {
                                 shards may have grown larger via auto-resplit */
     int     bulk_commit_window; /* records per commit window; 0 = default
                                    (1024). db.env BULK_COMMIT_WINDOW. */
+    /* Registry reference count; see slotcask_registry_get/put. */
+    uint64_t reg_refs;
 
     SlotcaskStream *streams;
 
@@ -889,8 +891,15 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
  *
  * Returns NULL on open failure (logged via fprintf to stderr).
  *
- * The pointer is BORROWED — never call slotcask_close on it. The registry
- * owns lifetime.
+ * The pointer is REFCOUNTED: each slotcask_registry_get() call takes one
+ * reference that the caller MUST release exactly once with
+ * slotcask_registry_put() (or the SDB_REG_REF scoped guard below) when
+ * the pointer is no longer needed — including on early-return paths.
+ * slotcask_registry_invalidate() unlinks the entry and flushes the
+ * kfcache/segcache prefixes immediately; the struct itself is closed and
+ * freed by the last put(). Only pointers obtained from
+ * slotcask_registry_get() are put()-able: a SlotcaskDb opened directly
+ * via slotcask_open() keeps its existing open/close pairing.
  */
 typedef struct {
     int splits;            /* num_shards for the keyfile */
@@ -901,6 +910,17 @@ typedef struct {
 SlotcaskDb *slotcask_registry_get(const char *effective_root,
                                   const char *object,
                                   const SlotcaskSchemaInfo *info);
+
+/* Release one reference taken by slotcask_registry_get(). NULL tolerated.
+   The last put() (transition 1→0) runs slotcask_close + free. */
+void slotcask_registry_put(SlotcaskDb *db);
+
+static inline void slotcask_registry_ref_release(SlotcaskDb **pp) {
+    if (pp) slotcask_registry_put(*pp);
+}
+
+/* Scoped guard for a confined registry reference. */
+#define SDB_REG_REF __attribute__((cleanup(slotcask_registry_ref_release)))
 
 void slotcask_registry_invalidate(const char *effective_root,
                                   const char *object);

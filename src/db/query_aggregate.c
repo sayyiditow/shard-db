@@ -102,7 +102,7 @@ static void keyset_emit_agg(const char *db_root, const char *object,
         .splits = sch->splits, .slot_size = sch->slot_size,
         .streams = sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &sinfo);
     if (sdb) {
         KeysetEmitAggCtx cb_ctx;
         memset(&cb_ctx, 0, sizeof(cb_ctx));
@@ -1640,7 +1640,7 @@ static void *wfc_worker(void *arg) {
         .splits = w->sch->splits, .slot_size = w->sch->slot_size,
         .streams = w->sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(w->db_root, w->object, &info);
 
     char idx_path[PATH_MAX];
     build_idx_path(idx_path, sizeof(idx_path),
@@ -2487,7 +2487,7 @@ static void *shard_agg_worker(void *arg) {
         .slot_size = sa->sch->slot_size,
         .streams = sa->sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(sa->db_root, sa->object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(sa->db_root, sa->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "shard_agg_worker: slotcask_registry_get failed for %s/%s", sa->db_root, sa->object);
         return NULL;
@@ -2791,7 +2791,7 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
             .splits = sch->splits, .slot_size = sch->slot_size,
             .streams = sch->streams,
         };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
         if (sdb) parallel_agg_scan_shards_o_direct(ctx, sdb);
     }
 
@@ -4654,7 +4654,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             vs_need_lookup = 1;
         }
     }
-    SlotcaskDb *vs_sdb = NULL;
+    SlotcaskDb *vs_sdb SDB_REG_REF = NULL;
     if (vs_eligible && vs_need_lookup) {
         SlotcaskSchemaInfo info = {
             .splits = sch.splits, .slot_size = sch.slot_size,
@@ -5193,7 +5193,7 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                     .slot_size = sch.slot_size,
                     .streams  = sch.streams
                 };
-                SlotcaskDb *bm_sdb = slotcask_registry_get(db_root, object,
+                SlotcaskDb *bm_sdb SDB_REG_REF = slotcask_registry_get(db_root, object,
                                                              &bm_info);
                 if (!bm_sdb) { hbk_free(&hbk_bm); goto igb_skip; }
 

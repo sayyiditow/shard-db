@@ -264,4 +264,12 @@ The full 232-case suite runs cleanly under both AddressSanitizer and ThreadSanit
 - `localtime` → `localtime_r` everywhere (libc's non-reentrant `localtime` returned a shared static buffer, racing across concurrent log calls).
 - `parallel_for`'s help-drain race fixed with an `_Atomic int finishing` counter — caller waits for both `remaining==0` AND `finishing==0` before destroying the pool group.
 
-Two known patterns remain suppressed (documented inline in `.tsan.supp`): the `bt_acquire / segcache_acquire / kfcache_acquire` verify-retry lock-order false positive (release happens between acquires; TSan tracks cycles without modeling unlocks), and the `seg_record_emit` byte-level races where the byte-18 flag is the release-store/acquire-load synchronisation point for the full record (C11 guarantees coherency after observing `flag==1`; TSan tracks each byte independently).
+As of 2026-08-30 there is no suppression file: every previously
+suppressed finding was fixed or restructured (registry lifetime is
+refcounted and drop-object takes the object wrlock; the bulk-lookup
+kf reader stays held across verify; the byte-18 flag is uniformly
+release-store/acquire-load; the `bt_acquire` verify-retry report never
+re-fired after the chunked-resumable fetch rework — no lock is ever
+held across a `bt_cache_lock` re-probe). See
+`docs/plans/2026-08-28-eliminate-tsan-supp.md` for the per-finding
+rationale. Any new TSan report fails the gate and must be root-caused.

@@ -57,7 +57,7 @@ static int test_reindex_bitmap_after_kf_resplit_run(void) {
         .slot_size = sch.slot_size,
         .streams = sch.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(effective_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(effective_root, object, &info);
     ASSERT_NOT_NULL(sdb, "open fixture slotcask registry entry");
     if (!sdb) {
         tu_pdb_drop_object(db, dir, object);

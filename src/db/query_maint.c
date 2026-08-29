@@ -130,7 +130,7 @@ int cmd_estimate_index(const char *db_root, const char *object,
     SlotcaskSchemaInfo info = {
         .splits = sch.splits, .slot_size = sch.slot_size, .streams = sch.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         OUT("{\"error\":\"slotcask open failed\"}\n");
         return 1;
@@ -204,7 +204,7 @@ int cmd_vacuum(const char *db_root, const char *object,
         .splits = sch.splits, .slot_size = sch.slot_size,
         .streams = sch.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         OUT("{\"error\":\"object not open\"}\n");
         return 1;
@@ -888,7 +888,7 @@ int cmd_recount(const char *db_root, const char *object) {
         .splits = sch.splits, .slot_size = sch.slot_size,
         .streams = sch.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         OUT("{\"error\":\"object not open\"}\n");
         return 1;

@@ -968,7 +968,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
         .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
         .streams = sw->sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(sw->db_root, sw->object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_SLOTCASK, "INSERT_DROP shard=%d (cannot open slotcask, dropping %zu records)",
                 sw->shard_id, sw->count);
@@ -1558,7 +1558,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
             .splits = sc.splits, .slot_size = sc.slot_size,
             .streams = sc.streams,
         };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
         if (sdb) (void)slotcask_pregrow_kf(sdb, rec_count);
     }
 
@@ -2294,7 +2294,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
             .splits = sc.splits, .slot_size = sc.slot_size,
             .streams = sc.streams,
         };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
         if (sdb) (void)slotcask_pregrow_kf(sdb, rec_count);
     }
 
@@ -2642,7 +2642,7 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
         .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
         .streams = sw->sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(sw->db_root, sw->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "bulk_del_shard_worker_v2: slotcask_registry_get failed for %s/%s", sw->db_root, sw->object);
         return NULL;
@@ -3306,7 +3306,7 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
         .splits = w->sch->splits, .slot_size = w->sch->slot_size,
         .streams = w->sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "bulk_upd_shard_worker_v2: slotcask_registry_get failed for %s/%s", w->db_root, w->object);
         w->skipped += w->count; return NULL;
@@ -3807,7 +3807,7 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
         .splits = w->sch->splits, .slot_size = w->sch->slot_size,
         .streams = w->sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "bulk_upd_delim_shard_worker_v2: slotcask_registry_get failed for %s/%s", w->db_root, w->object);
         w->skipped += w->count; return NULL;
@@ -4370,7 +4370,7 @@ static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
         .splits = w->sch->splits, .slot_size = w->sch->slot_size,
         .streams = w->sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(w->db_root, w->object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "bulk_upd_json_shard_worker_v2: slotcask_registry_get failed for %s/%s", w->db_root, w->object);
         w->skipped += w->count; return NULL;
@@ -5355,7 +5355,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         .splits = sch.splits, .slot_size = sch.slot_size,
         .streams = sch.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
