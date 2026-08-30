@@ -374,6 +374,9 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_version_compare.c \
     src/test/cases/test_version_compat.c \
     src/test/cases/test_reindex_bitmap_resplit.c \
+    src/test/cases/test_drop_object_read_wire.c \
+    src/test/cases/test_registry_uaf_invalidate.c \
+    src/test/cases/test_bulk_lookup_kf_held_gap.c \
     src/test/cases/test_varlen_scan_resync.c \
     src/test/cases/test_varlen_scan_resync_odirect.c \
     src/test/cases/test_varlen_compact_stat_resync.c \

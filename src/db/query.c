@@ -567,7 +567,7 @@ void btree_dispatch(const char *db_root, const char *object,
         SlotcaskSchemaInfo info = {
             .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
         };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
         if (!sdb) return;
 
         if (pc->op == OP_EQUAL || pc->op == OP_IN) {
@@ -925,7 +925,7 @@ static void *shard_count_worker(void *arg) {
     /* Pre-open bitmap shards and KF handle for this worker's shard group.
      * All entries in this group share the same hash[0..1] → same data shard. */
     int shard_id = -1;
-    SlotcaskDb *sdb = NULL;
+    SlotcaskDb *sdb SDB_REG_REF = NULL;
     SlotcaskKfHandle kh;
     memset(&kh, 0, sizeof(kh));
     if (sc->n_bm_postfilter > 0 && sc->entry_count > 0) {
@@ -941,8 +941,10 @@ static void *shard_count_worker(void *arg) {
         if (sdb) {
             char kf_p[PATH_MAX];
             kf_path_for(kf_p, sdb->data_dir, shard_id);
-            if (kfcache_acquire(&kh, kf_p, sdb->slots_per_shard, 0) != 0)
+            if (kfcache_acquire(&kh, kf_p, sdb->slots_per_shard, 0) != 0) {
+                slotcask_registry_put(sdb);
                 sdb = NULL;  // disable KF probe if acquire fails
+            }
         }
         for (int b = 0; b < sc->n_bm_postfilter; b++) {
             char bp[PATH_MAX];
@@ -1060,19 +1062,18 @@ static void *shard_count_worker(void *arg) {
             .slot_size = sc->sch->slot_size,
             .streams = sc->sch->streams,
         };
-        SlotcaskDb *batch_sdb = sdb;
-        if (!batch_sdb)
-            batch_sdb = slotcask_registry_get(sc->db_root, sc->object, &info);
-        if (batch_sdb) {
+        if (!sdb)
+            sdb = slotcask_registry_get(sc->db_root, sc->object, &info);
+        if (sdb) {
             CountBatchCbCtx cb_ctx = { sc, &local };
             if (resolved) {
                 /* Bitmap path: already have resolved locations, skip KF re-probe */
-                slotcask_bulk_fetch_resolved(batch_sdb, resolved,
+                slotcask_bulk_fetch_resolved(sdb, resolved,
                                               (size_t)n_need_fetch,
                                               &cb_ctx, count_batch_cb);
             } else {
                 /* Non-bitmap path: use combined resolve+fetch */
-                slotcask_bulk_resolve_and_fetch(batch_sdb, fetch_hashes,
+                slotcask_bulk_resolve_and_fetch(sdb, fetch_hashes,
                                                   (size_t)n_need_fetch,
                                                   &cb_ctx, count_batch_cb);
             }
@@ -1867,7 +1868,7 @@ static int idx_find_streaming(const char *db_root, const char *object,
     SlotcaskSchemaInfo sinfo = { .splits = sch->splits,
                                  .slot_size = sch->slot_size,
                                  .streams = sch->streams };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &sinfo);
 
     StreamFindCtx sc = {0};
     sc.db_root = db_root;
@@ -2539,7 +2540,7 @@ static int find_via_composite_key(const char *db_root, const char *object,
     SlotcaskSchemaInfo sinfo = { .splits = sch->splits,
                                  .slot_size = sch->slot_size,
                                  .streams = sch->streams };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &sinfo);
 
     CompositePrefixCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -3626,7 +3627,7 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
         SlotcaskSchemaInfo info_g = {
             .splits = sc_g.splits, .slot_size = sc_g.slot_size, .streams = sc_g.streams,
         };
-        SlotcaskDb *sdb_g = slotcask_registry_get(db_root, object, &info_g);
+        SlotcaskDb *sdb_g SDB_REG_REF = slotcask_registry_get(db_root, object, &info_g);
         if (!sdb_g) {
             LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_from_bitmap: slotcask_registry_get failed for %s/%s", db_root, object);
             return NULL;
@@ -3701,7 +3702,7 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
     SlotcaskSchemaInfo info = {
         .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_from_bitmap: slotcask_registry_get failed for %s/%s", db_root, object);
         free(vals); free(vlens); return NULL;
@@ -3831,7 +3832,7 @@ static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *o
     SlotcaskSchemaInfo info = {
         .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_bitmap_complement: slotcask_registry_get failed for %s/%s", db_root, object);
         return NULL;
@@ -4753,7 +4754,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
         .splits = sch->splits, .slot_size = sch->slot_size,
         .streams = sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &sinfo);
     if (!sdb) {
         free(hashes);
         free(key_to_fetch);
@@ -5114,7 +5115,7 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
             .splits = sch->splits, .slot_size = sch->slot_size,
             .streams = sch->streams,
         };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &sinfo);
         if (!sdb) {
             free(hashes);
             keyset_free(ks);
@@ -5518,7 +5519,7 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
             .splits = sch.splits, .slot_size = sch.slot_size,
             .streams = sch.streams,
         };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
         if (sdb) {
             int64_t match_count = 0;
             scan_shards_v2_o_direct_match(sdb, &fs, fast_cc,
@@ -6324,7 +6325,7 @@ static void *cursor_fetch_worker(void *arg) {
         .slot_size = ctx->sch->slot_size,
         .streams = ctx->sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(ctx->db_root, ctx->object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(ctx->db_root, ctx->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "cursor_fetch_worker: slotcask_registry_get failed for %s/%s", ctx->db_root, ctx->object);
         return NULL;
@@ -6633,7 +6634,7 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
             .splits = sch->splits, .slot_size = sch->slot_size,
             .streams = sch->streams,
         };
-        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &sinfo);
 #define FS_BATCH 1024
         uint8_t batch[FS_BATCH][16];
         int batch_n = 0;
@@ -6909,7 +6910,7 @@ int bulk_delete_phase1_indexed(const char *db_root, const char *object,
         .splits = sch->splits, .slot_size = sch->slot_size,
         .streams = sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) { keyset_free(ks); return 0; }
 
     /* Iterate keyset and resolve in batches of 1024 (same as ordered-find). */
@@ -7401,7 +7402,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                             .splits = sch.splits, .slot_size = sch.slot_size,
                             .streams = sch.streams,
                         };
-                        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+                        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &sinfo);
                         uint8_t (*hashes)[16] = malloc(n_pre * sizeof(*hashes));
                         int *passed = calloc(n_pre, sizeof(int));
                         D2HashIdxEntry *hmap = d2_build_hash_map(sp_rows, n_pre);
@@ -7985,7 +7986,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                             .splits = sch.splits, .slot_size = sch.slot_size,
                             .streams = sch.streams,
                         };
-                        SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &sinfo);
+                        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &sinfo);
                         uint8_t (*hashes)[16] = malloc(n_pre * sizeof(*hashes));
                         int *passed = calloc(n_pre, sizeof(int));
                         D2HashIdxEntry *hmap = d2_build_hash_map(rows, n_pre);
@@ -8501,7 +8502,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                 .splits = sch.splits, .slot_size = sch.slot_size,
                 .streams = sch.streams,
             };
-            SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+            SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
             if (sdb) scan_shards_v2_streaming(sdb, adv_search_cb, &ctx);
             else     scan_dispatch(db_root, object, &sch, data_dir, adv_search_cb, &ctx);
         } else {

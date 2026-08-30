@@ -1353,7 +1353,33 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *ie_s = json_obj_strdup(&req, "if_exists");
         int if_exists = json_obj_is_true(&req, "if_exists") ||
                         (ie_s && strcmp(ie_s, "1") == 0);
+        /* drop-object frees the registry entry (slotcask_registry_
+           invalidate) — it needs the object wrlock like every other
+           invalidate caller (objlock.c contract; truncate/vacuum get
+           theirs from mode_is_schema, but drop-object returns before
+           that generic take). The effective root is NOT built until the
+           generic block below, so build our own — same construction and
+           therefore the same (eff_root, object) lock key readers use. */
+        char drop_eff_root[PATH_MAX];
+        build_effective_root(drop_eff_root, sizeof(drop_eff_root), dir);
+        objlock_wrlock(drop_eff_root, object);
+        if (g_db && g_schema_wrlock_test_delay_ms > 0) {
+            char marker_path[PATH_MAX];
+            snprintf(marker_path, sizeof(marker_path),
+                     "%s/.schema-wrlock-test-delay-%s.active",
+                     drop_eff_root, object);
+            FILE *mf = fopen(marker_path, "w");
+            if (mf) {
+                fprintf(mf, "mode=drop-object\nobject=%s\n", object);
+                fclose(mf);
+            }
+            struct timespec delay_ts = { g_schema_wrlock_test_delay_ms / 1000,
+                                         (long)(g_schema_wrlock_test_delay_ms % 1000) * 1000000L };
+            nanosleep(&delay_ts, NULL);
+            unlink(marker_path);
+        }
         cmd_drop_object(g_db_root, dir, object, if_exists);
+        objlock_wrunlock(drop_eff_root, object);
         free(ie_s);
         free(mode); free(dir); free(object);
         return;
@@ -2701,7 +2727,7 @@ static void *warmup_kf_task_fn(void *arg) {
     SlotcaskSchemaInfo info = {
         .splits = sch.splits, .slot_size = sch.slot_size, .streams = sch.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(t->eff, t->obj, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(t->eff, t->obj, &info);
     if (!sdb) {
         objlock_rdunlock(t->eff, t->obj);
         return NULL;
@@ -2868,6 +2894,7 @@ static void *warmup_thread(void *arg) {
             if (!sdb) { objlock_rdunlock(dir_path, de->d_name); continue; }
             objects++;
             int num_shards = sdb->num_shards;
+            slotcask_registry_put(sdb);
             objlock_rdunlock(dir_path, de->d_name);
 
             /* Per-shard kf tasks for this object */

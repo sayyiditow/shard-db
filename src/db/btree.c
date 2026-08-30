@@ -1008,7 +1008,12 @@ retry_bt_acquire:
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     atomic_store_explicit(&e->validated_publish_generation,
                           opened_generation, memory_order_release);
-    atomic_store_explicit(&e->used, BT_CACHE_LIVE, memory_order_relaxed);
+    /* RELEASE publish: the verifier's acquire-load of `used` (bt_acquire_
+       impl's hit path, under the entry rdlock) must happen-after these
+       field writes, or the path/fd/map reads race the install (TSan
+       flagged exactly that — kfcache's install already publishes with
+       release). */
+    atomic_store_explicit(&e->used, BT_CACHE_LIVE, memory_order_release);
     e->last_access = __atomic_add_fetch(&bt_cache_clock, 1, __ATOMIC_RELAXED);
     bt_cache_count++;
     pthread_rwlock_t *lock = &e->rwlock;

@@ -300,7 +300,7 @@ static int resolve_counts_with_schema(const char *db_root, const char *object,
         .splits = sc->splits, .slot_size = sc->slot_size,
         .streams = sc->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(eff_root, bare_obj, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(eff_root, bare_obj, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_SLOTCASK, "resolve_counts %s/%s: slotcask_registry_get failed", eff_root, bare_obj);
         *out_live = 0; *out_deleted = 0; return -1;
@@ -386,7 +386,7 @@ int cmd_get(const char *db_root, const char *object,
         .splits = sc.splits, .slot_size = sc.slot_size,
         .streams = sc.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
     void *val = NULL; size_t vlen = 0;
     if (slotcask_get(sdb, key, klen, &val, &vlen) != 0) {
@@ -414,7 +414,7 @@ int cmd_get_fields(const char *db_root, const char *object,
         .splits = sc.splits, .slot_size = sc.slot_size,
         .streams = sc.streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
     void *val = NULL; size_t vlen = 0;
     if (slotcask_get(sdb, key, klen, &val, &vlen) != 0) {
@@ -986,7 +986,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         .splits = sc->splits, .slot_size = sc->slot_size,
         .streams = sc->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         free(typed_buf);
         OUT("{\"error\":\"Cannot open shard\"}\n");
@@ -1556,7 +1556,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
         .splits = sc->splits, .slot_size = sc->slot_size,
         .streams = sc->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
 
     TypedSchema *ts = load_typed_schema(db_root, object);
@@ -1848,7 +1848,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
         .splits = sc->splits, .slot_size = sc->slot_size,
         .streams = sc->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", wire_key);
         return 0;
@@ -2088,7 +2088,7 @@ static void *multi_exists_shard_worker(void *arg) {
         .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
         .streams = sw->sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(sw->db_root, sw->object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_SLOTCASK, "multi_exists_shard_worker %s/%s: slotcask_registry_get failed, %d keys reported as not-found", sw->db_root, sw->object, sw->count);
         return NULL;
@@ -2444,7 +2444,7 @@ static void *multi_get_shard_worker(void *arg) {
         .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
         .streams = sw->sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(sw->db_root, sw->object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(sw->db_root, sw->object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_SLOTCASK, "multi_get_shard_worker %s/%s: slotcask_registry_get failed, %d keys reported as missing", sw->db_root, sw->object, sw->count);
         return NULL;

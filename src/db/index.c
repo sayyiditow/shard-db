@@ -2673,7 +2673,7 @@ index_build_result build_trigram_pass(const char *db_root, const char *object,
         .splits = sch->splits, .slot_size = sch->slot_size,
         .streams = sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_TRIGRAM, "build_trigram_pass: slotcask_registry_get failed for %s/%s", db_root, object);
         return index_build_failed(0);
@@ -2708,7 +2708,7 @@ index_build_result build_btree_streaming(const char *db_root, const char *object
         .splits = sch->splits, .slot_size = sch->slot_size,
         .streams = sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_BTREE, "build_btree_streaming: slotcask_registry_get failed for %s/%s/%s", db_root, object, field);
         return index_build_failed(0);
@@ -2875,7 +2875,7 @@ index_build_result build_bitmap_pass(const char *db_root, const char *object,
         .splits = sch->splits, .slot_size = sch->slot_size,
         .streams = sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_BITMAP, "build_bitmap_pass: slotcask_registry_get failed for %s/%s/%s", db_root, object, field);
         return index_build_failed(0);
@@ -4294,7 +4294,7 @@ static index_build_result build_indexes_streaming_multi(const char *db_root, con
     SlotcaskSchemaInfo info = {
         .splits = sch->splits, .slot_size = sch->slot_size, .streams = sch->streams,
     };
-    SlotcaskDb *sdb = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_REINDEX, "build_indexes_streaming_multi: slotcask_registry_get failed for %s/%s", db_root, object);
         return index_build_failed(0);

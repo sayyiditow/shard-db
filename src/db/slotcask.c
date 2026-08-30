@@ -53,6 +53,9 @@ int  g_shard_test_pause_phase = -1;
 int  g_shard_test_pause_occurrence = 1;
 _Atomic int g_shard_test_pause_hits;
 _Atomic int g_shard_test_pause_release;
+_Atomic int g_shard_test_bulk_lookup_gap;
+_Atomic int g_shard_test_bulk_lookup_gap_hit;
+_Atomic int g_shard_test_bulk_lookup_gap_release;
 #define SHARD_TEST_NOTE_SYNC(p) (shard_test_note_sync(p))
 #define SHARD_TEST_PHASE_PAUSE(p) (shard_test_phase_pause(p))
 #define SHARD_TEST_FAIL_POSTLINK g_shard_test_fail_postlink
@@ -1226,6 +1229,11 @@ static int kfcache_acquire_direct_ex(SlotcaskKfHandle *h, SlotRef *ref,
     (void)db;          /* used only to make the signature future-proof */
     (void)kf_shard_id; /* same */
 
+    /* Warm path touches g_kfcache = g_db->kfcache: a raw thread with an
+       unbound TLS g_db must bind here, or it indexes a garbage table
+       (the slow path below already binds; objlock.c:41 precedent). */
+    if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+
     if (ref && ref->slot >= 0) {
         int s = ref->slot;
         KfCacheEntry *e = &g_kfcache[s];
@@ -1798,6 +1806,9 @@ static SlotRef *seg_ref_for(SlotcaskDb *db, int stream_id, uint32_t file_id) {
  */
 int segcache_acquire_direct(SlotcaskSegHandle *h, SlotRef *ref,
                              const char *path) {
+    /* Warm path touches g_segcache = g_db->segcache: bind an unbound
+       TLS g_db here too (same rationale as kfcache_acquire_direct_ex). */
+    if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
     if (ref && ref->slot >= 0) {
         int s = ref->slot;
         SegCacheEntry *e = &g_segcache[s];
@@ -3540,7 +3551,7 @@ static inline void seg_record_emit(uint8_t *dst, int slot_size,
     /* Flag stays 0 until payload is fully in place. Use atomic_store with
        relaxed ordering for the initial 0 — readers that see 0 simply skip
        the record (no acquire needed). */
-    __atomic_store_n(&dst[18], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&dst[18], 0, __ATOMIC_RELEASE);
     dst[19] = 0;
     uint32_t v32 = (uint32_t)vlen;
     memcpy(dst + 20, &v32, 4);
@@ -3570,7 +3581,7 @@ static inline void seg_record_emit_pending(uint8_t *dst, int slot_size,
     memcpy(dst, hash, 16);
     uint16_t k16 = (uint16_t)klen;
     memcpy(dst + 16, &k16, 2);
-    __atomic_store_n(&dst[18], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&dst[18], 0, __ATOMIC_RELEASE);
     dst[19] = 0;
     uint32_t v32 = (uint32_t)vlen;
     memcpy(dst + 20, &v32, 4);
@@ -6041,7 +6052,25 @@ int slotcask_bulk_lookup_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         if (rc < 0) { r->status = -2; continue; }
         st[i].kf_found = 1;
     }
-    kfcache_release(&kh);
+    /* The kf reader stays held through phase 2: the window contract
+       ("Kf read handle stays live until the segment record has been
+       checked against its hash/key and copied into caller-owned
+       memory") requires it. Released here, a window could tombstone
+       (T) and re-emit (P) this slot while phase 2 reads it under an
+       independent segcache rdlock — plain-vs-plain, zero common lock.
+       Same discipline as slotcask_get and kf_reval_fetch_one. */
+#ifdef TEST_BUILD
+    /* Regression hook (docs/plans/2026-08-28-eliminate-tsan-supp.md
+       Task B1): parks the caller after the probe phase so a test can
+       run a full window's worth of slot churn in the gap. Post-fix the
+       kf reader is still held here, so any window T step in the gap
+       blocks — which is exactly the assertion the test makes. */
+    if (atomic_load(&g_shard_test_bulk_lookup_gap) &&
+        atomic_fetch_add(&g_shard_test_bulk_lookup_gap_hit, 1) == 0) {
+        while (!atomic_load(&g_shard_test_bulk_lookup_gap_release))
+            nanosleep(&(struct timespec){0, 1000000L}, NULL);
+    }
+#endif
 
     /* Phase 2: batched verify_stored_key — sort kf-hits by (sid, fid),
        take segcache rdlock once per unique file, verify each record
@@ -6109,6 +6138,7 @@ int slotcask_bulk_lookup_in_kfshard(SlotcaskDb *db, int kf_shard_id,
         }
     }
 
+    kfcache_release(&kh);
     free(st);
     return 0;
 }
@@ -6589,6 +6619,16 @@ static void reg_key(char out[PATH_MAX], const char *effective_root,
 /* Linear probe from path_hash. Returns the matching bucket (used=1, key matches),
    or the first empty bucket (used=0) suitable for insertion. -1 if the table is
    completely full. */
+/* The registry table, lock, and cond live in the g_db ShardDb, which is
+   THREAD-LOCAL (embedded.c __thread g_db). Threads spawned outside the
+   embedded/server bind paths (direct API callers, test pthreads) start with
+   TLS g_db == NULL and would otherwise lock/cond-wait on garbage addresses —
+   silently bypassing the registry protocol. Bind lazily from the process
+   instance, same precedent as objlock.c's g_db guard. */
+static void registry_bind_g_db(void) {
+    if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+}
+
 static int reg_probe(const char *key) {
     uint32_t h = path_hash(key);
     int idx = (int)(h % SLOTCASK_REG_BUCKETS);
@@ -6606,6 +6646,7 @@ SlotcaskDb *slotcask_registry_get(const char *effective_root,
     if (!info) return NULL;
     if (info->splits <= 0 || info->slot_size <= 0 || info->streams <= 0)
         return NULL;
+    registry_bind_g_db();
 
     char key[PATH_MAX];
     reg_key(key, effective_root, object);
@@ -6632,6 +6673,7 @@ SlotcaskDb *slotcask_registry_get(const char *effective_root,
         }
         if (g_reg[slot].used) {
             SlotcaskDb *db = g_reg[slot].db;
+            __atomic_add_fetch(&db->reg_refs, 1, __ATOMIC_ACQ_REL);
             pthread_mutex_unlock(&g_reg_lock);
             return db;
         }
@@ -6679,6 +6721,8 @@ SlotcaskDb *slotcask_registry_get(const char *effective_root,
             return NULL;
         }
         g_reg[reserved].db = db;
+        /* Table reference plus the opener's caller reference. */
+        __atomic_store_n(&db->reg_refs, 2, __ATOMIC_RELAXED);
         g_reg[reserved].used = 1;
         g_reg[reserved].opening = 0;
         pthread_cond_broadcast(&g_reg_cond);
@@ -6687,8 +6731,18 @@ SlotcaskDb *slotcask_registry_get(const char *effective_root,
     }
 }
 
+void slotcask_registry_put(SlotcaskDb *db) {
+    if (!db) return;
+    if (__atomic_sub_fetch(&db->reg_refs, 1, __ATOMIC_ACQ_REL) == 0) {
+        slotcask_close(db);
+        free(db);
+    }
+}
+
 void slotcask_registry_invalidate(const char *effective_root,
                                   const char *object) {
+    registry_bind_g_db();
+
     char key[PATH_MAX];
     reg_key(key, effective_root, object);
 
@@ -6701,35 +6755,34 @@ void slotcask_registry_invalidate(const char *effective_root,
 
     pthread_mutex_lock(&g_reg_lock);
     int slot = reg_probe(key);
+    SlotcaskDb *db = NULL;
     if (slot >= 0 && g_reg[slot].used) {
-        SlotcaskDb *db = g_reg[slot].db;
+        db = g_reg[slot].db;
         g_reg[slot].used = 0;
         g_reg[slot].key[0] = '\0';
         g_reg[slot].db = NULL;
-        pthread_mutex_unlock(&g_reg_lock);
-        slotcask_close(db);
-        free(db);
-        kfcache_invalidate_prefix(data_dir);
-        segcache_invalidate_prefix(data_dir);
-        return;
     }
     pthread_mutex_unlock(&g_reg_lock);
-    /* No registry entry — still flush any cache entries that linger from
-       earlier opens (e.g. cmd_create_object opens + closes a SlotcaskDb
-       directly without registering it). */
+
     kfcache_invalidate_prefix(data_dir);
     segcache_invalidate_prefix(data_dir);
+
+    /* Drop the table reference after unlinking and cache invalidation. */
+    if (db) slotcask_registry_put(db);
 }
 
 void slotcask_registry_shutdown(void) {
+    registry_bind_g_db();
     pthread_mutex_lock(&g_reg_lock);
     for (int i = 0; i < SLOTCASK_REG_BUCKETS; i++) {
         if (g_reg[i].used && g_reg[i].db) {
-            slotcask_close(g_reg[i].db);
-            free(g_reg[i].db);
+            SlotcaskDb *db = g_reg[i].db;
             g_reg[i].db = NULL;
             g_reg[i].used = 0;
             g_reg[i].key[0] = '\0';
+            pthread_mutex_unlock(&g_reg_lock);
+            slotcask_registry_put(db);
+            pthread_mutex_lock(&g_reg_lock);
         }
     }
     pthread_mutex_unlock(&g_reg_lock);

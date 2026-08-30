@@ -724,7 +724,7 @@ scan_top:
             uint8_t  flag;
             memcpy(&klen, carry + 16, 2);
             memcpy(&vlen, carry + 20, 4);
-            flag = carry[18];
+            flag = __atomic_load_n(&carry[18], __ATOMIC_ACQUIRE);
             size_t rec_size = od_varlen_rec_size(klen, (uint32_t)vlen);
 
             /* flag==0 is sparse/pool-reuse padding, not a real record
@@ -774,7 +774,7 @@ scan_top:
         /* Stride through whole records in this chunk. */
         while (pos + 24 <= (size_t)chunk_len) {
             uint8_t *rec  = chunk + pos;
-            uint8_t  flag = rec[18];
+            uint8_t  flag = __atomic_load_n(&rec[18], __ATOMIC_ACQUIRE);
             uint16_t klen;
             uint32_t vlen;
             memcpy(&klen, rec + 16, 2);

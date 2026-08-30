@@ -42,6 +42,12 @@ extern int  g_shard_test_pause_phase;      /* -1 = disabled */
 extern int  g_shard_test_pause_occurrence; /* 1-based */
 extern _Atomic int g_shard_test_pause_hits;
 extern _Atomic int g_shard_test_pause_release;
+/* Task B1 regression hook (docs/plans/2026-08-28-eliminate-tsan-supp.md):
+   parks slotcask_bulk_lookup_in_kfshard between its probe and verify
+   phases so a test can run kf-slot churn in the gap. */
+extern _Atomic int g_shard_test_bulk_lookup_gap;
+extern _Atomic int g_shard_test_bulk_lookup_gap_hit;
+extern _Atomic int g_shard_test_bulk_lookup_gap_release;
 
 static inline void shard_test_ctl_reset(void) {
     for (int i = 0; i < SHARD_TEST_PHASE_COUNT; i++)
@@ -54,6 +60,9 @@ static inline void shard_test_ctl_reset(void) {
     g_shard_test_pause_occurrence = 1;
     atomic_store(&g_shard_test_pause_hits, 0);
     atomic_store(&g_shard_test_pause_release, 0);
+    atomic_store(&g_shard_test_bulk_lookup_gap, 0);
+    atomic_store(&g_shard_test_bulk_lookup_gap_hit, 0);
+    atomic_store(&g_shard_test_bulk_lookup_gap_release, 0);
 }
 
 /* Barrier call: count the sync in `phase`; return 1 when this attempt is
