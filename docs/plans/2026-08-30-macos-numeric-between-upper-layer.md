@@ -477,3 +477,13 @@ gh pr create --draft --title "scratch: numeric-between round-2 probe (do not mer
   evidence.
 - The fix goes where the defect is (root cause), not where the symptom
   is observed.
+
+## Evidence — Task 3
+
+Round-two CI: both Linux probe legs passed. On macOS, W1 returned 2 while
+W2 explained the same B-tree leaf plan as Linux and C2–C5 all returned 3.
+
+## Task 4 — halt report
+
+The "All C green, W1 = 2, explain identical" row applied. No fix code was
+written; the remaining suspects require a daemon-side seam.
