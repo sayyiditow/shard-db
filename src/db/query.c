@@ -5638,6 +5638,17 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
         col.tf = tf;
         btree_dispatch(db_root, object, leaf->field, sch->splits,
                        leaf, tf, collect_hash_cb, &col);
+#ifdef TEST_BUILD
+        /* Round-4 diagnostic seam — candidate count straight off
+           collect_hash_cb's atomic slot allocator (CollectCtx.count),
+           before any Kf-boundary revalidation. Temporary — delete with
+           docs/plans/2026-08-31-macos-numeric-between-round4-collection-count.md. */
+        LOG_AUDIT(LOG_SUB_QUERY,
+                  "NB2TRACE4 collect field=%s op=%d op_between=%d count=%zu "
+                  "budget_exceeded=%d",
+                  leaf->field, (int)leaf->op, leaf->op == OP_BETWEEN,
+                  col.count, col.budget_exceeded);
+#endif
         if (col.budget_exceeded) {
             collect_ctx_destroy(&col);
             free_compiled_criteria(cc, 1);
@@ -5646,6 +5657,18 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
         cnt = parallel_indexed_count(db_root, object, sch,
                                      col.entries, (int)col.count,
                                      &leaf_node, (FieldSchema *)fs, dl, NULL, 1);
+#ifdef TEST_BUILD
+        /* Round-4 diagnostic seam — final Kf-revalidated count for the
+           same call. Compared against the collect trace above, this
+           localizes the loss to either the range-walk/collection stage
+           or parallel_indexed_count's per-record revalidation. Temporary
+           — delete with the plan close-out. */
+        LOG_AUDIT(LOG_SUB_QUERY,
+                  "NB2TRACE4 validate field=%s op=%d op_between=%d in=%zu "
+                  "out=%zu",
+                  leaf->field, (int)leaf->op, leaf->op == OP_BETWEEN,
+                  col.count, cnt);
+#endif
         collect_ctx_destroy(&col);
     }
     free_compiled_criteria(cc, 1);
