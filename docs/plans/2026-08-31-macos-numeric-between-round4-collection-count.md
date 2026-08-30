@@ -616,6 +616,46 @@ silently.
    | `collect` and `validate` both show `count=3`/`out=3` on macOS (bug doesn't reproduce under the seam) | the seam itself perturbs timing/ordering enough to mask the defect — note this explicitly, do not conclude "fixed"; escalate to the human before any further round |
    | Anything else | stop and ask |
 
+## Evidence — Task 4
+
+Scratch PR [#322](https://github.com/sayyiditow/shard-db/pull/322), commit
+`be7e7c5`, workflow run `33325403119`. The TEST_BUILD-only seam remains on
+the scratch branch only.
+
+### Linux x86_64 — pass
+
+`test-numeric-between-probe4`: **9 passed, 0 failed**. The BETWEEN pair
+was `NB2TRACE4 collect field=amt op=14 op_between=1 count=3
+budget_exceeded=0`, followed by `NB2TRACE4 validate field=amt op=14
+op_between=1 in=3 out=3`.
+
+### Linux arm64 — pass
+
+`test-numeric-between-probe4`: **9 passed, 0 failed**. Its BETWEEN pair
+is identical to Linux x86_64: collection `count=3`, then validation
+`in=3 out=3`.
+
+### macOS arm64 — fail
+
+`test-numeric-between-probe4`: **7 passed, 2 failed**. W1 and in-process
+S1 each returned **2**. The relevant pair is
+`NB2TRACE4 collect field=amt op=14 op_between=1 count=3
+budget_exceeded=0`, followed by `NB2TRACE4 validate field=amt op=14
+op_between=1 in=3 out=2`. The `lt` and `gte` control pairs remained
+2→2 and 3→3 respectively.
+
+### Read-out
+
+This matches the decision-table row **“collect count=3, validate in=3,
+out=2”**. The B-tree range walk and `collect_hash_cb` are exonerated: all
+three candidates reach `parallel_indexed_count`. The loss is in that
+function's Kf-boundary revalidation path — `shard_count_worker`,
+`count_batch_cb`, or its batch record-fetch/resolve dependency
+(`slotcask_bulk_fetch_resolved` / `slotcask_bulk_resolve_and_fetch`) — not
+the encoded bounds or numeric comparator. This is a platform-specific
+observed outcome, not yet a mechanism explaining why macOS differs; no fix
+is authorized. A follow-up plan must bisect that revalidation path.
+
 ## Task 5 — HALT: report root cause; fix requires a human-approved plan
 
 1. **Stop.** Post the evidence: the matching decision-table row, both
