@@ -332,6 +332,11 @@ int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, void *c
 int stream_keyset_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx);
 int idx_count_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx);
 void idx_count_cb_flush_thread(void);
+#ifdef TEST_BUILD
+/* Round-3 diagnostic seam — see query.c. Temporary; delete with the
+   plan close-out. */
+long long idx_count_cb_flush_thread_dbg(void);
+#endif
 
 /* query.c — operator classification (used by query_aggregate.c) */
 int op_is_length(enum SearchOp op);

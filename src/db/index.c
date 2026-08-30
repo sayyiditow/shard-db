@@ -154,7 +154,18 @@ static void *shard_walk_worker(void *arg) {
        per-match atomic-adds into one per-shard-worker atomic-add); if
        more callbacks adopt the same pattern, hook them in this single
        cleanup point. No-op for callbacks that don't use TLS. */
+#ifdef TEST_BUILD
+    /* Round-3 diagnostic seam — trace a count callback's per-worker flush.
+       Temporary — delete with
+       docs/plans/2026-08-30-macos-numeric-between-daemon-seam.md. */
+    {
+        long long nb2_flushed = idx_count_cb_flush_thread_dbg();
+        LOG_AUDIT(LOG_SUB_INDEX, "NB2TRACE flushed=%lld path=%s",
+                  nb2_flushed, sw->idx_path);
+    }
+#else
     idx_count_cb_flush_thread();
+#endif
     return NULL;
 }
 

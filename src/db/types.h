@@ -1052,6 +1052,11 @@ void btree_idx_walk_ordered(const char *db_root, const char *object,
    contribution. Currently only idx_count_cb uses TLS; if more callbacks
    adopt the pattern, fan out from this single hook. */
 void idx_count_cb_flush_thread(void);
+#ifdef TEST_BUILD
+/* Round-3 diagnostic seam — see query.c. Temporary; delete with
+   docs/plans/2026-08-30-macos-numeric-between-daemon-seam.md. */
+long long idx_count_cb_flush_thread_dbg(void);
+#endif
 
 /* Drop every shard file for an index and the parent directory. */
 void btree_idx_unlink_all(const char *db_root, const char *object,

@@ -665,6 +665,23 @@ void btree_dispatch(const char *db_root, const char *object,
         case OP_BETWEEN:
             encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
             encode_criterion_value(tf, pc->value2, strlen(pc->value2), buf2, &len2);
+#ifdef TEST_BUILD
+            /* Round-3 diagnostic seam — encoded-bound trace for
+               docs/plans/2026-08-30-macos-numeric-between-daemon-seam.md.
+               Temporary — delete with the plan close-out. */
+            {
+                char nb2_lo[17] = {0}, nb2_hi[17] = {0};
+                for (int i = 0; i < 8 && (size_t)i < len1; i++)
+                    snprintf(nb2_lo + i * 2, 3, "%02x", buf1[i]);
+                for (int i = 0; i < 8 && (size_t)i < len2; i++)
+                    snprintf(nb2_hi + i * 2, 3, "%02x", buf2[i]);
+                LOG_AUDIT(LOG_SUB_QUERY,
+                          "NB2TRACE between len1=%zu lo=%s len2=%zu hi=%s "
+                          "min_ex=%d max_ex=%d",
+                          len1, nb2_lo, len2, nb2_hi,
+                          pc->min_exclusive, pc->max_exclusive);
+            }
+#endif
             if (pc->min_exclusive || pc->max_exclusive) {
                 btree_idx_range_ex(db_root, object, field, splits,
                                    (const char *)buf1, len1, pc->min_exclusive,
@@ -868,6 +885,24 @@ void idx_count_cb_flush_thread(void) {
         idx_count_local.pending = 0;
     }
 }
+
+#ifdef TEST_BUILD
+/* Round-3 diagnostic seam — flushes exactly like
+   idx_count_cb_flush_thread() and returns the pending total committed
+   (0 when nothing was pending). TEST_BUILD-only; release builds never
+   see it. Temporary — delete with
+   docs/plans/2026-08-30-macos-numeric-between-daemon-seam.md. */
+long long idx_count_cb_flush_thread_dbg(void) {
+    if (!idx_count_local.bound_ic) return 0;
+    long long flushed = (long long)idx_count_local.pending;
+    __atomic_add_fetch(
+        &((IdxCountCtx *)idx_count_local.bound_ic)->count,
+        idx_count_local.pending, __ATOMIC_RELAXED);
+    idx_count_local.bound_ic = NULL;
+    idx_count_local.pending = 0;
+    return flushed;
+}
+#endif
 
 /* ========== Indexed count with multi-criteria: parallel per-shard ==========
    Mirrors the old shard_find_worker's shape but accumulates a counter instead
