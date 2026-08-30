@@ -204,6 +204,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_objlock.c \
     src/test/cases/test_field_vs_field.c \
     src/test/cases/test_binary_index.c \
+    src/test/cases/test_numeric_between_probe2.c \
     src/test/cases/test_stats_prom.c \
     src/test/cases/test_parallel_index_integrity.c \
     src/test/cases/test_parallel_cross_pool_nesting.c \
