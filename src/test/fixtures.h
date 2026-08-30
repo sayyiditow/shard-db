@@ -5,6 +5,7 @@
  */
 #ifndef TEST_FIXTURES_H
 #define TEST_FIXTURES_H
+#include <stddef.h>
 #include <pthread.h>
 #include <sys/types.h>
 #include "../db/shard_db.h"
@@ -69,6 +70,8 @@ void test_env_stop_keep(TestEnv *env);
 
 /* Shared test utilities — formerly duplicated as `static` in 20+ case
    files. Prefix `tu_` is "test utility". */
+int   tu_appendf(char *buf, size_t cap, size_t *len, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
 int   tu_run_cmd(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 char *tu_capture_cmd(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 char *tu_read_file(const char *path);

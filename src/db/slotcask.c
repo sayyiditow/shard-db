@@ -981,12 +981,12 @@ static int kfm2_read_batch_marker(const char *path, BatchMarkerEntry **out_entri
 
     *out_entries = NULL;
     *out_count = 0;
-    if (stat(path, &st) != 0) return errno == ENOENT ? 1 : -1;
-    if (st.st_size < (off_t)sizeof(BatchMarkerHeader) ||
-        st.st_size > (off_t)(64 * 1024 * 1024))
-        return -1;
-    fd = open(path, O_RDONLY);
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return errno == ENOENT ? 1 : -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size < (off_t)sizeof(BatchMarkerHeader) ||
+        st.st_size > (off_t)(64 * 1024 * 1024))
+        goto out;
     buf = malloc((size_t)st.st_size);
     if (!buf) goto out;
     {
@@ -1069,11 +1069,11 @@ int kf_batch_marker_corrupt_first_kf_slot_for_test(const char *data_dir,
     int fd = -1, rc = -1;
 
     kf_batch_marker_path(path, sizeof(path), data_dir, kf_shard, batch_id);
-    if (stat(path, &st) != 0) return errno == ENOENT ? 1 : -1;
-    if (st.st_size < (off_t)(sizeof(BatchMarkerHeader) + sizeof(BatchMarkerEntry)))
-        return -1;
-    fd = open(path, O_RDWR);
-    if (fd < 0) return -1;
+    fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return errno == ENOENT ? 1 : -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size < (off_t)(sizeof(BatchMarkerHeader) + sizeof(BatchMarkerEntry)))
+        goto out;
     buf = malloc((size_t)st.st_size);
     if (!buf) goto out;
     {

@@ -23,12 +23,28 @@
 #include "test_client.h"
 
 #include <pthread.h>
+#include <ftw.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+static int remove_tree_entry(const char *path, const struct stat *st,
+                             int typeflag, struct FTW *ftwbuf) {
+    (void)st;
+    (void)typeflag;
+    (void)ftwbuf;
+    return remove(path);
+}
+
+static int remove_tree(const char *path) {
+    if (!path || !path[0]) { errno = EINVAL; return -1; }
+    if (nftw(path, remove_tree_entry, 32, FTW_DEPTH | FTW_PHYS) == 0)
+        return 0;
+    return errno == ENOENT ? 0 : -1;
+}
 
 #define FIXTURE_ROWS 200
 #define WEDGE_ROWS 12      /* > streaming batch cap (limit-bound => 10) */
@@ -387,9 +403,14 @@ static int test_bt_kf_inversion_stream_find_run(void) {
     if (joined_upd == 0) tu_join_signal_destroy(&ua.js);
     else { /* wedged thread may still touch js — leak it per contract */ }
     test_env_kill(&env);
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", env.db_root);
-    system(cmd);
+    char base[sizeof(env.db_root)];
+    char *slash = strrchr(env.db_root, '/');
+    if (slash && slash != env.db_root) {
+        size_t base_len = (size_t)(slash - env.db_root);
+        memcpy(base, env.db_root, base_len);
+        base[base_len] = '\0';
+        ASSERT_EQ_INT(remove_tree(base), 0, "remove test fixture tree");
+    }
     return t_ctx->failed ? 1 : 0;
 }
 

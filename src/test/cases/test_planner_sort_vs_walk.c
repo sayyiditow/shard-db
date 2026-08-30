@@ -32,16 +32,21 @@ static int seed_sort_walk_fixture(TestClient *tc, const char *dir,
                                   const char *what) {
     char *req = malloc(65536); char *resp = NULL;
     ASSERT_NOT_NULL(req, "seed alloc");
-    size_t off = (size_t)snprintf(req, 65536,
+    if (!req) return -1;
+    size_t off = 0;
+    int request_ok = tu_appendf(req, 65536, &off,
         "{\"mode\":\"bulk-insert\",\"dir\":\"%s\",\"object\":\"%s\",\"records\":[",
-        dir, obj);
+        dir, obj) == 0;
     for (int i = 0; i < n; i++) {
         const char *cat = (i < 5) ? "rare" : "common";
-        off += (size_t)snprintf(req + off, 65536 - off,
-            "%s{\"key\":\"k%04d\",\"value\":{\"%s\":\"%s\",\"%s\":%d}}",
-            i ? "," : "", i, str_field, cat, num_field, i);
+        if (request_ok)
+            request_ok = tu_appendf(req, 65536, &off,
+                "%s{\"key\":\"k%04d\",\"value\":{\"%s\":\"%s\",\"%s\":%d}}",
+                i ? "," : "", i, str_field, cat, num_field, i) == 0;
     }
-    snprintf(req + off, 65536 - off, "]}");
+    if (request_ok) request_ok = tu_appendf(req, 65536, &off, "]}") == 0;
+    ASSERT_TRUE(request_ok, "build bounded bulk seed request");
+    if (!request_ok) { free(req); return -1; }
     tc_request(tc, req, &resp);
     free(req);
     char expect[64];

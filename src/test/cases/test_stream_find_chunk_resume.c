@@ -192,16 +192,18 @@ static int test_stream_find_chunk_resume_run(void) {
      * batch cap at small sizes. */
     static char crit[2048];
     size_t off = 0;
-    off += (size_t)snprintf(crit + off, sizeof(crit) - off,
-        "{\"and\":[{\"field\":\"k\",\"op\":\"in\",\"value\":\"");
-    int listed = 0;
+    int criteria_ok = tu_appendf(crit, sizeof(crit), &off,
+        "{\"and\":[{\"field\":\"k\",\"op\":\"in\",\"value\":\"") == 0;
     for (int idx = 150; idx <= 209; idx++) {
-        off += (size_t)snprintf(crit + off, sizeof(crit) - off,
-                                "%s%d", listed ? "," : "", idx);
-        listed++;
+        if (criteria_ok)
+            criteria_ok = tu_appendf(crit, sizeof(crit), &off, "%s%d",
+                                     idx == 150 ? "" : ",", idx) == 0;
     }
-    off += (size_t)snprintf(crit + off, sizeof(crit) - off,
-        "\"},{\"field\":\"v\",\"op\":\"contains\",\"value\":\"q\"}]}");
+    if (criteria_ok)
+        criteria_ok = tu_appendf(crit, sizeof(crit), &off,
+            "\"},{\"field\":\"v\",\"op\":\"contains\",\"value\":\"q\"}]}") == 0;
+    ASSERT_TRUE(criteria_ok, "build bounded IN-list criteria");
+    if (!criteria_ok) { test_env_stop(&env); return 1; }
 
     KeySet2 got, expect;
     ASSERT_EQ_INT(find_keys(&env, crit, 0, 7, &got, NULL), 0,

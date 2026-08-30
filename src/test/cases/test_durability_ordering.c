@@ -750,6 +750,39 @@ static int test_durability_bulk_marker_recovers(void) {
         }
         ASSERT_TRUE(stable_slots,
                     "fresh batch markers persist their planned kf slots for recovery");
+
+        /* Recovery evidence must be read and modified only through its own
+           regular-file descriptor: following a symlink here would let a
+           same-directory attacker substitute a different marker between a
+           pathname check and its use. Keep the real file intact so the
+           existing restart below still exercises normal recovery. */
+        char batch_marker_real_path[PATH_MAX];
+        snprintf(batch_marker_real_path, sizeof(batch_marker_real_path),
+                 "%s.real", batch_marker_path);
+        ASSERT_EQ_INT(rename(batch_marker_path, batch_marker_real_path), 0,
+                      "move retained batch marker behind symlink");
+        ASSERT_EQ_INT(symlink(batch_marker_real_path, batch_marker_path), 0,
+                      "replace marker pathname with symlink");
+        struct stat symlink_st;
+        ASSERT_EQ_INT(lstat(batch_marker_path, &symlink_st), 0,
+                      "marker pathname is inspectable as a symlink");
+        ASSERT_TRUE(S_ISLNK(symlink_st.st_mode),
+                    "marker pathname remains a symlink");
+        int symlink_fd = open(batch_marker_path, O_RDONLY | O_NOFOLLOW);
+        ASSERT_EQ_INT(symlink_fd, -1,
+                      "O_NOFOLLOW rejects the test marker symlink");
+        if (symlink_fd >= 0) close(symlink_fd);
+        ASSERT_EQ_INT(kf_batch_marker_read_slots_for_test(
+                          batch_marker_data_dir, 0, 0, slots,
+                          sizeof(slots) / sizeof(slots[0]), &got),
+                      -1, "batch marker reader rejects symlink path");
+        ASSERT_EQ_INT(kf_batch_marker_corrupt_first_kf_slot_for_test(
+                          batch_marker_data_dir, 0, 0, slots[0].kf_slot, NULL),
+                      -1, "batch marker writer rejects symlink path");
+        ASSERT_EQ_INT(unlink(batch_marker_path), 0,
+                      "remove test symlink before recovery");
+        ASSERT_EQ_INT(rename(batch_marker_real_path, batch_marker_path), 0,
+                      "restore retained batch marker before recovery");
     }
     /* Kill unconditionally: on timeout the daemon is still running and
        holds the DB lock, so leaving it up would cascade into every later

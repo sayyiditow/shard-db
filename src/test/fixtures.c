@@ -579,6 +579,19 @@ void test_env_stop(TestEnv *env) {
 
 /* ---- Shared test utilities (formerly duplicated across case files) ---- */
 
+int tu_appendf(char *buf, size_t cap, size_t *len, const char *fmt, ...) {
+    if (!buf || !len || !fmt || *len >= cap) return -1;
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *len, cap - *len, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - *len) return -1;
+
+    *len += (size_t)n;
+    return 0;
+}
+
 int tu_run_cmd(const char *fmt, ...) {
     char cmd[2048];
     va_list ap;
