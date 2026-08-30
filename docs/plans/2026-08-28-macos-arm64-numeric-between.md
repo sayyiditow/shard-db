@@ -698,3 +698,21 @@ ok 14 - date gte 2026 = 1
 
 `got 2` means one in-range key is missing: the lower-bound seek likely
 overshoots the `-1` key (`0x7F…FF`), or skips a leaf/page.
+
+## Evidence — Task 3
+
+CI run 33300760755, scratch PR #319:
+
+- Linux x86_64: `test-numeric-between-probe` passed 34/0.
+- Linux arm64: the probe step passed.
+- macOS arm64: A1–A6 and B2 passed; B1 alone failed with `expected 3 got 2`.
+
+The direct btree range and production-shaped per-shard ranges are correct;
+the failure is in the upper-layer indexed count path.
+
+## Task 4 — halt report
+
+Round one localizes the defect to the B1 row: all arithmetic, encoder,
+direct-btree, and physical-index probes pass, but the daemon wire count loses
+one match. Suspects are `idx_count_cb` TLS batching/flush, fan-out dispatch,
+planner-produced criteria, or deadline handling. No fix code was written.
