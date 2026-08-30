@@ -560,6 +560,51 @@ hunk ride along silently.
    | NB2TRACE `between` line shows lo/hi ≠ `7fffffffffffff9c` / `8000000000000064` (len 8) | the daemon encodes different criterion bounds — compile layer |
    | Anything else | stop and ask |
 
+## Evidence — Task 4
+
+Scratch PR [#321](https://github.com/sayyiditow/shard-db/pull/321), commit
+`99373b5`, workflow run `33322758976`. The temporary seams remain on the
+scratch branch only.
+
+The S1 probe scaffolding was amended during execution: it uses
+`shard_db_open_internal(env.db_root)` to construct a fully initialized local
+context for `cmd_count`; the fixture daemon is a separate process and cannot
+share its `g_db` state. `types.h` also declares the TEST_BUILD-only debug
+flush because `index.c` includes `types.h`, rather than `query_internal.h`.
+
+### Linux x86_64 — pass
+
+`test-numeric-between-probe3`: **9 passed, 0 failed**. W1 between = 3;
+S1 captured `3`. The seam reported
+`between len1=8 lo=7fffffffffffff9c len2=8 hi=8000000000000064
+min_ex=0 max_ex=0`; each of `000.idx`, `001.idx`, `002.idx`, and `003.idx`
+reported `NB2TRACE flushed=0`.
+
+### Linux arm64 — pass
+
+`test-numeric-between-probe3`: **9 passed, 0 failed**. W1 between = 3;
+S1 captured `3`. The encoded-bound trace is byte-identical to Linux x86_64,
+and all four index-shard flush traces are `0`.
+
+### macOS arm64 — fail
+
+`test-numeric-between-probe3`: **7 passed, 2 failed**. W1 between expected
+3, got **2**; S1 captured **2**. The encoded-bound trace is nevertheless
+identical to both Linux legs:
+`len1=8 lo=7fffffffffffff9c len2=8 hi=8000000000000064 min_ex=0 max_ex=0`.
+All four index-shard trace paths (`000.idx` through `003.idx`) reported
+`flushed=0`.
+
+### Read-out
+
+This matches the decision-table row **“S1 = 2 (in-process)”**: the defect is
+reproducible within `cmd_count_with_tree`, not introduced by wire framing or
+daemon-only runtime context. Bounds are ruled out by their byte-identical
+traces. The zero flush traces do not identify a shard-level loss, so the next
+plan must bisect the count orchestrator/planner-to-executor path (including
+the `check_primary` and compiled-criterion fast paths) before proposing any
+fix. Stop here; no fix code is authorized.
+
 ## Task 5 — HALT: report root cause; fix requires a human-approved plan
 
 1. **Stop.** Post the evidence: the matching decision-table row, both
