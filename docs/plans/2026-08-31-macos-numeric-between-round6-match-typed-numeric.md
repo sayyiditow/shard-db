@@ -582,3 +582,38 @@ a round-7 (or fix) plan.
 - No new dependency; `log.h` is already reachable in `query_plan.c`
   transitively via `types.h` (`types.h:1362`), so no new `#include` is
   needed (unlike round 5's `slotcask.c`, which required one).
+
+## Evidence — Task 4
+
+CI run `33407282653`: Linux x86_64 and Linux arm64 passed; macOS arm64
+failed W1 (`expected 3 got 2`). The exact `op_between=1` comparison
+lines were:
+
+```text
+linux x86_64
+NB2TRACE6 numeric_cmp field=amt op=14 op_between=1 v=-1 i1=-100 i2=100 min_excl=0 max_excl=0 raw_v1=-1 raw_v2=1 result=1
+NB2TRACE6 numeric_cmp field=amt op=14 op_between=1 v=1 i1=-100 i2=100 min_excl=0 max_excl=0 raw_v1=-1 raw_v2=1 result=1
+NB2TRACE6 numeric_cmp field=amt op=14 op_between=1 v=0 i1=-100 i2=100 min_excl=0 max_excl=0 raw_v1=-1 raw_v2=1 result=1
+
+linux arm64
+NB2TRACE6 numeric_cmp field=amt op=14 op_between=1 v=-1 i1=-100 i2=100 min_excl=0 max_excl=0 raw_v1=-1 raw_v2=1 result=1
+NB2TRACE6 numeric_cmp field=amt op=14 op_between=1 v=1 i1=-100 i2=100 min_excl=0 max_excl=0 raw_v1=-1 raw_v2=1 result=1
+NB2TRACE6 numeric_cmp field=amt op=14 op_between=1 v=0 i1=-100 i2=100 min_excl=0 max_excl=0 raw_v1=-1 raw_v2=1 result=1
+
+macOS arm64
+NB2TRACE6 numeric_cmp field=amt op=14 op_between=1 v=-1 i1=-100 i2=100 min_excl=0 max_excl=0 raw_v1=-1 raw_v2=1 result=1
+NB2TRACE6 numeric_cmp field=amt op=14 op_between=1 v=1 i1=-100 i2=100 min_excl=0 max_excl=0 raw_v1=-1 raw_v2=1 result=1
+NB2TRACE6 numeric_cmp field=amt op=14 op_between=1 v=5999791 i1=-100 i2=100 min_excl=0 max_excl=0 raw_v1=-1 raw_v2=1 result=0
+```
+
+Decision-table row: macOS decodes one expected candidate as `5999791`,
+not one of the fixture's valid encodings (`-99999`, `-1`, `0`, `1`,
+`99999`). This confirms suspect #2: the numeric comparison receives
+wrong bytes for that record (either `TypedField.offset` is wrong or the
+record was written incorrectly). The compiled bounds, flags, and raw
+literals are identical across all three legs. This diagnostic round
+halts here; no production fix was attempted.
+
+The separate Linux TSan workflow timed out at its 900-second watchdog
+in `test-rebuild-validation`; it is tracked separately and is not part
+of this round-6 numeric evidence.
