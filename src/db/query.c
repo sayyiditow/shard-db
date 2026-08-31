@@ -1065,6 +1065,30 @@ static void *shard_count_worker(void *arg) {
         if (!sdb)
             sdb = slotcask_registry_get(sc->db_root, sc->object, &info);
         if (sdb) {
+#ifdef TEST_BUILD
+            /* Round-5 diagnostic seam — enumerate every candidate handed to
+               the resolve/fetch batch call, before any resolution happens.
+               Cross-referenced by hash against the kf_reval_fetch_one traces
+               in slotcask.c (Seam B), this shows whether a candidate
+               present here never reaches count_batch_cb — i.e. is dropped
+               inside the Kf-boundary revalidation or segment-liveness check,
+               not by criteria_match_tree. Temporary — delete with
+               docs/plans/2026-08-31-macos-numeric-between-round5-kf-fetch-drop.md. */
+            {
+                int nb2_between = sc->tree && sc->tree->kind == CNODE_LEAF &&
+                                   sc->tree->leaf.op == OP_BETWEEN;
+                for (int nb2_i = 0; nb2_i < n_need_fetch; nb2_i++) {
+                    const uint8_t *nb2_h = resolved ? resolved[nb2_i].hash
+                                                     : fetch_hashes[nb2_i];
+                    char nb2_hex[33] = {0};
+                    for (int nb2_j = 0; nb2_j < 16; nb2_j++)
+                        snprintf(nb2_hex + nb2_j * 2, 3, "%02x", nb2_h[nb2_j]);
+                    LOG_AUDIT(LOG_SUB_QUERY,
+                              "NB2TRACE5 fetch_in op_between=%d idx=%d hash=%s",
+                              nb2_between, nb2_i, nb2_hex);
+                }
+            }
+#endif
             CountBatchCbCtx cb_ctx = { sc, &local };
             if (resolved) {
                 /* Bitmap path: already have resolved locations, skip KF re-probe */

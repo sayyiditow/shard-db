@@ -44,6 +44,7 @@
  * a regression test arms the controls. */
 #ifdef TEST_BUILD
 #include "shard_test_ctl.h"
+#include "log.h"  /* LOG_AUDIT/LOG_SUB_SLOTCASK — round-5 diagnostic seam only */
 long g_shard_test_sync_counts[SHARD_TEST_PHASE_COUNT];
 long g_shard_test_fail_phase = -1;
 long g_shard_test_fail_occurrence;
@@ -6286,6 +6287,24 @@ static void kf_reval_fetch_one(KfRevalFetchArg *fa) {
     SlotcaskKfHandle kh;
     if (kfcache_acquire(&kh, kf_path, fa->db->slots_per_shard, 0) != 0) {
         /* Whole partition unreadable — retire every record in it. */
+#ifdef TEST_BUILD
+        /* Round-5 diagnostic seam — per-hash trace when the entire kf
+           partition for this shard is unreadable (kfcache_acquire
+           failure), so this silent whole-partition retirement is
+           distinguishable from a per-record kf_reval mismatch (below)
+           or an upstream drop in slotcask_bulk_resolve_hashes (which
+           would show as no kf_acquire_fail AND no kf_reval line at all
+           for that hash). Temporary — delete with the plan close-out. */
+        for (size_t i = 0; i < fa->count; i++) {
+            const uint8_t *nb2_h = fa->recs[fa->start + i].hash;
+            char nb2_hex[33] = {0};
+            for (int nb2_j = 0; nb2_j < 16; nb2_j++)
+                snprintf(nb2_hex + nb2_j * 2, 3, "%02x", nb2_h[nb2_j]);
+            LOG_AUDIT(LOG_SUB_SLOTCASK,
+                      "NB2TRACE5 kf_acquire_fail hash=%s kf_shard=%d",
+                      nb2_hex, fa->kf_shard);
+        }
+#endif
         for (size_t i = 0; i < fa->count; i++)
             fa->recs[fa->start + i].sid = 0xFF;
         return;
@@ -6297,10 +6316,40 @@ static void kf_reval_fetch_one(KfRevalFetchArg *fa) {
         uint16_t fid = 0;
         uint32_t off = 0;
         size_t slot = 0;
+#ifdef TEST_BUILD
+        /* Round-5 diagnostic seam — per-record outcome of the kf-boundary
+           revalidation probe. A resolve-time (r->sid/fid/off, captured by
+           slotcask_bulk_resolve_hashes moments earlier under a SEPARATE
+           kfcache_acquire on this same shard) that disagrees with this
+           second, still-single-threaded lookup — with no writer able to
+           run between the two calls in this test — points at the
+           revalidation probe itself rather than a genuine repoint/delete.
+           Temporary — delete with the plan close-out. */
+        int nb2_rc = kf_lookup_no_verify(&kh, r->hash, &flag, &sid, &fid,
+                                          &off, &slot);
+        int nb2_mismatch = nb2_rc != 0 || flag != 1 || sid != r->sid ||
+                            fid != r->fid || off != r->off;
+        {
+            char nb2_hex[33] = {0};
+            for (int nb2_j = 0; nb2_j < 16; nb2_j++)
+                snprintf(nb2_hex + nb2_j * 2, 3, "%02x", r->hash[nb2_j]);
+            LOG_AUDIT(LOG_SUB_SLOTCASK,
+                      "NB2TRACE5 kf_reval hash=%s rc=%d mismatch=%d "
+                      "resolve_sid=%u resolve_fid=%u resolve_off=%u "
+                      "reval_flag=%u reval_sid=%u reval_fid=%u reval_off=%u",
+                      nb2_hex, nb2_rc, nb2_mismatch,
+                      (unsigned)r->sid, (unsigned)r->fid, (unsigned)r->off,
+                      (unsigned)flag, (unsigned)sid, (unsigned)fid,
+                      (unsigned)off);
+        }
+        if (nb2_mismatch)
+            r->sid = 0xFF;  /* repointed or gone since resolve */
+#else
         if (kf_lookup_no_verify(&kh, r->hash, &flag, &sid, &fid, &off,
                                 &slot) != 0 ||
             flag != 1 || sid != r->sid || fid != r->fid || off != r->off)
             r->sid = 0xFF;  /* repointed or gone since resolve */
+#endif
     }
 
     /* Compact survivors within the slice (disjoint per partition). */
@@ -6333,7 +6382,26 @@ static void kf_reval_fetch_one(KfRevalFetchArg *fa) {
                     const SlotcaskResolvedRec *r =
                         &fa->recs[fa->start + j];
                     const uint8_t *rec = h.map + r->off;
+#ifdef TEST_BUILD
+                    /* Round-5 diagnostic seam — per-record outcome of the
+                       final segment-level liveness+hash check, the last
+                       gate before a resolved-and-kf-revalidated candidate
+                       reaches count_batch_cb. Temporary — delete with the
+                       plan close-out. */
+                    {
+                        int nb2_live = seg_rec_live_with_hash(rec, r->hash);
+                        char nb2_hex[33] = {0};
+                        for (int nb2_j = 0; nb2_j < 16; nb2_j++)
+                            snprintf(nb2_hex + nb2_j * 2, 3, "%02x",
+                                     r->hash[nb2_j]);
+                        LOG_AUDIT(LOG_SUB_SLOTCASK,
+                                  "NB2TRACE5 seg_live hash=%s live=%d",
+                                  nb2_hex, nb2_live);
+                        if (!nb2_live) continue;
+                    }
+#else
                     if (!seg_rec_live_with_hash(rec, r->hash)) continue;
+#endif
                     uint16_t klen = seg_rec_klen(rec);
                     uint32_t vlen = seg_rec_vlen(rec);
                     if (fa->cb(r->hash, rec + 24, klen,
@@ -6342,6 +6410,29 @@ static void kf_reval_fetch_one(KfRevalFetchArg *fa) {
                 }
                 segcache_release(&h);
             }
+#ifdef TEST_BUILD
+            else {
+                /* Round-5 diagnostic seam — per-hash trace when the
+                   segment file backing this run is unreadable
+                   (segcache_acquire failure), so this silent whole-run
+                   skip is distinguishable from a per-record
+                   seg_rec_live_with_hash rejection (above). Every hash
+                   in [run_start, i] is affected — none of them get a
+                   seg_live line for this call. Temporary — delete with
+                   the plan close-out. */
+                for (size_t j = run_start; j <= i; j++) {
+                    const uint8_t *nb2_h = fa->recs[fa->start + j].hash;
+                    char nb2_hex[33] = {0};
+                    for (int nb2_k = 0; nb2_k < 16; nb2_k++)
+                        snprintf(nb2_hex + nb2_k * 2, 3, "%02x",
+                                 nb2_h[nb2_k]);
+                    LOG_AUDIT(LOG_SUB_SLOTCASK,
+                              "NB2TRACE5 seg_acquire_fail hash=%s "
+                              "seg_path=%s",
+                              nb2_hex, seg_path);
+                }
+            }
+#endif
             run_start = i + 1;
         }
     }
