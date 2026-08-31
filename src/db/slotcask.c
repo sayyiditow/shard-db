@@ -6336,6 +6336,69 @@ static void kf_reval_fetch_one(KfRevalFetchArg *fa) {
                     if (!seg_rec_live_with_hash(rec, r->hash)) continue;
                     uint16_t klen = seg_rec_klen(rec);
                     uint32_t vlen = seg_rec_vlen(rec);
+#ifdef TEST_BUILD
+                    /* Round-7 diagnostic seam A — fetch point. Round 6
+                       proved match_typed decodes a wrong value for one
+                       record on macOS with no source-level copy between
+                       this call site and that decode (value pointer is
+                       passed straight through count_batch_cb /
+                       criteria_match_tree unchanged). This dumps the key,
+                       klen/vlen, the raw value bytes exactly as read off
+                       the mmap'd segment, and the value pointer itself —
+                       right before they're handed to the callback, the
+                       earliest point in the chain any diagnostic has
+                       observed so far. value_ptr is logged so Task 4 can
+                       pair this line with its Seam-B counterpart by
+                       pointer identity rather than by log order: this
+                       function dispatches shard partitions across
+                       parallel workers (kf_reval_fetch_worker /
+                       parallel_for_io), so NB2TRACE7A/NB2TRACE7B lines
+                       from different records can interleave in the log
+                       and must not be paired by position.
+
+                       The raw-bytes window below is deliberately NOT
+                       bounded by vlen. match_typed's FT_NUMERIC case
+                       reads a fixed 8-byte window via ld_be_i64 without
+                       ever consulting vlen, so a seam that bounds its
+                       own dump by vlen goes blind exactly when vlen
+                       itself is the anomaly (observed for key=n_2 in an
+                       earlier run of this seam: vlen=0 zeroed the copy
+                       length, so vbytes read back as the zero-
+                       initialized buffer instead of the actual bytes at
+                       that address — worthless for comparing against
+                       Seam B). Bounding by fa->db->slot_size instead is
+                       always safe regardless of vlen or of which object
+                       this fires for: seg_record_emit zero-pads every
+                       record to slot_size at write time
+                       (slotcask.c:3561-3562), so every byte in
+                       [rec, rec+slot_size) is real, initialized memory
+                       for this record's slot, never past the mmap'd
+                       segment. Temporary — delete with the plan
+                       close-out. */
+                    {
+                        char kbuf[64];
+                        size_t kcopy = klen < sizeof(kbuf) - 1 ? klen : sizeof(kbuf) - 1;
+                        memcpy(kbuf, rec + 24, kcopy);
+                        kbuf[kcopy] = '\0';
+                        uint8_t vb[8] = {0};
+                        size_t vcopy = 0;
+                        if ((size_t)klen + 24 <= (size_t)fa->db->slot_size) {
+                            size_t vroom = (size_t)fa->db->slot_size - 24 - klen;
+                            vcopy = vroom < 8 ? vroom : 8;
+                        }
+                        memcpy(vb, rec + 24 + klen, vcopy);
+                        LOG_AUDIT(LOG_SUB_SLOTCASK,
+                                  "NB2TRACE7A kf_fetch key=%s klen=%u vlen=%u "
+                                  "value_ptr=%p "
+                                  "vbytes=%02x%02x%02x%02x%02x%02x%02x%02x",
+                                  kbuf, (unsigned)klen, (unsigned)vlen,
+                                  (const void *)(rec + 24 + klen),
+                                  (unsigned)vb[0], (unsigned)vb[1],
+                                  (unsigned)vb[2], (unsigned)vb[3],
+                                  (unsigned)vb[4], (unsigned)vb[5],
+                                  (unsigned)vb[6], (unsigned)vb[7]);
+                    }
+#endif
                     if (fa->cb(r->hash, rec + 24, klen,
                                rec + 24 + klen, vlen, fa->ctx) != 0)
                         break;
