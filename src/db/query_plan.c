@@ -937,34 +937,7 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
     }
     case FT_NUMERIC: {
         int64_t v = ld_be_i64(p);
-#ifdef TEST_BUILD
-        /* Round-6 diagnostic seam — round 5 proved every BETWEEN
-           candidate's fetched record bytes reach count_batch_cb intact
-           on macOS (kf_reval mismatch=0, seg_live live=1 for all 3).
-           This traces the FT_NUMERIC comparison itself: the decoded
-           record value, the compiled query bounds, the exclusivity
-           flags, and the raw query literals they were parsed from — so
-           a divergence in any one of those (vs. the pure comparison
-           logic in cmp_op_i64) is directly visible instead of inferred.
-           Temporary — delete with the plan close-out. */
-        int nb2_r = cmp_op_i64(v, cc->i1, cc->i2, cc->op, cc->in_i64,
-                               cc->in_count, cc);
-        LOG_AUDIT(LOG_SUB_QUERY,
-                  "NB2TRACE6 numeric_cmp field=%s op=%d op_between=%d "
-                  "v=%lld i1=%lld i2=%lld min_excl=%d max_excl=%d "
-                  "raw_v1=%s raw_v2=%s result=%d",
-                  cc->raw ? cc->raw->field : "?", (int)cc->op,
-                  cc->op == OP_BETWEEN,
-                  (long long)v, (long long)cc->i1, (long long)cc->i2,
-                  (cc->raw ? cc->raw->min_exclusive : -1),
-                  (cc->raw ? cc->raw->max_exclusive : -1),
-                  (cc->raw && cc->raw->value[0]) ? cc->raw->value : "?",
-                  (cc->raw && cc->raw->value2[0]) ? cc->raw->value2 : "?",
-                  nb2_r);
-        return nb2_r;
-#else
         return cmp_op_i64(v, cc->i1, cc->i2, cc->op, cc->in_i64, cc->in_count, cc);
-#endif
     }
     case FT_DOUBLE: {
         double v; memcpy(&v, p, 8);
