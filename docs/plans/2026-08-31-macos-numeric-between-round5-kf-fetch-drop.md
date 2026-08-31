@@ -927,3 +927,58 @@ unmerged, pending human review and a round-6 (or fix) plan.
   already does nothing there but retire/skip).
 - No new dependency; `log.h` is already part of this codebase, only
   newly included by `slotcask.c` under the existing `TEST_BUILD` guard.
+
+## Evidence — Task 4
+
+CI run `33375564346`: Linux x86_64 and Linux arm64 passed; macOS arm64
+failed only W1 (`expected 3 got 2`). On every leg, the three BETWEEN
+hashes emitted `fetch_in`, `kf_reval mismatch=0`, and `seg_live live=1`.
+There were no `kf_acquire_fail` or `seg_acquire_fail` lines for them.
+
+macOS arm64 exact BETWEEN lines:
+
+```text
+NB2TRACE5 fetch_in op_between=1 idx=0 hash=15980c845e1af02bbf807f439dbe0b14
+NB2TRACE5 kf_reval hash=15980c845e1af02bbf807f439dbe0b14 rc=0 mismatch=0 resolve_sid=2 resolve_fid=0 resolve_off=0 reval_flag=1 reval_sid=2 reval_fid=0 reval_off=0
+NB2TRACE5 seg_live hash=15980c845e1af02bbf807f439dbe0b14 live=1
+NB2TRACE5 fetch_in op_between=1 idx=0 hash=5b8caf5a35fee16548321d31a3fdaa76
+NB2TRACE5 kf_reval hash=5b8caf5a35fee16548321d31a3fdaa76 rc=0 mismatch=0 resolve_sid=1 resolve_fid=0 resolve_off=72 reval_flag=1 reval_sid=1 reval_fid=0 reval_off=72
+NB2TRACE5 seg_live hash=5b8caf5a35fee16548321d31a3fdaa76 live=1
+NB2TRACE5 fetch_in op_between=1 idx=0 hash=ce33e603c9ea4b74010c089f489694a0
+NB2TRACE5 kf_reval hash=ce33e603c9ea4b74010c089f489694a0 rc=0 mismatch=0 resolve_sid=1 resolve_fid=0 resolve_off=40 reval_flag=1 reval_sid=1 reval_fid=0 reval_off=40
+NB2TRACE5 seg_live hash=ce33e603c9ea4b74010c089f489694a0 live=1
+```
+
+Linux arm64 exact BETWEEN lines:
+
+```text
+NB2TRACE5 fetch_in op_between=1 idx=0 hash=15980c845e1af02bbf807f439dbe0b14
+NB2TRACE5 kf_reval hash=15980c845e1af02bbf807f439dbe0b14 rc=0 mismatch=0 resolve_sid=0 resolve_fid=0 resolve_off=0 reval_flag=1 reval_sid=0 reval_fid=0 reval_off=0
+NB2TRACE5 seg_live hash=15980c845e1af02bbf807f439dbe0b14 live=1
+NB2TRACE5 fetch_in op_between=1 idx=0 hash=5b8caf5a35fee16548321d31a3fdaa76
+NB2TRACE5 kf_reval hash=5b8caf5a35fee16548321d31a3fdaa76 rc=0 mismatch=0 resolve_sid=2 resolve_fid=0 resolve_off=0 reval_flag=1 reval_sid=2 reval_fid=0 reval_off=0
+NB2TRACE5 seg_live hash=5b8caf5a35fee16548321d31a3fdaa76 live=1
+NB2TRACE5 fetch_in op_between=1 idx=0 hash=ce33e603c9ea4b74010c089f489694a0
+NB2TRACE5 kf_reval hash=ce33e603c9ea4b74010c089f489694a0 rc=0 mismatch=0 resolve_sid=0 resolve_fid=0 resolve_off=40 reval_flag=1 reval_sid=0 reval_fid=0 reval_off=40
+NB2TRACE5 seg_live hash=ce33e603c9ea4b74010c089f489694a0 live=1
+```
+
+Linux x86_64 exact BETWEEN lines:
+
+```text
+NB2TRACE5 fetch_in op_between=1 idx=0 hash=15980c845e1af02bbf807f439dbe0b14
+NB2TRACE5 kf_reval hash=15980c845e1af02bbf807f439dbe0b14 rc=0 mismatch=0 resolve_sid=0 resolve_fid=0 resolve_off=0 reval_flag=1 reval_sid=0 reval_fid=0 reval_off=0
+NB2TRACE5 seg_live hash=15980c845e1af02bbf807f439dbe0b14 live=1
+NB2TRACE5 fetch_in op_between=1 idx=0 hash=5b8caf5a35fee16548321d31a3fdaa76
+NB2TRACE5 kf_reval hash=5b8caf5a35fee16548321d31a3fdaa76 rc=0 mismatch=0 resolve_sid=2 resolve_fid=0 resolve_off=0 reval_flag=1 reval_sid=2 reval_fid=0 reval_off=0
+NB2TRACE5 seg_live hash=5b8caf5a35fee16548321d31a3fdaa76 live=1
+NB2TRACE5 fetch_in op_between=1 idx=0 hash=ce33e603c9ea4b74010c089f489694a0
+NB2TRACE5 kf_reval hash=ce33e603c9ea4b74010c089f489694a0 rc=0 mismatch=0 resolve_sid=0 resolve_fid=0 resolve_off=40 reval_flag=1 reval_sid=0 reval_fid=0 reval_off=40
+NB2TRACE5 seg_live hash=ce33e603c9ea4b74010c089f489694a0 live=1
+```
+
+Decision-table row: all three hashes survive all round-5 seams on
+macOS, yet W1 returns 2. This confirms suspect #6: the drop is
+downstream of `slotcask_bulk_resolve_and_fetch`, in `count_batch_cb` or
+`criteria_match_tree` operating on the fetched record. This diagnostic
+round halts here; no production fix was attempted.
