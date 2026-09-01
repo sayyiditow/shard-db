@@ -666,6 +666,67 @@ Insert the new line between them:
    Quote the exact log lines, not a paraphrase, for whichever rows
    apply (one `vlen` row plus one `vbytes`/`v=` row per platform).
 
+## Evidence — Task 4
+
+PR #329: https://github.com/sayyiditow/shard-db/pull/329, commit
+`7769582`. CI matrix results: `Build & test (linux x86_64)` pass,
+`Build & test (linux arm64)` pass, `Build & test (macos arm64)` **fail**
+(the target — `not ok 2 - W1 wire between -1 and 1 = 3`), plus an
+additional `TSan (Linux x86_64)` leg that failed on an unrelated
+900s watchdog timeout in `test-rebuild-validation` (no ThreadSanitizer
+report; `test-numeric-between-probe7` itself passed 5/5 under TSan) —
+not part of this plan's required three legs and not evidence for or
+against this bug.
+
+Raw lines below are the audit-log content only, with the CI log
+wrapper (job name / `UNKNOWN STEP` / ISO timestamp prefix) stripped;
+otherwise verbatim.
+
+### Linux x86_64 (`Build & test (linux x86_64)` — pass)
+
+```
+S2 2026-08-31-audit.log: 2026-08-31 23:11:09 INFO [slotcask] NB2TRACE7A kf_fetch key=n_1 klen=3 vlen=8 value_ptr=0x7f9a7000001b vbytes=ffffffffffffffff
+S2 2026-08-31-audit.log: 2026-08-31 23:11:09 INFO [slotcask] NB2TRACE7A kf_fetch key=n_3 klen=3 vlen=8 value_ptr=0x7f9a6000001b vbytes=0000000000000001
+S2 2026-08-31-audit.log: 2026-08-31 23:11:09 INFO [slotcask] NB2TRACE7A kf_fetch key=n_2 klen=3 vlen=0 value_ptr=0x7f9a70000043 vbytes=0000000000000000
+S2 2026-08-31-audit.log: 2026-08-31 23:11:09 INFO [query] NB2TRACE7B match_typed value_ptr=0x7f9a7000001b v=-1 i1=-100 i2=100 op=14
+S2 2026-08-31-audit.log: 2026-08-31 23:11:09 INFO [query] NB2TRACE7B match_typed value_ptr=0x7f9a6000001b v=1 i1=-100 i2=100 op=14
+S2 2026-08-31-audit.log: 2026-08-31 23:11:09 INFO [query] NB2TRACE7B match_typed value_ptr=0x7f9a70000043 v=0 i1=-100 i2=100 op=14
+```
+
+Pairing: `key=n_1` value_ptr=0x7f9a7000001b (A: vlen=8 vbytes=ffff…ff → B: v=-1), `key=n_3` value_ptr=0x7f9a6000001b (A: vlen=8 vbytes=…01 → B: v=1), `key=n_2` value_ptr=0x7f9a70000043 (A: vlen=0 vbytes=all-zero → B: v=0). All three self-consistent; test passed (`W1 wire between -1 and 1 = 3`).
+
+### Linux arm64 (`Build & test (linux arm64)` — pass)
+
+```
+S2 2026-08-31-audit.log: 2026-08-31 23:11:01 INFO [slotcask] NB2TRACE7A kf_fetch key=n_1 klen=3 vlen=8 value_ptr=0xff947000001b vbytes=ffffffffffffffff
+S2 2026-08-31-audit.log: 2026-08-31 23:11:01 INFO [slotcask] NB2TRACE7A kf_fetch key=n_3 klen=3 vlen=8 value_ptr=0xff946000001b vbytes=0000000000000001
+S2 2026-08-31-audit.log: 2026-08-31 23:11:01 INFO [slotcask] NB2TRACE7A kf_fetch key=n_2 klen=3 vlen=0 value_ptr=0xff9470000043 vbytes=0000000000000000
+S2 2026-08-31-audit.log: 2026-08-31 23:11:01 INFO [query] NB2TRACE7B match_typed value_ptr=0xff947000001b v=-1 i1=-100 i2=100 op=14
+S2 2026-08-31-audit.log: 2026-08-31 23:11:01 INFO [query] NB2TRACE7B match_typed value_ptr=0xff946000001b v=1 i1=-100 i2=100 op=14
+S2 2026-08-31-audit.log: 2026-08-31 23:11:01 INFO [query] NB2TRACE7B match_typed value_ptr=0xff9470000043 v=0 i1=-100 i2=100 op=14
+```
+
+Pairing: identical structure to Linux x86_64 above — `key=n_2` value_ptr=0xff9470000043 (A: vlen=0 vbytes=all-zero → B: v=0). All three self-consistent; test passed.
+
+### macOS arm64 (`Build & test (macos arm64)` — **fail**, target evidence)
+
+```
+S2 2026-08-31-audit.log: 2026-08-31 23:11:52 INFO [slotcask] NB2TRACE7A kf_fetch key=n_1 klen=3 vlen=8 value_ptr=0x13460401b vbytes=ffffffffffffffff
+S2 2026-08-31-audit.log: 2026-08-31 23:11:52 INFO [slotcask] NB2TRACE7A kf_fetch key=n_3 klen=3 vlen=8 value_ptr=0x12c604063 vbytes=0000000000000001
+S2 2026-08-31-audit.log: 2026-08-31 23:11:52 INFO [slotcask] NB2TRACE7A kf_fetch key=n_2 klen=3 vlen=0 value_ptr=0x12c604043 vbytes=00000000005b8caf
+S2 2026-08-31-audit.log: 2026-08-31 23:11:52 INFO [query] NB2TRACE7B match_typed value_ptr=0x13460401b v=-1 i1=-100 i2=100 op=14
+S2 2026-08-31-audit.log: 2026-08-31 23:11:52 INFO [query] NB2TRACE7B match_typed value_ptr=0x12c604063 v=1 i1=-100 i2=100 op=14
+S2 2026-08-31-audit.log: 2026-08-31 23:11:52 INFO [query] NB2TRACE7B match_typed value_ptr=0x12c604043 v=5999791 i1=-100 i2=100 op=14
+```
+
+Pairing: `key=n_1` value_ptr=0x13460401b (A: vlen=8 vbytes=ffff…ff → B: v=-1, matches Linux), `key=n_3` value_ptr=0x12c604063 (A: vlen=8 vbytes=…01 → B: v=1, matches Linux), `key=n_2` value_ptr=0x12c604043 (A: vlen=0 **vbytes=00000000005b8caf** → B: **v=5999791**). `n_2`'s pair is where macOS diverges from both Linux legs: `0x5b8caf` = 5999791 decimal, and Seam B's decoded value is exactly that — the two seams agree with each other, but Seam A's raw bytes already hold garbage before `match_typed` ever runs. `not ok 2 - W1 wire between -1 and 1 = 3` confirms the resulting `between -1..1` count drops to 2 (n_2 excluded because it decodes as 5999791, outside `[-100, 100]`).
+
+### Decision table applied
+
+**`vlen=` tier:** `key=n_2`'s `vlen=0` on macOS matches row 1 ("reads `0`, or any value other than the fixed `8`") — literally, this is flagged. But the same `vlen=0` for the same record appears identically on **both** passing Linux legs, so `vlen=0` for `n_2` is not itself macOS-specific and is not, by itself, sufficient to explain the count drop (Linux gets `v=0`/correct-count with the identical `vlen=0`). Per the table's instruction, this does not resolve the round on its own — recording it as an additional fact per the table's requirement, and proceeding to the `vbytes`/`v=` tier using the same log line. (Round 8, if it pursues the `vlen` instrumentation the table calls for, should account for this cross-platform `vlen=0` observation rather than treating `vlen=0` as macOS-exclusive.)
+
+**`vbytes`/`v=` tier:** macOS's `key=n_2` line matches row 1 exactly: `vbytes=00000000005b8caf` is not `00 00 00 00 00 00 00 00` — Seam A itself shows the garbage value, before the callback fires. **This confirms suspect #1 or #2** — the corruption (or wrong `r->off`) exists upstream of `kf_reval_fetch_one`'s callback dispatch, upstream of everything round 5/6 traced through `match_typed`. Round 6's "match_typed decodes a wrong value" framing undersold where the divergence actually is: `match_typed` (Seam B) is not misdecoding anything — it correctly decodes the 8 bytes it's handed, and those 8 bytes are already wrong at the fetch point. Per the table, round 8 must target either the on-disk write path for `n_2` (raw hex dump of the segment file at its actual offset, independent of the daemon) or the KF-resolve step producing `r->off` upstream of `kf_reval_fetch_one` (`fa->recs[].off`'s producer — not yet located).
+
 ## Task 5 — HALT
 
 Do not write or propose a fix. Do not modify `kf_reval_fetch_one`,
