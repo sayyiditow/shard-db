@@ -937,28 +937,6 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
     }
     case FT_NUMERIC: {
         int64_t v = ld_be_i64(p);
-#ifdef TEST_BUILD
-        /* Round-7 diagnostic seam B — decode point. Paired with seam
-           A in slotcask.c's kf_reval_fetch_one: that seam dumps the
-           same bytes at the moment they're first read off the mmap'd
-           segment, before any callback runs. No source-level copy
-           exists between the two seams (value pointer passed through
-           count_batch_cb/criteria_match_tree unchanged) — p here is
-           numerically identical to seam A's value_ptr for the same
-           record, so Task 4 pairs lines by value_ptr, not by log
-           order (kf_reval_fetch_one dispatches across parallel
-           workers, so lines from different records can interleave).
-           If this seam's decoded v disagrees with seam A's vbytes
-           for the same value_ptr, that's the direct signature of
-           either a concurrent mutation of the mmap page between the
-           two reads, or a codegen/UB difference in the read itself.
-           Temporary — delete with the plan close-out. */
-        LOG_AUDIT(LOG_SUB_QUERY,
-                  "NB2TRACE7B match_typed value_ptr=%p v=%lld i1=%lld "
-                  "i2=%lld op=%d",
-                  (const void *)p, (long long)v, (long long)cc->i1,
-                  (long long)cc->i2, (int)cc->op);
-#endif
         return cmp_op_i64(v, cc->i1, cc->i2, cc->op, cc->in_i64, cc->in_count, cc);
     }
     case FT_DOUBLE: {
