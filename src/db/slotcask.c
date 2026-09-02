@@ -3474,6 +3474,11 @@ static int pool_try_pop_for_size(SlotcaskStream *p, uint32_t needed_size,
    return it to the pool as its own independent, correctly-capacitied
    entry so the invariant "on-disk footprint == header-computed size"
    holds for every record unconditionally. */
+#ifdef TEST_BUILD
+/* Round-8 diagnostic: distinguishes an acquire failure before memset
+   from a later free-list registration failure after it. */
+static __thread int g_nb2trace8_split_memset_ran;
+#endif
 static int pool_split_leftover(SlotcaskDb *db, uint8_t stream_id,
                                 uint16_t file_id, uint32_t offset,
                                 uint32_t len) {
@@ -3481,8 +3486,16 @@ static int pool_split_leftover(SlotcaskDb *db, uint8_t stream_id,
     char path[PATH_MAX];
     seg_path_for(path, db->data_dir, stream_id, file_id);
     SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 0, 0, 1) != 0) return -1;
+    if (segcache_acquire(&h, path, 0, 0, 1) != 0) {
+#ifdef TEST_BUILD
+        g_nb2trace8_split_memset_ran = 0;
+#endif
+        return -1;
+    }
     memset(h.map + offset, 0, len);
+#ifdef TEST_BUILD
+    g_nb2trace8_split_memset_ran = 1;
+#endif
     if (h.slot >= 0) {
         SegCacheEntry *e = &g_segcache[h.slot];
         durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
@@ -4514,16 +4527,27 @@ static void bulk_phase3_stage_pending(SlotcaskDb *db,
             SlotcaskFreeSlot fs;
             size_t needed = 24 + r->klen + r->vlen;
             size_t rec_size = slotcask_record_size_varlen(r->klen, r->vlen);
+#ifdef TEST_BUILD
+            int split_rc = 0;
+            int split_memset_ran = -1;
+#endif
             if (pool_try_pop_for_size(pool, (uint32_t)needed,
                                       db->slot_size, &fs) == 0) {
                 st[i].target_fid = fs.file_id;
                 st[i].target_off = fs.offset;
                 st[i].got_pool = 1;
                 r->slot_capacity = (uint32_t)rec_size;
-                if (fs.capacity > (uint32_t)rec_size)
-                    pool_split_leftover(db, (uint8_t)s, fs.file_id,
-                                        fs.offset + (uint32_t)rec_size,
-                                        fs.capacity - (uint32_t)rec_size);
+                if (fs.capacity > (uint32_t)rec_size) {
+#ifdef TEST_BUILD
+                    split_rc =
+#endif
+                        pool_split_leftover(db, (uint8_t)s, fs.file_id,
+                                            fs.offset + (uint32_t)rec_size,
+                                            fs.capacity - (uint32_t)rec_size);
+#ifdef TEST_BUILD
+                    split_memset_ran = g_nb2trace8_split_memset_ran;
+#endif
+                }
             } else {
                 uint32_t fid, off;
                 if (append_reserve_single_varlen(db, pool, rec_size,
@@ -4550,6 +4574,46 @@ static void bulk_phase3_stage_pending(SlotcaskDb *db,
             seg_record_emit_pending(h.map + st[i].target_off, (int)rec_size,
                                     st[i].hash, r->key, r->klen,
                                     r->value, r->vlen);
+#ifdef TEST_BUILD
+            /* Round-8 write seam: record the persisted bytes and allocation
+               provenance immediately after the pending record write. */
+            {
+                size_t klen = r->klen, vlen = r->vlen;
+                size_t used = 24 + klen + vlen;
+                uint32_t pool_cap = 0;
+                int split_occurred = 0;
+                if (st[i].got_pool) {
+                    pool_cap = fs.capacity;
+                    split_occurred = (fs.capacity > (uint32_t)rec_size);
+                }
+                char kbuf[64];
+                size_t kcopy = klen < sizeof(kbuf) - 1 ? klen : sizeof(kbuf) - 1;
+                memcpy(kbuf, h.map + st[i].target_off + 24, kcopy);
+                kbuf[kcopy] = '\0';
+                uint8_t vb[16] = {0};
+                size_t vstart = (size_t)st[i].target_off + 24 + klen;
+                size_t seg_max = slotcask_seg_max_bytes();
+                size_t map_remaining = vstart <= seg_max ? seg_max - vstart : 0;
+                size_t vcopy = map_remaining < sizeof(vb) ? map_remaining : sizeof(vb);
+                memcpy(vb, h.map + vstart, vcopy);
+                LOG_AUDIT(LOG_SUB_SLOTCASK,
+                          "NB2TRACE8W bulk_phase3 key=%s klen=%u vlen=%u used=%zu "
+                          "rec_size=%zu fid=%u off=%u got_pool=%d pool_cap=%u "
+                          "split=%d split_rc=%d split_memset_ran=%d vcopy=%zu "
+                          "vbytes=%02x%02x%02x%02x%02x%02x%02x%02x"
+                          "%02x%02x%02x%02x%02x%02x%02x%02x",
+                          kbuf, (unsigned)klen, (unsigned)vlen, used, rec_size,
+                          (unsigned)st[i].target_fid, (unsigned)st[i].target_off,
+                          (int)st[i].got_pool, (unsigned)pool_cap,
+                          split_occurred, split_rc, split_memset_ran, vcopy,
+                          (unsigned)vb[0], (unsigned)vb[1], (unsigned)vb[2],
+                          (unsigned)vb[3], (unsigned)vb[4], (unsigned)vb[5],
+                          (unsigned)vb[6], (unsigned)vb[7], (unsigned)vb[8],
+                          (unsigned)vb[9], (unsigned)vb[10], (unsigned)vb[11],
+                          (unsigned)vb[12], (unsigned)vb[13], (unsigned)vb[14],
+                          (unsigned)vb[15]);
+            }
+#endif
             SegCacheEntry *e = &g_segcache[h.slot];
             durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
             segcache_release(&h);
@@ -6336,6 +6400,43 @@ static void kf_reval_fetch_one(KfRevalFetchArg *fa) {
                     if (!seg_rec_live_with_hash(rec, r->hash)) continue;
                     uint16_t klen = seg_rec_klen(rec);
                     uint32_t vlen = seg_rec_vlen(rec);
+#ifdef TEST_BUILD
+                    /* Round-8 fetch seam: capture the same mapped window as
+                       the write seam before invoking the query callback. */
+                    {
+                        size_t used = 24 + (size_t)klen + (size_t)vlen;
+                        size_t computed_rec_size =
+                            slotcask_record_size_varlen(klen, vlen);
+                        char kbuf[64];
+                        size_t kcopy = klen < sizeof(kbuf) - 1 ? klen : sizeof(kbuf) - 1;
+                        memcpy(kbuf, rec + 24, kcopy);
+                        kbuf[kcopy] = '\0';
+                        uint8_t vb[16] = {0};
+                        size_t vstart = (size_t)r->off + 24 + (size_t)klen;
+                        size_t seg_max = slotcask_seg_max_bytes();
+                        size_t map_remaining = vstart <= seg_max ? seg_max - vstart : 0;
+                        size_t vcopy = map_remaining < sizeof(vb) ? map_remaining : sizeof(vb);
+                        memcpy(vb, h.map + vstart, vcopy);
+                        LOG_AUDIT(LOG_SUB_SLOTCASK,
+                                  "NB2TRACE8F kf_fetch key=%s klen=%u vlen=%u "
+                                  "used=%zu rec_size=%zu fid=%u off=%u vcopy=%zu "
+                                  "value_ptr=%p "
+                                  "vbytes=%02x%02x%02x%02x%02x%02x%02x%02x"
+                                  "%02x%02x%02x%02x%02x%02x%02x%02x",
+                                  kbuf, (unsigned)klen, (unsigned)vlen,
+                                  used, computed_rec_size,
+                                  (unsigned)r->fid, (unsigned)r->off, vcopy,
+                                  (const void *)(rec + 24 + klen),
+                                  (unsigned)vb[0], (unsigned)vb[1],
+                                  (unsigned)vb[2], (unsigned)vb[3],
+                                  (unsigned)vb[4], (unsigned)vb[5],
+                                  (unsigned)vb[6], (unsigned)vb[7],
+                                  (unsigned)vb[8], (unsigned)vb[9],
+                                  (unsigned)vb[10], (unsigned)vb[11],
+                                  (unsigned)vb[12], (unsigned)vb[13],
+                                  (unsigned)vb[14], (unsigned)vb[15]);
+                    }
+#endif
                     if (fa->cb(r->hash, rec + 24, klen,
                                rec + 24 + klen, vlen, fa->ctx) != 0)
                         break;

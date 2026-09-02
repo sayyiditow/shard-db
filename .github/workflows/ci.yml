@@ -75,6 +75,12 @@ jobs:
         # TEST_REGISTER static-init; one invocation runs the whole suite.
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
+      # TEMPORARY (scratch branch only) — round-8 diagnostic probe for
+      # docs/plans/2026-09-01-macos-numeric-between-round8-trim-boundary-overread.md.
+      # Remove with the plan close-out.
+      - name: PROBE (scratch) — numeric between round 8
+        run: ./build/bin/shard-db-test run test-numeric-between-probe8
+
       - name: Run full C test suite
         # 40+ cases / 1000+ assertions. Each case spawns its own daemon on
         # a free port at a unique tmpdir, so cases are CWD-independent and
