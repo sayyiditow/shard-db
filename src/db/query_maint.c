@@ -60,11 +60,12 @@ static int tg_estimate_cb(uint32_t slot, const uint8_t hash16[16],
                           const void *key, size_t klen,
                           const void *value, size_t vlen,
                           void *ctx) {
-    (void)slot; (void)hash16; (void)key; (void)klen; (void)vlen;
+    (void)slot; (void)hash16; (void)key; (void)klen;
     TgEstimateCtx *c = (TgEstimateCtx *)ctx;
     if (c->sampled >= c->max_sample) return -1;
     const TypedField *f = &c->ts->fields[c->field_index];
-    const uint8_t *vbase = (const uint8_t *)value + f->offset;
+    const uint8_t *vbase = ((size_t)f->offset + (size_t)f->size > vlen)
+        ? g_zero_field_65537 : (const uint8_t *)value + f->offset;
     uint16_t actual_len = ((uint16_t)vbase[0] << 8) | (uint16_t)vbase[1];
     /* actual_len is an on-disk length prefix; clamp it to the field's
        actual declared content size before reading past vbase + 2

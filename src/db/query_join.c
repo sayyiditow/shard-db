@@ -602,8 +602,8 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
 
     /* Criteria match + join resolution are thread-local reads, lock-free. */
     int match = sc->fast_cc
-        ? match_typed((const uint8_t *)raw, sc->fast_cc, sc->fs)
-        : criteria_match_tree((const uint8_t *)raw, sc->tree, sc->fs);
+        ? match_typed((const uint8_t *)raw, hdr->value_len, sc->fast_cc, sc->fs)
+        : criteria_match_tree((const uint8_t *)raw, hdr->value_len, sc->tree, sc->fs);
 
     if (match) {
         RecordRef     *join_refs = NULL;

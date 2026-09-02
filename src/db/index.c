@@ -1964,12 +1964,16 @@ static int bm_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
                          const void *key, size_t klen,
                          const void *value, size_t vlen,
                          void *ctx) {
-    (void)hash16; (void)key; (void)klen; (void)vlen;
+    (void)hash16; (void)key; (void)klen;
     BmRebuildCtx *c = (BmRebuildCtx *)ctx;
     if (c->field_index < 0) return 0;
     const TypedField *f = &c->ts->fields[c->field_index];
-    /* Pull the raw field bytes out of the typed-record value. */
-    const uint8_t *vbase = (const uint8_t *)value + f->offset;
+    /* Pull the raw field bytes out of the typed-record value. Trim-encoded
+       records may be shorter than f->offset+f->size — substitute the
+       shared zero buffer rather than reading past vlen (same pattern as
+       typed_get_field_str, config.c:3159-3176). */
+    const uint8_t *vbase = ((size_t)f->offset + (size_t)f->size > vlen)
+        ? g_zero_field_65537 : (const uint8_t *)value + f->offset;
     /* Encode via the same path bitmap_update uses on insert. For fixed
        types the raw stored bytes are already the index-key form;
        varchar carries a 2-byte length prefix in storage that we need

@@ -912,7 +912,7 @@ static int count_batch_cb(const uint8_t hash[16],
     (void)hash; (void)key; (void)klen;
     CountBatchCbCtx *c = (CountBatchCbCtx *)ctx_ptr;
     if (query_deadline_tick(c->sc->deadline, &c->sc->dl_counter)) return 1;
-    if (criteria_match_tree((const uint8_t *)value, c->sc->tree, c->sc->fs)) {
+    if (criteria_match_tree((const uint8_t *)value, vlen, c->sc->tree, c->sc->fs)) {
         __atomic_add_fetch(c->local, 1, __ATOMIC_RELAXED);
     }
     return 0;
@@ -1595,7 +1595,7 @@ static int stream_find_record_cb(const uint8_t hash16[16],
                                   const void *key, size_t klen,
                                   const void *value, size_t vlen,
                                   void *ctx) {
-    (void)hash16; (void)vlen;
+    (void)hash16;
     StreamFindCtx *sc = (StreamFindCtx *)ctx;
     g_out = sc->parent_out;
 
@@ -1608,7 +1608,7 @@ static int stream_find_record_cb(const uint8_t hash16[16],
 
     if (is_excluded(sc->excluded, keybuf)) return 0;
 
-    if (!criteria_match_tree(value, sc->tree, sc->fs)) return 0;
+    if (!criteria_match_tree(value, vlen, sc->tree, sc->fs)) return 0;
 
     pthread_mutex_lock(&sc->lock);
     int my_seq = ++sc->passed;
@@ -2056,7 +2056,7 @@ static int composite_prefix_cb(const char *val, size_t vlen,
 
     /* Post-filter: apply the full criteria tree (seed leaf trivially passes
        since we're inside its prefix; any extra AND leaves still need checking). */
-    if (c->tree && !criteria_match_tree(raw, c->tree, c->fs)) {
+    if (c->tree && !criteria_match_tree(raw, value_len, c->tree, c->fs)) {
         release_record_ref(&rr);
         return 0;
     }
@@ -2120,7 +2120,7 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
                                        const void *key, size_t klen,
                                        const void *value, size_t vlen,
                                        void *ctx) {
-    (void)hash16; (void)vlen;
+    (void)hash16;
     CompositePrefixCtx *c = (CompositePrefixCtx *)ctx;
     g_out = c->parent_out;
 
@@ -2130,7 +2130,7 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
         if (is_excluded(c->excluded, keybuf)) return 0;
     }
 
-    if (c->tree && !criteria_match_tree(value, c->tree, c->fs)) return 0;
+    if (c->tree && !criteria_match_tree(value, vlen, c->tree, c->fs)) return 0;
 
     pthread_mutex_lock(&c->lock);
     if (c->skip_remaining > 0) {
@@ -2677,7 +2677,7 @@ static int order_index_walk_cb(const char *val, size_t vlen,
 
     /* Post-filter: apply the FULL criteria tree — unlike D1 nothing is
        guaranteed to match by the walk range alone. */
-    if (c->tree && !criteria_match_tree(raw, c->tree, c->fs)) {
+    if (c->tree && !criteria_match_tree(raw, value_len, c->tree, c->fs)) {
         release_record_ref(&rr);
         return 0;
     }
@@ -4809,7 +4809,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
 
             const uint8_t *raw = fvals[fi];
             uint32_t value_len = (uint32_t)fvlens[fi];
-            if (need_rematch && !criteria_match_tree(raw, tree, fs)) continue;
+            if (need_rematch && !criteria_match_tree(raw, value_len, tree, fs)) continue;
 
             {  /* Single-iteration block — no probe loop in the dispatched path. */
 
@@ -5061,7 +5061,7 @@ static int or_count_batch_cb(const uint8_t hash16[16],
     (void)hash16; (void)key; (void)klen;
     OrCountCtx *c = (OrCountCtx *)ctx_ptr;
     if (query_deadline_tick(c->dl, &c->dl_counter)) return 1;
-    if (criteria_match_tree((const uint8_t *)value, c->tree, c->fs))
+    if (criteria_match_tree((const uint8_t *)value, vlen, c->tree, c->fs))
         __sync_fetch_and_add(&c->count, 1);
     return 0;
 }
@@ -5099,7 +5099,7 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
                 if (ks->state[b] != 2) continue;
                 RecordRef rr;
                 if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
-                if (criteria_match_tree(rr.val, tree, fs)) n++;
+                if (criteria_match_tree(rr.val, rr.vlen, tree, fs)) n++;
                 release_record_ref(&rr);
             }
             keyset_free(ks);
@@ -5710,7 +5710,7 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
     if (is_excluded(oc->excluded, keybuf)) return 0;
 
     const uint8_t *raw = block + hdr->key_len;
-    if (!criteria_match_tree(raw, oc->tree, oc->fs)) return 0;
+    if (!criteria_match_tree(raw, hdr->value_len, oc->tree, oc->fs)) return 0;
 
     /* Extract sort key */
     char *sv = NULL;
@@ -6008,7 +6008,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
        stays correct because the btree walk only visits entries that would
        pass a range/eq on the indexed field, and range checks in the tree
        agree with the range in the walk. */
-    if (c->remaining && !criteria_match_tree(raw, c->remaining, c->fs)) {
+    if (c->remaining && !criteria_match_tree(raw, value_len, c->remaining, c->fs)) {
         release_record_ref(&rr);
         return 0;
     }
@@ -6213,7 +6213,7 @@ static int d2_batch_cb(const uint8_t hash16[16],
     if (ctx->passed[i]) return 0;  /* already processed (hash collision edge) */
 
     /* Run criteria match tree on this record */
-    if (ctx->tree && !criteria_match_tree((const uint8_t *)value,
+    if (ctx->tree && !criteria_match_tree((const uint8_t *)value, vlen,
                                            ctx->tree, ctx->fs))
         return 0;  /* reject — leave passed[i]=0 */
 
@@ -6287,7 +6287,7 @@ static int cursor_fetch_cb(const uint8_t hash[16],
     CursorFetchCtx *ctx = (CursorFetchCtx *)ctx_ptr;
     if (query_deadline_tick(ctx->deadline, &ctx->dl_counter)) return 1;
 
-    if (ctx->tree && !criteria_match_tree((const uint8_t *)value,
+    if (ctx->tree && !criteria_match_tree((const uint8_t *)value, vlen,
                                            ctx->tree, ctx->fs))
         return 0;
 
@@ -6514,7 +6514,7 @@ static int fetch_sort_batch_cb(const uint8_t hash16[16],
     FetchSortCtx *c = (FetchSortCtx *)ctx_ptr;
     if (query_deadline_tick(c->dl, &c->dl_counter)) return 1;
 
-    if (c->tree && !criteria_match_tree((const uint8_t *)value,
+    if (c->tree && !criteria_match_tree((const uint8_t *)value, vlen,
                                          c->tree, c->fs)) return 0;
     if (c->excluded && c->excluded->count > 0) {
         char keybuf[1100];
@@ -6835,14 +6835,14 @@ static int bulk_criteria_indexed_cb(const uint8_t hash16[16],
                                      const void *key, size_t klen,
                                      const void *value, size_t vlen,
                                      void *raw_ctx) {
-    (void)hash16; (void)vlen;
+    (void)hash16;
     BulkCriteriaCtx *bc = (BulkCriteriaCtx *)raw_ctx;
     if (bc->budget_exceeded) return 0;
     if (bc->limit > 0 && bc->count >= bc->limit) return 0;
     if (query_deadline_tick(bc->deadline, &bc->dl_counter)) return 0;
 
     /* Re-verify full criteria tree (index may be slightly stale) */
-    if (!criteria_match_tree(value, bc->tree, bc->fs)) return 0;
+    if (!criteria_match_tree(value, vlen, bc->tree, bc->fs)) return 0;
 
     char *k = malloc(klen + 1);
     if (!k) return 0;
@@ -7449,7 +7449,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                             RecordRef rr;
                             if (read_record_ref(db_root, object, &sch,
                                                 sp_rows[i].hash, &rr) != 0) continue;
-                            if (tree && !criteria_match_tree((const uint8_t *)rr.val,
+                            if (tree && !criteria_match_tree((const uint8_t *)rr.val, rr.vlen,
                                                               tree, &driver_fs)) {
                                 release_record_ref(&rr);
                                 continue;
@@ -8032,7 +8032,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                             RecordRef rr;
                             if (read_record_ref(db_root, object, &sch,
                                                  rows[i].hash, &rr) != 0) continue;
-                            if (tree && !criteria_match_tree((const uint8_t *)rr.val,
+                            if (tree && !criteria_match_tree((const uint8_t *)rr.val, rr.vlen,
                                                                tree, &driver_fs)) {
                                 release_record_ref(&rr);
                                 continue;

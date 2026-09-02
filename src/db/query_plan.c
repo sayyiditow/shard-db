@@ -891,9 +891,9 @@ static int field_vs_field_match(int cmp, enum SearchOp op) {
    `rec` points at the raw value region of the record (hdr->key_len offset
    into block). Returns 1 on match, 0 otherwise.
    For composite/unknown fields, falls back to decode_field + match_criterion. */
-int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs) {
+int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc, FieldSchema *fs) {
     if (cc->composite || !cc->tf) {
-        char *attr = decode_field((const char *)rec, 0, cc->raw->field, fs);
+        char *attr = decode_field((const char *)rec, data_len, cc->raw->field, fs);
         int r = match_criterion(attr, cc->raw);
         free(attr);
         return r;
@@ -906,13 +906,17 @@ int match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs
         cc->op == OP_LT_FIELD || cc->op == OP_GT_FIELD ||
         cc->op == OP_LTE_FIELD || cc->op == OP_GTE_FIELD) {
         if (!cc->rhs_tf) return 0;
-        int r = cmp_typed_field_pair(rec + cc->tf->offset,
-                                     rec + cc->rhs_tf->offset, cc->tf);
+        const uint8_t *lhs = ((size_t)cc->tf->offset + (size_t)cc->tf->size > data_len)
+            ? g_zero_field_65537 : rec + cc->tf->offset;
+        const uint8_t *rhs = ((size_t)cc->rhs_tf->offset + (size_t)cc->rhs_tf->size > data_len)
+            ? g_zero_field_65537 : rec + cc->rhs_tf->offset;
+        int r = cmp_typed_field_pair(lhs, rhs, cc->tf);
         return field_vs_field_match(r, cc->op);
     }
 
     const TypedField *f = cc->tf;
-    const uint8_t *p = rec + f->offset;
+    const uint8_t *p = ((size_t)f->offset + (size_t)f->size > data_len)
+        ? g_zero_field_65537 : rec + f->offset;
 
     switch (f->type) {
     case FT_NONE:
@@ -1691,19 +1695,19 @@ void recompile_criteria_tree(CriteriaNode *n, const TypedSchema *ts) {
     for (int i = 0; i < n->n_children; i++) recompile_criteria_tree(n->children[i], ts);
 }
 
-int criteria_match_tree(const uint8_t *rec, const CriteriaNode *n, FieldSchema *fs) {
+int criteria_match_tree(const uint8_t *rec, size_t data_len, const CriteriaNode *n, FieldSchema *fs) {
     if (!n) return 1;
     switch (n->kind) {
     case CNODE_LEAF:
         if (!n->compiled) return 0;
-        return match_typed(rec, n->compiled, fs);
+        return match_typed(rec, data_len, n->compiled, fs);
     case CNODE_AND:
         for (int i = 0; i < n->n_children; i++)
-            if (!criteria_match_tree(rec, n->children[i], fs)) return 0;
+            if (!criteria_match_tree(rec, data_len, n->children[i], fs)) return 0;
         return 1;
     case CNODE_OR:
         for (int i = 0; i < n->n_children; i++)
-            if (criteria_match_tree(rec, n->children[i], fs)) return 1;
+            if (criteria_match_tree(rec, data_len, n->children[i], fs)) return 1;
         return 0;
     }
     return 0;

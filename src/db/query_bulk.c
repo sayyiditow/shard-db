@@ -2932,7 +2932,7 @@ static int bulk_criteria_scan_cb(const SlotHeader *hdr, const uint8_t *block, vo
 
     const uint8_t *raw = block + hdr->key_len;
 
-    if (!criteria_match_tree(raw, bc->tree, bc->fs)) return 0;
+    if (!criteria_match_tree(raw, hdr->value_len, bc->tree, bc->fs)) return 0;
 
     /* Match — grow array and append under internal mutex. criteria_match_tree
        above runs lock-free; only the shared-state mutation is serialized. */
@@ -3050,7 +3050,7 @@ static int v2_bulk_upd_value_compute(const SlotcaskOldRecord *old,
     V2BulkUpdCtx *ctx = (V2BulkUpdCtx *)rec->user_ctx;
     BulkUpdShardWork *w = ctx->w;
     if (!old) return -1;
-    if (!criteria_match_tree(old->value, w->tree, w->fs)) return -1;
+    if (!criteria_match_tree(old->value, old->vlen, w->tree, w->fs)) return -1;
     if (w->cas_crit && w->cas_ncrit > 0 &&
         !cas_check(w->ts, old->value, (int)old->vlen, w->cas_crit, w->cas_ncrit)) return -1;
 
@@ -5143,7 +5143,7 @@ static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
     V2BulkDelCritCtx *ctx = (V2BulkDelCritCtx *)rec->user_ctx;
     BulkDelCritShardWork *w = ctx->w;
     if (!old) return -1;
-    if (!criteria_match_tree(old->value, w->tree, w->fs)) return -1;
+    if (!criteria_match_tree(old->value, old->vlen, w->tree, w->fs)) return -1;
     if (w->cas_crit && w->cas_ncrit > 0 &&
         !cas_check(w->ts, old->value, (int)old->vlen, w->cas_crit, w->cas_ncrit)) return -1;
     return 0;
@@ -5163,7 +5163,7 @@ static int v2_bulk_del_crit_prepare_window(SlotcaskBulkRec *recs,
         SlotcaskBulkRec *r = &recs[j];
         if (r->status != 0) continue;
         if (!r->old_value) { r->status = -1; continue; }
-        if (!criteria_match_tree(r->old_value, w->tree, w->fs)) {
+        if (!criteria_match_tree(r->old_value, r->old_vlen, w->tree, w->fs)) {
             r->status = -1; continue;
         }
         if (w->cas_crit && w->cas_ncrit > 0 &&

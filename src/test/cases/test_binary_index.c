@@ -12,6 +12,8 @@
 #include "fixtures.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <math.h>
 
 
 static int do_count(TestClient *tc, const char *obj, const char *crit) {
@@ -24,6 +26,23 @@ static int do_count(TestClient *tc, const char *obj, const char *crit) {
     int n = tu_parse_count(resp);
     free(resp);
     return n;
+}
+
+static double do_sum_amt(TestClient *tc, const char *obj) {
+    char req[512];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"%s\","
+        "\"aggregates\":[{\"fn\":\"sum\",\"field\":\"amt\"}]}", obj);
+    char *resp = NULL;
+    tc_request(tc, req, &resp);
+    /* Response: [{"sum_amt":<number>}] (alias defaults to fn_field). */
+    double v = 0.0;
+    if (resp) {
+        const char *p = strstr(resp, "\"sum_amt\":");
+        if (p) v = strtod(p + strlen("\"sum_amt\":"), NULL);
+    }
+    free(resp);
+    return v;
 }
 
 static int test_binary_index_run(void) {
@@ -110,6 +129,8 @@ static int test_binary_index_run(void) {
     ASSERT_EQ_INT(do_count(tc, "bi_num",
         "[{\"field\":\"amt\",\"op\":\"between\",\"value\":\"-1\",\"value2\":\"1\"}]"),
                   3, "numeric between -1 and 1 = 3");
+    ASSERT_TRUE(fabs(do_sum_amt(tc, "bi_num") - 0.0) < 0.001,
+        "numeric sum(amt) across -999.99..999.99 incl. 0 = 0.00");
 
     /* DATE RANGE. */
     tc_request(tc,

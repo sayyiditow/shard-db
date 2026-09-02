@@ -1598,13 +1598,13 @@ static int wfc_batch_cb(const uint8_t hash16[16],
                          const void *key, size_t klen,
                          const void *value, size_t vlen,
                          void *ctx) {
-    (void)hash16; (void)key; (void)klen; (void)vlen;
+    (void)hash16; (void)key; (void)klen;
     WfcBatchCtx *bc = (WfcBatchCtx *)ctx;
-    if (!criteria_match_tree(value, bc->tree, bc->fs)) return 0;
+    if (!criteria_match_tree(value, vlen, bc->tree, bc->fs)) return 0;
+    const uint8_t *agg_p = ((size_t)bc->agg_tf->offset + (size_t)bc->agg_tf->size > vlen)
+        ? g_zero_field_65537 : (const uint8_t *)value + bc->agg_tf->offset;
     double v;
-    if (!typed_field_to_double(bc->agg_tf,
-                               (const uint8_t *)value + bc->agg_tf->offset,
-                               &v))
+    if (!typed_field_to_double(bc->agg_tf, agg_p, &v))
         return 0;
     pthread_mutex_lock(&bc->mu);
     if (!*bc->found ||
@@ -2065,7 +2065,7 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
     const uint8_t *raw = block + hdr->key_len;
 
     /* Check full criteria tree (AND/OR) */
-    if (!criteria_match_tree(raw, ctx->tree, ctx->fs)) return 0;
+    if (!criteria_match_tree(raw, hdr->value_len, ctx->tree, ctx->fs)) return 0;
 
     /* Extract group_by values into stack buffers (no malloc). gbuf[i][0]
        is forced to NUL up front because typed_field_to_buf_raw can return
@@ -2148,8 +2148,11 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
                always carry a value, so the field arg is informational. */
             if (ctx->specs[i].field[0] && ctx->spec_tfs[i] &&
                 ctx->spec_tfs[i]->type == FT_VARCHAR) {
-                int elen = varchar_eff_len(raw + ctx->spec_tfs[i]->offset,
-                                           ctx->spec_tfs[i]->size);
+                const TypedField *cvtf = ctx->spec_tfs[i];
+                const uint8_t *cvp = ((size_t)cvtf->offset + (size_t)cvtf->size >
+                                      (size_t)hdr->value_len)
+                    ? g_zero_field_65537 : raw + cvtf->offset;
+                int elen = varchar_eff_len(cvp, cvtf->size);
                 if (elen <= 0) continue;
             }
             a->count++;
@@ -2159,8 +2162,11 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         double v;
         int present = 0;
         if (ctx->spec_tfs[i]) {
-            present = typed_field_to_double(ctx->spec_tfs[i],
-                                            raw + ctx->spec_tfs[i]->offset, &v);
+            const TypedField *stf = ctx->spec_tfs[i];
+            const uint8_t *sp = ((size_t)stf->offset + (size_t)stf->size >
+                                 (size_t)hdr->value_len)
+                ? g_zero_field_65537 : raw + stf->offset;
+            present = typed_field_to_double(stf, sp, &v);
         } else {
             char *fv = decode_field((const char *)raw, hdr->value_len,
                                     ctx->specs[i].field, ctx->fs);
@@ -3221,7 +3227,7 @@ static int vs_lookup_cb(const uint8_t hash16[16],
                         const void *key, size_t klen,
                         const void *value, size_t vlen,
                         void *raw) {
-    (void)key; (void)klen; (void)vlen;
+    (void)key; (void)klen;
     VSLookupCtx *c = (VSLookupCtx *)raw;
     int p = vs_pair_find(c, hash16);
     if (p < 0) return 0;
@@ -3233,8 +3239,10 @@ static int vs_lookup_cb(const uint8_t hash16[16],
         if (fn == AGG_COUNT) continue;
         const TypedField *tf = c->spec_tfs[i];
         if (!tf) continue;
+        const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > vlen)
+            ? g_zero_field_65537 : rec + tf->offset;
         double v;
-        if (!typed_field_to_double(tf, rec + tf->offset, &v)) continue;
+        if (!typed_field_to_double(tf, fp, &v)) continue;
         switch (fn) {
         case AGG_SUM:
         case AGG_AVG:
