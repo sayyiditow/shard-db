@@ -48,6 +48,24 @@ extern _Atomic int g_shard_test_pause_release;
 extern _Atomic int g_shard_test_bulk_lookup_gap;
 extern _Atomic int g_shard_test_bulk_lookup_gap_hit;
 extern _Atomic int g_shard_test_bulk_lookup_gap_release;
+/* Count-worker pass-1 gap hook (docs/plans/2026-08-27-shard-count-worker-
+   nested-kf-read.md Task 1): parks shard_count_worker after pass-1's
+   inline KF probe — while the probe reader is still held — so the
+   cross-process test control channel can queue a mutation writer on the
+   same shard before the batch fetch re-acquires the same kfcache entry.
+   Armed by test_control.c on INSTALL kind 1; the daemon-side park itself
+   waits on the control-channel condvar (see test_control.c), so unlike
+   the B1 gap there is no release atomic here. */
+extern _Atomic int g_shard_test_count_gap;
+extern _Atomic int g_shard_test_count_gap_hit;
+/* The blocking park body lives behind a runtime hook (mirrors
+   slotcask_test_set_after_old_hook): query.c calls slotcask_test_count_gap_park(),
+   which is defined in slotcask.c and therefore resolves in every TEST_BUILD
+   link (runner and test-server alike); only the test-server links
+   test_control.c, which installs the hook that talks to the runner. */
+typedef void (*shard_db_test_count_gap_fn)(void *ctx);
+void shard_db_test_set_count_gap_hook(shard_db_test_count_gap_fn fn, void *ctx);
+void slotcask_test_count_gap_park(void);
 
 static inline void shard_test_ctl_reset(void) {
     for (int i = 0; i < SHARD_TEST_PHASE_COUNT; i++)
@@ -63,6 +81,8 @@ static inline void shard_test_ctl_reset(void) {
     atomic_store(&g_shard_test_bulk_lookup_gap, 0);
     atomic_store(&g_shard_test_bulk_lookup_gap_hit, 0);
     atomic_store(&g_shard_test_bulk_lookup_gap_release, 0);
+    atomic_store(&g_shard_test_count_gap, 0);
+    atomic_store(&g_shard_test_count_gap_hit, 0);
 }
 
 /* Barrier call: count the sync in `phase`; return 1 when this attempt is

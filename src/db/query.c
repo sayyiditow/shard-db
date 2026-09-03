@@ -7,6 +7,11 @@
 #include "query_internal.h"
 #include <math.h>
 #include <dirent.h>
+#ifdef TEST_BUILD
+#include <stdatomic.h>
+#include "shard_test_ctl.h"
+#include "test_control.h"
+#endif
 
 /* ========== ADVANCED SEARCH (multi-criteria, all operators) ========== */
 
@@ -1053,6 +1058,28 @@ static void *shard_count_worker(void *arg) {
                 n_need_fetch++;
             }
         }
+
+#ifdef TEST_BUILD
+        /* Regression seam (docs/plans/2026-08-27-shard-count-worker-
+         * nested-kf-read.md Task 1): parks the worker after pass-1's
+         * inline KF probe — the probe reader is still held here — so the
+         * count-gap test can queue a mutation writer on this shard before
+         * the batch fetch re-acquires the same kfcache entry. One-shot:
+         * disarmed on first hit so every later count passes through. */
+        slotcask_test_count_gap_park();
+#endif
+    }
+
+    /* The pass-1 probe reader must die before the batch fetch: every
+     * partition the fetcher builds routes to THIS worker's shard, so
+     * kf_reval_fetch_one would re-acquire the same kfcache entry on this
+     * thread while we still hold it. The kfcache rwlocks are writer-
+     * preferring NONRECURSIVE (shard_db_internal.h) — a recursive reader
+     * parked behind a queued mutation writer self-deadlocks (worker waits
+     * on acquire #2, the writer waits on acquire #1). */
+    if (kh.map) {
+        kfcache_release(&kh);
+        memset(&kh, 0, sizeof(kh));
     }
 
     /* Pass 2: batch fetch all needs-fetch entries */

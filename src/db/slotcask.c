@@ -56,6 +56,40 @@ _Atomic int g_shard_test_pause_release;
 _Atomic int g_shard_test_bulk_lookup_gap;
 _Atomic int g_shard_test_bulk_lookup_gap_hit;
 _Atomic int g_shard_test_bulk_lookup_gap_release;
+_Atomic int g_shard_test_count_gap;
+_Atomic int g_shard_test_count_gap_hit;
+
+/* Count-gap park hook: fire site for the shard_count_worker pass-1 seam
+   (docs/plans/2026-08-27-shard-count-worker-nested-kf-read.md Task 1).
+   slotcask.c is linked into every TEST_BUILD binary (runner included),
+   while test_control.c exists only in the test-server link — so the seam
+   must reference this symbol, not anything in test_control.c. Mirrors
+   slotcask_test_set_after_old_hook's install-then-fire shape. */
+static pthread_mutex_t g_count_gap_hook_lock = PTHREAD_MUTEX_INITIALIZER;
+static shard_db_test_count_gap_fn g_count_gap_fn = NULL;
+static void *g_count_gap_ctx = NULL;
+
+void shard_db_test_set_count_gap_hook(shard_db_test_count_gap_fn fn,
+                                      void *ctx) {
+    pthread_mutex_lock(&g_count_gap_hook_lock);
+    g_count_gap_fn = fn;
+    g_count_gap_ctx = ctx;
+    pthread_mutex_unlock(&g_count_gap_hook_lock);
+}
+
+void slotcask_test_count_gap_park(void) {
+    if (!atomic_load(&g_shard_test_count_gap) ||
+        atomic_fetch_add(&g_shard_test_count_gap_hit, 1) != 0)
+        return;
+    atomic_store(&g_shard_test_count_gap, 0); /* one-shot: disarm on hit */
+    shard_db_test_count_gap_fn fn;
+    void *ctx;
+    pthread_mutex_lock(&g_count_gap_hook_lock);
+    fn = g_count_gap_fn;
+    ctx = g_count_gap_ctx;
+    pthread_mutex_unlock(&g_count_gap_hook_lock);
+    if (fn) fn(ctx);   /* blocks until the runner releases (or daemon stop) */
+}
 #define SHARD_TEST_NOTE_SYNC(p) (shard_test_note_sync(p))
 #define SHARD_TEST_PHASE_PAUSE(p) (shard_test_phase_pause(p))
 #define SHARD_TEST_FAIL_POSTLINK g_shard_test_fail_postlink

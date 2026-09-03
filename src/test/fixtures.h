@@ -52,7 +52,8 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port);
    complete protocol exchange and -1 on EOF, malformed framing, or I/O error.
    `wait` blocks until the daemon-side hook reports the requested phase. */
 int test_env_test_hook_install(TestEnv *env);
-int test_env_test_hook_wait(TestEnv *env, int *out_under_kf_wrlock);
+int test_env_test_hook_install_kind(TestEnv *env, int kind);
+int test_env_test_hook_wait(TestEnv *env, int *out_phase);
 int test_env_test_hook_release(TestEnv *env);
 int test_env_test_hook_clear(TestEnv *env);
 
