@@ -15,8 +15,8 @@ urllib3>=2.7.0
 # make the floor explicit.
 idna>=3.19
 
-# Pin pymdown-extensions >=11.0.1 — Dependabot #3: regression in
+# Pin pymdown-extensions >=11.0.2 — Dependabot #3: regression in
 # pymdownx.snippets reintroduced the sibling-prefix path-traversal
 # bypass that restrict_base_path was supposed to fix. 10.21.3 restores
 # the safe behaviour.
-pymdown-extensions>=11.0.1
+pymdown-extensions>=11.0.2
