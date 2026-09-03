@@ -162,15 +162,15 @@ static int kf_live_match_cb(const uint8_t hash16[16],
                             const void *key, size_t klen,
                             const void *value, size_t vlen,
                             void *raw) {
-    (void)hash16; (void)key; (void)klen; (void)vlen;
+    (void)hash16; (void)key; (void)klen;
     KfMatchCtx *mc = (KfMatchCtx *)raw;
     if (query_deadline_tick(mc->dl, &mc->dl_counter)) return 1;
     int matched = 0;
     if (mc->single_cc) {
-        if (match_typed(value, mc->single_cc, mc->fs) > 0)
+        if (match_typed(value, vlen, mc->single_cc, mc->fs) > 0)
             matched = 1;
     } else if (mc->tree) {
-        if (criteria_match_tree(value, mc->tree, mc->fs))
+        if (criteria_match_tree(value, vlen, mc->tree, mc->fs))
             matched = 1;
     }
     if (matched) mc->count++;

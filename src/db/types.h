@@ -1116,7 +1116,7 @@ char *json_escape_const(const char *v);
    back to decode_field + match_criterion internally. */
 CompiledCriterion *compile_criteria(const SearchCriterion *in, int n, const TypedSchema *ts);
 void free_compiled_criteria(CompiledCriterion *arr, int n);
-int  match_typed(const uint8_t *rec, const CompiledCriterion *cc, FieldSchema *fs);
+int  match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc, FieldSchema *fs);
 int  match_criterion(const char *val_str, const SearchCriterion *c);
 
 /* query.c */
@@ -1389,7 +1389,7 @@ void compile_criteria_tree(CriteriaNode *root, const TypedSchema *ts);
 
 /* Recursive match: AND short-circuits on first false, OR on first true. Passing
    NULL means "no criteria" → match-all (returns 1). */
-int criteria_match_tree(const uint8_t *rec, const CriteriaNode *node, FieldSchema *fs);
+int criteria_match_tree(const uint8_t *rec, size_t data_len, const CriteriaNode *node, FieldSchema *fs);
 int cas_check(TypedSchema *ts, const uint8_t *value_ptr, int value_len, SearchCriterion *crit, int ncrit);
 
 
