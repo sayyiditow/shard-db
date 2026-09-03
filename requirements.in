@@ -9,14 +9,14 @@ mkdocs-material==9.7.7
 # - Sensitive headers forwarded across origins in proxied redirects
 urllib3>=2.7.0
 
-# Pin idna >=3.18 — Dependabot #4: "Specially crafted inputs to
+# Pin idna >=3.19 — Dependabot #4: "Specially crafted inputs to
 # idna.encode() can bypass CVE-2024-3651 fix" affects every prior 3.x
 # release. Pulled transitively via `requests`; we pin it directly to
 # make the floor explicit.
-idna>=3.18
+idna>=3.19
 
-# Pin pymdown-extensions >=11.0.1 — Dependabot #3: regression in
+# Pin pymdown-extensions >=11.0.2 — Dependabot #3: regression in
 # pymdownx.snippets reintroduced the sibling-prefix path-traversal
 # bypass that restrict_base_path was supposed to fix. 10.21.3 restores
 # the safe behaviour.
-pymdown-extensions>=11.0.1
+pymdown-extensions>=11.0.2
