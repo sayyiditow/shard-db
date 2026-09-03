@@ -387,6 +387,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_varlen_compact_crash_mid_migration.c \
     src/test/cases/test_bt_kf_inversion_stream_find.c \
     src/test/cases/test_stream_find_chunk_resume.c \
+    src/test/cases/test_shard_count_nested_kf_read.c \
     src/db/util.c \
     src/db/durability.c \
     src/bench/bench_stats.c \

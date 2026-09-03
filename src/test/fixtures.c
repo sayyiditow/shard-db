@@ -731,8 +731,15 @@ static int test_hook_read_full(int fd, void *buf, size_t n) {
 }
 
 int test_env_test_hook_install(TestEnv *env) {
+    /* kind 0 = legacy slotcask after-old hook. The kind constants live in
+       test_control.c; the runner duplicates them by convention (same as
+       the TestHookMessage layout). */
+    return test_env_test_hook_install_kind(env, 0);
+}
+
+int test_env_test_hook_install_kind(TestEnv *env, int kind) {
     if (!env || env->test_control_fd < 0) return -1;
-    TestHookMessage msg = { .kind = TEST_HOOK_INSTALL, .phase = 0 };
+    TestHookMessage msg = { .kind = TEST_HOOK_INSTALL, .phase = kind };
     if (test_hook_write_full(env->test_control_fd, &msg, sizeof(msg)) != 0)
         return -1;
     TestHookMessage rep = {0};
@@ -742,14 +749,16 @@ int test_env_test_hook_install(TestEnv *env) {
     return 0;
 }
 
-int test_env_test_hook_wait(TestEnv *env, int *out_under_kf_wrlock) {
-    if (!env || env->test_control_fd < 0 || !out_under_kf_wrlock) return -1;
+int test_env_test_hook_wait(TestEnv *env, int *out_phase) {
+    if (!env || env->test_control_fd < 0 || !out_phase) return -1;
     TestHookMessage rep = {0};
     if (test_hook_read_full(env->test_control_fd, &rep, sizeof(rep)) != 0)
         return -1;
     if (rep.kind != TEST_HOOK_REACHED) return -1;
-    if (rep.phase != 0 && rep.phase != 1) return -1;
-    *out_under_kf_wrlock = rep.phase;
+    /* phase: 0 = stale snapshot, 1 = under kf wrlock (after-old hook),
+       2 = count worker parked in the pass-1 gap (probe reader held). */
+    if (rep.phase < 0 || rep.phase > 2) return -1;
+    *out_phase = rep.phase;
     return 0;
 }
 

@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 
 #include "slotcask.h"
+#include "shard_test_ctl.h"
 #include "test_control.h"
 
 /* Message kinds — private duplicated constants; the runner (fixtures.c)
@@ -32,6 +33,11 @@ enum {
     TEST_HOOK_ACK     = 4,
     TEST_HOOK_REACHED = 5,
 };
+
+/* INSTALL message phase selects which daemon-side hook to arm.
+   0 = legacy slotcask after-old hook; 1 = count-worker pass-1 gap. */
+#define TEST_HOOK_KIND_AFTER_OLD 0
+#define TEST_HOOK_KIND_COUNT_GAP 1
 
 typedef struct {
     uint32_t kind;   /* INSTALL=1, RELEASE=2, CLEAR=3, ACK=4, REACHED=5 */
@@ -109,6 +115,36 @@ static void test_control_after_old(int under_kf_wrlock, void *ctx_ptr) {
     pthread_mutex_unlock(&c->lock);
 }
 
+/* Runs on the count worker thread inside the pass-1 gap seam (installed by
+   INSTALL kind 1 via shard_db_test_set_count_gap_hook): reports REACHED
+   with phase 2 and blocks until the control thread broadcasts a release
+   (or the daemon stops). Same contract as test_control_after_old; the
+   caller holds the pass-1 KF reader while parked — that is the point. */
+static void test_control_count_gap_block(void *ctx_ptr) {
+    TestControl *c = ctx_ptr;
+    TestHookMessage reached = { .kind = TEST_HOOK_REACHED, .phase = 2 };
+    pthread_mutex_lock(&c->lock);
+    c->waiting_for_release = 1;
+    c->release = 0;
+    pthread_cond_broadcast(&c->cond);
+    pthread_mutex_unlock(&c->lock);
+
+    if (test_control_write_full(c->fd, &reached, sizeof(reached)) != 0) {
+        pthread_mutex_lock(&c->lock);
+        c->release = 1;
+        pthread_cond_broadcast(&c->cond);
+        c->waiting_for_release = 0;
+        pthread_mutex_unlock(&c->lock);
+        return;
+    }
+
+    pthread_mutex_lock(&c->lock);
+    while (c->running && !c->release)
+        pthread_cond_wait(&c->cond, &c->lock);
+    c->waiting_for_release = 0;
+    pthread_mutex_unlock(&c->lock);
+}
+
 static void *test_control_thread_main(void *arg) {
     TestControl *c = arg;
     for (;;) {
@@ -118,7 +154,14 @@ static void *test_control_thread_main(void *arg) {
 
         switch (msg.kind) {
         case TEST_HOOK_INSTALL:
-            slotcask_test_set_after_old_hook(test_control_after_old, c);
+            if (msg.phase == TEST_HOOK_KIND_COUNT_GAP) {
+                atomic_store(&g_shard_test_count_gap, 1);
+                atomic_store(&g_shard_test_count_gap_hit, 0);
+                shard_db_test_set_count_gap_hook(test_control_count_gap_block,
+                                                 c);
+            } else {
+                slotcask_test_set_after_old_hook(test_control_after_old, c);
+            }
             break;
         case TEST_HOOK_RELEASE:
             pthread_mutex_lock(&c->lock);
@@ -128,6 +171,8 @@ static void *test_control_thread_main(void *arg) {
             break;
         case TEST_HOOK_CLEAR:
             slotcask_test_set_after_old_hook(NULL, NULL);
+            shard_db_test_set_count_gap_hook(NULL, NULL);
+            atomic_store(&g_shard_test_count_gap, 0);
             pthread_mutex_lock(&c->lock);
             c->release = 1;
             pthread_cond_broadcast(&c->cond);
@@ -171,6 +216,7 @@ void shard_db_test_control_stop(void) {
     /* Release a parked callback and prevent any future fire, then wake the
        control thread's blocking read. */
     slotcask_test_set_after_old_hook(NULL, NULL);
+    shard_db_test_set_count_gap_hook(NULL, NULL);
     pthread_mutex_lock(&g_test_control.lock);
     g_test_control.running = 0;
     g_test_control.release = 1;
