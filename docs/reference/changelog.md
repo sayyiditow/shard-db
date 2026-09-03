@@ -6,6 +6,24 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**Fixed: bitmap-primary streaming finds no longer flush the batch fetch
+inline under held kf+bitmap handles.** The legacy executor's IT_BITMAP
+branches hold the walked shard's kf reader + bitmap handle across the
+emit, and the streaming collector flushed on buffer-full inside that
+window — `slotcask_bulk_resolve_and_fetch` re-acquired the same shard's
+kf reader on the same thread, a recursive reader that self-deadlocks
+under `PREFER_WRITER_NONRECURSIVE` against any queued durability-window
+writer (wedging the find and the writer permanently). The bitmap-routed
+fallback now uses a deferred collector: per-walk-thread append-only
+batches, one blocking bulk fetch per worker after its walk releases the
+handles (mirroring the 2026-08-27 chunked-executor invariant for the
+no-resume bitmap walk). Candidate batches are bounded by the
+`QUERY_BUFFER_MB` per-query budget; on exceed the find returns the
+partial result (deadline-style), never a silent drop. All non-bitmap
+`btree_dispatch` callers are byte-identical. Regression test:
+`test-bitmap-stream-find-flush-gate` (deterministic red on base via the
+TEST_BUILD find-flush gate seam).
+
 **Fixed: `.tsan.supp` eliminated — every suppressed finding fixed or
 restructured.** The registry UAF is closed structurally: `SlotcaskDb`
 lifetime is refcounted (`slotcask_registry_get` takes a reference,

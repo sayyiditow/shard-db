@@ -260,7 +260,7 @@ Optional, off by default. `TLS_ENABLE=1` in db.env makes `PORT` TLS-only (single
 
 ### Per-query memory cap
 
-`QUERY_BUFFER_MB` (default 256) bounds intermediate buffers any single query can hold. 8 collection sites checked (ordered find buffer, aggregate buckets, bulk-delete/update key list, OR KeySet, `CollectCtx.entries`, `ShardWorkCtx.results`, per-worker agg hash tables, list-files names buffer). Exceeded → query aborts with `{"error":"query memory buffer exceeded; ..."}`; server keeps serving.
+`QUERY_BUFFER_MB` (default 256) bounds intermediate buffers any single query can hold. 9 collection sites checked (ordered find buffer, aggregate buckets, bulk-delete/update key list, OR KeySet, `CollectCtx.entries`, `ShardWorkCtx.results`, per-worker agg hash tables, list-files names buffer, bitmap deferred candidate batches). Exceeded → query aborts with `{"error":"query memory buffer exceeded; ..."}` (the bitmap deferred collector instead stops collecting and returns the partial result, deadline-style); server keeps serving.
 
 `MAX_CONCURRENT_QUERIES` (default 0 = auto = `max(4, min(nproc, 32))`) hard-caps simultaneously-running queries. Implemented via a sem_trywait semaphore in `dispatch_json_query` — every request takes a slot at entry and releases via `__attribute__((cleanup))` on any return path. Exceeded → immediate `{"error":"server at capacity"}`, client retries. Worst-case query-buffer RAM = `MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB` (predictable peak for sizing). Pair with whole-process containment (systemd MemoryMax, cgroup, ulimit -v) as a final backstop. See [docs/reference/limits.md](docs/reference/limits.md).
 

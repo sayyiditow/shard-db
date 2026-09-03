@@ -756,8 +756,9 @@ int test_env_test_hook_wait(TestEnv *env, int *out_phase) {
         return -1;
     if (rep.kind != TEST_HOOK_REACHED) return -1;
     /* phase: 0 = stale snapshot, 1 = under kf wrlock (after-old hook),
-       2 = count worker parked in the pass-1 gap (probe reader held). */
-    if (rep.phase < 0 || rep.phase > 2) return -1;
+       2 = count worker parked in the pass-1 gap (probe reader held),
+       3 = find worker parked at the batch-fetch gate. */
+    if (rep.phase < 0 || rep.phase > 3) return -1;
     *out_phase = rep.phase;
     return 0;
 }

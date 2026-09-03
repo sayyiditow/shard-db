@@ -106,7 +106,13 @@ typedef struct {
    under this policy (this is why objlock.c, whose API deliberately permits
    recursive readers, is not switched to this helper). Checked against every
    acquire/release call site in btree.c, slotcask.c (kfcache + segcache), and
-   bitmap.c: no such recursive acquisition exists today. In particular,
+   bitmap.c: no such recursive acquisition exists today. One counterexample
+   existed and was removed: the bitmap-routed streaming find used to flush
+   its batch fetch inline inside the walk's callbacks, nesting a second
+   kfcache read acquire of the walked shard under the one it already held
+   (docs/plans/2026-08-27-bitmap-inline-flush-hazard.md) — the collector now
+   defers to one bulk fetch per worker after the walk's handles drop. In
+   particular,
    btree_idx_walk_ordered's k-way cursor merge opens one BtRangeIter per
    shard, always on a distinct path, never the same file twice in one
    thread; every eviction path uses non-blocking trywrlock against LRU

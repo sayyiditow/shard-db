@@ -35,9 +35,11 @@ enum {
 };
 
 /* INSTALL message phase selects which daemon-side hook to arm.
-   0 = legacy slotcask after-old hook; 1 = count-worker pass-1 gap. */
+   0 = legacy slotcask after-old hook; 1 = count-worker pass-1 gap;
+   2 = find-flush gate (batch-fetch park). */
 #define TEST_HOOK_KIND_AFTER_OLD 0
 #define TEST_HOOK_KIND_COUNT_GAP 1
+#define TEST_HOOK_KIND_FIND_FLUSH_GATE 2
 
 typedef struct {
     uint32_t kind;   /* INSTALL=1, RELEASE=2, CLEAR=3, ACK=4, REACHED=5 */
@@ -145,6 +147,38 @@ static void test_control_count_gap_block(void *ctx_ptr) {
     pthread_mutex_unlock(&c->lock);
 }
 
+/* Runs on the find worker thread at the batch-fetch gate (installed by
+   INSTALL kind 2 via shard_db_test_set_find_flush_gate_hook): reports
+   REACHED with phase 3 and blocks until the control thread broadcasts a
+   release (or the daemon stops). Same contract as the other park
+   functions; the caller is about to issue a blocking batch fetch — on
+   the legacy collector with the walk's kf+bitmap handles still held,
+   on the deferred collector with none held. That is the point. */
+static void test_control_find_flush_gate_block(void *ctx_ptr) {
+    TestControl *c = ctx_ptr;
+    TestHookMessage reached = { .kind = TEST_HOOK_REACHED, .phase = 3 };
+    pthread_mutex_lock(&c->lock);
+    c->waiting_for_release = 1;
+    c->release = 0;
+    pthread_cond_broadcast(&c->cond);
+    pthread_mutex_unlock(&c->lock);
+
+    if (test_control_write_full(c->fd, &reached, sizeof(reached)) != 0) {
+        pthread_mutex_lock(&c->lock);
+        c->release = 1;
+        pthread_cond_broadcast(&c->cond);
+        c->waiting_for_release = 0;
+        pthread_mutex_unlock(&c->lock);
+        return;
+    }
+
+    pthread_mutex_lock(&c->lock);
+    while (c->running && !c->release)
+        pthread_cond_wait(&c->cond, &c->lock);
+    c->waiting_for_release = 0;
+    pthread_mutex_unlock(&c->lock);
+}
+
 static void *test_control_thread_main(void *arg) {
     TestControl *c = arg;
     for (;;) {
@@ -159,6 +193,11 @@ static void *test_control_thread_main(void *arg) {
                 atomic_store(&g_shard_test_count_gap_hit, 0);
                 shard_db_test_set_count_gap_hook(test_control_count_gap_block,
                                                  c);
+            } else if (msg.phase == TEST_HOOK_KIND_FIND_FLUSH_GATE) {
+                atomic_store(&g_shard_test_find_flush_gate, 1);
+                atomic_store(&g_shard_test_find_flush_gate_hit, 0);
+                shard_db_test_set_find_flush_gate_hook(
+                    test_control_find_flush_gate_block, c);
             } else {
                 slotcask_test_set_after_old_hook(test_control_after_old, c);
             }
@@ -172,7 +211,9 @@ static void *test_control_thread_main(void *arg) {
         case TEST_HOOK_CLEAR:
             slotcask_test_set_after_old_hook(NULL, NULL);
             shard_db_test_set_count_gap_hook(NULL, NULL);
+            shard_db_test_set_find_flush_gate_hook(NULL, NULL);
             atomic_store(&g_shard_test_count_gap, 0);
+            atomic_store(&g_shard_test_find_flush_gate, 0);
             pthread_mutex_lock(&c->lock);
             c->release = 1;
             pthread_cond_broadcast(&c->cond);
@@ -217,6 +258,7 @@ void shard_db_test_control_stop(void) {
        control thread's blocking read. */
     slotcask_test_set_after_old_hook(NULL, NULL);
     shard_db_test_set_count_gap_hook(NULL, NULL);
+    shard_db_test_set_find_flush_gate_hook(NULL, NULL);
     pthread_mutex_lock(&g_test_control.lock);
     g_test_control.running = 0;
     g_test_control.release = 1;

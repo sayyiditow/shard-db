@@ -81,9 +81,20 @@ patterns:
    entry using inclusive bounds plus the raw-hash16 tiebreak skip. Worker
    memory stays bounded (per-worker cap derived from `QUERY_BUFFER_MB`),
    and no cross-thread iterator state exists.
+3. **Deferred drain (bitmap-primary streaming find):** the bitmap walk has
+   no resume primitive and must hold the shard's kf reader + bitmap handle
+   for the whole emit, so its collector **never flushes or fetches inside a
+   callback** — `stream_find_defer_cb` only appends to a per-walk-thread
+   batch (bounded by the `QUERY_BUFFER_MB` per-query budget), and each
+   worker issues one blocking bulk fetch via `bm_defer_drain_if_armed`
+   only after `bitmap_emit_*_for_shard` returned and both handles are
+   released. An inline flush here would nest a second kfcache read
+   acquire of the walked shard under the held one — a
+   `PREFER_WRITER_NONRECURSIVE` self-deadlock against any queued window
+   writer.
 
 Calling blocking record-fetch helpers directly from any bt-callback context
-recreates the deadlock.
+recreates the deadlock; bitmap-walk callbacks must never flush at all.
 
 Related liveness rule: object-wide counter sums (`slotcask_sum_kf_totals`,
 used by counts and find-total hints) read shard headers via lock-free
