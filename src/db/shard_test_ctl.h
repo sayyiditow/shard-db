@@ -66,6 +66,17 @@ extern _Atomic int g_shard_test_count_gap_hit;
 typedef void (*shard_db_test_count_gap_fn)(void *ctx);
 void shard_db_test_set_count_gap_hook(shard_db_test_count_gap_fn fn, void *ctx);
 void slotcask_test_count_gap_park(void);
+/* Find-flush gate hook (docs/plans/2026-08-27-bitmap-inline-flush-
+   hazard.md Task 1): parks a streaming-find worker immediately before
+   its blocking batch fetch. On the legacy collector that point sits
+   inside batch_buf_flush_copy with the walk's kf+bitmap handles still
+   held; on the deferred collector it sits in bm_defer_drain_if_armed
+   with no handles held. Armed by test_control.c on INSTALL kind 2; the
+   park waits on the control-channel condvar (see test_control.c). */
+extern _Atomic int g_shard_test_find_flush_gate;
+extern _Atomic int g_shard_test_find_flush_gate_hit;
+typedef void (*shard_db_test_gate_fn)(void *ctx);
+void shard_db_test_set_find_flush_gate_hook(shard_db_test_gate_fn fn, void *ctx);
 
 static inline void shard_test_ctl_reset(void) {
     for (int i = 0; i < SHARD_TEST_PHASE_COUNT; i++)

@@ -1312,10 +1312,45 @@ static int batch_buf_init(BatchFetchBuf *b, SlotcaskDb *sdb,
     return 0;
 }
 
+#ifdef TEST_BUILD
+/* Find-flush gate (test-control kind 2): parks the caller immediately
+   before a blocking batch fetch. Inert until armed via the test-control
+   channel; first caller parks, peers proceed. The atomics are defined
+   here — the TU that polls them — mirroring how the count-gap atomics
+   live beside slotcask_test_count_gap_park in slotcask.c. */
+_Atomic int g_shard_test_find_flush_gate;
+_Atomic int g_shard_test_find_flush_gate_hit;
+static shard_db_test_gate_fn g_shard_test_find_flush_gate_fn;
+static void *g_shard_test_find_flush_gate_ctx;
+
+void shard_db_test_set_find_flush_gate_hook(shard_db_test_gate_fn fn,
+                                            void *ctx) {
+    g_shard_test_find_flush_gate_fn = fn;
+    g_shard_test_find_flush_gate_ctx = ctx;
+}
+
+/* Called inside batch_buf_flush_copy on the legacy collector (kf+bitmap
+   handles still held when the bitmap walk drove the flush) and, after
+   the deferred collector lands, inside bm_defer_drain_if_armed (no
+   handles held). */
+static void bm_defer_gate_park(void) {
+    if (!atomic_load(&g_shard_test_find_flush_gate)) return;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_shard_test_find_flush_gate_hit,
+                                        &expected, 1))
+        return;                       /* another worker already parked */
+    if (g_shard_test_find_flush_gate_fn)
+        g_shard_test_find_flush_gate_fn(g_shard_test_find_flush_gate_ctx);
+}
+#endif
+
 static void batch_buf_flush_copy(BatchFetchBuf *b) {
     size_t n;
     uint8_t (*copy)[16] = NULL;
 
+#ifdef TEST_BUILD
+    bm_defer_gate_park();
+#endif
     pthread_mutex_lock(&b->lock);
     n = b->pending_n;
     if (n > 0) {
@@ -1616,6 +1651,12 @@ typedef struct {
     int               passed;     /* records that passed both filters */
     int               printed;    /* records actually emitted */
     int               stop;       /* atomic — set when printed >= limit */
+
+    /* Deferred-collector budget (bitmap-routed fallback): per-query cap
+       on candidate hashes held across worker walks, QUERY_BUFFER_MB
+       class. defer_total is manipulated via __atomic builtins. */
+    size_t            defer_total;
+    size_t            defer_budget;
 } StreamFindCtx;
 
 static int stream_find_record_cb(const uint8_t hash16[16],
@@ -1691,14 +1732,10 @@ static int stream_find_record_cb(const uint8_t hash16[16],
     return done ? -1 : 0;
 }
 
-static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, void *raw_ctx) {
-    StreamFindCtx *sc = (StreamFindCtx *)raw_ctx;
-    if (__atomic_load_n(&sc->stop, __ATOMIC_ACQUIRE)) return -1;
-
-    BatchFetchBuf *bfb = &sc->bfb;
-    g_out = sc->parent_out;
-
-    /* Primary check (LEN_*, like patterns where check_primary == 1). */
+/* Primary-leaf match shared by stream_find_cb and stream_find_defer_cb
+   so both collectors agree on which entries become fetch candidates. */
+static int stream_primary_check(StreamFindCtx *sc,
+                                const char *val, size_t vlen) {
     if (sc->primary_crit && op_is_length(sc->primary_crit->op)) {
         if (!match_length_vlen(vlen, sc->primary_crit)) return 0;
     } else if (sc->check_primary && sc->primary_crit) {
@@ -1716,8 +1753,102 @@ static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, v
         }
         if (!matched) return 0;
     }
+    return 1;
+}
+
+static int stream_find_cb(const char *val, size_t vlen, const uint8_t *hash16, void *raw_ctx) {
+    StreamFindCtx *sc = (StreamFindCtx *)raw_ctx;
+    if (__atomic_load_n(&sc->stop, __ATOMIC_ACQUIRE)) return -1;
+
+    BatchFetchBuf *bfb = &sc->bfb;
+    g_out = sc->parent_out;
+
+    if (!stream_primary_check(sc, val, vlen)) return 0;
 
     return batch_buf_collect_hash(bfb, hash16);
+}
+
+/* Deferred collector for the bitmap-routed fallback. The bitmap
+   emitters hold the shard's kf reader + bitmap handle across the walk
+   (kfcache-before-bitmap order), so an inline flush here would nest a
+   second kf read acquire under the held one — a
+   PREFER_WRITER_NONRECURSIVE self-deadlock behind any queued window
+   writer. Instead each walk thread appends to its OWN thread-local
+   batch and drains it with ONE blocking bulk fetch after
+   bitmap_emit_*_for_shard returned and every handle is released. The
+   bitmap walk has no resume primitive, so a single post-walk fetch per
+   worker (not mid-walk flushing) is the correct shape; growth is
+   bounded by the per-query budget in sc->defer_budget. */
+typedef struct {
+    uint8_t        (*hashes)[16];
+    size_t         n;
+    size_t         cap;
+    StreamFindCtx *sc;
+} BmDeferBatch;
+
+static __thread BmDeferBatch tl_bm_defer;
+
+static int stream_find_defer_cb(const char *val, size_t vlen,
+                                const uint8_t *hash16, void *raw_ctx) {
+    StreamFindCtx *sc = (StreamFindCtx *)raw_ctx;
+    if (__atomic_load_n(&sc->stop, __ATOMIC_ACQUIRE)) return -1;
+    g_out = sc->parent_out;
+    if (!stream_primary_check(sc, val, vlen)) return 0;
+
+    BmDeferBatch *t = &tl_bm_defer;
+    if (t->cap == 0) {
+        t->cap = 64;
+        t->hashes = malloc(t->cap * 16);
+        if (!t->hashes) {
+            __atomic_store_n(&sc->stop, 1, __ATOMIC_RELEASE);
+            return -1;
+        }
+        t->sc = sc;
+    }
+    if ((size_t)__atomic_add_fetch(&sc->defer_total, 1,
+                                   __ATOMIC_RELAXED) > sc->defer_budget) {
+        /* Per-query candidate budget exhausted (QUERY_BUFFER_MB class).
+           Stop collecting walk-wide; what was collected still drains —
+           the streaming deadline's partial-result semantics, never a
+           silent drop. */
+        LOG_WARN(LOG_SUB_QUERY,
+                 "bitmap deferred batch budget exceeded; find returns "
+                 "partial results");
+        __atomic_store_n(&sc->stop, 1, __ATOMIC_RELEASE);
+        return -1;
+    }
+    if (t->n == t->cap) {
+        size_t ncap = t->cap * 2;
+        uint8_t (*nh)[16] = realloc(t->hashes, ncap * 16);
+        if (!nh) {
+            __atomic_store_n(&sc->stop, 1, __ATOMIC_RELEASE);
+            return -1;
+        }
+        t->hashes = nh;
+        t->cap = ncap;
+    }
+    memcpy(t->hashes[t->n], hash16, 16);
+    t->n++;
+    return 0;
+}
+
+/* Worker-side drain. No-op for every cb other than the deferred
+   collector — all pre-existing btree_dispatch callers are byte-
+   identical. Runs after bitmap_emit_*_for_shard returned: this shard's
+   kf reader and bitmap handle are released, so the blocking fetch
+   nests nothing (the 2026-08-27 chunked-executor invariant, adapted to
+   the no-resume bitmap walk). */
+static void bm_defer_drain_if_armed(bt_result_cb cb, SlotcaskDb *sdb) {
+    BmDeferBatch *t = &tl_bm_defer;
+    if (cb != stream_find_defer_cb || t->n == 0 || !t->sc) return;
+    StreamFindCtx *sc = t->sc;
+#ifdef TEST_BUILD
+    bm_defer_gate_park();   /* parks with NO handles held on this build */
+#endif
+    slotcask_bulk_resolve_and_fetch(sdb, t->hashes, t->n,
+                                    sc->bfb.record_ctx, sc->bfb.record_cb);
+    free(t->hashes);
+    t->hashes = NULL; t->n = 0; t->cap = 0; t->sc = NULL;
 }
 
 /* Primary-leaf match for the chunked streaming executor — mirrors the
@@ -1748,9 +1879,11 @@ static int stream_primary_filter(const char *val, size_t vlen, void *raw_ctx) {
  * lock-holding branches of btree_dispatch (query.c OP_EQUAL..OP_NOT_EQUAL)
  * as resume-capable range specs; ops whose dispatch route holds no bt_cache
  * lock (bitmap fast/dict paths, O_DIRECT default leaf scans) must fall back
- * to btree_dispatch + stream_find_cb, whose inline batch flush is safe
- * there. Returns 1 when the op was driven here, 0 when the caller must use
- * the legacy path. */
+ * to btree_dispatch + stream_find_cb, whose inline batch flush is safe on
+ * those no-handle branches. Bitmap branches are NOT safe for inline flush
+ * (they hold kf+bitmap handles across the emit) and get the deferred
+ * collector instead — see idx_find_streaming. Returns 1 when the op was
+ * driven here, 0 when the caller must use the legacy path. */
 static int chunked_stream_dispatch(ChunkShared *sh,
                                    const char *db_root, const char *object,
                                    const char *field, int splits,
@@ -1917,6 +2050,7 @@ static int idx_find_streaming(const char *db_root, const char *object,
     sc.parent_out = g_out;
     sc.tf = resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field);
     pthread_mutex_init(&sc.lock, NULL);
+    sc.defer_budget = g_query_buffer_max_bytes / 16;
 
     if (batch_buf_init(&sc.bfb, sdb, sch->slot_size, limit) != 0) {
         pthread_mutex_destroy(&sc.lock);
@@ -1950,12 +2084,19 @@ static int idx_find_streaming(const char *db_root, const char *object,
                             primary_crit, sc.tf, stream_find_cb, &sc);
         }
     } else {
-        /* Legacy fan-out — IT_BITMAP branches and O_DIRECT leaf scans hold
-         * no bt_cache lock, so inline batch flushing stays safe there. */
+        /* IT_BITMAP branches hold kf(S)+bitmap(S) across the emit, so the
+         * collector must never flush inline: the resolver's per-shard
+         * kfcache acquires would nest a second kf(S) read acquire under
+         * the held one — PREFER_WRITER_NONRECURSIVE self-deadlock behind
+         * any queued window writer. The deferred collector appends to a
+         * per-thread batch only; each worker fetches after its walk
+         * releases the handles. O_DIRECT leaf-scan branches (btree
+         * primaries the chunked dispatcher didn't drive) hold no handles
+         * and keep the inline-flush collector on the !driven path. */
         btree_dispatch(db_root, object, primary_crit->field, sch->splits,
                         primary_crit,
                         resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field),
-                        stream_find_cb, &sc);
+                        stream_find_defer_cb, &sc);
     }
 
     batch_buf_destroy(&sc.bfb);
@@ -3082,6 +3223,7 @@ static void *bm_generic_shard_worker(void *arg) {
                                                  a->field, a->shard_idx,
                                                  a->crit, a->tf,
                                                  a->cb, a->ctx, a->sdb);
+    bm_defer_drain_if_armed(a->cb, a->sdb);
     if (stopped && a->stop_flag) {
         __atomic_store_n(a->stop_flag, 1, __ATOMIC_RELAXED);
     }
@@ -3368,6 +3510,7 @@ static void *bm_shard_walk_worker(void *arg) {
     int stopped = bitmap_emit_for_shard(a->db_root, a->object, a->field,
                                         a->shard_idx, a->value, a->vlen,
                                         a->cb, a->ctx, a->sdb);
+    bm_defer_drain_if_armed(a->cb, a->sdb);
     if (stopped && a->stop_flag) {
         __atomic_store_n(a->stop_flag, 1, __ATOMIC_RELAXED);
     }

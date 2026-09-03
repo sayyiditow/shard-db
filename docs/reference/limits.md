@@ -46,7 +46,7 @@ Changing these requires recompiling. Most don't need to change.
 | AND-intersection leaves | 8 | `MAX_INTERSECT_LEAVES` — beyond this the planner picks single-leaf primary. |
 | `join` chain length | no hard cap | Each join adds a per-record lookup; keep it short. |
 | Composite index arity | 16 fields | Hard-coded in `IndexScanCtx`. |
-| Per-query intermediate buffers | `QUERY_BUFFER_MB` MB (default 256) | Enforced at every collection site (collect-hash, KeySet, aggregate buckets, sort buffers, trigram intersect). Exceeded → `query memory buffer exceeded` error and the server keeps serving. |
+| Per-query intermediate buffers | `QUERY_BUFFER_MB` MB (default 256) | Enforced at every collection site (collect-hash, KeySet, aggregate buckets, sort buffers, trigram intersect, bitmap deferred candidate batches). Exceeded → `query memory buffer exceeded` error and the server keeps serving. The bitmap deferred collector (bitmap-primary streaming finds holds candidate hashes per walk thread until the walk's locks drop) is bounded by the same budget; on exceed it stops collecting and returns the partial result (deadline-style), never a silent drop. |
 | Concurrent queries in-flight | `MAX_CONCURRENT_QUERIES` (default auto = `max(4, min(nproc, 32))`) | Hard cap on simultaneously-running queries. Exceeded → immediate `{"error":"server at capacity"}` response so the client can retry without holding the TCP thread. `MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB` is the predictable peak for query-buffer RAM. |
 | Per-request statement timeout | global `TIMEOUT` (db.env, seconds) or per-request `timeout_ms` (override) | Disabled when both are 0. |
 | Request size (one JSON line) | `MAX_REQUEST_SIZE` (default 32 MB) | Configurable per install. |
