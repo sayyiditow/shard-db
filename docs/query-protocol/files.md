@@ -54,7 +54,7 @@ On CAS conflict:
 
 ### Atomicity
 
-Writes go to `<dest>.tmp.<pid>`, `fsync`ed, then `rename`d onto `<dest>`. A mid-upload crash leaves no partial file. Default is silent overwrite; add `if_not_exists:true` to refuse.
+Writes go to a unique exclusive temp sibling of the destination (`<dest>.tmp.<pid>.<nonce>`, created `O_EXCL` so concurrent uploads of the same filename never share a temp file), `fsync`ed, then `rename`d onto `<dest>`, and the parent directory is fsynced — a mid-upload crash leaves no partial file, and a durability failure surfaces as an error instead of silent success. Default is silent overwrite; add `if_not_exists:true` to refuse.
 
 ### Size cap
 

@@ -236,16 +236,25 @@ struct ShardDb {
     uint64_t bt_cache_misses;
     uint64_t server_start_ms;
     uint64_t slow_query_count;
-    /* Durability commit-window instrumentation. commit_count
-       and commit_lock_hold_us_total cover single-record upsert/insert
-       commits and each bulk commit window; commit_sync_us_total covers
-       time spent specifically inside the marker fsync / kf-slot-sync
-       primitives (KFM2 publication/clear,
-       kfcache_sync_slots_locked) — a subset of the lock-hold total, kept
-       separate so the marker-fsync cost can be reported on its own. */
+    /* Durability commit-window instrumentation. commit_count and
+       commit_lock_hold_us_total cover single-record upsert/insert commits
+       and each bulk shard-call (one shard-call may contain many windows —
+       use windows_total for per-window math). Per-phase totals below split
+       the M/A/I/K/C barrier costs so sync_us_avg is attributable:
+       marker_publish/clear = KFM2 publication + clear fsyncs,
+       segment_sync = the P/A segment msync+fdatasync barrier,
+       index_sync = the per-(field, idx shard) flush in phase I,
+       commit_sync_us_total = the K-phase kf mapping sync only. */
     uint64_t commit_count;
     uint64_t commit_lock_hold_us_total;
     uint64_t commit_sync_us_total;
+    uint64_t commit_windows_total;
+    uint64_t commit_marker_publish_us_total;
+    uint64_t commit_marker_publish_count;
+    uint64_t commit_segment_sync_us_total;
+    uint64_t commit_index_sync_us_total;
+    uint64_t commit_index_sync_ops_total;
+    uint64_t commit_marker_clear_us_total;
 
     /* config / tuning */
     int slow_query_ms;
@@ -420,6 +429,13 @@ extern ShardDb *g_shard_db_instance;
 #define g_commit_count              (g_db->commit_count)
 #define g_commit_lock_hold_us_total (g_db->commit_lock_hold_us_total)
 #define g_commit_sync_us_total      (g_db->commit_sync_us_total)
+#define g_commit_windows_total      (g_db->commit_windows_total)
+#define g_commit_marker_publish_us_total (g_db->commit_marker_publish_us_total)
+#define g_commit_marker_publish_count    (g_db->commit_marker_publish_count)
+#define g_commit_segment_sync_us_total   (g_db->commit_segment_sync_us_total)
+#define g_commit_index_sync_us_total     (g_db->commit_index_sync_us_total)
+#define g_commit_index_sync_ops_total    (g_db->commit_index_sync_ops_total)
+#define g_commit_marker_clear_us_total   (g_db->commit_marker_clear_us_total)
 #define g_random_seq_ratio          (g_db->random_seq_ratio)
 #define g_vacuum_recommend_pct      (g_db->vacuum_recommend_pct)
 #define g_vacuum_recommend_min_deleted (g_db->vacuum_recommend_min_deleted)

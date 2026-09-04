@@ -897,6 +897,11 @@ long long seq_next_val(const char *db_root, const char *object,
                        const char *seq_name);
 long long seq_next_val_batch(const char *db_root, const char *object,
                              const char *seq_name, int n);
+/* Durable reset of one sequence to 0. Takes the same per-sequence flock the
+   allocation paths hold, so reset cannot race a concurrent allocation.
+   Returns 0 or -1. */
+int seq_state_reset(const char *db_root, const char *object,
+                    const char *seq_name);
 
 /* storage.c */
 void compute_hash_raw(const char *key, size_t key_len, uint8_t hash_out[16]);
@@ -1487,6 +1492,12 @@ int index_sync_record_fields(const char *db_root, const char *object, int splits
                              const uint8_t hash16[16],
                              const char *const *fields,
                              const enum IndexType *types, int nfields);
+
+/* Flush one (field, kf shard) bitmap file through the bm cache — the bulk
+   window flush seam's counterpart of index_sync_record_fields for bitmap
+   fields (which index_sync_record_fields deliberately skips). */
+int bitmap_sync_shard_path(const char *db_root, const char *object,
+                           const char *field, int kf_shard, int splits);
 
 /* ── Bitmap prepare/apply split ──────────────────────────────────────────
    Closes the cap-check-then-apply race without transferring rwlock-owned

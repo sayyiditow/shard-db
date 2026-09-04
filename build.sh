@@ -249,6 +249,12 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_durability_ordering.c \
     src/test/cases/test_window_release_routes.c \
     src/test/cases/test_durability_sync_failures.c \
+    src/test/cases/test_commit_phase_metrics.c \
+    src/test/cases/test_bulk_idx_sync_batching.c \
+    src/test/cases/test_bulk_idx_types_batching.c \
+    src/test/cases/test_sequence_durability.c \
+    src/test/cases/test_file_ops_roundtrip.c \
+    src/test/cases/test_bulk_commit_window_default.c \
     src/test/cases/test_durability_sync_cache_paths.c \
     src/test/cases/test_embedded_bg_threads.c \
     src/test/cases/test_read_objlock_contention.c \
@@ -522,7 +528,7 @@ export IO_THREADS=0
 # raise on a beefy box with many short-lived queries.
 export MAX_CONCURRENT_QUERIES=0
 # Record count per synchronous indexed durability window.
-export BULK_COMMIT_WINDOW=1024
+export BULK_COMMIT_WINDOW=4096
 
 # Request + query limits
 export GLOBAL_LIMIT=100000

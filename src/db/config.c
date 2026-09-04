@@ -2535,6 +2535,62 @@ static void gen_random_hex(int nbytes, char *buf, size_t bufsz) {
         snprintf(buf + i * 2, 3, "%02x", raw[i]);
 }
 
+/* Durable sequence-state write: temp file in the same directory, full
+   write, fdatasync, rename, parent-dir fsync. The flock caller holds the
+   per-sequence lock across read-modify-write, so rename's replace
+   semantics are safe. Returns 0, or -1 with the state file unchanged. */
+static int seq_state_write(const char *seq_dir, const char *seq_path,
+                           long long val) {
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", seq_path, (int)getpid());
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    char line[32];
+    int n = snprintf(line, sizeof(line), "%lld\n", val);
+    const char *p = line;
+    size_t left = (size_t)n;
+    while (left > 0) {
+        ssize_t w = write(fd, p, left);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            close(fd); unlink(tmp); return -1;
+        }
+        p += w; left -= (size_t)w;
+    }
+    if (fdatasync(fd) != 0) {
+        close(fd); unlink(tmp); return -1;
+    }
+    /* close() releases the fd even when it reports failure — closing again
+       here could hit a number another thread has already opened (the
+       fd = -1 idiom in marker_publish_atomic exists for the same reason),
+       and a stray EBADF would clobber the real error errno. */
+    if (close(fd) != 0) {
+        unlink(tmp); return -1;
+    }
+    if (rename(tmp, seq_path) != 0) { unlink(tmp); return -1; }
+    if (fsync_parent_dir(seq_path) != 0) return -1;
+    return 0;
+}
+
+/* Durable reset of one sequence to 0. Takes the same per-sequence flock the
+   allocation paths hold, so reset can no longer race a concurrent
+   seq_next_val / seq_next_val_batch. Returns 0 or -1. */
+int seq_state_reset(const char *db_root, const char *object,
+                    const char *seq_name) {
+    char seq_dir[PATH_MAX], seq_path[PATH_MAX], lock_path[PATH_MAX];
+    snprintf(seq_dir, sizeof(seq_dir), "%s/%s/metadata/sequences", db_root, object);
+    mkdirp(seq_dir);
+    snprintf(seq_path, sizeof(seq_path), "%s/%s", seq_dir, seq_name);
+    snprintf(lock_path, sizeof(lock_path), "%s/%s.lock", seq_dir, seq_name);
+    int lockfd = open(lock_path, O_RDWR | O_CREAT, 0644);
+    if (lockfd < 0) return -1;
+    flock(lockfd, LOCK_EX);
+    int rc = seq_state_write(seq_dir, seq_path, 0);
+    flock(lockfd, LOCK_UN);
+    close(lockfd);
+    return rc;
+}
+
 /* Sequence next — returns next value without printing. Used by
    DK_SEQ field defaults and by the auto_key=seq(<name>) insert path.
    Promoted from static to public in 2026.05.5 so storage.c can call it
@@ -2557,8 +2613,12 @@ long long seq_next_val(const char *db_root, const char *object, const char *seq_
     FILE *f = fopen(seq_path, "r");
     if (f) { if (fscanf(f, "%lld", &val) != 1) val = 0; fclose(f); }
     val++;
-    f = fopen(seq_path, "w");
-    if (f) { fprintf(f, "%lld\n", val); fclose(f); }
+    if (seq_state_write(seq_dir, seq_path, val) != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "seq_next_val: durable write failed for [%s]", seq_name);
+        flock(lockfd, LOCK_UN);
+        close(lockfd);
+        return -1;
+    }
 
     flock(lockfd, LOCK_UN);
     close(lockfd);
@@ -2596,8 +2656,12 @@ long long seq_next_val_batch(const char *db_root, const char *object,
     }
     long long start = val + 1;
     val += n;
-    f = fopen(seq_path, "w");
-    if (f) { fprintf(f, "%lld\n", val); fclose(f); }
+    if (seq_state_write(seq_dir, seq_path, val) != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "seq_next_val_batch: durable write failed for [%s]", seq_name);
+        flock(lockfd, LOCK_UN);
+        close(lockfd);
+        return -1;
+    }
 
     flock(lockfd, LOCK_UN);
     close(lockfd);

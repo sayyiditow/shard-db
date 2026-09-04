@@ -1839,6 +1839,33 @@ void free_excluded(ExcludedKeys *ex) {
 
 /* ========== PUT-FILE / GET-FILE-PATH ========== */
 
+/* Process-wide nonce for upload temp names (pid alone is shared by every
+   concurrent request in this process; see open_upload_tmp). */
+static uint64_t g_upload_tmp_seq;
+
+/* Open a unique, exclusive temp sibling of dest for a streaming upload.
+   A predictable temp name like <dest>.tmp.<pid> is shared by every
+   concurrent upload of the same filename: two requests would
+   truncate/interleave the same file and one could rename a torn mix into
+   place. Mirrors marker_make_unique_paths' pid+nonce O_EXCL pattern,
+   retrying on the rare nonce collision. Returns the fd, with *tmp_out
+   filled; -1 on failure. */
+static int open_upload_tmp(const char *dest, char *tmp_out, size_t tmp_cap) {
+    for (int attempt = 0; attempt < 8; attempt++) {
+        uint64_t seq = __atomic_add_fetch(&g_upload_tmp_seq, 1,
+                                          __ATOMIC_RELAXED);
+        uint64_t nonce = now_us() ^ (seq << 32);
+        int n = snprintf(tmp_out, tmp_cap, "%s.tmp.%d.%llu",
+                         dest, (int)getpid(), (unsigned long long)nonce);
+        if (n < 0 || (size_t)n >= tmp_cap) { errno = ENAMETOOLONG; return -1; }
+        int fd = open(tmp_out, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd >= 0) return fd;
+        if (errno != EEXIST) return -1;
+    }
+    errno = EEXIST;
+    return -1;
+}
+
 int cmd_put_file(const char *db_root, const char *object, const char *src) {
     /* Open the source first, then fstat the fd. CodeQL flagged the prior
        stat()-then-open() as a TOCTOU race: an attacker controlling the
@@ -1865,11 +1892,63 @@ int cmd_put_file(const char *db_root, const char *object, const char *src) {
     snprintf(dest, sizeof(dest), "%s/%s", dest_dir, filename);
     mkdirp(dest_dir);
 
-    int dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (dfd < 0) { close(sfd); fprintf(stderr, "Error: Cannot create %s\n", dest); return 1; }
+    /* Write to a unique exclusive temp sibling, fsync, rename, fsync the
+       parent dir — an interrupted copy leaves the previous file intact
+       instead of a truncated live destination, and concurrent uploads of
+       the same filename never share a temp file. Short writes and read
+       errors are failures, not silent truncation. */
+    char tmp[PATH_MAX];
+    int dfd = open_upload_tmp(dest, tmp, sizeof(tmp));
+    if (dfd < 0) {
+        close(sfd);
+        fprintf(stderr, "Error: Cannot create %s: %s\n", tmp, strerror(errno));
+        return 1;
+    }
     char buf[65536]; ssize_t n;
-    while ((n = read(sfd, buf, sizeof(buf))) > 0) write(dfd, buf, n);
-    close(sfd); close(dfd);
+    while ((n = read(sfd, buf, sizeof(buf))) > 0) {
+        size_t off = 0;
+        while (off < (size_t)n) {
+            ssize_t w = write(dfd, buf + off, (size_t)n - off);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                close(sfd); close(dfd); unlink(tmp);
+                fprintf(stderr, "Error: write to %s failed: %s\n",
+                        tmp, strerror(errno));
+                return 1;
+            }
+            off += (size_t)w;
+        }
+    }
+    if (n < 0) {
+        close(sfd); close(dfd); unlink(tmp);
+        fprintf(stderr, "Error: read from %s failed\n", src);
+        return 1;
+    }
+    close(sfd);
+    if (fsync(dfd) != 0) {
+        close(dfd); unlink(tmp);
+        fprintf(stderr, "Error: fsync(%s) failed: %s\n", tmp, strerror(errno));
+        return 1;
+    }
+    if (close(dfd) != 0) {
+        unlink(tmp);
+        fprintf(stderr, "Error: close(%s) failed\n", tmp);
+        return 1;
+    }
+    if (rename(tmp, dest) != 0) {
+        unlink(tmp);
+        fprintf(stderr, "Error: rename %s -> %s failed: %s\n",
+                tmp, dest, strerror(errno));
+        return 1;
+    }
+    if (fsync_parent_dir(dest) != 0) {
+        /* Same fail-closed rule as cmd_put_file_b64 / cmd_delete_file: this
+           path variant is wire-reachable (server.c put-file), so a failed
+           directory sync must not surface as success. */
+        OUT("{\"error\":\"stored but durability unconfirmed\",\"path\":\"%s\"}\n",
+            dest);
+        return 1;
+    }
     OUT("{\"status\":\"stored\",\"path\":\"%s\"}\n", dest);
     return 0;
 }
@@ -1932,8 +2011,7 @@ int cmd_put_file_b64(const char *db_root, const char *object,
     mkdirp(dest_dir);
 
     char tmp[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", dest, (int)getpid());
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open_upload_tmp(dest, tmp, sizeof(tmp));
     if (fd < 0) { free(raw); OUT("{\"error\":\"cannot create %s\"}\n", tmp); return 1; }
 
     size_t w = 0;
@@ -1942,13 +2020,21 @@ int cmd_put_file_b64(const char *db_root, const char *object,
         if (n <= 0) { close(fd); unlink(tmp); free(raw); OUT("{\"error\":\"write failed\"}\n"); return 1; }
         w += (size_t)n;
     }
-    fsync(fd);
+    if (fsync(fd) != 0) {
+        close(fd); unlink(tmp); free(raw);
+        OUT("{\"error\":\"fsync failed\"}\n");
+        return 1;
+    }
     close(fd);
     free(raw);
 
     if (rename(tmp, dest) != 0) {
         unlink(tmp);
         OUT("{\"error\":\"rename failed\"}\n");
+        return 1;
+    }
+    if (fsync_parent_dir(dest) != 0) {
+        OUT("{\"error\":\"stored but durability unconfirmed\"}\n");
         return 1;
     }
 
@@ -2015,6 +2101,13 @@ int cmd_delete_file(const char *db_root, const char *object, const char *filenam
         else
             OUT("{\"error\":\"unlink failed: %s\",\"filename\":\"%s\"}\n",
                 strerror(errno), filename);
+        return 1;
+    }
+    /* Same fail-closed rule as the marker clear: a failed directory sync
+       means the deletion's durability is unconfirmed — report it. */
+    if (fsync_parent_dir(dest) != 0) {
+        OUT("{\"error\":\"deleted but durability unconfirmed\",\"filename\":\"%s\"}\n",
+            filename);
         return 1;
     }
 
