@@ -259,7 +259,7 @@ typedef struct SlotcaskDb {
     size_t  slots_per_shard; /* per-shard kf capacity floor; individual
                                 shards may have grown larger via auto-resplit */
     int     bulk_commit_window; /* records per commit window; 0 = default
-                                   (1024). db.env BULK_COMMIT_WINDOW. */
+                                      (4096). db.env BULK_COMMIT_WINDOW. */
     /* Registry reference count; see slotcask_registry_get/put. */
     uint64_t reg_refs;
 
@@ -570,7 +570,7 @@ typedef int (*slotcask_bulk_value_fn)(const SlotcaskOldRecord *old,
                                        SlotcaskBulkRec *rec);
 
 /* Two-phase, window-scoped hooks for indexed bulk-insert windows
- * (db->bulk_commit_window records per commit window; 0 = default 1024).
+ * (db->bulk_commit_window records per commit window; 0 = default 4096).
  *
  * prepare_window — fires once per window, on the bulk worker thread,
  *   BEFORE the window's batch marker exists. active[] lists indices into
@@ -689,6 +689,15 @@ typedef struct {
        (safe degraded state). Caller propagates to wire response. */
     int                         *out_durability_degraded;
 } SlotcaskBulkOpts;
+
+/* Record one (field, idx shard) index file the current bulk window mutated,
+   so bulk_apply_and_sync_indexes_locked can fdatasync each unique file once
+   before the marker is cleared instead of every mutation syncing inline.
+   No-op when no bulk apply_window is in flight (single-record paths keep
+   their own sync contract). For IT_BITMAP, idx_shard is the kf shard and
+   hash16 may be NULL. */
+void idx_touch_record(const char *field, int idx_shard, int type,
+                      const uint8_t hash16[16]);
 
 /* Returns 0 if the batch ran (per-record results in recs[].status), -1 on
    hard error (kf_acquire failed). Records that hit if_not_exists,

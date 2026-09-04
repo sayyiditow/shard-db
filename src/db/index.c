@@ -397,6 +397,12 @@ void *update_idx_fn(void *arg) {
                     a->out_error = -2;
                     a->out_errno = errno;
                 }
+            } else if (!a->out_error && (a->old_key || a->new_key)) {
+                /* Bulk window: record the touched (field, shard) so the
+                   post-apply flush syncs each unique file exactly once
+                   (invariant I1) instead of per record. */
+                idx_touch_record(a->field, idx_shard_for_hash(a->hash, a->splits),
+                                 IT_BTREE, a->hash);
             }
             if (!a->out_error && index_test_should_fail_after_success()) {
                 a->out_error = -2;
@@ -415,6 +421,7 @@ void *update_idx_fn(void *arg) {
                record's own write cost dominates anyway. */
             uint8_t old_tg[TG_MAX_DISTINCT][3];
             uint8_t new_tg[TG_MAX_DISTINCT][3];
+            size_t n_old_deleted = 0, n_new_inserted = 0;
             size_t n_old = a->old_key
                 ? tg_extract_distinct(a->old_key, a->old_len, old_tg, TG_MAX_DISTINCT)
                 : 0;
@@ -435,6 +442,7 @@ void *update_idx_fn(void *arg) {
                         a->out_errno = errno;
                         break;
                     }
+                    n_old_deleted++;
                 }
             }
 
@@ -453,6 +461,7 @@ void *update_idx_fn(void *arg) {
                         a->out_errno = errno;
                         break;
                     }
+                    n_new_inserted++;
                 }
             }
             if (!a->out_error && a->sync_after) {
@@ -463,6 +472,12 @@ void *update_idx_fn(void *arg) {
                     a->out_error = -2;
                     a->out_errno = errno;
                 }
+            } else if (!a->out_error && (n_old_deleted || n_new_inserted)) {
+                /* Bulk window: record only when a trigram leaf write really
+                   happened — key churn with an identical trigram set must
+                   not O_CREAT an otherwise-untouched .tg via the flush. */
+                idx_touch_record(a->field, idx_shard_for_hash(a->hash, a->splits),
+                                 IT_TRIGRAM, a->hash);
             }
             if (!a->out_error && index_test_should_fail_after_success()) {
                 a->out_error = -2;
@@ -487,6 +502,12 @@ void *update_idx_fn(void *arg) {
                                          a->new_key, a->new_len,
                                          a->old_key, a->old_len,
                                          a->sync_after);
+            if (!a->out_error && !a->sync_after && (a->old_key || a->new_key)) {
+                /* Bulk window: the flush seam syncs this (field, kf shard)
+                   bitmap file once via the bm cache (hash16 unused — bitmap
+                   files route by kf shard). */
+                idx_touch_record(a->field, a->kf_shard, IT_BITMAP, NULL);
+            }
             if (!a->out_error && index_test_should_fail_after_success()) {
                 a->out_error = -2;
                 a->out_errno = EIO;
@@ -865,6 +886,23 @@ int index_sync_record_fields(const char *db_root, const char *object, int splits
         }
     free(args);
     if (rc != 0) errno = saved_err ? saved_err : EIO;
+    return rc;
+}
+
+/* Flush one (field, kf shard) bitmap file through the bm cache. Used by the
+   bulk window flush seam (invariant I1: before marker clear). bm handles
+   stay alive in the cache after bm_close, so this is one fdatasync per
+   unique file per window. A missing file means nothing was ever written —
+   not an error. Returns 0 or -1. */
+int bitmap_sync_shard_path(const char *db_root, const char *object,
+                           const char *field, int kf_shard, int splits) {
+    char path[1024];
+    bitmap_shard_path(path, sizeof(path), db_root, object, field, kf_shard);
+    int slots = (int)slotcask_default_slots_for_splits(splits);
+    BitmapShard *bm = bm_open(path, slots, 0, 0, 0, 1 /* writer */);
+    if (!bm) return errno == ENOENT ? 0 : -1;
+    int rc = bm_sync(bm);
+    bm_close(bm);
     return rc;
 }
 

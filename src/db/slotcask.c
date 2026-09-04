@@ -889,11 +889,14 @@ static int marker_make_unique_paths(const char *kf_dir, const char *final_name,
 }
 
 /* Tri-state contract:
- *   0  = marker published (linked) and its publication is durable
+ *   0  = marker published (renamed into place) and its publication durable
  *   1  = marker IS published but publication durability is unconfirmed
- *        (post-link unlink/fsync_dir failure) — caller MUST treat this as a
+ *        (post-rename fsync_dir failure) — caller MUST treat this as a
  *        post-M failure: forward replay, else EINPROGRESS
- *   -1 = marker was never linked — safe plain pre-M failure */
+ *   -1 = marker was never published — safe plain pre-M failure
+ * rename (not link) is safe here: kf_shard_marker_gate replays and clears
+ * any retained marker before a new window plans, so a pre-existing final
+ * name can never belong to another window's live intent. */
 static int marker_publish_atomic(const char *kf_dir, const char *final_name,
                                  const void *bytes, size_t len) {
     char tmp_path[PATH_MAX], final_path[PATH_MAX];
@@ -919,11 +922,11 @@ static int marker_publish_atomic(const char *kf_dir, const char *final_name,
     if (fsync(fd) != 0) goto fail_open;
     if (close(fd) != 0) { fd = -1; goto fail_open; }
     fd = -1;
-    if (link(tmp_path, final_path) != 0) goto fail_open;
+    if (rename(tmp_path, final_path) != 0) goto fail_open;
 
     /* Past this point the final marker exists: every remaining failure is
      * a post-M outcome and is reported as published-but-pending. */
-    if (unlink(tmp_path) == 0 && fsync_dir(kf_dir) == 0)
+    if (fsync_dir(kf_dir) == 0)
         return 0;
     return 1;
 
@@ -1191,25 +1194,34 @@ static void commit_sync_us_record(uint64_t t0) {
     if (g_db) __atomic_add_fetch(&g_commit_sync_us_total, now_us() - t0, __ATOMIC_RELAXED);
 }
 
+/* Accumulate time into one named durability-phase counter (see
+   shard_db_internal.h). counter is one of the g_commit_*_us_total lvalues. */
+static void commit_phase_us_record(uint64_t *counter, uint64_t t0) {
+    if (g_db) __atomic_add_fetch(counter, now_us() - t0, __ATOMIC_RELAXED);
+}
+
 /* Sync only the pages containing the given kf slots, while h's writer
    lock remains held. header_changed: sync the 24-byte shard header too.
    h must be a writer-acquired handle with non-NULL hdr and map. */
 static int kfcache_sync_slots_locked_impl(SlotcaskKfHandle *h,
                               const size_t *slots, size_t nslots,
                               int header_changed) {
+    (void)header_changed;  /* the 24-byte header lives at byte 0 of the same
+                              mapping and is covered by the full-range sync */
     if (!h || !h->writer || !h->hdr || (!slots && nslots)) {
         errno = EINVAL;
         return -1;
     }
-    for (size_t i = 0; i < nslots; i++) {
+    for (size_t i = 0; i < nslots; i++)
         if (slots[i] >= h->capacity) { errno = EINVAL; return -1; }
-        size_t off = SLOTCASK_KF_HDR_SIZE + slots[i] * sizeof(*h->map);
-        if (durability_msync_range(h->hdr, off, sizeof(*h->map)) < 0)
-            return -1;
-    }
-    return !header_changed ||
-           durability_msync_range(h->hdr, 0, SLOTCASK_KF_HDR_SIZE) == 0
-               ? 0 : -1;
+    /* One whole-mapping MS_SYNC instead of one msync per touched slot:
+       the caller holds this shard's exclusive wrlock, so every dirty page
+       of the mapping belongs to it (readers never dirty pages), and a
+       full-range MS_SYNC waits once for the batched writeback instead of
+       once per 24-byte slot (~170 slots share a page; hash-scattered slots
+       otherwise force ~1 blocking flush per record). Same contract as the
+       kfcache shutdown path's msync(map, map_size, MS_SYNC). */
+    return msync((void *)h->hdr, h->map_size, MS_SYNC) == 0 ? 0 : -1;
 }
 
 int kfcache_sync_slots_locked(SlotcaskKfHandle *h,
@@ -4413,13 +4425,15 @@ typedef struct {
 typedef struct { IdxTouch *v; size_t n, cap; } IdxTouchSet;
 
 /* Installed by bulk_apply_and_sync_indexes_locked for the duration of the
-   caller's apply_window hook so query_bulk.c's per-index-op callbacks can
-   record what they touched instead of syncing per-record themselves.
+   caller's apply_window hook — bulk windows only (window_cap > 1; the
+   single-record adapter windows have window_cap == 1 and their own flush
+   contract) — so query_bulk.c's per-index-op callbacks can record what they
+   touched instead of syncing per-record themselves.
    NULL outside of apply_window (single-record hooks still sync directly). */
 static _Thread_local IdxTouchSet *tls_idx_touch;
 
-static void __attribute__((unused)) idx_touch_record(const char *field, int idx_shard, int type,
-                             const uint8_t hash16[16]) {
+void idx_touch_record(const char *field, int idx_shard, int type,
+                      const uint8_t hash16[16]) {
     IdxTouchSet *s = tls_idx_touch;
     if (!s) return;
     if (s->n == s->cap) {
@@ -4434,7 +4448,8 @@ static void __attribute__((unused)) idx_touch_record(const char *field, int idx_
     snprintf(s->v[s->n].field, sizeof(s->v[0].field), "%s", field);
     s->v[s->n].idx_shard = idx_shard;
     s->v[s->n].type = type;
-    memcpy(s->v[s->n].hash16, hash16, 16);
+    if (hash16) memcpy(s->v[s->n].hash16, hash16, 16);
+    else memset(s->v[s->n].hash16, 0, 16);
     s->n++;
 }
 
@@ -5090,7 +5105,11 @@ static int bulk_activate_new_payloads_locked(BulkMutationTxn *txn,
         n++;
     }
     qsort(locs, n, sizeof(*locs), segloc_cmp);
-    rc = bulk_seg_apply_and_sync(txn->db, locs, n, 1, 1);
+    {
+        uint64_t t0a = now_us();
+        rc = bulk_seg_apply_and_sync(txn->db, locs, n, 1, 1);
+        commit_phase_us_record(&g_commit_segment_sync_us_total, t0a);
+    }
     free(locs);
     if (rc == 0 && n > 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_A)) rc = -1;
     return rc;
@@ -5112,16 +5131,22 @@ static int bulk_apply_and_sync_indexes_locked(BulkMutationTxn *txn,
     SHARD_TEST_PHASE_PAUSE(SHARD_TEST_PHASE_I);
     durability_test_pause(txn->db->data_dir, "win-I");
 
+    /* Recording is bulk-only: single-record mutations route through this
+       same coordinator with window_cap == 1, and their hooks already sync
+       via their own apply_commit flush (storage.c's
+       index_sync_record_fields calls). Letting a window_cap=1 window
+       record would double-sync every touched file. */
+    int record_touches = txn->window_cap > 1;
     if (shard->kind == BULK_MUTATION_DELETE) {
         if (!txn->delete_opts || !txn->delete_opts->apply_window) return 0;
-        tls_idx_touch = &plan->touch;
+        if (record_touches) tls_idx_touch = &plan->touch;
         rc = txn->delete_opts->apply_window(shard->recs, plan->active,
                                             plan->nactive,
                                             txn->delete_opts->bulk_hook_ctx);
         tls_idx_touch = NULL;
     } else {
         if (!txn->upsert_opts || !txn->upsert_opts->apply_window) return 0;
-        tls_idx_touch = &plan->touch;
+        if (record_touches) tls_idx_touch = &plan->touch;
         rc = txn->upsert_opts->apply_window(shard->recs, plan->active,
                                             plan->nactive,
                                             txn->upsert_opts->bulk_hook_ctx);
@@ -5131,7 +5156,7 @@ static int bulk_apply_and_sync_indexes_locked(BulkMutationTxn *txn,
 
     /* one durable sync per touched (field, idx shard): dedupe, then flush
        via the existing per-record flush seam with one representative hash */
-    if (plan->touch.n > 0)     /* delete windows carry no touches: v is NULL */
+    if (plan->touch.n > 0)     /* empty unless an apply_window recorded touches */
         qsort(plan->touch.v, plan->touch.n, sizeof(IdxTouch), idx_touch_cmp);
     size_t w = 0;
     for (size_t i = 0; i < plan->touch.n; i++)
@@ -5141,14 +5166,26 @@ static int bulk_apply_and_sync_indexes_locked(BulkMutationTxn *txn,
 
     split_data_dir(txn->db->data_dir, eff_root, sizeof(eff_root),
                    object, sizeof(object));
-    for (size_t i = 0; i < plan->touch.n; i++) {
-        const IdxTouch *t = &plan->touch.v[i];
-        const char *field = t->field;
-        if (index_sync_record_fields(eff_root, object, txn->db->num_shards,
-                                     t->hash16, &field,
-                                     (const enum IndexType *)&t->type,
-                                     1) != 0)
-            return -1;
+    {
+        uint64_t t0i = now_us();
+        for (size_t i = 0; i < plan->touch.n; i++) {
+            const IdxTouch *t = &plan->touch.v[i];
+            const char *field = t->field;
+            if (t->type == IT_BITMAP) {
+                if (bitmap_sync_shard_path(eff_root, object, t->field,
+                                           t->idx_shard,
+                                           txn->db->num_shards) != 0)
+                    return -1;
+            } else if (index_sync_record_fields(eff_root, object,
+                                                txn->db->num_shards,
+                                                t->hash16, &field,
+                                                (const enum IndexType *)&t->type,
+                                                1) != 0)
+                return -1;
+            __atomic_add_fetch(&g_commit_index_sync_ops_total, 1,
+                               __ATOMIC_RELAXED);
+        }
+        commit_phase_us_record(&g_commit_index_sync_us_total, t0i);
     }
     if (plan->touch.n > 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_I)) return -1;
     return 0;
@@ -5314,7 +5351,11 @@ static int bulk_clear_window_marker_locked(BulkMutationTxn *txn,
     snprintf(path, sizeof(path), "%s/%03x_batch_%u_marker.dat",
              kf_dir, (unsigned)plan->kf_shard_id, plan->batch_id);
     if (unlink(path) != 0) return -1;
-    rc = fsync_dir(kf_dir);
+    {
+        uint64_t t0c = now_us();
+        rc = fsync_dir(kf_dir);
+        commit_phase_us_record(&g_commit_marker_clear_us_total, t0c);
+    }
     if (rc == 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_C)) rc = -1;
     return rc;
 }
@@ -5363,7 +5404,18 @@ static int bulk_commit_one_kf_window(BulkMutationTxn *txn,
     }
     if (bulk_plan_window_locked(txn, shard, begin, end, &kh, &plan) != 0)
         goto out;
-    prc = bulk_publish_window_marker_locked(txn, &kh, &plan);
+    {
+        uint64_t t0m = now_us();
+        prc = bulk_publish_window_marker_locked(txn, &kh, &plan);
+        commit_phase_us_record(&g_commit_marker_publish_us_total, t0m);
+        if (prc >= 0 && plan.nactive > 0) {
+            /* prc < 0: pre-M publish failure — no marker exists, so this
+               window must not count as published. */
+            __atomic_add_fetch(&g_commit_marker_publish_count, 1,
+                               __ATOMIC_RELAXED);
+            __atomic_add_fetch(&g_commit_windows_total, 1, __ATOMIC_RELAXED);
+        }
+    }
     /* publish returns 0 WITHOUT creating any marker when the window
        planned zero active records (all records policy-rejected) — that is
        not a commit point. Only nactive > 0 with prc >= 0 means durable
@@ -6006,7 +6058,7 @@ int slotcask_bulk_upsert_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     BulkMutationTxn txn = {0};
     txn.db = db; txn.shards = &shard; txn.nshards = 1;
     txn.window_cap = db->bulk_commit_window > 0
-                    ? (size_t)db->bulk_commit_window : 1024;
+                    ? (size_t)db->bulk_commit_window : 4096;
     txn.upsert_opts = opts;
 
     int rc = slotcask_bulk_mutation_transaction(&txn);
@@ -6031,7 +6083,7 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
     BulkMutationTxn txn = {0};
     txn.db = db; txn.shards = &shard; txn.nshards = 1;
     txn.window_cap = db->bulk_commit_window > 0
-                    ? (size_t)db->bulk_commit_window : 1024;
+                    ? (size_t)db->bulk_commit_window : 4096;
     txn.delete_opts = opts;
 
     int rc = slotcask_bulk_mutation_transaction(&txn);

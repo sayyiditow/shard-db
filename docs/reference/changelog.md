@@ -6,6 +6,39 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**Bulk-commit throughput + durability closure (2026.09).** Indexed bulk
+insert/update/delete now collect the unique (field, idx shard) files a
+window touched — btree, trigram, and bitmap alike — and fdatasync each
+exactly once per window before the commit-intent marker is cleared
+(invariant I1), instead of syncing per (record, field). This removes the
+per-record index syncs (the dominant cost on indexed bulk update/delete),
+stops trigram per-record syncs in bulk insert, scopes btree syncing to
+actually-touched shards (never-touched shards are no longer O_CREAT'd as
+empty `.idx` files), and closes a durability gap: bitmap windows in bulk
+insert previously cleared the marker with bitmap pages still only in page
+cache. The K-phase keyfile barrier is now one whole-mapping `MS_SYNC`
+per window instead of one blocking msync per 24-byte slot. KFM2 marker
+publication switched from link/unlink to fsync+rename+dir-fsync (same
+tri-state contract; safe because the marker gate replays any retained
+marker before a new window plans). `stats` / `stats-prom` gained
+per-phase durability counters (`commit.windows_total`,
+`commit.marker_publish_*`, `commit.segment_sync_us_total`,
+`commit.index_sync_*`, `commit.marker_clear_us_total`). Durability fixes:
+sequence allocation now persists temp+fdatasync+rename+dir-fsync and fails
+closed (`-1`) on write failure — previously a swallowed `fopen("w")`
+failure still returned the allocated value — and `sequence reset` takes
+the same flock as allocation (no longer racy) and reports failures instead
+of silently succeeding. put-file (streaming path) is now atomic
+(temp+rename) with checked writes and fsync; both put-file variants and
+delete-file fsync the parent directory and report unconfirmed durability
+instead of silent success. `BULK_COMMIT_WINDOW` default raised 1024 → 4096
+(operator-tunable, `[16, 16384]` unchanged): with batched syncing, larger
+windows mainly amortize marker publication costs; shard wrlock hold per
+window grows proportionally. New regression tests: `test-commit-phase-metrics`,
+`test-bulk-idx-sync-batching`, `test-bulk-idx-types-batching`,
+`test-sequence-durability`, `test-file-ops-roundtrip`,
+`test-bulk-commit-window-default`.
+
 **Breaking: create-object no longer auto-indexes `bool`/`enum`
 fields.** Indexes are now exactly what the request declares — nothing
 else. Previously every `bool` / `enum(...)` field not present in

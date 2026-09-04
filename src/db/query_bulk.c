@@ -715,7 +715,8 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                     ta.old_key = staged_old;
                     ta.old_len = staged_old ? old_idx_lens[fi] : 0;
                     ta.hash = r->hash; ta.type = IT_TRIGRAM;
-                    ta.sync_after = 1;
+                    ta.sync_after = 0;  /* flush seam syncs once per touched
+                                           (field, idx shard) after apply */
                     int tracked = !have_new || (bw_track_buf(sw, key_buf) == 0);
                     if (!tracked || tg_track_op(sw, &ta) != 0) {
                         if (!tracked) free(key_buf);
@@ -884,7 +885,6 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
     if (sw->nidx == 0 || nactive == 0) return 0;
 
     int rc = 0;
-    int bt_field_touched[MAX_FIELDS] = {0};
 
     for (size_t i = 0; i < sw->tg_nops; i++) {
         update_idx_fn(&sw->tg_ops[i]);
@@ -896,7 +896,9 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
         if (delete_index_entry(sw->db_root, sw->object, sw->idx_fields[op->fi],
                                sw->sch->splits, op->key, op->klen, op->hash) != 0)
             rc = -1;
-        bt_field_touched[op->fi] = 1;
+        idx_touch_record(sw->idx_fields[op->fi],
+                         idx_shard_for_hash(op->hash, sw->sch->splits),
+                         IT_BTREE, op->hash);
     }
 
     for (int fi = 0; fi < sw->nidx; fi++) {
@@ -908,25 +910,31 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
         fa.new_entries = sw->idx_pairs[fi]; fa.new_count = count;
         idx_build_field_worker(&fa);
         if (fa.out_error) rc = -1;
-        bt_field_touched[fi] = 1;
+        for (size_t pi = 0; pi < count; pi++)
+            idx_touch_record(sw->idx_fields[fi],
+                             idx_shard_for_hash(sw->idx_pairs[fi][pi].hash,
+                                                sw->sch->splits),
+                             IT_BTREE, sw->idx_pairs[fi][pi].hash);
     }
 
     /* btree_bulk_merge/delete_index_entry only dirty mmap'd pages — they do
-       not fsync. Force every touched field's shards durable now, before the
-       window's marker gets cleared and Kf is published, so a crash right
-       after "apply succeeded" can't leave on-disk B-tree state lagging
-       behind the now-durable Kf state. */
-    for (int fi = 0; fi < sw->nidx; fi++) {
-        if (!bt_field_touched[fi]) continue;
-        int idx_n = index_splits_for(sw->sch->splits);
-        for (int s = 0; s < idx_n; s++) {
-            char idx_path[PATH_MAX];
-            build_idx_path(idx_path, sizeof(idx_path), sw->db_root, sw->object,
-                           sw->idx_fields[fi], s);
-            if (btree_sync_path(idx_path) != 0) rc = -1;
-        }
-    }
-
+       not fsync. Durability for this window's btree/trigram/bitmap files is
+       now owned by the post-apply flush seam (unique (field, shard) files
+       synced exactly once, before the marker is cleared — invariant I1).
+       btree_bulk_merge's rename-published shards are already durable; their
+       recorded touch re-fdatasyncs an already-clean file, which is cheap
+       and keeps one uniform rule. Never-touched shards are never synced, so
+       bt_acquire(writer)'s O_CREAT can no longer materialize empty .idx
+       files (index.c warns about exactly this). */
+    /* Bitmap touches MUST be recorded here, not in prepare_window: the
+       coordinator installs the TLS touch collector only around apply_window,
+       so a prepare-time idx_touch_record is a silent no-op and the window
+       would clear its marker with dirty bitmap pages (finding-1 regression).
+       Entries are 1:1 with staged (field, kf shard) pairs. */
+    for (size_t i = 0; i < sw->bw_window.n_entries; i++)
+        idx_touch_record(sw->bw_window.entries[i].field,
+                         sw->bw_window.entries[i].kf_shard,
+                         IT_BITMAP, NULL);
     if (bitmap_prepare_window_apply(&sw->bw_window) != 0) rc = -1;
     return rc;
 }
@@ -2577,7 +2585,10 @@ typedef struct {
    — required whenever type==IT_BITMAP (index.c's update_idx_fn dispatches
    IT_BITMAP straight into bitmap_update using these raw). Callers either
    dispatch immediately via update_idx_fn() or batch several into a
-   parallel_for() array; either way out_error must be checked afterward. */
+   parallel_for() array; either way out_error must be checked afterward.
+   sync_after is 0: during a bulk window, update_idx_fn records an
+   idx_touch_record instead of syncing, and the window's flush seam does
+   one fdatasync per unique (field, idx shard) before marker clear. */
 static UpdateIdxArg make_index_diff_arg(const char *db_root, const char *object,
                                          const char *field, int splits,
                                          enum IndexType itype,
@@ -2593,7 +2604,12 @@ static UpdateIdxArg make_index_diff_arg(const char *db_root, const char *object,
     a.hash = hash; a.type = itype;
     a.kf_shard = kf_shard; a.kf_slot = kf_slot;
     a.bm_max_values = 0;  /* default cap — header wins on existing */
-    a.sync_after = 1;
+    /* Bulk windows record touched (field, shard) files instead of syncing
+       per mutation; bulk_apply_and_sync_indexes_locked flushes each unique
+       file once before the marker is cleared (invariant I1). All five call
+       sites are bulk apply_window callbacks (key-list delete, structured /
+       delimited / JSON update, criteria delete) — no single-record caller. */
+    a.sync_after = 0;
     return a;
 }
 

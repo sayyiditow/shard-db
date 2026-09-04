@@ -255,8 +255,10 @@ int cmd_sequence(const char *db_root, const char *object,
     }
 
     if (strcmp(action, "reset") == 0) {
-        FILE *f = fopen(seq_path, "w");
-        if (f) { fprintf(f, "0\n"); fclose(f); }
+        if (seq_state_reset(db_root, object, seq_name) != 0) {
+            OUT("{\"error\":\"sequence reset failed: %s\"}\n", strerror(errno));
+            return 1;
+        }
         OUT("{\"sequence\":\"%s\",\"value\":0}\n", seq_name);
         return 0;
     }
