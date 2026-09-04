@@ -37,15 +37,16 @@ static int test_enum_run(void) {
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"e\",\"object\":\"a\","
         "\"splits\":8,\"max_key\":16,"
-        "\"fields\":[\"color:enum(red,green,blue)\",\"name:varchar:32\"]}",
+        "\"fields\":[\"color:enum(red,green,blue)\",\"name:varchar:32\"],"
+        "\"indexes\":[\"color:bitmap\"]}",
         &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create with enum");
     free(resp); resp = NULL;
 
-    /* describe-object surfaces the enum type token + auto-bitmap. */
+    /* describe-object surfaces the enum type token + the declared bitmap. */
     tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"e\",\"object\":\"a\"}", &resp);
     ASSERT_CONTAINS(resp, "\"type\":\"enum\"",  "describe: type=enum");
-    ASSERT_CONTAINS(resp, "\"color:bitmap\"",   "describe: auto-bitmap on color");
+    ASSERT_CONTAINS(resp, "\"color:bitmap\"",   "describe: explicit bitmap on color");
     free(resp); resp = NULL;
 
     /* Empty value list → error. */

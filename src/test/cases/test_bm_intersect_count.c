@@ -4,7 +4,7 @@
  * for multi-field AND on bitmap-indexed fields. Exercises the
  * bm_popcount_intersect fast path added for all-bitmap eq/in COUNT.
  *
- * bool fields get auto-bitmap (even without :bitmap suffix), so the
+ * the tests declare `flag` bare, which promotes to bitmap, so the
  * intersect popcount fast path fires when both leaves are bitmap-
  * indexed and all ops are eq/in. */
 
@@ -54,7 +54,7 @@ static void bm_insert(TestClient *tc, const char *obj,
 
 static int test_bm_intersect_eq(void) {
     TestEnv env = {0};
-    /* bool flag gets auto-bitmap; region:bitmap is explicit.
+    /* bare bool `flag` promotes to bitmap; region:bitmap is explicit.
      * With both bitmap-indexed, the planner fires all_bitmap=1
      * and count eq+eq drops into bm_popcount_intersect. */
     TestClient *tc = cm_setup(&env, "bmix_eq",

@@ -63,7 +63,7 @@ await db.query({
     'active:bool',
     'created:datetime:auto_create'
   ],
-  indexes: ['email', 'age']
+  indexes: ['email', 'age', 'active']
 })
 ```
 

@@ -52,7 +52,8 @@ query({
     "object": "products",
     "splits": 16,
     "max_key": 128,
-    "fields": ["name:varchar:100", "price:numeric:10,2", "stock:int", "active:bool"]
+    "fields": ["name:varchar:100", "price:numeric:10,2", "stock:int", "active:bool"],
+    "indexes": ["stock", "active"]
 })
 
 # Insert

@@ -201,7 +201,7 @@ CLI shortcut (single-field — JSON form covers batch):
 | `numeric:P,S1 → numeric:P,S2` | Scale-up multiplies the stored `int64` by `10^(S2−S1)`; refused pre-flight if any value would overflow `int64`. Scale-down divides and **truncates toward zero** (matches Postgres). |
 | `float → double` | Always allowed; IEEE 754 widen, no validation needed. |
 | `enum(a,b,c) → enum(a,b,c,d,…)` (append) | Always allowed. Existing records keep their byte index; new value gets the next index. No rebuild needed; only `fields.conf` is updated. |
-| `enum(a,b,c) → enum(a,b,c,…257+ values)` (auto-widen 1B → 2B) | Allowed. Triggers a full record rebuild (zero-extends each record's byte index) and rewrites the bitmap with the wider encoding. |
+| `enum(a,b,c) → enum(a,b,c,…257+ values)` (auto-widen 1B → 2B) | Allowed. Triggers a full record rebuild (zero-extends each record's byte index) and, when the field has a bitmap index, rewrites it with the wider encoding. |
 | `enum(a,b,c) → enum(x,b,c)` (rename at position) | Requires `"allow_rename": true` in the request body. Existing records keep their byte index; the displayed value changes. Without the flag, refused. |
 | `enum(a,b,c) → enum(a,b)` (remove) | **Always refused.** Records reference values by position; removing would corrupt every record using the dropped value. |
 | `enum(a,b,c) → enum(c,a,b)` (reorder) | **Refused** (caught by the position-by-position diff — same shape as remove). |

@@ -25,7 +25,7 @@ startup before index work begins.
 shard-db ships three index types:
 
 - **B+ tree** (default for every typed field) — prefix-compressed leaves at `<object>/indexes/<field>/<NNN>.idx`. Each field's btree is split into `index_splits_for(splits)` shards — a non-linear fan-out curve (`8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`) that caps idx file count at high split values without sacrificing read parallelism at moderate splits. Reads fan out across all idx-shards in parallel via the unified worker pool; writes route by record hash to a single shard. Every search operator uses the btree when available (default fallthrough is a full-leaf scan with per-entry criterion check — still cheaper than scanning the data files since leaves are smaller than records).
-- **Bitmap** (auto-default for `bool` and `enum` fields since 2026.05.7; opt-in via `"field:bitmap"` or `"field:bitmap(N)"` for low-cardinality `varchar`) — one dense bit per slot, per-distinct-value, at `<object>/indexes/<field>/<NNN>.bm`. The bitmap shards 1:1 with data shards so bit `i` of shard `s` = "slot `i` in data shard `s` has this value". Default cap is 256 distinct values per (shard, field); override with `bitmap(N)` up to 65535. For `enum` fields the cap matches the field's declared domain (256 for 1-byte enums, 65535 for 2-byte enums declared with >256 values). The planner routes `eq` / `in` / `neq` / `not_in` through a popcount-style fast path and every other op through a per-shard dict-scan (≤ cap dict entries iterated, decoded, matched, then the matching value-bitmaps walked). Either way, queries route through the index file — never the data file.
+- **Bitmap** (opt-in via `"field:bitmap"` or `"field:bitmap(N)"` — for `bool`, `enum`, and low-cardinality `varchar`; a declared *bare* `bool`/`enum` name also promotes to bitmap) — one dense bit per slot, per-distinct-value, at `<object>/indexes/<field>/<NNN>.bm`. The bitmap shards 1:1 with data shards so bit `i` of shard `s` = "slot `i` in data shard `s` has this value". Default cap is 256 distinct values per (shard, field); override with `bitmap(N)` up to 65535. For `enum` fields the cap matches the field's declared domain (256 for 1-byte enums, 65535 for 2-byte enums declared with >256 values). The planner routes `eq` / `in` / `neq` / `not_in` through a popcount-style fast path and every other op through a per-shard dict-scan (≤ cap dict entries iterated, decoded, matched, then the matching value-bitmaps walked). Either way, queries route through the index file — never the data file.
 - **Trigram** (opt-in via `"field:trigram"` on `varchar`; new in 2026.05.7) — substring index for `contains` and `i_contains` queries. Each record contributes one entry per distinct 3-byte lowercased trigram extracted from the field's value into `<object>/indexes/<field>/<NNN>.tg` (uses the same BTRH btree format as `.idx` so existing infrastructure handles caching, range scans, and reads). Queries extract trigrams from the pattern, look up posting lists per trigram, intersect rarest-first, then per-record verify the substring (kills false positives from order-insensitive trigram matching). When a field has both btree AND trigram, the planner auto-picks btree-leaf scan for short patterns (`< 6` chars — verify cost dominates trigram for non-selective common substrings) and trigram for longer patterns. Build uses external-merge sort: bounded per-worker memory + tight prefix-compressed leaves at any scale (25M, 100M, 1B records).
 
 ## When to add an index
@@ -35,7 +35,7 @@ Add an index when:
 - The object is big enough that a full scan is noticeably slow (tens of thousands of records and up), or
 - You'll use the field as a `join` `remote` key.
 
-For `bool` and `enum` fields you usually don't need to make a decision — the auto-default puts them on bitmap. Bitmap pays off most when:
+For `bool` and `enum` fields, declare the bitmap explicitly — `field:bitmap` or the bare field name (which promotes to bitmap). Bitmap pays off most when:
 - Your queries `count` / `aggregate` on the field (popcount is O(slots / 64), no btree leaf walk per match).
 - Selectivity is broad (10%+ of records match). At those selectivities a btree leaf walk emits one cb per match; bitmap returns in popcount time.
 
@@ -53,7 +53,7 @@ Files created: `<obj>/indexes/customer/000.idx` … `<NNN>.idx` (`index_splits_f
 
 ### Explicit type
 
-`add-index` / `create-object` accept an explicit type suffix when you want bitmap or trigram on a field that wouldn't auto-default to that type:
+`add-index` / `create-object` accept an explicit type suffix when you want bitmap or trigram on a field whose bare name wouldn't already promote to bitmap (only `bool`/`enum` do):
 
 ```json
 {"mode":"add-index","dir":"acme","object":"users","field":"status:bitmap"}
@@ -63,13 +63,13 @@ Files created: `<obj>/indexes/customer/000.idx` … `<NNN>.idx` (`index_splits_f
 
 | spec | files created (per data shard) | use case |
 |---|---|---|
-| `field` (no suffix) | `<obj>/indexes/<field>/<NNN>.idx` (btree fan-out curve) | default — every field type |
-| `field:btree` | same as above (explicit) | force btree on a bool/enum (suppresses auto-bitmap) |
+| `field` (no suffix) | `<obj>/indexes/<field>/<NNN>.idx` (btree fan-out curve); `.bm` shards (1:1) instead when a bare bool/enum name promotes | default — every field type |
+| `field:btree` | same as above (explicit) | force btree on a bool/enum (whose bare name would promote to bitmap) |
 | `field:bitmap` | `<obj>/indexes/<field>/<NNN>.bm` (1:1 with data shards) | low-cardinality varchar; `eq` / `in` / `neq` hot paths |
 | `field:bitmap(N)` | same, with cap `N ∈ [2, 65535]` | override the default 256-value cap |
 | `field:trigram` | `<obj>/indexes/<field>/<NNN>.tg` (btree fan-out curve, BTRH format) | substring search on varchar — `contains` / `i_contains` |
 
-Auto-defaults: `bool` and `enum` fields → bitmap. Everything else → btree. To override an auto-default, declare the type explicitly (e.g., `active:btree` keeps a bool on btree). Multiple types on the same field are allowed and useful — e.g., `email` declared as both `email` (btree, for eq lookups) AND `email:trigram` (for substring search) — the planner picks per-query.
+Only user-declared indexes are created — there is no auto-default. Declared indexes are btree unless typed; a bare `bool`/`enum` name promotes to bitmap (so `active` on a bool field gives you a bitmap, and `active:btree` keeps it on btree). Multiple types on the same field are allowed and useful — e.g., `email` declared as both `email` (btree, for eq lookups) AND `email:trigram` (for substring search) — the planner picks per-query.
 
 Trigram cost notes:
 - Disk: ~5× the btree's footprint on the same field (one entry per (record × distinct trigram in value) vs btree's one per record), but still bounded — see `estimate-index` to project before committing.

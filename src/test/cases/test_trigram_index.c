@@ -561,17 +561,15 @@ static int run_singular_add_index_assertions(TestEnv *env) {
                     "singular bitmap: 000.bm materialised on disk");
     }
 
-    /* === Singular path: bare bool. create-object auto-defaults bool to
-       bitmap (query.c:15677), so the .bm is already on disk and the
-       singular add-index correctly returns "exists" via the typed
-       skip-probe — proving the typed dispatch fires (pre-fix it would
-       have hit the btree branch and silently no-op'd). Force-rebuild
-       confirms the auto-promote rule runs on the same path. */
+    /* === Singular path: bare bool. Nothing pre-exists (no auto-default),
+       so the bare add-index promotes via idx_should_auto_bitmap and
+       builds fresh. Force-rebuild confirms the promote rule runs on the
+       same path. */
     tc_request(tc,
         "{\"mode\":\"add-index\",\"dir\":\"s\",\"object\":\"items\","
         "\"field\":\"active\"}", &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"exists\"",
-                    "singular bare bool: typed skip-probe sees existing .bm");
+    ASSERT_CONTAINS(resp, "\"status\":\"indexed\"",
+                    "singular bare bool: promotes + builds (no pre-existing .bm)");
     free(resp); resp = NULL;
     tc_request(tc,
         "{\"mode\":\"add-index\",\"dir\":\"s\",\"object\":\"items\","

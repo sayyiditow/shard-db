@@ -6,6 +6,26 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**Breaking: create-object no longer auto-indexes `bool`/`enum`
+fields.** Indexes are now exactly what the request declares — nothing
+else. Previously every `bool` / `enum(...)` field not present in
+`indexes` got an implicit `IT_BITMAP`: a `name:bitmap` line persisted
+into `indexes/index.conf` and `.bm` shard files materialized at create
+time. New objects with undeclared bool/enum fields now get no index for
+them (`describe-object` reports `"indexes":[]`, no
+`indexes/index.conf` on disk). To keep a bitmap, declare it:
+`add-index` with the bare field name (promotes via
+`idx_should_auto_bitmap`) or `"field:bitmap"` / `"field:bitmap(N)"` in
+create-object / add-index. Existing objects are unaffected — their
+persisted `index.conf` lines are declarations and keep working
+everywhere (CRUD maintenance, reindex, planner). Also in this change:
+create-object now accepts explicit `name:bitmap` on `enum` fields
+(aligned with `cmd_add_index`, which never restricted the type); 2-byte
+enums get the full-domain 65535 cap by default, `bitmap(N)` overrides.
+`bench-invoice` / `bench-parallel` disk/write numbers shift slightly
+(two never-queried implicit bitmaps per object gone); no bench query
+used them.
+
 **Fixed: bitmap-primary streaming finds no longer flush the batch fetch
 inline under held kf+bitmap handles.** The legacy executor's IT_BITMAP
 branches hold the walked shard's kf reader + bitmap handle across the
