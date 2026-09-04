@@ -337,22 +337,24 @@ static int test_bitmap_index_run(void) {
         "\"indexes\":["
           "\"name\","                /* legacy bare → btree */
           "\"score\","
-          "\"type:bitmap\","         /* opt-in varchar enum */
+          "\"type:bitmap\","         /* opt-in varchar bitmap */
           "\"text:trigram\","
-          "\"name+score\"]}",         /* composite stays btree */
+          "\"name+score\","          /* composite stays btree */
+          "\"dead:bitmap\","         /* bool bitmaps are opt-in */
+          "\"deleted:bitmap\"]}",
         &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create object 'a'");
     free(resp); resp = NULL;
 
     /* describe-object surfaces the canonicalised :type strings + the
-       auto-defaulted bitmap entries for both bool fields. */
+       explicitly declared bitmap entries for both bool fields. */
     tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"t\",\"object\":\"a\"}", &resp);
     ASSERT_CONTAINS(resp, "\"name\"",          "describe: btree name");
     ASSERT_CONTAINS(resp, "\"type:bitmap\"",   "describe: explicit varchar bitmap");
     ASSERT_CONTAINS(resp, "\"text:trigram\"",  "describe: explicit varchar trigram");
     ASSERT_CONTAINS(resp, "\"name+score\"",    "describe: composite btree");
-    ASSERT_CONTAINS(resp, "\"dead:bitmap\"",   "describe: auto-bitmap on dead");
-    ASSERT_CONTAINS(resp, "\"deleted:bitmap\"","describe: auto-bitmap on deleted");
+    ASSERT_CONTAINS(resp, "\"dead:bitmap\"",   "describe: explicit bitmap on dead");
+    ASSERT_CONTAINS(resp, "\"deleted:bitmap\"","describe: explicit bitmap on deleted");
     free(resp); resp = NULL;
 
     /* === Error: bitmap on non-bool/non-varchar === */
@@ -382,7 +384,7 @@ static int test_bitmap_index_run(void) {
     ASSERT_CONTAINS(resp, "composite indexes are btree-only", "error explains restriction");
     free(resp); resp = NULL;
 
-    /* === Auto-default: bool fields with NO indexes declared still get bitmap === */
+    /* === No auto-default: undeclared bool fields get NO index at all === */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"bools_only\","
         "\"splits\":8,\"max_key\":16,"
@@ -391,25 +393,79 @@ static int test_bitmap_index_run(void) {
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"t\",\"object\":\"bools_only\"}", &resp);
-    ASSERT_CONTAINS(resp, "\"a:bitmap\"", "implicit bitmap on a");
-    ASSERT_CONTAINS(resp, "\"b:bitmap\"", "implicit bitmap on b");
-    /* `c:int` must NOT be indexed since user didn't ask for it. `c`
-       legitimately appears in the fields section, so scope the check
-       to the substring after `"indexes":[`. */
-    {
-        const char *idx_section = SAFE_STRSTR(resp, "\"indexes\":[");
-        ASSERT_NOT_NULL((void *)idx_section, "indexes section present");
-        if (idx_section) {
-            const char *idx_end = strchr(idx_section, ']');
-            char idx_buf[1024] = {0};
-            if (idx_end && (size_t)(idx_end - idx_section) < sizeof(idx_buf)) {
-                memcpy(idx_buf, idx_section, idx_end - idx_section);
-            }
-            ASSERT_TRUE(strstr(idx_buf, "\"c\"") == NULL && strstr(idx_buf, "\"c:") == NULL,
-                        "c (int) NOT in indexes list");
-        }
-    }
+    ASSERT_CONTAINS(resp, "\"indexes\":[]", "no auto-default: zero indexes for undeclared bools");
     free(resp); resp = NULL;
+    {
+        char icp[1024];
+        snprintf(icp, sizeof(icp), "%s/t/bools_only/indexes/index.conf", env.db_root);
+        struct stat st;
+        ASSERT_TRUE(stat(icp, &st) != 0 && errno == ENOENT,
+                    "no index.conf without declared indexes");
+        char fdp[1024];
+        snprintf(fdp, sizeof(fdp), "%s/t/bools_only/indexes/a", env.db_root);
+        struct stat st2;
+        ASSERT_TRUE(stat(fdp, &st2) != 0 && errno == ENOENT,
+                    "no .bm shard dir for undeclared bool field");
+    }
+
+    /* Declared-after-the-fact still works: bare add-index promotes bool. */
+    tc_request(tc,
+        "{\"mode\":\"add-index\",\"dir\":\"t\",\"object\":\"bools_only\","
+        "\"field\":\"a\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"indexed\"", "bare add-index promotes bool to bitmap");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"t\",\"object\":\"bools_only\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"a:bitmap\"", "declared bare bool → bitmap");
+    ASSERT_NOT_CONTAINS(resp, "\"b:bitmap\"", "undeclared b stays unindexed");
+    ASSERT_NOT_CONTAINS(resp, "\"c:bitmap\"", "int c stays unindexed");
+    free(resp); resp = NULL;
+
+    /* === No auto-default: undeclared enum fields get NO index either,
+       and a declared explicit bitmap on a 2-byte enum takes the full
+       65535 domain cap at create-object (matching cmd_add_index) without
+       the operator spelling bitmap(65535). === */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"enums_only\","
+        "\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"color:enum(red,green,blue)\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "enums_only created");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"t\",\"object\":\"enums_only\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"indexes\":[]", "no auto-default: zero indexes for undeclared enums");
+    free(resp); resp = NULL;
+    {
+        char fdp[1024];
+        snprintf(fdp, sizeof(fdp), "%s/t/enums_only/indexes/color", env.db_root);
+        struct stat st;
+        ASSERT_TRUE(stat(fdp, &st) != 0 && errno == ENOENT,
+                    "no .bm shard dir for undeclared enum field");
+    }
+
+    /* Explicit name:bitmap on an enum is accepted at create-object
+       (matching cmd_add_index) and keeps the default cap. A 2-byte
+       (257+ value) enum cannot be declared on any wire path — create
+       caps field specs at 511 bytes and add/edit-field caps lines at
+       256 — so the enum_width==2 → 65535 default cap in the create
+       validator is defensive consistency with the shared rule, not
+       wire-reachable. */
+    {
+        char req[512];
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"enum_bm\","
+            "\"splits\":8,\"max_key\":16,"
+            "\"fields\":[\"color:enum(red,green,blue)\"],"
+            "\"indexes\":[\"color:bitmap\"]}");
+        tc_request(tc, req, &resp);
+        ASSERT_CONTAINS(resp, "\"status\":\"created\"",
+                        "explicit enum bitmap accepted at create-object");
+        free(resp); resp = NULL;
+        tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"t\",\"object\":\"enum_bm\"}", &resp);
+        ASSERT_CONTAINS(resp, "\"color:bitmap\"",
+                        "enum bitmap line persisted");
+        ASSERT_NOT_CONTAINS(resp, "\"color:bitmap(",
+                        "1-byte enum keeps the default cap (no (N) suffix)");
+        free(resp); resp = NULL;
+    }
 
     /* === Legacy / back-compat: bare names still mean btree, no implicit type. === */
     tc_request(tc,
@@ -428,7 +484,7 @@ static int test_bitmap_index_run(void) {
     ASSERT_NOT_CONTAINS(resp, ":trigram", "no spurious trigram");
     free(resp); resp = NULL;
 
-    /* === Explicit :bitmap on bool overrides the auto-default contract
+    /* === Explicit :bitmap on bool is declared exactly once
            (no duplicate entry written). === */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"explicit_bool_bm\","
@@ -490,8 +546,8 @@ static int test_bitmap_index_run(void) {
         "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"e2e\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"flag:bool\",\"label:varchar:16\"],"
-        "\"indexes\":[\"label:bitmap\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create e2e (bool auto + label:bitmap)");
+        "\"indexes\":[\"flag:bitmap\",\"label:bitmap\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create e2e (flag:bitmap + label:bitmap)");
     free(resp); resp = NULL;
 
     /* Insert 6 records with varied (flag, label) so each bool value gets
@@ -602,7 +658,8 @@ static int test_bitmap_index_run(void) {
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"reix\","
         "\"splits\":8,\"max_key\":16,"
-        "\"fields\":[\"flag:bool\",\"label:varchar:16\"]}", &resp);
+        "\"fields\":[\"flag:bool\",\"label:varchar:16\"],"
+        "\"indexes\":[\"flag:bitmap\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create reix");
     free(resp); resp = NULL;
 
@@ -761,7 +818,8 @@ static int test_bitmap_index_run(void) {
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"qry\","
         "\"splits\":8,\"max_key\":16,"
-        "\"fields\":[\"flag:bool\",\"name:varchar:8\"]}", &resp);
+        "\"fields\":[\"flag:bool\",\"name:varchar:8\"],"
+        "\"indexes\":[\"flag:bitmap\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create qry");
     free(resp); resp = NULL;
 
@@ -919,8 +977,9 @@ static int test_bitmap_index_run(void) {
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"t\",\"object\":\"bulk\","
         "\"splits\":8,\"max_key\":16,"
-        "\"fields\":[\"flag:bool\"]}", &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create bulk (auto-bitmap on flag)");
+        "\"fields\":[\"flag:bool\"],"
+        "\"indexes\":[\"flag:bitmap\"]}", &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create bulk (flag:bitmap declared)");
     free(resp); resp = NULL;
 
     tc_request(tc,
@@ -1383,7 +1442,7 @@ static int test_bitmap_index_run(void) {
             tc_request(tc2, "{\"mode\":\"describe-object\",\"dir\":\"t\",\"object\":\"a\"}", &resp);
             ASSERT_CONTAINS(resp, "\"type:bitmap\"",   "post-restart: bitmap preserved");
             ASSERT_CONTAINS(resp, "\"text:trigram\"",  "post-restart: trigram preserved");
-            ASSERT_CONTAINS(resp, "\"dead:bitmap\"",   "post-restart: auto-bitmap preserved");
+            ASSERT_CONTAINS(resp, "\"dead:bitmap\"",   "post-restart: explicit bool bitmap preserved");
             free(resp); resp = NULL;
             tc_close(tc2);
         }

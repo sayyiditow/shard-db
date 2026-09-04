@@ -978,11 +978,13 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     /* Parse + validate `indexes` into an in-memory list of (name, type) so
        we can:
          1. Reject unknown types / type-field mismatches upfront.
-         2. Auto-default `IT_BITMAP` for `bool` fields not explicitly indexed.
-         3. Write `<obj>/indexes/index.conf` from the canonicalised list
+         2. Write `<obj>/indexes/index.conf` from the canonicalised list
             rather than re-parsing the JSON.
 
        Line format on disk is `name` (legacy → IT_BTREE) or `name:type`.
+       Only user-declared indexes are created — there is no auto-default.
+       (Bare `bool`/`enum` names still promote to bitmap via
+       idx_should_auto_bitmap: a declared index with an automatic type.)
        Composite indexes (`f1+f2`) are btree-only in 2026.05.7. */
     struct ParsedIdx {
         char name[256];
@@ -992,27 +994,43 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     struct ParsedIdx pidx[MAX_FIELDS];
     int npidx = 0;
 
-    /* Helper closures aren't a thing in C — declare a small lambda-ish via
-       a macro so the field-type lookup is a single readable expression in
-       the hot loop below. Returns 1 if `fname` matches a field whose typed
-       name (the substring after the first `:`) equals `expected_tname`. */
-    #define FIELD_TYPE_IS(fname, fnlen, expected_tname)                       \
+    /* Type token (the substring after the first ':') of the first field
+       named fname, or NULL. First-name-match-wins: a duplicate field
+       name resolves to its first declaration. */
+    #define FIELD_TYPE_TOKEN(fname, fnlen)                                    \
         ({                                                                    \
-            int _matched = 0;                                                 \
+            const char *_tok = NULL;                                          \
             for (int _i = 0; _i < nfields; _i++) {                            \
                 const char *_c = strchr(field_specs[_i], ':');                \
                 if (!_c) continue;                                            \
                 int _nlen = (int)(_c - field_specs[_i]);                      \
                 if (_nlen != (fnlen)) continue;                               \
                 if (memcmp(field_specs[_i], (fname), _nlen) != 0) continue;   \
-                /* Found field; check its type name */                        \
-                size_t _elen = strlen(expected_tname);                        \
-                if (strncmp(_c + 1, (expected_tname), _elen) == 0 &&          \
-                    (_c[1 + _elen] == '\0' || _c[1 + _elen] == ':')) {        \
-                    _matched = 1;                                             \
-                }                                                             \
+                _tok = _c + 1;                                                \
                 break;                                                        \
             }                                                                 \
+            _tok;                                                             \
+        })
+    /* The delimiter tail check is what keeps "timestamp" from matching
+       "time"; an enum spec continues with '(' after the token, so it can
+       never pass this check — FIELD_TYPE_PREFIX_IS covers it. */
+    #define FIELD_TYPE_IS(fname, fnlen, expected_tname)                       \
+        ({                                                                    \
+            const char *_tok = FIELD_TYPE_TOKEN((fname), (fnlen));            \
+            int _matched = 0;                                                 \
+            if (_tok) {                                                       \
+                size_t _elen = strlen(expected_tname);                        \
+                if (strncmp(_tok, (expected_tname), _elen) == 0 &&            \
+                    (_tok[_elen] == '\0' || _tok[_elen] == ':'))              \
+                    _matched = 1;                                             \
+            }                                                                 \
+            _matched;                                                         \
+        })
+    #define FIELD_TYPE_PREFIX_IS(fname, fnlen, prefix)                        \
+        ({                                                                    \
+            const char *_tok = FIELD_TYPE_TOKEN((fname), (fnlen));            \
+            int _matched = _tok != NULL &&                                    \
+                           strncmp(_tok, (prefix), strlen(prefix)) == 0;      \
             _matched;                                                         \
         })
 
@@ -1089,8 +1107,9 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                         if (!ps.is_composite) {
                             if (ps.type == IT_BITMAP) {
                                 if (!FIELD_TYPE_IS(tok, tok_len, "bool") &&
-                                    !FIELD_TYPE_IS(tok, tok_len, "varchar")) {
-                                    OUT("{\"error\":\"bitmap index requires bool or varchar field (got \\\"%s\\\")\"}\n", tok);
+                                    !FIELD_TYPE_IS(tok, tok_len, "varchar") &&
+                                    !FIELD_TYPE_PREFIX_IS(tok, tok_len, "enum(")) {
+                                    OUT("{\"error\":\"bitmap index requires bool, varchar or enum field (got \\\"%s\\\")\"}\n", tok);
                                     return 1;
                                 }
                             } else if (ps.type == IT_TRIGRAM) {
@@ -1121,10 +1140,13 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                             parse_field_type(c + 1, &tf);
                             if (idx_should_auto_bitmap(ps.had_explicit_type, tf.type)) {
                                 ps.type = IT_BITMAP;
-                                if (tf.type == FT_ENUM && tf.enum_width == 2 &&
-                                    ps.max_values == 0) {
-                                    ps.max_values = 65535;
-                                }
+                            }
+                            /* 2-byte enums need the full-domain cap whether the
+                               bitmap came from a bare promote or an explicit
+                               name:bitmap (explicit bitmap(N) overrides). */
+                            if (ps.type == IT_BITMAP && tf.type == FT_ENUM &&
+                                tf.enum_width == 2 && ps.max_values == 0) {
+                                ps.max_values = 65535;
                             }
                             free_enum_values(&tf);
                             break;
@@ -1141,48 +1163,9 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         }
     }
 
-    /* Auto-default: every `bool` or `enum(...)` field that isn't already
-       declared as an index gets IT_BITMAP. Single-field only; bool / enum
-       can't legally be in a composite anyway since we reject non-btree
-       composites above. For enum the bitmap cap matches the byte-width
-       ceiling: 1-byte (≤256 values) keeps the default (256), 2-byte
-       (257-65535 values) needs cap=65535 so the dict can grow to the
-       full enum domain. */
-    for (int i = 0; i < nfields; i++) {
-        const char *c = strchr(field_specs[i], ':');
-        if (!c) continue;
-        int fnlen = (int)(c - field_specs[i]);
-
-        int is_bool = (strncmp(c + 1, "bool", 4) == 0 &&
-                       (c[5] == '\0' || c[5] == ':'));
-        int is_enum = (strncmp(c + 1, "enum(", 5) == 0);
-        if (!is_bool && !is_enum) continue;
-
-        int already = 0;
-        for (int j = 0; j < npidx; j++) {
-            if ((int)strlen(pidx[j].name) == fnlen &&
-                memcmp(pidx[j].name, field_specs[i], fnlen) == 0) {
-                already = 1; break;
-            }
-        }
-        if (already) continue;
-        if (npidx >= MAX_FIELDS) break;  /* full — drop the implicit; user can add later */
-        memcpy(pidx[npidx].name, field_specs[i], fnlen);
-        pidx[npidx].name[fnlen] = '\0';
-        pidx[npidx].type = IT_BITMAP;
-        pidx[npidx].max_values = 0;  /* bool/1B-enum: default 256 */
-        if (is_enum) {
-            /* Parse the enum spec once to learn enum_width. */
-            TypedField tf = {0};
-            parse_field_type(c + 1, &tf);
-            if (tf.type == FT_ENUM && tf.enum_width == 2) {
-                pidx[npidx].max_values = 65535;
-            }
-            free_enum_values(&tf);
-        }
-        npidx++;
-    }
     #undef FIELD_TYPE_IS
+    #undef FIELD_TYPE_PREFIX_IS
+    #undef FIELD_TYPE_TOKEN
 
     /* All validation passed — invalidate caches (in case object is being recreated) */
     invalidate_idx_cache(db_root, object);
@@ -1327,8 +1310,8 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         slotcask_close(&sdb);
     }
 
-    /* Write index.conf from the parsed list — both explicit indexes and any
-       auto-defaulted bitmap entries on bool fields. Line format is `name`
+    /* Write index.conf from the parsed list — exactly the user-declared
+       indexes, nothing else. Line format is `name`
        for btree (back-compat with pre-2026.05.7 readers), `name:type` for
        trigram, or `name:bitmap[(N)]` where the (N) is only emitted when a
        non-default cap was declared. */

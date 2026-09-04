@@ -1,7 +1,7 @@
 /* src/bench/bench_bitmap_vs_btree.c — head-to-head latency comparison.
  *
  * Two objects with the same schema (`flag:bool`). One declared
- * `flag:bitmap` (auto-default behaviour, made explicit for clarity),
+ * `flag:bitmap` (explicit; a bare `flag` would promote to the same bitmap),
  * the other `flag:btree`. Bulk-insert N identical records into each,
  * then run count + find queries `flag eq false` / `flag eq true` on
  * both, sweeping `limit ∈ {1000, 100000, 1000000}` so the crossover

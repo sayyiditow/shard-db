@@ -24,8 +24,8 @@ Suffix the field name to pick a non-default index type:
 
 | spec | type | files written | use for |
 |---|---|---|---|
-| `field` | btree (or bitmap if bool/enum auto-default) | `<field>/<NNN>.idx` | default — every field type |
-| `field:btree` | btree (explicit) | same | force btree on bool/enum (suppresses auto-bitmap) |
+| `field` | btree (bitmap for a declared bare bool/enum name — promote rule) | `<field>/<NNN>.idx`; `<field>/<NNN>.bm` shards when a bare bool/enum name promotes | default — every field type |
+| `field:btree` | btree (explicit) | same | force btree on bool/enum (bare name would promote to bitmap) |
 | `field:bitmap` | bitmap, cap=256 | `<field>/<NNN>.bm` (1:1 with data shards) | low-cardinality varchar, fast eq/in/neq |
 | `field:bitmap(N)` | bitmap, cap=`N` | same | override default cap (`N ∈ [2, 65535]`) |
 | `field:trigram` | trigram | `<field>/<NNN>.tg` (btree fan-out curve) | varchar substring search (`contains` / `i_contains`) |

@@ -31,7 +31,7 @@ An **object** is shard-db's equivalent of a table: a typed schema (from `fields.
     "active:bool",
     "created:datetime:auto_create"
   ],
-  "indexes": ["email", "age"]
+  "indexes": ["email", "age", "active"]
 }'
 ```
 
@@ -44,7 +44,7 @@ Returns:
 - `streams: 8` → derived from `nproc` (≤ 8 → nproc; ≤ 16 → 8; else 16). Inserts hash to one stream and append to its active segment file — parallel writers contend per stream, not per shard.
 - `max_key: 128` → keys up to 128 bytes. Stored inline with the value record in the segment file. UUIDs fit in 36 bytes.
 - `storage_version: 2` → slotcask engine version slot, kept in the response for forward compatibility. The slotcask engine is the only supported layout as of 2026.05.5; legacy v1 (probe-into-slot) was removed.
-- `indexes: ["email","age"]` → two B+ tree indexes built on first insert. Each indexed field is split into `index_splits_for(splits)` files under `data/indexes/<field>/` — for `splits=16` that's 4 idx-shard files per field.
+- `indexes: ["email","age","active"]` → three indexes built on first insert: `email` and `age` as B+ trees (4 idx-shard files each at `splits=16`); `active` declared bare on a `bool` field promotes to a bitmap index (16 `.bm` shard files, 1:1 with data shards).
 - `created:datetime:auto_create` → server fills in the current datetime on every INSERT.
 
 See [Concepts → Storage model](../concepts/storage-model.md) for what's actually on disk.

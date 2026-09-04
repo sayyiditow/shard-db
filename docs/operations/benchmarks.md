@@ -55,7 +55,7 @@ Shard load distribution (128 splits): avg 0.298 (kf), 78K records/shard, even di
 
 13 typed fields (varchar, int, long, short, double, bool, byte, date, datetime, numeric, currency). 12 indexes (`username`, `email`, `age`, `active`, `birthday`, `user_id`, `rank`, `score`, `level`, `created_at`, `balance`, `hourly_rate`); `bio` left non-indexed to exercise full-scan paths. C-bench measurements; cache is hot from the same-process bulk insert.
 
-`active` is a `bool` field — since 2026.05.7 it auto-defaults to a **bitmap** index (one dense bit per slot, per-distinct-value). All other typed fields fall back to btree. The planner routes eq/IN/NEQ/NOT_IN through bitmap popcount and every other op through a per-shard dict-scan (≤ 256 dict entries per shard) so any operator goes through the index — never the data file.
+`active` is a `bool` field declared **bare** in the bench's index list — the bare name promotes it to a **bitmap** index (one dense bit per slot, per-distinct-value). All other typed fields fall back to btree. The planner routes eq/IN/NEQ/NOT_IN through bitmap popcount and every other op through a per-shard dict-scan (≤ 256 dict entries per shard) so any operator goes through the index — never the data file.
 
 **Insert** (1M records, 1 conn, JSON, 12 indexes built upfront): **0.24 M/sec** (4.12 s).
 

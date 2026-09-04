@@ -583,8 +583,8 @@ static int bench_queries_run(void) {
     BR("email in 2-set          (varchar idx)", "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"email\",\"op\":\"in\",\"value\":\"alice0@gmail.com,bob1@yahoo.com\"}]}");
     bench_table_section_end();
 
-    /* ---------- COUNT — enum field (auto-bitmap, 5 values) ---------- */
-    bench_table_section_begin("COUNT — enum (auto-bitmap on category, 5 values)");
+    /* ---------- COUNT — enum field (bare-declared, promotes to bitmap, 5 values) ---------- */
+    bench_table_section_begin("COUNT — enum (bare-declared category promotes to bitmap, 5 values)");
     BR("category=electronics                   (eq)",      "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"category\",\"op\":\"eq\",\"value\":\"electronics\"}]}");
     BR("category!=electronics                  (neq)",     "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"category\",\"op\":\"neq\",\"value\":\"electronics\"}]}");
     BR("category in {electronics,books}        (in 2)",    "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"users\",\"criteria\":[{\"field\":\"category\",\"op\":\"in\",\"value\":\"electronics,books\"}]}");
