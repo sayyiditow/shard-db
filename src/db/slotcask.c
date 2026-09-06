@@ -38,6 +38,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include "io_direct.h"
+#include "trigram.h"       /* tg_build_path — request commit-flush path builder */
+#include "bitmap.h"        /* bm_open/bm_sync/bm_close — request bitmap flush */
 #include "seg_scan_varlen.h"
 
 /* TEST_BUILD-only window instrumentation (shard_test_ctl.h); inert unless
@@ -853,8 +855,48 @@ int kfcache_try_acquire_rd(SlotcaskKfHandle *h, const char *path,
    shard_db_internal.h. */
 RecoveryIndexDiffFn g_recovery_index_diff_fn = NULL;
 
-static void kf_marker_dir_path(char *buf, size_t cap, const char *data_dir) {
-    snprintf(buf, cap, "%s/data/kf", data_dir);
+/* ── Per-kf-shard writer admission gates (request-level batching) ──
+   The deferred request's coordinator holds every touched shard's gate for
+   the whole request; ordinary mutating writers lock the gate for their
+   target shard around their mutation; readers never take it. Gates exist
+   from the moment slotcask_open installs them, so no runtime writer can
+   touch an uninitialised one. */
+static int writer_gates_init(SlotcaskDb *db) {
+    db->writer_gates = calloc((size_t)db->num_shards,
+                              sizeof(*db->writer_gates));
+    if (!db->writer_gates) return -1;
+    for (int s = 0; s < db->num_shards; s++) {
+        int rc = pthread_mutex_init(&db->writer_gates[s], NULL);
+        if (rc != 0) {
+            errno = rc;
+            while (db->writer_gates_inited > 0) {
+                db->writer_gates_inited--;
+                pthread_mutex_destroy(
+                    &db->writer_gates[db->writer_gates_inited]);
+            }
+            free(db->writer_gates);
+            db->writer_gates = NULL;
+            return -1;
+        }
+        db->writer_gates_inited++;
+    }
+    return 0;
+}
+
+static void writer_gates_destroy(SlotcaskDb *db) {
+    while (db->writer_gates_inited > 0) {
+        db->writer_gates_inited--;
+        pthread_mutex_destroy(&db->writer_gates[db->writer_gates_inited]);
+    }
+    free(db->writer_gates);
+    db->writer_gates = NULL;
+}
+
+static void writer_gate_lock(SlotcaskDb *db, int kf_shard) {
+    pthread_mutex_lock(&db->writer_gates[kf_shard]);
+}
+static void writer_gate_unlock(SlotcaskDb *db, int kf_shard) {
+    pthread_mutex_unlock(&db->writer_gates[kf_shard]);
 }
 
 static int fsync_dir(const char *dir_path) {
@@ -888,52 +930,56 @@ static int marker_make_unique_paths(const char *kf_dir, const char *final_name,
     return 0;
 }
 
-/* Tri-state contract:
- *   0  = marker published (renamed into place) and its publication durable
- *   1  = marker IS published but publication durability is unconfirmed
- *        (post-rename fsync_dir failure) — caller MUST treat this as a
- *        post-M failure: forward replay, else EINPROGRESS
- *   -1 = marker was never published — safe plain pre-M failure
- * rename (not link) is safe here: kf_shard_marker_gate replays and clears
- * any retained marker before a new window plans, so a pre-existing final
- * name can never belong to another window's live intent. */
-static int marker_publish_atomic(const char *kf_dir, const char *final_name,
-                                 const void *bytes, size_t len) {
+/* 0 after file fsync + atomic no-replace publication; 1 means the final
+   path exists but temp cleanup was incomplete; -1 means no final path was
+   installed. link() prevents even a nonce collision from overwriting a
+   retained marker. Returns the exact installed path via out_path. */
+static int marker_publish_file_atomic(const char *kf_dir,
+                                      const char *final_name,
+                                      const void *bytes, size_t len,
+                                      char out_path[PATH_MAX]) {
     char tmp_path[PATH_MAX], final_path[PATH_MAX];
-    const char *p = bytes;
+    const uint8_t *p = bytes;
     size_t left = len;
     int fd = -1;
-
     if (marker_make_unique_paths(kf_dir, final_name, tmp_path,
                                  sizeof(tmp_path), final_path,
                                  sizeof(final_path)) != 0)
         return -1;
     fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) return -1;
-    while (left > 0) {
-        ssize_t n = write(fd, p, left);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            goto fail_open;
-        }
-        p += n;
-        left -= (size_t)n;
+    while (left) {
+        ssize_t nw = write(fd, p, left);
+        if (nw < 0 && errno == EINTR) continue;
+        if (nw <= 0) goto fail;
+        p += (size_t)nw;
+        left -= (size_t)nw;
     }
-    if (fsync(fd) != 0) goto fail_open;
-    if (close(fd) != 0) { fd = -1; goto fail_open; }
+    if (fsync(fd) != 0) goto fail;
+    if (close(fd) != 0) { fd = -1; goto fail; }
     fd = -1;
-    if (rename(tmp_path, final_path) != 0) goto fail_open;
-
-    /* Past this point the final marker exists: every remaining failure is
-     * a post-M outcome and is reported as published-but-pending. */
-    if (fsync_dir(kf_dir) == 0)
-        return 0;
-    return 1;
-
-fail_open:
+    int on = snprintf(out_path, PATH_MAX, "%s", final_path);
+    if (on < 0 || on >= PATH_MAX) { errno = ENAMETOOLONG; goto fail; }
+    if (link(tmp_path, final_path) != 0) goto fail;
+    if (unlink(tmp_path) != 0) return 1;
+    return 0;
+fail:
     if (fd >= 0) close(fd);
     unlink(tmp_path);
     return -1;
+}
+
+/* Legacy tri-state: 0 durable, 1 published but dir durability unknown,
+   -1 definitely pre-publish. Used by the single-record/legacy coordinator,
+   which keeps its immediate per-window directory fsync. */
+static int marker_publish_and_sync_dir(const char *kf_dir,
+                                       const char *final_name,
+                                       const void *bytes, size_t len,
+                                       char out_path[PATH_MAX]) {
+    int rc = marker_publish_file_atomic(kf_dir, final_name, bytes, len,
+                                        out_path);
+    if (rc < 0) return -1;
+    return fsync_dir(kf_dir) == 0 ? 0 : 1;
 }
 
 /* ── KFM2 batch markers (per-Kf-window redo records) ──
@@ -946,7 +992,7 @@ fail_open:
  * other state. Serialized as header + entries, each entry followed by
  * key, old_value, new_value. */
 enum { KF_BATCH_MARKER_MAGIC = 0x4B464D32u };  /* "KFM2" */
-enum { KF_BATCH_MARKER_VERSION = 1 };
+enum { KF_BATCH_MARKER_VERSION = 2 };
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;             /* KF_BATCH_MARKER_MAGIC */
@@ -957,45 +1003,22 @@ typedef struct __attribute__((packed)) {
 
 _Static_assert(sizeof(BatchMarkerHeader) == 16, "fixed on-disk header");
 
-typedef struct __attribute__((packed)) {
-    KfMarkerSlot slot;          /* slot.checksum = 0 when written; patched
-                                   below to cover the whole entry */
-    uint8_t  hash[16];
-    uint16_t klen;
-    uint16_t old_vlen;
-    uint16_t new_vlen;
-} BatchMarkerEntry;
+/* Marker V2: 16 B header + count × 32 B KfMarkerSlot, exact-size
+ * validated, 1 ≤ count ≤ 16384 (window ceiling) → worst case 524,304 B.
+ * Replay re-derives key/old/new bytes from the segment records the slots
+ * name, so the on-disk marker carries no variable-length spans at all
+ * (V1's 54-byte entries + spans and their 64 MiB size ceiling are gone).
+ * The V1 disk typedef (BatchMarkerEntry) is deleted; its name survives
+ * only as a test-local V1 fixture in test_marker_v2.c. */
 
-_Static_assert(sizeof(BatchMarkerEntry) == 54, "fixed on-disk entry");
+/* In-memory planner entry — deliberately not the disk type. `hash` is
+ * transient index/K planning data never serialized in V2. */
+typedef struct ReqWindow ReqWindow;
 
-static int buf_append(uint8_t **buf, size_t *len, size_t *cap,
-                      const void *src, size_t n) {
-    if (*len + n > *cap) {
-        size_t ncap = *cap ? *cap : 256;
-        while (ncap < *len + n) ncap *= 2;
-        uint8_t *nb = realloc(*buf, ncap);
-        if (!nb) return -1;
-        *buf = nb;
-        *cap = ncap;
-    }
-    memcpy(*buf + *len, src, n);
-    *len += n;
-    return 0;
-}
-
-/* C (commit): unlink the window's marker and make the unlink durable.
- * Returns 0 ok, -1 on failure (safe degraded state — the retained marker
- * forward-replays idempotently on the next open). */
-static int kfm2_clear_batch_marker(const char *data_dir, int kf_shard_id,
-                                   uint32_t batch_id) {
-    char kf_dir[PATH_MAX], path[PATH_MAX];
-
-    snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
-    snprintf(path, sizeof(path), "%s/%03x_batch_%u_marker.dat",
-             kf_dir, (unsigned)kf_shard_id, batch_id);
-    if (unlink(path) != 0 && errno != ENOENT) return -1;
-    return fsync_dir(kf_dir);
-}
+typedef struct {
+    KfMarkerSlot slot;                 /* the only bytes serialized in V2 */
+    uint8_t      hash[16];             /* transient index/K planning data */
+} BulkPlanEntry;
 
 /* Full parse of a retained KFM2 batch marker for cross-process gate replay
  * (the process that published it died before clearing it, so there is no
@@ -1007,186 +1030,139 @@ static int kfm2_clear_batch_marker(const char *data_dir, int kf_shard_id,
  * itself (kf_marker_replay_entry_locked) re-derives OLD/NEW from the live
  * segment records named by entry->slot, so the spans exist to make the
  * on-disk marker self-checksummed, not as replay's data source.
- * Returns 0 (out_entries/out_count populated, caller frees out_entries),
- * 1 (file absent), -1 (short/corrupt/checksum-mismatched — fail closed). */
-static int kfm2_read_batch_marker(const char *path, BatchMarkerEntry **out_entries,
+ * The V2 layout is 16 B header + count × 32 B KfMarkerSlot, validated
+ * against the exact file size before any allocation. Returns 0
+ * (out_slots/out_count populated, caller frees out_slots), 1 (file
+ * absent), -1 (short/corrupt/checksum-mismatched/unsupported version —
+ * fail closed). V1 (span-bearing entries) predates this binary and is
+ * refused with ENOTSUP per the upgrade policy. */
+static int kfm2_read_batch_marker(const char *path,
+                                  KfMarkerSlot **out_slots,
                                   size_t *out_count) {
     struct stat st;
-    uint8_t *buf = NULL;
-    BatchMarkerEntry *entries = NULL;
+    BatchMarkerHeader hdr;
+    KfMarkerSlot *slots = NULL;
     int fd = -1, rc = -1;
-
-    *out_entries = NULL;
+    if (!path || !out_slots || !out_count) { errno = EINVAL; return -1; }
+    *out_slots = NULL;
     *out_count = 0;
     fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return errno == ENOENT ? 1 : -1;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-        st.st_size < (off_t)sizeof(BatchMarkerHeader) ||
-        st.st_size > (off_t)(64 * 1024 * 1024))
+        st.st_size < (off_t)sizeof(hdr))
         goto out;
-    buf = malloc((size_t)st.st_size);
-    if (!buf) goto out;
-    {
-        size_t left = (size_t)st.st_size;
-        uint8_t *p = buf;
-        while (left > 0) {
-            ssize_t n = read(fd, p, left);
-            if (n < 0) { if (errno == EINTR) continue; goto out; }
-            if (n == 0) goto out;              /* truncated mid-read */
-            p += n;
-            left -= (size_t)n;
-        }
+    ssize_t hn;
+    do { hn = pread(fd, &hdr, sizeof(hdr), 0); }
+    while (hn < 0 && errno == EINTR);
+    if (hn != (ssize_t)sizeof(hdr)) { errno = EILSEQ; goto out; }
+    if (hdr.magic != KF_BATCH_MARKER_MAGIC) goto out;
+    if (hdr.version < KF_BATCH_MARKER_VERSION) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "marker %s: format v%u predates this binary (v%u); "
+                  "all writes must be durable before upgrading",
+                  path, (unsigned)hdr.version,
+                  (unsigned)KF_BATCH_MARKER_VERSION);
+        errno = ENOTSUP;
+        goto out;
     }
-
-    BatchMarkerHeader hdr;
-    memcpy(&hdr, buf, sizeof(hdr));
-    if (hdr.magic != KF_BATCH_MARKER_MAGIC ||
-        hdr.version != KF_BATCH_MARKER_VERSION || hdr.count == 0)
+    if (hdr.version != KF_BATCH_MARKER_VERSION || hdr.reserved != 0 ||
+        hdr.count == 0 || hdr.count > 16384) {
+        errno = EILSEQ;
         goto out;
-
-    entries = calloc(hdr.count, sizeof(*entries));
-    if (!entries) goto out;
-
-    size_t at = sizeof(hdr);
-    size_t total = (size_t)st.st_size;
+    }
+    uint64_t expect = (uint64_t)sizeof(hdr) +
+                      (uint64_t)hdr.count * sizeof(*slots);
+    if (expect > (uint64_t)INT64_MAX || (uint64_t)st.st_size != expect) {
+        errno = EILSEQ;
+        goto out;
+    }
+    slots = calloc((size_t)hdr.count, sizeof(*slots));
+    if (!slots) goto out;
+    size_t need = (size_t)hdr.count * sizeof(*slots), got = 0;
+    while (got < need) {
+        ssize_t nr = pread(fd, (uint8_t *)slots + got, need - got,
+                           (off_t)sizeof(hdr) + (off_t)got);
+        if (nr < 0 && errno == EINTR) continue;
+        if (nr <= 0) { errno = EILSEQ; goto out; }
+        got += (size_t)nr;
+    }
     for (uint32_t i = 0; i < hdr.count; i++) {
-        if (at + sizeof(BatchMarkerEntry) > total) goto out;
-        size_t entry_start = at;
-        memcpy(&entries[i], buf + at, sizeof(BatchMarkerEntry));
-        at += sizeof(BatchMarkerEntry);
-        size_t klen = entries[i].klen;
-        size_t old_vlen = entries[i].old_vlen;
-        size_t new_vlen = entries[i].new_vlen;
-        if (at + klen + old_vlen + new_vlen > total) goto out;
-        at += klen + old_vlen + new_vlen;
-
-        size_t span_len = at - entry_start;
-        uint8_t *verify_buf = malloc(span_len);
-        if (!verify_buf) goto out;
-        memcpy(verify_buf, buf + entry_start, span_len);
-        uint32_t stored_sum = entries[i].slot.checksum;
-        memset(verify_buf + offsetof(BatchMarkerEntry, slot) +
-                   offsetof(KfMarkerSlot, checksum),
-               0, sizeof(uint32_t));
-        uint32_t computed = XXH32(verify_buf, span_len, 0);
-        free(verify_buf);
-        if (computed != stored_sum) goto out;
-        if (!kf_marker_op_valid(&entries[i].slot)) goto out;
-    }
-
-    *out_entries = entries;
-    *out_count = hdr.count;
-    entries = NULL;
-    rc = 0;
-out:
-    free(buf);
-    free(entries);
-    if (fd >= 0) close(fd);
-    return rc;
-}
-
-/* Test-only accessor: corrupt the first entry's kf_slot in a durable
- * KFM2 batch marker at <kf_shard>/<batch_id>, recomputing that entry's
- * checksum so the file still validates as well-formed KFM2 (magic,
- * version, per-entry checksum) with only kf_slot semantically out of
- * range -- regression coverage for the kf_slot bounds check in
- * kf_marker_replay_upsert_entry_locked. Returns 0 (patched, *out_has_old
- * set), 1 (no marker file at this shard/batch), -1 (I/O or parse error). */
-static void kf_batch_marker_path(char *buf, size_t cap, const char *data_dir,
-                                  int kf_shard, uint32_t batch_id);
-
-int kf_batch_marker_corrupt_first_kf_slot_for_test(const char *data_dir,
-                                                   int kf_shard,
-                                                   uint32_t batch_id,
-                                                   uint32_t bad_kf_slot,
-                                                   int *out_has_old) {
-    char path[PATH_MAX];
-    struct stat st;
-    uint8_t *buf = NULL;
-    int fd = -1, rc = -1;
-
-    kf_batch_marker_path(path, sizeof(path), data_dir, kf_shard, batch_id);
-    fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return errno == ENOENT ? 1 : -1;
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-        st.st_size < (off_t)(sizeof(BatchMarkerHeader) + sizeof(BatchMarkerEntry)))
-        goto out;
-    buf = malloc((size_t)st.st_size);
-    if (!buf) goto out;
-    {
-        size_t left = (size_t)st.st_size;
-        uint8_t *p = buf;
-        while (left > 0) {
-            ssize_t n = read(fd, p, left);
-            if (n < 0) { if (errno == EINTR) continue; goto out; }
-            if (n == 0) goto out;
-            p += n;
-            left -= (size_t)n;
+        KfMarkerSlot check;
+        memcpy(&check, &slots[i], sizeof(check));
+        uint32_t stored = check.checksum;
+        check.checksum = 0;
+        if (!kf_marker_op_valid(&check) ||
+            stored != XXH32(&check,
+                            offsetof(KfMarkerSlot, checksum), 0)) {
+            errno = EILSEQ;
+            goto out;
         }
     }
-
-    BatchMarkerHeader hdr;
-    memcpy(&hdr, buf, sizeof(hdr));
-    if (hdr.magic != KF_BATCH_MARKER_MAGIC ||
-        hdr.version != KF_BATCH_MARKER_VERSION || hdr.count == 0)
-        goto out;
-
-    {
-        size_t entry_start = sizeof(hdr);
-        if (entry_start + sizeof(BatchMarkerEntry) > (size_t)st.st_size) goto out;
-        BatchMarkerEntry e;
-        memcpy(&e, buf + entry_start, sizeof(e));
-        size_t span_len = sizeof(e) + e.klen + e.old_vlen + e.new_vlen;
-        if (entry_start + span_len > (size_t)st.st_size) goto out;
-
-        if (out_has_old) *out_has_old = e.slot.has_old;
-        e.slot.kf_slot = bad_kf_slot;
-        e.slot.checksum = 0;
-        memcpy(buf + entry_start, &e, sizeof(e));
-        uint32_t sum = XXH32(buf + entry_start, span_len, 0);
-        memcpy(buf + entry_start + offsetof(BatchMarkerEntry, slot) +
-                   offsetof(KfMarkerSlot, checksum), &sum, sizeof(sum));
-    }
-
-    if (pwrite(fd, buf, (size_t)st.st_size, 0) != (ssize_t)st.st_size) goto out;
-    if (fsync(fd) != 0) goto out;
+    *out_slots = slots;
+    *out_count = (size_t)hdr.count;
+    slots = NULL;
     rc = 0;
 out:
-    free(buf);
+    free(slots);
     if (fd >= 0) close(fd);
-    if (rc == 0) {
-        char kf_dir[PATH_MAX];
-        snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
-        int dfd = open(kf_dir, O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) { fsync(dfd); close(dfd); }
-    }
     return rc;
 }
 
 /* Test-only accessor: read the entry count and each entry's
- * (checksum-validated) KfMarkerSlot from a durable KFM2 batch marker at
- * <kf_shard>/<batch_id>. slots_out must have room for at least max_slots
- * entries; entries beyond max_slots are still counted in *out_count but
- * not copied. Returns 0 (found and validated), 1 (no marker file at this
- * shard/batch), -1 (I/O, parse, or checksum error). */
-int kf_batch_marker_read_slots_for_test(const char *data_dir, int kf_shard,
-                                        uint32_t batch_id,
-                                        KfMarkerSlot *slots_out,
-                                        size_t max_slots,
-                                        size_t *out_count) {
-    char path[PATH_MAX];
-    BatchMarkerEntry *entries = NULL;
+ * (checksum-validated) KfMarkerSlot from a marker at an exact path.
+ * slots_out must have room for at least max_slots entries; entries beyond
+ * max_slots are still counted in *out_count but not copied. Returns 0
+ * (found and validated), 1 (file absent), -1 (I/O, parse, or checksum
+ * error). The exact-path contract mirrors MarkerRef identity: no test
+ * reconstructs a <shard>_<batch> filename. */
+int kf_batch_marker_read_path_for_test(const char *path,
+                                       KfMarkerSlot *slots_out,
+                                       size_t max_slots,
+                                       size_t *out_count) {
+    if (!path || !out_count) { errno = EINVAL; return -1; }
+    KfMarkerSlot *slots = NULL;
     size_t count = 0;
-    int rc;
-
-    kf_batch_marker_path(path, sizeof(path), data_dir, kf_shard, batch_id);
-    rc = kfm2_read_batch_marker(path, &entries, &count);
+    int rc = kfm2_read_batch_marker(path, &slots, &count);
     if (rc != 0) return rc;
     if (out_count) *out_count = count;
-    for (size_t i = 0; i < count && i < max_slots; i++)
-        slots_out[i] = entries[i].slot;
-    free(entries);
+    size_t copy = count < max_slots ? count : max_slots;
+    if (copy && !slots_out) { free(slots); errno = EINVAL; return -1; }
+    for (size_t i = 0; i < copy; i++) slots_out[i] = slots[i];
+    free(slots);
     return 0;
+}
+
+/* Test-only accessor: corrupt the first slot's kf_slot in a durable
+ * KFM2 v2 marker at an exact path, recomputing that slot's checksum so
+ * the file still validates as well-formed KFM2 (magic, version, header,
+ * per-slot checksum) with only kf_slot semantically out of range —
+ * regression coverage for the kf_slot bounds check in
+ * kf_marker_replay_upsert_entry_locked. Returns 0 (patched, *out_has_old
+ * set), 1 (file absent), -1 (I/O or parse error). */
+int kf_batch_marker_corrupt_first_kf_slot_for_test(
+        const char *path, uint32_t bad_kf_slot, int *out_has_old) {
+    KfMarkerSlot *slots = NULL;
+    size_t count = 0;
+    if (!path) { errno = EINVAL; return -1; }
+    if (kfm2_read_batch_marker(path, &slots, &count) != 0) return -1;
+    if (count == 0) { free(slots); errno = EILSEQ; return -1; }
+    KfMarkerSlot slot = slots[0];
+    free(slots);
+    if (out_has_old) *out_has_old = slot.has_old;
+    slot.kf_slot = bad_kf_slot;
+    slot.checksum = 0;
+    slot.checksum = XXH32(&slot, offsetof(KfMarkerSlot, checksum), 0);
+    int fd = open(path, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    ssize_t nw;
+    do { nw = pwrite(fd, &slot, sizeof(slot),
+                     (off_t)sizeof(BatchMarkerHeader)); }
+    while (nw < 0 && errno == EINTR);
+    int rc = nw == (ssize_t)sizeof(slot) && fsync(fd) == 0 ? 0 : -1;
+    int saved = errno;
+    close(fd);
+    if (rc != 0) errno = saved ? saved : EIO;
+    return rc;
 }
 
 /* Accumulate time spent in marker and targeted kf durability barriers. */
@@ -1533,6 +1509,24 @@ static int seg_open_file(const char *path, int create,
         char *slash = strrchr(dir, '/');
         if (slash) { *slash = 0; mkdirp_local(dir); }
         fd = open(path, O_RDWR | O_CREAT, 0644);
+        if (fd >= 0) {
+            /* I3: a freshly created segment file's directory entry must be
+               durable before any marker can reference the file. Creation is
+               rare (first touch / rotation), so an immediate dir fsync is
+               cheap and covers every writer path — single-record, legacy
+               bulk, and deferred requests alike. A pre-existing empty file
+               is indistinguishable from a new one; the extra fsync is
+               harmless. */
+            struct stat dst;
+            if (fstat(fd, &dst) != 0) {
+                close(fd);
+                return -1;
+            }
+            if (dst.st_size == 0 && fsync_dir(dir) != 0) {
+                close(fd);
+                return -1;
+            }
+        }
     } else {
         fd = open(path, O_RDWR);
     }
@@ -2155,11 +2149,18 @@ typedef struct {
 
 static void *slotcask_pregrow_worker(void *raw) {
     SlotcaskPregrowArg *a = (SlotcaskPregrowArg *)raw;
+    /* Pre-grow mutates kf shard capacity outside the bulk transaction
+       shape, so it owns the same per-shard writer gate the bulk paths
+       use. Bulk call sites must invoke slotcask_pregrow_kf BEFORE
+       slotcask_bulk_request_execute, never after gates are acquired. */
+    writer_gate_lock(a->db, a->kf_shard_id);
     char kf_path[PATH_MAX];
     kf_path_for(kf_path, a->db->data_dir, a->kf_shard_id);
     SlotcaskKfHandle kh;
-    if (kfcache_acquire(&kh, kf_path, a->db->slots_per_shard, 1) != 0)
+    if (kfcache_acquire(&kh, kf_path, a->db->slots_per_shard, 1) != 0) {
+        writer_gate_unlock(a->db, a->kf_shard_id);
         return NULL;
+    }
     if (kh.hdr) {
         uint64_t cur_total = kh.hdr->total;
         uint64_t projected = cur_total + (uint64_t)a->add_records;
@@ -2171,6 +2172,7 @@ static void *slotcask_pregrow_worker(void *raw) {
         }
     }
     kfcache_release(&kh);
+    writer_gate_unlock(a->db, a->kf_shard_id);
     return NULL;
 }
 
@@ -2292,6 +2294,48 @@ typedef struct {
     size_t      klen;
 } KfInsertPlan;
 
+/* Cross-window planned-slot reservation (deferred requests). Window N+1
+   plans its inserts while window N's K hasn't committed yet; this map
+   makes window N's planned slots visible to window N+1's probe exactly
+   as the committed table would on the legacy per-window path. Keyed by
+   target slot, open-addressed, sized 2x the shard's record count. */
+typedef struct {
+    size_t        slot;
+    const void   *key;
+    size_t        klen;
+    uint8_t       hash[16];
+    int           used;
+} ReqSlotRes;
+
+static size_t req_res_pow2(size_t n) {
+    size_t c = 16;
+    while (c < n) {
+        if (c > SIZE_MAX / 2) return SIZE_MAX;
+        c *= 2;
+    }
+    return c;
+}
+
+/* Returns the bucket for `kf_slot` (used=1) or the first empty bucket. */
+static size_t req_res_probe(const ReqSlotRes *map, size_t cap, size_t kf_slot) {
+    size_t i = kf_slot & (cap - 1);
+    while (map[i].used && map[i].slot != kf_slot)
+        i = (i + 1) & (cap - 1);
+    return i;
+}
+
+static int req_res_insert(ReqSlotRes *map, size_t cap, const KfInsertPlan *p) {
+    if (!map || cap == 0) return 0;
+    size_t i = req_res_probe(map, cap, p->target_slot);
+    if (map[i].used) return 0;   /* double-insert: caller's bug; ignore */
+    map[i].slot = p->target_slot;
+    map[i].key = p->key;
+    map[i].klen = p->klen;
+    memcpy(map[i].hash, p->hash, 16);
+    map[i].used = 1;
+    return 1;
+}
+
 /* Non-mutating probe for a brand-new kf entry. Finds the slot a subsequent
    kf_commit_planned_slot call should write to, without touching the table.
    Returns 0 (planned into *out_plan), 1 (key already live — duplicate), or
@@ -2369,6 +2413,7 @@ static int kf_plan_window_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh,
                                        const void *key, size_t klen,
                                        const char *data_dir,
                                        const KfInsertPlan *reserved, size_t nreserved,
+                                       const ReqSlotRes *res_map, size_t res_cap,
                                        KfInsertPlan *out_plan) {
     (void)db;
     if (kh->hdr) {
@@ -2388,6 +2433,21 @@ static int kf_plan_window_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh,
         size_t slot = (start + i) % cap;
 
         int reserved_here = 0;
+        if (res_map && res_cap > 0) {
+            /* Cross-window reservations: slots planned (but not yet
+               committed) by earlier windows of this request — exactly the
+               table state the legacy per-window path had already
+               committed by the time the next window planned. */
+            size_t ri = req_res_probe(res_map, res_cap, slot);
+            if (res_map[ri].used && res_map[ri].slot == slot) {
+                reserved_here = 1;
+                if (memcmp(res_map[ri].hash, hash, 16) == 0 &&
+                    res_map[ri].klen == klen &&
+                    memcmp(res_map[ri].key, key, klen) == 0) {
+                    return 1; /* duplicate key within this request */
+                }
+            }
+        }
         for (size_t r = 0; r < nreserved; r++) {
             if (reserved[r].target_slot != slot) continue;
             reserved_here = 1;
@@ -3143,247 +3203,276 @@ int clean_flag_remove(const char *data_dir) {
 
 /* KFM2 marker I/O. */
 
-static void kf_batch_marker_path(char *buf, size_t cap, const char *data_dir,
-                                  int kf_shard, uint32_t batch_id) {
-    snprintf(buf, cap, "%s/data/kf/%03x_batch_%u_marker.dat",
-             data_dir, (unsigned)kf_shard, batch_id);
+/* ── Exact marker identity (MarkerRef) ──
+ * Nonce-bearing publication names make (shard, batch_id) insufficient
+ * identity, so every gate/startup/clear consumer works on the exact path
+ * returned by readdir — filenames are never reconstructed from numeric
+ * IDs. MarkerRef.nonce is zero only for the legacy (pre-nonce) filename,
+ * which remains recognized so a binary upgrade never orphans an older
+ * retained intent. */
+typedef struct {
+    int      kf_shard;
+    uint32_t batch_id;
+    uint64_t nonce;                 /* zero only for the legacy filename */
+    char     path[PATH_MAX];         /* exact path returned by readdir */
+} MarkerRef;
+
+static int marker_ref_cmp(const void *ap, const void *bp) {
+    const MarkerRef *a = ap, *b = bp;
+    if (a->batch_id != b->batch_id)
+        return (a->batch_id > b->batch_id) - (a->batch_id < b->batch_id);
+    if (a->nonce != b->nonce)
+        return (a->nonce > b->nonce) - (a->nonce < b->nonce);
+    return strcmp(a->path, b->path);
 }
 
-/* Clear batch marker file after recovery/completion. */
-static int kf_batch_marker_clear_impl(const char *data_dir, int kf_shard, uint32_t batch_id) {
-    char path[PATH_MAX], dpath[PATH_MAX];
-    kf_batch_marker_path(path, sizeof(path), data_dir, kf_shard, batch_id);
-    if (unlink(path) != 0 && errno != ENOENT) return -1;
-    /* The marker lives in data/kf, so the parent directory that must be
-       synced is data/kf itself.  Treat a failed directory sync as a failed
-       clear: otherwise the caller could reuse this batch id before the
-       unlink is durable. */
-    kf_marker_dir_path(dpath, sizeof(dpath), data_dir);
-    return fsync_dir(dpath);
+static int marker_ref_from_name(const char *kf_dir, const char *name,
+                                MarkerRef *out) {
+    int used = 0;
+    unsigned shard = 0, batch = 0;
+    unsigned long long nonce = 0;
+    int ok = sscanf(name, "%x_batch_%u_%16llx_marker.dat%n",
+                    &shard, &batch, &nonce, &used) == 3 &&
+             used == (int)strlen(name);
+    if (!ok) {
+        used = 0;
+        ok = sscanf(name, "%x_batch_%u_marker.dat%n",
+                    &shard, &batch, &used) == 2 &&
+             used == (int)strlen(name);
+        nonce = 0;
+    }
+    if (!ok || shard >= MAX_SPLITS) return 1;
+    int n = snprintf(out->path, sizeof(out->path), "%s/%s", kf_dir, name);
+    if (n < 0 || (size_t)n >= sizeof(out->path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    out->kf_shard = (int)shard;
+    out->batch_id = (uint32_t)batch;
+    out->nonce = (uint64_t)nonce;
+    return 0;
 }
 
-int kf_batch_marker_clear(const char *data_dir, int kf_shard, uint32_t batch_id) {
-    uint64_t t0 = now_us();
-    int rc = kf_batch_marker_clear_impl(data_dir, kf_shard, batch_id);
-    commit_sync_us_record(t0);
+static int marker_tmp_name_valid(const char *name) {
+    int used = 0;
+    unsigned shard = 0, batch = 0, pid = 0;
+    unsigned long long nonce = 0, tmpnonce = 0;
+    if (sscanf(name, "%x_batch_%u_%16llx_marker.dat.tmp.%u.%llu%n",
+               &shard, &batch, &nonce, &pid, &tmpnonce, &used) == 5 &&
+        used == (int)strlen(name))
+        return 1;
+    used = 0;
+    return sscanf(name, "%x_batch_%u_marker.dat.tmp.%u.%llu%n",
+                  &shard, &batch, &pid, &tmpnonce, &used) == 4 &&
+           used == (int)strlen(name);
+}
+
+/* Scan kf_dir for final marker files. cleanup_temps also removes
+ * recognised publication temporaries (inert pre-M debris); an unlink
+ * error fails the scan. Unrecognised marker-namespace files fail closed
+ * with EILSEQ. Duplicate identity fails closed. */
+static int marker_refs_scan(const char *kf_dir, int wanted_shard,
+                            int cleanup_temps,
+                            MarkerRef **out_refs, size_t *out_n) {
+    DIR *d = NULL;
+    MarkerRef *refs = NULL;
+    size_t n = 0, cap = 0;
+    int rc = -1;
+    *out_refs = NULL;
+    *out_n = 0;
+    d = opendir(kf_dir);
+    if (!d) return errno == ENOENT ? 0 : -1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        MarkerRef ref;
+        int prc = marker_ref_from_name(kf_dir, de->d_name, &ref);
+        if (prc < 0) goto out;
+        if (prc > 0) {
+            if (marker_tmp_name_valid(de->d_name)) {
+                if (!cleanup_temps) continue;
+                char tmp_path[PATH_MAX];
+                int tn = snprintf(tmp_path, sizeof(tmp_path), "%s/%s",
+                                  kf_dir, de->d_name);
+                if (tn < 0 || (size_t)tn >= sizeof(tmp_path)) {
+                    errno = ENAMETOOLONG;
+                    goto out;
+                }
+                if (unlink(tmp_path) != 0 && errno != ENOENT) goto out;
+                continue;
+            }
+            if (strstr(de->d_name, "_marker.dat") != NULL) {
+                errno = EILSEQ;
+                goto out;
+            }
+            continue;
+        }
+        if (wanted_shard >= 0 && ref.kf_shard != wanted_shard) continue;
+        if (n == cap) {
+            size_t next = cap ? cap * 2 : 8;
+            if (next < cap || next > SIZE_MAX / sizeof(*refs)) {
+                errno = EOVERFLOW;
+                goto out;
+            }
+            MarkerRef *grown = realloc(refs, next * sizeof(*refs));
+            if (!grown) goto out;
+            refs = grown;
+            cap = next;
+        }
+        refs[n++] = ref;
+    }
+    if (n > 1) qsort(refs, n, sizeof(*refs), marker_ref_cmp);
+    for (size_t i = 1; i < n; i++) {
+        if (refs[i - 1].kf_shard == refs[i].kf_shard &&
+            refs[i - 1].batch_id == refs[i].batch_id &&
+            refs[i - 1].nonce == refs[i].nonce) {
+            errno = EILSEQ;
+            goto out;
+        }
+    }
+    *out_refs = refs;
+    *out_n = n;
+    refs = NULL;
+    rc = 0;
+out:
+    free(refs);
+    closedir(d);
     return rc;
 }
 
-static int batch_marker_id_cmp(const void *a, const void *b) {
-    const uint32_t aa = *(const uint32_t *)a;
-    const uint32_t bb = *(const uint32_t *)b;
-    return (aa > bb) - (aa < bb);
+static int kfm2_unlink_by_path(const char *path) {
+    if (unlink(path) == 0 || errno == ENOENT) return 0;
+    return -1;
 }
 
-/* Retained KFM2 markers replay while their shard writer lock is held, before
-   a new window can plan against the keyfile. */
-static int kf_batch_marker_gate(int kf_shard, SlotcaskKfHandle *kh,
-                                const char *data_dir) {
-    char kf_dir[PATH_MAX];
-    snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
-    DIR *d = opendir(kf_dir);
-    if (!d) return errno == ENOENT ? 0 : -1;
-
-    char eff_root[PATH_MAX], object[256];
-    split_data_dir(data_dir, eff_root, sizeof(eff_root), object, sizeof(object));
-    uint32_t *ids = NULL;
-    size_t nids = 0, cap_ids = 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        int marker_shard = -1, consumed = 0;
-        unsigned batch_id = 0;
-        int is_marker = sscanf(e->d_name, "%x_batch_%u_marker.dat%n",
-                               &marker_shard, &batch_id, &consumed) == 2 &&
-                        consumed == (int)strlen(e->d_name);
-        if (!is_marker || marker_shard != kf_shard)
-            continue;
-        int duplicate = 0;
-        for (size_t i = 0; i < nids; i++) {
-            if (ids[i] == (uint32_t)batch_id) {
-                duplicate = 1;
-                break;
-            }
-        }
-        if (duplicate) continue;
-        if (nids == cap_ids) {
-            size_t next = cap_ids ? cap_ids * 2 : 4;
-            uint32_t *grown = realloc(ids, next * sizeof(*ids));
-            if (!grown) { free(ids); closedir(d); return -1; }
-            ids = grown;
-            cap_ids = next;
-        }
-        ids[nids++] = (uint32_t)batch_id;
+static int kfm2_clear_by_path_sync(const char *path) {
+    char dir[PATH_MAX];
+    int n = snprintf(dir, sizeof(dir), "%s", path);
+    if (n < 0 || (size_t)n >= sizeof(dir)) {
+        errno = ENAMETOOLONG;
+        return -1;
     }
-    closedir(d);
-    if (nids) qsort(ids, nids, sizeof(*ids), batch_marker_id_cmp);
+    char *slash = strrchr(dir, '/');
+    if (!slash) { errno = EINVAL; return -1; }
+    *slash = '\0';
+    if (kfm2_unlink_by_path(path) != 0) return -1;
+    return fsync_dir(dir);
+}
 
-    /* KFM2 batch markers never spawn abort sidecars: the coordinator's
-       M step validates every CAS/policy/reservation before publishing, so
-       there is no legitimate post-M rejection and nothing to roll back —
-       only forward replay to C, or EINPROGRESS. */
+static int kfm2_read_batch_marker(const char *path,
+                                  KfMarkerSlot **out_slots,
+                                  size_t *out_count);
+
+/* Gate/startup replay of every retained marker on one shard, via exact
+ * refs. kh must be a writer-acquired handle for that shard. */
+static int kf_batch_marker_gate_refs(int kf_shard, SlotcaskKfHandle *kh,
+                                     const char *data_dir) {
+    char kf_dir[PATH_MAX], eff_root[PATH_MAX], object[256];
+    MarkerRef *refs = NULL;
+    size_t nrefs = 0;
+    snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+    split_data_dir(data_dir, eff_root, sizeof(eff_root),
+                   object, sizeof(object));
+    if (marker_refs_scan(kf_dir, kf_shard, 1, &refs, &nrefs) != 0)
+        return -1;
     int rc = 0;
-    for (size_t i = 0; i < nids && rc == 0; i++) {
-        char path[PATH_MAX];
-        BatchMarkerEntry *entries = NULL;
+    for (size_t i = 0; i < nrefs && rc == 0; i++) {
+        KfMarkerSlot *slots = NULL;
         size_t count = 0;
-        kf_batch_marker_path(path, sizeof(path), data_dir, kf_shard, ids[i]);
-        int mrc = kfm2_read_batch_marker(path, &entries, &count);
-        if (mrc == 1) {
-            /* Vanished between our directory scan and this read: another
-               gate already replayed and cleared it. */
-            continue;
-        }
-        if (mrc != 0) {
-            /* Short/corrupt/checksum-mismatched: fail closed rather than
-               silently proceed past unreplayed durability state. */
-            rc = -1;
-            break;
-        }
+        int mrc = kfm2_read_batch_marker(refs[i].path, &slots, &count);
+        if (mrc == 1) continue;
+        if (mrc != 0) { rc = -1; break; }
         LOG_ERROR(LOG_SUB_DURABILITY,
                   "kf shard %d: retained commit marker %s; attempting "
-                  "synchronous forward replay", kf_shard, path);
-        for (size_t j = 0; j < count && rc == 0; j++) {
+                  "synchronous forward replay", kf_shard, refs[i].path);
+        for (size_t j = 0; j < count && rc == 0; j++)
             if (kf_marker_replay_entry_locked(eff_root, object, data_dir,
                                               kf_shard, kh,
-                                              &entries[j].slot) != 0)
+                                              &slots[j]) != 0)
                 rc = -1;
-        }
-        if (rc == 0 && kfm2_clear_batch_marker(data_dir, kf_shard,
-                                               ids[i]) != 0)
+        free(slots);
+        if (rc == 0 && kfm2_clear_by_path_sync(refs[i].path) != 0)
             rc = -1;
-        free(entries);
     }
-    free(ids);
+    free(refs);
     return rc;
 }
 
-/* Every writer recovers retained KFM2 markers before it plans a slot or opens
-   a bitmap writer handle. */
+/* Every writer recovers retained KFM2 markers before it plans a slot or
+   opens a bitmap writer handle. */
 static int kf_shard_marker_gate(int kf_shard, SlotcaskKfHandle *kh,
                                 const char *data_dir) {
-    return kf_batch_marker_gate(kf_shard, kh, data_dir);
+    return kf_batch_marker_gate_refs(kf_shard, kh, data_dir);
 }
 
-/* Marker recovery sweep: scan one object's data/kf/ for retained KFM2 final
-   markers and replay each to completion. Recognised publication temporaries
-   are inert pre-M debris and are removed; all other marker-namespace files
-   fail closed because this release only understands KFM2 redo records.
-   Called at startup when unclean shutdown was detected, before the
-   server accepts connections. Caller must already hold the object's
-   write lock (objlock_wrlock) for the duration.
-   Returns 0 if every marker found was replayed/cleared, -1 if any marker
-   is corrupt or fails to replay (fail-closed — operator must investigate;
-   the marker is left on disk so nothing is silently lost).
-   If out_replayed is non-NULL, it is incremented once per marker file this
-   call actually found (regardless of replay outcome) — callers use this to
-   report whether recovery replayed anything, as opposed to merely running. */
+/* Marker recovery sweep: scan one object's data/kf/ for retained final
+ * markers and replay each to completion, grouped per shard under that
+ * shard's writer handle. Recognised publication temporaries are inert
+ * pre-M debris and are removed; all other marker-namespace files fail
+ * closed because this release only understands KFM2 redo records.
+ * Called at startup when unclean shutdown was detected, before the
+ * server accepts connections. Caller must already hold the object's
+ * write lock (objlock_wrlock) for the duration.
+ * Returns 0 if every marker found was replayed/cleared, -1 if any marker
+ * is corrupt or fails to replay (fail-closed — operator must investigate;
+ * the marker is left on disk so nothing is silently lost).
+ * If out_replayed is non-NULL, it is incremented once per marker file
+ * this call actually found. */
 int marker_recovery_sweep_object(const char *eff_root, const char *data_dir, const char *object_name,
                                   int *out_replayed) {
     char kf_dir[PATH_MAX];
     snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
 
-    DIR *d = opendir(kf_dir);
-    if (!d) return (errno == ENOENT) ? 0 : -1;
-
+    MarkerRef *refs = NULL;
+    size_t nrefs = 0;
+    if (marker_refs_scan(kf_dir, -1, 1, &refs, &nrefs) != 0) return -1;
     int rc = 0;
-    int *batch_shards = NULL;
-    size_t n_batch_shards = 0, cap_batch_shards = 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        int kf_shard = -1;
-        unsigned batch_id = 0;
-        int name_len = (int)strlen(e->d_name);
-        int consumed = 0;
-
-        if (sscanf(e->d_name, "%x_batch_%u_marker.dat%n", &kf_shard, &batch_id, &consumed) == 2 &&
-            consumed == name_len) {
-            /* recognised KFM2 final marker */
-        } else if (strstr(e->d_name, "_marker.dat") != NULL ||
-                   strstr(e->d_name, "_marker.dat.tmp.") != NULL) {
-            /* A stale publication temporary is safe to discard only when it
-               exactly derives from a KFM2 final name. */
-            int tmp_shard = -1;
-            unsigned tmp_batch = 0;
-            unsigned tmp_pid = 0;
-            unsigned long long tmp_nonce = 0;
-            consumed = 0;
-            if (sscanf(e->d_name, "%x_batch_%u_marker.dat.tmp.%u.%llu%n",
-                       &tmp_shard, &tmp_batch, &tmp_pid, &tmp_nonce,
-                       &consumed) == 4 &&
-                consumed == name_len) {
-                char tmp_path[PATH_MAX];
-                snprintf(tmp_path, sizeof(tmp_path), "%s/%s", kf_dir, e->d_name);
-                if (unlink(tmp_path) != 0 && errno != ENOENT) rc = -1;
-                continue;
-            }
-            errno = EILSEQ;
-            rc = -1;
-            continue;
-        } else {
-            continue;
-        }
-        if (kf_shard < 0) continue;
-
-        if (out_replayed) (*out_replayed)++;
-
-        size_t i;
-        for (i = 0; i < n_batch_shards; i++)
-            if (batch_shards[i] == kf_shard) break;
-        if (i == n_batch_shards) {
-            if (n_batch_shards == cap_batch_shards) {
-                size_t next = cap_batch_shards ? cap_batch_shards * 2 : 4;
-                int *grown = realloc(batch_shards, next * sizeof(*batch_shards));
-                if (!grown) { rc = -1; break; }
-                batch_shards = grown;
-                cap_batch_shards = next;
-            }
-            batch_shards[n_batch_shards++] = kf_shard;
-        }
-    }
-    closedir(d);
-    for (size_t i = 0; i < n_batch_shards; i++) {
+    for (size_t i = 0; i < nrefs; ) {
+        int shard = refs[i].kf_shard;
+        size_t j = i + 1;
+        while (j < nrefs && refs[j].kf_shard == shard) j++;
+        if (out_replayed) *out_replayed += (int)(j - i);
         char kf_path[PATH_MAX];
-        kf_path_for(kf_path, data_dir, batch_shards[i]);
+        kf_path_for(kf_path, data_dir, shard);
         SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kf_path, 0, 1) != 0) {
-            rc = -1;
-            continue;
+        if (kfcache_acquire(&kh, kf_path, 0, 1) != 0) { rc = -1; break; }
+        for (size_t k = i; k < j && rc == 0; k++) {
+            KfMarkerSlot *slots = NULL;
+            size_t count = 0;
+            int mrc = kfm2_read_batch_marker(refs[k].path, &slots, &count);
+            if (mrc == 1) continue;
+            if (mrc != 0) { rc = -1; break; }
+            LOG_ERROR(LOG_SUB_DURABILITY,
+                      "startup: retained commit marker %s; forward replay",
+                      refs[k].path);
+            for (size_t x = 0; x < count && rc == 0; x++)
+                if (kf_marker_replay_entry_locked(eff_root, object_name,
+                                                  data_dir, shard, &kh,
+                                                  &slots[x]) != 0)
+                    rc = -1;
+            free(slots);
+            if (rc == 0 && kfm2_clear_by_path_sync(refs[k].path) != 0)
+                rc = -1;
         }
-        if (kf_batch_marker_gate(batch_shards[i], &kh, data_dir) != 0)
-            rc = -1;
         kfcache_release(&kh);
+        if (rc != 0) break;
+        i = j;
     }
-    free(batch_shards);
+    free(refs);
     return rc;
 }
 
-/* Non-replaying marker check for graceful shutdown. Deliberately does not read/verify marker
-   contents — a corrupt marker still means "not safe to skip recovery next
-   time," so mere presence of a matching filename is enough to answer 1. */
+/* Non-replaying marker check for graceful shutdown. Deliberately does not
+   read/verify marker contents — a corrupt marker still means "not safe to
+   skip recovery next time," so mere presence of a matching final-marker
+   name (nonce-bearing or legacy) is enough to answer 1. */
 int object_has_pending_markers(const char *data_dir) {
     char kf_dir[PATH_MAX];
     snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
-
-    DIR *d = opendir(kf_dir);
-    if (!d) return (errno == ENOENT) ? 0 : -1;
-
-    int found = 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        int kf_shard = -1;
-        unsigned batch_id = 0;
-        int name_len = (int)strlen(e->d_name);
-        int consumed = 0;
-        int is_batch_match = sscanf(e->d_name, "%x_batch_%u_marker.dat%n", &kf_shard, &batch_id, &consumed) == 2 &&
-                              consumed == name_len;
-        consumed = 0;
-        if (is_batch_match) {
-            found = 1;
-            break;
-        }
-    }
-    closedir(d);
-    return found;
+    MarkerRef *refs = NULL;
+    size_t nrefs = 0;
+    int rc = marker_refs_scan(kf_dir, -1, 0, &refs, &nrefs);
+    free(refs);
+    return rc == 0 ? (nrefs != 0) : -1;
 }
 
 /* Repoint EXISTING key's slot. Atomic 8B store on the trailing group keeps
@@ -3994,8 +4083,12 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
     if (mkdirp_local(data_dir) != 0) return -1;
 
     pthread_mutex_init(&db->trim_init_lock, NULL);
+    if (writer_gates_init(db) != 0) {
+        pthread_mutex_destroy(&db->trim_init_lock);
+        return -1;
+    }
     db->streams = calloc(num_streams, sizeof(SlotcaskStream));
-    if (!db->streams) return -1;
+    if (!db->streams) goto fail;
     for (int i = 0; i < num_streams; i++) {
         SlotcaskStream *s = &db->streams[i];
         s->stream_id = i;
@@ -4141,6 +4234,7 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
 
 fail:
     if (errno == 0) errno = EIO;
+    writer_gates_destroy(db);
     pthread_mutex_destroy(&db->trim_init_lock);
     /* slotcask_registry_get frees the outer SlotcaskDb after this return.
        Release every auxiliary allocation made before a failed open too;
@@ -4166,6 +4260,7 @@ fail:
 }
 
 void slotcask_close(SlotcaskDb *db) {
+    writer_gates_destroy(db);
     pthread_mutex_destroy(&db->trim_init_lock);
     if (db->streams) {
         for (int i = 0; i < db->num_streams; i++) {
@@ -4376,6 +4471,8 @@ typedef struct {
  * T (tombstone OLD) -> C (clear marker), replaying forward on any
  * post-M failure instead of rolling back. */
 
+struct SlotcaskBulkRequest;      /* request coordinator state (below) */
+
 typedef enum {
     BULK_MUTATION_UPSERT,
     BULK_MUTATION_DELETE,
@@ -4401,6 +4498,9 @@ typedef struct {
     const SlotcaskBulkOpts *upsert_opts;
     const SlotcaskBulkDeleteOpts *delete_opts;
     _Atomic int cancelled;
+    struct SlotcaskBulkRequest *req;   /* non-NULL inside a deferred
+                                          request: A/I/K/P/T deferral and
+                                          the request flushes key off it */
 } BulkMutationTxn;
 
 typedef struct { uint8_t sid; uint16_t fid; uint32_t off; } SegLoc;
@@ -4413,6 +4513,78 @@ static int segloc_cmp(const void *a, const void *b) {
     return 0;
 }
 
+static int segloc_vec_append(SegLoc **dst, size_t *n, size_t *cap,
+                             const SegLoc *src, size_t add) {
+    if (add == 0) return 0;
+    if (*n > SIZE_MAX - add) { errno = EOVERFLOW; return -1; }
+    size_t need = *n + add;
+    if (need > *cap) {
+        size_t nc = *cap ? *cap : 16;
+        while (nc < need) {
+            if (nc > SIZE_MAX / 2) { errno = EOVERFLOW; return -1; }
+            nc *= 2;
+        }
+        if (nc > SIZE_MAX / sizeof(**dst)) { errno = EOVERFLOW; return -1; }
+        SegLoc *v = realloc(*dst, nc * sizeof(*v));
+        if (!v) return -1;
+        *dst = v;
+        *cap = nc;
+    }
+    memcpy(*dst + *n, src, add * sizeof(*src));
+    *n = need;
+    return 0;
+}
+
+static int size_add_checked(size_t *total, size_t add) {
+    if (*total > SIZE_MAX - add) { errno = EOVERFLOW; return -1; }
+    *total += add;
+    return 0;
+}
+
+static int size_vec_append(size_t **dst, size_t *n, size_t *cap,
+                           const size_t *src, size_t add) {
+    if (add == 0) return 0;
+    if (*n > SIZE_MAX - add) { errno = EOVERFLOW; return -1; }
+    size_t need = *n + add;
+    if (need > *cap) {
+        size_t nc = *cap ? *cap : 16;
+        while (nc < need) {
+            if (nc > SIZE_MAX / 2) { errno = EOVERFLOW; return -1; }
+            nc *= 2;
+        }
+        if (nc > SIZE_MAX / sizeof(**dst)) { errno = EOVERFLOW; return -1; }
+        size_t *v = realloc(*dst, nc * sizeof(*v));
+        if (!v) return -1;
+        *dst = v;
+        *cap = nc;
+    }
+    memcpy(*dst + *n, src, add * sizeof(*src));
+    *n = need;
+    return 0;
+}
+
+/* Apply segment flags without a durability wait. `locs` is sorted.
+   The request commit barrier performs the merged sync pass. */
+static int bulk_seg_apply_flags(SlotcaskDb *db, const SegLoc *locs,
+                                size_t n, uint8_t flag) {
+    size_t i = 0;
+    while (i < n) {
+        size_t j = i + 1;
+        while (j < n && locs[j].sid == locs[i].sid &&
+               locs[j].fid == locs[i].fid) j++;
+        char path[PATH_MAX];
+        seg_path_for(path, db->data_dir, locs[i].sid, locs[i].fid);
+        SlotcaskSegHandle h;
+        if (segcache_acquire(&h, path, 0, 0, 0) != 0) return -1;
+        for (size_t k = i; k < j; k++)
+            __atomic_store_n(&h.map[locs[k].off + 18], flag,
+                             __ATOMIC_RELEASE);
+        segcache_release(&h);
+        i = j;
+    }
+    return 0;
+}
+
 /* One (field, idx_shard) index flush owed by the current window; deduped
    and flushed once per unique pair after apply_window returns. */
 typedef struct {
@@ -4422,7 +4594,13 @@ typedef struct {
     uint8_t  hash16[16];        /* representative hash for the flush call */
 } IdxTouch;
 
-typedef struct { IdxTouch *v; size_t n, cap; } IdxTouchSet;
+typedef struct {
+    IdxTouch *v;
+    size_t n, cap;
+    int failed;    /* sticky: a lost touch (overflow/OOM) is a durability
+                      error — the window must fail before its marker can
+                      be cleared, on both the legacy and deferred paths */
+} IdxTouchSet;
 
 /* Installed by bulk_apply_and_sync_indexes_locked for the duration of the
    caller's apply_window hook — bulk windows only (window_cap > 1; the
@@ -4439,10 +4617,10 @@ void idx_touch_record(const char *field, int idx_shard, int type,
     if (s->n == s->cap) {
         IdxTouch *nv;
         /* Guard BEFORE doubling: s->cap * 2 itself must not overflow. */
-        if (s->cap > SIZE_MAX / (2 * sizeof(IdxTouch))) return;
+        if (s->cap > SIZE_MAX / (2 * sizeof(IdxTouch))) { s->failed = 1; return; }
         size_t ncap = s->cap ? s->cap * 2 : 16;
         nv = realloc(s->v, ncap * sizeof(IdxTouch));
-        if (!nv) return;
+        if (!nv) { s->failed = 1; return; }
         s->v = nv; s->cap = ncap;
     }
     snprintf(s->v[s->n].field, sizeof(s->v[0].field), "%s", field);
@@ -4457,7 +4635,7 @@ typedef struct {
     uint32_t           batch_id;
     int                kf_shard_id;
     BulkMutationShard *shard;
-    BatchMarkerEntry  *entries;
+    BulkPlanEntry     *entries;
     size_t            *active;
     size_t             nactive;
     size_t            *kf_slots;
@@ -4466,9 +4644,21 @@ typedef struct {
     IdxTouchSet        touch;
     KfInsertPlan      *abandoned;   /* reserved-but-rejected NEW-insert slots */
     size_t             nabandoned;
+    /* Deferred-request owner: set before finalize/retry so every A/I/K/T
+       step can route its durability waits into the request window. */
+    ReqWindow         *req_window;
+    /* Exact installed marker path (publication's output buffer). The
+       legacy clear uses it via kfm2_clear_by_path_sync — never a
+       reconstructed ID-only name. A caller must never pass marker_path
+       as a final_name. */
+    char               marker_path[PATH_MAX];
     /* prepare_window ran OK: the caller's bulk_hook_ctx now owns staged
        state that exactly one of {commit_done, abort_window, release_window}
-       must release at this window's exit (see bulk_commit_one_kf_window). */
+       must release at this window's exit (see bulk_commit_one_kf_window).
+       hook_state is the opaque per-window hook state handed back by
+       prepare_window; the move into ReqWindow transfers ownership so
+       exactly one terminal callback consumes it. */
+    void              *hook_state;
     int                hooks_staged;
 } BulkWindowPlan;
 
@@ -4478,6 +4668,68 @@ static void bulk_window_plan_destroy(BulkWindowPlan *plan) {
     free(plan->touch.v); free(plan->abandoned);
     memset(plan, 0, sizeof(*plan));
 }
+
+/* ── Deferred request state (request-level commit batching) ──────────
+ * One deferred bulk request spans an entire cmd_bulk_* call. The
+ * coordinator holds the writer gate of every touched shard for the whole
+ * request (ascending acquire, reverse release); ordinary writers to those
+ * shards block on the gate; readers never touch it. Per-shard transaction
+ * state persists across the coordinator's phase joins. */
+struct ReqWindow {
+    BulkWindowPlan  plan;              /* owned; moved from the stack      */
+    char            marker_path[PATH_MAX];   /* exact path, preserved     */
+    SegLoc         *a_locs; size_t na, cap_a; /* activation bytes (defer) */
+    SegLoc         *t_locs; size_t nt, cap_t; /* tombstone bytes (defer)  */
+    size_t         *kf_slots; size_t nkf, cap_kf;
+    int             kf_header_changed;
+    void           *hook_state;        /* opaque per-window hook state     */
+    int             published;         /* marker file exists               */
+    int             converged;         /* A/I/K/T completed                */
+    int             unlink_succeeded;  /* unlink/ENOENT completed          */
+    int             cleared;           /* unlink made durable by dir fsync */
+    int             hooks_staged;
+    struct {
+        slotcask_bulk_terminal_window_fn commit_done;
+        slotcask_bulk_terminal_window_fn release_window;
+        slotcask_bulk_terminal_window_fn abort_window;
+        void *ctx;
+    } hooks;
+};
+
+typedef struct {
+    int        used;
+    int        kf_shard_id;
+    int        stage_failed;
+    /* Request-owned options (by value — worker-stack opts would dangle). */
+    BulkMutationKind        kind;
+    union {
+        SlotcaskBulkOpts       upsert;
+        SlotcaskBulkDeleteOpts delete_;
+    } opts;
+    BulkMutationShard shard;                  /* persisted executor state */
+    BulkMutationTxn  txn;                     /* persisted across waves    */
+    int              has_txn;
+    SlotcaskBulkRec *recs; size_t nrecs;      /* caller-owned batch slice  */
+    SegLoc    *p_locs; size_t np, cap_p;      /* payload bytes (epoch 1)   */
+    ReqWindow *windows; size_t nwindows, cap_windows;
+    ReqSlotRes *res_map; size_t res_cap;     /* cross-window planned slots */
+    int        failed;                 /* EINPROGRESS / unreplayed         */
+} ReqShard;
+
+typedef struct SlotcaskBulkRequest SlotcaskBulkRequest;
+
+struct SlotcaskBulkRequest {
+    SlotcaskDb *db;
+    ReqShard   *shards;                /* [num_shards], indexed by kf id   */
+    int         num_shards;
+    char        kf_dir[PATH_MAX];
+    uint64_t    nonce;                 /* per-request marker uniqueness    */
+    int        *touched;               /* [ntouched] ascending, deduped    */
+    size_t      ntouched;
+    int         any_published;
+    int         payload_rc, publish_rc, marker_dir_rc, finalize_rc, commit_rc;
+    int         any_failed;            /* any retained/unreplayed window   */
+};
 
 /* ----- Phase helpers shared by the slow and fast bulk-upsert paths.
    The two paths differ only in Phase 1 (kf lookup vs skip) and Phase 4
@@ -4833,16 +5085,28 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
             if (r->status != 0 || !s->needs_write) continue;
 
             if (!s->old_found) {
+                const ReqSlotRes *res_map = NULL;
+                size_t res_cap = 0;
+                if (txn->req) {
+                    ReqShard *rs = &txn->req->shards[shard->kf_shard_id];
+                    res_map = rs->res_map;
+                    res_cap = rs->res_cap;
+                }
                 if (kf_plan_window_insert_slot(txn->db, kh, s->hash,
                                                r->key, r->klen,
                                                txn->db->data_dir,
                                                reserved_plans, nreserved,
+                                               res_map, res_cap,
                                                &s->kf_plan) != 0) {
                     r->status = -1;
                     continue;
                 }
                 s->has_plan = 1;
                 reserved_plans[nreserved++] = s->kf_plan;
+                if (txn->req)
+                    req_res_insert(txn->req->shards[shard->kf_shard_id].res_map,
+                                   txn->req->shards[shard->kf_shard_id].res_cap,
+                                   &s->kf_plan);
             }
             /* OLD-derived records never went through the P wave: stage NEW
                synchronously here so M still covers a durable payload. */
@@ -4857,6 +5121,7 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
                     continue;
                 }
                 r->slot_capacity = cap;
+                s->needs_write = 1;   /* staged bytes owe a D5 sync */
             }
         }
     }
@@ -4913,8 +5178,11 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
         for (size_t i = begin; i < end; i++)
             if (recs[i].status == 0 && st[i].needs_write)
                 plan->active[n++] = i;
-        if (uo->prepare_window(recs, plan->active, n,
-                               uo->bulk_hook_ctx) != 0) goto hard_fail;
+        void *window_state = NULL;
+        if (uo->prepare_window(recs, plan->active, n, uo->bulk_hook_ctx,
+                               &window_state) != 0)
+            goto hard_fail;                 /* failed prepare self-cleans */
+        plan->hook_state = window_state;
         plan->hooks_staged = 1;
         /* hook may have set status=-1/-2 (policy); rebuild below */
     } else if (shard->kind == BULK_MUTATION_DELETE && txn->delete_opts &&
@@ -4923,8 +5191,11 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
         for (size_t i = begin; i < end; i++)
             if (recs[i].status == 0 && st[i].needs_write)
                 plan->active[n++] = i;
+        void *window_state = NULL;
         if (txn->delete_opts->prepare_window(recs, plan->active, n,
-                               txn->delete_opts->bulk_hook_ctx) != 0) goto hard_fail;
+                               txn->delete_opts->bulk_hook_ctx,
+                               &window_state) != 0) goto hard_fail;
+        plan->hook_state = window_state;
         plan->hooks_staged = 1;
     }
 
@@ -4932,7 +5203,6 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
     plan->nabandoned = 0;
     for (size_t i = begin; i < end; i++) {
         SlotcaskBulkState *s = &st[i];
-        BatchMarkerEntry *e;
         if (recs[i].status != 0) {
             /* A NEW-insert's kf slot was reserved by kf_plan_window_insert_
                slot above (s->has_plan) but the record never made it into
@@ -4947,7 +5217,7 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
             continue;
         }
         if (!s->needs_write) continue;
-        e = &plan->entries[plan->nactive];
+        BulkPlanEntry *e = &plan->entries[plan->nactive];
         memset(e, 0, sizeof(*e));
         e->slot.magic = KF_BATCH_MARKER_ENTRY_MAGIC;
         e->slot.op = shard->kind == BULK_MUTATION_DELETE
@@ -4979,9 +5249,6 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
             e->slot.new_offset = s->target_off;
         }
         memcpy(e->hash, s->hash, 16);
-        e->klen = (uint16_t)recs[i].klen;
-        e->new_vlen = shard->kind == BULK_MUTATION_DELETE ? 0 : (uint16_t)recs[i].vlen;
-        e->old_vlen = (uint16_t)s->old_vlen;
         plan->active[plan->nactive++] = i;
     }
     free(old_idx);
@@ -4995,14 +5262,46 @@ hard_fail:
     return -1;
 }
 
+/* ── Marker V2 serializer: header + nactive slots, checksums patched.
+   No variable-length spans — replay re-derives bytes from the segment
+   records each slot names. Both the legacy publisher and the deferred
+   publish half serialize through this one function. */
+static int bulk_build_window_marker_v2(const BulkWindowPlan *plan,
+                                       uint8_t **out_buf,
+                                       size_t *out_len) {
+    *out_buf = NULL;
+    *out_len = 0;
+    if (!plan || plan->nactive == 0 || plan->nactive > 16384) {
+        errno = EINVAL;
+        return -1;
+    }
+    BatchMarkerHeader hdr = {
+        .magic = KF_BATCH_MARKER_MAGIC,
+        .version = KF_BATCH_MARKER_VERSION,
+        .count = (uint32_t)plan->nactive,
+        .reserved = 0,
+    };
+    size_t len = sizeof(hdr) + (size_t)plan->nactive * sizeof(KfMarkerSlot);
+    uint8_t *buf = malloc(len);
+    if (!buf) return -1;
+    memcpy(buf, &hdr, sizeof(hdr));
+    for (size_t i = 0; i < plan->nactive; i++) {
+        KfMarkerSlot slot = plan->entries[i].slot;
+        slot.checksum = 0;
+        slot.checksum = XXH32(&slot, offsetof(KfMarkerSlot, checksum), 0);
+        memcpy(buf + sizeof(hdr) + i * sizeof(slot), &slot, sizeof(slot));
+    }
+    *out_buf = buf;
+    *out_len = len;
+    return 0;
+}
+
 static int bulk_publish_window_marker_locked(BulkMutationTxn *txn,
                                              SlotcaskKfHandle *kh,
                                              BulkWindowPlan *plan) {
-    char kf_dir[PATH_MAX], final[64];
-    BatchMarkerHeader hdr = { KF_BATCH_MARKER_MAGIC, KF_BATCH_MARKER_VERSION,
-                              (uint32_t)plan->nactive, 0 };
+    char kf_dir[PATH_MAX], final[128];
     uint8_t *buf = NULL;
-    size_t len = 0, cap = 0;
+    size_t len = 0;
     int rc;
 
     (void)kh;
@@ -5010,23 +5309,12 @@ static int bulk_publish_window_marker_locked(BulkMutationTxn *txn,
     durability_test_pause(txn->db->data_dir, "win-M");
     durability_test_pause(txn->db->data_dir, "bulk-window-prepared");
     if (plan->nactive == 0) return 0;
-    if (buf_append(&buf, &len, &cap, &hdr, sizeof(hdr)) != 0) goto oom;
-    for (size_t i = 0; i < plan->nactive; i++) {
-        BatchMarkerEntry *e = &plan->entries[i];
-        const SlotcaskBulkRec *r = &plan->shard->recs[plan->active[i]];
-        const SlotcaskBulkState *s = &plan->shard->st[plan->active[i]];
-        size_t at;
-        if (buf_append(&buf, &len, &cap, e, sizeof(*e)) != 0) goto oom;
-        at = len - sizeof(*e);
-        if (e->klen     && buf_append(&buf, &len, &cap, r->key,   e->klen)     != 0) goto oom;
-        if (e->old_vlen && buf_append(&buf, &len, &cap, s->old_buf, e->old_vlen) != 0) goto oom;
-        if (e->new_vlen && buf_append(&buf, &len, &cap, r->value, e->new_vlen) != 0) goto oom;
-        uint32_t sum = XXH32(buf + at, len - at, 0);   /* entry written with
-                                                          slot.checksum = 0 */
-        memcpy(buf + at + offsetof(BatchMarkerEntry, slot) +
-               offsetof(KfMarkerSlot, checksum), &sum, sizeof(sum));
-    }
+    if (bulk_build_window_marker_v2(plan, &buf, &len) != 0) return -1;
     snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", txn->db->data_dir);
+    /* Legacy/single windows keep the nonce-less final name; the MarkerRef
+       scan recognizes it (nonce 0). The gate replayed and cleared any
+       retained marker for this (shard, batch) before planning, so the
+       no-replace link below can never collide with a live intent. */
     snprintf(final, sizeof(final), "%03x_batch_%u_marker.dat",
              (unsigned)plan->kf_shard_id, plan->batch_id);
     {
@@ -5035,15 +5323,12 @@ static int bulk_publish_window_marker_locked(BulkMutationTxn *txn,
             free(buf);
             return -1;
         }
-        rc = marker_publish_atomic(kf_dir, final, buf, len);
+        rc = marker_publish_and_sync_dir(kf_dir, final, buf, len,
+                                         plan->marker_path);
         free(buf);
         if (fail_now && SHARD_TEST_FAIL_POSTLINK && rc == 0) rc = 1;
     }
     return rc;
-
-oom:
-    free(buf);
-    return -1;
 }
 
 /* store=0: sync-only pass (P barrier and T after tombstone_and_push_back).
@@ -5097,7 +5382,7 @@ static int bulk_activate_new_payloads_locked(BulkMutationTxn *txn,
     locs = calloc(plan->nactive, sizeof(*locs));
     if (!locs) return -1;
     for (size_t i = 0; i < plan->nactive; i++) {
-        const BatchMarkerEntry *e = &plan->entries[i];
+        const BulkPlanEntry *e = &plan->entries[i];
         if (e->slot.op != KF_MARKER_OP_UPSERT) continue;
         locs[n].sid = e->slot.new_stream_id;
         locs[n].fid = e->slot.new_file_id;
@@ -5105,13 +5390,22 @@ static int bulk_activate_new_payloads_locked(BulkMutationTxn *txn,
         n++;
     }
     qsort(locs, n, sizeof(*locs), segloc_cmp);
-    {
+    if (txn->req) {
+        ReqWindow *rw = plan->req_window;
+        if (!rw || bulk_seg_apply_flags(txn->db, locs, n, 1) != 0 ||
+            segloc_vec_append(&rw->a_locs, &rw->na, &rw->cap_a,
+                              locs, n) != 0)
+            rc = -1;
+        else
+            rc = 0;
+    } else {
         uint64_t t0a = now_us();
         rc = bulk_seg_apply_and_sync(txn->db, locs, n, 1, 1);
         commit_phase_us_record(&g_commit_segment_sync_us_total, t0a);
+        if (rc == 0 && n > 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_A))
+            rc = -1;
     }
     free(locs);
-    if (rc == 0 && n > 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_A)) rc = -1;
     return rc;
 }
 
@@ -5131,28 +5425,54 @@ static int bulk_apply_and_sync_indexes_locked(BulkMutationTxn *txn,
     SHARD_TEST_PHASE_PAUSE(SHARD_TEST_PHASE_I);
     durability_test_pause(txn->db->data_dir, "win-I");
 
-    /* Recording is bulk-only: single-record mutations route through this
-       same coordinator with window_cap == 1, and their hooks already sync
-       via their own apply_commit flush (storage.c's
-       index_sync_record_fields calls). Letting a window_cap=1 window
-       record would double-sync every touched file. */
-    int record_touches = txn->window_cap > 1;
+    /* Recording is bulk-only for the legacy path: single-record mutations
+       route through this same coordinator with window_cap == 1, and their
+       hooks already sync via their own apply_commit flush (storage.c's
+       index_sync_record_fields calls). Deferred requests record their
+       touches at ANY window size — the request commit barrier needs every
+       window's durability targets for the merged flush. */
+    int record_touches = txn->req != NULL || txn->window_cap > 1;
     if (shard->kind == BULK_MUTATION_DELETE) {
         if (!txn->delete_opts || !txn->delete_opts->apply_window) return 0;
         if (record_touches) tls_idx_touch = &plan->touch;
+        void *window_state = plan->req_window
+                           ? plan->req_window->hook_state
+                           : plan->hook_state;
         rc = txn->delete_opts->apply_window(shard->recs, plan->active,
                                             plan->nactive,
-                                            txn->delete_opts->bulk_hook_ctx);
+                                            txn->delete_opts->bulk_hook_ctx,
+                                            window_state);
         tls_idx_touch = NULL;
     } else {
         if (!txn->upsert_opts || !txn->upsert_opts->apply_window) return 0;
         if (record_touches) tls_idx_touch = &plan->touch;
+        void *window_state = plan->req_window
+                           ? plan->req_window->hook_state
+                           : plan->hook_state;
         rc = txn->upsert_opts->apply_window(shard->recs, plan->active,
                                             plan->nactive,
-                                            txn->upsert_opts->bulk_hook_ctx);
+                                            txn->upsert_opts->bulk_hook_ctx,
+                                            window_state);
         tls_idx_touch = NULL;
     }
     if (rc != 0) return -1;
+
+    /* A lost touch (overflow/OOM inside a hook's idx_touch_record) is a
+       durability error on BOTH paths: fail the window before declaring it
+       converged, so its marker can never be cleared while a touched index
+       file may be unsynced. */
+    if (plan->touch.failed) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "window flush: touch set lost entries (OOM); failing "
+                  "window before marker clear");
+        return -1;
+    }
+
+    if (txn->req != NULL) {
+        /* Deferred request: the touch set stays in plan->touch for the
+           request-wide merged flush; no per-window sync here. */
+        return 0;
+    }
 
     /* one durable sync per touched (field, idx shard): dedupe, then flush
        via the existing per-record flush seam with one representative hash */
@@ -5168,22 +5488,51 @@ static int bulk_apply_and_sync_indexes_locked(BulkMutationTxn *txn,
                    object, sizeof(object));
     {
         uint64_t t0i = now_us();
+        /* Bitmap files: cache-handle sync, serial (bounded by bitmap
+           fields × kf shards; the bm cache serialises writers per file). */
         for (size_t i = 0; i < plan->touch.n; i++) {
             const IdxTouch *t = &plan->touch.v[i];
-            const char *field = t->field;
-            if (t->type == IT_BITMAP) {
-                if (bitmap_sync_shard_path(eff_root, object, t->field,
-                                           t->idx_shard,
-                                           txn->db->num_shards) != 0)
-                    return -1;
-            } else if (index_sync_record_fields(eff_root, object,
-                                                txn->db->num_shards,
-                                                t->hash16, &field,
-                                                (const enum IndexType *)&t->type,
-                                                1) != 0)
+            if (t->type != IT_BITMAP) continue;
+            if (bitmap_sync_shard_path(eff_root, object, t->field,
+                                       t->idx_shard,
+                                       txn->db->num_shards) != 0)
                 return -1;
             __atomic_add_fetch(&g_commit_index_sync_ops_total, 1,
                                __ATOMIC_RELAXED);
+        }
+        /* btree/trigram pairs: distinct files → parallel issue. */
+        size_t npaths = 0;
+        for (size_t i = 0; i < plan->touch.n; i++)
+            if (plan->touch.v[i].type != IT_BITMAP) npaths++;
+        if (npaths > 0) {
+            char *path_buf = malloc(npaths * PATH_MAX);
+            const char **paths = malloc(npaths * sizeof(*paths));
+            if (!path_buf || !paths) {
+                free(path_buf); free(paths);
+                errno = ENOMEM;
+                return -1;
+            }
+            size_t w = 0;
+            for (size_t i = 0; i < plan->touch.n; i++) {
+                const IdxTouch *t = &plan->touch.v[i];
+                if (t->type == IT_BITMAP) continue;
+                int shard = idx_shard_for_hash(t->hash16,
+                                               txn->db->num_shards);
+                if (t->type == IT_TRIGRAM)
+                    tg_build_path(path_buf + w * PATH_MAX, PATH_MAX,
+                                  eff_root, object, t->field, shard);
+                else
+                    build_idx_path(path_buf + w * PATH_MAX, PATH_MAX,
+                                   eff_root, object, t->field, shard);
+                paths[w] = path_buf + w * PATH_MAX;
+                w++;
+            }
+            int frc = index_sync_path_set(paths, w);
+            free(path_buf);
+            free(paths);
+            if (frc != 0) return -1;
+            __atomic_add_fetch(&g_commit_index_sync_ops_total,
+                               (uint64_t)w, __ATOMIC_RELAXED);
         }
         commit_phase_us_record(&g_commit_index_sync_us_total, t0i);
     }
@@ -5225,7 +5574,7 @@ static int bulk_apply_and_sync_kf_locked(BulkMutationTxn *txn,
     for (size_t i = 0; i < plan->nactive; i++) {
         SlotcaskBulkRec *r = &shard->recs[plan->active[i]];
         SlotcaskBulkState *s = &shard->st[plan->active[i]];
-        BatchMarkerEntry *e = &plan->entries[i];
+        BulkPlanEntry *e = &plan->entries[i];
         size_t out_slot;
 
         if (e->slot.op == KF_MARKER_OP_DELETE) {
@@ -5254,6 +5603,18 @@ static int bulk_apply_and_sync_kf_locked(BulkMutationTxn *txn,
         if (!w || plan->kf_slots[w - 1] != plan->kf_slots[i])
             plan->kf_slots[w++] = plan->kf_slots[i];
     plan->nkf_slots = w;
+    if (txn->req) {
+        /* Deferred request: retain every kf mutation, defer the sync into
+           the request window; the commit barrier merges the slot vectors
+           and performs one kf sync per dirty shard. */
+        ReqWindow *rw = plan->req_window;
+        if (!rw) { errno = EINVAL; return -1; }
+        if (size_vec_append(&rw->kf_slots, &rw->nkf, &rw->cap_kf,
+                            plan->kf_slots, plan->nkf_slots) != 0)
+            return -1;
+        rw->kf_header_changed |= plan->kf_header_changed;
+        return 0;
+    }
     {
         int rc = kfcache_sync_slots_locked(kh, plan->kf_slots, plan->nkf_slots,
                                            plan->kf_header_changed);
@@ -5274,7 +5635,7 @@ static int bulk_tombstone_old_payloads_locked(BulkMutationTxn *txn,
 
     if (!locs) return -1;
     for (size_t i = 0; i < plan->nactive; i++) {
-        const BatchMarkerEntry *e = &plan->entries[i];
+        const BulkPlanEntry *e = &plan->entries[i];
         if (!e->slot.has_old) continue;      /* fresh insert: nothing dead */
         locs[n].sid = e->slot.old_stream_id;
         locs[n].fid = e->slot.old_file_id;
@@ -5298,9 +5659,16 @@ static int bulk_tombstone_old_payloads_locked(BulkMutationTxn *txn,
         }
     }
     qsort(locs, n, sizeof(*locs), segloc_cmp);
-    rc = bulk_seg_apply_and_sync(txn->db, locs, n, 0, 0);
+    if (txn->req) {
+        ReqWindow *rw = plan->req_window;
+        rc = rw ? segloc_vec_append(&rw->t_locs, &rw->nt, &rw->cap_t,
+                                    locs, n) : -1;
+    } else {
+        rc = bulk_seg_apply_and_sync(txn->db, locs, n, 0, 0);
+        if (rc == 0 && n > 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_T))
+            rc = -1;
+    }
     free(locs);
-    if (rc == 0 && n > 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_T)) rc = -1;
     return rc;
 }
 
@@ -5321,7 +5689,7 @@ static int bulk_tombstone_old_payloads_locked(BulkMutationTxn *txn,
 static void bulk_reclaim_old_payloads_locked(BulkMutationTxn *txn,
                                              BulkWindowPlan *plan) {
     for (size_t i = 0; i < plan->nactive; i++) {
-        const BatchMarkerEntry *e = &plan->entries[i];
+        const BulkPlanEntry *e = &plan->entries[i];
         if (!e->slot.has_old) continue;
         char path[PATH_MAX];
         SlotcaskSegHandle h;
@@ -5347,13 +5715,12 @@ static int bulk_clear_window_marker_locked(BulkMutationTxn *txn,
     durability_test_pause(txn->db->data_dir, "win-C");
 
     if (plan->nactive == 0) return 0;
-    snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", txn->db->data_dir);
-    snprintf(path, sizeof(path), "%s/%03x_batch_%u_marker.dat",
-             kf_dir, (unsigned)plan->kf_shard_id, plan->batch_id);
-    if (unlink(path) != 0) return -1;
+    (void)kf_dir; (void)path;
+    /* Clear through the exact installed path — never a reconstructed
+       ID-only name (nonce-bearing publication made that lossy). */
     {
         uint64_t t0c = now_us();
-        rc = fsync_dir(kf_dir);
+        rc = kfm2_clear_by_path_sync(plan->marker_path);
         commit_phase_us_record(&g_commit_marker_clear_us_total, t0c);
     }
     if (rc == 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_C)) rc = -1;
@@ -5456,18 +5823,22 @@ out:
     if (plan.hooks_staged) {
         const SlotcaskBulkOpts *uo = shard->upsert_opts;
         const SlotcaskBulkDeleteOpts *dopt = shard->delete_opts;
+        void *window_state = plan.hook_state;
         if (!published) {
             if (uo && uo->abort_window)
-                uo->abort_window(uo->bulk_hook_ctx);
+                uo->abort_window(uo->bulk_hook_ctx, window_state);
             else if (dopt && dopt->abort_window)
-                dopt->abort_window(dopt->bulk_hook_ctx);
+                dopt->abort_window(dopt->bulk_hook_ctx, window_state);
         } else if (rc == 0) {
             if (uo && uo->commit_done)
-                uo->commit_done(uo->bulk_hook_ctx);
+                uo->commit_done(uo->bulk_hook_ctx, window_state);
         } else {
             if (uo && uo->release_window)
-                uo->release_window(uo->bulk_hook_ctx);
+                uo->release_window(uo->bulk_hook_ctx, window_state);
         }
+        /* Exactly one terminal callback consumed the state. */
+        plan.hook_state = NULL;
+        plan.hooks_staged = 0;
     }
     bulk_window_plan_destroy(&plan);
     kfcache_release(&kh);
@@ -5479,6 +5850,185 @@ out:
         shard->st[i].old_buf = NULL;
     }
     return rc;
+}
+
+/* ── Deferred window leaves (request-only; txn->req != NULL) ─────────
+ * The monolithic legacy bulk_commit_one_kf_window above keeps its
+ * per-window immediate durability behavior for single-record and legacy
+ * callers. These leaves split it into a publish pass (plan → D5 sync →
+ * M via marker_publish_file_atomic; marker retained) and a finalize pass
+ * (A → I(apply) → K → T with every sync deferred into the request-owned
+ * collections; failure is retried idempotently but NEVER clears here —
+ * a converged retry joins the common request durability barrier). */
+static int bulk_publish_one_kf_window(BulkMutationTxn *txn,
+                                      BulkMutationShard *shard,
+                                      SlotcaskKfHandle *kh,
+                                      size_t begin, size_t end,
+                                      ReqWindow *rw);
+static int bulk_finalize_one_kf_window(BulkMutationTxn *txn,
+                                       BulkMutationShard *shard,
+                                       SlotcaskKfHandle *kh,
+                                       ReqWindow *rw);
+
+/* D5: OLD-derived records never went through the P wave — their fallback
+ * staged bytes owe an immediate pre-marker sync (invariant I2). Marks
+ * staged_in_wave only after the sync succeeds, so a failed sync can be
+ * retried and can never precede a durable marker. */
+static int bulk_sync_fallback_payloads(BulkMutationTxn *txn,
+                                       BulkMutationShard *shard,
+                                       size_t begin, size_t end) {
+    SlotcaskBulkRec *recs = shard->recs;
+    SegLoc *locs = calloc(end - begin, sizeof(*locs));
+    size_t n = 0;
+    if (!locs) return -1;
+    for (size_t i = begin; i < end; i++) {
+        SlotcaskBulkState *st = &shard->st[i];
+        if (recs[i].status != 0 || st->staged_in_wave || !st->needs_write)
+            continue;
+        locs[n++] = (SegLoc){ .sid = st->target_stream,
+                             .fid = st->target_fid,
+                             .off = st->target_off };
+    }
+    qsort(locs, n, sizeof(*locs), segloc_cmp);
+    int rc = n ? bulk_seg_apply_and_sync(txn->db, locs, n, 0, 0) : 0;
+    if (rc == 0)
+        for (size_t i = begin; i < end; i++) {
+            SlotcaskBulkState *st = &shard->st[i];
+            if (recs[i].status == 0 && !st->staged_in_wave && st->needs_write)
+                st->staged_in_wave = 1;
+        }
+    free(locs);
+    return rc;
+}
+
+static void req_window_abort_pre_marker(ReqWindow *rw) {
+    if (rw->hooks_staged && rw->hooks.abort_window)
+        rw->hooks.abort_window(rw->hooks.ctx, rw->hook_state);
+    rw->hooks_staged = 0;
+    rw->hook_state = NULL;
+}
+
+static void req_window_capture_hooks(ReqWindow *rw,
+                                     const BulkMutationShard *shard) {
+    if (shard->kind == BULK_MUTATION_UPSERT && shard->upsert_opts) {
+        rw->hooks.commit_done = shard->upsert_opts->commit_done;
+        rw->hooks.release_window = shard->upsert_opts->release_window;
+        rw->hooks.abort_window = shard->upsert_opts->abort_window;
+        rw->hooks.ctx = shard->upsert_opts->bulk_hook_ctx;
+    } else if (shard->delete_opts) {
+        rw->hooks.commit_done = shard->delete_opts->commit_done;
+        rw->hooks.release_window = shard->delete_opts->release_window;
+        rw->hooks.abort_window = shard->delete_opts->abort_window;
+        rw->hooks.ctx = shard->delete_opts->bulk_hook_ctx;
+    }
+}
+
+static ReqWindow *req_window_append(ReqShard *rs) {
+    if (rs->nwindows == rs->cap_windows) {
+        size_t cap = rs->cap_windows ? rs->cap_windows * 2 : 4;
+        if (cap < rs->cap_windows || cap > SIZE_MAX / sizeof(*rs->windows)) {
+            errno = EOVERFLOW;
+            return NULL;
+        }
+        ReqWindow *v = realloc(rs->windows, cap * sizeof(*v));
+        if (!v) return NULL;
+        rs->windows = v;
+        rs->cap_windows = cap;
+    }
+    ReqWindow *rw = &rs->windows[rs->nwindows++];
+    memset(rw, 0, sizeof(*rw));
+    return rw;
+}
+
+static void bulk_window_plan_move(BulkWindowPlan *dst,
+                                  BulkWindowPlan *src) {
+    *dst = *src;
+    memset(src, 0, sizeof(*src));
+}
+
+static int bulk_publish_one_kf_window(BulkMutationTxn *txn,
+                                      BulkMutationShard *shard,
+                                      SlotcaskKfHandle *kh,
+                                      size_t begin, size_t end,
+                                      ReqWindow *rw) {
+    BulkWindowPlan plan = {0};
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    int rc = -1;
+    if (bulk_plan_window_locked(txn, shard, begin, end, kh, &plan) != 0) {
+        req_window_capture_hooks(rw, shard);
+        rw->hook_state = plan.hook_state;
+        rw->hooks_staged = plan.hooks_staged;
+        plan.hook_state = NULL;
+        plan.hooks_staged = 0;
+        req_window_abort_pre_marker(rw);
+        goto out;
+    }
+    bulk_window_plan_move(&rw->plan, &plan);
+    req_window_capture_hooks(rw, shard);
+    rw->hook_state = rw->plan.hook_state;
+    rw->hooks_staged = rw->plan.hooks_staged;
+    rw->plan.hook_state = NULL;
+    rw->plan.hooks_staged = 0;
+    if (rw->plan.nactive == 0) {
+        req_window_abort_pre_marker(rw);
+        rc = 0;
+        goto out;
+    }
+    /* Same deterministic pause surface the legacy M phase offered
+       cross-process crash tests (marker not yet on disk). */
+    SHARD_TEST_PHASE_PAUSE(SHARD_TEST_PHASE_M);
+    durability_test_pause(txn->db->data_dir, "win-M");
+    durability_test_pause(txn->db->data_dir, "bulk-window-prepared");
+    if (bulk_sync_fallback_payloads(txn, shard, begin, end) != 0)
+        goto out;
+    if (bulk_build_window_marker_v2(&rw->plan, &buf, &len) != 0)
+        goto out;
+    {
+        char final_name[128];
+        int nn = snprintf(final_name, sizeof(final_name),
+                          "%03x_batch_%u_%016llx_marker.dat",
+                          (unsigned)shard->kf_shard_id,
+                          (unsigned)rw->plan.batch_id,
+                          (unsigned long long)txn->req->nonce);
+        if (nn < 0 || (size_t)nn >= sizeof(final_name)) {
+            errno = ENAMETOOLONG;
+            goto out;
+        }
+        uint64_t t0m = now_us();
+        int prc = marker_publish_file_atomic(txn->req->kf_dir, final_name,
+                                             buf, len, rw->marker_path);
+        commit_phase_us_record(&g_commit_marker_publish_us_total, t0m);
+        if (prc < 0) goto out;
+        rw->published = 1;
+        __atomic_add_fetch(&g_commit_marker_publish_count, 1,
+                           __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_commit_windows_total, 1, __ATOMIC_RELAXED);
+        rc = 0;                         /* prc==1 is installed and retained */
+    }
+out:
+    free(buf);
+    bulk_window_plan_destroy(&plan); /* moved source is zero */
+    if (rc != 0 && !rw->published) {
+        req_window_abort_pre_marker(rw);
+        for (size_t i = begin; i < end; i++)
+            if (shard->recs[i].status == 0) shard->recs[i].status = -1;
+    }
+    return rc;
+}
+
+static int bulk_finalize_one_kf_window(BulkMutationTxn *txn,
+                                       BulkMutationShard *shard,
+                                       SlotcaskKfHandle *kh,
+                                       ReqWindow *rw) {
+    (void)shard;
+    rw->plan.req_window = rw;
+    if (bulk_activate_new_payloads_locked(txn, &rw->plan) != 0) return -1;
+    if (bulk_apply_and_sync_indexes_locked(txn, &rw->plan) != 0) return -1;
+    if (bulk_apply_and_sync_kf_locked(txn, kh, &rw->plan) != 0) return -1;
+    if (bulk_tombstone_old_payloads_locked(txn, &rw->plan) != 0) return -1;
+    rw->converged = 1;
+    return 0;
 }
 
 typedef struct { BulkMutationTxn *txn; size_t shard_idx; } BulkStageWork;
@@ -5550,15 +6100,32 @@ static void *bulk_stage_one_shard(void *raw) {
             locs[n].fid = st[i].target_fid;
             locs[n].off = st[i].target_off;
             n++;
-            st[i].staged_in_wave = 1;
         }
         qsort(locs, n, sizeof(*locs), segloc_cmp);
-        if (n > 0 && bulk_seg_apply_and_sync(txn->db, locs, n, 0, 0) != 0) {
-            free(locs);
-            goto fail;
+        if (txn->req) {
+            ReqShard *rs = &txn->req->shards[shard->kf_shard_id];
+            if (segloc_vec_append(&rs->p_locs, &rs->np, &rs->cap_p,
+                                  locs, n) != 0) {
+                free(locs);
+                goto fail;
+            }
+            for (size_t i = 0; i < shard->nrecs; i++)
+                if (recs[i].status == 0 && st[i].needs_write)
+                    st[i].staged_in_wave = 1;
+        } else {
+            if (n > 0 && bulk_seg_apply_and_sync(txn->db, locs, n, 0, 0) != 0) {
+                free(locs);
+                goto fail;
+            }
+            for (size_t i = 0; i < shard->nrecs; i++)
+                if (recs[i].status == 0 && st[i].needs_write)
+                    st[i].staged_in_wave = 1;
+            if (SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_P)) {
+                free(locs);
+                goto fail;
+            }
         }
         free(locs);
-        if (n > 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_P)) goto fail;
     }
     return NULL;
 
@@ -5655,18 +6222,808 @@ static void bulk_mutation_txn_free_state(BulkMutationTxn *txn) {
     }
 }
 
-static int slotcask_bulk_mutation_transaction(BulkMutationTxn *txn) {
+/* ── Request coordinator: begin/end, phase entry points, flushes ───── */
+
+static SlotcaskBulkRequest *slotcask_bulk_request_begin(
+        SlotcaskDb *db, const int *touched_shards, size_t ntouched) {
+    if (!db || !touched_shards || ntouched == 0) return NULL;
+    SlotcaskBulkRequest *req = calloc(1, sizeof(*req));
+    if (!req) return NULL;
+    req->db = db;
+    req->num_shards = db->num_shards;
+    req->nonce = now_us() ^
+                 (__atomic_add_fetch(&g_marker_nonce_seq, 1,
+                                     __ATOMIC_RELAXED) << 32);
+    req->shards = calloc((size_t)db->num_shards, sizeof(*req->shards));
+    if (!req->shards) { free(req); return NULL; }
+    if (ntouched > SIZE_MAX / sizeof(*req->touched)) {
+        free(req->shards); free(req); errno = EOVERFLOW; return NULL;
+    }
+    req->touched = malloc(ntouched * sizeof(*req->touched));
+    if (!req->touched) { free(req->shards); free(req); return NULL; }
+    /* Ascending touched-shard copy (dedup: the caller's map is already
+       per-shard, but be defensive). Gate acquisition is ascending; release
+       is reverse — no deadlock (each ordinary writer holds ONE gate). */
+    for (size_t i = 0; i < ntouched; i++) {
+        int s = touched_shards[i];
+        if (s < 0 || s >= db->num_shards) {
+            free(req->touched); free(req->shards); free(req);
+            errno = EINVAL;
+            return NULL;
+        }
+        int dup = 0;
+        for (size_t k = 0; k < req->ntouched; k++)
+            if (req->touched[k] == s) { dup = 1; break; }
+        if (dup) continue;
+        /* Insertion into the sorted prefix (standard insertion step). */
+        size_t pos = req->ntouched++;
+        while (pos > 0 && req->touched[pos - 1] > s) {
+            req->touched[pos] = req->touched[pos - 1];
+            pos--;
+        }
+        req->touched[pos] = s;
+    }
+
+    int kn = snprintf(req->kf_dir, sizeof(req->kf_dir),
+                      "%s/data/kf", db->data_dir);
+    if (kn < 0 || (size_t)kn >= sizeof(req->kf_dir)) {
+        free(req->touched); free(req->shards); free(req);
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    /* Acquire touched writer gates in ascending order. Ordinary writers
+       take exactly one gate, so no acquisition cycle is possible. */
+    for (size_t k = 0; k < req->ntouched; k++)
+        writer_gate_lock(db, req->touched[k]);
+    return req;
+}
+
+static void slotcask_bulk_request_end(SlotcaskBulkRequest *req) {
+    if (!req) return;
+    SlotcaskDb *db = req->db;
+    for (int s = 0; s < req->num_shards; s++) {
+        ReqShard *rs = &req->shards[s];
+        if (rs->has_txn && rs->shard.st) {
+            for (size_t i = 0; i < rs->shard.nrecs; i++) {
+                free(rs->shard.st[i].old_buf);
+                rs->shard.st[i].old_buf = NULL;
+            }
+        }
+        if (rs->has_txn)
+            bulk_mutation_txn_free_state(&rs->txn);
+        for (size_t i = 0; i < rs->nwindows; i++) {
+            ReqWindow *rw = &rs->windows[i];
+            /* Retained (EINPROGRESS) windows keep their marker for
+               gate/startup replay; their opaque hook state is released
+               through the path's release hook. */
+            if (rw->hooks_staged) {
+                if (rw->hooks.release_window)
+                    rw->hooks.release_window(rw->hooks.ctx,
+                                             rw->hook_state);
+                rw->hooks_staged = 0;
+                rw->hook_state = NULL;
+            }
+            bulk_window_plan_destroy(&rw->plan);
+            free(rw->a_locs); free(rw->t_locs); free(rw->kf_slots);
+        }
+        free(rs->windows);
+        free(rs->p_locs);
+        free(rs->res_map);
+        rs->res_map = NULL;
+    }
+    /* Same coordinator thread that acquired the gates releases them after
+       terminal hook and request-state cleanup has finished. */
+    for (size_t k = req->ntouched; k > 0; k--)
+        writer_gate_unlock(db, req->touched[k - 1]);
+    free(req->shards);
+    free(req->touched);
+    free(req);
+}
+
+static int request_owns_shard(const SlotcaskBulkRequest *req, int shard) {
+    size_t lo = 0, hi = req->ntouched;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cur = req->touched[mid];
+        if (cur == shard) return 1;
+        if (cur < shard) lo = mid + 1;
+        else hi = mid;
+    }
+    return 0;
+}
+
+/* Wave 1 per shard: gate replay + stage; P sync deferred into p_locs. */
+static int slotcask_bulk_stage_shard(SlotcaskBulkRequest *req,
+                                     int kf_shard_id,
+                                     SlotcaskBulkRec *recs, size_t n,
+                                     const SlotcaskBulkOpts *ups,
+                                     const SlotcaskBulkDeleteOpts *dels) {
+    if (!req || kf_shard_id < 0 || kf_shard_id >= req->num_shards ||
+        !request_owns_shard(req, kf_shard_id) || !recs || n == 0 ||
+        (!!ups == !!dels)) {
+        errno = EINVAL;
+        return -1;
+    }
+    ReqShard *rs = &req->shards[kf_shard_id];
+    if (rs->used) { errno = EALREADY; return -1; }
+    rs->used = 1;
+    rs->kf_shard_id = kf_shard_id;
+    rs->recs = recs;
+    rs->nrecs = n;
+    rs->kind = ups ? BULK_MUTATION_UPSERT : BULK_MUTATION_DELETE;
+    if (ups)  rs->opts.upsert  = *ups;
+    if (dels) rs->opts.delete_ = *dels;
+
+    memset(&rs->shard, 0, sizeof(rs->shard));
+    rs->shard.kf_shard_id = kf_shard_id;
+    rs->shard.recs = recs;
+    rs->shard.nrecs = n;
+    rs->shard.kind = rs->kind;
+    if (ups) rs->shard.upsert_opts = &rs->opts.upsert;
+    else rs->shard.delete_opts = &rs->opts.delete_;
+
+    /* Phase-local kf handle: acquired and released within this task (a
+       POSIX rwlock must not cross threads). ReqShard never stores it. */
+    SlotcaskKfHandle kh;
+    if (kf_shard_acquire(&kh, req->db, kf_shard_id, 1) != 0) {
+        rs->stage_failed = 1;
+        for (size_t i = 0; i < n; i++) recs[i].status = -1;
+        return -1;
+    }
+
+    /* Gate retained markers once, before staging: replay converges any
+       prior request's retained state; v1/corrupt markers fail closed.
+       Preserve the gate's errno: EILSEQ for corrupt/v1 markers is not
+       retryable, I/O errors are. Overwriting with EINPROGRESS would
+       misreport corruption as retryable. */
+    if (kf_batch_marker_gate_refs(kf_shard_id, &kh,
+                                  req->db->data_dir) != 0) {
+        kfcache_release(&kh);
+        rs->stage_failed = 1;
+        for (size_t i = 0; i < n; i++) recs[i].status = -1;
+        return -1;
+    }
+
+    /* Pre-grow folded into the stage wave. The coordinator already holds
+       this shard's writer gate for the whole request, so the resplit is
+       exclusive against every writer by construction — and no pool task
+       ever blocks on a gate. (A parallel pre-grow outside the request,
+       as the original plan had it, let gate-blocked pregrow tasks from
+       concurrent requests occupy every IO-pool worker; the running
+       request's own waves then queued behind them and could never join —
+       a circular wait.) The 75% load trigger matches kf_put_new's inline
+       check; resplit in a loop for the same reason slotcask_pregrow_kf
+       does. */
+    if (kh.hdr) {
+        uint64_t projected = kh.hdr->total + (uint64_t)n;
+        while (kh.capacity < SLOTCASK_MAX_SLOTS_PER_SHARD &&
+               projected * 4 >= (uint64_t)kh.capacity * 3) {
+            if (kfcache_resplit_locked(&kh, kh.capacity * 2) != 0) break;
+        }
+    }
+    kfcache_release(&kh);
+
+    /* Per-shard transaction assembly — the verified preludes of
+       slotcask_bulk_upsert_in_kfshard / slotcask_bulk_delete_in_kfshard,
+       with the transaction PERSISTED in the ReqShard so the coordinator's
+       phase waves operate on it across joins. */
+    memset(&rs->txn, 0, sizeof(rs->txn));
+    rs->txn.db = req->db;
+    rs->txn.shards = &rs->shard;
+    rs->txn.nshards = 1;
+    rs->txn.window_cap = req->db->bulk_commit_window > 0
+                       ? (size_t)req->db->bulk_commit_window
+                       : (size_t)4096;
+    if (rs->kind == BULK_MUTATION_UPSERT) {
+        rs->txn.upsert_opts = &rs->opts.upsert;
+    } else {
+        rs->txn.delete_opts = &rs->opts.delete_;
+    }
+    rs->txn.req = req;
+    atomic_init(&rs->txn.cancelled, 0);
+    rs->has_txn = 1;
+
+    /* This function already runs in the coordinator's parallel stage wave.
+       Do not call bulk_stage_payload_wave (that would nest the executor).
+       Allocate the one shard's state and invoke its leaf worker inline. */
+    rs->shard.st = calloc(n, sizeof(*rs->shard.st));
+    if (!rs->shard.st) {
+        rs->stage_failed = 1;
+        for (size_t i = 0; i < n; i++) recs[i].status = -1;
+        return -1;
+    }
+    rs->res_cap = req_res_pow2(n * 2);
+    if (rs->res_cap != SIZE_MAX) {
+        rs->res_map = calloc(rs->res_cap, sizeof(*rs->res_map));
+        if (!rs->res_map) rs->res_cap = 0;
+    } else {
+        rs->res_map = NULL;
+        rs->res_cap = 0;
+    }
+    BulkStageWork work = { .txn = &rs->txn, .shard_idx = 0 };
+    bulk_stage_one_shard(&work);
+    int rc = atomic_load_explicit(&rs->txn.cancelled,
+                                  memory_order_acquire) || rs->shard.rc != 0
+           ? -1 : 0;
+    if (rc != 0) {
+        rs->stage_failed = 1;
+        for (size_t i = 0; i < n; i++)
+            if (recs[i].status == 0) recs[i].status = -1;
+    }
+    return rc;
+}
+
+static int slotcask_bulk_publish_shard(SlotcaskBulkRequest *req,
+                                       int kf_shard_id) {
+    if (!req || kf_shard_id < 0 || kf_shard_id >= req->num_shards ||
+        !request_owns_shard(req, kf_shard_id)) {
+        errno = EINVAL;
+        return -1;
+    }
+    ReqShard *rs = &req->shards[kf_shard_id];
+    if (!rs->has_txn || rs->stage_failed || req->payload_rc != 0) return 0;
+    SlotcaskKfHandle kh;
+    if (kf_shard_acquire(&kh, req->db, kf_shard_id, 1) != 0) return -1;
+    int rc = 0;
+    while (rs->shard.cursor < rs->shard.nrecs) {
+        size_t begin = rs->shard.cursor;
+        size_t end = begin + rs->txn.window_cap;
+        if (end > rs->shard.nrecs) end = rs->shard.nrecs;
+        ReqWindow *rw = req_window_append(rs);
+        if (!rw) { rc = -1; break; }
+        if (bulk_publish_one_kf_window(&rs->txn, &rs->shard, &kh,
+                                       begin, end, rw) != 0)
+            rc = -1; /* this window aborted pre-M; later windows may proceed */
+        rs->shard.cursor = end;
+    }
+    kfcache_release(&kh);
+    return rc;
+}
+
+static int slotcask_bulk_finalize_shard(SlotcaskBulkRequest *req,
+                                        int kf_shard_id) {
+    if (!req || kf_shard_id < 0 || kf_shard_id >= req->num_shards ||
+        !request_owns_shard(req, kf_shard_id)) {
+        errno = EINVAL;
+        return -1;
+    }
+    ReqShard *rs = &req->shards[kf_shard_id];
+    if (!rs->has_txn || req->marker_dir_rc != 0) return 0;
+    SlotcaskKfHandle kh;
+    if (kf_shard_acquire(&kh, req->db, kf_shard_id, 1) != 0) return -1;
+    int rc = 0;
+    for (size_t i = 0; i < rs->nwindows; i++) {
+        ReqWindow *rw = &rs->windows[i];
+        if (!rw->published) continue;
+        if (bulk_finalize_one_kf_window(&rs->txn, &rs->shard,
+                                        &kh, rw) != 0) {
+            /* Forward retry remains deferred. It may make mutations
+               idempotently, but it never clears before the common barrier. */
+            if (bulk_finalize_one_kf_window(&rs->txn, &rs->shard,
+                                            &kh, rw) != 0) {
+                rs->failed = 1;
+                rc = -1;
+            }
+        }
+    }
+    kfcache_release(&kh);
+    return rc;
+}
+
+/* ── Request flushes ── */
+
+static int slotcask_bulk_request_flush_payloads(SlotcaskBulkRequest *req) {
+    /* Merge every shard's payload locations request-wide, dedupe, and
+       flush in ONE pass — shared stream files are written once. */
+    size_t total = 0;
+    for (int s = 0; s < req->num_shards; s++)
+        if (size_add_checked(&total, req->shards[s].np) != 0) return -1;
+    if (total == 0) return 0;
+    if (total > SIZE_MAX / sizeof(SegLoc)) { errno = EOVERFLOW; return -1; }
+    SegLoc *all = malloc(total * sizeof(*all));
+    if (!all) return -1;
+    size_t n = 0;
+    for (int s = 0; s < req->num_shards; s++) {
+        if (req->shards[s].np)
+            memcpy(all + n, req->shards[s].p_locs,
+                   req->shards[s].np * sizeof(*all));
+        n += req->shards[s].np;
+    }
+    qsort(all, n, sizeof(*all), segloc_cmp);
+    size_t w = 0;
+    for (size_t i = 0; i < n; i++)
+        if (w == 0 || segloc_cmp(&all[w - 1], &all[i]) != 0) all[w++] = all[i];
+    uint64_t t0 = now_us();
+    int rc = bulk_seg_apply_and_sync(req->db, all, w, 0, 0);
+    commit_phase_us_record(&g_commit_segment_sync_us_total, t0);
+    free(all);
+    for (int s = 0; s < req->num_shards; s++) req->shards[s].np = 0;
+    if (rc == 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_P)) rc = -1;
+    return rc;
+}
+
+static int slotcask_bulk_request_flush_marker_dir(SlotcaskBulkRequest *req) {
+    if (!req->any_published) return 0;
+    int rc = fsync_dir(req->kf_dir);
+    if (rc == 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_M)) rc = -1;
+    return rc;
+}
+
+typedef struct {
+    SlotcaskBulkRequest *req;
+    int shard_id;
     int rc;
-    if (bulk_stage_payload_wave(txn) != 0) {
-        bulk_mutation_txn_free_state(txn);
+    int err;
+} ReqKfSyncArg;
+
+static void *req_kf_sync_worker(void *raw) {
+    ReqKfSyncArg *a = raw;
+    ReqShard *rs = &a->req->shards[a->shard_id];
+    size_t total = 0;
+    int header_changed = 0;
+    for (size_t i = 0; i < rs->nwindows; i++) {
+        ReqWindow *rw = &rs->windows[i];
+        if (!rw->converged) continue;
+        if (size_add_checked(&total, rw->nkf) != 0) {
+            a->rc = -1; a->err = errno; return NULL;
+        }
+        header_changed |= rw->kf_header_changed;
+    }
+    if (total == 0 && !header_changed) return NULL;
+    if (total > SIZE_MAX / sizeof(size_t)) {
+        a->rc = -1; a->err = EOVERFLOW; return NULL;
+    }
+    size_t *slots = total ? malloc(total * sizeof(*slots)) : NULL;
+    if (total && !slots) { a->rc = -1; a->err = ENOMEM; return NULL; }
+    size_t n = 0;
+    for (size_t i = 0; i < rs->nwindows; i++) {
+        ReqWindow *rw = &rs->windows[i];
+        if (!rw->converged) continue;
+        if (rw->nkf > 0) {
+            memcpy(slots + n, rw->kf_slots, rw->nkf * sizeof(*slots));
+            n += rw->nkf;
+        }
+    }
+    if (n > 1) qsort(slots, n, sizeof(*slots), size_cmp);
+    size_t w = 0;
+    for (size_t i = 0; i < n; i++)
+        if (w == 0 || slots[w - 1] != slots[i]) slots[w++] = slots[i];
+    SlotcaskKfHandle kh;
+    if (kf_shard_acquire(&kh, a->req->db, a->shard_id, 1) != 0) {
+        a->rc = -1; a->err = errno; free(slots); return NULL;
+    }
+    a->rc = kfcache_sync_slots_locked(&kh, slots, w, header_changed);
+    a->err = a->rc == 0 ? 0 : errno;
+    kfcache_release(&kh);
+    free(slots);
+    return NULL;
+}
+
+static int req_flush_kf(SlotcaskBulkRequest *req) {
+    ReqKfSyncArg *args = calloc(req->ntouched, sizeof(*args));
+    if (!args) return -1;
+    for (size_t i = 0; i < req->ntouched; i++) {
+        args[i].req = req;
+        args[i].shard_id = req->touched[i];
+    }
+    parallel_for_io(req_kf_sync_worker, args, (int)req->ntouched,
+                    sizeof(*args));
+    int rc = 0, saved = 0;
+    for (size_t i = 0; i < req->ntouched; i++) {
+        if (args[i].rc == 0) continue;
+        rc = -1;
+        if (!saved) saved = args[i].err;
+    }
+    free(args);
+    if (rc == 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_K)) rc = -1;
+    if (rc != 0) errno = saved ? saved : EIO;
+    return rc;
+}
+
+/* Bitmap file path for the request commit flush (mirrors index.c's
+   bm_build_path: <root>/<obj>/indexes/<field>/<NNN>.bm). */
+static void req_bitmap_file_path(char *out, size_t outlen,
+                                 const char *db_root, const char *object,
+                                 const char *field, int shard_idx) {
+    snprintf(out, outlen, "%s/%s/indexes/%s/%03d.bm",
+             db_root, object, field, shard_idx);
+}
+
+/* fdatasync a file by path without touching any cache. */
+static int fdatasync_path(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    int rc = fdatasync(fd);
+    int saved = errno;
+    close(fd);
+    if (rc != 0) errno = saved;
+    return rc;
+}
+
+static int slotcask_bulk_request_flush_commit(SlotcaskBulkRequest *req) {
+    /* 1. Index flush: merge converged windows' touch sets request-wide,
+          dedupe, issue through Task 1's parallel issuer; bitmaps serial. */
+    size_t total = 0;
+    for (int s = 0; s < req->num_shards; s++)
+        for (size_t i = 0; i < req->shards[s].nwindows; i++)
+            if (req->shards[s].windows[i].converged)
+                if (size_add_checked(
+                        &total,
+                        req->shards[s].windows[i].plan.touch.n) != 0)
+                    return -1;
+    if (total > 0) {
+        uint64_t t0i = now_us();
+        if (total > SIZE_MAX / sizeof(IdxTouch)) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        IdxTouch *all = malloc(total * sizeof(*all));
+        if (!all) return -1;
+        size_t n = 0;
+        char eff_root[PATH_MAX], object[256];
+        split_data_dir(req->db->data_dir, eff_root, sizeof(eff_root),
+                       object, sizeof(object));
+        for (int s = 0; s < req->num_shards; s++)
+            for (size_t i = 0; i < req->shards[s].nwindows; i++) {
+                ReqWindow *rw = &req->shards[s].windows[i];
+                if (!rw->converged) continue;
+                if (rw->plan.touch.n)
+                    memcpy(all + n, rw->plan.touch.v,
+                           rw->plan.touch.n * sizeof(*all));
+                n += rw->plan.touch.n;
+            }
+        qsort(all, n, sizeof(*all), idx_touch_cmp);
+        size_t w = 0;
+        for (size_t i = 0; i < n; i++)
+            if (w == 0 || idx_touch_cmp(&all[w - 1], &all[i]) != 0)
+                all[w++] = all[i];
+        n = w;   /* deduplicated count drives everything below */
+        size_t npaths = 0;
+        for (size_t i = 0; i < n; i++)
+            if (all[i].type != IT_BITMAP) npaths++;
+        if (npaths > 0) {
+            char *path_buf = malloc(npaths * PATH_MAX);
+            const char **paths = malloc(npaths * sizeof(*paths));
+            if (!path_buf || !paths) {
+                free(all); free(path_buf); free(paths);
+                return -1;
+            }
+            size_t w2 = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (all[i].type == IT_BITMAP) continue;
+                int shard = idx_shard_for_hash(all[i].hash16,
+                                               req->num_shards);
+                if (all[i].type == IT_TRIGRAM)
+                    tg_build_path(path_buf + w2 * PATH_MAX, PATH_MAX,
+                                  eff_root, object, all[i].field, shard);
+                else
+                    build_idx_path(path_buf + w2 * PATH_MAX, PATH_MAX,
+                                   eff_root, object, all[i].field, shard);
+                paths[w2] = path_buf + w2 * PATH_MAX;
+                w2++;
+            }
+            int frc = index_sync_path_set(paths, npaths);
+            free(path_buf); free(paths);
+            if (frc != 0) { free(all); return -1; }
+            __atomic_add_fetch(&g_commit_index_sync_ops_total,
+                               (uint64_t)npaths, __ATOMIC_RELAXED);
+        }
+        for (size_t i = 0; i < n; i++) {
+            if (all[i].type != IT_BITMAP) continue;
+            /* Plain-fd fdatasync: the dirty bitmap pages belong to the
+               inode (written via the bm cache's mmap), so syncing any fd
+               of the file is equivalent — without re-entering the bm
+               cache, whose entry wrlocks are parked by the request's own
+               prepare-staged handles until finalize. A missing file means
+               nothing was ever written — not an error. */
+            char bpath[1024];
+            req_bitmap_file_path(bpath, sizeof(bpath), eff_root, object,
+                                 all[i].field, all[i].idx_shard);
+            if (fdatasync_path(bpath) != 0) {
+                if (errno != ENOENT) { free(all); return -1; }
+                continue;
+            }
+            __atomic_add_fetch(&g_commit_index_sync_ops_total, 1,
+                               __ATOMIC_RELAXED);
+        }
+        free(all);
+        commit_phase_us_record(&g_commit_index_sync_us_total, t0i);
+    }
+    /* 2. K barrier: one mmap durability wait per dirty kf shard. */
+    if (req_flush_kf(req) != 0) return -1;
+
+    /* 3. Segment barriers: activation + tombstone bytes, request-wide
+          dedupe, one pass each. Locations belong to ReqWindow. */
+    for (int pass = 0; pass < 2; pass++) {
+        size_t total = 0;
+        for (int s = 0; s < req->num_shards; s++)
+            for (size_t i = 0; i < req->shards[s].nwindows; i++)
+                if (size_add_checked(
+                        &total,
+                        pass == 0 ? req->shards[s].windows[i].na
+                                  : req->shards[s].windows[i].nt) != 0)
+                    return -1;
+        if (total == 0) continue;
+        if (total > SIZE_MAX / sizeof(SegLoc)) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        SegLoc *all = malloc(total * sizeof(*all));
+        if (!all) return -1;
+        size_t n = 0;
+        for (int s = 0; s < req->num_shards; s++)
+            for (size_t i = 0; i < req->shards[s].nwindows; i++) {
+                ReqWindow *rw = &req->shards[s].windows[i];
+                if (pass == 0) {
+                    if (rw->na) memcpy(all + n, rw->a_locs,
+                                       rw->na * sizeof(*all));
+                    n += rw->na;
+                } else {
+                    if (rw->nt) memcpy(all + n, rw->t_locs,
+                                       rw->nt * sizeof(*all));
+                    n += rw->nt;
+                }
+            }
+        qsort(all, n, sizeof(*all), segloc_cmp);
+        size_t w = 0;
+        for (size_t i = 0; i < n; i++)
+            if (w == 0 || segloc_cmp(&all[w - 1], &all[i]) != 0) all[w++] = all[i];
+        uint64_t t0s = now_us();
+        int rc = bulk_seg_apply_and_sync(req->db, all, w, 0, 0);
+        commit_phase_us_record(&g_commit_segment_sync_us_total, t0s);
+        free(all);
+        if (rc != 0) return -1;
+    }
+    if (SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_A)) return -1;
+    if (SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_T)) return -1;
+
+    /* 4. Batched clear: unlink every converged window's marker via its
+          preserved path, then ONE dir fsync. Failed (non-converged)
+          windows stay retained. */
+    int any_unlinked = 0;
+    int unlink_rc = 0;
+    int unlink_errno = 0;
+    for (int s = 0; s < req->num_shards; s++) {
+        for (size_t i = 0; i < req->shards[s].nwindows; i++) {
+            ReqWindow *rw = &req->shards[s].windows[i];
+            if (!rw->published || !rw->converged || rw->cleared) continue;
+            if (kfm2_unlink_by_path(rw->marker_path) != 0) {
+                if (!unlink_errno) unlink_errno = errno;
+                unlink_rc = -1;
+                continue; /* still fsync every successful unlink */
+            }
+            rw->unlink_succeeded = 1;
+            any_unlinked = 1;
+        }
+    }
+    int dir_rc = 0;
+    uint64_t t0c = now_us();
+    if (any_unlinked && fsync_dir(req->kf_dir) != 0) dir_rc = -1;
+    if (any_unlinked)
+        commit_phase_us_record(&g_commit_marker_clear_us_total, t0c);
+    if (any_unlinked && dir_rc == 0 &&
+        SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_C)) dir_rc = -1;
+    if (dir_rc != 0) return -1; /* no reclaim: a marker may survive crash */
+
+    /* 5. Directory-durable clears: reclaim OLD capacity, then transfer
+          terminal ownership. This is the only deferred commit_done site. */
+    for (int s = 0; s < req->num_shards; s++) {
+        for (size_t i = 0; i < req->shards[s].nwindows; i++) {
+            ReqWindow *rw = &req->shards[s].windows[i];
+            if (!rw->unlink_succeeded || rw->cleared) continue;
+            rw->cleared = 1;
+            bulk_reclaim_old_payloads_locked(&req->shards[s].txn,
+                                              &rw->plan);
+            if (rw->hooks_staged && rw->hooks.commit_done)
+                rw->hooks.commit_done(rw->hooks.ctx, rw->hook_state);
+            rw->hooks_staged = 0;
+            rw->hook_state = NULL;
+        }
+    }
+    /* Deterministic pause surface for cross-process crash tests: the
+       request-level equivalent of the legacy per-window post-clear pause
+       (all windows are converged and their markers dir-durably cleared). */
+    durability_test_pause(req->db->data_dir, "bulk-window-cleared");
+    if (unlink_rc != 0) errno = unlink_errno ? unlink_errno : EIO;
+    return unlink_rc;
+}
+
+/* ── Phase dispatch + public coordinator ── */
+
+typedef struct {
+    SlotcaskBulkRequest   *req;
+    SlotcaskBulkShardInput *in;
+    int phase;
+    int rc;
+    int err;
+} ReqPhaseArg;
+
+enum { REQ_STAGE = 1, REQ_PUBLISH = 2, REQ_FINALIZE = 3 };
+
+static void *req_phase_worker(void *raw) {
+    ReqPhaseArg *a = raw;
+    SlotcaskBulkShardInput *in = a->in;
+    if (a->phase == REQ_STAGE) {
+        const SlotcaskBulkOpts *up =
+            in->kind == SLOTCASK_BULK_INPUT_UPSERT ? &in->opts.upsert : NULL;
+        const SlotcaskBulkDeleteOpts *del =
+            in->kind == SLOTCASK_BULK_INPUT_DELETE ? &in->opts.delete_ : NULL;
+        a->rc = slotcask_bulk_stage_shard(a->req, in->kf_shard_id,
+                                           in->recs, in->nrecs, up, del);
+    } else if (a->phase == REQ_PUBLISH) {
+        a->rc = slotcask_bulk_publish_shard(a->req, in->kf_shard_id);
+    } else {
+        a->rc = slotcask_bulk_finalize_shard(a->req, in->kf_shard_id);
+    }
+    a->err = a->rc == 0 ? 0 : errno;
+    return NULL;
+}
+
+static int req_run_phase(SlotcaskBulkRequest *req,
+                         SlotcaskBulkShardInput *inputs, size_t ninputs,
+                         int phase) {
+    ReqPhaseArg *args = calloc(ninputs, sizeof(*args));
+    if (!args) return -1;
+    for (size_t i = 0; i < ninputs; i++) {
+        args[i].req = req;
+        args[i].in = &inputs[i];
+        args[i].phase = phase;
+    }
+    parallel_for_io(req_phase_worker, args, (int)ninputs, sizeof(*args));
+    int rc = 0, saved = 0;
+    for (size_t i = 0; i < ninputs; i++) {
+        if (args[i].rc != 0) {
+            inputs[i].rc = -1;
+            rc = -1;
+            if (!saved) saved = args[i].err;
+        }
+    }
+    free(args);
+    if (rc != 0) errno = saved ? saved : EIO;
+    return rc;
+}
+
+static void req_mark_durability_degraded(SlotcaskBulkRequest *req) {
+    for (size_t i = 0; i < req->ntouched; i++) {
+        ReqShard *rs = &req->shards[req->touched[i]];
+        int retained = 0;
+        for (size_t w = 0; w < rs->nwindows; w++)
+            retained |= rs->windows[w].published && !rs->windows[w].cleared;
+        if (!retained) continue;
+        int *out = rs->kind == BULK_MUTATION_UPSERT
+                 ? rs->opts.upsert.out_durability_degraded
+                 : rs->opts.delete_.out_durability_degraded;
+        if (out) *out = 1;
+    }
+}
+
+int slotcask_bulk_request_execute(SlotcaskDb *db,
+                                  SlotcaskBulkShardInput *inputs,
+                                  size_t ninputs) {
+    if (!db || !inputs || ninputs == 0 || ninputs > (size_t)INT_MAX) {
+        errno = EINVAL;
         return -1;
     }
-    if (bulk_commit_kf_windows_wave(txn) != 0) {
-        bulk_mutation_txn_free_state(txn);
+    int *touched = malloc(ninputs * sizeof(*touched));
+    if (!touched) return -1;
+    for (size_t i = 0; i < ninputs; i++) {
+        if (inputs[i].kf_shard_id < 0 ||
+            inputs[i].kf_shard_id >= db->num_shards ||
+            !inputs[i].recs || inputs[i].nrecs == 0 ||
+            (inputs[i].kind != SLOTCASK_BULK_INPUT_UPSERT &&
+             inputs[i].kind != SLOTCASK_BULK_INPUT_DELETE)) {
+            free(touched);
+            errno = EINVAL;
+            return -1;
+        }
+        inputs[i].rc = 0;
+        int *degraded = inputs[i].kind == SLOTCASK_BULK_INPUT_UPSERT
+                      ? inputs[i].opts.upsert.out_durability_degraded
+                      : inputs[i].opts.delete_.out_durability_degraded;
+        if (degraded) *degraded = 0;
+        touched[i] = inputs[i].kf_shard_id;
+        for (size_t j = 0; j < i; j++) {
+            if (inputs[j].kf_shard_id == inputs[i].kf_shard_id) {
+                free(touched);
+                errno = EINVAL;
+                return -1;
+            }
+        }
+    }
+    SlotcaskBulkRequest *req =
+        slotcask_bulk_request_begin(db, touched, ninputs);
+    free(touched);
+    if (!req) return -1;
+
+    int stage_rc = req_run_phase(req, inputs, ninputs, REQ_STAGE);
+    req->payload_rc = slotcask_bulk_request_flush_payloads(req);
+    if (req->payload_rc != 0) {
+        for (size_t si = 0; si < ninputs; si++)
+            for (size_t ri = 0; ri < inputs[si].nrecs; ri++)
+                if (inputs[si].recs[ri].status == 0)
+                    inputs[si].recs[ri].status = -1;
+    }
+    /* Every phase is joined even after failure. The phase helpers enforce
+       the shard/window predicates and become no-ops when ineligible. */
+    req->publish_rc = req_run_phase(req, inputs, ninputs, REQ_PUBLISH);
+    req->any_published = 0;           /* coordinator-only post-join merge */
+    for (size_t si = 0; si < req->ntouched; si++) {
+        ReqShard *rs = &req->shards[req->touched[si]];
+        for (size_t wi = 0; wi < rs->nwindows; wi++)
+            req->any_published |= rs->windows[wi].published;
+    }
+    req->marker_dir_rc = slotcask_bulk_request_flush_marker_dir(req);
+    if (req->any_published) {
+        SHARD_TEST_PHASE_PAUSE(SHARD_TEST_PHASE_REQ_PUBLISHED);
+        durability_test_pause(req->db->data_dir, "req-published");
+    }
+    req->finalize_rc = req_run_phase(req, inputs, ninputs, REQ_FINALIZE);
+    req->any_failed = 0;              /* coordinator-only post-join merge */
+    for (size_t si = 0; si < req->ntouched; si++)
+        req->any_failed |= req->shards[req->touched[si]].failed;
+    req->commit_rc = slotcask_bulk_request_flush_commit(req);
+
+    int pending = req->any_failed ||
+                  (req->any_published &&
+                   (req->marker_dir_rc != 0 || req->finalize_rc != 0 ||
+                    req->commit_rc != 0));
+    int failed = stage_rc != 0 || req->payload_rc != 0 ||
+                 req->publish_rc != 0 || req->marker_dir_rc != 0 ||
+                 req->finalize_rc != 0 || req->commit_rc != 0;
+    int saved = pending ? EINPROGRESS : (failed ? (errno ? errno : EIO) : 0);
+    if (pending) {
+        req_mark_durability_degraded(req);
+        for (size_t i = 0; i < ninputs; i++) {
+            ReqShard *rs = &req->shards[inputs[i].kf_shard_id];
+            for (size_t w = 0; w < rs->nwindows; w++)
+                if (rs->windows[w].published && !rs->windows[w].cleared) {
+                    inputs[i].rc = -2;
+                    break;
+                }
+        }
+    }
+    slotcask_bulk_request_end(req);   /* releases gates on this same thread */
+    if (failed) { errno = saved; return -1; }
+    return 0;
+}
+
+static int int_cmp(const void *ap, const void *bp) {
+    int a = *(const int *)ap, b = *(const int *)bp;
+    return (a > b) - (a < b);
+}
+
+/* All non-request mutation modes take the writer gates here, centrally —
+   single upsert/insert/delete adapters and the legacy per-shard bulk
+   entry points all route through this transaction (the deferred
+   coordinator never calls it, so it cannot self-deadlock). Ascending
+   acquire, reverse release; ordinary writers hold exactly one gate. */
+static int slotcask_bulk_mutation_transaction(BulkMutationTxn *txn) {
+    int *ids = NULL;
+    size_t nids = 0;
+    int rc = -1;
+    if (!txn || !txn->db || !txn->shards || txn->nshards == 0) {
+        errno = EINVAL;
         return -1;
     }
+    ids = malloc(txn->nshards * sizeof(*ids));
+    if (!ids) return -1;
+    for (size_t i = 0; i < txn->nshards; i++)
+        ids[nids++] = txn->shards[i].kf_shard_id;
+    qsort(ids, nids, sizeof(*ids), int_cmp);
+    size_t w = 0;
+    for (size_t i = 0; i < nids; i++)
+        if (w == 0 || ids[w - 1] != ids[i]) ids[w++] = ids[i];
+    nids = w;
+    for (size_t i = 0; i < nids; i++) writer_gate_lock(txn->db, ids[i]);
+
+    if (bulk_stage_payload_wave(txn) != 0) goto out;
+    if (bulk_commit_kf_windows_wave(txn) != 0) goto out;
     rc = bulk_finish_status(txn);
+out:
     bulk_mutation_txn_free_state(txn);
+    for (size_t i = nids; i > 0; i--)
+        writer_gate_unlock(txn->db, ids[i - 1]);
+    free(ids);
     return rc;
 }
 
@@ -5754,7 +7111,8 @@ static int upsert_adapter_pre_commit(const SlotcaskOldRecord *old,
    index writes with no home but the pre-marker pre_commit hook. */
 static int upsert_adapter_prepare_window(SlotcaskBulkRec *recs,
                                          const size_t *active, size_t nactive,
-                                         void *ctx) {
+                                         void *ctx, void **out_window_state) {
+    *out_window_state = NULL;   /* single record: scratch stays in actx */
     if (nactive == 0) return 0;
     SlotcaskBulkRec *rec = &recs[active[0]];
     UpsertAdapterCtx *actx = (UpsertAdapterCtx *)ctx;
@@ -5777,7 +7135,8 @@ static int upsert_adapter_prepare_window(SlotcaskBulkRec *recs,
 
 static int upsert_adapter_apply_window(SlotcaskBulkRec *recs,
                                        const size_t *active, size_t nactive,
-                                       void *ctx) {
+                                       void *ctx, void *window_state) {
+    (void)window_state;
     if (nactive == 0) return 0;
     SlotcaskBulkRec *rec = &recs[active[0]];
     UpsertAdapterCtx *actx = (UpsertAdapterCtx *)ctx;
@@ -5787,7 +7146,8 @@ static int upsert_adapter_apply_window(SlotcaskBulkRec *recs,
                             uo->pre_commit_ctx) != 0 ? -1 : 0;
 }
 
-static void upsert_adapter_abort_window(void *ctx) {
+static void upsert_adapter_abort_window(void *ctx, void *window_state) {
+    (void)window_state;
     UpsertAdapterCtx *actx = (UpsertAdapterCtx *)ctx;
     const SlotcaskUpsertOpts *uo = actx->uo;
     if (uo->prepare_commit && uo->abort_commit) uo->abort_commit(uo->pre_commit_ctx);
@@ -6572,8 +7932,9 @@ static int delete_adapter_pre_commit(const SlotcaskOldRecord *old,
 
 static int delete_adapter_prepare_window(SlotcaskBulkRec *recs,
                                          const size_t *active, size_t nactive,
-                                         void *ctx) {
+                                         void *ctx, void **out_window_state) {
     (void)recs;
+    *out_window_state = NULL;   /* single record: scratch stays in actx */
     if (nactive == 0) return 0;
     DeleteAdapterCtx *actx = (DeleteAdapterCtx *)ctx;
     const SlotcaskDeleteOpts *dopt = actx->dopt;
@@ -6586,7 +7947,8 @@ static int delete_adapter_prepare_window(SlotcaskBulkRec *recs,
 
 static int delete_adapter_apply_window(SlotcaskBulkRec *recs,
                                        const size_t *active, size_t nactive,
-                                       void *ctx) {
+                                       void *ctx, void *window_state) {
+    (void)window_state;
     if (nactive == 0) return 0;
     DeleteAdapterCtx *actx = (DeleteAdapterCtx *)ctx;
     const SlotcaskDeleteOpts *dopt = actx->dopt;
@@ -6597,7 +7959,8 @@ static int delete_adapter_apply_window(SlotcaskBulkRec *recs,
                               dopt->pre_commit_ctx) != 0 ? -1 : 0;
 }
 
-static void delete_adapter_abort_window(void *ctx) {
+static void delete_adapter_abort_window(void *ctx, void *window_state) {
+    (void)window_state;
     DeleteAdapterCtx *actx = (DeleteAdapterCtx *)ctx;
     const SlotcaskDeleteOpts *dopt = actx->dopt;
     if (dopt->abort_commit) dopt->abort_commit(dopt->pre_commit_ctx);

@@ -1499,6 +1499,10 @@ int index_sync_record_fields(const char *db_root, const char *object, int splits
 int bitmap_sync_shard_path(const char *db_root, const char *object,
                            const char *field, int kf_shard, int splits);
 
+/* Fdatasync a set of distinct index-file paths in parallel (bulk window
+   flush seam). Paths must be distinct files; any failure → -1. */
+int index_sync_path_set(const char *const *paths, size_t n);
+
 /* ── Bitmap prepare/apply split ──────────────────────────────────────────
    Closes the cap-check-then-apply race without transferring rwlock-owned
    handles across threads: every BitmapShard writer handle opened by
@@ -1555,6 +1559,10 @@ typedef struct {
     BitmapPendingValue *pending;
     size_t              npending;
     size_t              pending_cap;
+    /* Reopen parameters captured at first open, so apply can reacquire
+       the handle within its own call stack (see unpark). */
+    uint32_t            bm_max_values;
+    int                 bool_fastpath;
 } BitmapWindowEntry;
 
 typedef struct {
@@ -1572,6 +1580,10 @@ typedef struct {
     size_t              n_entries, cap_entries;
     BitmapWindowOp     *ops;
     size_t              n_ops, cap_ops;
+    /* Origin coordinates for apply-time handle reopen (see unpark). */
+    char                db_root[PATH_MAX];
+    char                object[256];
+    int                 splits;
 } BitmapPrepareWindow;
 
 int  bitmap_prepare_window_init(BitmapPrepareWindow *win, size_t max_fields,
@@ -1584,6 +1596,13 @@ int  bitmap_prepare_window_add(BitmapPrepareWindow *win, const UpdateIdxArg *arg
                                char *err_field, size_t err_field_len);
 /* Applies every staged op in the order added, then closes all handles. */
 int  bitmap_prepare_window_apply(BitmapPrepareWindow *win);
+/* Release every entry's open bitmap handle while keeping the staged ops
+   and pending-value bookkeeping. apply() reopens each handle within its
+   own call stack. Bulk windows MUST unpark before their prepare call
+   returns: a cache-entry writer lock parked across the deferred request's
+   wave boundaries blocks every other bm-cache participant (including LRU
+   eviction) for the request's whole span. */
+void bitmap_prepare_window_unpark(BitmapPrepareWindow *win);
 void bitmap_prepare_window_abort(BitmapPrepareWindow *win);
 void bitmap_prepare_window_free(BitmapPrepareWindow *win);
 

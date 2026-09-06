@@ -6,6 +6,39 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**Request-level commit batching + marker V2 (2026.09).** Indexed bulk
+insert/update/delete now execute as one deferred request with two-epoch
+waves (stage → payload flush → publish → one marker-dir fsync → finalize →
+commit flush), collapsing per-window durability barrier groups into three
+request-level flush passes (~10× fewer durable ops on a 1M-record kv
+insert, ~5–10× on a 100k × 14-index insert). Per-kf-shard **writer
+admission gates** are held request-wide by the coordinator: requests on
+disjoint shards run concurrently, single writes to a touched shard stall
+for the request span, readers never block, and the kf rwlock stays
+phase-local (readers between waves see only coherent old/new records).
+Marker format **V2**: a 16-byte header + one 32-byte `KfMarkerSlot` per
+record (exact-size validated, `1 ≤ count ≤ 16384`, worst case 524,304 B) —
+the variable-length key/old/new spans are gone (replay re-derives bytes
+from the segment records the slots name), removing the V1 write
+amplification and the 64 MiB marker-size ceiling that could brick startup
+for large-record schemas. V1 markers are refused at replay with a logged
+upgrade note (`ENOTSUP`); all writes must be durable before upgrading.
+Marker publication is now no-replace (`link`) from a unique temp, with
+nonce-bearing final names (`<shard>_batch_<id>_<nonce>_marker.dat`) so
+identity is the exact path (`MarkerRef`) — gate replay, startup recovery,
+and clears never reconstruct filenames from shard/batch IDs, and a nonce
+collision can never overwrite a retained intent. A stream directory-entry
+durability hole is closed: `seg_open_file` fsyncs the `data/streams/NNN`
+dir when it creates a segment file (pre-existing on main for
+single-record writes too). The window index flush now issues btree/trigram
+fdatasyncs in parallel (`index_sync_path_set`), and a lost touch-set entry
+(OOM) fails the window before its marker can be cleared instead of
+silently proceeding. `BULK_COMMIT_WINDOW` now bounds marker size and
+replay granularity, not barrier boundaries. New regression tests:
+`test-request-flush-batching` (retention, failure semantics, D5 fallback
+payloads, gate admission, concurrency, inline/limited-pool) and
+`test-marker-v2` (format validation, v1 refusal, gate fail-closed cases).
+
 **Bulk-commit throughput + durability closure (2026.09).** Indexed bulk
 insert/update/delete now collect the unique (field, idx shard) files a
 window touched — btree, trigram, and bitmap alike — and fdatasync each

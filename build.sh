@@ -221,6 +221,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_or_keyset_cap.c \
     src/test/cases/test_agg_walk_fetch_check.c \
     src/test/cases/test_regex_anchor_prefilter.c \
+    src/test/cases/test_request_flush_batching.c \
     src/test/cases/test_request_timeout.c \
     src/test/cases/test_and_intersection.c \
     src/test/cases/test_find_cursor.c \
@@ -247,6 +248,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_warmup_vacuum_norace.c \
     src/test/cases/test_bench_stats.c \
     src/test/cases/test_durability_ordering.c \
+    src/test/cases/test_marker_v2.c \
     src/test/cases/test_window_release_routes.c \
     src/test/cases/test_durability_sync_failures.c \
     src/test/cases/test_commit_phase_metrics.c \

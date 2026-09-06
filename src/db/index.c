@@ -654,6 +654,9 @@ static BitmapWindowEntry *bitmap_window_find_or_open(BitmapPrepareWindow *win, c
     snprintf(e->field, sizeof(e->field), "%s", arg->field);
     e->kf_shard = arg->kf_shard;
     e->bm = bm;
+    e->bm_max_values = arg->bm_max_values;
+    e->bool_fastpath = (arg->new_key && arg->new_len == 1) ||
+                       (arg->old_key && arg->old_len == 1);
     e->pending = NULL;
     e->npending = 0;
     e->pending_cap = 0;
@@ -710,11 +713,41 @@ int bitmap_prepare_window_add(BitmapPrepareWindow *win, const UpdateIdxArg *arg,
     return 0;
 }
 
+/* Reopen one entry's writer handle within apply's call stack (after an
+   unpark). Serialized against every other writer by the request's writer
+   gate, so the file cannot have changed hands since prepare validated it.
+   NULL on I/O failure (errno set). */
+static BitmapShard *bitmap_window_entry_reopen(BitmapPrepareWindow *win,
+                                               BitmapWindowEntry *e) {
+    UpdateIdxArg a = {0};
+    a.db_root = win->db_root;
+    a.object  = win->object;
+    a.field   = e->field;
+    a.splits  = win->splits;
+    a.kf_shard = e->kf_shard;
+    a.bm_max_values = e->bm_max_values;
+    /* bitmap_prepare_open derives bool_fastpath from a 1-byte key; honor
+       the flag captured at first open via a length-only hint. */
+    static uint8_t bm_fastpath_hint[1] = { 0 };
+    if (e->bool_fastpath) {
+        a.new_key = bm_fastpath_hint;
+        a.new_len = 1;
+    }
+    return bitmap_prepare_open(&a);
+}
+
 int bitmap_prepare_window_apply(BitmapPrepareWindow *win) {
     int rc = 0;
     for (size_t i = 0; i < win->n_ops; i++) {
         BitmapWindowOp *op = &win->ops[i];
-        BitmapShard *bm = (BitmapShard *)win->entries[op->entry_idx].bm;
+        BitmapWindowEntry *e = &win->entries[op->entry_idx];
+        if (!e->bm) {
+            /* Parked by prepare (unpark before the wave boundary):
+               reacquire within this call stack. */
+            e->bm = bitmap_window_entry_reopen(win, e);
+            if (!e->bm) { rc = -1; continue; }
+        }
+        BitmapShard *bm = (BitmapShard *)e->bm;
         if (!bm) continue;
         if (bitmap_apply_grow_for_slot(bm, op->kf_slot) != 0) {
             rc = -1;
@@ -739,6 +772,13 @@ int bitmap_prepare_window_apply(BitmapPrepareWindow *win) {
     win->n_entries = 0;
     win->n_ops = 0;
     return rc;
+}
+
+void bitmap_prepare_window_unpark(BitmapPrepareWindow *win) {
+    for (size_t i = 0; i < win->n_entries; i++) {
+        BitmapWindowEntry *e = &win->entries[i];
+        if (e->bm) { bm_close((BitmapShard *)e->bm); e->bm = NULL; }
+    }
 }
 
 void bitmap_prepare_window_abort(BitmapPrepareWindow *win) {
@@ -880,6 +920,59 @@ int index_sync_record_fields(const char *db_root, const char *object, int splits
     }
     int saved_err = 0;
     for (int i = 0; i < n; i++)
+        if (args[i].rc != 0) {
+            rc = -1;
+            if (!saved_err) saved_err = args[i].err;
+        }
+    free(args);
+    if (rc != 0) errno = saved_err ? saved_err : EIO;
+    return rc;
+}
+
+/* ── Window-flush issuer ────────────────────────────────────────────────
+   The bulk window flush seam hands over fdatasync targets that are all
+   distinct files: issue them through parallel_for (same contract as
+   index_sync_record_fields for nfields > 1) instead of one blocking wait
+   per file. Any failure → -1 with errno set to the first failing
+   flush's errno (or EIO). */
+typedef struct {
+    const char *path;
+    int rc;
+    int err;
+} PathSyncArg;
+
+static void *path_sync_thread_fn(void *p) {
+    PathSyncArg *a = (PathSyncArg *)p;
+    a->rc = btree_sync_path(a->path);
+    a->err = a->rc != 0 ? errno : 0;
+    return NULL;
+}
+
+int index_sync_path_set(const char *const *paths, size_t n) {
+    if (n == 0) return 0;
+    if (!paths || n > (size_t)INT_MAX) { errno = EINVAL; return -1; }
+    PathSyncArg *args = malloc(n * sizeof(*args));
+    if (!args) {
+        int rc = 0, saved_err = 0;
+        for (size_t i = 0; i < n; i++)
+            if (btree_sync_path(paths[i]) != 0) {
+                if (!saved_err) saved_err = errno;
+                rc = -1;
+            }
+        if (rc != 0) errno = saved_err ? saved_err : EIO;
+        return rc;
+    }
+    for (size_t i = 0; i < n; i++) {
+        args[i].path = paths[i];
+        args[i].rc = 0;
+        args[i].err = 0;
+    }
+    if (n == 1)
+        path_sync_thread_fn(&args[0]);
+    else
+        parallel_for(path_sync_thread_fn, args, n, sizeof(*args));
+    int rc = 0, saved_err = 0;
+    for (size_t i = 0; i < n; i++)
         if (args[i].rc != 0) {
             rc = -1;
             if (!saved_err) saved_err = args[i].err;

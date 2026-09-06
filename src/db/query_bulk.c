@@ -352,6 +352,19 @@ typedef struct {
     BtEntry       **idx_pairs;        /* [nidx] */
     size_t         *idx_pair_counts;  /* [nidx] */
     size_t         *idx_pair_caps;    /* [nidx] */
+    /* Deferred-request input. The worker prepares it (batch, per-record
+       ctxs, arenas, hook context — all owned HERE and alive until
+       bulk_ins_finish_request); the command thread executes one request
+       over every worker's input and only then folds results and frees. */
+    SlotcaskBulkShardInput input;
+    int             prepared;
+    SlotcaskBulkRec *batch;
+    void            *ctxs;      /* V2BulkInsCtx[], freed opaque here */
+    int             *kf_shard_of;
+    int             *kf_counts;
+    int             *kf_offsets;
+    int             *kf_cursors;
+    uint8_t         *old_arena;
 } BulkInsShardWork;
 
 /* Build the shard→worker mapping used by every parallel bulk path
@@ -459,97 +472,114 @@ static int v2_bulk_ins_ac_value_compute(const SlotcaskOldRecord *old,
     return 0;
 }
 
-/* Track a malloc'd key buffer so it survives from prepare_window (where
-   it's queued into sw->bw_window or sw->tg_ops) through apply_window
-   (which actually dereferences it), then gets freed exactly once. */
-static int bw_track_buf(BulkInsShardWork *sw, void *buf) {
+/* Per-window staged index state. With deferred request batching the
+ * coordinator's publish pass prepares EVERY window of a shard before any
+ * finalize pass applies one, so per-window staging can no longer live in
+ * the shared worker struct — prepare_window allocates one of these, the
+ * coordinator carries it opaquely, apply_window consumes it, and exactly
+ * one terminal hook frees it. */
+typedef struct {
+    BitmapPrepareWindow bw_window;
+    void               **bw_bufs;       /* malloc'd key buffers kept alive
+                                            until apply/abort closes
+                                            bw_window */
+    size_t               bw_nbufs, bw_bufs_cap;
+    UpdateIdxArg        *tg_ops;
+    size_t                tg_nops, tg_cap;
+    BtDeleteOp          *bt_del_ops;
+    size_t                bt_del_nops, bt_del_cap;
+    /* Per-window staged new-entry B-tree inserts, [nidx] arrays —
+       consumed (flushed) by apply_window, freed by the terminal hook. */
+    BtEntry             **idx_pairs;
+    size_t               *idx_pair_counts;
+    size_t               *idx_pair_caps;
+    int                   nidx;
+} BulkInsWindowState;
+
+/* The worker-ctx variants of the staging helpers, re-keyed onto the
+   per-window state. */
+static int bw_track_buf(BulkInsWindowState *ws, void *buf) {
     if (!buf) return 0;
-    if (sw->bw_nbufs >= sw->bw_bufs_cap) {
-        size_t ncap = sw->bw_bufs_cap ? sw->bw_bufs_cap * 2 : 32;
-        void **t = realloc(sw->bw_bufs, ncap * sizeof(void *));
+    if (ws->bw_nbufs >= ws->bw_bufs_cap) {
+        size_t ncap = ws->bw_bufs_cap ? ws->bw_bufs_cap * 2 : 32;
+        void **t = realloc(ws->bw_bufs, ncap * sizeof(void *));
         if (!t) return -1;
-        sw->bw_bufs = t;
-        sw->bw_bufs_cap = ncap;
+        ws->bw_bufs = t;
+        ws->bw_bufs_cap = ncap;
     }
-    sw->bw_bufs[sw->bw_nbufs++] = buf;
+    ws->bw_bufs[ws->bw_nbufs++] = buf;
     return 0;
 }
 
-static void bw_free_bufs(BulkInsShardWork *sw) {
-    for (size_t i = 0; i < sw->bw_nbufs; i++) free(sw->bw_bufs[i]);
-    free(sw->bw_bufs);
-    sw->bw_bufs = NULL;
-    sw->bw_nbufs = 0;
-    sw->bw_bufs_cap = 0;
+static void bw_free_bufs(BulkInsWindowState *ws) {
+    for (size_t i = 0; i < ws->bw_nbufs; i++) free(ws->bw_bufs[i]);
+    free(ws->bw_bufs);
+    ws->bw_bufs = NULL;
+    ws->bw_nbufs = 0;
+    ws->bw_bufs_cap = 0;
 }
 
-/* Returns a buffer holding the old index key that's safe to reference from
-   a deferred apply_window op. `buf` may point into the per-worker OLD-key
-   arena (owned == 0), which is reused by the next record's prepare call
-   before apply_window ever runs — those bytes must be copied out. When the
-   buffer is already independently heap-allocated for this record
-   (owned == 1), ownership just transfers into bw_track_buf() instead.
-   Sets *err = -1 on allocation/tracking failure (caller must abort the
-   window); leaves *err untouched on success. */
-static uint8_t *bw_stage_old_key(BulkInsShardWork *sw, uint8_t *buf, size_t len,
-                                  int owned, int *err) {
+static uint8_t *bw_stage_old_key(BulkInsWindowState *ws, uint8_t *buf,
+                                  size_t len, int owned, int *err) {
     if (owned) {
-        if (bw_track_buf(sw, buf) != 0) { free(buf); *err = -1; return NULL; }
+        if (bw_track_buf(ws, buf) != 0) { free(buf); *err = -1; return NULL; }
         return buf;
     }
     uint8_t *copy = malloc(len);
     if (!copy) { *err = -1; return NULL; }
     memcpy(copy, buf, len);
-    if (bw_track_buf(sw, copy) != 0) { free(copy); *err = -1; return NULL; }
+    if (bw_track_buf(ws, copy) != 0) { free(copy); *err = -1; return NULL; }
     return copy;
 }
 
-/* Queue a trigram mutation for apply_window. Real dispatch (update_idx_fn)
-   must not happen until the window's marker is durable. */
-static int tg_track_op(BulkInsShardWork *sw, const UpdateIdxArg *a) {
-    if (sw->tg_nops >= sw->tg_cap) {
-        size_t ncap = sw->tg_cap ? sw->tg_cap * 2 : 32;
-        UpdateIdxArg *t = realloc(sw->tg_ops, ncap * sizeof(UpdateIdxArg));
+static int tg_track_op(BulkInsWindowState *ws, const UpdateIdxArg *a) {
+    if (ws->tg_nops >= ws->tg_cap) {
+        size_t ncap = ws->tg_cap ? ws->tg_cap * 2 : 32;
+        UpdateIdxArg *t = realloc(ws->tg_ops, ncap * sizeof(UpdateIdxArg));
         if (!t) return -1;
-        sw->tg_ops = t;
-        sw->tg_cap = ncap;
+        ws->tg_ops = t;
+        ws->tg_cap = ncap;
     }
-    sw->tg_ops[sw->tg_nops++] = *a;
+    ws->tg_ops[ws->tg_nops++] = *a;
     return 0;
 }
 
-/* Queue a B-tree old-entry deletion for apply_window. Real dispatch
-   (delete_index_entry) must not happen until the window's marker is
-   durable. */
-static int bt_track_del_op(BulkInsShardWork *sw, const BtDeleteOp *op) {
-    if (sw->bt_del_nops >= sw->bt_del_cap) {
-        size_t ncap = sw->bt_del_cap ? sw->bt_del_cap * 2 : 32;
-        BtDeleteOp *t = realloc(sw->bt_del_ops, ncap * sizeof(BtDeleteOp));
+static int bt_track_del_op(BulkInsWindowState *ws, const BtDeleteOp *op) {
+    if (ws->bt_del_nops >= ws->bt_del_cap) {
+        size_t ncap = ws->bt_del_cap ? ws->bt_del_cap * 2 : 32;
+        BtDeleteOp *t = realloc(ws->bt_del_ops, ncap * sizeof(BtDeleteOp));
         if (!t) return -1;
-        sw->bt_del_ops = t;
-        sw->bt_del_cap = ncap;
+        ws->bt_del_ops = t;
+        ws->bt_del_cap = ncap;
     }
-    sw->bt_del_ops[sw->bt_del_nops++] = *op;
+    ws->bt_del_ops[ws->bt_del_nops++] = *op;
     return 0;
 }
 
-/* Releases every resource a window's prepare_window may have staged:
- * open bitmap writer handles, tracked key buffers, queued trigram ops,
- * queued B-tree deletions, and any B-tree inserts already accumulated
- * for this window's idx_pairs. Used both when a window is torn down
- * without ever reaching apply (hard staging failure, or every active
- * record individually rejected) and, for idx_pairs, is mirrored by
- * apply_window's own post-flush reset. */
-static void v2_bulk_ins_window_release(BulkInsShardWork *sw) {
-    bitmap_prepare_window_free(&sw->bw_window);
-    bw_free_bufs(sw);
-    free(sw->tg_ops); sw->tg_ops = NULL; sw->tg_nops = sw->tg_cap = 0;
-    free(sw->bt_del_ops); sw->bt_del_ops = NULL; sw->bt_del_nops = sw->bt_del_cap = 0;
-    for (int fi = 0; fi < sw->nidx; fi++) {
-        for (size_t k = 0; k < sw->idx_pair_counts[fi]; k++)
-            free((void *)sw->idx_pairs[fi][k].value);
-        sw->idx_pair_counts[fi] = 0;
+/* Releases every resource a window's prepare_window staged, and the
+ * window-state object itself. Used by all three terminal routes
+ * (commit_done / release_window / abort_window) and by prepare's own
+ * all-rejected teardown. NULL state is a no-op (prepare staged nothing). */
+static void v2_bulk_ins_window_release_state(void *ctx, void *window_state) {
+    BulkInsShardWork *sw = ctx;
+    BulkInsWindowState *ws = window_state;
+    (void)sw;
+    if (!ws) return;
+    bitmap_prepare_window_free(&ws->bw_window);
+    bw_free_bufs(ws);
+    free(ws->tg_ops); ws->tg_ops = NULL; ws->tg_nops = ws->tg_cap = 0;
+    free(ws->bt_del_ops); ws->bt_del_ops = NULL; ws->bt_del_nops = ws->bt_del_cap = 0;
+    if (ws->idx_pairs) {
+        for (int fi = 0; fi < ws->nidx; fi++) {
+            for (size_t k = 0; k < ws->idx_pair_counts[fi]; k++)
+                free((void *)ws->idx_pairs[fi][k].value);
+            free(ws->idx_pairs[fi]);
+        }
+        free(ws->idx_pairs);
     }
+    free(ws->idx_pair_counts);
+    free(ws->idx_pair_caps);
+    free(ws);
 }
 
 /* Two-phase replacement for the old single-phase bulk index hook.
@@ -580,16 +610,41 @@ static void v2_bulk_ins_window_release(BulkInsShardWork *sw) {
  * taken before this record's first field — so a rejected record leaves
  * zero staged index side effects across every field type. */
 static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *active,
-                                       size_t nactive, void *ctx) {
+                                       size_t nactive, void *ctx,
+                                       void **out_window_state) {
     BulkInsShardWork *sw = (BulkInsShardWork *)ctx;
+    *out_window_state = NULL;
     if (sw->nidx == 0 || nactive == 0) return 0;
 
-    if (bitmap_prepare_window_init(&sw->bw_window, (size_t)sw->nidx,
-                                    nactive * (size_t)sw->nidx) != 0)
+    BulkInsWindowState *ws = calloc(1, sizeof(*ws));
+    if (!ws) return -1;
+    ws->nidx = sw->nidx;
+    ws->idx_pairs = calloc((size_t)sw->nidx, sizeof(BtEntry *));
+    ws->idx_pair_counts = calloc((size_t)sw->nidx, sizeof(size_t));
+    ws->idx_pair_caps = calloc((size_t)sw->nidx, sizeof(size_t));
+    if (!ws->idx_pairs || !ws->idx_pair_counts || !ws->idx_pair_caps) {
+        v2_bulk_ins_window_release_state(sw, ws);
         return -1;
-    sw->bw_bufs = NULL; sw->bw_nbufs = 0; sw->bw_bufs_cap = 0;
-    sw->tg_ops = NULL; sw->tg_nops = 0; sw->tg_cap = 0;
-    sw->bt_del_ops = NULL; sw->bt_del_nops = 0; sw->bt_del_cap = 0;
+    }
+    for (int fi = 0; fi < sw->nidx; fi++) {
+        ws->idx_pair_caps[fi] = 64;
+        ws->idx_pairs[fi] = malloc(ws->idx_pair_caps[fi] * sizeof(BtEntry));
+        if (!ws->idx_pairs[fi]) {
+            v2_bulk_ins_window_release_state(sw, ws);
+            return -1;
+        }
+    }
+
+    if (bitmap_prepare_window_init(&ws->bw_window, (size_t)sw->nidx,
+                                    nactive * (size_t)sw->nidx) != 0) {
+        v2_bulk_ins_window_release_state(sw, ws);
+        return -1;
+    }
+    snprintf(ws->bw_window.db_root, sizeof(ws->bw_window.db_root),
+             "%s", sw->db_root);
+    snprintf(ws->bw_window.object, sizeof(ws->bw_window.object),
+             "%s", sw->object);
+    ws->bw_window.splits = sw->sch->splits;
 
     size_t nsurvive = 0;
 
@@ -642,12 +697,12 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
 
         const uint8_t *new_value = (const uint8_t *)rec->value;
         int record_rejected = 0;
-        size_t tg_start = sw->tg_nops;
-        size_t bt_del_start = sw->bt_del_nops;
+        size_t tg_start = ws->tg_nops;
+        size_t bt_del_start = ws->bt_del_nops;
         size_t idx_pair_start[MAX_FIELDS];
-        for (int fi = 0; fi < sw->nidx; fi++) idx_pair_start[fi] = sw->idx_pair_counts[fi];
+        for (int fi = 0; fi < sw->nidx; fi++) idx_pair_start[fi] = ws->idx_pair_counts[fi];
         BitmapWindowCheckpoint bm_cp;
-        bitmap_prepare_window_checkpoint(&sw->bw_window, &bm_cp);
+        bitmap_prepare_window_checkpoint(&ws->bw_window, &bm_cp);
 
         for (int fi = 0; fi < sw->nidx; fi++) {
             enum IndexType itype = sw->idx_types ? sw->idx_types[fi] : IT_BTREE;
@@ -699,12 +754,12 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                 if (tg_bm_change) {
                     int err = 0;
                     uint8_t *staged_old = old_idx_have[fi]
-                        ? bw_stage_old_key(sw, old_idx_bufs[fi], old_idx_lens[fi],
+                        ? bw_stage_old_key(ws, old_idx_bufs[fi], old_idx_lens[fi],
                                           old_idx_owned[fi], &err)
                         : NULL;
                     if (err) {
                         free(key_buf);
-                        v2_bulk_ins_window_release(sw);
+                        v2_bulk_ins_window_release_state(sw, ws);
                         return -1;
                     }
                     UpdateIdxArg ta = {0};
@@ -717,10 +772,10 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                     ta.hash = r->hash; ta.type = IT_TRIGRAM;
                     ta.sync_after = 0;  /* flush seam syncs once per touched
                                            (field, idx shard) after apply */
-                    int tracked = !have_new || (bw_track_buf(sw, key_buf) == 0);
-                    if (!tracked || tg_track_op(sw, &ta) != 0) {
+                    int tracked = !have_new || (bw_track_buf(ws, key_buf) == 0);
+                    if (!tracked || tg_track_op(ws, &ta) != 0) {
                         if (!tracked) free(key_buf);
-                        v2_bulk_ins_window_release(sw);
+                        v2_bulk_ins_window_release_state(sw, ws);
                         return -1;
                     }
                 } else {
@@ -734,12 +789,12 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                 if (tg_bm_change) {
                     int err = 0;
                     uint8_t *staged_old = old_idx_have[fi]
-                        ? bw_stage_old_key(sw, old_idx_bufs[fi], old_idx_lens[fi],
+                        ? bw_stage_old_key(ws, old_idx_bufs[fi], old_idx_lens[fi],
                                           old_idx_owned[fi], &err)
                         : NULL;
                     if (err) {
                         free(key_buf);
-                        v2_bulk_ins_window_release(sw);
+                        v2_bulk_ins_window_release_state(sw, ws);
                         return -1;
                     }
                     UpdateIdxArg ba = {0};
@@ -752,12 +807,12 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                     ba.hash = r->hash; ba.type = IT_BITMAP;
                     ba.kf_shard = rec->kf_shard; ba.kf_slot = rec->kf_slot;
                     char errf[128];
-                    int rc = bitmap_prepare_window_add(&sw->bw_window, &ba,
+                    int rc = bitmap_prepare_window_add(&ws->bw_window, &ba,
                                                         errf, sizeof(errf));
                     if (rc == 0) {
-                        if (have_new && bw_track_buf(sw, key_buf) != 0) {
+                        if (have_new && bw_track_buf(ws, key_buf) != 0) {
                             free(key_buf);
-                            v2_bulk_ins_window_release(sw);
+                            v2_bulk_ins_window_release_state(sw, ws);
                             return -1;
                         }
                     } else if (rc == 1) {
@@ -765,7 +820,7 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                         record_rejected = 1;
                     } else {
                         free(key_buf);
-                        v2_bulk_ins_window_release(sw);
+                        v2_bulk_ins_window_release_state(sw, ws);
                         return -1;
                     }
                 } else {
@@ -781,11 +836,11 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                the window's marker is durable). */
             if (old_idx_have[fi] && !unchanged) {
                 int err = 0;
-                uint8_t *staged_old = bw_stage_old_key(sw, old_idx_bufs[fi], old_idx_lens[fi],
+                uint8_t *staged_old = bw_stage_old_key(ws, old_idx_bufs[fi], old_idx_lens[fi],
                                                        old_idx_owned[fi], &err);
                 if (err) {
                     free(key_buf);
-                    v2_bulk_ins_window_release(sw);
+                    v2_bulk_ins_window_release_state(sw, ws);
                     return -1;
                 }
                 BtDeleteOp bdop;
@@ -793,9 +848,9 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                 bdop.key = staged_old;
                 bdop.klen = old_idx_lens[fi];
                 memcpy(bdop.hash, r->hash, 16);
-                if (bt_track_del_op(sw, &bdop) != 0) {
+                if (bt_track_del_op(ws, &bdop) != 0) {
                     free(key_buf);
-                    v2_bulk_ins_window_release(sw);
+                    v2_bulk_ins_window_release_state(sw, ws);
                     return -1;
                 }
             } else if (old_idx_have[fi] && old_idx_owned[fi]) {
@@ -805,13 +860,13 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
             if (unchanged) { free(key_buf); continue; }
 
             if (have_new) {
-                if (sw->idx_pair_counts[fi] >= sw->idx_pair_caps[fi]) {
-                    size_t new_cap = sw->idx_pair_caps[fi] ? sw->idx_pair_caps[fi] * 2 : 64;
+                if (ws->idx_pair_counts[fi] >= ws->idx_pair_caps[fi]) {
+                    size_t new_cap = ws->idx_pair_caps[fi] ? ws->idx_pair_caps[fi] * 2 : 64;
                     /* Keep the existing entries live on OOM so the common
                        window-release path can free every already allocated
                        key.  xrealloc_or_free() releases only the outer
                        array, leaking those per-entry values. */
-                    BtEntry *t = realloc(sw->idx_pairs[fi], new_cap * sizeof(BtEntry));
+                    BtEntry *t = realloc(ws->idx_pairs[fi], new_cap * sizeof(BtEntry));
                     if (!t) {
                         /* Abort the whole pre-marker window rather than
                            silently committing records with a missing B-tree
@@ -819,13 +874,13 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                         LOG_ERROR(LOG_SUB_INDEX, "INDEX_OOM shard=%d field=%s (aborting bulk window)",
                                 sw->shard_id, sw->idx_fields[fi]);
                         free(key_buf);
-                        v2_bulk_ins_window_release(sw);
+                        v2_bulk_ins_window_release_state(sw, ws);
                         return -1;
                     }
-                    sw->idx_pairs[fi] = t;
-                    sw->idx_pair_caps[fi] = new_cap;
+                    ws->idx_pairs[fi] = t;
+                    ws->idx_pair_caps[fi] = new_cap;
                 }
-                BtEntry *bp = &sw->idx_pairs[fi][sw->idx_pair_counts[fi]++];
+                BtEntry *bp = &ws->idx_pairs[fi][ws->idx_pair_counts[fi]++];
                 bp->value = (const char *)key_buf;
                 bp->vlen  = key_len;
                 memcpy(bp->hash, r->hash, 16);
@@ -837,26 +892,35 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
         if (record_rejected) {
             /* Undo every index diff this record staged so far, across all
                field types, so a rejected record leaves zero side effects. */
-            sw->tg_nops = tg_start;
-            sw->bt_del_nops = bt_del_start;
+            ws->tg_nops = tg_start;
+            ws->bt_del_nops = bt_del_start;
             for (int fi = 0; fi < sw->nidx; fi++) {
-                for (size_t k = idx_pair_start[fi]; k < sw->idx_pair_counts[fi]; k++)
-                    free((void *)sw->idx_pairs[fi][k].value);
-                sw->idx_pair_counts[fi] = idx_pair_start[fi];
+                for (size_t k = idx_pair_start[fi]; k < ws->idx_pair_counts[fi]; k++)
+                    free((void *)ws->idx_pairs[fi][k].value);
+                ws->idx_pair_counts[fi] = idx_pair_start[fi];
             }
-            bitmap_prepare_window_rollback(&sw->bw_window, &bm_cp);
+            bitmap_prepare_window_rollback(&ws->bw_window, &bm_cp);
             recs[j].status = -1;
             continue;
         }
         nsurvive++;
     }
 
+    /* Release the parked bitmap writer handles before this call returns:
+       cache-entry locks must never span the deferred request's wave
+       boundaries (publish → finalize). apply_window reopens each handle
+       within its own call stack, serialized by the request's writer gate.
+       The staged ops/pending bookkeeping is untouched. */
+    bitmap_prepare_window_unpark(&ws->bw_window);
+
     if (nsurvive == 0) {
         /* Every active record in this window was individually rejected;
            apply_window will never be invoked for an empty active set, so
            release the window's staged resources here instead. */
-        v2_bulk_ins_window_release(sw);
+        v2_bulk_ins_window_release_state(sw, ws);
+        ws = NULL;
     }
+    *out_window_state = ws;
     return 0;
 }
 
@@ -873,26 +937,28 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
  *
  * MUST be safe to call more than once: forward replay after a post-marker
  * failure re-invokes this on the same staged state, so it never frees or
- * resets sw->tg_ops / sw->bt_del_ops / sw->idx_pairs / sw->bw_window —
+ * resets ws->tg_ops / ws->bt_del_ops / ws->idx_pairs / ws->bw_window —
  * re-running update_idx_fn/delete_index_entry/idx_build_field_worker on
  * already-converged entries is a no-op by construction of those
- * primitives. Release of the staged state happens once, later, in
- * v2_bulk_ins_commit_done — never here. */
+ * primitives. Release of the staged state happens once, later, in the
+ * terminal hook — never here. */
 static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
-                                     size_t nactive, void *ctx) {
+                                     size_t nactive, void *ctx,
+                                     void *window_state) {
     BulkInsShardWork *sw = (BulkInsShardWork *)ctx;
+    BulkInsWindowState *ws = window_state;
     (void)recs; (void)active;
-    if (sw->nidx == 0 || nactive == 0) return 0;
+    if (sw->nidx == 0 || nactive == 0 || !ws) return 0;
 
     int rc = 0;
 
-    for (size_t i = 0; i < sw->tg_nops; i++) {
-        update_idx_fn(&sw->tg_ops[i]);
-        if (sw->tg_ops[i].out_error) rc = -1;
+    for (size_t i = 0; i < ws->tg_nops; i++) {
+        update_idx_fn(&ws->tg_ops[i]);
+        if (ws->tg_ops[i].out_error) rc = -1;
     }
 
-    for (size_t i = 0; i < sw->bt_del_nops; i++) {
-        BtDeleteOp *op = &sw->bt_del_ops[i];
+    for (size_t i = 0; i < ws->bt_del_nops; i++) {
+        BtDeleteOp *op = &ws->bt_del_ops[i];
         if (delete_index_entry(sw->db_root, sw->object, sw->idx_fields[op->fi],
                                sw->sch->splits, op->key, op->klen, op->hash) != 0)
             rc = -1;
@@ -902,19 +968,19 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
     }
 
     for (int fi = 0; fi < sw->nidx; fi++) {
-        size_t count = sw->idx_pair_counts[fi];
+        size_t count = ws->idx_pair_counts[fi];
         if (count == 0) continue;
         IdxFieldArg fa = {0};
         fa.db_root = sw->db_root; fa.object = sw->object;
         fa.field = sw->idx_fields[fi]; fa.splits = sw->sch->splits;
-        fa.new_entries = sw->idx_pairs[fi]; fa.new_count = count;
+        fa.new_entries = ws->idx_pairs[fi]; fa.new_count = count;
         idx_build_field_worker(&fa);
         if (fa.out_error) rc = -1;
         for (size_t pi = 0; pi < count; pi++)
             idx_touch_record(sw->idx_fields[fi],
-                             idx_shard_for_hash(sw->idx_pairs[fi][pi].hash,
+                             idx_shard_for_hash(ws->idx_pairs[fi][pi].hash,
                                                 sw->sch->splits),
-                             IT_BTREE, sw->idx_pairs[fi][pi].hash);
+                             IT_BTREE, ws->idx_pairs[fi][pi].hash);
     }
 
     /* btree_bulk_merge/delete_index_entry only dirty mmap'd pages — they do
@@ -931,11 +997,11 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
        so a prepare-time idx_touch_record is a silent no-op and the window
        would clear its marker with dirty bitmap pages (finding-1 regression).
        Entries are 1:1 with staged (field, kf shard) pairs. */
-    for (size_t i = 0; i < sw->bw_window.n_entries; i++)
-        idx_touch_record(sw->bw_window.entries[i].field,
-                         sw->bw_window.entries[i].kf_shard,
+    for (size_t i = 0; i < ws->bw_window.n_entries; i++)
+        idx_touch_record(ws->bw_window.entries[i].field,
+                         ws->bw_window.entries[i].kf_shard,
                          IT_BITMAP, NULL);
-    if (bitmap_prepare_window_apply(&sw->bw_window) != 0) rc = -1;
+    if (bitmap_prepare_window_apply(&ws->bw_window) != 0) rc = -1;
     return rc;
 }
 
@@ -945,8 +1011,8 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
  * whose kf entry was never committed). Mirrors v2_bulk_ins_window_release
  * exactly; kept as a separate name for the SlotcaskBulkOpts.abort_window
  * wiring so the call site reads as "abort", not "release". */
-static void v2_bulk_ins_abort_window(void *ctx) {
-    v2_bulk_ins_window_release((BulkInsShardWork *)ctx);
+static void v2_bulk_ins_abort_window(void *ctx, void *window_state) {
+    v2_bulk_ins_window_release_state(ctx, window_state);
 }
 
 /* Fires at most once, after the window is fully durable (kf published, old
@@ -955,8 +1021,8 @@ static void v2_bulk_ins_abort_window(void *ctx) {
  * prepare_window/apply_window staged. Mirrors v2_bulk_ins_window_release
  * exactly; kept as a separate name for the SlotcaskBulkOpts.commit_done
  * wiring so the call site reads as "commit done", not "release". */
-static void v2_bulk_ins_commit_done(void *ctx) {
-    v2_bulk_ins_window_release((BulkInsShardWork *)ctx);
+static void v2_bulk_ins_commit_done(void *ctx, void *window_state) {
+    v2_bulk_ins_window_release_state(ctx, window_state);
 }
 
 /* Post-M unresolved exit (EINPROGRESS): identical release body to
@@ -965,8 +1031,52 @@ static void v2_bulk_ins_commit_done(void *ctx) {
    staged state must be released now even though durability never
    confirmed. Kept as a distinct name so the SlotcaskBulkOpts.release_window
    wiring reads honestly. */
-static void v2_bulk_ins_release_window(void *ctx) {
-    v2_bulk_ins_window_release((BulkInsShardWork *)ctx);
+static void v2_bulk_ins_release_window(void *ctx, void *window_state) {
+    v2_bulk_ins_window_release_state(ctx, window_state);
+}
+
+/* Command-thread compaction: gather every prepared worker's input into
+   one contiguous heap array (workers arrive one-per-shard in ascending
+   shard order; the coordinator re-validates). Returns NULL when nothing
+   is prepared or on OOM — check ninputs. */
+static SlotcaskBulkShardInput *bulk_ins_collect_inputs(
+    BulkInsShardWork *workers, int nworkers, size_t *ninputs) {
+    *ninputs = 0;
+    size_t np = 0;
+    for (int i = 0; i < nworkers; i++)
+        if (workers[i].prepared) np++;
+    if (np == 0) return NULL;
+    SlotcaskBulkShardInput *inputs = calloc(np, sizeof(*inputs));
+    if (!inputs) return NULL;
+    size_t k = 0;
+    for (int i = 0; i < nworkers; i++)
+        if (workers[i].prepared) inputs[k++] = workers[i].input;
+    *ninputs = np;
+    return inputs;
+}
+
+static void bulk_ins_publish_rc(BulkInsShardWork *workers, int nworkers,
+                                SlotcaskBulkShardInput *inputs) {
+    size_t k = 0;
+    for (int i = 0; i < nworkers; i++)
+        if (workers[i].prepared) workers[i].input.rc = inputs[k++].rc;
+}
+
+/* Shared tail for every bulk command: exactly one synchronous deferred
+   request over the compacted per-shard inputs. Pre-grow is NOT run here:
+   it is folded into the request's own stage wave (under the coordinator's
+   writer gates). A parallel pre-grow outside the request would let
+   gate-blocked pregrow tasks from concurrent requests occupy every
+   IO-pool worker, starving the running request's waves — a circular
+   wait. pregrow_count is retained in the signature for call-site
+   stability; slotcask_pregrow_kf remains for standalone (non-request)
+   callers only. */
+static int bulk_execute_prepared(SlotcaskDb *sdb,
+                                 SlotcaskBulkShardInput *inputs,
+                                 size_t ninputs, size_t pregrow_count) {
+    (void)pregrow_count;
+    if (ninputs == 0) return 0;
+    return slotcask_bulk_request_execute(sdb, inputs, ninputs);
 }
 
 static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
@@ -1078,30 +1188,55 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
            slotcask.h and its consumer in bulk_stage_one_shard). */
         .value_rewrites_payload = has_ac,
     };
-    for (int s = 0; s < splits; s++) {
-        if (counts[s] == 0) continue;
-        uint64_t _commit_t0 = now_us();
-        int rc = slotcask_bulk_upsert_in_kfshard(sdb, s,
-                                                  batch + offsets[s],
-                                                  (size_t)counts[s], &opts);
-        commit_lock_hold_record(_commit_t0, sw->db_root, sw->object);
-        if (rc != 0) {
-            for (int k = 0; k < counts[s]; k++) {
-                if (batch[offsets[s] + k].status == 0)
-                    batch[offsets[s] + k].status = -1;
+    /* Deferred-request preparation: build the per-shard input by value.
+       No mutation happens here — the command thread executes one request
+       across every worker's input after this preparation phase joins. */
+    {
+        int only_shard = -1;
+        for (int s = 0; s < splits; s++)
+            if (counts[s] > 0) { only_shard = s; break; }
+        if (only_shard < 0) {
+            /* No records survived bucketing (all invalid): fold now. */
+            for (size_t i = 0; i < sw->count; i++) {
+                if (batch[i].status == 0) {
+                    if (!batch[i].was_update) sw->inserted++;
+                } else if (batch[i].status == -2) sw->skipped++;
+                else sw->errors++;
             }
+            free(batch); free(ctxs); free(kf_shards);
+            free(counts); free(offsets); free(cursors);
+            free(old_arena);
+            sw->wall_ms = now_ms_coarse() - t_worker_start;
+            return NULL;
         }
-
-        /* Flush accumulated bitmap pairs for this shard. One bm_open
-           per (shard, field) — wrlock acquired once, all bm_set's
-           applied, wrlock released. Same amortisation pattern btree
-           uses with btree_insert_batch in the merge phase. */
-        /* Bitmap (and trigram) mutations for this shard's records already
-           happened inside slotcask_bulk_upsert_in_kfshard, via
-           v2_bulk_ins_apply_window, before kf was committed for the
-           surviving records — no post-return flush needed here anymore. */
+        sw->batch = batch;
+        sw->ctxs = ctxs;
+        sw->kf_shard_of = kf_shards;
+        sw->kf_counts = counts;
+        sw->kf_offsets = offsets;
+        sw->kf_cursors = cursors;
+        sw->old_arena = old_arena;
+        memset(&sw->input, 0, sizeof(sw->input));
+        sw->input.kf_shard_id = only_shard;
+        sw->input.recs = batch + offsets[only_shard];
+        sw->input.nrecs = (size_t)counts[only_shard];
+        sw->input.kind = SLOTCASK_BULK_INPUT_UPSERT;
+        sw->input.opts.upsert = opts;    /* by value; targets owned by sw */
+        sw->prepared = 1;
     }
+    sw->wall_ms = now_ms_coarse() - t_worker_start;
+    return NULL;
+}
 
+/* Command-thread tail for the insert trio: fold the request outcome into
+   the worker counters, then release the worker-owned scratch. */
+static void bulk_ins_finish_request(BulkInsShardWork *sw) {
+    if (!sw->prepared) return;
+    SlotcaskBulkRec *batch = sw->batch;
+    if (sw->input.rc != 0) {
+        for (size_t k = 0; k < sw->input.nrecs; k++)
+            if (batch[k].status == 0) batch[k].status = -1;
+    }
     for (size_t i = 0; i < sw->count; i++) {
         if (batch[i].status == 0) {
             if (!batch[i].was_update) sw->inserted++;
@@ -1111,12 +1246,14 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
             sw->errors++;
         }
     }
-    free(batch); free(ctxs); free(kf_shards);
-    free(counts); free(offsets); free(cursors);
-    free(old_arena);
+    free(sw->batch); free(sw->ctxs); free(sw->kf_shard_of);
+    free(sw->kf_counts); free(sw->kf_offsets); free(sw->kf_cursors);
+    free(sw->old_arena);
+    sw->batch = NULL; sw->ctxs = NULL;
+    sw->kf_shard_of = NULL; sw->kf_counts = NULL;
+    sw->kf_offsets = NULL; sw->kf_cursors = NULL;
+    sw->old_arena = NULL;
     bm_flush_thread_bitmap_cache();  /* no-op shim, kept for symmetry */
-    sw->wall_ms = now_ms_coarse() - t_worker_start;
-    return NULL;
 }
 
 /* Probe + write every record in one shard's bucket under a single
@@ -1546,29 +1683,16 @@ static int bulk_ins_run(const char *db_root, const char *object,
     }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
 
-    /* ===== Phase 1.6: pre-grow shards once, sized to the incoming batch.
+    /* ===== Phase 1.6: pre-grow kf shards once, sized to the incoming batch.
        Letting the worker hit the in-loop grow path repeatedly costs O(slots)
        per grow, and each subsequent grow re-buckets a growing record set —
        so total rebuild work scales with the number of incremental doublings.
-       One up-front grow to the right size avoids that.
        Slotcask keyfile shards are pre-sized at slotcask_open time and
-       resplit per-shard internally on load — slotcask_pregrow_kf below
-       absorbs the same role for the kf. */
-    {
-        /* Pre-grow kf shards to fit the incoming records up-front. Without
-           this, kf resplits trigger inline during the bulk insert and
-           their msync(MS_SYNC) joins the segment writeback queue — a
-           12.6 MB kf flush balloons from ~50ms to 4-5 sec at 25M scale
-           because it's stuck behind hundreds of MB of concurrent segment
-           dirty pages. Doing it now (no inserter active yet) keeps each
-           per-shard resplit at its quiet-system cost. */
-        SlotcaskSchemaInfo info = {
-            .splits = sc.splits, .slot_size = sc.slot_size,
-            .streams = sc.streams,
-        };
-        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
-        if (sdb) (void)slotcask_pregrow_kf(sdb, rec_count);
-    }
+       resplit per-shard internally on load — slotcask_pregrow_kf absorbs
+       the same role for the kf.
+       (Pre-grow moved to the command-level bulk_execute_prepared call:
+       it owns the same per-shard writer gates as the deferred request,
+       so it must complete before request_begin acquires them.) */
 
     int *worker_shards = NULL, *shard_to_worker = NULL;
     int nshard_groups = build_shard_worker_map(shard_counts, sc.splits,
@@ -1636,6 +1760,40 @@ static int bulk_ins_run(const char *db_root, const char *object,
        is small enough that spawn/join overhead would dominate. */
     parallel_for_io(bulk_insert_shard_worker, workers, nshard_groups,
                  sizeof(BulkInsShardWork));
+
+    /* Request execution: one deferred request over every worker's prepared
+       input (ascending shard order), pre-grow inside — before the gates
+       are taken. Exactly one execute per command. */
+    {
+        size_t ninputs = 0;
+        SlotcaskBulkShardInput *inputs =
+            bulk_ins_collect_inputs(workers, nshard_groups, &ninputs);
+        if (ninputs > 0 && !inputs) {
+            for (int wi = 0; wi < nshard_groups; wi++)
+                if (workers[wi].prepared)
+                    workers[wi].input.rc = -1;   /* OOM: fail the request */
+        } else if (ninputs > 0) {
+            SlotcaskSchemaInfo info = {
+                .splits = sc.splits, .slot_size = sc.slot_size,
+                .streams = sc.streams,
+            };
+            SlotcaskDb *sdb SDB_REG_REF =
+                slotcask_registry_get(db_root, object, &info);
+            uint64_t _commit_t0 = now_us();
+            int rc = sdb ? bulk_execute_prepared(sdb, inputs, ninputs,
+                                                 (size_t)rec_count) : -1;
+            commit_lock_hold_record(_commit_t0, db_root, object);
+            if (rc != 0 && errno != EINPROGRESS) {
+                /* Hard failure surfaces as per-record errors via the rc
+                   fold below; EINPROGRESS (retained markers) keeps the
+                   input.rc = -2 the coordinator wrote. */
+            }
+            bulk_ins_publish_rc(workers, nshard_groups, inputs);
+        }
+        free(inputs);
+        for (int wi = 0; wi < nshard_groups; wi++)
+            bulk_ins_finish_request(&workers[wi]);
+    }
     uint64_t t2 = now_ms_coarse();  /* end of Phase 2 (parallel shard write) */
 
     /* Phase-2 breakdown across workers. */
@@ -2295,16 +2453,8 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     }
     for (size_t i = 0; i < rec_count; i++) shard_counts[records[i].shard_id]++;
 
-    /* ===== Phase 1.6: pre-grow kf shards once, sized to the incoming batch.
-       See cmd_bulk_insert (JSON path) for the rationale. */
-    {
-        SlotcaskSchemaInfo info = {
-            .splits = sc.splits, .slot_size = sc.slot_size,
-            .streams = sc.streams,
-        };
-        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
-        if (sdb) (void)slotcask_pregrow_kf(sdb, rec_count);
-    }
+    /* (Pre-grow moved to the command-level bulk_execute_prepared call —
+       same rationale as the JSON insert path.) */
 
     int *worker_shards = NULL, *shard_to_worker = NULL;
     int nshard_groups = build_shard_worker_map(shard_counts, sc.splits,
@@ -2367,6 +2517,40 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
        oversubscription hides shard-rwlock stalls. */
     parallel_for_io(bulk_insert_shard_worker, workers, nshard_groups,
                  sizeof(BulkInsShardWork));
+
+    /* Request execution: one deferred request over every worker's prepared
+       input (ascending shard order), pre-grow inside — before the gates
+       are taken. Exactly one execute per command. */
+    {
+        size_t ninputs = 0;
+        SlotcaskBulkShardInput *inputs =
+            bulk_ins_collect_inputs(workers, nshard_groups, &ninputs);
+        if (ninputs > 0 && !inputs) {
+            for (int wi = 0; wi < nshard_groups; wi++)
+                if (workers[wi].prepared)
+                    workers[wi].input.rc = -1;   /* OOM: fail the request */
+        } else if (ninputs > 0) {
+            SlotcaskSchemaInfo info = {
+                .splits = sc.splits, .slot_size = sc.slot_size,
+                .streams = sc.streams,
+            };
+            SlotcaskDb *sdb SDB_REG_REF =
+                slotcask_registry_get(db_root, object, &info);
+            uint64_t _commit_t0 = now_us();
+            int rc = sdb ? bulk_execute_prepared(sdb, inputs, ninputs,
+                                                 (size_t)rec_count) : -1;
+            commit_lock_hold_record(_commit_t0, db_root, object);
+            if (rc != 0 && errno != EINPROGRESS) {
+                /* Hard failure surfaces as per-record errors via the rc
+                   fold below; EINPROGRESS (retained markers) keeps the
+                   input.rc = -2 the coordinator wrote. */
+            }
+            bulk_ins_publish_rc(workers, nshard_groups, inputs);
+        }
+        free(inputs);
+        for (int wi = 0; wi < nshard_groups; wi++)
+            bulk_ins_finish_request(&workers[wi]);
+    }
     uint64_t t2 = now_ms_coarse();  /* end of Phase 2 (parallel shard write) */
 
     /* Phase-2 breakdown across workers (mirrors cmd_bulk_insert JSON path). */
@@ -2573,6 +2757,11 @@ typedef struct {
        val is malloc'd index-key bytes (or NULL). */
     uint8_t ***idx_vals;
     size_t  **idx_lens;
+    /* Deferred-request input + worker-owned scratch, alive until
+       bulk_del_finish_request. */
+    SlotcaskBulkShardInput input;
+    int             prepared;
+    SlotcaskBulkRec *batch;
 } BulkDelShardWork;
 
 /* === v2 bulk-delete (key-list) worker ===
@@ -2620,7 +2809,8 @@ static UpdateIdxArg make_index_diff_arg(const char *db_root, const char *object,
    abort sidecar + inverse in the primitive). */
 static int v2_bulk_del_apply_window(SlotcaskBulkRec *recs,
                                      const size_t *active, size_t nactive,
-                                     void *ctx) {
+                                     void *ctx, void *window_state) {
+    (void)window_state;
     BulkDelShardWork *sw = (BulkDelShardWork *)ctx;
     if (!sw || sw->nidx == 0 || !sw->ts) return 0;
 
@@ -2689,26 +2879,38 @@ static void *bulk_del_shard_worker_v2(BulkDelShardWork *sw) {
     SlotcaskBulkDeleteOpts opts = {
         .has_indexed_fields = (sw->nidx > 0),
     };
-    int durability_degraded = 0;
-    opts.out_durability_degraded = &durability_degraded;
+    sw->durability_degraded = 0;
+    opts.out_durability_degraded = &sw->durability_degraded;
     if (sw->nidx > 0) {
         opts.apply_window = v2_bulk_del_apply_window;
         opts.bulk_hook_ctx = sw;
     }
-    int bulk_rc = slotcask_bulk_delete_in_kfshard(sdb, kf_shard_id,
-                                                   batch, sw->key_count, &opts);
-    if (bulk_rc != 0) {
+    /* Deferred-request preparation: no mutation here. */
+    sw->batch = batch;
+    memset(&sw->input, 0, sizeof(sw->input));
+    sw->input.kf_shard_id = kf_shard_id;
+    sw->input.recs = batch;
+    sw->input.nrecs = (size_t)sw->key_count;
+    sw->input.kind = SLOTCASK_BULK_INPUT_DELETE;
+    sw->input.opts.delete_ = opts;
+    sw->prepared = 1;
+    return NULL;
+}
+
+/* Command-thread tail for the key-list delete workers. */
+static void bulk_del_finish_request(BulkDelShardWork *sw) {
+    if (!sw->prepared) return;
+    SlotcaskBulkRec *batch = sw->batch;
+    if (sw->input.rc != 0) {
         for (int ki = 0; ki < sw->key_count; ki++)
             if (batch[ki].status == 0) batch[ki].status = -1;
     }
-    sw->durability_degraded = durability_degraded;
-
     for (int ki = 0; ki < sw->key_count; ki++) {
         if (batch[ki].status == 0) sw->deleted++;
         /* status=-2 (not found) and status=-1 (error) are not counted. */
     }
-    free(batch);
-    return NULL;
+    free(sw->batch);
+    sw->batch = NULL;
 }
 
 static void *bulk_del_shard_worker(void *arg) {
@@ -2853,6 +3055,39 @@ static int bulk_delete_run(const char *db_root, const char *object,
 
     /* Phase 1: Parallel shard tombstoning */
     parallel_for_io(bulk_del_shard_worker, workers, nshard_groups, sizeof(BulkDelShardWork));
+
+    /* Request execution: one deferred request over every worker's prepared
+       input (ascending shard order). Exactly one execute per command. */
+    {
+        size_t np = 0;
+        for (int g = 0; g < nshard_groups; g++)
+            if (workers[g].prepared) np++;
+        SlotcaskBulkShardInput *inputs = np ? calloc(np, sizeof(*inputs)) : NULL;
+        size_t k = 0;
+        for (int g = 0; g < nshard_groups; g++)
+            if (workers[g].prepared) inputs[k++] = workers[g].input;
+        if (np && !inputs) {
+            for (int g = 0; g < nshard_groups; g++)
+                if (workers[g].prepared) workers[g].input.rc = -1;
+        } else if (np) {
+            SlotcaskSchemaInfo info = {
+                .splits = sch.splits, .slot_size = sch.slot_size,
+                .streams = sch.streams,
+            };
+            SlotcaskDb *xsdb SDB_REG_REF =
+                slotcask_registry_get(db_root, object, &info);
+            uint64_t _commit_t0 = now_us();
+            int xrc = xsdb ? bulk_execute_prepared(xsdb, inputs, np, 0) : -1;
+            commit_lock_hold_record(_commit_t0, db_root, object);
+            (void)xrc;
+            k = 0;
+            for (int g = 0; g < nshard_groups; g++)
+                if (workers[g].prepared) workers[g].input.rc = inputs[k++].rc;
+        }
+        free(inputs);
+        for (int g = 0; g < nshard_groups; g++)
+            bulk_del_finish_request(&workers[g]);
+    }
 
     /* Phase 2: Parallel index cleanup — one thread per index. Skipped for
        v2: the per-record pre_commit hook in bulk_del_shard_worker_v2 already
@@ -3022,6 +3257,14 @@ typedef struct {
     /* Results */
     int            updated;
     int            skipped;
+    /* Deferred-request input + worker-owned scratch (bulk_upd_finish_request). */
+    SlotcaskBulkShardInput input;
+    int             prepared;
+    SlotcaskBulkRec *batch;
+    void            *ctxs;
+    void            *scratch;
+    uint8_t         *old_arena;
+    uint8_t         *new_arena;
 } BulkUpdShardWork;
 
 /* === v2 worker for criteria-driven bulk-update ===
@@ -3221,15 +3464,16 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
    already handled by value_compute in Phase 1c. */
 static int v2_bulk_upd_noop_prepare(SlotcaskBulkRec *recs,
                                      const size_t *active, size_t nactive,
-                                     void *ctx) {
+                                     void *ctx, void **out_window_state) {
     (void)recs; (void)active; (void)nactive; (void)ctx;
+    *out_window_state = NULL;   /* apply builds its args inline */
     return 0;
 }
 
 static int v2_bulk_upd_apply_window(SlotcaskBulkRec *recs,
                                      const size_t *active, size_t nactive,
-                                     void *ctx) {
-    (void)ctx;
+                                     void *ctx, void *window_state) {
+    (void)ctx; (void)window_state;
     int idx_failed = 0;
     for (size_t a = 0; a < nactive; a++) {
         size_t j = active[a];
@@ -3384,19 +3628,36 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
         opts.pre_commit           = v2_bulk_upd_pre_commit_bulk;
         opts.pre_commit_needs_old = 1;
     }
-    uint64_t _commit_t0 = now_us();
-    (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
-                                           batch, (size_t)w->count, &opts);
-    commit_lock_hold_record(_commit_t0, w->db_root, w->object);
+    /* Deferred-request preparation: no mutation here. Scratch stays
+       worker-owned and alive until bulk_upd_finish_request. */
+    w->batch = batch; w->ctxs = ctxs; w->scratch = scratch;
+    w->old_arena = old_arena; w->new_arena = new_arena;
+    memset(&w->input, 0, sizeof(w->input));
+    w->input.kf_shard_id = w->shard_id;
+    w->input.recs = batch;
+    w->input.nrecs = (size_t)w->count;
+    w->input.kind = SLOTCASK_BULK_INPUT_UPSERT;
+    w->input.opts.upsert = opts;
+    w->prepared = 1;
+    return NULL;
+}
 
+/* Command-thread tail for the structured bulk-update workers. */
+static void bulk_upd_finish_request(BulkUpdShardWork *w) {
+    if (!w->prepared) return;
+    SlotcaskBulkRec *batch = w->batch;
+    if (w->input.rc != 0) {
+        for (size_t k = 0; k < w->input.nrecs; k++)
+            if (batch[k].status == 0) batch[k].status = -1;
+    }
     for (int ki = 0; ki < w->count; ki++) {
         if (batch[ki].status == 0) w->updated++;
         else w->skipped++;
     }
-
-    free(batch); free(ctxs); free(scratch);
-    free(old_arena); free(new_arena);
-    return NULL;
+    free(w->batch); free(w->ctxs); free(w->scratch);
+    free(w->old_arena); free(w->new_arena);
+    w->batch = NULL; w->ctxs = NULL; w->scratch = NULL;
+    w->old_arena = NULL; w->new_arena = NULL;
 }
 
 /* Bulk-update phase 2 worker — one per shard, holds the kf-shard wrlock once
@@ -3561,6 +3822,39 @@ int cmd_bulk_update(const char *db_root, const char *object,
 
     parallel_for_io(bulk_upd_shard_worker, workers, nshard_groups, sizeof(BulkUpdShardWork));
 
+    /* Request execution: one deferred request over every worker's prepared
+       input (ascending shard order). Exactly one execute per command. */
+    {
+        size_t np = 0;
+        for (int g = 0; g < nshard_groups; g++)
+            if (workers[g].prepared) np++;
+        SlotcaskBulkShardInput *inputs = np ? calloc(np, sizeof(*inputs)) : NULL;
+        size_t k = 0;
+        for (int g = 0; g < nshard_groups; g++)
+            if (workers[g].prepared) inputs[k++] = workers[g].input;
+        if (np && !inputs) {
+            for (int g = 0; g < nshard_groups; g++)
+                if (workers[g].prepared) workers[g].input.rc = -1;
+        } else if (np) {
+            SlotcaskSchemaInfo info = {
+                .splits = sch.splits, .slot_size = sch.slot_size,
+                .streams = sch.streams,
+            };
+            SlotcaskDb *xsdb SDB_REG_REF =
+                slotcask_registry_get(db_root, object, &info);
+            uint64_t _commit_t0 = now_us();
+            int xrc = xsdb ? bulk_execute_prepared(xsdb, inputs, np, 0) : -1;
+            commit_lock_hold_record(_commit_t0, db_root, object);
+            (void)xrc;
+            k = 0;
+            for (int g = 0; g < nshard_groups; g++)
+                if (workers[g].prepared) workers[g].input.rc = inputs[k++].rc;
+        }
+        free(inputs);
+        for (int g = 0; g < nshard_groups; g++)
+            bulk_upd_finish_request(&workers[g]);
+    }
+
     for (int wi = 0; wi < nshard_groups; wi++) {
         updated += workers[wi].updated;
         skipped += workers[wi].skipped;
@@ -3615,6 +3909,12 @@ typedef struct {
     /* Results */
     int               updated;
     int               skipped;
+    /* Deferred-request input + worker-owned scratch. */
+    SlotcaskBulkShardInput input;
+    int             prepared;
+    SlotcaskBulkRec *batch;
+    void            *ctxs;
+    void            *scratch;
 } BulkUpdDelimShardWork;
 
 /* === v2 bulk-update-delimited worker ===
@@ -3692,8 +3992,8 @@ static int v2_bulk_upd_delim_pre_commit_bulk(const SlotcaskOldRecord *old,
    every active record. */
 static int v2_bulk_upd_delim_apply_window(SlotcaskBulkRec *recs,
                                            const size_t *active, size_t nactive,
-                                           void *ctx) {
-    (void)ctx;
+                                           void *ctx, void *window_state) {
+    (void)ctx; (void)window_state;
     int idx_failed = 0;
     for (size_t a = 0; a < nactive; a++) {
         size_t j = active[a];
@@ -3872,18 +4172,32 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
         opts.pre_commit           = v2_bulk_upd_delim_pre_commit_bulk;
         opts.pre_commit_needs_old = 1;
     }
-    uint64_t _commit_t0 = now_us();
-    (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
-                                           batch, (size_t)w->count, &opts);
-    commit_lock_hold_record(_commit_t0, w->db_root, w->object);
+    /* Deferred-request preparation: no mutation here. */
+    w->batch = batch; w->ctxs = ctxs; w->scratch = scratch;
+    memset(&w->input, 0, sizeof(w->input));
+    w->input.kf_shard_id = w->shard_id;
+    w->input.recs = batch;
+    w->input.nrecs = (size_t)w->count;
+    w->input.kind = SLOTCASK_BULK_INPUT_UPSERT;
+    w->input.opts.upsert = opts;
+    w->prepared = 1;
+    return NULL;
+}
 
+/* Command-thread tail for the delimited bulk-update workers. */
+static void bulk_upd_delim_finish_request(BulkUpdDelimShardWork *w) {
+    if (!w->prepared) return;
+    SlotcaskBulkRec *batch = w->batch;
+    if (w->input.rc != 0) {
+        for (size_t k = 0; k < w->input.nrecs; k++)
+            if (batch[k].status == 0) batch[k].status = -1;
+    }
     for (int ki = 0; ki < w->count; ki++) {
         if (batch[ki].status == 0) w->updated++;
         else w->skipped++;
     }
-
-    free(batch); free(ctxs); free(scratch);
-    return NULL;
+    free(w->batch); free(w->ctxs); free(w->scratch);
+    w->batch = NULL; w->ctxs = NULL; w->scratch = NULL;
 }
 
 static void *bulk_upd_delim_shard_worker(void *arg) {
@@ -4049,6 +4363,39 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
     parallel_for_io(bulk_upd_delim_shard_worker, workers, nshard_groups,
                  sizeof(BulkUpdDelimShardWork));
 
+    /* Request execution: one deferred request over every worker's prepared
+       input (ascending shard order). Exactly one execute per command. */
+    {
+        size_t np = 0;
+        for (int g = 0; g < nshard_groups; g++)
+            if (workers[g].prepared) np++;
+        SlotcaskBulkShardInput *inputs = np ? calloc(np, sizeof(*inputs)) : NULL;
+        size_t k = 0;
+        for (int g = 0; g < nshard_groups; g++)
+            if (workers[g].prepared) inputs[k++] = workers[g].input;
+        if (np && !inputs) {
+            for (int g = 0; g < nshard_groups; g++)
+                if (workers[g].prepared) workers[g].input.rc = -1;
+        } else if (np) {
+            SlotcaskSchemaInfo info = {
+                .splits = sch.splits, .slot_size = sch.slot_size,
+                .streams = sch.streams,
+            };
+            SlotcaskDb *xsdb SDB_REG_REF =
+                slotcask_registry_get(db_root, object, &info);
+            uint64_t _commit_t0 = now_us();
+            int xrc = xsdb ? bulk_execute_prepared(xsdb, inputs, np, 0) : -1;
+            commit_lock_hold_record(_commit_t0, db_root, object);
+            (void)xrc;
+            k = 0;
+            for (int g = 0; g < nshard_groups; g++)
+                if (workers[g].prepared) workers[g].input.rc = inputs[k++].rc;
+        }
+        free(inputs);
+        for (int g = 0; g < nshard_groups; g++)
+            bulk_upd_delim_finish_request(&workers[g]);
+    }
+
     int updated = 0;
     for (int wi = 0; wi < nshard_groups; wi++) {
         updated += workers[wi].updated;
@@ -4180,6 +4527,12 @@ typedef struct {
     /* Results */
     int               updated;
     int               skipped;
+    /* Deferred-request input + worker-owned scratch. */
+    SlotcaskBulkShardInput input;
+    int             prepared;
+    SlotcaskBulkRec *batch;
+    void            *ctxs;
+    void            *scratch;
 } BulkUpdJsonShardWork;
 
 /* === v2 bulk-update-json worker ===
@@ -4261,8 +4614,8 @@ static int v2_bulk_upd_json_pre_commit_bulk(const SlotcaskOldRecord *old,
    every active record. */
 static int v2_bulk_upd_json_apply_window(SlotcaskBulkRec *recs,
                                           const size_t *active, size_t nactive,
-                                          void *ctx) {
-    (void)ctx;
+                                          void *ctx, void *window_state) {
+    (void)ctx; (void)window_state;
     int idx_failed = 0;
     for (size_t a = 0; a < nactive; a++) {
         size_t j = active[a];
@@ -4433,18 +4786,32 @@ static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
         opts.pre_commit           = v2_bulk_upd_json_pre_commit_bulk;
         opts.pre_commit_needs_old = 1;
     }
-    uint64_t _commit_t0 = now_us();
-    (void)slotcask_bulk_upsert_in_kfshard(sdb, w->shard_id,
-                                           batch, (size_t)w->count, &opts);
-    commit_lock_hold_record(_commit_t0, w->db_root, w->object);
+    /* Deferred-request preparation: no mutation here. */
+    w->batch = batch; w->ctxs = ctxs; w->scratch = scratch;
+    memset(&w->input, 0, sizeof(w->input));
+    w->input.kf_shard_id = w->shard_id;
+    w->input.recs = batch;
+    w->input.nrecs = (size_t)w->count;
+    w->input.kind = SLOTCASK_BULK_INPUT_UPSERT;
+    w->input.opts.upsert = opts;
+    w->prepared = 1;
+    return NULL;
+}
 
+/* Command-thread tail for the JSON bulk-update workers. */
+static void bulk_upd_json_finish_request(BulkUpdJsonShardWork *w) {
+    if (!w->prepared) return;
+    SlotcaskBulkRec *batch = w->batch;
+    if (w->input.rc != 0) {
+        for (size_t k = 0; k < w->input.nrecs; k++)
+            if (batch[k].status == 0) batch[k].status = -1;
+    }
     for (int ki = 0; ki < w->count; ki++) {
         if (batch[ki].status == 0) w->updated++;
         else w->skipped++;
     }
-
-    free(batch); free(ctxs); free(scratch);
-    return NULL;
+    free(w->batch); free(w->ctxs); free(w->scratch);
+    w->batch = NULL; w->ctxs = NULL; w->scratch = NULL;
 }
 
 static void *bulk_upd_json_shard_worker(void *arg) {
@@ -5077,6 +5444,39 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
     parallel_for_io(bulk_upd_json_shard_worker, workers, nshard_groups,
                  sizeof(BulkUpdJsonShardWork));
 
+    /* Request execution: one deferred request over every worker's prepared
+       input (ascending shard order). Exactly one execute per command. */
+    {
+        size_t np = 0;
+        for (int g = 0; g < nshard_groups; g++)
+            if (workers[g].prepared) np++;
+        SlotcaskBulkShardInput *inputs = np ? calloc(np, sizeof(*inputs)) : NULL;
+        size_t k = 0;
+        for (int g = 0; g < nshard_groups; g++)
+            if (workers[g].prepared) inputs[k++] = workers[g].input;
+        if (np && !inputs) {
+            for (int g = 0; g < nshard_groups; g++)
+                if (workers[g].prepared) workers[g].input.rc = -1;
+        } else if (np) {
+            SlotcaskSchemaInfo info = {
+                .splits = sch.splits, .slot_size = sch.slot_size,
+                .streams = sch.streams,
+            };
+            SlotcaskDb *xsdb SDB_REG_REF =
+                slotcask_registry_get(db_root, object, &info);
+            uint64_t _commit_t0 = now_us();
+            int xrc = xsdb ? bulk_execute_prepared(xsdb, inputs, np, 0) : -1;
+            commit_lock_hold_record(_commit_t0, db_root, object);
+            (void)xrc;
+            k = 0;
+            for (int g = 0; g < nshard_groups; g++)
+                if (workers[g].prepared) workers[g].input.rc = inputs[k++].rc;
+        }
+        free(inputs);
+        for (int g = 0; g < nshard_groups; g++)
+            bulk_upd_json_finish_request(&workers[g]);
+    }
+
     int updated = 0;
     for (int gi = 0; gi < nshard_groups; gi++) {
         updated += workers[gi].updated;
@@ -5144,6 +5544,11 @@ typedef struct {
     int             deleted;
     int             skipped;
     int             durability_degraded;
+    /* Deferred-request input + worker-owned scratch. */
+    SlotcaskBulkShardInput input;
+    int             prepared;
+    SlotcaskBulkRec *batch;
+    void            *ctxs;
 } BulkDelCritShardWork;
 
 typedef struct {
@@ -5172,8 +5577,9 @@ static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
    the marker for this window). */
 static int v2_bulk_del_crit_prepare_window(SlotcaskBulkRec *recs,
                                             const size_t *active, size_t nactive,
-                                            void *ctx) {
+                                            void *ctx, void **out_window_state) {
     BulkDelCritShardWork *w = (BulkDelCritShardWork *)ctx;
+    *out_window_state = NULL;
     for (size_t a = 0; a < nactive; a++) {
         size_t j = active[a];
         SlotcaskBulkRec *r = &recs[j];
@@ -5198,7 +5604,8 @@ static int v2_bulk_del_crit_prepare_window(SlotcaskBulkRec *recs,
    batch abort sidecar + inverse in the primitive). */
 static int v2_bulk_del_crit_apply_window(SlotcaskBulkRec *recs,
                                           const size_t *active, size_t nactive,
-                                          void *ctx) {
+                                          void *ctx, void *window_state) {
+    (void)window_state;
     BulkDelCritShardWork *w = (BulkDelCritShardWork *)ctx;
     int idx_failed = 0;
     for (size_t a = 0; a < nactive; a++) {
@@ -5260,8 +5667,6 @@ static void *bulk_del_crit_shard_worker(void *arg) {
     SlotcaskBulkDeleteOpts opts = {
         .has_indexed_fields = (w->nidx > 0),
     };
-    int durability_degraded = 0;
-    opts.out_durability_degraded = &durability_degraded;
     if (w->nidx > 0) {
         opts.prepare_window = v2_bulk_del_crit_prepare_window;
         opts.apply_window   = v2_bulk_del_crit_apply_window;
@@ -5272,20 +5677,34 @@ static void *bulk_del_crit_shard_worker(void *arg) {
            force the batched read regardless of nidx. */
         opts.pre_commit_needs_old = 1;
     }
-    int bulk_rc = slotcask_bulk_delete_in_kfshard(w->sdb, kf_shard_id,
-                                                   batch, (size_t)w->count, &opts);
-    if (bulk_rc != 0) {
+    /* Deferred-request preparation: no mutation here. */
+    w->durability_degraded = 0;
+    opts.out_durability_degraded = &w->durability_degraded;
+    w->batch = batch; w->ctxs = ctxs;
+    memset(&w->input, 0, sizeof(w->input));
+    w->input.kf_shard_id = kf_shard_id;
+    w->input.recs = batch;
+    w->input.nrecs = (size_t)w->count;
+    w->input.kind = SLOTCASK_BULK_INPUT_DELETE;
+    w->input.opts.delete_ = opts;
+    w->prepared = 1;
+    return NULL;
+}
+
+/* Command-thread tail for the criteria-delete workers. */
+static void bulk_del_crit_finish_request(BulkDelCritShardWork *w) {
+    if (!w->prepared) return;
+    SlotcaskBulkRec *batch = w->batch;
+    if (w->input.rc != 0) {
         for (int i = 0; i < w->count; i++)
             if (batch[i].status == 0) batch[i].status = -1;
     }
-    w->durability_degraded = durability_degraded;
-
     for (int i = 0; i < w->count; i++) {
         if (batch[i].status == 0) w->deleted++;
         else w->skipped++;
     }
-    free(batch); free(ctxs);
-    return NULL;
+    free(w->batch); free(w->ctxs);
+    w->batch = NULL; w->ctxs = NULL;
 }
 
 int cmd_bulk_delete_criteria(const char *db_root, const char *object,
@@ -5460,6 +5879,33 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
 
     parallel_for(bulk_del_crit_shard_worker, workers, nshard_groups,
                   sizeof(BulkDelCritShardWork));
+
+    /* Request execution: one deferred request over every worker's prepared
+       input (ascending shard order). Exactly one execute per command. */
+    {
+        size_t np = 0;
+        for (int g = 0; g < nshard_groups; g++)
+            if (workers[g].prepared) np++;
+        SlotcaskBulkShardInput *inputs = np ? calloc(np, sizeof(*inputs)) : NULL;
+        size_t k = 0;
+        for (int g = 0; g < nshard_groups; g++)
+            if (workers[g].prepared) inputs[k++] = workers[g].input;
+        if (np && !inputs) {
+            for (int g = 0; g < nshard_groups; g++)
+                if (workers[g].prepared) workers[g].input.rc = -1;
+        } else if (np) {
+            uint64_t _commit_t0 = now_us();
+            int xrc = bulk_execute_prepared(sdb, inputs, np, 0);
+            commit_lock_hold_record(_commit_t0, db_root, object);
+            (void)xrc;
+            k = 0;
+            for (int g = 0; g < nshard_groups; g++)
+                if (workers[g].prepared) workers[g].input.rc = inputs[k++].rc;
+        }
+        free(inputs);
+        for (int g = 0; g < nshard_groups; g++)
+            bulk_del_crit_finish_request(&workers[g]);
+    }
 
     for (int g = 0; g < nshard_groups; g++) {
         deleted += workers[g].deleted;

@@ -196,6 +196,72 @@ no-overlap case — vacuum completes *entirely* before the delayed task ever
 attempts the rdlock — still leaves the daemon crash-free and the object
 correctly re-resolved to its new post-vacuum shape.
 
+## Bulk mutations: two-epoch request batching and per-shard writer gates
+
+Bulk mutations (all six `bulk-insert` / `bulk-update` / `bulk-delete` forms)
+execute as **one deferred request** spanning the whole command. The request's
+coordinator acquires every touched kf shard's **writer gate** — a plain
+per-shard admission mutex (`SlotcaskDb.writer_gates`) — in ascending shard
+order and holds them for the entire request; ordinary mutating writers
+(single insert/update/delete, legacy bulk entries, pre-grow) take exactly one
+gate around their mutation, via the central legacy transaction
+(`slotcask_bulk_mutation_transaction`). Readers never touch the gates. So:
+
+- requests on disjoint shards of one object run concurrently;
+- requests sharing a shard serialize on that shard's gate;
+- a single write to a touched shard stalls for the deferred request's span
+  (documented trade); a write to an untouched shard proceeds;
+- the kf rwlock stays **phase-local**: each wave task acquires and releases
+  it within the same task, so readers between waves only ever see coherent
+  states (old committed record before finalize, new committed record after).
+
+Each request runs two epochs of per-shard waves with request-level
+durability barriers (invariants I1–I5 below):
+
+```
+stage wave    : per shard — gate replay of retained markers → stage payloads
+barrier 1     : payload flush — one merged, deduped segment sync       [I2]
+publish wave  : per shard — per window: plan → D5 fallback sync →
+                marker published via no-replace link (V2 format)
+barrier 2     : ONE fsync(data/kf dir) — marker dir entries durable    [I4]
+finalize wave : per shard — per published window: A → I(apply) → K → T
+                (every sync deferred into the request)
+barrier 3     : commit flush — merged index flush [I1] + one kf sync per
+                dirty shard + A/T segment sync + batched marker unlink
+                + ONE fsync(data/kf dir)
+```
+
+Failure is shard- and window-scoped: a stage failure stops only that shard;
+a payload-flush failure prevents all publications; one window's publish
+failure doesn't stop others; a marker-dir fsync failure retains every
+published marker for replay; commit-flush failure retains converged markers
+(the request reports `EINPROGRESS`, the caller sees `out_durability_degraded`
+/ per-shard `rc = -2`). The next writer's gate replays any retained marker
+before planning; startup recovery replays via the same exact-path
+(`MarkerRef`) machinery.
+
+## Single-record and legacy windows
+
+Single-record writes and any remaining legacy bulk callers run the
+per-window M/A/I/K/T/C protocol with immediate per-window durability (via
+`marker_publish_and_sync_dir` and per-phase syncs), under one writer gate.
+Marker format and replay machinery are shared with the deferred path.
+
+## Durability invariants (bulk paths)
+
+- **I1** — index mutations are durable before the marker that would
+  re-apply them is cleared (the commit flush precedes every marker clear).
+- **I2** — segment payload bytes are durable before any marker referencing
+  them (epoch-1 flush for P-wave records; immediate pre-marker sync for
+  OLD-derived fallback records).
+- **I3** — a newly created segment file's directory entry is fsynced at
+  creation, before any marker can reference the file.
+- **I4** — marker directory entries are durable (one `fsync(data/kf dir)`
+  after the publish wave) before any window mutation (A/I/K/T) runs.
+- **I5** — a touched shard is exclusively reserved against mutating writers
+  from before its gate replay until after its batched clear, by the
+  per-shard writer gate.
+
 ## Durability: window barriers and eviction-time flush
 
 Durability is bounded synchronously by the per-window M/A/I/K/T/C marker protocol (see [storage-model.md](storage-model.md)), not by a periodic background sweep — a mutation's durability point is the fsync'd marker write, not a subsequent timed flush. There is no longer a mandatory background durability-sync thread; each cache entry's `dirty`/`dirty_since_ms` fields (`_Atomic`, on every kf/seg/bt/bm cache entry) are only consumed synchronously, at cache-eviction time.

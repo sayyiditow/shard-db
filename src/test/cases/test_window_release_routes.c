@@ -79,9 +79,10 @@ typedef struct {
 } RouteCounts;
 
 static int rt_prepare(SlotcaskBulkRec *recs, const size_t *active,
-                      size_t nactive, void *ctx) {
+                      size_t nactive, void *ctx, void **out_window_state) {
     RouteCounts *c = ctx;
     (void)recs; (void)active;
+    *out_window_state = NULL;
     if (c->fail_next) {
         /* Stage, then self-clean — the contract obliges a failed prepare
            to release what it staged before returning non-zero, and Route 4
@@ -94,6 +95,7 @@ static int rt_prepare(SlotcaskBulkRec *recs, const size_t *active,
     }
     c->staged = malloc(32);           /* only a route hook may free this */
     if (!c->staged) return -1;
+    *out_window_state = c->staged;    /* carried opaquely by the coordinator */
     c->prepares++;
     if (c->reject_all && nactive > 0)
         recs[active[0]].status = -2;  /* policy rejection by the hook */
@@ -101,26 +103,29 @@ static int rt_prepare(SlotcaskBulkRec *recs, const size_t *active,
 }
 
 static int rt_apply(SlotcaskBulkRec *recs, const size_t *active,
-                    size_t nactive, void *ctx) {
+                    size_t nactive, void *ctx, void *window_state) {
     RouteCounts *c = ctx;
-    (void)recs; (void)active; (void)nactive;
+    (void)recs; (void)active; (void)nactive; (void)window_state;
     c->applies++;
     return 0;
 }
 
-static void rt_commit(void *ctx) {
+static void rt_commit(void *ctx, void *window_state) {
     RouteCounts *c = ctx;
-    free(c->staged); c->staged = NULL;
+    free(window_state);
+    c->staged = NULL;
     c->commits++;
 }
-static void rt_abort(void *ctx) {
+static void rt_abort(void *ctx, void *window_state) {
     RouteCounts *c = ctx;
-    free(c->staged); c->staged = NULL;
+    free(window_state);
+    c->staged = NULL;
     c->aborts++;
 }
-static void rt_release(void *ctx) {
+static void rt_release(void *ctx, void *window_state) {
     RouteCounts *c = ctx;
-    free(c->staged); c->staged = NULL;
+    free(window_state);
+    c->staged = NULL;
     c->releases++;
 }
 
@@ -142,6 +147,13 @@ static int rt_single_apply_noop(const uint8_t *new_value, size_t new_vlen,
     (void)new_value; (void)new_vlen; (void)planned_kf_slot;
     c->applies++;
     return 0;
+}
+/* Single-record adapter abort_commit has the (void *) shape — the window
+   signature above doesn't fit this slot. */
+static void rt_single_abort_commit(void *ctx) {
+    RouteCounts *c = ctx;
+    free(c->staged); c->staged = NULL;
+    c->aborts++;
 }
 
 /* Drive one 1-record window through the bulk primitive with the recording
@@ -259,7 +271,7 @@ static int test_window_release_routes(void) {
         so.has_indexed_fields = 1;
         so.prepare_commit = rt_single_prepare_fail;
         so.apply_commit   = rt_single_apply_noop;
-        so.abort_commit   = rt_abort;       /* recorder: increments aborts */
+        so.abort_commit   = rt_single_abort_commit; /* recorder */
         so.pre_commit_ctx = &c;
         ASSERT_EQ_INT(slotcask_upsert_with_hooks(&w.db, 0, &skey, sizeof(skey),
                                                  sv, 5, &so, NULL), -1,
