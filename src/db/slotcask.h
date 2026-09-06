@@ -288,6 +288,13 @@ typedef struct SlotcaskDb {
     _Atomic(SlotcaskTrimFn) trim_fn;
     void                   *trim_ctx;
     pthread_mutex_t         trim_init_lock;
+    /* Per-kf-shard writer admission gates (request-level commit batching).
+       Writers only: the deferred request's coordinator holds every touched
+       shard's gate for the whole request (ascending acquire, reverse
+       release); ordinary writers hold exactly one around their mutation.
+       Readers never take it. */
+    pthread_mutex_t        *writer_gates;
+    size_t                  writer_gates_inited;
 } SlotcaskDb;
 
 /* Test-only: write a synthetic `total` (and matching `deleted`) into a kf
@@ -626,14 +633,27 @@ typedef int (*slotcask_bulk_value_fn)(const SlotcaskOldRecord *old,
  * have fully released everything it staged before returning non-zero (and
  * after rejecting every active record). The coordinator fires no release
  * route after a failed prepare_window. */
+/* Window hooks carry an opaque per-window state pointer owned by the hook
+ * implementation: prepare allocates it via *out_window_state on success
+ * (NULL is fine), apply receives it back, and exactly one terminal hook
+ * (commit_done / release_window / abort_window) consumes it. slotcask
+ * stores and returns the pointer opaquely — with deferred request
+ * batching, several windows of one shard are prepared before any of them
+ * is applied, so per-window staging cannot live in the shared ctx. */
 typedef int (*slotcask_bulk_prepare_window_fn)(SlotcaskBulkRec *recs,
                                                 const size_t *active,
-                                                size_t nactive, void *ctx);
+                                                size_t nactive, void *ctx,
+                                                void **out_window_state);
 typedef int (*slotcask_bulk_apply_window_fn)(SlotcaskBulkRec *recs,
                                               const size_t *active,
-                                              size_t nactive, void *ctx);
-typedef void (*slotcask_bulk_commit_done_fn)(void *ctx);
-typedef void (*slotcask_bulk_abort_window_fn)(void *ctx);
+                                              size_t nactive, void *ctx,
+                                              void *window_state);
+typedef void (*slotcask_bulk_terminal_window_fn)(void *ctx,
+                                                  void *window_state);
+typedef void (*slotcask_bulk_commit_done_fn)(void *ctx,
+                                              void *window_state);
+typedef void (*slotcask_bulk_abort_window_fn)(void *ctx,
+                                               void *window_state);
 
 typedef struct {
     int                          if_not_exists;     /* skip if key exists */
@@ -667,7 +687,7 @@ typedef struct {
        old payloads tombstoned, marker cleared); see
        slotcask_bulk_commit_done_fn above. NULL if apply_window/prepare_window
        stage nothing that needs releasing after commit. */
-    slotcask_bulk_commit_done_fn    commit_done;
+    slotcask_bulk_terminal_window_fn commit_done;
     /* Fires at most once, on the post-M UNRESOLVED exit: the window's marker
        is (or may be) durable but the coordinator's in-process forward replay
        failed to converge, so the outcome is pending (EINPROGRESS). Durable
@@ -679,8 +699,8 @@ typedef struct {
        Distinct from abort_window: that name is contractually reserved for
        the pre-M case where no durable evidence exists. Optional; NULL is
        fine for hooks that stage nothing. */
-    slotcask_bulk_commit_done_fn    release_window;
-    slotcask_bulk_abort_window_fn   abort_window;
+    slotcask_bulk_terminal_window_fn release_window;
+    slotcask_bulk_terminal_window_fn abort_window;
     void                            *bulk_hook_ctx;
     /* Gate: when 0, skip marker path entirely. Set from load_index_fields()
        same as the single-record path. */
@@ -740,17 +760,25 @@ typedef int (*slotcask_bulk_del_pre_commit_fn)(const SlotcaskOldRecord *old,
  * the kf wrlock is held, rejects the records, and returns the original
  * apply error only after the sidecar was fsynced. abort_window frees
  * staging without writing. */
+/* Delete windows use the same state-bearing hook contract as upserts —
+ * the five fields below mirror SlotcaskBulkOpts's, including the terminal
+ * trio (commit_done / release_window / abort_window). */
 typedef int (*slotcask_bulk_del_prepare_window_fn)(
-    SlotcaskBulkRec *recs, const size_t *active, size_t nactive, void *ctx);
+    SlotcaskBulkRec *recs, const size_t *active, size_t nactive, void *ctx,
+    void **out_window_state);
 typedef int (*slotcask_bulk_del_apply_window_fn)(
-    SlotcaskBulkRec *recs, const size_t *active, size_t nactive, void *ctx);
-typedef void (*slotcask_bulk_del_abort_window_fn)(void *ctx);
+    SlotcaskBulkRec *recs, const size_t *active, size_t nactive, void *ctx,
+    void *window_state);
+typedef void (*slotcask_bulk_del_abort_window_fn)(void *ctx,
+                                                   void *window_state);
 
 typedef struct {
     slotcask_bulk_del_pre_commit_fn       pre_commit;
     int                                    pre_commit_needs_old;
     slotcask_bulk_del_prepare_window_fn   prepare_window;
     slotcask_bulk_del_apply_window_fn     apply_window;
+    slotcask_bulk_terminal_window_fn      commit_done;
+    slotcask_bulk_terminal_window_fn      release_window;
     slotcask_bulk_del_abort_window_fn     abort_window;
     void                                  *bulk_hook_ctx;
     int                                    has_indexed_fields;
@@ -760,6 +788,42 @@ typedef struct {
 int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                      SlotcaskBulkRec *recs, size_t n,
                                      const SlotcaskBulkDeleteOpts *opts);
+
+/* ============================================================ Deferred
+ * bulk request (request-level commit batching).
+ *
+ * One synchronous request spans an entire cmd_bulk_* call: the caller
+ * bucket-ises its records per kf shard and hands over one input per
+ * touched shard. The coordinator acquires every touched shard's writer
+ * gate (ascending) for the whole request, runs the two-epoch wave
+ * protocol (stage → payload flush → publish → one kf-dir fsync →
+ * finalize → commit flush), and releases the gates before returning.
+ * Requests on disjoint shards run concurrently; requests sharing a shard
+ * serialize on that shard's gate; readers never take the gate.
+ *
+ * Ownership: input records, option pointer targets, hook contexts, and
+ * arenas remain owned by the caller and MUST stay valid until this call
+ * returns (the per-window hook states flow through it opaquely).
+ * Duplicate kf_shard_id inputs are rejected. */
+typedef struct {
+    int               kf_shard_id;
+    SlotcaskBulkRec  *recs;
+    size_t            nrecs;
+    enum { SLOTCASK_BULK_INPUT_UPSERT = 1,
+           SLOTCASK_BULK_INPUT_DELETE = 2 } kind;
+    union {
+        SlotcaskBulkOpts       upsert;
+        SlotcaskBulkDeleteOpts delete_;
+    } opts;                         /* copied by value by query_bulk */
+    int rc;                         /* per-shard aggregate result:
+                                       0 ok, -1 failed, -2 pending
+                                       (retained marker, EINPROGRESS) */
+} SlotcaskBulkShardInput;
+
+/* The only new public operation. Synchronous. */
+int slotcask_bulk_request_execute(SlotcaskDb *db,
+                                  SlotcaskBulkShardInput *inputs,
+                                  size_t ninputs);
 
 /* ============================================================ Bulk lookup
  *

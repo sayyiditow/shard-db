@@ -589,17 +589,16 @@ static inline int kf_marker_op_valid(const KfMarkerSlot *marker) {
     return marker->has_old <= 1;
 }
 
-/* KFM2 test accessors. */
-int kf_batch_marker_corrupt_first_kf_slot_for_test(const char *data_dir,
-                                                   int kf_shard,
-                                                   uint32_t batch_id,
+/* KFM2 test accessors. Exact-path identity (MarkerRef): callers locate a
+ * marker by scanning data/kf and pass the path returned by readdir — no
+ * shard/batch ID reconstruction. */
+int kf_batch_marker_corrupt_first_kf_slot_for_test(const char *path,
                                                    uint32_t bad_kf_slot,
                                                    int *out_has_old);
-int kf_batch_marker_read_slots_for_test(const char *data_dir, int kf_shard,
-                                        uint32_t batch_id,
-                                        KfMarkerSlot *slots_out,
-                                        size_t max_slots,
-                                        size_t *out_count);
+int kf_batch_marker_read_path_for_test(const char *path,
+                                       KfMarkerSlot *slots_out,
+                                       size_t max_slots,
+                                       size_t *out_count);
 
 /* Recovery-time index reconciliation callback.
    slotcask.c is deliberately decoupled from schema/index logic (that lives

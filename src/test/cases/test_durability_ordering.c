@@ -91,13 +91,23 @@ static int test_ordering_marker_clean_after_crud(void) {
                                          val, sizeof(val), &opts, NULL);
     ASSERT_EQ_INT(rc, 0, "slotcask_upsert_with_hooks for marker-clean");
 
-    /* Marker must be absent for every shard */
-    for (int sid = 0; sid < 8; sid++) {
-        char mpath[PATH_MAX];
-        snprintf(mpath, sizeof(mpath), "%s/data/kf/%03d_batch_0_marker.dat", base, sid);
-        struct stat st;
-        ASSERT_TRUE(stat(mpath, &st) != 0,
-                    "marker absent after clean upsert cycle");
+    /* Marker must be absent (any shard, any name shape) */
+    {
+        char kdir[PATH_MAX];
+        snprintf(kdir, sizeof(kdir), "%s/data/kf", base);
+        int ghosts = 0;
+        DIR *d = opendir(kdir);
+        ASSERT_NOT_NULL(d, "open kf dir for ghost scan");
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                size_t L = strlen(e->d_name);
+                if (L > 11 && strcmp(e->d_name + L - 11, "_marker.dat") == 0)
+                    ghosts++;
+            }
+            closedir(d);
+        }
+        ASSERT_EQ_INT(ghosts, 0, "marker absent after clean upsert cycle");
     }
 
     slotcask_close(&db);
@@ -143,13 +153,23 @@ static int test_ordering_delete_marker_free(void) {
     ASSERT_EQ_INT(rc, 0, "delete succeeds");
     ASSERT_TRUE(dr.not_found == 0, "key was found");
 
-    /* No marker files for any shard */
-    for (int sid = 0; sid < 8; sid++) {
-        char mpath[PATH_MAX];
-        snprintf(mpath, sizeof(mpath), "%s/data/kf/%03d_batch_0_marker.dat", base, sid);
-        struct stat st;
-        ASSERT_TRUE(stat(mpath, &st) != 0,
-                    "no ghost marker after delete");
+    /* No marker files anywhere in the object (any name shape) */
+    {
+        char kdir[PATH_MAX];
+        snprintf(kdir, sizeof(kdir), "%s/data/kf", base);
+        int ghosts = 0;
+        DIR *d = opendir(kdir);
+        ASSERT_NOT_NULL(d, "open kf dir for delete ghost scan");
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                size_t L = strlen(e->d_name);
+                if (L > 11 && strcmp(e->d_name + L - 11, "_marker.dat") == 0)
+                    ghosts++;
+            }
+            closedir(d);
+        }
+        ASSERT_EQ_INT(ghosts, 0, "no ghost marker after delete");
     }
 
     slotcask_close(&db);
@@ -373,6 +393,32 @@ static pid_t trigger_insert(TestEnv *env, const char *object, const char *key,
     _exit(rc == 0 ? 0 : 3);
 }
 
+/* Scan the object's kf dir for final marker files. Exact-path identity:
+ * nonce-bearing publication names are returned as found by readdir and
+ * never reconstructed from shard/batch IDs. Returns the count. */
+static int scan_kf_markers(const char *db_root, const char *object,
+                           char paths[][PATH_MAX], int max) {
+    char kdir[PATH_MAX];
+    snprintf(kdir, sizeof(kdir), "%s/default/%s/data/kf", db_root, object);
+    DIR *d = opendir(kdir);
+    if (!d) return -1;
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t L = strlen(e->d_name);
+        if (L > 11 && strcmp(e->d_name + L - 11, "_marker.dat") == 0) {
+            if (n < max)
+                snprintf(paths[n], PATH_MAX, "%s/%s", kdir, e->d_name);
+            n++;
+        }
+    }
+    closedir(d);
+    return n;
+}
+
+static int scan_kf_markers(const char *db_root, const char *object,
+                           char paths[][PATH_MAX], int max);
+
 static int write_bytes_marker(const char *db_root, const char *object,
                               int kf_shard, const void *buf, size_t len) {
     char path[PATH_MAX];
@@ -563,20 +609,23 @@ static int test_durability_corrupt_update_marker_kf_slot_rejected(void) {
        of size 1 is always batch_id 0; any of the object's 8 kf shards
        could hold the marker, so find it and mutate it in place. */
     int corrupted = 0;
-    for (int sid = 0; sid < 8 && !corrupted; sid++) {
-        char data_dir[PATH_MAX];
-        snprintf(data_dir, sizeof(data_dir), "%s/default/%s",
-                 saved_db_root, object);
-        int has_old = -1;
-        int rc = kf_batch_marker_corrupt_first_kf_slot_for_test(
-            data_dir, sid, 0, 0x7FFFFFFF /* far beyond any real kf capacity */,
-            &has_old);
-        if (rc == 0) {
-            ASSERT_EQ_INT(has_old, 1,
-                          "captured marker is the UPDATE we triggered");
-            corrupted = 1;
-        } else {
-            ASSERT_TRUE(rc == 1, "batch marker scan hit no I/O error");
+    {
+        char mpaths[8][PATH_MAX];
+        int nmarkers = scan_kf_markers(saved_db_root, object, mpaths, 8);
+        ASSERT_EQ_INT(nmarkers, 1,
+                      "exactly one pending marker (single-record update)");
+        if (nmarkers == 1) {
+            int has_old = -1;
+            int rc = kf_batch_marker_corrupt_first_kf_slot_for_test(
+                mpaths[0],
+                0x7FFFFFFF /* far beyond any real kf capacity */, &has_old);
+            if (rc == 0) {
+                ASSERT_EQ_INT(has_old, 1,
+                              "captured marker is the UPDATE we triggered");
+                corrupted = 1;
+            } else {
+                ASSERT_TRUE(rc == -1, "corruptor hit no unexpected state");
+            }
         }
     }
     ASSERT_TRUE(corrupted, "found and corrupted the pending update marker");
@@ -598,13 +647,14 @@ static int test_durability_corrupt_update_marker_kf_slot_rejected(void) {
        fabricated, only the crashed update itself was never applied. The
        restart below succeeding on the same port/db_root is itself proof
        no daemon was left running after the fail-closed refusal above. */
-    for (int sid = 0; sid < 8; sid++) {
-        char data_dir[PATH_MAX];
-        snprintf(data_dir, sizeof(data_dir), "%s/default/%s", saved_db_root, object);
-        /* The retained marker is the current KFM2 batch format (batch_id 0
-           for a size-1 window), not the legacy single-slot marker; clear
-           via the matching batch API. */
-        kf_batch_marker_clear(data_dir, sid, 0);
+    {
+        /* Operator cleanup: unlink the retained marker by its exact path
+           (KFM2 batch format; names are nonce-bearing or legacy, never
+           reconstructed). */
+        char mpaths[8][PATH_MAX];
+        int nmarkers = scan_kf_markers(saved_db_root, object, mpaths, 8);
+        for (int mi = 0; mi < nmarkers; mi++)
+            ASSERT_EQ_INT(unlink(mpaths[mi]), 0, "clear retained marker");
     }
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
                   "restart succeeds once the corrupted marker is cleared");
@@ -725,18 +775,23 @@ static int test_durability_bulk_marker_recovers(void) {
     char batch_marker_data_dir[PATH_MAX];
     snprintf(batch_marker_data_dir, sizeof(batch_marker_data_dir),
              "%s/default/%s", saved_db_root, object);
-    char batch_marker_path[PATH_MAX];
-    snprintf(batch_marker_path, sizeof(batch_marker_path),
-             "%s/data/kf/000_batch_0_marker.dat", batch_marker_data_dir);
+    char batch_marker_path[PATH_MAX] = "";
     if (marker_rc == 0) {
-        /* The live commit path writes the KFM2 batch-marker format (a
-           header + N variable-length entries), not a flat KfMarkerSlot
-           array, so parse it via the real reader instead of stat()-sizing
-           and fread()-looping raw slots off disk. */
+        char mpaths[8][PATH_MAX];
+        int nmarkers = scan_kf_markers(saved_db_root, object, mpaths, 8);
+        ASSERT_EQ_INT(nmarkers, 1, "one retained marker while paused");
+        if (nmarkers == 1)
+            snprintf(batch_marker_path, sizeof(batch_marker_path), "%s",
+                     mpaths[0]);
+    }
+    if (marker_rc == 0 && batch_marker_path[0]) {
+        /* The live commit path writes the KFM2 v2 format (a 16 B header +
+           N 32-byte slots), parsed via the real reader instead of
+           stat()-sizing and fread()-looping raw slots off disk. */
         KfMarkerSlot slots[64];
         size_t got = 0;
-        int read_rc = kf_batch_marker_read_slots_for_test(
-            batch_marker_data_dir, 0, 0, slots,
+        int read_rc = kf_batch_marker_read_path_for_test(
+            batch_marker_path, slots,
             sizeof(slots) / sizeof(slots[0]), &got);
         ASSERT_EQ_INT(read_rc, 0, "batch marker file exists while paused");
         ASSERT_EQ_INT((long long)got, (long long)nrecords,
@@ -772,18 +827,21 @@ static int test_durability_bulk_marker_recovers(void) {
         ASSERT_EQ_INT(symlink_fd, -1,
                       "O_NOFOLLOW rejects the test marker symlink");
         if (symlink_fd >= 0) close(symlink_fd);
-        ASSERT_EQ_INT(kf_batch_marker_read_slots_for_test(
-                          batch_marker_data_dir, 0, 0, slots,
+        ASSERT_EQ_INT(kf_batch_marker_read_path_for_test(
+                          batch_marker_path, slots,
                           sizeof(slots) / sizeof(slots[0]), &got),
                       -1, "batch marker reader rejects symlink path");
         ASSERT_EQ_INT(kf_batch_marker_corrupt_first_kf_slot_for_test(
-                          batch_marker_data_dir, 0, 0, slots[0].kf_slot, NULL),
+                          batch_marker_path, slots[0].kf_slot, NULL),
                       -1, "batch marker writer rejects symlink path");
         ASSERT_EQ_INT(unlink(batch_marker_path), 0,
                       "remove test symlink before recovery");
         ASSERT_EQ_INT(rename(batch_marker_real_path, batch_marker_path), 0,
                       "restore retained batch marker before recovery");
     }
+    if (!batch_marker_path[0])
+        snprintf(batch_marker_path, sizeof(batch_marker_path),
+                 "%s/data/kf", batch_marker_data_dir);
     /* Kill unconditionally: on timeout the daemon is still running and
        holds the DB lock, so leaving it up would cascade into every later
        test_env_start_at() in this process. */
@@ -865,12 +923,10 @@ static int test_durability_bulk_window_prepared_recovers(void) {
     ASSERT_EQ_INT(marker_rc, 0,
                   "bulk-insert reaches the deterministic bulk-window-prepared pause");
 
-    char batch_marker_path[PATH_MAX];
-    snprintf(batch_marker_path, sizeof(batch_marker_path),
-             "%s/default/%s/data/kf/000_batch_0_marker.dat", saved_db_root, object);
     if (marker_rc == 0) {
-        ASSERT_TRUE(access(batch_marker_path, F_OK) != 0,
-                    "no batch marker file exists yet at the prepare boundary");
+        char mpaths[8][PATH_MAX];
+        ASSERT_EQ_INT(scan_kf_markers(saved_db_root, object, mpaths, 8), 0,
+                      "no batch marker file exists yet at the prepare boundary");
     }
     /* Kill unconditionally: on timeout the daemon is still running and
        holds the DB lock, so leaving it up would cascade into every later
@@ -882,8 +938,9 @@ static int test_durability_bulk_window_prepared_recovers(void) {
     ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
                   "restart runs recovery sweep after prepare-boundary SIGKILL");
     if (env.daemon_pid > 0) {
-        ASSERT_TRUE(access(batch_marker_path, F_OK) != 0,
-                    "still no batch marker file after recovery");
+        char mpaths[8][PATH_MAX];
+        ASSERT_EQ_INT(scan_kf_markers(saved_db_root, object, mpaths, 8), 0,
+                      "still no batch marker file after recovery");
         ASSERT_EQ_INT(request_count(&env, object), 0,
                       "no records were committed — the window never reached a marker");
         test_env_stop(&env);
@@ -934,25 +991,24 @@ static int test_durability_bulk_window_applied_recovers(void) {
     ASSERT_EQ_INT(marker_rc, 0,
                   "bulk-insert reaches the deterministic bulk-window-applied pause");
 
-    char batch_marker_path[PATH_MAX];
-    snprintf(batch_marker_path, sizeof(batch_marker_path),
-             "%s/default/%s/data/kf/000_batch_0_marker.dat", saved_db_root, object);
+    char batch_marker_path[PATH_MAX] = "";
     struct stat mst;
     if (marker_rc == 0) {
+        char mpaths[8][PATH_MAX];
+        int nmarkers = scan_kf_markers(saved_db_root, object, mpaths, 8);
+        ASSERT_EQ_INT(nmarkers, 1, "one retained marker at the apply boundary");
+        if (nmarkers == 1)
+            snprintf(batch_marker_path, sizeof(batch_marker_path), "%s",
+                     mpaths[0]);
         ASSERT_EQ_INT(stat(batch_marker_path, &mst), 0,
                       "batch marker file still intact at the apply boundary");
-        /* Window-coordinator batch markers carry the complete redo record
-           per entry (slotcask.c:899-907), not a bare KfMarkerSlot: a
-           16-byte BatchMarkerHeader, then per entry a 32-byte KfMarkerSlot
-           + 16-byte hash + three uint16 lengths (54 bytes), followed by
-           the key and (for a fresh insert) a zero-length old value and
-           the full encoded new value. */
-        const size_t entry_fixed = sizeof(KfMarkerSlot) + 16 + 2 + 2 + 2;
-        const size_t encoded_record_len = 4 /* score:int */ + 2 + 64 /* title:varchar:64 */;
+        /* V2 markers are a 16-byte header + one 32-byte KfMarkerSlot per
+           active record — no variable-length spans (replay re-derives the
+           bytes from the segment records the slots name). */
         long long expected_size = (long long)(16 + (size_t)nrecords *
-            (entry_fixed + strlen(keys[0]) + encoded_record_len));
+            sizeof(KfMarkerSlot));
         ASSERT_EQ_INT((long long)mst.st_size, expected_size,
-                      "batch marker still holds a full redo entry for every record in the window");
+                      "batch marker still holds a full redo slot for every record in the window");
     }
     /* Kill unconditionally: on timeout the daemon is still running and
        holds the DB lock, so leaving it up would cascade into every later
@@ -1179,6 +1235,9 @@ static int test_durability_bulk_window_boundary_mixed_indexes(void) {
  * (which has no window protocol) and green once Tasks 2-4 land. */
 #include "shard_test_ctl.h"
 #include <dirent.h>
+
+static int scan_kf_markers(const char *db_root, const char *object,
+                           char paths[][PATH_MAX], int max);
 
 /* types.h declares the raw hasher; slotcask wraps it as compute_hash. */
 extern void compute_hash_raw(const char *key, size_t key_len,

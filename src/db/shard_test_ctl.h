@@ -25,6 +25,9 @@ typedef enum {
     SHARD_TEST_PHASE_K,       /* kf slot/header barrier */
     SHARD_TEST_PHASE_T,       /* old-payload tombstone barrier */
     SHARD_TEST_PHASE_C,       /* marker clear barrier */
+    SHARD_TEST_PHASE_REQ_PUBLISHED, /* request-level: every window's marker
+                                       published + kf dir fsync done, before
+                                       the finalize wave */
     SHARD_TEST_PHASE_COUNT
 } ShardTestPhase;
 
