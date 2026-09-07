@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <unistd.h>
 
 /* Linux exposes EUCLEAN for detected on-disk corruption; Darwin does not.
@@ -1176,28 +1177,42 @@ static void commit_phase_us_record(uint64_t *counter, uint64_t t0) {
     if (g_db) __atomic_add_fetch(counter, now_us() - t0, __ATOMIC_RELAXED);
 }
 
-/* Sync only the pages containing the given kf slots, while h's writer
-   lock remains held. header_changed: sync the 24-byte shard header too.
-   h must be a writer-acquired handle with non-NULL hdr and map. */
+/* Sync one page-aligned range spanning the given kf slots while h's writer
+   lock remains held. header_changed extends the range through the 24-byte
+   shard header. h must be a writer-acquired handle with non-NULL hdr/map. */
 static int kfcache_sync_slots_locked_impl(SlotcaskKfHandle *h,
                               const size_t *slots, size_t nslots,
                               int header_changed) {
-    (void)header_changed;  /* the 24-byte header lives at byte 0 of the same
-                              mapping and is covered by the full-range sync */
     if (!h || !h->writer || !h->hdr || (!slots && nslots)) {
         errno = EINVAL;
         return -1;
     }
-    for (size_t i = 0; i < nslots; i++)
+    size_t lo = SIZE_MAX, hi = 0;
+    for (size_t i = 0; i < nslots; i++) {
         if (slots[i] >= h->capacity) { errno = EINVAL; return -1; }
-    /* One whole-mapping MS_SYNC instead of one msync per touched slot:
-       the caller holds this shard's exclusive wrlock, so every dirty page
-       of the mapping belongs to it (readers never dirty pages), and a
-       full-range MS_SYNC waits once for the batched writeback instead of
-       once per 24-byte slot (~170 slots share a page; hash-scattered slots
-       otherwise force ~1 blocking flush per record). Same contract as the
-       kfcache shutdown path's msync(map, map_size, MS_SYNC). */
-    return msync((void *)h->hdr, h->map_size, MS_SYNC) == 0 ? 0 : -1;
+        if (slots[i] < lo) lo = slots[i];
+        if (slots[i] > hi) hi = slots[i];
+    }
+    if (nslots == 0 && !header_changed) return 0;
+
+    size_t range_lo = header_changed ? 0
+                     : SLOTCASK_KF_HDR_SIZE + lo * sizeof(SlotcaskKfEntry);
+    size_t range_hi_excl = nslots
+        ? SLOTCASK_KF_HDR_SIZE + (hi + 1) * sizeof(SlotcaskKfEntry)
+        : SLOTCASK_KF_HDR_SIZE;
+
+    /* Resolve page size per call: request K flushes run concurrently across
+       shards, so a lazily-written function-static cache would be a data race. */
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) return -1;
+    size_t page = (size_t)ps;
+    size_t aligned_lo = (range_lo / page) * page;
+    size_t aligned_hi = ((range_hi_excl + page - 1) / page) * page;
+    if (aligned_hi > h->map_size) aligned_hi = h->map_size;
+    if (aligned_lo >= aligned_hi) return 0;
+
+    return msync((uint8_t *)h->hdr + aligned_lo,
+                 aligned_hi - aligned_lo, MS_SYNC) == 0 ? 0 : -1;
 }
 
 int kfcache_sync_slots_locked(SlotcaskKfHandle *h,
@@ -4079,6 +4094,15 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
     db->num_streams = num_streams;
     db->slot_size = slot_size;
     db->slots_per_shard = slotcask_default_slots_for_splits(num_shards);
+    /* bulk_commit_window lives on ShardDb (config.c/db.env-facing); this
+       SlotcaskDb is a separate struct with its own copy that every window-
+       chunking read site falls back to 4096 for when zero. slotcask_open()
+       runs on whatever thread first touches the object (registry_get,
+       create-object, reindex), not necessarily the one that set its own
+       thread-local g_db, so use the same process-wide fallback already
+       used elsewhere in this file. */
+    if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+    db->bulk_commit_window = g_db ? g_db->bulk_commit_window : 0;
 
     if (mkdirp_local(data_dir) != 0) return -1;
 
@@ -5332,9 +5356,9 @@ static int bulk_publish_window_marker_locked(BulkMutationTxn *txn,
 }
 
 /* store=0: sync-only pass (P barrier and T after tombstone_and_push_back).
-   store=1: atomic-store `flag` at each offset first. One msync pass with
-   gaps <= 4096 merged and one fdatasync per file. */
-static int bulk_seg_apply_and_sync(SlotcaskDb *db, const SegLoc *locs,
+   store=1: atomic-store `flag` at each offset first. One msync and one
+   fdatasync per file. */
+static int bulk_seg_sync_one_group(SlotcaskDb *db, const SegLoc *locs,
                                    size_t n, int store, uint8_t flag) {
     size_t i = 0;
     while (i < n) {
@@ -5350,14 +5374,7 @@ static int bulk_seg_apply_and_sync(SlotcaskDb *db, const SegLoc *locs,
                 __atomic_store_n(&h.map[locs[k].off + 18], flag,
                                  __ATOMIC_RELEASE);
         }
-        size_t lo = locs[i].off, hi = locs[i].off + 1;
-        for (size_t k = i + 1; k < j; k++) {
-            if (locs[k].off <= hi + 4096) { hi = locs[k].off + 1; continue; }
-            if (durability_msync_range(h.map, lo, hi - lo) != 0) {
-                segcache_release(&h); return -1;
-            }
-            lo = locs[k].off; hi = lo + 1;
-        }
+        size_t lo = locs[i].off, hi = locs[j - 1].off + 1;
         if (durability_msync_range(h.map, lo, hi - lo) != 0 ||
             fdatasync(h.fd) != 0) {
             segcache_release(&h);
@@ -5367,6 +5384,75 @@ static int bulk_seg_apply_and_sync(SlotcaskDb *db, const SegLoc *locs,
         i = j;
     }
     return 0;
+}
+
+/* One file-group's sync as a parallel_for_io work item. Groups are
+   independent (distinct files, own segcache handles, flag stores complete
+   within the group before that group's sync), so failure isolation is
+   per-group: rc/err are captured per worker instead of aborting siblings
+   mid-flight, and the caller reports the first failure after the join.
+   errno is thread-local and still live immediately after the failing
+   group body returns, so the worker snapshot is exact. */
+typedef struct {
+    SlotcaskDb   *db;
+    const SegLoc *locs;
+    size_t        n;
+    int           store;
+    uint8_t       flag;
+    int           rc;
+    int           err;
+} SegSyncGroupWork;
+
+static void *bulk_seg_sync_group_worker(void *raw) {
+    SegSyncGroupWork *w = raw;
+    w->rc = bulk_seg_sync_one_group(w->db, w->locs, w->n, w->store, w->flag);
+    if (w->rc != 0) w->err = errno;
+    return NULL;
+}
+
+static int bulk_seg_apply_and_sync(SlotcaskDb *db, const SegLoc *locs,
+                                   size_t n, int store, uint8_t flag) {
+    /* Group callers' sorted locs into per-file runs. Syncs dominate the
+       cost and each file's msync+fdatasync is an independent wait, so
+       fan the groups out across the IO pool (same machinery as the K
+       barrier): the serial chain was one blocking round trip per touched
+       segment file, twice for insert-only requests (P wave, then A). */
+    size_t i = 0, ngroups = 0;
+    while (i < n) {
+        size_t j = i + 1;
+        while (j < n && locs[j].sid == locs[i].sid && locs[j].fid == locs[i].fid)
+            j++;
+        i = j;
+        ngroups++;
+    }
+    if (ngroups <= 1)
+        return bulk_seg_sync_one_group(db, locs, n, store, flag);
+    if (ngroups > (size_t)INT_MAX)
+        return bulk_seg_sync_one_group(db, locs, n, store, flag);
+
+    SegSyncGroupWork *works = calloc(ngroups, sizeof(*works));
+    if (!works)
+        return bulk_seg_sync_one_group(db, locs, n, store, flag);
+    i = 0;
+    for (size_t g = 0; g < ngroups; g++) {
+        size_t j = i + 1;
+        while (j < n && locs[j].sid == locs[i].sid && locs[j].fid == locs[i].fid)
+            j++;
+        works[g] = (SegSyncGroupWork){ .db = db, .locs = locs + i,
+                                       .n = j - i, .store = store,
+                                       .flag = flag, .rc = 0, .err = 0 };
+        i = j;
+    }
+    parallel_for_io(bulk_seg_sync_group_worker, works, (int)ngroups,
+                    sizeof(*works));
+    int rc = 0, saved_err = 0;
+    for (size_t g = 0; g < ngroups; g++) {
+        if (works[g].rc == 0) continue;
+        if (rc == 0) { rc = -1; saved_err = works[g].err; }
+    }
+    free(works);
+    if (rc != 0) errno = saved_err;
+    return rc;
 }
 
 static int bulk_activate_new_payloads_locked(BulkMutationTxn *txn,
@@ -5402,6 +5488,7 @@ static int bulk_activate_new_payloads_locked(BulkMutationTxn *txn,
         uint64_t t0a = now_us();
         rc = bulk_seg_apply_and_sync(txn->db, locs, n, 1, 1);
         commit_phase_us_record(&g_commit_segment_sync_us_total, t0a);
+        commit_phase_us_record(&g_commit_segment_post_us_total, t0a);
         if (rc == 0 && n > 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_A))
             rc = -1;
     }
@@ -5890,7 +5977,9 @@ static int bulk_sync_fallback_payloads(BulkMutationTxn *txn,
                              .off = st->target_off };
     }
     qsort(locs, n, sizeof(*locs), segloc_cmp);
+    uint64_t t0d5 = now_us();
     int rc = n ? bulk_seg_apply_and_sync(txn->db, locs, n, 0, 0) : 0;
+    commit_phase_us_record(&g_commit_segment_p_us_total, t0d5);
     if (rc == 0)
         for (size_t i = begin; i < end; i++) {
             SlotcaskBulkState *st = &shard->st[i];
@@ -6536,6 +6625,7 @@ static int slotcask_bulk_request_flush_payloads(SlotcaskBulkRequest *req) {
     uint64_t t0 = now_us();
     int rc = bulk_seg_apply_and_sync(req->db, all, w, 0, 0);
     commit_phase_us_record(&g_commit_segment_sync_us_total, t0);
+    commit_phase_us_record(&g_commit_segment_p_us_total, t0);
     free(all);
     for (int s = 0; s < req->num_shards; s++) req->shards[s].np = 0;
     if (rc == 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_P)) rc = -1;
@@ -6771,6 +6861,7 @@ static int slotcask_bulk_request_flush_commit(SlotcaskBulkRequest *req) {
         uint64_t t0s = now_us();
         int rc = bulk_seg_apply_and_sync(req->db, all, w, 0, 0);
         commit_phase_us_record(&g_commit_segment_sync_us_total, t0s);
+        commit_phase_us_record(&g_commit_segment_post_us_total, t0s);
         free(all);
         if (rc != 0) return -1;
     }

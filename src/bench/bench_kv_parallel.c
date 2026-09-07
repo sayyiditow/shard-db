@@ -29,6 +29,9 @@
 #define DEFAULT_CHUNK    200000
 #define CONNS   5
 #define SPLITS  128
+/* Runtime-resolved object shard count (SHARD_BENCH_SPLITS); reset_object
+   runs outside bench_kv_parallel_run() so the env override lives here. */
+static int g_bench_splits = SPLITS;
 /* TOTAL / CHUNK / NCHUNKS are now runtime-configurable via env vars
    SHARD_BENCH_TOTAL and SHARD_BENCH_CHUNK; resolved at the top of
    bench_kv_parallel_run(). NCHUNKS = TOTAL / CHUNK. */
@@ -59,6 +62,70 @@ static void make_val(int i, char out[VAL_LEN + 1])
     memcpy(out, tmp, (size_t)n);
     for (int j = n; j < VAL_LEN; j++) out[j] = 'x';
     out[VAL_LEN] = '\0';
+}
+
+/* ------------------------------------------------- commit-phase counters
+ * Diagnostic only: pulls the daemon's cumulative commit_* stats and prints
+ * the delta since the last snapshot, so a single-connection bulk-insert's
+ * time can be attributed to kf msync / segment sync / marker publish /
+ * marker clear instead of guessed at. See docs stats field names in
+ * server.c's "mode":"stats" JSON response.
+ */
+typedef struct {
+    unsigned long count, lock_hold_us, sync_us, windows, mpub_us, mpub_n,
+                  segsync_us, seg_p_us, seg_post_us,
+                  idxsync_us, idxsync_n, mclear_us;
+} CommitStats;
+
+static unsigned long json_ulong_after(const char *hay, const char *key)
+{
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(hay, pat);
+    if (!p) return 0;
+    return strtoul(p + strlen(pat), NULL, 10);
+}
+
+static void fetch_commit_stats(TestClient *tc, CommitStats *out)
+{
+    memset(out, 0, sizeof(*out));
+    char *resp = NULL;
+    if (tc_request(tc, "{\"mode\":\"stats\"}", &resp) != 0 || !resp) return;
+    out->count        = json_ulong_after(resp, "count");
+    out->lock_hold_us  = json_ulong_after(resp, "lock_hold_us_total");
+    out->sync_us       = json_ulong_after(resp, "sync_us_total");
+    out->windows       = json_ulong_after(resp, "windows_total");
+    out->mpub_us       = json_ulong_after(resp, "marker_publish_us_total");
+    out->mpub_n        = json_ulong_after(resp, "marker_publish_count");
+    out->segsync_us    = json_ulong_after(resp, "segment_sync_us_total");
+    out->seg_p_us      = json_ulong_after(resp, "segment_p_us_total");
+    out->seg_post_us   = json_ulong_after(resp, "segment_post_us_total");
+    out->idxsync_us    = json_ulong_after(resp, "index_sync_us_total");
+    out->idxsync_n     = json_ulong_after(resp, "index_sync_ops_total");
+    out->mclear_us     = json_ulong_after(resp, "marker_clear_us_total");
+    free(resp);
+}
+
+static void print_commit_stats_delta(const char *label,
+                                     const CommitStats *base,
+                                     const CommitStats *cur)
+{
+    printf("  [%s] commit: requests=%lu  lock_hold_us=%lu  kf_msync_us=%lu  windows=%lu\n"
+           "  [%s] marker_publish: n=%lu us=%lu   segment_sync_us=%lu "
+           "(pre_marker_p=%lu post_marker=%lu)   "
+           "index_sync: n=%lu us=%lu   marker_clear_us=%lu\n",
+           label,
+           cur->count - base->count,
+           cur->lock_hold_us - base->lock_hold_us,
+           cur->sync_us - base->sync_us,
+           cur->windows - base->windows,
+           label,
+           cur->mpub_n - base->mpub_n, cur->mpub_us - base->mpub_us,
+           cur->segsync_us - base->segsync_us,
+           cur->seg_p_us - base->seg_p_us,
+           cur->seg_post_us - base->seg_post_us,
+           cur->idxsync_n - base->idxsync_n, cur->idxsync_us - base->idxsync_us,
+           cur->mclear_us - base->mclear_us);
 }
 
 /* -------------------------------------------------------- memfd helper */
@@ -169,7 +236,7 @@ static void reset_object(TestClient *tc)
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"kvbench\","
         "\"splits\":%d,\"max_key\":%d,"
         "\"fields\":[\"v:varchar:%d\"]}",
-        SPLITS, KEY_LEN, VAL_LEN);
+        g_bench_splits, KEY_LEN, VAL_LEN);
     tc_request(tc, req, &resp);
     free(resp);
 }
@@ -216,14 +283,24 @@ static void run_parallel(int port, const char *mode, int *chunk_memfds, int nchu
 
 static int bench_kv_parallel_run(void)
 {
-    /* Resolve TOTAL / CHUNK from env vars (defaults match the bash bench). */
+    /* Resolve TOTAL / CHUNK from env vars (defaults match the bash bench).
+       Connection count = NCHUNKS (one conn per chunk; CHUNK=500000 with
+       TOTAL=1000000 gives a 2-conn run). SHARD_BENCH_SPLITS overrides the
+       object's shard count so K-phase cost can be measured at
+       production-typical geometry (8) vs the wide default (128). */
     const char *total_env = getenv("SHARD_BENCH_TOTAL");
     const char *chunk_env = getenv("SHARD_BENCH_CHUNK");
+    const char *splits_env = getenv("SHARD_BENCH_SPLITS");
     int TOTAL = total_env ? atoi(total_env) : DEFAULT_TOTAL;
     int CHUNK = chunk_env ? atoi(chunk_env) : DEFAULT_CHUNK;
+    int SPLITS_N = splits_env ? atoi(splits_env) : SPLITS;
     if (TOTAL <= 0) TOTAL = DEFAULT_TOTAL;
     if (CHUNK <= 0) CHUNK = DEFAULT_CHUNK;
     if (CHUNK > TOTAL) CHUNK = TOTAL;
+    if (SPLITS_N < 8 || SPLITS_N > 4096 ||
+        (SPLITS_N & (SPLITS_N - 1)) != 0)
+        SPLITS_N = SPLITS;   /* splits must be a power of 2 in [8, 4096] */
+    g_bench_splits = SPLITS_N;
     int NCHUNKS = (TOTAL + CHUNK - 1) / CHUNK;
 
     /* Spawn daemon. */
@@ -251,12 +328,12 @@ static int bench_kv_parallel_run(void)
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"kvbench\","
         "\"splits\":%d,\"max_key\":%d,"
         "\"fields\":[\"v:varchar:%d\"]}",
-        SPLITS, KEY_LEN, VAL_LEN);
+        g_bench_splits, KEY_LEN, VAL_LEN);
     tc_request(tc, req, &resp); free(resp); resp = NULL;
 
     printf("======================================\n");
     printf("  K/V parallel bench: total=%d chunk=%d conns=%d splits=%d\n",
-           TOTAL, CHUNK, CONNS, SPLITS);
+           TOTAL, CHUNK, NCHUNKS, g_bench_splits);
     printf("======================================\n\n");
 
     /* Build all chunk memfds + a combined single-blob memfd for tests 1a/1b. */
@@ -311,32 +388,45 @@ static int bench_kv_parallel_run(void)
         free(buf);
 
         long us_1a = 0, us_1b = 0, us_2 = 0, us_3 = 0;
+        CommitStats cs_before = {0}, cs_after = {0};
 
         /* TEST 1a: single JSON */
         reset_object(tc);
+        fetch_commit_stats(tc, &cs_before);
         { uint64_t t0 = bench_now_ns();
           do_bulk_insert(tc, "json", single_json);
           us_1a = (long)((bench_now_ns() - t0) / 1000); }
         close(single_json);
+        fetch_commit_stats(tc, &cs_after);
+        print_commit_stats_delta("single JSON", &cs_before, &cs_after);
 
         /* TEST 1b: single CSV */
         reset_object(tc);
+        fetch_commit_stats(tc, &cs_before);
         { uint64_t t0 = bench_now_ns();
           do_bulk_insert(tc, "csv", single_csv);
           us_1b = (long)((bench_now_ns() - t0) / 1000); }
         close(single_csv);
+        fetch_commit_stats(tc, &cs_after);
+        print_commit_stats_delta("single CSV ", &cs_before, &cs_after);
 
         /* TEST 2: parallel JSON */
         reset_object(tc);
+        fetch_commit_stats(tc, &cs_before);
         { uint64_t t0 = bench_now_ns();
           run_parallel(env.port, "json", chunk_json, NCHUNKS);
           us_2 = (long)((bench_now_ns() - t0) / 1000); }
+        fetch_commit_stats(tc, &cs_after);
+        print_commit_stats_delta("par JSON    ", &cs_before, &cs_after);
 
         /* TEST 3: parallel CSV */
         reset_object(tc);
+        fetch_commit_stats(tc, &cs_before);
         { uint64_t t0 = bench_now_ns();
           run_parallel(env.port, "csv", chunk_csv, NCHUNKS);
           us_3 = (long)((bench_now_ns() - t0) / 1000); }
+        fetch_commit_stats(tc, &cs_after);
+        print_commit_stats_delta("par CSV     ", &cs_before, &cs_after);
 
         char e1a[48], e1b[48], e2[48], e3[48], lbl2[64], lbl3[64];
         snprintf(e1a, sizeof(e1a), "%.2f M rows/s",
