@@ -128,9 +128,18 @@ static int bench_kv_run(void)
     const char *count_env = getenv("SHARD_BENCH_COUNT");
     int COUNT = count_env ? atoi(count_env) : 1000000;
     if (COUNT <= 0) COUNT = 1000000;
+    /* SHARD_BENCH_SPLITS matches bench-kv-parallel: default 128 (wide),
+       override to 8 for production-default geometry. Without the knob this
+       bench silently measured the wide-splits kf-writeback floor. */
+    const char *splits_env = getenv("SHARD_BENCH_SPLITS");
+    int SPLITS_N = splits_env ? atoi(splits_env) : SPLITS;
+    if (SPLITS_N < 8 || SPLITS_N > 4096 ||
+        (SPLITS_N & (SPLITS_N - 1)) != 0)
+        SPLITS_N = SPLITS;
 
     printf("======================================\n");
-    printf("  shard-db K/V benchmark (%d records)\n", COUNT);
+    printf("  shard-db K/V benchmark (%d records, splits=%d)\n", COUNT,
+           SPLITS_N);
     printf("  key=16B hex, value=varchar(100) — matches db_bench / LMDB shape\n");
     printf("======================================\n\n");
 
@@ -158,8 +167,8 @@ static int bench_kv_run(void)
         char create[512];
         snprintf(create, sizeof(create),
             "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"kvbench\","
-            "\"splits\":128,\"max_key\":16,"
-            "\"fields\":[\"v:varchar:100\"]}");
+            "\"splits\":%d,\"max_key\":16,"
+            "\"fields\":[\"v:varchar:100\"]}", SPLITS_N);
         tc_request(tc, create, &resp);
         free(resp); resp = NULL;
     }
@@ -304,7 +313,6 @@ static int bench_kv_run(void)
     long get_total_us = 0; uint64_t get_p50 = 0;
     long exists_hit_total_us = 0; uint64_t exists_hit_p50 = 0;
     long exists_miss_total_us = 0; uint64_t exists_miss_p50 = 0;
-    long delete_total_us = 0; uint64_t delete_p50 = 0;
 
     /* GET single (warm) */
     {
@@ -392,33 +400,14 @@ static int bench_kv_run(void)
        latency, not DB throughput. Parallel writes below cover the
        write path at realistic concurrency. */
 
-    /* DELETE x10000 (deterministic coverage of first N keys) */
+    /* ---- Single-conn latency table -----------------------------------
+       NOTE: no single-record DELETE row. A single delete is a full ACID
+       commit (payload sync + marker publish + clear), so its latency is
+       the durability floor (~15-20ms on typical disks), not a storage-
+       engine cost — printing it next to pipelined GET/EXISTS read like an
+       engine regression and invited a pointless optimization round. */
     {
-        const int N = 10000;
-        uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
-        BenchHist h;
-        bench_hist_init(&h, samples, (size_t)N);
-        uint64_t wall_start = bench_now_ns();
-        for (int i = 0; i < N; i++) {
-            char req[256];
-            snprintf(req, sizeof(req),
-                     "{\"mode\":\"delete\",\"dir\":\"default\",\"object\":\"kvbench\","
-                     "\"key\":\"%s\"}", keys[i]);
-            uint64_t t0 = bench_now_ns();
-            tc_request(tc, req, &resp);
-            bench_hist_add(&h, bench_now_ns() - t0);
-            free(resp); resp = NULL;
-        }
-        delete_total_us = (long)((bench_now_ns() - wall_start) / 1000);
-        delete_p50 = bench_hist_p50_ns(&h);
-        free(samples);
-
-        bench_print_object_stats(tc, "default", "kvbench", "AFTER DELETE x10000");
-    }
-
-    /* ---- Single-conn latency table ----------------------------------- */
-    {
-        char e_get[48], e_exh[48], e_exm[48], e_del[48];
+        char e_get[48], e_exh[48], e_exm[48];
         snprintf(e_get, sizeof(e_get), "p50=%.0fµs  %.0f k op/s",
                  (double)get_p50 / 1000.0,
                  10.0 / ((double)get_total_us / 1e6));
@@ -428,15 +417,11 @@ static int bench_kv_run(void)
         snprintf(e_exm, sizeof(e_exm), "p50=%.0fµs  %.0f k op/s",
                  (double)exists_miss_p50 / 1000.0,
                  10.0 / ((double)exists_miss_total_us / 1e6));
-        snprintf(e_del, sizeof(e_del), "p50=%.0fµs  %.0f k op/s",
-                 (double)delete_p50 / 1000.0,
-                 10.0 / ((double)delete_total_us / 1e6));
         bench_table_section_begin("Single-conn latency batches (N=10000)");
         bench_table_record("GET   single warm", get_warm_us, 1, NULL);
         bench_table_record("GET    x10000 pipelined", get_total_us, 1, e_get);
         bench_table_record("EXISTS x10000 (hits)",   exists_hit_total_us, 1, e_exh);
         bench_table_record("EXISTS x10000 (all-miss)", exists_miss_total_us, 1, e_exm);
-        bench_table_record("DELETE x10000",          delete_total_us, 1, e_del);
         bench_table_section_end();
     }
 
@@ -546,6 +531,60 @@ static int bench_kv_run(void)
     }
 
     /* ---- 13. Re-populate for parallel section ----------------------- */
+    /* ---- 13b. Durable single-op latency (full ACID commits) ----------
+       Each op below is one synchronous commit: payload sync + marker
+       publish + marker clear (update/delete add a tombstone sync). N is
+       deliberately small — the section is pure fsync wait, and 100
+       samples estimate p50 as well as 10k would while keeping the bench
+       fast. These numbers are the per-op durability floor, not engine
+       throughput. Uses keys[20000..] so no earlier section is touched. */
+    {
+        const int N = 100;
+        if (COUNT >= 20000 + N) {
+            uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
+            char req[256];
+            long totals[3] = {0, 0, 0};
+            uint64_t p50s[3] = {0, 0, 0};
+            if (samples) {
+                BenchHist h;
+                for (int pass = 0; pass < 3; pass++) {
+                    const char *mode =
+                        pass == 0 ? "insert" : pass == 1 ? "update" : "delete";
+                    bench_hist_init(&h, samples, (size_t)N);
+                    uint64_t wall = bench_now_ns();
+                    for (int i = 0; i < N; i++) {
+                        snprintf(req, sizeof(req),
+                            "{\"mode\":\"%s\",\"dir\":\"default\","
+                            "\"object\":\"kvbench\",\"key\":\"%s\","
+                            "\"value\":\"dur_%d\"}", mode, keys[20000 + i], i);
+                        uint64_t t0 = bench_now_ns();
+                        tc_request(tc, req, &resp);
+                        bench_hist_add(&h, bench_now_ns() - t0);
+                        free(resp); resp = NULL;
+                    }
+                    totals[pass] = (long)((bench_now_ns() - wall) / 1000);
+                    p50s[pass] = bench_hist_p50_ns(&h);
+                }
+                free(samples);
+            }
+            char e_ins[64], e_upd[64], e_del[64];
+            snprintf(e_ins, sizeof(e_ins), "p50=%.0fµs  %.2f k op/s",
+                     (double)p50s[0] / 1000.0,
+                     (double)N * 1000.0 / (double)totals[0]);
+            snprintf(e_upd, sizeof(e_upd), "p50=%.0fµs  %.2f k op/s",
+                     (double)p50s[1] / 1000.0,
+                     (double)N * 1000.0 / (double)totals[1]);
+            snprintf(e_del, sizeof(e_del), "p50=%.0fµs  %.2f k op/s",
+                     (double)p50s[2] / 1000.0,
+                     (double)N * 1000.0 / (double)totals[2]);
+            bench_table_section_begin("Durable single-op latency (full ACID commit, N=100)");
+            bench_table_record("INSERT x100 (full commit)", totals[0], 1, e_ins);
+            bench_table_record("UPDATE x100 (full commit)", totals[1], 1, e_upd);
+            bench_table_record("DELETE x100 (full commit)", totals[2], 1, e_del);
+            bench_table_section_end();
+        }
+    }
+
     printf("--- Re-populating for parallel test ---\n");
     fflush(stdout);
     {
