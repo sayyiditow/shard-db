@@ -107,6 +107,32 @@ static int sleep_ms(int ms) {
     return nanosleep(&ts, NULL);
 }
 
+/* The fixture-generated db.env is machine-written and tiny: replace its
+   `export PORT=` line for the bind-race respawn in test_env_start_ex. */
+static int fixture_rewrite_port(const char *env_path, int new_port) {
+    FILE *f = fopen(env_path, "r");
+    if (!f) return -1;
+    char body[8192];
+    size_t got = fread(body, 1, sizeof(body) - 1, f);
+    fclose(f);
+    if (got >= sizeof(body) - 1) return -1;
+    body[got] = '\0';
+    f = fopen(env_path, "w");
+    if (!f) return -1;
+    char *line = body;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (strncmp(line, "export PORT=", 12) == 0)
+            fprintf(f, "export PORT=%d\n", new_port);
+        else
+            fprintf(f, "%s\n", line);
+        line = nl ? nl + 1 : NULL;
+    }
+    fclose(f);
+    return 0;
+}
+
 /* Diagnostic state: when wait_daemon_ready times out, the test fixture
    prints why. Filled by the last failed step. */
 static __thread int g_wait_last_step = 0;   /* 1=connect 2=request */
@@ -278,13 +304,28 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
         return -1;
     }
 
+    /* Capture daemon stdout+stderr to a log file so spawn failures can be
+       diagnosed in CI (where each test's "daemon spawn" fails as a bare
+       assertion otherwise). Path lives under base/, so test_env_stop's
+       rm -rf cleans it up. */
+    char dlog[400];
+    snprintf(dlog, sizeof(dlog), "%s/daemon.log", base);
+
+    /* Bind-race respawn: the picker's close-to-bind window can hand out a
+       port a just-killed daemon still holds (slower-reaping macOS runners
+       hit this about once per CI run, failing whichever case spawned a
+       daemon in the window). When the first spawn dies before ready with
+       "Address already in use" in its log, respawn once on a freshly
+       picked port. */
+    int is_test_server = (strstr(binary_abs, "/shard-db-test-server") != NULL);
+    int spawn_attempt = 0;
+respawn:;
     /* Inherited anonymous Unix socketpair control channel for the TEST_BUILD
        daemon: the child keeps its endpoint across exec and invokes the test
        server as `server --test-control-fd <fd>`; the parent side lives in
        env->test_control_fd and is closed by test_env_stop / stop_keep /
        kill and on every start-failure path. The production-binary fallback
        passes no test-control argument and leaves test_control_fd == -1. */
-    int is_test_server = (strstr(binary_abs, "/shard-db-test-server") != NULL);
     int child_ctl_fd = -1;
     if (is_test_server) {
         int sv[2];
@@ -292,13 +333,6 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
         env->test_control_fd = sv[0];
         child_ctl_fd = sv[1];
     }
-
-    /* Capture daemon stdout+stderr to a log file so spawn failures can be
-       diagnosed in CI (where each test's "daemon spawn" fails as a bare
-       assertion otherwise). Path lives under base/, so test_env_stop's
-       rm -rf cleans it up. */
-    char dlog[400];
-    snprintf(dlog, sizeof(dlog), "%s/daemon.log", base);
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -348,9 +382,20 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
            waitpid(WNOHANG) returns >0; if alive, returns 0. */
         int wstatus = 0;
         pid_t r = waitpid(pid, &wstatus, WNOHANG);
+        int bind_conflict = 0;
         if (r == pid) {
             fprintf(stderr, "daemon pid=%d exited before ready: status=0x%x\n",
                     (int)pid, wstatus);
+            /* Decide the respawn from the daemon's own log, not the
+               generic timeout: only a genuine bind conflict retries. */
+            FILE *lf = fopen(dlog, "r");
+            if (lf) {
+                char lbuf[2048];
+                size_t lgot = fread(lbuf, 1, sizeof(lbuf) - 1, lf);
+                lbuf[lgot] = '\0';
+                fclose(lf);
+                bind_conflict = strstr(lbuf, "Address already in use") != NULL;
+            }
         } else {
             fprintf(stderr, "daemon pid=%d still running but not responsive\n",
                     (int)pid);
@@ -361,6 +406,19 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
         if (env->test_control_fd > 0) {
             close(env->test_control_fd);
             env->test_control_fd = -1;
+        }
+        if (bind_conflict && spawn_attempt == 0) {
+            int old_port = env->port;
+            int new_port = test_pick_port();
+            if (new_port > 0 &&
+                fixture_rewrite_port(env_path, new_port) == 0) {
+                env->port = new_port;
+                spawn_attempt++;
+                fprintf(stderr,
+                        "port %d lost the bind race; respawning daemon on %d\n",
+                        old_port, new_port);
+                goto respawn;
+            }
         }
         return -1;
     }
