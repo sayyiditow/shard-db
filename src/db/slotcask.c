@@ -2463,15 +2463,24 @@ static int kf_plan_window_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh,
                 }
             }
         }
-        for (size_t r = 0; r < nreserved; r++) {
-            if (reserved[r].target_slot != slot) continue;
-            reserved_here = 1;
-            if (memcmp(reserved[r].hash, hash, 16) == 0 &&
-                reserved[r].klen == klen &&
-                memcmp(reserved[r].key, key, klen) == 0) {
-                return 1; /* duplicate key within this window */
+        /* Deferred requests insert every within-window plan into res_map
+           at the call site, so the probes above already cover this
+           window's earlier plans; the linear scan is only the safety net
+           for the legacy path (txn->req == NULL, res_map NULL) and a
+           failed res_map allocation. Scanning reserved[] at every probed
+           slot made planning O(records x window) — 47% of all bench
+           cycles, and the bulk_commit_window=16384 cliff. */
+        if (!res_map || res_cap == 0) {
+            for (size_t r = 0; r < nreserved; r++) {
+                if (reserved[r].target_slot != slot) continue;
+                reserved_here = 1;
+                if (memcmp(reserved[r].hash, hash, 16) == 0 &&
+                    reserved[r].klen == klen &&
+                    memcmp(reserved[r].key, key, klen) == 0) {
+                    return 1; /* duplicate key within this window */
+                }
+                break;
             }
-            break;
         }
         if (reserved_here) continue; /* treat as occupied, keep probing */
 
@@ -4833,6 +4842,17 @@ static void bulk_phase3_stage_pending(SlotcaskDb *db,
         if (cnt == 0) continue;
         SlotcaskStream *pool = &db->streams[s];
 
+        /* Segcache handle reuse: append reservations land in the same
+           file for long consecutive runs, so hold the entry writer lock
+           across the run instead of paying a path snprintf + cache
+           lookup + lock pair per record. Re-acquire only when the target
+           fid changes (pool pops can scatter fids); a failed acquire is
+           remembered per fid so the failure path stays cheap. Holding
+           the lock across a run matches the long kf-wrlock holds the
+           commit path already takes. */
+        SlotcaskSegHandle h;
+        int have_handle = 0, cur_attempted = 0, cur_acquired = 0;
+        uint16_t cur_fid = 0;
         for (int k = 0; k < cnt; k++) {
             int i = stream_idx[s][k];
             SlotcaskBulkRec *r = &recs[i];
@@ -4861,10 +4881,19 @@ static void bulk_phase3_stage_pending(SlotcaskDb *db,
                 st[i].got_pool = 0;
                 r->slot_capacity = (uint32_t)rec_size;
             }
-            char path[PATH_MAX];
-            seg_path_for(path, db->data_dir, (uint8_t)s, st[i].target_fid);
-            SlotcaskSegHandle h;
-            if (segcache_acquire(&h, path, 1, 0, 1) != 0) {
+            if (!cur_attempted || st[i].target_fid != cur_fid) {
+                if (have_handle) segcache_release(&h);
+                have_handle = 0;
+                cur_fid = st[i].target_fid;
+                cur_attempted = 1;
+                char path[PATH_MAX];
+                seg_path_for(path, db->data_dir, (uint8_t)s, cur_fid);
+                cur_acquired = segcache_acquire(&h, path, 1, 0, 1) == 0;
+                have_handle = cur_acquired;
+            }
+            if (!cur_acquired) {
+                /* Same failure the per-record path hit: release the
+                   reserved capacity and fail just this record. */
                 if (st[i].got_pool)
                     pool_push_free_cap(pool, st[i].target_fid,
                                        st[i].target_off,
@@ -4877,8 +4906,8 @@ static void bulk_phase3_stage_pending(SlotcaskDb *db,
                                     r->value, r->vlen);
             SegCacheEntry *e = &g_segcache[h.slot];
             durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
-            segcache_release(&h);
         }
+        if (have_handle) segcache_release(&h);
     }
 }
 
@@ -7026,7 +7055,9 @@ int slotcask_bulk_request_execute(SlotcaskDb *db,
     free(touched);
     if (!req) return -1;
 
+    uint64_t t0st = now_us();
     int stage_rc = req_run_phase(req, inputs, ninputs, REQ_STAGE);
+    commit_phase_us_record(&g_bulk_stage_us_total, t0st);
     req->payload_rc = slotcask_bulk_request_flush_payloads(req);
     if (req->payload_rc != 0) {
         for (size_t si = 0; si < ninputs; si++)

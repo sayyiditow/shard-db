@@ -53,7 +53,12 @@ static void db_defaults_set(ShardDb *db) {
     db->auto_vacuum_interval_sec  = 3600;
     db->auto_reshard_hour         = 3;
     db->auto_reshard_throttle_ms  = 0;
-    db->bulk_commit_window        = 4096;
+    /* 16384 = the KFM2 marker entry ceiling: biggest window = fewest
+       marker-publish fsyncs per request. The old per-window planning scan
+       that made large windows quadratic is gone (see
+       kf_plan_window_insert_slot), so window size no longer trades CPU.
+       Memory per window is ~2MB transient (plan + reserved arrays). */
+    db->bulk_commit_window        = 16384;
     db->warmup_explicit           = 0;
     db->log_level                 = 3;
     db->log_retain_days           = 7;
