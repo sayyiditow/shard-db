@@ -250,6 +250,15 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
        `TestEnv env;` callers are unaffected. */
     if (qbuf_mb_override && *qbuf_mb_override)
         fprintf(f, "export QUERY_BUFFER_MB=%s\n", qbuf_mb_override);
+    /* Pass through BULK_COMMIT_WINDOW from the invoking shell so bench/test
+       runs can exercise the knob without hand-editing this generated file.
+       config.c validates range on parse; an out-of-range value here just
+       logs and keeps the daemon default, same as a hand-edited db.env. */
+    {
+        const char *bcw = getenv("BULK_COMMIT_WINDOW");
+        if (bcw && *bcw)
+            fprintf(f, "export BULK_COMMIT_WINDOW=%s\n", bcw);
+    }
     fclose(f);
     char logs_dir[400];
     snprintf(logs_dir, sizeof(logs_dir), "%s/logs", base);

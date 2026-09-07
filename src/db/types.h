@@ -501,9 +501,19 @@ uint64_t now_ms(void);
 uint64_t now_ms_coarse(void);
 uint64_t now_us(void);
 void commit_lock_hold_record(uint64_t t0_us, const char *dir, const char *object);
+/* Bulk CPU attribution: record an already-elapsed span (µs) from
+   query_bulk.c's phase 1 (parse + bucket + pre-grow). No-op without g_db. */
+void bulk_parse_us_record(uint64_t dt_us);
 
 static inline void durability_mark_dirty(_Atomic int *dirty,
                                          _Atomic uint64_t *dirty_since_ms) {
+    /* Fast path: a failing strong CAS is still a full RMW and takes the
+       line exclusive, so per-record marks under bulk staging ping-pong
+       the segcache entry's dirty line across worker cores (7% of bench
+       cycles). A relaxed load seeing 1 skips the RMW — shared-state
+       reads don't bounce the line, and the earliest-timestamp contract
+       only ever needs the first successful transition. */
+    if (atomic_load_explicit(dirty, memory_order_relaxed) == 1) return;
     int expected = 0;
     if (atomic_compare_exchange_strong_explicit(dirty, &expected, 1,
                                                 memory_order_acq_rel,

@@ -396,6 +396,11 @@ void commit_lock_hold_record(uint64_t t0_us, const char *dir, const char *object
     }
 }
 
+void bulk_parse_us_record(uint64_t dt_us) {
+    if (!g_db) return;
+    __atomic_add_fetch(&g_db->bulk_parse_us_total, dt_us, __ATOMIC_RELAXED);
+}
+
 int load_db_root(char *out, size_t outlen) {
     FILE *f = fopen("db.env", "r");
     if (!f) { fprintf(stderr, "Error: db.env not found\n"); return -1; }

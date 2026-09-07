@@ -1752,6 +1752,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
     }
 
     uint64_t t1 = now_ms_coarse();  /* end of Phase 1 (parse + bucket) */
+    bulk_parse_us_record((t1 - t0) * 1000);
 
     /* ===== Phase 2: run shard workers in parallel. Each worker owns one shard's
        writes so kf-shard wrlocks are disjoint across workers — no cross-worker
@@ -2511,6 +2512,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     }
 
     uint64_t t1 = now_ms_coarse();  /* end of Phase 1 (parse + bucket) */
+    bulk_parse_us_record((t1 - t0) * 1000);
 
     /* ===== Phase 2: parallel shard workers via shared pool.
        All concurrent callers share one pool sized to ~4× cores by default;

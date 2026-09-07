@@ -262,6 +262,12 @@ struct ShardDb {
        _p + _post therefore >= segment_sync_us_total by the D5 excess. */
     uint64_t commit_segment_p_us_total;
     uint64_t commit_segment_post_us_total;
+    /* CPU-side bulk attribution (query_bulk.c phase 1 → request dispatch,
+       and the deferred request's REQ_STAGE wave): with syncs attributed by
+       the counters above, parse_us + stage_us + sync counters should
+       account for nearly all of a bulk request's server wall time. */
+    uint64_t bulk_parse_us_total;
+    uint64_t bulk_stage_us_total;
     uint64_t commit_index_sync_us_total;
     uint64_t commit_index_sync_ops_total;
     uint64_t commit_marker_clear_us_total;
@@ -445,6 +451,8 @@ extern ShardDb *g_shard_db_instance;
 #define g_commit_segment_sync_us_total   (g_db->commit_segment_sync_us_total)
 #define g_commit_segment_p_us_total      (g_db->commit_segment_p_us_total)
 #define g_commit_segment_post_us_total   (g_db->commit_segment_post_us_total)
+#define g_bulk_parse_us_total            (g_db->bulk_parse_us_total)
+#define g_bulk_stage_us_total            (g_db->bulk_stage_us_total)
 #define g_commit_index_sync_us_total     (g_db->commit_index_sync_us_total)
 #define g_commit_index_sync_ops_total    (g_db->commit_index_sync_ops_total)
 #define g_commit_marker_clear_us_total   (g_db->commit_marker_clear_us_total)

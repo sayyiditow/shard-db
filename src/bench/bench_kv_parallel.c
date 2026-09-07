@@ -73,7 +73,7 @@ static void make_val(int i, char out[VAL_LEN + 1])
  */
 typedef struct {
     unsigned long count, lock_hold_us, sync_us, windows, mpub_us, mpub_n,
-                  segsync_us, seg_p_us, seg_post_us,
+                  segsync_us, seg_p_us, seg_post_us, parse_us, stage_us,
                   idxsync_us, idxsync_n, mclear_us;
 } CommitStats;
 
@@ -100,6 +100,8 @@ static void fetch_commit_stats(TestClient *tc, CommitStats *out)
     out->segsync_us    = json_ulong_after(resp, "segment_sync_us_total");
     out->seg_p_us      = json_ulong_after(resp, "segment_p_us_total");
     out->seg_post_us   = json_ulong_after(resp, "segment_post_us_total");
+    out->parse_us      = json_ulong_after(resp, "bulk_parse_us_total");
+    out->stage_us      = json_ulong_after(resp, "bulk_stage_us_total");
     out->idxsync_us    = json_ulong_after(resp, "index_sync_us_total");
     out->idxsync_n     = json_ulong_after(resp, "index_sync_ops_total");
     out->mclear_us     = json_ulong_after(resp, "marker_clear_us_total");
@@ -113,7 +115,8 @@ static void print_commit_stats_delta(const char *label,
     printf("  [%s] commit: requests=%lu  lock_hold_us=%lu  kf_msync_us=%lu  windows=%lu\n"
            "  [%s] marker_publish: n=%lu us=%lu   segment_sync_us=%lu "
            "(pre_marker_p=%lu post_marker=%lu)   "
-           "index_sync: n=%lu us=%lu   marker_clear_us=%lu\n",
+           "index_sync: n=%lu us=%lu   marker_clear_us=%lu\n"
+           "  [%s] cpu: parse_us=%lu   stage_us=%lu\n",
            label,
            cur->count - base->count,
            cur->lock_hold_us - base->lock_hold_us,
@@ -125,7 +128,10 @@ static void print_commit_stats_delta(const char *label,
            cur->seg_p_us - base->seg_p_us,
            cur->seg_post_us - base->seg_post_us,
            cur->idxsync_n - base->idxsync_n, cur->idxsync_us - base->idxsync_us,
-           cur->mclear_us - base->mclear_us);
+           cur->mclear_us - base->mclear_us,
+           label,
+           cur->parse_us - base->parse_us,
+           cur->stage_us - base->stage_us);
 }
 
 /* -------------------------------------------------------- memfd helper */
