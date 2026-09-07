@@ -3645,8 +3645,14 @@ static int pool_try_pop_batch_for_size(SlotcaskStream *p, uint32_t needed_size,
                 out[got++] = *cand;
                 p->free_slots[b][i - 1] = p->free_slots[b][p->free_count[b] - 1];
                 p->free_count[b]--;
-                /* no i-- here: the element swapped into i-1 must be
-                   examined against the same needed_size */
+                /* The swap moved the former last element into i-1. When
+                   the removed slot WAS the last element that is a self-
+                   assignment and i-1 now sits past the shrunk end: step
+                   over it, or the same slot is handed out twice (two
+                   records staged into one offset — corruption). A middle
+                   removal re-examines i-1 (no step), which is the point
+                   of the batch scan. */
+                if (i - 1 == p->free_count[b]) i--;
             } else {
                 i--;
             }
