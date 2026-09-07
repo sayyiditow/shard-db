@@ -2700,6 +2700,29 @@ static int kf_lookup_with_slot(SlotcaskKfHandle *kh, const uint8_t hash[16],
     return -1;
 }
 
+/* Deferred-verify variant for bulk delete planning: walk the chain and
+   collect flag==1 hash-matching candidate slots WITHOUT reading segments
+   (hash collisions cannot be resolved until the stored key is compared,
+   so candidates are returned in chain order; the caller verifies them in
+   batches — one segcache handle per file — and takes the first verified
+   candidate per key, which is exactly what the inline walk would pick).
+   Empty and tombstone slots stop the walk exactly like
+   kf_lookup_with_slot. Returns the candidate count. */
+static int kf_collect_live_candidates(SlotcaskKfHandle *kh,
+                                      const uint8_t hash[16],
+                                      size_t *out_slots, int max) {
+    KfProbeIter it; kf_probe_init(&it, kh, hash);
+    int n = 0;
+    size_t slot;
+    while ((slot = kf_probe_next(&it)) != (size_t)-1 && n < max) {
+        SlotcaskKfEntry *e = &kh->map[slot];
+        if (e->flag == 0 || e->flag == 2) break;
+        if (memcmp(e->hash, hash, sizeof(e->hash)) == 0)
+            out_slots[n++] = slot;
+    }
+    return n;
+}
+
 /* Direct kf_repoint at a known slot — skips probe + verify since the
    caller (bulk primitive Phase 4) already holds the wrlock that was
    acquired BEFORE the kf_lookup_with_slot call, so the slot is still
@@ -5000,50 +5023,178 @@ static void bulk_phase3_stage_pending(SlotcaskDb *db,
    parallel P wave (value_compute/require_existing/pre_commit_needs_old
    need OLD before the payload can be computed). Reserve + emit-pending +
    durable sync inline, mirroring slotcask_insert's allocation shape. */
-static int bulk_stage_single_pending(SlotcaskDb *db, uint8_t stream_id,
-                                     const uint8_t hash[16],
-                                     const void *key, size_t klen,
-                                     const void *value, size_t vlen,
-                                     uint16_t *out_fid, uint32_t *out_off,
-                                     uint32_t *out_cap) {
-    SlotcaskStream *pool = &db->streams[stream_id];
-    SlotcaskFreeSlot fs;
-    size_t rec_size = slotcask_record_size_varlen(klen, vlen);
-    uint16_t fid; uint32_t off; int got_pool;
+/* Bulk-update fallback staging, batched. Records whose NEW bytes depend
+   on OLD (value_rewrites_payload) cannot ride the P wave — staging needs
+   the post-plan value — but they must not pay per-record pool/segcache
+   traffic either. Grouped by stream, reserved with batched pool pops
+   (empty-streak guarded, mirroring bulk_phase3_stage_pending), then
+   emitted in (fid, offset) runs: one segcache handle per run, and for
+   legacy windows (sync_now) one msync+fdatasync per run instead of per
+   record. Deferred requests leave the bytes dirty — the window's batched
+   D5 pass (bulk_sync_fallback_payloads) makes them durable before the
+   marker (invariant I2). Per-record failures mirror the old
+   single-record path: status=-1 plus pool push-back, siblings unaffected. */
 
-    if (pool_try_pop_for_size(pool, (uint32_t)(24 + klen + vlen),
-                              db->slot_size, &fs) == 0) {
-        fid = fs.file_id; off = fs.offset; got_pool = 1;
-        if (fs.capacity > (uint32_t)rec_size)
-            pool_split_leftover(db, stream_id, fid, off + (uint32_t)rec_size,
-                                fs.capacity - (uint32_t)rec_size);
-    } else {
-        uint32_t f32, o32;
-        if (append_reserve_single_varlen(db, pool, rec_size, &f32, &o32) != 0)
-            return -1;
-        fid = (uint16_t)f32; off = o32; got_pool = 0;
-    }
+typedef struct { int i; uint32_t cap; uint64_t key; } BulkFbRunEnt;
 
-    char path[PATH_MAX];
-    seg_path_for(path, db->data_dir, stream_id, fid);
-    SlotcaskSegHandle h;
-    if (segcache_acquire(&h, path, 1, 0, 1) != 0) {
-        if (got_pool)
-            pool_push_free_cap(pool, fid, off, (uint32_t)rec_size, db->slot_size);
-        return -1;
+/* One collected kf-chain candidate for a bulk-delete record: gkey packs
+   (stream_id, file_id, collection seq) so the batch verify can group by
+   segment file with qsort while chain order within a record survives. */
+typedef struct { int li; size_t slot; uint64_t gkey; } BulkDelCand;
+
+static int bulk_del_cand_cmp(const void *a, const void *b) {
+    uint64_t x = ((const BulkDelCand *)a)->gkey;
+    uint64_t y = ((const BulkDelCand *)b)->gkey;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static int bulk_fb_run_cmp(const void *a, const void *b) {
+    uint64_t x = ((const BulkFbRunEnt *)a)->key;
+    uint64_t y = ((const BulkFbRunEnt *)b)->key;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static void bulk_stage_fallback_batch(SlotcaskDb *db, SlotcaskBulkRec *recs,
+                                      SlotcaskBulkState *st,
+                                      const int *idx, int n, int sync_now) {
+    BulkFbRunEnt *run = malloc((size_t)n * sizeof(*run));
+    if (!run) {
+        /* Allocation failure fails this window's fallback records
+           cleanly; the request-level durability-degraded path owns
+           recovery, same as any other OOM inside a commit. */
+        for (int j = 0; j < n; j++) recs[idx[j]].status = -1;
+        return;
     }
-    seg_record_emit_pending(h.map + off, (int)rec_size, hash, key, klen,
-                            value, vlen);
-    int rc = durability_msync_range(h.map, off, rec_size);
-    if (rc == 0 && fdatasync(h.fd) != 0) rc = -1;
-    segcache_release(&h);
-    if (rc != 0) {
-        if (got_pool)
-            pool_push_free_cap(pool, fid, off, (uint32_t)rec_size, db->slot_size);
-        return -1;
+    for (int s = 0; s < db->num_streams; s++) {
+        SlotcaskStream *pool = &db->streams[s];
+        SlotcaskFreeSlot cache[32];
+        int ncache = 0, empty_streak = 0;
+        int cnt = 0;
+        for (int j = 0; j < n; j++) {
+            int i = idx[j];
+            SlotcaskBulkRec *r = &recs[i];
+            if (r->status != 0 || st[i].target_stream != (uint8_t)s) continue;
+            size_t needed = 24 + r->klen + r->vlen;
+            size_t rec_size = slotcask_record_size_varlen(r->klen, r->vlen);
+            int pick = -1;
+            for (int c = 0; c < ncache; c++)
+                if (cache[c].capacity >= needed) { pick = c; break; }
+            if (pick < 0 && empty_streak < 64) {
+                int base = ncache;
+                int got = pool_try_pop_batch_for_size(pool, (uint32_t)needed,
+                                                      db->slot_size,
+                                                      cache + ncache,
+                                                      (int)(32 - ncache));
+                ncache += got;
+                if (got > 0) { pick = base; empty_streak = 0; }
+                else empty_streak++;
+            }
+            uint16_t fid; uint32_t off; uint32_t cap;
+            if (pick >= 0) {
+                fid = cache[pick].file_id;
+                off = cache[pick].offset;
+                cap = cache[pick].capacity;
+                st[i].got_pool = 1;
+                cache[pick] = cache[ncache - 1];
+                ncache--;
+            } else {
+                uint32_t f32, o32;
+                if (append_reserve_single_varlen(db, pool, rec_size,
+                                                 &f32, &o32) != 0) {
+                    r->status = -1;
+                    continue;
+                }
+                fid = (uint16_t)f32; off = o32; cap = (uint32_t)rec_size;
+                st[i].got_pool = 0;
+            }
+            st[i].target_fid = fid;
+            st[i].target_off = off;
+            r->slot_capacity = (uint32_t)rec_size;
+            run[cnt].i = i;
+            run[cnt].cap = cap;
+            run[cnt].key = ((uint64_t)fid << 32) | off;
+            cnt++;
+        }
+        if (!cnt) {
+            for (int c = 0; c < ncache; c++)
+                pool_push_free_cap(pool, cache[c].file_id, cache[c].offset,
+                                   cache[c].capacity, db->slot_size);
+            continue;
+        }
+        qsort(run, (size_t)cnt, sizeof(*run), bulk_fb_run_cmp);
+
+        int j = 0;
+        while (j < cnt) {
+            uint16_t fid = (uint16_t)(run[j].key >> 32);
+            int jend = j;
+            while (jend < cnt && (uint16_t)(run[jend].key >> 32) == fid) jend++;
+            char path[PATH_MAX];
+            seg_path_for(path, db->data_dir, (uint8_t)s, fid);
+            SlotcaskSegHandle h;
+            if (segcache_acquire(&h, path, 1, 0, 1) != 0) {
+                for (int k = j; k < jend; k++) {
+                    int i = run[k].i;
+                    recs[i].status = -1;
+                    if (st[i].got_pool)
+                        pool_push_free_cap(pool, fid, st[i].target_off,
+                                           recs[i].slot_capacity,
+                                           db->slot_size);
+                }
+                j = jend;
+                continue;
+            }
+            for (int k = j; k < jend; k++) {
+                int i = run[k].i;
+                uint32_t off = (uint32_t)(run[k].key & 0xffffffffu);
+                uint32_t cap = run[k].cap;
+                seg_record_emit_pending(h.map + off,
+                    (int)slotcask_record_size_varlen(recs[i].klen,
+                                                     recs[i].vlen),
+                    st[i].hash, recs[i].key, recs[i].klen, recs[i].value,
+                    recs[i].vlen);
+                /* Same invariant pool_split_leftover enforces on the P
+                   wave: a reused slot larger than the record must not
+                   leave stale bytes past the record header, or readers
+                   that stride by header size misparse what follows. */
+                if (cap > (uint32_t)slotcask_record_size_varlen(recs[i].klen,
+                                                                recs[i].vlen)) {
+                    uint32_t rs = (uint32_t)slotcask_record_size_varlen(
+                        recs[i].klen, recs[i].vlen);
+                    memset(h.map + off + rs, 0, cap - rs);
+                    pool_push_free_cap(pool, fid, off + rs, cap - rs,
+                                       db->slot_size);
+                }
+                st[i].needs_write = 1;
+            }
+            if (sync_now) {
+                uint32_t lo = (uint32_t)(run[j].key & 0xffffffffu);
+                int last = run[jend - 1].i;
+                uint32_t hi = st[last].target_off + run[jend - 1].cap;
+                int rc = durability_msync_range(h.map, lo, hi - lo);
+                if (rc == 0 && fdatasync(h.fd) != 0) rc = -1;
+                if (rc != 0) {
+                    for (int k = j; k < jend; k++) {
+                        int i = run[k].i;
+                        recs[i].status = -1;
+                        st[i].needs_write = 0;
+                        if (st[i].got_pool)
+                            pool_push_free_cap(pool, fid, st[i].target_off,
+                                               recs[i].slot_capacity,
+                                               db->slot_size);
+                    }
+                }
+            } else {
+                durability_mark_dirty(&g_segcache[h.slot].dirty,
+                                      &g_segcache[h.slot].dirty_since_ms);
+            }
+            segcache_release(&h);
+            j = jend;
+        }
+        for (int c = 0; c < ncache; c++)
+            pool_push_free_cap(pool, cache[c].file_id, cache[c].offset,
+                               cache[c].capacity, db->slot_size);
     }
-    *out_fid = fid; *out_off = off; *out_cap = (uint32_t)rec_size;
-    return 0;
+    free(run);
 }
 
 /* ============================================================ Task 4:
@@ -5135,6 +5286,21 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
     if (!plan->entries || !plan->active || !plan->abandoned || !old_idx ||
         !reserved_plans) goto oom;
     int nold = 0;
+    /* Bulk-delete key verification is batched: candidates are collected
+       per record during planning (no segment I/O), then verified with one
+       segcache handle per (stream, file) run after the loop. The
+       per-record verify round trips dominated bulk-delete planning. */
+    int delete_kind = (shard->kind == BULK_MUTATION_DELETE);
+    BulkDelCand *cands = NULL;
+    int *cand_base = NULL, *cand_cnt = NULL, *cand_done = NULL;
+    int ncand = 0;
+    if (delete_kind) {
+        cands     = malloc(span * 4 * sizeof(*cands));
+        cand_base = calloc(span, sizeof(*cand_base));
+        cand_cnt  = calloc(span, sizeof(*cand_cnt));
+        cand_done = calloc(span, sizeof(*cand_done));
+        if (!cands || !cand_base || !cand_cnt || !cand_done) goto oom;
+    }
 
     for (size_t i = begin; i < end; i++) {
         SlotcaskBulkRec *r = &recs[i];
@@ -5150,36 +5316,39 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
             continue;               /* staged payload (if any) stays flag=0 */
         }
         compute_hash(r->key, r->klen, s->hash);
+        s->target_stream = (uint8_t)((unsigned)s->hash[15] %
+                                     (unsigned)txn->db->num_streams);
+
+        if (delete_kind) {
+            /* Deferred key verification: collect this record's live
+               hash-match candidates from the kf chain without touching
+               segments; the whole window's candidates are verified per
+               segment file after the loop. Cap 4: >4 live 128-bit-hash
+               matches for one key is not a reachable chain. */
+            int li = (int)(i - begin);
+            int base = ncand;
+            size_t slots4[4];
+            int got = kf_collect_live_candidates(kh, s->hash, slots4, 4);
+            cand_base[li] = base;
+            cand_cnt[li] = got;
+            for (int c2 = 0; c2 < got; c2++) {
+                SlotcaskKfEntry *e = &kh->map[slots4[c2]];
+                cands[base + c2].li = li;
+                cands[base + c2].slot = slots4[c2];
+                cands[base + c2].gkey = ((uint64_t)e->stream_id << 40) |
+                                        ((uint64_t)e->file_id << 24) |
+                                        (uint64_t)((base + c2) & 0xffffffu);
+            }
+            ncand += got;
+            s->needs_write = 1;
+            continue;
+        }
+
         found = (kf_lookup_with_slot(kh, s->hash, r->key, r->klen,
                                      txn->db->data_dir, &old_flag,
                                      &s->old_sid, &s->old_fid,
                                      &s->old_off, &s->old_kf_slot) == 0);
         s->old_found = (uint8_t)(found ? 1 : 0);
-        s->target_stream = (uint8_t)((unsigned)s->hash[15] %
-                                     (unsigned)txn->db->num_streams);
-
-        if (shard->kind == BULK_MUTATION_DELETE) {
-            if (!found) { r->status = -2; continue; }
-            /* prepare_window's and apply_window's documented contracts
-               (slotcask.h) both require OLD -- CAS re-verification plus
-               the forward index diff (old=OLD, new=NULL) -- exactly as
-               much as pre_commit does, so their presence must gate the
-               batched old-value fetch too, not just pre_commit_needs_old
-               (which the has_indexed_fields branch leaves unset since it
-               uses prepare_window/apply_window instead of pre_commit).
-               Without this, every indexed delete (CAS or plain) always
-               saw old_value == NULL: CAS-deletes rejected every record,
-               and plain indexed deletes silently skipped index removal. */
-            if (txn->delete_opts &&
-                (txn->delete_opts->pre_commit_needs_old ||
-                 txn->delete_opts->prepare_window ||
-                 txn->delete_opts->apply_window) &&
-                r->old_value == NULL) {
-                old_idx[nold++] = (int)i;
-            }
-            s->needs_write = 1;
-            continue;
-        }
 
         if (found && uo && (uo->if_not_exists || r->if_not_exists)) {
             r->status = -2; r->was_update = 1;
@@ -5197,6 +5366,78 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
         }
         r->was_update = found ? 1 : 0;
         s->needs_write = 1;
+    }
+
+    if (delete_kind && ncand > 0) {
+        /* Verify all candidates grouped by segment file: first verified
+           candidate (chain order within a record) wins. */
+        qsort(cands, (size_t)ncand, sizeof(*cands), bulk_del_cand_cmp);
+        int j = 0;
+        while (j < ncand) {
+            uint64_t g = cands[j].gkey;
+            int jend = j;
+            while (jend < ncand && cands[jend].gkey == g) jend++;
+            char path[PATH_MAX];
+            seg_path_for(path, txn->db->data_dir, (uint8_t)(g >> 40),
+                         (uint16_t)((g >> 24) & 0xffffu));
+            SlotcaskSegHandle h;
+            if (segcache_acquire(&h, path, 0, 0, 0) != 0) {
+                /* I/O error, not "not found": fail the affected records
+                   (status=-1) unless another file already verified them. */
+                for (int k = j; k < jend; k++) {
+                    int li = cands[k].li;
+                    if (cand_done[li] || recs[begin + li].status != 0) continue;
+                    recs[begin + li].status = -1;
+                    st[begin + li].needs_write = 0;
+                }
+                j = jend;
+                continue;
+            }
+            for (int k = j; k < jend; k++) {
+                int li = cands[k].li;
+                if (cand_done[li]) continue;
+                SlotcaskBulkRec *r = &recs[begin + li];
+                if (r->status != 0) continue;
+                SlotcaskKfEntry *e = &kh->map[cands[k].slot];
+                const uint8_t *rec = h.map + e->offset;
+                if (seg_rec_klen(rec) != r->klen ||
+                    memcmp(rec + 24, r->key, r->klen) != 0)
+                    continue;
+                SlotcaskBulkState *s = &st[begin + li];
+                s->old_found = 1;
+                s->old_sid = e->stream_id;
+                s->old_fid = e->file_id;
+                s->old_off = e->offset;
+                s->old_kf_slot = cands[k].slot;
+                cand_done[li] = 1;
+            }
+            segcache_release(&h);
+            j = jend;
+        }
+    }
+    if (delete_kind) {
+        /* Old-value fetch gating (indexed/CAS deletes) for verified
+           records; not-found post pass fails the rest. Runs for EVERY
+           delete window — including ncand==0 (nothing found), where the
+           missing pass would let a delete of a missing key succeed. */
+        for (size_t i = begin; i < end; i++) {
+            SlotcaskBulkRec *r = &recs[i];
+            SlotcaskBulkState *s = &st[i];
+            if (r->status != 0) continue;
+            if (s->old_found) {
+                if (txn->delete_opts &&
+                    (txn->delete_opts->pre_commit_needs_old ||
+                     txn->delete_opts->prepare_window ||
+                     txn->delete_opts->apply_window) &&
+                    r->old_value == NULL)
+                    old_idx[nold++] = (int)i;
+            } else {
+                r->status = -2;         /* not found */
+                s->needs_write = 0;
+            }
+        }
+        free(cands); free(cand_base); free(cand_cnt); free(cand_done);
+        cands = NULL; cand_base = NULL; cand_cnt = NULL; cand_done = NULL;
     }
 
     if (nold > 0) {
@@ -5217,6 +5458,18 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
     }
 
     if (shard->kind == BULK_MUTATION_UPSERT) {
+        /* Fallback staging is batched after the planning loop: these
+           records could not ride the P wave (their NEW bytes depend on
+           OLD), but they stage exactly like it — grouped by stream,
+           batched pool pops, fid-run emission (see
+           bulk_stage_fallback_batch). */
+        int *fb_idx = malloc((size_t)(end - begin) * sizeof(*fb_idx));
+        int fb_n = 0;
+        if (!fb_idx) {
+            for (size_t i = begin; i < end; i++) recs[i].status = -1;
+            errno = ENOMEM;
+            return -1;
+        }
         for (size_t i = begin; i < end; i++) {
             SlotcaskBulkRec *r = &recs[i];
             SlotcaskBulkState *s = &st[i];
@@ -5241,27 +5494,24 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
                 }
                 s->has_plan = 1;
                 reserved_plans[nreserved++] = s->kf_plan;
-                if (txn->req)
-                    req_res_insert(txn->req->shards[shard->kf_shard_id].res_map,
-                                   txn->req->shards[shard->kf_shard_id].res_cap,
-                                   &s->kf_plan);
-            }
-            /* OLD-derived records never went through the P wave: stage NEW
-               synchronously here so M still covers a durable payload. */
-            if (!s->staged_in_wave) {
-                uint32_t cap;
-                if (bulk_stage_single_pending(txn->db, s->target_stream,
-                                              s->hash, r->key, r->klen,
-                                              r->value, r->vlen,
-                                              &s->target_fid, &s->target_off,
-                                              &cap) != 0) {
-                    r->status = -1;
-                    continue;
+                if (txn->req) {
+                    ReqShard *rs = &txn->req->shards[shard->kf_shard_id];
+                    req_res_insert(rs->res_map, rs->res_cap, &s->kf_plan);
                 }
-                r->slot_capacity = cap;
-                s->needs_write = 1;   /* staged bytes owe a D5 sync */
             }
+            /* OLD-derived records never went through the P wave (their
+               NEW bytes depend on OLD): collected here, staged in one
+               batched pass below. Legacy windows (txn->req == NULL) sync
+               each emitted run inline — durability lands before the ack;
+               deferred requests leave the bytes dirty for the window's
+               batched D5 pass before the marker. */
+            if (!s->staged_in_wave)
+                fb_idx[fb_n++] = (int)i;
         }
+        if (fb_n > 0)
+            bulk_stage_fallback_batch(txn->db, recs, st, fb_idx, fb_n,
+                                      txn->req == NULL);
+        free(fb_idx);
     }
 
     /* Physical kf location + pre_commit: fired under the held kf wrlock,
