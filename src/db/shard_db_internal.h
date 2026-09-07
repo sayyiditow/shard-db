@@ -252,6 +252,16 @@ struct ShardDb {
     uint64_t commit_marker_publish_us_total;
     uint64_t commit_marker_publish_count;
     uint64_t commit_segment_sync_us_total;
+    /* Classified split of the segment-sync cost: _p covers pre-marker
+       payload durability (the request P wave plus the D5 fallback sync),
+       _post covers everything after the marker is durable (A/T waves).
+       The design constraint this measures: only the _post share can ever
+       move off the response path, and only under a marker-retaining
+       commit design; the _p share is the floor. Both are subsets of the
+       deferred-request path; legacy immediate commits stay unrecorded.
+       _p + _post therefore >= segment_sync_us_total by the D5 excess. */
+    uint64_t commit_segment_p_us_total;
+    uint64_t commit_segment_post_us_total;
     uint64_t commit_index_sync_us_total;
     uint64_t commit_index_sync_ops_total;
     uint64_t commit_marker_clear_us_total;
@@ -433,6 +443,8 @@ extern ShardDb *g_shard_db_instance;
 #define g_commit_marker_publish_us_total (g_db->commit_marker_publish_us_total)
 #define g_commit_marker_publish_count    (g_db->commit_marker_publish_count)
 #define g_commit_segment_sync_us_total   (g_db->commit_segment_sync_us_total)
+#define g_commit_segment_p_us_total      (g_db->commit_segment_p_us_total)
+#define g_commit_segment_post_us_total   (g_db->commit_segment_post_us_total)
 #define g_commit_index_sync_us_total     (g_db->commit_index_sync_us_total)
 #define g_commit_index_sync_ops_total    (g_db->commit_index_sync_ops_total)
 #define g_commit_marker_clear_us_total   (g_db->commit_marker_clear_us_total)

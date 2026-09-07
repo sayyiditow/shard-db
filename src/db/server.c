@@ -1048,6 +1048,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         uint64_t commit_mpub_us   = __atomic_load_n(&g_commit_marker_publish_us_total, __ATOMIC_RELAXED);
         uint64_t commit_mpub_n    = __atomic_load_n(&g_commit_marker_publish_count, __ATOMIC_RELAXED);
         uint64_t commit_segsync_us = __atomic_load_n(&g_commit_segment_sync_us_total, __ATOMIC_RELAXED);
+        uint64_t commit_seg_p_us   = __atomic_load_n(&g_commit_segment_p_us_total, __ATOMIC_RELAXED);
+        uint64_t commit_seg_post_us = __atomic_load_n(&g_commit_segment_post_us_total, __ATOMIC_RELAXED);
         uint64_t commit_idxsync_us = __atomic_load_n(&g_commit_index_sync_us_total, __ATOMIC_RELAXED);
         uint64_t commit_idxsync_n  = __atomic_load_n(&g_commit_index_sync_ops_total, __ATOMIC_RELAXED);
         uint64_t commit_mclear_us = __atomic_load_n(&g_commit_marker_clear_us_total, __ATOMIC_RELAXED);
@@ -1078,8 +1080,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             OUT("commit          count=%lu lock_hold_avg_us=%lu sync_avg_us=%lu lock_hold_total_us=%lu sync_total_us=%lu\n",
                 commit_n, commit_hold_avg, commit_sync_avg, commit_hold_us, commit_sync_us);
             OUT("commit phases   windows=%lu marker_publish_us=%lu(marker_n=%lu) segment_sync_us=%lu "
+                "(pre_marker_p_us=%lu post_marker_us=%lu) "
                 "index_sync_us=%lu(index_ops=%lu) marker_clear_us=%lu\n",
                 commit_windows, commit_mpub_us, commit_mpub_n, commit_segsync_us,
+                commit_seg_p_us, commit_seg_post_us,
                 commit_idxsync_us, commit_idxsync_n, commit_mclear_us);
         } else {
             OUT("{\"uptime_ms\":%lu,\"marker_recovery_ran\":%d,\"active_threads\":%d,\"in_flight_writes\":%d,"
@@ -1087,14 +1091,16 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 "\"commit\":{\"count\":%lu,\"lock_hold_us_total\":%lu,\"lock_hold_us_avg\":%lu,"
                 "\"sync_us_total\":%lu,\"sync_us_avg\":%lu,"
                 "\"windows_total\":%lu,\"marker_publish_us_total\":%lu,\"marker_publish_count\":%lu,"
-                "\"segment_sync_us_total\":%lu,\"index_sync_us_total\":%lu,\"index_sync_ops_total\":%lu,"
+                "\"segment_sync_us_total\":%lu,\"segment_p_us_total\":%lu,\"segment_post_us_total\":%lu,"
+                "\"index_sync_us_total\":%lu,\"index_sync_ops_total\":%lu,"
                 "\"marker_clear_us_total\":%lu},"
                 "\"slow_query\":{\"threshold_ms\":%d,\"count\":%lu,\"recent\":[",
                 uptime, g_marker_recovery_ran, at, in_flight_writes,
                 bc_used, bc_total, bc_bytes, b_hits, b_miss,
                 commit_n, commit_hold_us, commit_hold_avg, commit_sync_us, commit_sync_avg,
                 commit_windows, commit_mpub_us, commit_mpub_n,
-                commit_segsync_us, commit_idxsync_us, commit_idxsync_n,
+                commit_segsync_us, commit_seg_p_us, commit_seg_post_us,
+                commit_idxsync_us, commit_idxsync_n,
                 commit_mclear_us,
                 g_slow_query_ms, slow_n);
             pthread_mutex_lock(&g_slow_query_lock);
@@ -1177,6 +1183,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         uint64_t commit_mpub_us = __atomic_load_n(&g_commit_marker_publish_us_total, __ATOMIC_RELAXED);
         uint64_t commit_mpub_n  = __atomic_load_n(&g_commit_marker_publish_count, __ATOMIC_RELAXED);
         uint64_t commit_segsync_us = __atomic_load_n(&g_commit_segment_sync_us_total, __ATOMIC_RELAXED);
+        uint64_t commit_seg_p_us   = __atomic_load_n(&g_commit_segment_p_us_total, __ATOMIC_RELAXED);
+        uint64_t commit_seg_post_us = __atomic_load_n(&g_commit_segment_post_us_total, __ATOMIC_RELAXED);
         uint64_t commit_idxsync_us = __atomic_load_n(&g_commit_index_sync_us_total, __ATOMIC_RELAXED);
         uint64_t commit_idxsync_n  = __atomic_load_n(&g_commit_index_sync_ops_total, __ATOMIC_RELAXED);
         uint64_t commit_mclear_us = __atomic_load_n(&g_commit_marker_clear_us_total, __ATOMIC_RELAXED);
@@ -1201,6 +1209,12 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         OUT("# HELP shard_db_commit_segment_sync_microseconds_total Cumulative segment msync+fdatasync barrier (phases P/A).\n");
         OUT("# TYPE shard_db_commit_segment_sync_microseconds_total counter\n");
         OUT("shard_db_commit_segment_sync_microseconds_total %lu\n", commit_segsync_us);
+        OUT("# HELP shard_db_commit_segment_p_microseconds_total Pre-marker payload sync (P wave + D5 fallback).\n");
+        OUT("# TYPE shard_db_commit_segment_p_microseconds_total counter\n");
+        OUT("shard_db_commit_segment_p_microseconds_total %lu\n", commit_seg_p_us);
+        OUT("# HELP shard_db_commit_segment_post_microseconds_total Post-marker segment sync (A/T waves + legacy A).\n");
+        OUT("# TYPE shard_db_commit_segment_post_microseconds_total counter\n");
+        OUT("shard_db_commit_segment_post_microseconds_total %lu\n", commit_seg_post_us);
         OUT("# HELP shard_db_commit_index_sync_microseconds_total Cumulative per-window secondary-index flushes (phase I).\n");
         OUT("# TYPE shard_db_commit_index_sync_microseconds_total counter\n");
         OUT("shard_db_commit_index_sync_microseconds_total %lu\n", commit_idxsync_us);
