@@ -3624,6 +3624,38 @@ static int pool_try_pop_for_size(SlotcaskStream *p, uint32_t needed_size,
     return 2;
 }
 
+/* Batch variant of pool_try_pop_for_size: one trylock fills up to `want`
+   fitting slots (smallest bucket first, swap-remove each — the element
+   swapped into a vacated position is re-examined). Returns the number
+   popped (0 = contested or none available; caller falls back to the
+   append path either way). Bulk staging refills a per-worker cache from
+   this once per batch instead of taking the shared stream lock per
+   record — the per-record trylock on a pool shared by every staging
+   worker was ~6.5% of bench cycles in raw lock traffic. */
+static int pool_try_pop_batch_for_size(SlotcaskStream *p, uint32_t needed_size,
+                                       int max_slot_size,
+                                       SlotcaskFreeSlot *out, int want) {
+    int got = 0;
+    if (pthread_mutex_trylock(&p->pool_lock) != 0) return 0;
+    int start_b = slotcask_bucket_for(needed_size, max_slot_size);
+    for (int b = start_b; b < SLOTCASK_POOL_BUCKETS && got < want; b++) {
+        for (size_t i = p->free_count[b]; i > 0 && got < want; ) {
+            SlotcaskFreeSlot *cand = &p->free_slots[b][i - 1];
+            if (cand->capacity >= needed_size) {
+                out[got++] = *cand;
+                p->free_slots[b][i - 1] = p->free_slots[b][p->free_count[b] - 1];
+                p->free_count[b]--;
+                /* no i-- here: the element swapped into i-1 must be
+                   examined against the same needed_size */
+            } else {
+                i--;
+            }
+        }
+    }
+    pthread_mutex_unlock(&p->pool_lock);
+    return got;
+}
+
 /* A free-pool slot popped by pool_try_pop_for_size() may be larger than
    the record about to be written into it (coarse bucket matching, see the
    comment above) — never let the excess be silently folded into that
@@ -4546,6 +4578,17 @@ static int segloc_cmp(const void *a, const void *b) {
     return 0;
 }
 
+/* O(n) sortedness probe: stage builds these vectors stream-major with
+   sequential append reservations, so the fresh-insert case is already
+   sorted by construction and the qsort before dedup is pure overhead
+   (comparator cycles were ~5% of bench profiles). Reuse-heavy patterns
+   scatter fids via pool pops and fall back to the sort. */
+static int segloc_is_sorted(const SegLoc *a, size_t n) {
+    for (size_t i = 1; i < n; i++)
+        if (segloc_cmp(&a[i - 1], &a[i]) > 0) return 0;
+    return 1;
+}
+
 static int segloc_vec_append(SegLoc **dst, size_t *n, size_t *cap,
                              const SegLoc *src, size_t add) {
     if (add == 0) return 0;
@@ -4853,14 +4896,45 @@ static void bulk_phase3_stage_pending(SlotcaskDb *db,
         SlotcaskSegHandle h;
         int have_handle = 0, cur_attempted = 0, cur_acquired = 0;
         uint16_t cur_fid = 0;
+        /* Per-run free-slot cache: one batch pop per lock hold instead of
+           one trylock per record against the shared stream pool. Unused
+           entries return to the pool when the stream's pass ends. */
+        SlotcaskFreeSlot cache[32];
+        int ncache = 0;
+        /* Empty-pool streak: a fresh object's pools are empty, and the
+           per-record batch pop would still pay the trylock just to learn
+           that every time. After 64 consecutive empty results, stop
+           probing until the next record would need a refill anyway;
+           slots pushed concurrently are picked up within 64 records, so
+           capacity is delayed, never stranded. */
+        int empty_streak = 0;
         for (int k = 0; k < cnt; k++) {
             int i = stream_idx[s][k];
             SlotcaskBulkRec *r = &recs[i];
-            SlotcaskFreeSlot fs;
             size_t needed = 24 + r->klen + r->vlen;
             size_t rec_size = slotcask_record_size_varlen(r->klen, r->vlen);
-            if (pool_try_pop_for_size(pool, (uint32_t)needed,
-                                      db->slot_size, &fs) == 0) {
+            int pick = -1;
+            for (int c = 0; c < ncache; c++)
+                if (cache[c].capacity >= needed) { pick = c; break; }
+            if (pick < 0 && empty_streak < 64) {
+                int base = ncache;
+                int got = pool_try_pop_batch_for_size(pool, (uint32_t)needed,
+                                                      db->slot_size,
+                                                      cache + ncache,
+                                                      (int)(32 - ncache));
+                ncache += got;
+                /* every batch entry fits `needed` by construction */
+                if (got > 0) {
+                    pick = base;
+                    empty_streak = 0;
+                } else {
+                    empty_streak++;
+                }
+            }
+            if (pick >= 0) {
+                SlotcaskFreeSlot fs = cache[pick];
+                cache[pick] = cache[ncache - 1];
+                ncache--;
                 st[i].target_fid = fs.file_id;
                 st[i].target_off = fs.offset;
                 st[i].got_pool = 1;
@@ -4908,6 +4982,11 @@ static void bulk_phase3_stage_pending(SlotcaskDb *db,
             durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
         }
         if (have_handle) segcache_release(&h);
+        /* Return unused cached capacity — dropping it would strand the
+           on-disk space outside the pool until vacuum. */
+        for (int c = 0; c < ncache; c++)
+            pool_push_free_cap(pool, cache[c].file_id, cache[c].offset,
+                               cache[c].capacity, db->slot_size);
     }
 }
 
@@ -5504,7 +5583,8 @@ static int bulk_activate_new_payloads_locked(BulkMutationTxn *txn,
         locs[n].off = e->slot.new_offset;
         n++;
     }
-    qsort(locs, n, sizeof(*locs), segloc_cmp);
+    if (n > 1 && !segloc_is_sorted(locs, n))
+        qsort(locs, n, sizeof(*locs), segloc_cmp);
     if (txn->req) {
         ReqWindow *rw = plan->req_window;
         if (!rw || bulk_seg_apply_flags(txn->db, locs, n, 1) != 0 ||
@@ -5661,6 +5741,34 @@ static int size_cmp(const void *a, const void *b) {
     return x < y ? -1 : x > y ? 1 : 0;
 }
 
+/* LSD radix sort for kf slot indices: values are < 2^24 (the
+   SLOTCASK_MAX_SLOTS_PER_SHARD ceiling), so three 8-bit counting passes
+   suffice and there are no comparator calls. qsort's function-pointer
+   comparator over hash-scattered slot vectors was ~2% of bench cycles.
+   Scratch must hold n elements; caller falls back to qsort on OOM. */
+static void radix_sort_sizes(size_t *a, size_t *scratch, size_t n) {
+    if (n < 2) return;
+    size_t *src = a, *dst = scratch;
+    for (int pass = 0; pass < 3; pass++) {
+        size_t count[256] = {0};
+        int shift = pass * 8;
+        for (size_t i = 0; i < n; i++)
+            count[(src[i] >> shift) & 0xff]++;
+        size_t sum = 0;
+        for (int b = 0; b < 256; b++) {
+            size_t c = count[b];
+            count[b] = sum;
+            sum += c;
+        }
+        for (size_t i = 0; i < n; i++)
+            dst[count[(src[i] >> shift) & 0xff]++] = src[i];
+        size_t *t = src;
+        src = dst;
+        dst = t;
+    }
+    if (src != a) memcpy(a, src, n * sizeof(*a));
+}
+
 static int bulk_apply_and_sync_kf_locked(BulkMutationTxn *txn,
                                          SlotcaskKfHandle *kh,
                                          BulkWindowPlan *plan) {
@@ -5774,7 +5882,8 @@ static int bulk_tombstone_old_payloads_locked(BulkMutationTxn *txn,
             return -1;
         }
     }
-    qsort(locs, n, sizeof(*locs), segloc_cmp);
+    if (n > 1 && !segloc_is_sorted(locs, n))
+        qsort(locs, n, sizeof(*locs), segloc_cmp);
     if (txn->req) {
         ReqWindow *rw = plan->req_window;
         rc = rw ? segloc_vec_append(&rw->t_locs, &rw->nt, &rw->cap_t,
@@ -6005,7 +6114,8 @@ static int bulk_sync_fallback_payloads(BulkMutationTxn *txn,
                              .fid = st->target_fid,
                              .off = st->target_off };
     }
-    qsort(locs, n, sizeof(*locs), segloc_cmp);
+    if (n > 1 && !segloc_is_sorted(locs, n))
+        qsort(locs, n, sizeof(*locs), segloc_cmp);
     uint64_t t0d5 = now_us();
     int rc = n ? bulk_seg_apply_and_sync(txn->db, locs, n, 0, 0) : 0;
     commit_phase_us_record(&g_commit_segment_p_us_total, t0d5);
@@ -6219,6 +6329,7 @@ static void *bulk_stage_one_shard(void *raw) {
             locs[n].off = st[i].target_off;
             n++;
         }
+        if (n > 1 && !segloc_is_sorted(locs, n))
         qsort(locs, n, sizeof(*locs), segloc_cmp);
         if (txn->req) {
             ReqShard *rs = &txn->req->shards[shard->kf_shard_id];
@@ -6647,7 +6758,8 @@ static int slotcask_bulk_request_flush_payloads(SlotcaskBulkRequest *req) {
                    req->shards[s].np * sizeof(*all));
         n += req->shards[s].np;
     }
-    qsort(all, n, sizeof(*all), segloc_cmp);
+    if (n > 1 && !segloc_is_sorted(all, n))
+        qsort(all, n, sizeof(*all), segloc_cmp);
     size_t w = 0;
     for (size_t i = 0; i < n; i++)
         if (w == 0 || segloc_cmp(&all[w - 1], &all[i]) != 0) all[w++] = all[i];
@@ -6703,7 +6815,15 @@ static void *req_kf_sync_worker(void *raw) {
             n += rw->nkf;
         }
     }
-    if (n > 1) qsort(slots, n, sizeof(*slots), size_cmp);
+    if (n > 1) {
+        size_t *scratch = malloc(n * sizeof(*scratch));
+        if (scratch) {
+            radix_sort_sizes(slots, scratch, n);
+            free(scratch);
+        } else {
+            qsort(slots, n, sizeof(*slots), size_cmp);
+        }
+    }
     size_t w = 0;
     for (size_t i = 0; i < n; i++)
         if (w == 0 || slots[w - 1] != slots[i]) slots[w++] = slots[i];
@@ -6883,6 +7003,7 @@ static int slotcask_bulk_request_flush_commit(SlotcaskBulkRequest *req) {
                     n += rw->nt;
                 }
             }
+        if (n > 1 && !segloc_is_sorted(all, n))
         qsort(all, n, sizeof(*all), segloc_cmp);
         size_t w = 0;
         for (size_t i = 0; i < n; i++)

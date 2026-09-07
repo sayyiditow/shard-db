@@ -10,12 +10,31 @@
 #include "test_client.h"
 #include "fixtures.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static void expect(int cond, const char *what) {
     ASSERT_TRUE(cond, what);
+}
+
+/* snprintf-append with truncation handling. CodeQL flags the raw
+   "p += snprintf(buf + p, cap - p, ...)" idiom: an unchecked return past
+   the remaining space wraps `cap - p` on the next call and writes past
+   the buffer. This clamps, fails the test, and pins the offset at cap so
+   every later call is a size-0 no-op. */
+static size_t req_append(char *buf, size_t cap, size_t p,
+                         const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + p, cap - p, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - p) {
+        expect(0, "request buffer truncated");
+        return cap;
+    }
+    return p + (size_t)n;
 }
 
 static long json_int_after(const char *resp, const char *key) {
@@ -48,14 +67,14 @@ static int test_bulk_idx_types_batching_run(void) {
     free(resp); resp = NULL;
 
     char *req = malloc(16384); size_t p = 0;
-    p += (size_t)snprintf(req + p, 16384 - p,
+    p = req_append(req, 16384, p,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"bix\","
         "\"records\":[");
     for (int i = 0; i < 32; i++)
-        p += (size_t)snprintf(req + p, 16384 - p,
+        p = req_append(req, 16384, p,
             "%s{\"key\":\"B-%02d\",\"value\":{\"flag\":\"f%d\"}}",
             i ? "," : "", i, i % 2);
-    snprintf(req + p, 16384 - p, "]}");
+    (void)req_append(req, 16384, p, "]}");
     tc_request(tc, req, &resp);
     expect(resp && !strstr(resp, "\"error\""), "bitmap bulk insert ok");
     free(resp); resp = NULL; free(req);
@@ -85,14 +104,14 @@ static int test_bulk_idx_types_batching_run(void) {
     free(resp); resp = NULL;
 
     req = malloc(16384); p = 0;
-    p += (size_t)snprintf(req + p, 16384 - p,
+    p = req_append(req, 16384, p,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"tix\","
         "\"records\":[");
     for (int i = 0; i < 32; i++)
-        p += (size_t)snprintf(req + p, 16384 - p,
+        p = req_append(req, 16384, p,
             "%s{\"key\":\"T-%02d\",\"value\":{\"desc\":\"alpha beta gamma %d\"}}",
             i ? "," : "", i, i);
-    snprintf(req + p, 16384 - p, "]}");
+    (void)req_append(req, 16384, p, "]}");
     tc_request(tc, req, &resp);
     expect(resp && !strstr(resp, "\"error\""), "trigram bulk insert ok");
     free(resp); resp = NULL; free(req);

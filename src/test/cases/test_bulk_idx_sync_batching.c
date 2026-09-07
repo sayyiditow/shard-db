@@ -9,12 +9,31 @@
 #include "test_client.h"
 #include "fixtures.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static void expect(int cond, const char *what) {
     ASSERT_TRUE(cond, what);
+}
+
+/* snprintf-append with truncation handling. CodeQL flags the raw
+   "p += snprintf(buf + p, cap - p, ...)" idiom: an unchecked return past
+   the remaining space wraps `cap - p` on the next call and writes past
+   the buffer. This clamps, fails the test, and pins the offset at cap so
+   every later call is a size-0 no-op. */
+static size_t req_append(char *buf, size_t cap, size_t p,
+                         const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + p, cap - p, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - p) {
+        expect(0, "request buffer truncated");
+        return cap;
+    }
+    return p + (size_t)n;
 }
 
 /* Extract a JSON integer that follows `"key":` in resp. Returns 0 on miss. */
@@ -52,14 +71,14 @@ static int test_bulk_idx_sync_batching_run(void) {
     /* 32 fresh inserts through the indexed bulk-insert window. */
     {
         char *req = malloc(8192); size_t p = 0;
-        p += (size_t)snprintf(req + p, 8192 - p,
+        p = req_append(req, 8192, p,
             "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"bat\","
             "\"records\":[");
         for (int i = 0; i < 32; i++)
-            p += (size_t)snprintf(req + p, 8192 - p,
+            p = req_append(req, 8192, p,
                 "%s{\"key\":\"K-%02d\",\"value\":{\"status\":\"S%d\",\"note\":\"n%d\"}}",
                 i ? "," : "", i, i % 4, i);
-        snprintf(req + p, 8192 - p, "]}");
+        (void)req_append(req, 8192, p, "]}");
         tc_request(tc, req, &resp);
         expect(resp && !strstr(resp, "\"error\""), "indexed bulk insert ok");
         free(resp); resp = NULL; free(req);
@@ -68,14 +87,14 @@ static int test_bulk_idx_sync_batching_run(void) {
     /* 32 updates that change the indexed field (per-record syncs today). */
     {
         char *req = malloc(8192); size_t p = 0;
-        p += (size_t)snprintf(req + p, 8192 - p,
+        p = req_append(req, 8192, p,
             "{\"mode\":\"bulk-update\",\"dir\":\"default\",\"object\":\"bat\","
             "\"records\":[");
         for (int i = 0; i < 32; i++)
-            p += (size_t)snprintf(req + p, 8192 - p,
+            p = req_append(req, 8192, p,
                 "%s{\"key\":\"K-%02d\",\"value\":{\"status\":\"T%d\"}}",
                 i ? "," : "", i, i % 3);
-        snprintf(req + p, 8192 - p, "]}");
+        (void)req_append(req, 8192, p, "]}");
         tc_request(tc, req, &resp);
         expect(resp && !strstr(resp, "\"error\""), "indexed bulk update ok");
         free(resp); resp = NULL; free(req);
@@ -84,13 +103,13 @@ static int test_bulk_idx_sync_batching_run(void) {
     /* 16 deletes through the indexed bulk-delete window. */
     {
         char *req = malloc(2048); size_t p = 0;
-        p += (size_t)snprintf(req + p, 2048 - p,
+        p = req_append(req, 2048, p,
             "{\"mode\":\"bulk-delete\",\"dir\":\"default\",\"object\":\"bat\","
             "\"keys\":[");
         for (int i = 0; i < 16; i++)
-            p += (size_t)snprintf(req + p, 2048 - p, "%s\"K-%02d\"",
-                                  i ? "," : "", i);
-        snprintf(req + p, 2048 - p, "]}");
+            p = req_append(req, 2048, p, "%s\"K-%02d\"",
+                           i ? "," : "", i);
+        (void)req_append(req, 2048, p, "]}");
         tc_request(tc, req, &resp);
         expect(resp && !strstr(resp, "\"error\""), "indexed bulk delete ok");
         free(resp); resp = NULL; free(req);
