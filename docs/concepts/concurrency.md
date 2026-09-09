@@ -224,7 +224,15 @@ around their mutation, via the central legacy transaction
   record before finalize, new committed record after);
 - concurrent pipelines **coalesce durability syncs per file** (a sync runs
   once; overlapping syncers skip once a completed sync covered their
-  bytes).
+  bytes). Since B3a this coalescing is **process-wide** for index
+  files (btree + trigram + bitmap-leg path syncs) and the marker
+  directory via path-keyed durability epochs
+  (`src/db/durability_epoch.c`): concurrent requests syncing the same
+  file or the same `data/kf` dir share one raw fdatasync/fsync, and a
+  failed raw op fails its whole registration window with a failed
+  round's errno. Segments keep the B2 dirty-flag per-window coalescer;
+  the K barrier needs none (only one window is ever in flight per
+  shard).
 
 Per shard the pipeline runs, in order (durability invariants I1–I5 below
 are per-window properties and are unchanged):
