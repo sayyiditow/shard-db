@@ -2,11 +2,11 @@
  * writer gates). docs/plans/2026-09-05-request-level-commit-batching.md.
  *
  * Red on base: SlotcaskBulkShardInput / slotcask_bulk_request_execute /
- * SHARD_TEST_PHASE_REQ_PUBLISHED / the state-bearing hook signatures do
+ * SHARD_TEST_PHASE_SHARD_PUBLISHED / the state-bearing hook signatures do
  * not exist yet (compile-red).
  *
  * Covers:
- *   1. multi-window retention via the req-published pause (marker files
+ *   1. multi-window retention via the shard-published pause (marker files
  *      only — no same-shard mutation while the coordinator holds the
  *      gate),
  *   2. payload-flush failure → -1, no markers, nothing committed,
@@ -179,7 +179,7 @@ typedef struct {
     SlotcaskBulkRec *perm;   /* per-batch permutation target — must stay
                                  alive for the whole request: inputs point
                                  into it, including while the request is
-                                 parked at the req-published pause */
+                                 parked at the shard-published pause */
     size_t n;
 } RfBatch;
 
@@ -289,6 +289,23 @@ static void *rf_req_thread(void *raw) {
     return NULL;
 }
 
+/* Drives one execute() over two FIXED shard inputs (no bucketing), so a
+   test can pin exactly which shards a request touches. Caller owns the
+   inputs for the request's whole life. */
+struct RfTwoShardArgs {
+    RfDb *w;
+    SlotcaskBulkShardInput *ins;   /* 2 inputs */
+    int done;
+    int rc;
+};
+
+static void *rf_two_shard_req_thread(void *raw) {
+    struct RfTwoShardArgs *a = raw;
+    a->rc = slotcask_bulk_request_execute(&a->w->db, a->ins, 2);
+    a->done = 1;
+    return NULL;
+}
+
 typedef struct {
     RfDb *w;
     const char *key;
@@ -380,7 +397,7 @@ static int test_request_flush_batching_run(void) {
     ASSERT_EQ_INT(rf_db_open(&w), 0, "open request-flush db");
     if (t_ctx->failed) return 1;
 
-    /* ── Scenario 1: multi-window retention via the req-published pause ── */
+    /* ── Scenario 1: multi-window retention via the shard-published pause ── */
     {
         static RfBatch b;
         static char keys[40][24], vals[40][24];
@@ -392,7 +409,7 @@ static int test_request_flush_batching_run(void) {
         uint64_t w0 = __atomic_load_n(&g_db->commit_windows_total,
                                       __ATOMIC_RELAXED);
         shard_test_ctl_reset();
-        g_shard_test_pause_phase = SHARD_TEST_PHASE_REQ_PUBLISHED;
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_SHARD_PUBLISHED;
         g_shard_test_pause_occurrence = 1;
 
         RfReqThr ta = { .w = &w, .b = &b, .done = 0, .rc = 0 };
@@ -401,7 +418,7 @@ static int test_request_flush_batching_run(void) {
                       "spawn request thread");
         rf_wait_pause_hit();
         ASSERT_TRUE(atomic_load(&g_shard_test_pause_hits) >= 1,
-                    "req-published pause hit");
+                    "shard-published pause hit");
         ASSERT_EQ_INT(rt_marker_scan(w.base), 3,
                       "3 windows published at pause");
         rf_release_pause();
@@ -630,7 +647,7 @@ static int test_request_flush_batching_run(void) {
 
         /* 6a: request B on disjoint shard 1 completes while A is paused. */
         shard_test_ctl_reset();
-        g_shard_test_pause_phase = SHARD_TEST_PHASE_REQ_PUBLISHED;
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_SHARD_PUBLISHED;
         g_shard_test_pause_occurrence = 1;
         RfReqThr ta = { .w = &w, .b = &ba, .done = 0, .rc = 0 };
         ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_req_thread, &ta), 0,
@@ -660,7 +677,7 @@ static int test_request_flush_batching_run(void) {
 
         /* 6b: a request sharing shard 0 serializes on the gate. */
         shard_test_ctl_reset();
-        g_shard_test_pause_phase = SHARD_TEST_PHASE_REQ_PUBLISHED;
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_SHARD_PUBLISHED;
         g_shard_test_pause_occurrence = 1;
         static RfBatch bc;
         static char keysc[8][24], valsc[8][24];
@@ -714,7 +731,7 @@ static int test_request_flush_batching_run(void) {
                               "seed key for delete admission");
             }
             shard_test_ctl_reset();
-            g_shard_test_pause_phase = SHARD_TEST_PHASE_REQ_PUBLISHED;
+            g_shard_test_pause_phase = SHARD_TEST_PHASE_SHARD_PUBLISHED;
             g_shard_test_pause_occurrence = 1;
             RfReqThr ta3 = { .w = &w, .b = &ba, .done = 0, .rc = 0 };
             ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_req_thread, &ta3),
@@ -759,7 +776,7 @@ static int test_request_flush_batching_run(void) {
         snprintf(bd.vals[0], sizeof(bd.vals[0]), "new");
         bd.recs[0].key = bd.keys[0]; bd.recs[0].klen = strlen(bd.keys[0]);
         bd.recs[0].value = bd.vals[0]; bd.recs[0].vlen = strlen(bd.vals[0]);
-        g_shard_test_pause_phase = SHARD_TEST_PHASE_REQ_PUBLISHED;
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_SHARD_PUBLISHED;
         g_shard_test_pause_occurrence = 1;
         RfReqThr te = { .w = &w, .b = &bd, .done = 0, .rc = 0 };
         ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_req_thread, &te), 0,
@@ -809,6 +826,283 @@ static int test_request_flush_batching_run(void) {
                     "last record of the 8-shard request visible");
 
         parallel_pool_shutdown();
+    }
+
+    /* ── Scenario 8: G1 — a request never holds two writer gates at
+     * once. Red until B1's pipeline loop (Task 4): the wave coordinator
+     * holds every touched gate simultaneously, so the counter observes
+     * RF_SPLITS on the multi-shard batch. ── */
+    {
+        static RfBatch b;
+        static char keys[64][24], vals[64][24];
+        static SlotcaskBulkRec recs[64];
+        static SlotcaskBulkRec perm20[64];
+        b.keys = keys; b.vals = vals; b.recs = recs; b.perm = perm20;
+        rf_batch_fill(&b, 20, 64, "v20", -1);   /* 8 records × 8 shards */
+        SlotcaskBulkOpts opts;
+        rf_fill_opts(&opts, NULL);
+        shard_test_ctl_reset();
+        ASSERT_EQ_INT(rf_run_request(&w, &b, &opts), 0,
+                      "8-shard request for G1 measurement");
+        ASSERT_TRUE(rf_record_visible(&w, b.keys[63], b.vals[63]),
+                    "G1 request committed");
+        ASSERT_TRUE(atomic_load(&g_shard_test_gate_held_max) <= 1,
+                    "G1: at most one writer gate held per thread "
+                    "(wave coordinator fails this: holds all touched)");
+    }
+
+    /* ── Scenario 9 (B2): intra-request overlap — A touches shards
+     * {0,1}; exactly ONE of its two pipelines parks at the seam while
+     * the other completes; B (disjoint shard 2) completes throughout.
+     * Red on B1's caller-serial dispatch: A's second pipeline never
+     * starts while the first is parked, so zero shards complete. ── */
+    {
+        /* The runner's process DB deliberately starts no thread pools,
+           so parallel_for_io would run both pipelines inline on this
+           thread and the overlap proof would degenerate to
+           caller-serial (the parked first task never returns). Start an
+           IO pool for this scenario, mirroring scenario 7's CPU-pool
+           pattern; the records of a shard parked at the seam are not
+           yet visible (visibility flips at finalize's A step), which is
+           what the exactly-one assert probes. */
+        parallel_io_pool_init(0);
+        static SlotcaskBulkShardInput ains[2];
+        static RfBatch b0, b1;
+        static char k0[16][24], v0[16][24];
+        static SlotcaskBulkRec r0[16], p0[16];
+        static char k1[16][24], v1[16][24];
+        static SlotcaskBulkRec r1[16], p1[16];
+        b0.keys = k0; b0.vals = v0; b0.recs = r0; b0.perm = p0;
+        b1.keys = k1; b1.vals = v1; b1.recs = r1; b1.perm = p1;
+        rf_batch_fill(&b0, 21, 16, "v21", 0);    /* shard 0 */
+        rf_batch_fill(&b1, 23, 16, "v24", 1);    /* shard 1 */
+        static RfBatch bb;
+        static char keysb[16][24], valsb[16][24];
+        static SlotcaskBulkRec recsb[16];
+        static SlotcaskBulkRec permb[16];
+        bb.keys = keysb; bb.vals = valsb; bb.recs = recsb; bb.perm = permb;
+        rf_batch_fill(&bb, 22, 16, "v22", 2);    /* shard 2 only */
+
+        SlotcaskBulkOpts oa;
+        rf_fill_opts(&oa, NULL);
+        memset(ains, 0, sizeof(ains));
+        ains[0].kf_shard_id = 0; ains[0].recs = r0; ains[0].nrecs = b0.n;
+        ains[0].kind = SLOTCASK_BULK_INPUT_UPSERT; ains[0].opts.upsert = oa;
+        ains[1].kf_shard_id = 1; ains[1].recs = r1; ains[1].nrecs = b1.n;
+        ains[1].kind = SLOTCASK_BULK_INPUT_UPSERT; ains[1].opts.upsert = oa;
+
+        shard_test_ctl_reset();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_SHARD_PUBLISHED;
+        g_shard_test_pause_occurrence = 1;
+
+        static struct RfTwoShardArgs ta;
+        ta.w = &w; ta.ins = ains; ta.done = 0; ta.rc = 0;
+        pthread_t tha;
+        ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_two_shard_req_thread,
+                                     &ta), 0,
+                      "spawn A (shards 0+1)");
+        rf_wait_pause_hit();
+        ASSERT_TRUE(atomic_load(&g_shard_test_pause_hits) >= 1,
+                    "one of A's pipelines parked at its seam");
+
+        RfReqThr tb = { .w = &w, .b = &bb, .done = 0, .rc = 0 };
+        pthread_t thb;
+        ASSERT_EQ_INT(pthread_create(&thb, NULL, rf_req_thread, &tb), 0,
+                      "spawn B (shard 2)");
+        ASSERT_TRUE(rf_wait_flag(&tb.done, 5000),
+                    "B completes shard 2 while A is paused mid-pipeline");
+        ASSERT_EQ_INT(tb.rc, 0, "B rc 0");
+        ASSERT_TRUE(rf_record_visible(&w, bb.keys[0], "v22-0000"),
+                    "B's record readable while A parked");
+
+        /* Intra-request overlap: exactly one of A's shards committed
+           while the other is parked. */
+        int s0v = rf_record_visible(&w, k0[0], "v21-0000");
+        int s1v = rf_record_visible(&w, k1[0], "v24-0000");
+        ASSERT_TRUE(s0v != s1v,
+                    "exactly one of A's pipelines completed while the "
+                    "other is parked (0 on caller-serial dispatch)");
+
+        rf_release_pause();
+        pthread_join(tha, NULL);
+        pthread_join(thb, NULL);
+        parallel_io_pool_shutdown();
+        ASSERT_EQ_INT(ta.rc, 0, "A converges after release");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "all markers cleared");
+        ASSERT_TRUE(rf_record_visible(&w, k0[0], "v21-0000") &&
+                    rf_record_visible(&w, k1[0], "v24-0000"),
+                    "both A shards visible after join");
+    }
+
+    /* ── Scenario 10: pre-M failure isolation — the P barrier fails for
+     * the first pipelined shard only; the sibling shard commits. Red
+     * until Task 4: the wave fold marks every shard's records -1. ── */
+    {
+        static RfBatch b0, b1;
+        static char k0[16][24], v0[16][24];
+        static SlotcaskBulkRec r0[16], p0[16];
+        static char k1[16][24], v1[16][24];
+        static SlotcaskBulkRec r1[16], p1[16];
+        b0.keys = k0; b0.vals = v0; b0.recs = r0; b0.perm = p0;
+        b1.keys = k1; b1.vals = v1; b1.recs = r1; b1.perm = p1;
+        rf_batch_fill(&b0, 30, 16, "vA", 0);
+        rf_batch_fill(&b1, 31, 16, "vB", 1);
+        SlotcaskBulkShardInput ins[2];
+        SlotcaskBulkOpts o0, o1;
+        int deg0 = 0, deg1 = 0;
+        rf_fill_opts(&o0, NULL); o0.out_durability_degraded = &deg0;
+        rf_fill_opts(&o1, NULL); o1.out_durability_degraded = &deg1;
+        memset(ins, 0, sizeof(ins));
+        ins[0].kf_shard_id = 0; ins[0].recs = r0; ins[0].nrecs = b0.n;
+        ins[0].kind = SLOTCASK_BULK_INPUT_UPSERT; ins[0].opts.upsert = o0;
+        ins[1].kf_shard_id = 1; ins[1].recs = r1; ins[1].nrecs = b1.n;
+        ins[1].kind = SLOTCASK_BULK_INPUT_UPSERT; ins[1].opts.upsert = o1;
+
+        shard_test_ctl_reset();
+        g_shard_test_fail_phase = SHARD_TEST_PHASE_P;
+        g_shard_test_fail_occurrence = 1;
+        errno = 0;   /* the injected failure leaves errno untouched; a
+                        stale EINPROGRESS from an earlier scenario would
+                        otherwise surface through the hard-failure fold */
+        ASSERT_EQ_INT(slotcask_bulk_request_execute(&w.db, ins, 2), -1,
+                      "P failure yields hard rc -1");
+        ASSERT_TRUE(errno != EINPROGRESS,
+                    "pre-M failure is not EINPROGRESS");
+        g_shard_test_fail_phase = -1; g_shard_test_fail_occurrence = 0;
+        /* Under concurrent pipelines either shard may fail first; the
+           isolation property is order-independent: exactly one input
+           hard-failed, the sibling is clean and committed. */
+        int failed_idx = ins[0].rc == -1 ? 0 : 1;
+        ASSERT_TRUE(ins[0].rc == -1 || ins[1].rc == -1,
+                    "exactly one shard hard-failed on P");
+        ASSERT_EQ_INT(ins[failed_idx].rc, -1, "failed shard rc");
+        ASSERT_EQ_INT(ins[1 - failed_idx].rc, 0, "sibling shard rc");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "no markers retained");
+        ASSERT_EQ_INT(failed_idx == 0 ? deg0 : deg1, 0,
+                      "failed shard not degraded (pre-M)");
+        ASSERT_EQ_INT(failed_idx == 0 ? deg1 : deg0, 0,
+                      "sibling not degraded");
+        RfBatch *fb = failed_idx == 0 ? &b0 : &b1;
+        RfBatch *sb = failed_idx == 0 ? &b1 : &b0;
+        SlotcaskBulkRec *fr = failed_idx == 0 ? r0 : r1;
+        SlotcaskBulkRec *sr = failed_idx == 0 ? r1 : r0;
+        int fbad = 0, sok = 1;
+        for (size_t i = 0; i < fb->n; i++) fbad |= fr[i].status != -1;
+        for (size_t i = 0; i < sb->n; i++) sok &= sr[i].status == 0;
+        ASSERT_TRUE(fbad == 0, "failed shard records all -1");
+        ASSERT_TRUE(sok, "sibling records all 0");
+        ASSERT_TRUE(rf_record_visible(&w, sb->keys[0], sb->vals[0]),
+                    "sibling record visible after sibling P failure");
+    }
+
+    /* ── Scenario 11: post-M failure isolation — the marker-clear dir
+     * fsync fails for the first pipelined shard; its marker is retained
+     * (EINPROGRESS, degraded, rc -2) while the sibling shard commits
+     * clean. Red on the wave coordinator (its single batched clear
+     * fails atomically for the whole request); the fix is Task 3's
+     * per-shard commit step, so this goes green within Task 3. ── */
+    {
+        static RfBatch b0, b1;
+        static char k0[16][24], v0[16][24];
+        static SlotcaskBulkRec r0[16], p0[16];
+        static char k1[16][24], v1[16][24];
+        static SlotcaskBulkRec r1[16], p1[16];
+        b0.keys = k0; b0.vals = v0; b0.recs = r0; b0.perm = p0;
+        b1.keys = k1; b1.vals = v1; b1.recs = r1; b1.perm = p1;
+        rf_batch_fill(&b0, 40, 16, "vC", 0);
+        rf_batch_fill(&b1, 41, 16, "vD", 1);
+        SlotcaskBulkShardInput ins[2];
+        SlotcaskBulkOpts o0, o1;
+        int deg0 = 0, deg1 = 0;
+        rf_fill_opts(&o0, NULL); o0.out_durability_degraded = &deg0;
+        rf_fill_opts(&o1, NULL); o1.out_durability_degraded = &deg1;
+        memset(ins, 0, sizeof(ins));
+        ins[0].kf_shard_id = 0; ins[0].recs = r0; ins[0].nrecs = b0.n;
+        ins[0].kind = SLOTCASK_BULK_INPUT_UPSERT; ins[0].opts.upsert = o0;
+        ins[1].kf_shard_id = 1; ins[1].recs = r1; ins[1].nrecs = b1.n;
+        ins[1].kind = SLOTCASK_BULK_INPUT_UPSERT; ins[1].opts.upsert = o1;
+
+        shard_test_ctl_reset();
+        g_shard_test_fail_phase = SHARD_TEST_PHASE_C;
+        g_shard_test_fail_occurrence = 1;
+        ASSERT_EQ_INT(slotcask_bulk_request_execute(&w.db, ins, 2), -1,
+                      "C failure rc -1");
+        ASSERT_EQ_INT(errno, EINPROGRESS, "post-M failure errno");
+        g_shard_test_fail_phase = -1; g_shard_test_fail_occurrence = 0;
+        /* Order-independent: exactly one shard retained (-2 + degraded),
+           the sibling clean and committed; both shards' records visible
+           (K applied before the failed clear). */
+        int ret_idx = ins[0].rc == -2 ? 0 : 1;
+        ASSERT_TRUE(ins[0].rc == -2 || ins[1].rc == -2,
+                    "exactly one shard retained on C failure");
+        ASSERT_EQ_INT(ins[ret_idx].rc, -2, "retained shard rc");
+        ASSERT_EQ_INT(ret_idx == 0 ? deg0 : deg1, 1, "retained degraded");
+        ASSERT_EQ_INT(ins[1 - ret_idx].rc, 0, "sibling rc 0");
+        ASSERT_EQ_INT(ret_idx == 0 ? deg1 : deg0, 0, "sibling clean");
+        ASSERT_TRUE(rf_record_visible(&w, b0.keys[0], "vC-0000") &&
+                    rf_record_visible(&w, b1.keys[0], "vD-0000"),
+                    "both shards' records visible");
+        /* Golden follow-up single writes on BOTH shards: whichever gate
+           replays (or finds already-applied) leaves the state clean. */
+        for (int pass = 0; pass < 2; pass++) {
+            char fk[24], fv[24];
+            snprintf(fk, sizeof(fk), "rf-follow-11-%d", pass);
+            int attempt = 0;
+            while (rf_shard_of(fk) != pass) {
+                snprintf(fk, sizeof(fk), "rf-follow-11-%d-%d", pass,
+                         attempt++);
+            }
+            snprintf(fv, sizeof(fv), "follow11");
+            SlotcaskUpsertOpts so;
+            memset(&so, 0, sizeof(so));
+            ASSERT_EQ_INT(slotcask_upsert_with_hooks(&w.db, pass, fk,
+                                                     strlen(fk), fv,
+                                                     strlen(fv), &so, NULL),
+                          0, "follow-up write converges");
+        }
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "markers clean at end");
+    }
+
+    /* ── Scenario 12: the gate-replay temp sweep is shard-scoped — a
+     * request on shard 0 sweeps only shard 0's publication temporaries.
+     * Red until the B1 hotfix: the sweep unlinked every shard's temps,
+     * which under per-shard pipelining races another request's in-flight
+     * temp on a different shard (its link() fails ENOENT and the whole
+     * window's records are dropped pre-marker). ── */
+    {
+        static RfBatch b;
+        static char keys[16][24], vals[16][24];
+        static SlotcaskBulkRec recs[16];
+        static SlotcaskBulkRec perm50[16];
+        b.keys = keys; b.vals = vals; b.recs = recs; b.perm = perm50;
+        rf_batch_fill(&b, 50, 16, "v50", 0);      /* shard 0 only */
+
+        char kdir[PATH_MAX];
+        snprintf(kdir, sizeof(kdir), "%s/data/kf", w.base);
+        char tmp0[PATH_MAX], tmp7[PATH_MAX];
+        snprintf(tmp0, sizeof(tmp0),
+                 "%s/000_batch_0_00000000000000aa_marker.dat.tmp.%d.1",
+                 kdir, (int)getpid());
+        snprintf(tmp7, sizeof(tmp7),
+                 "%s/007_batch_0_00000000000000bb_marker.dat.tmp.%d.2",
+                 kdir, (int)getpid());
+        FILE *f0 = fopen(tmp0, "w");
+        ASSERT_NOT_NULL(f0, "create shard-0 publication temp");
+        if (f0) fclose(f0);
+        FILE *f7 = fopen(tmp7, "w");
+        ASSERT_NOT_NULL(f7, "create shard-7 publication temp");
+        if (f7) fclose(f7);
+
+        SlotcaskBulkOpts opts;
+        rf_fill_opts(&opts, NULL);
+        ASSERT_EQ_INT(rf_run_request(&w, &b, &opts), 0,
+                      "shard-0 request for sweep check");
+
+        ASSERT_EQ_INT(access(tmp0, F_OK), -1,
+                      "own-shard publication temp swept by gate replay");
+        ASSERT_EQ_INT(access(tmp7, F_OK), 0,
+                      "other-shard publication temp left for its gate holder");
+        unlink(tmp7);
     }
 
     rf_db_close(&w);

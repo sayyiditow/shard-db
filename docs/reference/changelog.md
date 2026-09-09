@@ -6,16 +6,20 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
-**Request-level commit batching + marker V2 (2026.09).** Indexed bulk
-insert/update/delete now execute as one deferred request with two-epoch
-waves (stage → payload flush → publish → one marker-dir fsync → finalize →
-commit flush), collapsing per-window durability barrier groups into three
-request-level flush passes (~10× fewer durable ops on a 1M-record kv
-insert, ~5–10× on a 100k × 14-index insert). Per-kf-shard **writer
-admission gates** are held request-wide by the coordinator: requests on
-disjoint shards run concurrently, single writes to a touched shard stall
-for the request span, readers never block, and the kf rwlock stays
-phase-local (readers between waves see only coherent old/new records).
+**Per-shard bulk commit pipelines + marker V2 (2026.09).** Indexed bulk
+insert/update/delete execute as one deferred request that dispatches **one
+pipeline task per touched shard** to the I/O pool — the shards'
+pipelines run concurrently. Each task takes that shard's writer gate and
+holds it for replay → stage → payload flush → marker publish and
+directory sync → finalize → commit barriers → marker clear → terminal
+cleanup, never waiting on another gate while holding one (hold-and-wait
+freedom; a gate is held only by a running task, so the pool cannot
+deadlock). Concurrent requests pipeline across shards, while ordinary
+writes wait only for the current pipeline on their target shard. The
+per-shard payload/segment syncs and marker-dir fsyncs **coalesce across
+concurrent pipelines**: each file's sync runs once per dirty episode and
+overlapping syncers skip once a completed sync covered their bytes, so
+concurrent requests stop double-flushing each other's dirty pages.
 Marker format **V2**: a 16-byte header + one 32-byte `KfMarkerSlot` per
 record (exact-size validated, `1 ≤ count ≤ 16384`, worst case 524,304 B) —
 the variable-length key/old/new spans are gone (replay re-derives bytes

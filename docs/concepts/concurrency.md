@@ -196,47 +196,59 @@ no-overlap case — vacuum completes *entirely* before the delayed task ever
 attempts the rdlock — still leaves the daemon crash-free and the object
 correctly re-resolved to its new post-vacuum shape.
 
-## Bulk mutations: two-epoch request batching and per-shard writer gates
+## Bulk mutations: two-epoch pipelining and per-shard writer gates
 
 Bulk mutations (all six `bulk-insert` / `bulk-update` / `bulk-delete` forms)
-execute as **one deferred request** spanning the whole command. The request's
-coordinator acquires every touched kf shard's **writer gate** — a plain
-per-shard admission mutex (`SlotcaskDb.writer_gates`) — in ascending shard
-order and holds them for the entire request; ordinary mutating writers
-(single insert/update/delete, legacy bulk entries, pre-grow) take exactly one
-gate around their mutation, via the central legacy transaction
+execute as **one deferred request** spanning the whole command. The request
+dispatches **one pipeline task per touched shard** to the I/O thread pool —
+they run **concurrently**, and per-shard **writer gates** (plain per-shard
+admission mutexes, `SlotcaskDb.writer_gates`) provide admission: each task
+takes its shard's gate and holds it for that shard's complete commit
+pipeline. Deadlock freedom is the hold-and-wait property (G1′): a task
+holds exactly its own gate start-to-finish and never waits on another gate
+while holding it, and a task waiting for a gate holds nothing. Ordinary
+mutating writers (single
+insert/update/delete, legacy bulk entries, pre-grow) take exactly one gate
+around their mutation, via the central legacy transaction
 (`slotcask_bulk_mutation_transaction`). Readers never touch the gates. So:
 
-- requests on disjoint shards of one object run concurrently;
-- requests sharing a shard serialize on that shard's gate;
-- a single write to a touched shard stalls for the deferred request's span
-  (documented trade); a write to an untouched shard proceeds;
-- the kf rwlock stays **phase-local**: each wave task acquires and releases
-  it within the same task, so readers between waves only ever see coherent
-  states (old committed record before finalize, new committed record after).
+- requests on disjoint shards of one object run concurrently, and requests
+  overlapping only partially pipeline: one request's untouched shards
+  proceed while another is still mid-request;
+- requests sharing a shard serialize on that shard's gate, for that shard's
+  pipeline only;
+- a single write to a shard stalls at most for that shard's current
+  pipeline; a write to an untouched shard proceeds;
+- the kf rwlock stays **step-local**: acquired and released inside the same
+  pipeline step, so readers only ever see coherent states (old committed
+  record before finalize, new committed record after);
+- concurrent pipelines **coalesce durability syncs per file** (a sync runs
+  once; overlapping syncers skip once a completed sync covered their
+  bytes).
 
-Each request runs two epochs of per-shard waves with request-level
-durability barriers (invariants I1–I5 below):
+Per shard the pipeline runs, in order (durability invariants I1–I5 below
+are per-window properties and are unchanged):
 
 ```
-stage wave    : per shard — gate replay of retained markers → stage payloads
-barrier 1     : payload flush — one merged, deduped segment sync       [I2]
-publish wave  : per shard — per window: plan → D5 fallback sync →
-                marker published via no-replace link (V2 format)
-barrier 2     : ONE fsync(data/kf dir) — marker dir entries durable    [I4]
-finalize wave : per shard — per published window: A → I(apply) → K → T
-                (every sync deferred into the request)
-barrier 3     : commit flush — merged index flush [I1] + one kf sync per
-                dirty shard + A/T segment sync + batched marker unlink
-                + ONE fsync(data/kf dir)
+gate          : writer gate of shard s (held by this shard's task)
+replay+stage  : gate replay of retained markers → folded pre-grow → stage
+barrier P     : this shard's staged payload bytes, deduped, one sync   [I2]
+publish       : per window: plan → D5 fallback sync → no-replace link
+barrier M     : ONE fsync(data/kf dir) — this shard's markers durable  [I4]
+finalize      : per published window: A → I(apply) → K → T (syncs deferred)
+commit        : merged index flush [I1] + one kf sync + A/T segment sync
+                + batched marker unlink + ONE fsync(data/kf dir)
+release       : terminal hooks (commit_done / release_window) and frees,
+                then the writer gate
 ```
 
-Failure is shard- and window-scoped: a stage failure stops only that shard;
-a payload-flush failure prevents all publications; one window's publish
-failure doesn't stop others; a marker-dir fsync failure retains every
-published marker for replay; commit-flush failure retains converged markers
-(the request reports `EINPROGRESS`, the caller sees `out_durability_degraded`
-/ per-shard `rc = -2`). The next writer's gate replays any retained marker
+Failure stays shard- and window-scoped: a stage or payload-flush failure is
+a hard error for that shard only (records report -1, no markers); one
+window's publish failure doesn't stop its siblings; anything failing after a
+window's marker publication (dir fsync, finalize, commit barriers, clear)
+retains that window's marker and reports `EINPROGRESS` with
+`out_durability_degraded` / per-shard `rc = -2`; sibling shards that already
+completed stay committed. The next writer's gate replays any retained marker
 before planning; startup recovery replays via the same exact-path
 (`MarkerRef`) machinery.
 
@@ -256,8 +268,9 @@ Marker format and replay machinery are shared with the deferred path.
   OLD-derived fallback records).
 - **I3** — a newly created segment file's directory entry is fsynced at
   creation, before any marker can reference the file.
-- **I4** — marker directory entries are durable (one `fsync(data/kf dir)`
-  after the publish wave) before any window mutation (A/I/K/T) runs.
+- **I4** — each shard pipeline makes that shard's marker directory entries
+  durable with `fsync(data/kf dir)` before any of its window mutations
+  (A/I/K/T) run.
 - **I5** — a touched shard is exclusively reserved against mutating writers
   from before its gate replay until after its batched clear, by the
   per-shard writer gate.

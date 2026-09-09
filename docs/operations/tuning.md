@@ -228,7 +228,20 @@ Slot count per shard is tiered on `splits` (see `slotcask_default_slots_for_spli
 
 Numbers are aimed at keeping each kf shard well below its per-shard ceiling so resplits stay cheap and concurrent inserts don't queue behind a wrlock-held doubling. The exact records/shard band is forgiving — kf lookup stays O(1) at any load below the resplit threshold.
 
-Defaults: `create-object` with no `splits` gives **8** (fine for sub-10M objects — the ~80 % case). For 50M+ rows set `splits` explicitly per the table above; otherwise let the daemon nag you and `vacuum --splits=N` later, or turn on `AUTO_RESHARD_ENABLE=1` (see [configuration.md](../getting-started/configuration.md)) to have a nightly job do it for you automatically.
+### Ingest cost scales with `splits` — size for the present, widen later
+
+The table above is a *ceiling-planning* tool, not a growth-prediction one. Every indexed bulk request pays per-shard durability barriers — one kf sync, one marker publish + clear cycle, and one writer-gate hand-off per touched kf shard, plus (for indexed objects) fdatasyncs per idx shard via `index_splits_for(splits)`. Uniform hash routing means a bulk insert touches **every** shard, so those costs scale linearly with `splits`, while segment files stay fixed at the stream count derived from CPU count at `create-object` (`slotcask_streams_for_nproc()`, typically 16). Measured on the 2026-09 bench tree (`bench-kv-parallel`, 1M rows, 5-conn parallel = five concurrent 200k-row requests):
+
+| throughput, M rows/s | splits=8 | splits=16 | splits=128 |
+|---|---|---|---|
+| single JSON | 1.33 | ≈ same | 0.62 |
+| single CSV | 1.75 | ≈ same | 0.74 |
+| parallel JSON | 0.87 | slower | 0.08 |
+| parallel CSV | 1.04 | slower | 0.08 |
+
+So the operational rule is: **start at 8; raise `splits` only when the record count you already have approaches where the table above tells you to.** Prospective over-splitting buys nothing — capacity growth is automatic (per-shard in-place resplit at 75–80% load, `AUTO_RESHARD_ENABLE=1` nightly widening, online `vacuum --splits=N`) — but it taxes every bulk insert from day one. Widening later is cheap and online; the ingest penalty of a too-wide object is paid on every batch until you shrink it.
+
+Defaults: `create-object` with no `splits` gives **8** (fine for sub-10M objects — the ~80 % case). For objects already at 50M+ rows set `splits` explicitly per the table above; otherwise let the daemon nag you and `vacuum --splits=N` later, or turn on `AUTO_RESHARD_ENABLE=1` (see [configuration.md](../getting-started/configuration.md)) to have a nightly job do it for you automatically.
 
 > **The daemon will tell you when to re-split.** Run `./shard-db shard-stats <dir> <object>` periodically. The hint is driven by the object's *total* live record count against the same sizing table above (the identical lookup `AUTO_RESHARD_ENABLE`'s nightly sweep uses, see [Configuration](../getting-started/configuration.md)) — it fires whenever that count recommends a bigger `splits` than the object currently has, regardless of how evenly load is spread across shards. Separately, if max/min shard skew exceeds 4× the output flags `shard load is skewed — check key distribution` — a distribution/key-hashing health check, not a sizing recommendation. At `MAX_SPLITS=4096` and still nagging (10B+ live records), partition the object instead.
 
