@@ -286,10 +286,10 @@ static int create_indexed_object_default_splits(TestEnv *env, const char *object
 }
 
 /* Forks a child that issues one bulk-insert of `count` records against
-   `object`, using the given pre-picked keys (all routed to the same kf
-   shard by the caller via pick_same_shard_keys), each with score = its
-   index in `keys` so range/count assertions have a stable handle. Returns
-   the child pid, or -1 on fork failure. */
+   `object`, using the caller's pre-picked keys. Keys may span shards;
+   existing single-shard callers still use pick_same_shard_keys. Each
+   record's score is its index in `keys`, giving range/count assertions a
+   stable handle. Returns the child pid, or -1 on fork failure. */
 static pid_t trigger_bulk_insert(TestEnv *env, const char *object,
                                   char keys[][32], int count) {
     pid_t child = fork();
@@ -1041,6 +1041,113 @@ static int test_durability_bulk_window_applied_recovers(void) {
             ASSERT_EQ_INT(tu_parse_count(resp), nrecords,
                           "every recovered record is findable via its index exactly once "
                           "(no double-apply from the pre-crash apply_window pass)");
+            free(resp);
+            tc_close(tc);
+        }
+        test_env_stop(&env);
+    }
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+/* B1 crash regression: shard 0 has committed and cleared, shard 1 has a
+   directory-durable marker but has not finalized, and shard 2 has not
+   started. After SIGKILL, startup must retain shard 0, replay shard 1, and
+   leave shard 2 absent. This three-category state cannot occur under the
+   request-wide wave coordinator. */
+static int test_durability_bulk_pipeline_multishard_crash(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) return 1;
+    int saved_port = env.port;
+    char saved_db_root[256];
+    snprintf(saved_db_root, sizeof(saved_db_root), "%s", env.db_root);
+
+    const char *object = "durabpipe3";
+    ASSERT_EQ_INT(create_indexed_object_default_splits(&env, object), 0,
+                  "create multi-shard pipeline crash fixture");
+
+    char keys[6][32];
+    int next_candidate = 0;
+    ASSERT_EQ_INT(pick_same_shard_keys(8, 0, &next_candidate, keys, 2), 0,
+                  "pick two shard-0 keys");
+    ASSERT_EQ_INT(pick_same_shard_keys(8, 1, &next_candidate, keys + 2, 2), 0,
+                  "pick two shard-1 keys");
+    ASSERT_EQ_INT(pick_same_shard_keys(8, 2, &next_candidate, keys + 4, 2), 0,
+                  "pick two shard-2 keys");
+    test_env_stop_keep(&env);
+
+    ASSERT_EQ_INT(append_durability_pause_config(
+                      saved_db_root, "shard-published-001"),
+                  0, "pause shard 1 after marker-dir durability");
+    ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
+                  "restart with shard-1 pipeline pause");
+    if (env.daemon_pid <= 0) return 1;
+
+    pid_t bulk_pid = trigger_bulk_insert(&env, object, keys, 6);
+    ASSERT_TRUE(bulk_pid > 0, "spawn three-shard bulk request");
+
+    char pause_marker[PATH_MAX];
+    snprintf(pause_marker, sizeof(pause_marker),
+             "%s/default/%s/.durability-test-shard-published-001.active",
+             saved_db_root, object);
+    int pause_rc = wait_for_path(pause_marker, 20000);
+    ASSERT_EQ_INT(pause_rc, 0, "request pauses on shard 1 before finalize");
+    if (pause_rc != 0) {
+        test_env_kill(&env);
+        if (bulk_pid > 0) waitpid(bulk_pid, NULL, 0);
+        return t_ctx->failed > 0 ? 1 : 0;
+    }
+    /* Concurrent pipelines: shard 2 may have committed (or not) before
+       shard 1 parked, so the visible count is 0–4; shard 1's durable
+       marker is the deterministic fact. */
+    {
+        int mid = request_count(&env, object);
+        ASSERT_TRUE(mid >= 0 && mid <= 4 && mid % 2 == 0,
+                    "at-pause count is committed shards only "
+                    "(shard 1 parked pre-finalize)");
+    }
+    char mpaths_before[8][PATH_MAX];
+    ASSERT_TRUE(scan_kf_markers(saved_db_root, object, mpaths_before, 8) >= 1,
+                  "shard 1 has at least its durable marker at the pause");
+
+    test_env_kill(&env);
+    unlink(pause_marker);
+    if (bulk_pid > 0) waitpid(bulk_pid, NULL, 0);
+
+    ASSERT_EQ_INT(test_env_start_at(&env, saved_db_root, saved_port), 0,
+                  "restart recovers the interrupted shard pipeline");
+    if (env.daemon_pid > 0) {
+        ASSERT_EQ_INT(request_marker_recovery_ran(&env), 1,
+                      "startup replay ran for shard 1");
+        ASSERT_EQ_INT(request_count(&env, object), 6,
+                      "every record present after replay of every "
+                      "unresolved marker");
+        char mpaths[8][PATH_MAX];
+        ASSERT_EQ_INT(scan_kf_markers(saved_db_root, object, mpaths, 8), 0,
+                      "replayed shard-1 marker cleared");
+
+        TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
+        TestClient *tc = tc_connect(&cfg);
+        ASSERT_NOT_NULL(tc, "connect after multi-shard recovery");
+        if (tc) {
+            char req[512], *resp = NULL;
+            snprintf(req, sizeof(req),
+                "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"%s\","
+                "\"criteria\":[{\"field\":\"score\",\"op\":\"lte\",\"value\":\"3\"}]}",
+                object);
+            ASSERT_EQ_INT(tc_request(tc, req, &resp), 0,
+                          "query recovered shard-0/1 index entries");
+            ASSERT_EQ_INT(tu_parse_count(resp), 4,
+                          "all committed/replayed rows are indexed");
+            free(resp); resp = NULL;
+            snprintf(req, sizeof(req),
+                "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"%s\","
+                "\"criteria\":[{\"field\":\"score\",\"op\":\"gte\",\"value\":\"4\"}]}",
+                object);
+            ASSERT_EQ_INT(tc_request(tc, req, &resp), 0,
+                          "query untouched shard-2 score range");
+            ASSERT_EQ_INT(tu_parse_count(resp), 2,
+                          "shard 2 either committed pre-crash or replayed "
+                          "from its own marker — exactly its 2 rows");
             free(resp);
             tc_close(tc);
         }
@@ -2067,5 +2174,6 @@ TEST_REGISTER("test-durability-corrupt-marker-policy", test_durability_corrupt_m
 TEST_REGISTER("test-durability-bulk-marker-recovers", test_durability_bulk_marker_recovers)
 TEST_REGISTER("test-durability-bulk-window-prepared-recovers", test_durability_bulk_window_prepared_recovers)
 TEST_REGISTER("test-durability-bulk-window-applied-recovers", test_durability_bulk_window_applied_recovers)
+TEST_REGISTER("test-durability-bulk-pipeline-multishard-crash", test_durability_bulk_pipeline_multishard_crash)
 TEST_REGISTER("test-durability-bulk-window-boundary", test_durability_bulk_window_boundary)
 TEST_REGISTER("test-durability-bulk-window-boundary-mixed-indexes", test_durability_bulk_window_boundary_mixed_indexes)

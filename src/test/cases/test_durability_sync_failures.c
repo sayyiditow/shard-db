@@ -108,24 +108,34 @@ static int test_durability_msync_injection_run(void) {
     ASSERT_EQ_INT(slotcask_insert_with_hooks(&sdb, 0, "key", 3, "value", 5,
                                               NULL, NULL), 0,
                   "insert mutates cached segment and keyfile mappings");
+    /* B2: the insert's per-window barrier syncs through the coalescer,
+       which claims dirty→0 before its fdatasync — the flag is the
+       durability truth, so a completed insert leaves its segment clean
+       and the sweeper has nothing to do. Re-mark by hand and flush to
+       prove the sweep contract this section exists for. */
+    int used_seg_idx = -1;
     int dirty_segments = 0;
-    int dirty_seg_idx = -1;
     for (int i = 0; i < g_segcache_slots; i++) {
-        if (atomic_load_explicit(&g_segcache[i].used, memory_order_acquire) &&
-            atomic_load(&g_segcache[i].dirty)) {
-            dirty_segments++;
-            if (dirty_seg_idx < 0) dirty_seg_idx = i;
-        }
+        if (!atomic_load_explicit(&g_segcache[i].used, memory_order_acquire))
+            continue;
+        if (used_seg_idx < 0) used_seg_idx = i;
+        if (atomic_load(&g_segcache[i].dirty)) dirty_segments++;
     }
-    ASSERT_TRUE(dirty_segments > 0,
-                "slotcask insert marks its cached segment dirty");
-    if (dirty_seg_idx >= 0) {
+    ASSERT_TRUE(used_seg_idx >= 0,
+                "slotcask insert caches its segment mapping");
+    ASSERT_EQ_INT(dirty_segments, 0,
+                  "insert's per-window barrier leaves the flag clean");
+    if (used_seg_idx >= 0) {
+        durability_mark_dirty(&g_segcache[used_seg_idx].dirty,
+                              &g_segcache[used_seg_idx].dirty_since_ms);
         ASSERT_EQ_INT(
-            durability_flush_dirty(&g_segcache[dirty_seg_idx].dirty,
-                                   &g_segcache[dirty_seg_idx].dirty_since_ms,
-                                   g_segcache[dirty_seg_idx].map,
-                                   g_segcache[dirty_seg_idx].map_size),
+            durability_flush_dirty(&g_segcache[used_seg_idx].dirty,
+                                   &g_segcache[used_seg_idx].dirty_since_ms,
+                                   g_segcache[used_seg_idx].map,
+                                   g_segcache[used_seg_idx].map_size),
             1, "sweep synchronizes the dirty segment mapping");
+        ASSERT_EQ_INT(atomic_load(&g_segcache[used_seg_idx].dirty), 0,
+                      "sweep clears the segment dirty state");
     }
     slotcask_close(&sdb);
 

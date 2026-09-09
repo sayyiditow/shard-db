@@ -67,6 +67,13 @@ typedef struct {
     _Atomic int used;
     _Atomic int dirty;
     _Atomic uint64_t dirty_since_ms;
+    /* B2: coalesced bulk sync state. dirty is the durability truth
+       (claim-before-IO protocol); sync_mu/sync_cv serialize concurrent
+       bulk syncs of one file and let later syncers skip once a
+       completed sync provably covered their bytes. */
+    pthread_mutex_t sync_mu;
+    pthread_cond_t  sync_cv;
+    int             sync_in_flight;
     uint64_t last_access;
     _Atomic uint64_t gen;   /* incremented on eviction; SlotRef validation */
     dev_t    file_dev;      /* identity of the file open at install time — */

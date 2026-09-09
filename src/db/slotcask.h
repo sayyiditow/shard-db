@@ -288,11 +288,9 @@ typedef struct SlotcaskDb {
     _Atomic(SlotcaskTrimFn) trim_fn;
     void                   *trim_ctx;
     pthread_mutex_t         trim_init_lock;
-    /* Per-kf-shard writer admission gates (request-level commit batching).
-       Writers only: the deferred request's coordinator holds every touched
-       shard's gate for the whole request (ascending acquire, reverse
-       release); ordinary writers hold exactly one around their mutation.
-       Readers never take it. */
+    /* Per-kf-shard writer admission gates. Deferred requests take one gate
+       at a time around that shard's complete pipeline; ordinary writers
+       take exactly one around their mutation. Readers never take them. */
     pthread_mutex_t        *writer_gates;
     size_t                  writer_gates_inited;
 } SlotcaskDb;
@@ -790,16 +788,18 @@ int slotcask_bulk_delete_in_kfshard(SlotcaskDb *db, int kf_shard_id,
                                      const SlotcaskBulkDeleteOpts *opts);
 
 /* ============================================================ Deferred
- * bulk request (request-level commit batching).
+ * bulk request (per-shard commit pipelines).
  *
  * One synchronous request spans an entire cmd_bulk_* call: the caller
  * bucket-ises its records per kf shard and hands over one input per
- * touched shard. The coordinator acquires every touched shard's writer
- * gate (ascending) for the whole request, runs the two-epoch wave
- * protocol (stage → payload flush → publish → one kf-dir fsync →
- * finalize → commit flush), and releases the gates before returning.
- * Requests on disjoint shards run concurrently; requests sharing a shard
- * serialize on that shard's gate; readers never take the gate.
+ * touched shard. The coordinator dispatches one pipeline task per
+ * touched shard to the IO pool — they run concurrently; per shard a
+ * task takes that shard's writer gate and holds it for the shard's
+ * full commit pipeline (gate replay → stage → payload flush → publish
+ * → kf-dir fsync → finalize → commit barriers → marker clear →
+ * terminal cleanup), never waiting on another gate while holding one.
+ * Requests sharing a shard serialize only while each request runs that
+ * shard's pipeline; readers never take the gate.
  *
  * Ownership: input records, option pointer targets, hook contexts, and
  * arenas remain owned by the caller and MUST stay valid until this call
