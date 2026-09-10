@@ -2181,15 +2181,33 @@ int btree_delete(const char *path, const char *value, size_t vlen,
     return rc;
 }
 
-int btree_sync_path(const char *path) {
-#ifdef TEST_BUILD
-    atomic_fetch_add(&g_test_btree_sync_count, 1);
-#endif
+/* B3a raw leg: the sync itself keeps the exact pre-epoch discipline —
+   the file's writer rwlock is held across fdatasync, so concurrent
+   btree mutations (which need the same wrlock) can never interleave
+   with the flush, and bt_release still propagates grow-time remaps.
+   The epoch picks one flusher per registration window; concurrent
+   same-path syncers wait on the epoch instead of queueing on the
+   wrlock to perform redundant fdatasyncs. */
+static int btree_sync_path_raw(const char *path, void *ctx) {
+    (void)ctx;
     BtFile bt;
     if (bt_acquire(&bt, path, 1) != 0) return -1;
     int rc = fdatasync(bt.fd);
     bt_release(&bt);
     return rc;
+}
+
+int btree_sync_path(const char *path) {
+#ifdef TEST_BUILD
+    int synced = 0;
+    int rc = durability_epoch_sync_cb(path, DUREPOCH_DOMAIN_BTREE,
+                                      btree_sync_path_raw, NULL, &synced);
+    if (synced) atomic_fetch_add(&g_test_btree_sync_count, 1);
+    return rc;
+#else
+    return durability_epoch_sync_cb(path, DUREPOCH_DOMAIN_BTREE,
+                                    btree_sync_path_raw, NULL, NULL);
+#endif
 }
 
 void btree_search(const char *path, const char *value, size_t vlen,

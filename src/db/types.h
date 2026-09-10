@@ -600,6 +600,40 @@ typedef void (*durability_after_rename_fn)(const char *target, void *ctx);
 int durability_publish_replace(const char *target, const char *tmp_path,
                                durability_after_rename_fn after_rename,
                                void *after_rename_ctx);
+
+/* ── Path-keyed durability epochs (B3a) ────────────────────────────────
+   Coalesce concurrent fdatasync/fsync calls on one path: barrierers
+   register after their writes; one flusher per registration window
+   performs the raw sync (owning whatever mutation discipline it needs,
+   e.g. the btree writer rwlock); overlapping callers wait for that
+   round's result. Returns 0 only when a successful full-file sync
+   covered this registration; group-fails otherwise (errno: A failed
+   round's errno — diagnostic, see docs/concepts/concurrency.md).
+   Coalescing only happens within one DurEpochDomain. Table-full /
+   path-too-long falls back to an uncoalesced raw call. */
+typedef enum {
+    DUREPOCH_DOMAIN_NONE  = 0,  /* invalid — EINVAL                     */
+    DUREPOCH_DOMAIN_BTREE = 1,  /* btree/trigram idx: raw holds the file
+                                   writer rwlock across fdatasync       */
+    DUREPOCH_DOMAIN_FILE  = 2,  /* plain-fd fdatasync (bitmap commit leg;
+                                   ENOENT → success, nothing written)   */
+    DUREPOCH_DOMAIN_DIR   = 3   /* directory fsync (marker dir M/C)      */
+} DurEpochDomain;
+
+int durability_epoch_sync_cb(const char *path, unsigned domain,
+                             int (*raw)(const char *path, void *ctx),
+                             void *ctx, int *out_synced);
+int durability_epoch_fdatasync_path_ex(const char *path, int *out_synced);
+int durability_epoch_fsync_dir(const char *path);
+#ifdef TEST_BUILD
+void durability_test_epoch_set_delay_ms(int ms);
+void durability_test_epoch_set_register_hold(int n);
+void durability_test_epoch_fail_next(int count, int err);
+int  durability_test_epoch_file_sync_count(void);
+int  durability_test_epoch_dir_sync_count(void);
+void durability_test_epoch_reset(void);
+#endif
+
 void durability_test_pause(const char *data_dir, const char *phase);
 int bg_threads_start(struct ShardDb *db, BgRuntimeMode mode);
 void bg_threads_stop(struct ShardDb *db);

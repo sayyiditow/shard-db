@@ -197,9 +197,23 @@ static int bench_invoice_run(void)
     int COUNT = count_env ? atoi(count_env) : 1000000;
     if (COUNT <= 0) COUNT = 1000000;
 
+    /* Kf shard count for the bench object. Must be a power of two in
+       [8, 4096] (MAX_SPLITS); out-of-range/non-power-of-two values are
+       clamped/snaped down. Default 64 matches the historical shape. */
+    const char *splits_env = getenv("SHARD_BENCH_SPLITS");
+    int SPLITS = splits_env ? atoi(splits_env) : 64;
+    if (SPLITS < 8) SPLITS = 8;
+    if (SPLITS > 4096) SPLITS = 4096;
+    {
+        int p = 8;
+        while (p * 2 <= SPLITS) p *= 2;
+        SPLITS = p;
+    }
+
     printf("======================================\n");
     printf("  shard-db INVOICE benchmark (%d records)\n", COUNT);
-    printf("  64 fields, 14 indexes (incl. 4 composite)\n");
+    printf("  64 fields, 14 indexes (incl. 4 composite), splits=%d\n",
+           SPLITS);
     printf("======================================\n\n");
 
     /* ---- 1. Spawn daemon ----------------------------------------------- */
@@ -227,9 +241,9 @@ static int bench_invoice_run(void)
         char create[2048];
         snprintf(create, sizeof(create),
             "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bench\","
-            "\"splits\":64,\"max_key\":16,"
+            "\"splits\":%d,\"max_key\":16,"
             "\"fields\":[" INVOICE_SCHEMA_FIELDS "],"
-            "\"indexes\":[]}");
+            "\"indexes\":[]}", SPLITS);
         tc_request(tc, create, &resp);
         free(resp); resp = NULL;
     }
@@ -642,10 +656,10 @@ static int bench_invoice_run(void)
         "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"bench\"}");
     bench_table_section_end();
 
-    /* ---- 11. SINGLE DELETE x1000 — captured into Maintenance section -- */
+    /* ---- 11. SINGLE DELETE x100 — captured into Maintenance section -- */
     long single_del_total_us = 0; uint64_t single_del_p50 = 0;
     {
-        const int N = 1000;
+        const int N = 100;
         uint64_t *samples = malloc((size_t)N * sizeof(uint64_t));
         BenchHist h;
         bench_hist_init(&h, samples, (size_t)N);
@@ -703,8 +717,8 @@ static int bench_invoice_run(void)
             char extra[48];
             snprintf(extra, sizeof(extra), "p50=%.0fµs  %.1f k op/s",
                      (double)single_del_p50 / 1000.0,
-                     1000.0 / ((double)single_del_total_us / 1e6) / 1000.0);
-            bench_table_record("SINGLE DELETE x1000 (14 idx)",
+                     100.0 / ((double)single_del_total_us / 1e6) / 1000.0);
+            bench_table_record("SINGLE DELETE x100 (14 idx)",
                                single_del_total_us, 1, extra);
         }
         bench_table_run(tc, "BULK DELETE 1000 keys (14 idx)", req);

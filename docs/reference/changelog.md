@@ -42,6 +42,9 @@ replay granularity, not barrier boundaries. New regression tests:
 `test-request-flush-batching` (retention, failure semantics, D5 fallback
 payloads, gate admission, concurrency, inline/limited-pool) and
 `test-marker-v2` (format validation, v1 refusal, gate fail-closed cases).
+Since B3a, index and marker-dir durability syncs coalesce **across**
+concurrent requests via path-keyed epochs (`src/db/durability_epoch.c`),
+not just within one request.
 
 **Bulk-commit throughput + durability closure (2026.09).** Indexed bulk
 insert/update/delete now collect the unique (field, idx shard) files a

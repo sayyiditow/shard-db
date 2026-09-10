@@ -4856,13 +4856,6 @@ struct SlotcaskBulkRequest {
     int         any_pending;           /* any shard retained markers       */
     int         any_failed;            /* any shard errored or pending     */
     int         saved_errno;           /* first hard failure's errno       */
-    /* B2: marker-dir fsync coalescing — concurrent pipelines publish and
-       clear against one shared data/kf dir; the fsync runs once and
-       every waiter is covered. */
-    pthread_mutex_t dir_sync_mu;
-    pthread_cond_t  dir_sync_cv;
-    int             dir_dirty;
-    int             dir_sync_in_flight;
 };
 
 /* ----- Phase helpers shared by the slow and fast bulk-upsert paths.
@@ -6556,9 +6549,6 @@ static int bulk_publish_one_kf_window(BulkMutationTxn *txn,
         commit_phase_us_record(&g_commit_marker_publish_us_total, t0m);
         if (prc < 0) goto out;
         rw->published = 1;
-        pthread_mutex_lock(&txn->req->dir_sync_mu);
-        txn->req->dir_dirty = 1;
-        pthread_mutex_unlock(&txn->req->dir_sync_mu);
         __atomic_add_fetch(&g_commit_marker_publish_count, 1,
                            __ATOMIC_RELAXED);
         __atomic_add_fetch(&g_commit_windows_total, 1, __ATOMIC_RELAXED);
@@ -6788,8 +6778,6 @@ static SlotcaskBulkRequest *slotcask_bulk_request_begin(
     if (!db || !touched_shards || ntouched == 0) return NULL;
     SlotcaskBulkRequest *req = calloc(1, sizeof(*req));
     if (!req) return NULL;
-    pthread_mutex_init(&req->dir_sync_mu, NULL);
-    pthread_cond_init(&req->dir_sync_cv, NULL);
     req->db = db;
     req->num_shards = db->num_shards;
     req->nonce = now_us() ^
@@ -6884,8 +6872,6 @@ static void slotcask_bulk_shard_release(SlotcaskBulkRequest *req,
    nothing per-shard is left here. */
 static void slotcask_bulk_request_end(SlotcaskBulkRequest *req) {
     if (!req) return;
-    pthread_mutex_destroy(&req->dir_sync_mu);
-    pthread_cond_destroy(&req->dir_sync_cv);
     free(req->shards);
     free(req->touched);
     free(req);
@@ -7130,37 +7116,6 @@ static int slotcask_bulk_shard_flush_payloads(SlotcaskBulkRequest *req,
     return rc;
 }
 
-/* B2: coalesced fsync(data/kf dir). Concurrent pipelines publish and
-   clear against one shared directory; the fsync runs once per dirty
-   episode and every concurrent fsync caller is covered by it (claim-
-   before-IO: callers arriving during the IO see dir_dirty re-set by the
-   publishers/clears themselves and run their own — a no-op on a clean
-   dir is cheap). */
-static int slotcask_bulk_request_fsync_dir_coalesced(
-    SlotcaskBulkRequest *req) {
-    pthread_mutex_lock(&req->dir_sync_mu);
-    if (!req->dir_dirty) {
-        pthread_mutex_unlock(&req->dir_sync_mu);
-        return 0;
-    }
-    while (req->dir_sync_in_flight)
-        pthread_cond_wait(&req->dir_sync_cv, &req->dir_sync_mu);
-    if (!req->dir_dirty) {
-        pthread_mutex_unlock(&req->dir_sync_mu);
-        return 0;
-    }
-    req->dir_sync_in_flight = 1;
-    req->dir_dirty = 0;
-    pthread_mutex_unlock(&req->dir_sync_mu);
-    int rc = fsync_dir(req->kf_dir);
-    pthread_mutex_lock(&req->dir_sync_mu);
-    req->dir_sync_in_flight = 0;
-    if (rc != 0) req->dir_dirty = 1;
-    pthread_cond_broadcast(&req->dir_sync_cv);
-    pthread_mutex_unlock(&req->dir_sync_mu);
-    return rc;
-}
-
 /* M barrier for shard kf_shard_id: ONE fsync(data/kf dir) after this
    shard's windows' markers are link-published. 0 when nothing
    published. */
@@ -7171,7 +7126,7 @@ static int slotcask_bulk_shard_flush_marker_dir(SlotcaskBulkRequest *req,
     for (size_t i = 0; i < rs->nwindows; i++)
         any |= rs->windows[i].published;
     if (!any) return 0;
-    int rc = slotcask_bulk_request_fsync_dir_coalesced(req);
+    int rc = durability_epoch_fsync_dir(req->kf_dir);
     if (rc == 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_M)) {
         errno = EIO;
         rc = -1;
@@ -7242,15 +7197,14 @@ static void req_bitmap_file_path(char *out, size_t outlen,
              db_root, object, field, shard_idx);
 }
 
-/* fdatasync a file by path without touching any cache. */
+/* fdatasync a file by path without touching any cache. B3a: routed
+   through the path-keyed epoch so concurrent commit flushes syncing
+   the same bitmap file coalesce. The raw op converts ENOENT to success
+   (missing file = nothing ever written), so this returns 0 for a
+   missing file — the call site's errno != ENOENT skip is now
+   vestigial but kept unchanged. */
 static int fdatasync_path(const char *path) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
-    int rc = fdatasync(fd);
-    int saved = errno;
-    close(fd);
-    if (rc != 0) errno = saved;
-    return rc;
+    return durability_epoch_fdatasync_path_ex(path, NULL);
 }
 
 /* Per-shard commit barriers + clear for shard kf_shard_id (the
@@ -7422,15 +7376,10 @@ static int slotcask_bulk_shard_flush_commit(SlotcaskBulkRequest *req,
         rw->unlink_succeeded = 1;
         any_unlinked = 1;
     }
-    if (any_unlinked) {
-        pthread_mutex_lock(&req->dir_sync_mu);
-        req->dir_dirty = 1;
-        pthread_mutex_unlock(&req->dir_sync_mu);
-    }
     int dir_rc = 0;
     uint64_t t0c = now_us();
     if (any_unlinked &&
-        slotcask_bulk_request_fsync_dir_coalesced(req) != 0) dir_rc = -1;
+        durability_epoch_fsync_dir(req->kf_dir) != 0) dir_rc = -1;
     if (any_unlinked)
         commit_phase_us_record(&g_commit_marker_clear_us_total, t0c);
     if (any_unlinked && dir_rc == 0 &&
