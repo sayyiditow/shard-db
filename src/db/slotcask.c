@@ -7620,7 +7620,9 @@ static void bulk_commit_chain_fold_member(BulkChainMember *mem) {
    per-member outcomes are read from each member's in->rc. */
 static int bulk_commit_chain_run(BulkCommitChain *chain) {
 #ifdef TEST_BUILD
-    __atomic_add_fetch(&g_shard_test_bulk_chains, 1, __ATOMIC_RELAXED);
+    /* stdatomic (2-arg) form: portable across GCC and AppleClang. The
+     * __atomic builtins reject _Atomic-qualified addresses on clang. */
+    atomic_fetch_add(&g_shard_test_bulk_chains, 1);
 #endif
     int rc = 0;
 
