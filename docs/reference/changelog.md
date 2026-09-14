@@ -46,6 +46,25 @@ Since B3a, index and marker-dir durability syncs coalesce **across**
 concurrent requests via path-keyed epochs (`src/db/durability_epoch.c`),
 not just within one request.
 
+**Bulk commit-chain merge (B3b, 2026.09).** When many parallel bulk
+requests collapse onto the same partially filled shards
+(`connections × shards` high), each request paid its own full
+P/M/K/A/T/clear durability chain while serializing on the per-shard
+writer gate. The gate holder now admits up to **four already-queued
+same-kind bulk requests** for the same shard and runs one
+**owner-preserving commit chain** over all their windows: one merged P
+payload sync, one M directory fsync, and one merged I/K/A/T/clear pass
+(sorted, deduplicated aggregate sets), while stage, publish, finalize,
+outcome fold, and terminal cleanup stay per member through each member's
+own request/transaction/shard state — no window moves between requests,
+marker identity keeps each member's own nonce, uncontended requests are
+unchanged, and mixed-kind or queue-overflow requests serialize normally.
+Member cleanup is per-owner; an admitted waiter's task returns only
+after the chain has committed and released its shard. New test coverage
+in `test-request-flush-batching` (scenarios 13–18: deterministic merge,
+mixed-kind non-admission, admission cap, queue-full fallback, merged
+P/K failure isolation, per-member hook accounting).
+
 **Bulk-commit throughput + durability closure (2026.09).** Indexed bulk
 insert/update/delete now collect the unique (field, idx shard) files a
 window touched — btree, trigram, and bitmap alike — and fdatasync each

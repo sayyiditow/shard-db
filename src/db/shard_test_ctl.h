@@ -30,6 +30,17 @@ typedef enum {
                                        done, before this shard's finalize
                                        (B1 pipeline; supersedes the
                                        request-wide REQ_PUBLISHED seam) */
+    SHARD_TEST_PHASE_PRE_MERGE,       /* B3b: parks a shard-pipeline gate
+                                       holder immediately before it takes
+                                       matching waiters from the merge
+                                       queue (red-run position: pipeline
+                                       entry; final position: the take
+                                       seam). */
+    SHARD_TEST_PHASE_GATE_WAIT,       /* B3b: fires in writer_gate_lock on
+                                       try-lock contention, after the
+                                       caller's queue push and before the
+                                       blocking lock — a hit proves the
+                                       caller is queued. */
     SHARD_TEST_PHASE_COUNT
 } ShardTestPhase;
 
@@ -58,6 +69,9 @@ extern _Atomic int g_shard_test_bulk_lookup_gap_release;
  * TLS count under TEST_BUILD and fold it into this atomic; a thread
  * respecting G1 never drives it above 1. */
 extern _Atomic long g_shard_test_gate_held_max;
+/* B3b: count of bulk commit-chain coordinator invocations. A solo
+   request is 1; a merged pair is 1. */
+extern _Atomic long g_shard_test_bulk_chains;
 /* Count-worker pass-1 gap hook (docs/plans/2026-08-27-shard-count-worker-
    nested-kf-read.md Task 1): parks shard_count_worker after pass-1's
    inline KF probe — while the probe reader is still held — so the
@@ -105,6 +119,7 @@ static inline void shard_test_ctl_reset(void) {
     atomic_store(&g_shard_test_count_gap, 0);
     atomic_store(&g_shard_test_count_gap_hit, 0);
     atomic_store(&g_shard_test_gate_held_max, 0);
+    atomic_store(&g_shard_test_bulk_chains, 0);
 }
 
 /* Barrier call: count the sync in `phase`; return 1 when this attempt is

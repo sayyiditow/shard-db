@@ -219,8 +219,8 @@ Slot count per shard is tiered on `splits` (see `slotcask_default_slots_for_spli
 |-----------------------|----------------------|------------------------:|--------------------|
 | up to 1M              | 8                    | ~125K                   | ~100× before resplit ceiling |
 | 1–10M                 | 16                   | 63K – 625K              | ~20× headroom |
-| 10–50M                | 64                   | 156K – 781K             | ~16× headroom |
-| 50–200M               | 256                  | 195K – 781K             | ~16× headroom |
+| 10–50M                | 16                   | 625K – 3.1M             | ~4× headroom |
+| 50–200M               | 64                   | 780K – 3.1M             | ~4× headroom |
 | 200M–1B               | 1024                 | 195K – 977K             | ~13× headroom |
 | 1B–5B                 | 2048                 | 488K – 2.4M             | ~5× headroom |
 | 5B–10B                | 4096 (MAX_SPLITS)    | 1.2M – 2.4M             | ~5× headroom |
@@ -228,18 +228,21 @@ Slot count per shard is tiered on `splits` (see `slotcask_default_slots_for_spli
 
 Numbers are aimed at keeping each kf shard well below its per-shard ceiling so resplits stay cheap and concurrent inserts don't queue behind a wrlock-held doubling. The exact records/shard band is forgiving — kf lookup stays O(1) at any load below the resplit threshold.
 
+The 10–50M and 50–200M rows were revised (2026-09-14) after ingest measurement showed the previous 64-at-10M advice was slower than 16 on every axis — see the measured table below. The trade is deliberate: fewer shards leave ~4× resplit headroom at the top of each band instead of ~16×, and the widening ladder (shard-stats hint, `AUTO_RESHARD`, online `vacuum --splits=N`) moves you up as the live count grows.
+
 ### Ingest cost scales with `splits` — size for the present, widen later
 
-The table above is a *ceiling-planning* tool, not a growth-prediction one. Every indexed bulk request pays per-shard durability barriers — one kf sync, one marker publish + clear cycle, and one writer-gate hand-off per touched kf shard, plus (for indexed objects) fdatasyncs per idx shard via `index_splits_for(splits)`. Uniform hash routing means a bulk insert touches **every** shard, so those costs scale linearly with `splits`, while segment files stay fixed at the stream count derived from CPU count at `create-object` (`slotcask_streams_for_nproc()`, typically 16). Measured on the 2026-09 bench tree (`bench-kv-parallel`, 1M rows, 5-conn parallel = five concurrent 200k-row requests):
+The table above is a *ceiling-planning* tool, not a growth-prediction one. Every bulk request pays per-shard durability barriers — one kf sync, one marker publish + clear cycle, and one writer-gate hand-off per touched kf shard (merged across concurrent same-shard requests by the commit-chain coordinator), plus (for indexed objects) fdatasyncs per idx shard via `index_splits_for(splits)`. Uniform hash routing means a bulk insert touches **every** shard, so those costs scale linearly with `splits`, while segment files stay fixed at the stream count derived from CPU count at `create-object` (`slotcask_streams_for_nproc()`, typically 16). Measured on the 2026-09-14 tree (AMD Ryzen 7 7840U, 8C/16T, NVMe, `bench-kv-parallel`, 5-conn parallel = five concurrent requests, unindexed K/V):
 
-| throughput, M rows/s | splits=8 | splits=16 | splits=128 |
+| throughput, M rows/s | splits=8 | splits=16 | splits=64 |
 |---|---|---|---|
-| single JSON | 1.33 | ≈ same | 0.62 |
-| single CSV | 1.75 | ≈ same | 0.74 |
-| parallel JSON | 0.87 | slower | 0.08 |
-| parallel CSV | 1.04 | slower | 0.08 |
+| 1M rows — parallel CSV | 2.21 | — | 0.34 |
+| 10M rows — single CSV  | 1.92 | 2.09 | 2.70 |
+| 10M rows — parallel CSV | 2.93 | **3.17** | 2.48 (loses to single) |
 
-So the operational rule is: **start at 8; raise `splits` only when the record count you already have approaches where the table above tells you to.** Prospective over-splitting buys nothing — capacity growth is automatic (per-shard in-place resplit at 75–80% load, `AUTO_RESHARD_ENABLE=1` nightly widening, online `vacuum --splits=N`) — but it taxes every bulk insert from day one. Widening later is cheap and online; the ingest penalty of a too-wide object is paid on every batch until you shrink it.
+Parallel ingest peaked at **splits ≈ core count** (16 on the bench host) and fell off on both sides: an over-split 1M-row object collapsed to 0.34 M rows/s at splits=64, and at 10M rows splits=64 was the only sizing that lost to a single connection — gate parallelism above core count goes unused while every request still pays 4× the commit barriers. For comparison, the same 1M/splits=8 shape measured 1.04 M rows/s parallel on the pre-B3b tree; the commit-chain merge roughly doubles it.
+
+So the operational rule is: **start at 8; for ingest-heavy objects treat core count as the practical ceiling on `splits`; raise `splits` only when the record count approaches where the table above tells you to.** Capacity growth is automatic (per-shard in-place resplit at 75–80% load, `AUTO_RESHARD_ENABLE` nightly widening, online `vacuum --splits=N`) — but each shard holds at most ~12.8M live entries (16M slots × 80 %) before inserts refuse, so the band table is also your capacity plan: 8 shards ≈ 102M records, 16 ≈ 205M, and so on up the ladder toward ~52B at `MAX_SPLITS`. If you know an object will hold tens of millions of records before it exists, create it with the band's `splits` up front — that choice is free at `create-object` time, while widening a 100M-record object later is an online rehash worth planning.
 
 Defaults: `create-object` with no `splits` gives **8** (fine for sub-10M objects — the ~80 % case). For objects already at 50M+ rows set `splits` explicitly per the table above; otherwise let the daemon nag you and `vacuum --splits=N` later, or turn on `AUTO_RESHARD_ENABLE=1` (see [configuration.md](../getting-started/configuration.md)) to have a nightly job do it for you automatically.
 

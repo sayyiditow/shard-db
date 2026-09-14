@@ -251,6 +251,10 @@ typedef struct {
    Set db->trim_fn = NULL to disable. */
 typedef size_t (*SlotcaskTrimFn)(const void *val, size_t vlen, void *ctx);
 
+/* B3b: per-shard bounded admission queues for the bulk commit-chain
+   merge. Opaque here; the definition lives in slotcask.c. */
+typedef struct BulkGateWaiterQ BulkGateWaiterQ;
+
 typedef struct SlotcaskDb {
     char    data_dir[PATH_MAX];
     int     num_shards;
@@ -293,6 +297,8 @@ typedef struct SlotcaskDb {
        take exactly one around their mutation. Readers never take them. */
     pthread_mutex_t        *writer_gates;
     size_t                  writer_gates_inited;
+    BulkGateWaiterQ        *writer_gate_waiters;
+    size_t                  writer_gate_waiters_inited;
 } SlotcaskDb;
 
 /* Test-only: write a synthetic `total` (and matching `deleted`) into a kf
@@ -815,9 +821,8 @@ typedef struct {
         SlotcaskBulkOpts       upsert;
         SlotcaskBulkDeleteOpts delete_;
     } opts;                         /* copied by value by query_bulk */
-    int rc;                         /* per-shard aggregate result:
-                                       0 ok, -1 failed, -2 pending
-                                       (retained marker, EINPROGRESS) */
+    int rc;                         /* 0 ok, -1 failed, -2 pending */
+    int error_no;                   /* first hard error for this shard */
 } SlotcaskBulkShardInput;
 
 /* The only new public operation. Synchronous. */

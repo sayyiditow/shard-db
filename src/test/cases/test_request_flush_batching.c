@@ -216,6 +216,48 @@ static void rf_fill_opts(SlotcaskBulkOpts *o, RfApplyCtl *ctl) {
     o->bulk_hook_ctx = ctl;
 }
 
+/* Counting hook set with fail_all switch (B3b member-isolation tests). */
+typedef struct {
+    int prepare, apply, commit_done, release_window, abort_window;
+    int fail_all;
+} RfHookCtl;
+static int rf_hc_prepare(SlotcaskBulkRec *recs, const size_t *active,
+                         size_t nactive, void *ctx, void **out_window_state) {
+    (void)recs; (void)active; (void)nactive;
+    ((RfHookCtl *)ctx)->prepare++;
+    *out_window_state = NULL;
+    return 0;
+}
+static int rf_hc_apply(SlotcaskBulkRec *recs, const size_t *active,
+                       size_t nactive, void *ctx, void *window_state) {
+    (void)recs; (void)active; (void)nactive; (void)window_state;
+    RfHookCtl *c = ctx;
+    c->apply++;
+    return c->fail_all ? -1 : 0;
+}
+static void rf_hc_commit_done(void *ctx, void *window_state) {
+    (void)window_state;
+    ((RfHookCtl *)ctx)->commit_done++;
+}
+static void rf_hc_release_window(void *ctx, void *window_state) {
+    (void)window_state;
+    ((RfHookCtl *)ctx)->release_window++;
+}
+static void rf_hc_abort_window(void *ctx, void *window_state) {
+    (void)window_state;
+    ((RfHookCtl *)ctx)->abort_window++;
+}
+static void rf_fill_hc_opts(SlotcaskBulkOpts *o, RfHookCtl *c) {
+    memset(o, 0, sizeof(*o));
+    o->has_indexed_fields = 1;
+    o->prepare_window = rf_hc_prepare;
+    o->apply_window = rf_hc_apply;
+    o->commit_done = rf_hc_commit_done;
+    o->release_window = rf_hc_release_window;
+    o->abort_window = rf_hc_abort_window;
+    o->bulk_hook_ctx = c;
+}
+
 /* Build one input per touched shard (records bucketed by their real kf
  * shard, ascending) and run one deferred request. */
 static int rf_run_request(RfDb *w, RfBatch *b, SlotcaskBulkOpts *opts) {
@@ -304,6 +346,33 @@ static void *rf_two_shard_req_thread(void *raw) {
     a->rc = slotcask_bulk_request_execute(&a->w->db, a->ins, 2);
     a->done = 1;
     return NULL;
+}
+
+/* Drives one execute() over one FIXED shard input (B3b scenarios). */
+struct RfOneShardArgs {
+    RfDb *w;
+    SlotcaskBulkShardInput *in;
+    int done;
+    int rc;
+    int err;
+};
+
+static void *rf_one_shard_req_thread(void *raw) {
+    struct RfOneShardArgs *a = raw;
+    a->rc = slotcask_bulk_request_execute(&a->w->db, a->in, 1);
+    a->err = errno;
+    a->done = 1;
+    return NULL;
+}
+
+/* Poll until the armed pause counter reaches `n` (B3b choreographies):
+ * each hit proves the corresponding thread passed its push / reached
+ * its seam. Never used as the admission proof itself — the GATE_WAIT
+ * pause hit is. */
+static void rf_wait_pause_hits_at_least(int n) {
+    for (int i = 0; i < 30000 && atomic_load(&g_shard_test_pause_hits) < n;
+         i++)
+        usleep(1000);
 }
 
 typedef struct {
@@ -1103,6 +1172,453 @@ static int test_request_flush_batching_run(void) {
         ASSERT_EQ_INT(access(tmp7, F_OK), 0,
                       "other-shard publication temp left for its gate holder");
         unlink(tmp7);
+    }
+
+    /* ── Scenario 13 (B3b): deterministic same-shard chain merge ──
+     * A parks at the PRE_MERGE seam holding shard 0's gate; B is proven
+     * queued (GATE_WAIT pause fires after B's push, before its blocking
+     * lock); release lets A admit B: one chain, two members. Three
+     * consecutive cycles prove no waiter/queue state leaks. Red on
+     * base: the counter lives at the pipeline head, so two requests
+     * report chains == 2. */
+    {
+        static RfBatch ba, bb;
+        static char keysa[16][24], valsa[16][24];
+        static SlotcaskBulkRec recsa[16];
+        static SlotcaskBulkRec perma[16];
+        static char keysb[16][24], valsb[16][24];
+        static SlotcaskBulkRec recsb[16];
+        static SlotcaskBulkRec permb[16];
+        ba.keys = keysa; ba.vals = valsa; ba.recs = recsa; ba.perm = perma;
+        bb.keys = keysb; bb.vals = valsb; bb.recs = recsb; bb.perm = permb;
+        rf_batch_fill(&ba, 60, 16, "v60", 0);    /* all shard 0 */
+        rf_batch_fill(&bb, 61, 16, "v61", 0);    /* all shard 0 */
+
+        for (int cycle = 0; cycle < 3; cycle++) {
+            shard_test_ctl_reset();
+            g_shard_test_pause_phase = SHARD_TEST_PHASE_PRE_MERGE;
+            g_shard_test_pause_occurrence = 1;
+
+            RfReqThr ta = { .w = &w, .b = &ba, .done = 0, .rc = 0 };
+            pthread_t tha;
+            ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_req_thread, &ta),
+                          0, "spawn A (committer)");
+            rf_wait_pause_hit();
+            ASSERT_TRUE(atomic_load(&g_shard_test_pause_hits) >= 1,
+                        "A parked at the PRE_MERGE seam holding the gate");
+
+            g_shard_test_pause_phase = SHARD_TEST_PHASE_GATE_WAIT;
+            g_shard_test_pause_occurrence = 1;
+            RfReqThr tb = { .w = &w, .b = &bb, .done = 0, .rc = 0 };
+            pthread_t thb;
+            ASSERT_EQ_INT(pthread_create(&thb, NULL, rf_req_thread, &tb),
+                          0, "spawn B (same shard, must queue)");
+            rf_wait_pause_hits_at_least(2);
+            ASSERT_TRUE(atomic_load(&g_shard_test_pause_hits) >= 2,
+                        "B hit the GATE_WAIT barrier: queued before "
+                        "A's take");
+
+            atomic_store(&g_shard_test_pause_release, 1);
+            pthread_join(tha, NULL);
+            pthread_join(thb, NULL);
+            ASSERT_EQ_INT(ta.rc, 0, "A rc 0");
+            ASSERT_EQ_INT(tb.rc, 0, "B rc 0");
+            long chains = atomic_load(&g_shard_test_bulk_chains);
+            ASSERT_EQ_INT((int)chains, 1,
+                          "one chain covered both requests");
+            ASSERT_TRUE(rf_record_visible(&w, ba.keys[0], "v60-0000") &&
+                        rf_record_visible(&w, bb.keys[0], "v61-0000"),
+                        "both members' records visible");
+            ASSERT_EQ_INT(rt_marker_scan(w.base), 0,
+                          "no markers retained");
+        }
+    }
+
+    /* ── Scenario 14 (B3b): mixed kinds never share a chain ── */
+    {
+        static RfBatch ba;
+        static char keysa[8][24], valsa[8][24];
+        static SlotcaskBulkRec recsa[8];
+        static SlotcaskBulkRec perma[8];
+        static char keysb[8][24];
+        static SlotcaskBulkRec recsb[8];
+        ba.keys = keysa; ba.vals = valsa; ba.recs = recsa; ba.perm = perma;
+        rf_batch_fill(&ba, 62, 8, "v62", 0);
+        SlotcaskUpsertOpts seed_opts;
+        memset(&seed_opts, 0, sizeof(seed_opts));
+        for (size_t i = 0; i < 8; i++) {
+            rf_key_shard0("rf-mk", (int)i, keysb[i], sizeof(keysb[i]));
+            ASSERT_EQ_INT(slotcask_upsert_with_hooks(&w.db, 0, keysb[i],
+                                                     strlen(keysb[i]),
+                                                     "seed", 4, &seed_opts,
+                                                     NULL), 0,
+                          "seed delete key");
+            memset(&recsb[i], 0, sizeof(recsb[i]));
+            recsb[i].key = keysb[i];
+            recsb[i].klen = strlen(keysb[i]);
+        }
+
+        shard_test_ctl_reset();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_PRE_MERGE;
+        g_shard_test_pause_occurrence = 1;
+
+        static SlotcaskBulkShardInput ina, inb;
+        SlotcaskBulkOpts oa;
+        rf_fill_opts(&oa, NULL);
+        memset(&ina, 0, sizeof(ina));
+        ina.kf_shard_id = 0; ina.recs = recsa; ina.nrecs = ba.n;
+        ina.kind = SLOTCASK_BULK_INPUT_UPSERT; ina.opts.upsert = oa;
+        SlotcaskBulkDeleteOpts ob;
+        memset(&ob, 0, sizeof(ob));
+        memset(&inb, 0, sizeof(inb));
+        inb.kf_shard_id = 0; inb.recs = recsb; inb.nrecs = 8;
+        inb.kind = SLOTCASK_BULK_INPUT_DELETE; inb.opts.delete_ = ob;
+
+        static struct RfOneShardArgs ta;
+        ta.w = &w; ta.in = &ina; ta.done = 0; ta.rc = 0; ta.err = 0;
+        pthread_t tha;
+        ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_one_shard_req_thread,
+                                     &ta), 0, "spawn A (upsert)");
+        rf_wait_pause_hit();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_GATE_WAIT;
+        g_shard_test_pause_occurrence = 1;
+        static struct RfOneShardArgs tb;
+        tb.w = &w; tb.in = &inb; tb.done = 0; tb.rc = 0; tb.err = 0;
+        pthread_t thb;
+        ASSERT_EQ_INT(pthread_create(&thb, NULL, rf_one_shard_req_thread,
+                                     &tb), 0, "spawn B (delete)");
+        rf_wait_pause_hits_at_least(2);
+        atomic_store(&g_shard_test_pause_release, 1);
+        pthread_join(tha, NULL);
+        pthread_join(thb, NULL);
+        ASSERT_EQ_INT(ta.rc, 0, "A (upsert) rc 0");
+        ASSERT_EQ_INT(tb.rc, 0, "B (delete) rc 0");
+        long chains = atomic_load(&g_shard_test_bulk_chains);
+        ASSERT_EQ_INT((int)chains, 2,
+                      "mixed kinds serialize: two chains");
+        ASSERT_TRUE(rf_record_visible(&w, ba.keys[0], "v62-0000"),
+                    "A's record visible");
+        ASSERT_TRUE(!rf_record_visible(&w, keysb[0], "seed"),
+                    "B's delete applied");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "no markers retained");
+    }
+
+    /* ── Scenario 15 (B3b): admission capacity + queue-full fallback ── */
+    {
+        enum { N15 = 7 };   /* committer + 6 candidates */
+        static RfBatch b15[N15];
+        static char k15[N15][16][24], v15[N15][16][24];
+        static SlotcaskBulkRec r15[N15][16];
+        static SlotcaskBulkRec p15[N15][16];
+        static SlotcaskBulkShardInput ins15[N15];
+        static struct RfOneShardArgs tas15[N15];
+        static pthread_t ths15[N15];
+        SlotcaskBulkOpts o15;
+        rf_fill_opts(&o15, NULL);
+        for (int r = 0; r < N15; r++) {
+            b15[r].keys = k15[r]; b15[r].vals = v15[r];
+            b15[r].recs = r15[r]; b15[r].perm = p15[r];
+            rf_batch_fill(&b15[r], 63 + r, 16, "v63", 0);
+            memset(&ins15[r], 0, sizeof(ins15[r]));
+            ins15[r].kf_shard_id = 0;
+            ins15[r].recs = r15[r]; ins15[r].nrecs = 16;
+            ins15[r].kind = SLOTCASK_BULK_INPUT_UPSERT;
+            ins15[r].opts.upsert = o15;
+        }
+
+        /* 15a: committer parked pre-merge, four waiters queued → one
+         * five-member chain (BULK_MERGE_MAX_JOINERS + committer). */
+        shard_test_ctl_reset();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_PRE_MERGE;
+        g_shard_test_pause_occurrence = 1;
+        tas15[0].w = &w; tas15[0].in = &ins15[0];
+        tas15[0].done = 0; tas15[0].rc = 0; tas15[0].err = 0;
+        ASSERT_EQ_INT(pthread_create(&ths15[0], NULL,
+                                     rf_one_shard_req_thread,
+                                     &tas15[0]), 0, "15a spawn committer");
+        rf_wait_pause_hit();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_GATE_WAIT;
+        g_shard_test_pause_occurrence = 1;
+        for (int r = 1; r <= 4; r++) {
+            tas15[r].w = &w; tas15[r].in = &ins15[r];
+            tas15[r].done = 0; tas15[r].rc = 0; tas15[r].err = 0;
+            ASSERT_EQ_INT(pthread_create(&ths15[r], NULL,
+                                         rf_one_shard_req_thread,
+                                         &tas15[r]), 0, "15a spawn waiter");
+        }
+        rf_wait_pause_hits_at_least(5);
+        atomic_store(&g_shard_test_pause_release, 1);
+        for (int r = 0; r <= 4; r++) pthread_join(ths15[r], NULL);
+        for (int r = 0; r <= 4; r++)
+            ASSERT_EQ_INT(tas15[r].rc, 0, "15a request rc 0");
+        long chains15a = atomic_load(&g_shard_test_bulk_chains);
+        ASSERT_EQ_INT((int)chains15a, 1,
+                      "15a: one chain covered all five requests");
+        for (int r = 0; r <= 4; r++)
+            ASSERT_TRUE(rf_record_visible(&w, k15[r][0], v15[r][0]),
+                        "15a record visible");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "15a no markers");
+
+        /* 15b: six candidates — the queue holds five, the sixth falls
+         * through to the gate. All seven must commit exactly once with
+         * no retained markers and no waiter state leaking. The retained
+         * fifth either runs its own chain or is admitted by the sixth,
+         * so chains ∈ {2,3}. */
+        shard_test_ctl_reset();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_PRE_MERGE;
+        g_shard_test_pause_occurrence = 1;
+        tas15[0].w = &w; tas15[0].in = &ins15[0];
+        tas15[0].done = 0; tas15[0].rc = 0; tas15[0].err = 0;
+        ASSERT_EQ_INT(pthread_create(&ths15[0], NULL,
+                                     rf_one_shard_req_thread,
+                                     &tas15[0]), 0, "15b spawn committer");
+        rf_wait_pause_hit();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_GATE_WAIT;
+        g_shard_test_pause_occurrence = 1;
+        for (int r = 1; r <= 6; r++) {
+            tas15[r].w = &w; tas15[r].in = &ins15[r];
+            tas15[r].done = 0; tas15[r].rc = 0; tas15[r].err = 0;
+            ASSERT_EQ_INT(pthread_create(&ths15[r], NULL,
+                                         rf_one_shard_req_thread,
+                                         &tas15[r]), 0, "15b spawn waiter");
+        }
+        rf_wait_pause_hits_at_least(7);
+        atomic_store(&g_shard_test_pause_release, 1);
+        for (int r = 0; r <= 6; r++) pthread_join(ths15[r], NULL);
+        for (int r = 0; r <= 6; r++)
+            ASSERT_EQ_INT(tas15[r].rc, 0, "15b request rc 0");
+        long chains15b = atomic_load(&g_shard_test_bulk_chains);
+        ASSERT_TRUE(chains15b >= 2 && chains15b <= 3,
+                    "15b: queue-full overflow serialized cleanly");
+        for (int r = 0; r <= 6; r++)
+            ASSERT_TRUE(rf_record_visible(&w, k15[r][0], v15[r][0]),
+                        "15b record visible");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "15b no markers");
+        ASSERT_TRUE(atomic_load(&g_shard_test_gate_held_max) <= 1,
+                    "15b: G1 — at most one gate held per thread");
+    }
+
+    /* ── Scenario 16 (B3b): merged P failure → both members fail ── */
+    {
+        static RfBatch ba, bb;
+        static char keysa[16][24], valsa[16][24];
+        static SlotcaskBulkRec recsa[16];
+        static SlotcaskBulkRec perma[16];
+        static char keysb[16][24], valsb[16][24];
+        static SlotcaskBulkRec recsb[16];
+        static SlotcaskBulkRec permb[16];
+        ba.keys = keysa; ba.vals = valsa; ba.recs = recsa; ba.perm = perma;
+        bb.keys = keysb; bb.vals = valsb; bb.recs = recsb; bb.perm = permb;
+        rf_batch_fill(&ba, 70, 16, "v70", 0);
+        rf_batch_fill(&bb, 71, 16, "v71", 0);
+
+        shard_test_ctl_reset();
+        g_shard_test_fail_phase = SHARD_TEST_PHASE_P;
+        g_shard_test_fail_occurrence = 1;
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_PRE_MERGE;
+        g_shard_test_pause_occurrence = 1;
+
+        static SlotcaskBulkShardInput ina, inb;
+        SlotcaskBulkOpts oa, ob;
+        rf_fill_opts(&oa, NULL);
+        rf_fill_opts(&ob, NULL);
+        memset(&ina, 0, sizeof(ina));
+        ina.kf_shard_id = 0; ina.recs = recsa; ina.nrecs = ba.n;
+        ina.kind = SLOTCASK_BULK_INPUT_UPSERT; ina.opts.upsert = oa;
+        memset(&inb, 0, sizeof(inb));
+        inb.kf_shard_id = 0; inb.recs = recsb; inb.nrecs = bb.n;
+        inb.kind = SLOTCASK_BULK_INPUT_UPSERT; inb.opts.upsert = ob;
+
+        static struct RfOneShardArgs ta, tb;
+        ta.w = &w; ta.in = &ina; ta.done = 0; ta.rc = 0; ta.err = 0;
+        tb.w = &w; tb.in = &inb; tb.done = 0; tb.rc = 0; tb.err = 0;
+        pthread_t tha, thb;
+        ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_one_shard_req_thread,
+                                     &ta), 0, "16 spawn A");
+        rf_wait_pause_hit();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_GATE_WAIT;
+        g_shard_test_pause_occurrence = 1;
+        ASSERT_EQ_INT(pthread_create(&thb, NULL, rf_one_shard_req_thread,
+                                     &tb), 0, "16 spawn B");
+        rf_wait_pause_hits_at_least(2);
+        atomic_store(&g_shard_test_pause_release, 1);
+        pthread_join(tha, NULL);
+        pthread_join(thb, NULL);
+        g_shard_test_fail_phase = -1; g_shard_test_fail_occurrence = 0;
+        ASSERT_EQ_INT(ta.rc, -1, "16 A rc -1 (merged P failed)");
+        ASSERT_EQ_INT(tb.rc, -1, "16 B rc -1 (merged P failed)");
+        ASSERT_TRUE(ta.err != EINPROGRESS && tb.err != EINPROGRESS,
+                    "16 pre-M failure is not EINPROGRESS");
+        int bad = 0;
+        for (size_t i = 0; i < ba.n; i++) bad |= recsa[i].status != -1;
+        for (size_t i = 0; i < bb.n; i++) bad |= recsb[i].status != -1;
+        ASSERT_TRUE(bad == 0, "16 all member records -1");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "16 no markers");
+        ASSERT_TRUE(!rf_record_visible(&w, keysa[0], "v70-0000") &&
+                    !rf_record_visible(&w, keysb[0], "v71-0000"),
+                    "16 nothing committed");
+    }
+
+    /* ── Scenario 17 (B3b): chain K failure → both retained → replay ── */
+    {
+        static RfBatch ba, bb;
+        static char keysa[16][24], valsa[16][24];
+        static SlotcaskBulkRec recsa[16];
+        static SlotcaskBulkRec perma[16];
+        static char keysb[16][24], valsb[16][24];
+        static SlotcaskBulkRec recsb[16];
+        static SlotcaskBulkRec permb[16];
+        ba.keys = keysa; ba.vals = valsa; ba.recs = recsa; ba.perm = perma;
+        bb.keys = keysb; bb.vals = valsb; bb.recs = recsb; bb.perm = permb;
+        rf_batch_fill(&ba, 72, 16, "v72", 0);
+        rf_batch_fill(&bb, 73, 16, "v73", 0);
+
+        shard_test_ctl_reset();
+        g_shard_test_fail_phase = SHARD_TEST_PHASE_K;
+        g_shard_test_fail_occurrence = 1;
+        g_shard_test_fail_sticky = 1;
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_PRE_MERGE;
+        g_shard_test_pause_occurrence = 1;
+
+        static SlotcaskBulkShardInput ina, inb;
+        int deg_a = 0, deg_b = 0;
+        SlotcaskBulkOpts oa, ob;
+        rf_fill_opts(&oa, NULL); oa.out_durability_degraded = &deg_a;
+        rf_fill_opts(&ob, NULL); ob.out_durability_degraded = &deg_b;
+        memset(&ina, 0, sizeof(ina));
+        ina.kf_shard_id = 0; ina.recs = recsa; ina.nrecs = ba.n;
+        ina.kind = SLOTCASK_BULK_INPUT_UPSERT; ina.opts.upsert = oa;
+        memset(&inb, 0, sizeof(inb));
+        inb.kf_shard_id = 0; inb.recs = recsb; inb.nrecs = bb.n;
+        inb.kind = SLOTCASK_BULK_INPUT_UPSERT; inb.opts.upsert = ob;
+
+        static struct RfOneShardArgs ta, tb;
+        ta.w = &w; ta.in = &ina; ta.done = 0; ta.rc = 0; ta.err = 0;
+        tb.w = &w; tb.in = &inb; tb.done = 0; tb.rc = 0; tb.err = 0;
+        pthread_t tha, thb;
+        ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_one_shard_req_thread,
+                                     &ta), 0, "17 spawn A");
+        rf_wait_pause_hit();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_GATE_WAIT;
+        g_shard_test_pause_occurrence = 1;
+        ASSERT_EQ_INT(pthread_create(&thb, NULL, rf_one_shard_req_thread,
+                                     &tb), 0, "17 spawn B");
+        rf_wait_pause_hits_at_least(2);
+        atomic_store(&g_shard_test_pause_release, 1);
+        pthread_join(tha, NULL);
+        pthread_join(thb, NULL);
+        g_shard_test_fail_phase = -1; g_shard_test_fail_occurrence = 0;
+        g_shard_test_fail_sticky = 0;
+        /* a->rc is execute()'s return value; the per-input fold result
+         * (rc -2 for a retained shard) lives on the input struct. */
+        ASSERT_EQ_INT(ta.in->rc, -2, "17 A retained");
+        ASSERT_EQ_INT(tb.in->rc, -2, "17 B retained");
+        ASSERT_EQ_INT(ta.err, EINPROGRESS, "17 A EINPROGRESS");
+        ASSERT_EQ_INT(tb.err, EINPROGRESS, "17 B EINPROGRESS");
+        ASSERT_EQ_INT(deg_a, 1, "17 A degraded");
+        ASSERT_EQ_INT(deg_b, 1, "17 B degraded");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 2,
+                      "17 one retained marker per member");
+
+        /* Golden follow-up write on the shard: gate replay converges
+           BOTH retained markers. */
+        char fk[24], fv[24];
+        rf_key_shard0("rf-follow", 17, fk, sizeof(fk));
+        snprintf(fv, sizeof(fv), "follow17");
+        SlotcaskUpsertOpts so;
+        memset(&so, 0, sizeof(so));
+        ASSERT_EQ_INT(slotcask_upsert_with_hooks(&w.db, 0, fk, strlen(fk),
+                                                 fv, strlen(fv), &so, NULL),
+                      0, "17 follow-up replay converges");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "17 markers cleared");
+        ASSERT_TRUE(rf_record_visible(&w, keysa[0], "v72-0000") &&
+                    rf_record_visible(&w, keysb[0], "v73-0000"),
+                    "17 both members' records visible after replay");
+    }
+
+    /* ── Scenario 18 (B3b): one member's apply failure isolates only
+     * that member inside a shared chain ── */
+    {
+        static RfBatch ba, bb;
+        static char keysa[16][24], valsa[16][24];
+        static SlotcaskBulkRec recsa[16];
+        static SlotcaskBulkRec perma[16];
+        static char keysb[4][24], valsb[4][24];
+        static SlotcaskBulkRec recsb[4];
+        static SlotcaskBulkRec permb[4];
+        ba.keys = keysa; ba.vals = valsa; ba.recs = recsa; ba.perm = perma;
+        bb.keys = keysb; bb.vals = valsb; bb.recs = recsb; bb.perm = permb;
+        rf_batch_fill(&ba, 74, 16, "v74", 0);
+        rf_batch_fill(&bb, 75, 4, "v75", 0);
+
+        RfHookCtl ctl_a, ctl_b;
+        memset(&ctl_a, 0, sizeof(ctl_a));
+        memset(&ctl_b, 0, sizeof(ctl_b));
+        ctl_b.fail_all = 1;
+
+        shard_test_ctl_reset();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_PRE_MERGE;
+        g_shard_test_pause_occurrence = 1;
+
+        static SlotcaskBulkShardInput ina, inb;
+        SlotcaskBulkOpts oa, ob;
+        int deg_b = 0;
+        rf_fill_hc_opts(&oa, &ctl_a);
+        rf_fill_hc_opts(&ob, &ctl_b);
+        ob.out_durability_degraded = &deg_b;
+        memset(&ina, 0, sizeof(ina));
+        ina.kf_shard_id = 0; ina.recs = recsa; ina.nrecs = ba.n;
+        ina.kind = SLOTCASK_BULK_INPUT_UPSERT; ina.opts.upsert = oa;
+        memset(&inb, 0, sizeof(inb));
+        inb.kf_shard_id = 0; inb.recs = recsb; inb.nrecs = bb.n;
+        inb.kind = SLOTCASK_BULK_INPUT_UPSERT; inb.opts.upsert = ob;
+
+        static struct RfOneShardArgs ta, tb;
+        ta.w = &w; ta.in = &ina; ta.done = 0; ta.rc = 0; ta.err = 0;
+        tb.w = &w; tb.in = &inb; tb.done = 0; tb.rc = 0; tb.err = 0;
+        pthread_t tha, thb;
+        ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_one_shard_req_thread,
+                                     &ta), 0, "18 spawn A");
+        rf_wait_pause_hit();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_GATE_WAIT;
+        g_shard_test_pause_occurrence = 1;
+        ASSERT_EQ_INT(pthread_create(&thb, NULL, rf_one_shard_req_thread,
+                                     &tb), 0, "18 spawn B");
+        rf_wait_pause_hits_at_least(2);
+        atomic_store(&g_shard_test_pause_release, 1);
+        pthread_join(tha, NULL);
+        pthread_join(thb, NULL);
+        long chains = atomic_load(&g_shard_test_bulk_chains);
+        ASSERT_EQ_INT((int)chains, 1, "18 one shared chain");
+        ASSERT_EQ_INT(ta.in->rc, 0, "18 A clean");
+        ASSERT_EQ_INT(tb.in->rc, -2, "18 B retained");
+        ASSERT_EQ_INT(deg_b, 1, "18 B degraded");
+        ASSERT_TRUE(rf_record_visible(&w, keysa[0], "v74-0000"),
+                    "18 A committed despite B's failure");
+        ASSERT_TRUE(!rf_record_visible(&w, keysb[0], "v75-0000"),
+                    "18 B not visible before replay");
+        /* Exactly one terminal callback per window: A committed, B
+           released (both finalize attempts failed → one release). */
+        ASSERT_EQ_INT(ctl_a.prepare, 1, "18 A one window prepared");
+        ASSERT_EQ_INT(ctl_a.apply, 1, "18 A one apply");
+        ASSERT_EQ_INT(ctl_a.commit_done, 1, "18 A commit_done once");
+        ASSERT_EQ_INT(ctl_b.prepare, 1, "18 B one window prepared");
+        ASSERT_TRUE(ctl_b.apply >= 2, "18 B finalize retried");
+        ASSERT_EQ_INT(ctl_b.release_window, 1, "18 B release once");
+        ASSERT_EQ_INT(ctl_b.commit_done, 0, "18 B never commit_done");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 1, "18 B marker retained");
+
+        char fk[24], fv[24];
+        rf_key_shard0("rf-follow", 18, fk, sizeof(fk));
+        snprintf(fv, sizeof(fv), "follow18");
+        SlotcaskUpsertOpts so;
+        memset(&so, 0, sizeof(so));
+        ASSERT_EQ_INT(slotcask_upsert_with_hooks(&w.db, 0, fk, strlen(fk),
+                                                 fv, strlen(fv), &so, NULL),
+                      0, "18 follow-up replay converges B");
+        ASSERT_TRUE(rf_record_visible(&w, keysb[0], "v75-0000"),
+                    "18 B visible after replay");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "18 markers cleared");
     }
 
     rf_db_close(&w);

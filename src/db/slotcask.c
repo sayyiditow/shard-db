@@ -29,6 +29,7 @@
 #ifndef EUCLEAN
 #define EUCLEAN EIO
 #endif
+#include <assert.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -49,6 +50,7 @@
 #include "shard_test_ctl.h"
 long g_shard_test_sync_counts[SHARD_TEST_PHASE_COUNT];
 _Atomic long g_shard_test_gate_held_max;
+_Atomic long g_shard_test_bulk_chains;
 long g_shard_test_fail_phase = -1;
 long g_shard_test_fail_occurrence;
 int  g_shard_test_fail_postlink;
@@ -864,6 +866,60 @@ RecoveryIndexDiffFn g_recovery_index_diff_fn = NULL;
    mutation; readers never take it. Gates exist from the moment
    slotcask_open installs them, so no runtime writer can touch an
    uninitialised one. */
+/* ── B3b: bounded admission queues for the bulk commit-chain merge ──
+   One queue per kf shard, allocated with the writer gates. A pipeline
+   task registers itself before taking the gate; the current gate holder
+   may admit up to BULK_MERGE_MAX_JOINERS queued same-kind requests into
+   one commit chain. Queue mutexes are never held across staging, cache
+   locks, the writer gate, or I/O.
+   BULK_MERGE_MAX_JOINERS is defined exactly once, here: this block
+   precedes both the queue-operations block and the chain-flush region,
+   which both rely on it. */
+#define BULK_MERGE_MAX_JOINERS 4
+
+struct BulkGateWaiter;
+typedef struct BulkGateWaiter BulkGateWaiter;
+
+struct BulkGateWaiterQ {
+    pthread_mutex_t mu;
+    BulkGateWaiter *slot[BULK_MERGE_MAX_JOINERS + 1];
+    size_t n;
+};
+
+static int bulk_gate_waiters_init(SlotcaskDb *db) {
+    db->writer_gate_waiters =
+        calloc((size_t)db->num_shards, sizeof(*db->writer_gate_waiters));
+    if (!db->writer_gate_waiters) return -1;
+    for (int s = 0; s < db->num_shards; s++) {
+        int rc = pthread_mutex_init(&db->writer_gate_waiters[s].mu, NULL);
+        if (rc != 0) {
+            errno = rc;
+            while (db->writer_gate_waiters_inited > 0) {
+                db->writer_gate_waiters_inited--;
+                pthread_mutex_destroy(
+                    &db->writer_gate_waiters[
+                        db->writer_gate_waiters_inited].mu);
+            }
+            free(db->writer_gate_waiters);
+            db->writer_gate_waiters = NULL;
+            return -1;
+        }
+        db->writer_gate_waiters_inited++;
+    }
+    return 0;
+}
+
+static void bulk_gate_waiters_destroy(SlotcaskDb *db) {
+    if (!db->writer_gate_waiters) return;
+    while (db->writer_gate_waiters_inited > 0) {
+        db->writer_gate_waiters_inited--;
+        pthread_mutex_destroy(
+            &db->writer_gate_waiters[db->writer_gate_waiters_inited].mu);
+    }
+    free(db->writer_gate_waiters);
+    db->writer_gate_waiters = NULL;
+}
+
 static int writer_gates_init(SlotcaskDb *db) {
     db->writer_gates = calloc((size_t)db->num_shards,
                               sizeof(*db->writer_gates));
@@ -883,10 +939,20 @@ static int writer_gates_init(SlotcaskDb *db) {
         }
         db->writer_gates_inited++;
     }
+    if (bulk_gate_waiters_init(db) != 0) {
+        while (db->writer_gates_inited > 0) {
+            db->writer_gates_inited--;
+            pthread_mutex_destroy(&db->writer_gates[db->writer_gates_inited]);
+        }
+        free(db->writer_gates);
+        db->writer_gates = NULL;
+        return -1;
+    }
     return 0;
 }
 
 static void writer_gates_destroy(SlotcaskDb *db) {
+    bulk_gate_waiters_destroy(db);
     while (db->writer_gates_inited > 0) {
         db->writer_gates_inited--;
         pthread_mutex_destroy(&db->writer_gates[db->writer_gates_inited]);
@@ -903,7 +969,14 @@ static __thread int t_writer_gates_held;
 #endif
 
 static void writer_gate_lock(SlotcaskDb *db, int kf_shard) {
+#ifdef TEST_BUILD
+    if (pthread_mutex_trylock(&db->writer_gates[kf_shard]) != 0) {
+        SHARD_TEST_PHASE_PAUSE(SHARD_TEST_PHASE_GATE_WAIT);
+        pthread_mutex_lock(&db->writer_gates[kf_shard]);
+    }
+#else
     pthread_mutex_lock(&db->writer_gates[kf_shard]);
+#endif
 #ifdef TEST_BUILD
     t_writer_gates_held++;
     long cur = atomic_load(&g_shard_test_gate_held_max);
@@ -4850,12 +4923,11 @@ struct SlotcaskBulkRequest {
     uint64_t    nonce;                 /* per-request marker uniqueness    */
     int        *touched;               /* [ntouched] ascending, deduped    */
     size_t      ntouched;
-    /* B1: per-shard outcomes are folded into ReqShard before each gate
-       release; the request keeps only the aggregate for the final
-       errno. */
-    int         any_pending;           /* any shard retained markers       */
-    int         any_failed;            /* any shard errored or pending     */
-    int         saved_errno;           /* first hard failure's errno       */
+    /* B3b: per-shard outcomes are folded into each SlotcaskBulkShardInput
+       (rc / error_no) inside that shard's own pipeline; the request
+       object no longer aggregates across pipeline tasks (the old
+       any_pending/any_failed/saved_errno writes raced between tasks and
+       are read post-join from inputs[] instead). */
 };
 
 /* ----- Phase helpers shared by the slow and fast bulk-upsert paths.
@@ -7076,91 +7148,182 @@ static int slotcask_bulk_finalize_shard(SlotcaskBulkRequest *req,
     return rc;
 }
 
-/* ── Per-shard pipeline flushes (B1) ─────────────────────────────────
-   Each helper runs inside one shard's pipeline, under that shard's
-   writer gate — on the pipeline's IO-pool task under B2 (inline for
-   nested callers). They replace the request-wide passes: dedup is per
-   shard, so a stream or index file shared by several shards may be
-   synced once per touching shard — with the B2 coalescer, concurrent
-   syncers of one file collapse into the first in-flight sync. */
+/* ── B3b chain flushes (generalize the B1 per-shard flushes) ────────
+   Each runs inside the committer's single gate hold and merges every
+   member's contribution into one pass per durability barrier. A solo
+   chain (one member) performs exactly the passes the superseded
+   per-shard helpers performed. */
 
-/* P barrier for shard kf_shard_id: sync this shard's staged payload
-   bytes once. On failure the caller marks this shard's records -1
-   (only this shard — sibling shards are unaffected). */
-static int slotcask_bulk_shard_flush_payloads(SlotcaskBulkRequest *req,
-                                              int kf_shard_id) {
-    ReqShard *rs = &req->shards[kf_shard_id];
-    if (rs->np == 0) return 0;
-    SegLoc *all = malloc(rs->np * sizeof(*all));
-    if (!all) return -1;
-    memcpy(all, rs->p_locs, rs->np * sizeof(*all));
-    size_t n = rs->np;
+typedef struct {
+    SlotcaskBulkRequest    *req;
+    SlotcaskBulkShardInput *in;
+    ReqShard               *rs;
+    BulkGateWaiter         *waiter; /* NULL for the committer */
+} BulkChainMember;
+
+typedef struct {
+    SlotcaskDb      *db;
+    int              kf_shard_id;
+    char             kf_dir[PATH_MAX]; /* shared by all members (same db) */
+    BulkChainMember  members[BULK_MERGE_MAX_JOINERS + 1];
+    size_t            nmembers;
+} BulkCommitChain;
+
+/* Bitmap file path for the chain commit flush (mirrors index.c's
+   bm_build_path: <root>/<obj>/indexes/<field>/<NNN>.bm). */
+static void req_bitmap_file_path(char *out, size_t outlen,
+                                 const char *db_root, const char *object,
+                                 const char *field, int shard_idx) {
+    snprintf(out, outlen, "%s/%s/indexes/%s/%03d.bm",
+             db_root, object, field, shard_idx);
+}
+
+/* fdatasync a file by path without touching any cache. B3a: routed
+   through the path-keyed epoch so concurrent commit flushes syncing
+   the same bitmap file coalesce. The raw op converts ENOENT to success
+   (missing file = nothing ever written), so this returns 0 for a
+   missing file. */
+static int fdatasync_path(const char *path) {
+    return durability_epoch_fdatasync_path_ex(path, NULL);
+}
+
+/* Mark every non-stage-failed member holding staged payload locations as
+   payload-failed. Used by the P flush's early failure exits (slot-count
+   overflow, allocation), before any np reset — with the sync-failure
+   marking below, every failure exit of the flush marks exactly the
+   contributing members, so no record or input can report success after
+   a hard P failure. */
+static void bulk_chain_mark_payload_failed(BulkCommitChain *chain) {
+    for (size_t m = 0; m < chain->nmembers; m++) {
+        BulkChainMember *mem = &chain->members[m];
+        if (mem->rs->stage_failed || mem->rs->np == 0) continue;
+        mem->rs->payload_failed = 1;
+        mem->rs->step_failed = 1;
+        if (!mem->rs->step_errno)
+            mem->rs->step_errno = errno ? errno : EIO;
+    }
+}
+
+/* Chain P barrier: one merged, sorted, deduplicated sync pass over every
+   non-stage-failed member's staged payload locations. Contributors are
+   the members with rs->np > 0; on failure exactly the contributors are
+   marked payload_failed (their records report -1 and publish is
+   skipped) — non-contributing members are untouched. Mirrors the B1
+   flush's stage_failed skip, note-sync position, and unconditional
+   np reset on the sync path. */
+static int bulk_commit_chain_flush_payloads(BulkCommitChain *chain) {
+    size_t total = 0;
+    for (size_t m = 0; m < chain->nmembers; m++) {
+        ReqShard *rs = chain->members[m].rs;
+        if (rs->stage_failed) continue;
+        if (size_add_checked(&total, rs->np) != 0) {
+            bulk_chain_mark_payload_failed(chain);
+            return -1;
+        }
+    }
+    if (total == 0) return 0;
+    SegLoc *all = malloc(total * sizeof(*all));
+    if (!all) {
+        bulk_chain_mark_payload_failed(chain);
+        return -1;
+    }
+    size_t n = 0;
+    for (size_t m = 0; m < chain->nmembers; m++) {
+        ReqShard *rs = chain->members[m].rs;
+        if (rs->stage_failed) continue;
+        if (rs->np) {
+            memcpy(all + n, rs->p_locs, rs->np * sizeof(*all));
+            n += rs->np;
+        }
+    }
     if (n > 1 && !segloc_is_sorted(all, n))
         qsort(all, n, sizeof(*all), segloc_cmp);
     size_t w = 0;
     for (size_t i = 0; i < n; i++)
         if (w == 0 || segloc_cmp(&all[w - 1], &all[i]) != 0) all[w++] = all[i];
     uint64_t t0 = now_us();
-    int rc = bulk_seg_apply_and_sync(req->db, all, w, 0, 0);
+    int rc = bulk_seg_apply_and_sync(chain->db, all, w, 0, 0);
     int saved_errno = rc != 0 ? (errno ? errno : EIO) : 0;
     commit_phase_us_record(&g_commit_segment_sync_us_total, t0);
     commit_phase_us_record(&g_commit_segment_p_us_total, t0);
     free(all);
-    rs->np = 0;
     if (rc == 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_P)) {
         errno = EIO;
         rc = -1;
         saved_errno = EIO;
     }
+    for (size_t m = 0; m < chain->nmembers; m++) {
+        BulkChainMember *mem = &chain->members[m];
+        if (mem->rs->stage_failed) continue;
+        if (rc != 0 && mem->rs->np > 0) {
+            mem->rs->payload_failed = 1;
+            mem->rs->step_failed = 1;
+            if (!mem->rs->step_errno) mem->rs->step_errno = saved_errno;
+        }
+        mem->rs->np = 0;
+    }
     if (rc != 0) errno = saved_errno ? saved_errno : EIO;
     return rc;
 }
 
-/* M barrier for shard kf_shard_id: ONE fsync(data/kf dir) after this
-   shard's windows' markers are link-published. 0 when nothing
-   published. */
-static int slotcask_bulk_shard_flush_marker_dir(SlotcaskBulkRequest *req,
-                                                int kf_shard_id) {
-    ReqShard *rs = &req->shards[kf_shard_id];
+/* Chain M barrier: ONE fsync of the shared kf directory (every member of
+   a chain targets the same object, so req->kf_dir is identical) after
+   every member's windows' markers are link-published. On failure every
+   member with published windows is marked marker_dir_failed — its
+   finalize is skipped and its markers stay retained (rc -2,
+   EINPROGRESS); members that published nothing are unaffected. */
+static int bulk_commit_chain_flush_marker_dir(BulkCommitChain *chain) {
     int any = 0;
-    for (size_t i = 0; i < rs->nwindows; i++)
-        any |= rs->windows[i].published;
+    for (size_t m = 0; m < chain->nmembers; m++)
+        for (size_t i = 0; i < chain->members[m].rs->nwindows; i++)
+            any |= chain->members[m].rs->windows[i].published;
     if (!any) return 0;
-    int rc = durability_epoch_fsync_dir(req->kf_dir);
+    int rc = durability_epoch_fsync_dir(chain->kf_dir);
     if (rc == 0 && SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_M)) {
         errno = EIO;
         rc = -1;
     }
+    if (rc != 0) {
+        for (size_t m = 0; m < chain->nmembers; m++) {
+            ReqShard *rs = chain->members[m].rs;
+            int pub = 0;
+            for (size_t i = 0; i < rs->nwindows; i++)
+                pub |= rs->windows[i].published;
+            if (!pub) continue;
+            rs->marker_dir_failed = 1;
+            rs->step_failed = 1;
+            if (!rs->step_errno) rs->step_errno = errno ? errno : EIO;
+        }
+    }
     return rc;
 }
 
-/* K barrier for shard kf_shard_id: one mmap durability wait for the
-   shard's merged kf slot vector. Body of the former req_kf_sync_worker,
-   invoked inline by the pipeline instead of via parallel_for_io. */
-static int slotcask_bulk_shard_flush_kf(SlotcaskBulkRequest *req,
-                                        int kf_shard_id) {
-    ReqShard *rs = &req->shards[kf_shard_id];
+/* Chain K barrier: one mmap durability wait for the chain's merged kf
+   slot vector (all members are windows of the same kf shard). */
+static int bulk_commit_chain_flush_kf(BulkCommitChain *chain) {
     size_t total = 0;
     int header_changed = 0;
-    for (size_t i = 0; i < rs->nwindows; i++) {
-        ReqWindow *rw = &rs->windows[i];
-        if (!rw->converged) continue;
-        if (size_add_checked(&total, rw->nkf) != 0) return -1;
-        header_changed |= rw->kf_header_changed;
-    }
+    for (size_t m = 0; m < chain->nmembers; m++)
+        for (size_t i = 0; i < chain->members[m].rs->nwindows; i++) {
+            ReqWindow *rw = &chain->members[m].rs->windows[i];
+            if (!rw->converged) continue;
+            if (size_add_checked(&total, rw->nkf) != 0) return -1;
+            header_changed |= rw->kf_header_changed;
+        }
     if (total == 0 && !header_changed) return 0;
     if (total > SIZE_MAX / sizeof(size_t)) { errno = EOVERFLOW; return -1; }
     size_t *slots = total ? malloc(total * sizeof(*slots)) : NULL;
     if (total && !slots) { errno = ENOMEM; return -1; }
     size_t n = 0;
-    for (size_t i = 0; i < rs->nwindows; i++) {
-        ReqWindow *rw = &rs->windows[i];
-        if (!rw->converged) continue;
-        if (rw->nkf > 0) {
-            memcpy(slots + n, rw->kf_slots, rw->nkf * sizeof(*slots));
-            n += rw->nkf;
+    for (size_t m = 0; m < chain->nmembers; m++)
+        for (size_t i = 0; i < chain->members[m].rs->nwindows; i++) {
+            ReqWindow *rw = &chain->members[m].rs->windows[i];
+            if (!rw->converged) continue;
+            if (rw->nkf > 0) {
+                memcpy(slots + n, rw->kf_slots, rw->nkf * sizeof(*slots));
+                n += rw->nkf;
+            }
         }
-    }
     if (n > 1) {
         size_t *scratch = malloc(n * sizeof(*scratch));
         if (scratch) {
@@ -7174,7 +7337,7 @@ static int slotcask_bulk_shard_flush_kf(SlotcaskBulkRequest *req,
     for (size_t i = 0; i < n; i++)
         if (w == 0 || slots[w - 1] != slots[i]) slots[w++] = slots[i];
     SlotcaskKfHandle kh;
-    if (kf_shard_acquire(&kh, req->db, kf_shard_id, 1) != 0) {
+    if (kf_shard_acquire(&kh, chain->db, chain->kf_shard_id, 1) != 0) {
         free(slots);
         return -1;
     }
@@ -7188,42 +7351,23 @@ static int slotcask_bulk_shard_flush_kf(SlotcaskBulkRequest *req,
     return rc;
 }
 
-/* Bitmap file path for the request commit flush (mirrors index.c's
-   bm_build_path: <root>/<obj>/indexes/<field>/<NNN>.bm). */
-static void req_bitmap_file_path(char *out, size_t outlen,
-                                 const char *db_root, const char *object,
-                                 const char *field, int shard_idx) {
-    snprintf(out, outlen, "%s/%s/indexes/%s/%03d.bm",
-             db_root, object, field, shard_idx);
-}
-
-/* fdatasync a file by path without touching any cache. B3a: routed
-   through the path-keyed epoch so concurrent commit flushes syncing
-   the same bitmap file coalesce. The raw op converts ENOENT to success
-   (missing file = nothing ever written), so this returns 0 for a
-   missing file — the call site's errno != ENOENT skip is now
-   vestigial but kept unchanged. */
-static int fdatasync_path(const char *path) {
-    return durability_epoch_fdatasync_path_ex(path, NULL);
-}
-
-/* Per-shard commit barriers + clear for shard kf_shard_id (the
-   pipeline's last durability step, before the shard's terminal cleanup
-   and gate release): merged index flush [I1] → K sync → A/T segment
-   syncs → batched marker unlink + ONE fsync(data/kf dir) → reclaim +
-   commit_done. Per-shard predicates make ineligible windows no-ops, so
-   the helper is safe to run after any earlier pipeline failure. */
-static int slotcask_bulk_shard_flush_commit(SlotcaskBulkRequest *req,
-                                            int kf_shard_id) {
-    ReqShard *rs = &req->shards[kf_shard_id];
-
-    /* 1. Index flush: merge this shard's converged windows' touch sets,
-          dedupe, issue through the parallel issuer; bitmaps serial. */
+/* Chain commit barriers + clear: merged index flush [I] → chain K sync →
+   merged A/T segment syncs → batched marker unlink + ONE fsync of the
+   shared kf dir → reclaim + commit_done per window. Per-window
+   predicates (published/converged/cleared) make ineligible windows
+   no-ops, so the helper is safe to run after any earlier member's phase
+   failure. */
+static int bulk_commit_chain_flush_commit(BulkCommitChain *chain) {
+    /* 1. Index flush: merge every member's converged windows' touch
+          sets, dedupe, issue through the parallel issuer; bitmaps
+          serial. */
     size_t total = 0;
-    for (size_t i = 0; i < rs->nwindows; i++)
-        if (rs->windows[i].converged)
-            if (size_add_checked(&total, rs->windows[i].plan.touch.n) != 0)
-                return -1;
+    for (size_t m = 0; m < chain->nmembers; m++)
+        for (size_t i = 0; i < chain->members[m].rs->nwindows; i++)
+            if (chain->members[m].rs->windows[i].converged)
+                if (size_add_checked(&total,
+                        chain->members[m].rs->windows[i].plan.touch.n) != 0)
+                    return -1;
     if (total > 0) {
         uint64_t t0i = now_us();
         if (total > SIZE_MAX / sizeof(IdxTouch)) {
@@ -7234,16 +7378,17 @@ static int slotcask_bulk_shard_flush_commit(SlotcaskBulkRequest *req,
         if (!all) return -1;
         size_t n = 0;
         char eff_root[PATH_MAX], object[256];
-        split_data_dir(req->db->data_dir, eff_root, sizeof(eff_root),
+        split_data_dir(chain->db->data_dir, eff_root, sizeof(eff_root),
                        object, sizeof(object));
-        for (size_t i = 0; i < rs->nwindows; i++) {
-            ReqWindow *rw = &rs->windows[i];
-            if (!rw->converged) continue;
-            if (rw->plan.touch.n)
-                memcpy(all + n, rw->plan.touch.v,
-                       rw->plan.touch.n * sizeof(*all));
-            n += rw->plan.touch.n;
-        }
+        for (size_t m = 0; m < chain->nmembers; m++)
+            for (size_t i = 0; i < chain->members[m].rs->nwindows; i++) {
+                ReqWindow *rw = &chain->members[m].rs->windows[i];
+                if (!rw->converged) continue;
+                if (rw->plan.touch.n)
+                    memcpy(all + n, rw->plan.touch.v,
+                           rw->plan.touch.n * sizeof(*all));
+                n += rw->plan.touch.n;
+            }
         qsort(all, n, sizeof(*all), idx_touch_cmp);
         size_t w = 0;
         for (size_t i = 0; i < n; i++)
@@ -7264,7 +7409,7 @@ static int slotcask_bulk_shard_flush_commit(SlotcaskBulkRequest *req,
             for (size_t i = 0; i < n; i++) {
                 if (all[i].type == IT_BITMAP) continue;
                 int shard = idx_shard_for_hash(all[i].hash16,
-                                               req->num_shards);
+                                               chain->db->num_shards);
                 if (all[i].type == IT_TRIGRAM)
                     tg_build_path(path_buf + w2 * PATH_MAX, PATH_MAX,
                                   eff_root, object, all[i].field, shard);
@@ -7285,7 +7430,7 @@ static int slotcask_bulk_shard_flush_commit(SlotcaskBulkRequest *req,
             /* Plain-fd fdatasync: the dirty bitmap pages belong to the
                inode (written via the bm cache's mmap), so syncing any fd
                of the file is equivalent — without re-entering the bm
-               cache, whose entry wrlocks are parked by the request's own
+               cache, whose entry wrlocks are parked by each member's own
                prepare-staged handles until finalize. A missing file means
                nothing was ever written — not an error. */
             char bpath[1024];
@@ -7303,16 +7448,18 @@ static int slotcask_bulk_shard_flush_commit(SlotcaskBulkRequest *req,
     }
 
     /* 2. K barrier: one mmap durability wait for this dirty kf shard. */
-    if (slotcask_bulk_shard_flush_kf(req, kf_shard_id) != 0) return -1;
+    if (bulk_commit_chain_flush_kf(chain) != 0) return -1;
 
-    /* 3. Segment barriers: activation + tombstone bytes, this shard's
-          windows only, one pass each. */
+    /* 3. Segment barriers: activation + tombstone bytes across every
+          member's windows, one pass each. */
     for (int pass = 0; pass < 2; pass++) {
         size_t total = 0;
-        for (size_t i = 0; i < rs->nwindows; i++)
-            if (size_add_checked(&total,
-                    pass == 0 ? rs->windows[i].na : rs->windows[i].nt) != 0)
-                return -1;
+        for (size_t m = 0; m < chain->nmembers; m++)
+            for (size_t i = 0; i < chain->members[m].rs->nwindows; i++)
+                if (size_add_checked(&total,
+                        pass == 0 ? chain->members[m].rs->windows[i].na
+                                  : chain->members[m].rs->windows[i].nt) != 0)
+                    return -1;
         if (total == 0) continue;
         if (total > SIZE_MAX / sizeof(SegLoc)) {
             errno = EOVERFLOW;
@@ -7321,18 +7468,19 @@ static int slotcask_bulk_shard_flush_commit(SlotcaskBulkRequest *req,
         SegLoc *all = malloc(total * sizeof(*all));
         if (!all) return -1;
         size_t n = 0;
-        for (size_t i = 0; i < rs->nwindows; i++) {
-            ReqWindow *rw = &rs->windows[i];
-            if (pass == 0) {
-                if (rw->na) memcpy(all + n, rw->a_locs,
-                                   rw->na * sizeof(*all));
-                n += rw->na;
-            } else {
-                if (rw->nt) memcpy(all + n, rw->t_locs,
-                                   rw->nt * sizeof(*all));
-                n += rw->nt;
+        for (size_t m = 0; m < chain->nmembers; m++)
+            for (size_t i = 0; i < chain->members[m].rs->nwindows; i++) {
+                ReqWindow *rw = &chain->members[m].rs->windows[i];
+                if (pass == 0) {
+                    if (rw->na) memcpy(all + n, rw->a_locs,
+                                       rw->na * sizeof(*all));
+                    n += rw->na;
+                } else {
+                    if (rw->nt) memcpy(all + n, rw->t_locs,
+                                       rw->nt * sizeof(*all));
+                    n += rw->nt;
+                }
             }
-        }
         if (n > 1 && !segloc_is_sorted(all, n))
             qsort(all, n, sizeof(*all), segloc_cmp);
         size_t w = 0;
@@ -7340,7 +7488,7 @@ static int slotcask_bulk_shard_flush_commit(SlotcaskBulkRequest *req,
             if (w == 0 || segloc_cmp(&all[w - 1], &all[i]) != 0)
                 all[w++] = all[i];
         uint64_t t0s = now_us();
-        int rc = bulk_seg_apply_and_sync(req->db, all, w, 0, 0);
+        int rc = bulk_seg_apply_and_sync(chain->db, all, w, 0, 0);
         int saved_errno = rc != 0 ? (errno ? errno : EIO) : 0;
         commit_phase_us_record(&g_commit_segment_sync_us_total, t0s);
         commit_phase_us_record(&g_commit_segment_post_us_total, t0s);
@@ -7359,27 +7507,28 @@ static int slotcask_bulk_shard_flush_commit(SlotcaskBulkRequest *req,
         return -1;
     }
 
-    /* 4. Batched clear: unlink every converged window's marker of this
-          shard via its preserved path, then ONE dir fsync. Failed
+    /* 4. Batched clear: unlink every member's converged window's marker
+          via its preserved path, then ONE dir fsync. Failed
           (non-converged) windows stay retained. */
     int any_unlinked = 0;
     int unlink_rc = 0;
     int unlink_errno = 0;
-    for (size_t i = 0; i < rs->nwindows; i++) {
-        ReqWindow *rw = &rs->windows[i];
-        if (!rw->published || !rw->converged || rw->cleared) continue;
-        if (kfm2_unlink_by_path(rw->marker_path) != 0) {
-            if (!unlink_errno) unlink_errno = errno;
-            unlink_rc = -1;
-            continue; /* still fsync every successful unlink */
+    for (size_t m = 0; m < chain->nmembers; m++)
+        for (size_t i = 0; i < chain->members[m].rs->nwindows; i++) {
+            ReqWindow *rw = &chain->members[m].rs->windows[i];
+            if (!rw->published || !rw->converged || rw->cleared) continue;
+            if (kfm2_unlink_by_path(rw->marker_path) != 0) {
+                if (!unlink_errno) unlink_errno = errno;
+                unlink_rc = -1;
+                continue; /* still fsync every successful unlink */
+            }
+            rw->unlink_succeeded = 1;
+            any_unlinked = 1;
         }
-        rw->unlink_succeeded = 1;
-        any_unlinked = 1;
-    }
     int dir_rc = 0;
     uint64_t t0c = now_us();
     if (any_unlinked &&
-        durability_epoch_fsync_dir(req->kf_dir) != 0) dir_rc = -1;
+        durability_epoch_fsync_dir(chain->kf_dir) != 0) dir_rc = -1;
     if (any_unlinked)
         commit_phase_us_record(&g_commit_marker_clear_us_total, t0c);
     if (any_unlinked && dir_rc == 0 &&
@@ -7390,23 +7539,237 @@ static int slotcask_bulk_shard_flush_commit(SlotcaskBulkRequest *req,
     if (dir_rc != 0) return -1; /* no reclaim: a marker may survive crash */
 
     /* 5. Directory-durable clears: reclaim OLD capacity, then transfer
-          terminal ownership. This is the only deferred commit_done site. */
-    for (size_t i = 0; i < rs->nwindows; i++) {
-        ReqWindow *rw = &rs->windows[i];
-        if (!rw->unlink_succeeded || rw->cleared) continue;
-        rw->cleared = 1;
-        bulk_reclaim_old_payloads_locked(&rs->txn, &rw->plan);
-        if (rw->hooks_staged && rw->hooks.commit_done)
-            rw->hooks.commit_done(rw->hooks.ctx, rw->hook_state);
-        rw->hooks_staged = 0;
-        rw->hook_state = NULL;
-    }
-    /* Deterministic pause surface for cross-process crash tests (per
-       shard: the same point the request-wide pass offered, scoped to
-       this shard's cleared windows). */
-    durability_test_pause(req->db->data_dir, "bulk-window-cleared");
+          terminal ownership. Each window's reclaim uses its own member's
+          transaction. This is the only deferred commit_done site. */
+    for (size_t m = 0; m < chain->nmembers; m++)
+        for (size_t i = 0; i < chain->members[m].rs->nwindows; i++) {
+            ReqWindow *rw = &chain->members[m].rs->windows[i];
+            if (!rw->unlink_succeeded || rw->cleared) continue;
+            rw->cleared = 1;
+            bulk_reclaim_old_payloads_locked(&chain->members[m].rs->txn,
+                                             &rw->plan);
+            if (rw->hooks_staged && rw->hooks.commit_done)
+                rw->hooks.commit_done(rw->hooks.ctx, rw->hook_state);
+            rw->hooks_staged = 0;
+            rw->hook_state = NULL;
+        }
+    /* Deterministic pause surface for cross-process crash tests (once
+       per chain: the same point the per-shard pass offered, scoped to
+       this chain's cleared windows). */
+    durability_test_pause(chain->db->data_dir, "bulk-window-cleared");
     if (unlink_rc != 0) errno = unlink_errno ? unlink_errno : EIO;
     return unlink_rc;
+}
+
+static void bulk_commit_chain_init(BulkCommitChain *chain, SlotcaskDb *db,
+                                   int kf_shard_id) {
+    memset(chain, 0, sizeof(*chain));
+    chain->db = db;
+    chain->kf_shard_id = kf_shard_id;
+}
+
+static void bulk_commit_chain_add(BulkCommitChain *chain,
+                                  SlotcaskBulkRequest *req,
+                                  SlotcaskBulkShardInput *in,
+                                  ReqShard *rs,
+                                  BulkGateWaiter *waiter) {
+    assert(chain && req && in && rs);
+    assert(chain->nmembers < BULK_MERGE_MAX_JOINERS + 1);
+    assert(in->kf_shard_id == chain->kf_shard_id);
+    assert(chain->nmembers == 0 ||
+           in->kind == chain->members[0].in->kind);
+    if (chain->nmembers == 0)
+        snprintf(chain->kf_dir, sizeof(chain->kf_dir), "%s", req->kf_dir);
+    chain->members[chain->nmembers++] =
+        (BulkChainMember){ .req = req, .in = in, .rs = rs,
+                           .waiter = waiter };
+}
+
+/* Per-member outcome fold (the pipeline's former pre-release block):
+   retained windows own the terminal state (degraded flag, rc -2);
+   hard-failed members report rc -1 plus their first step errno; clean
+   members rc 0. Writes in->rc / in->error_no, then runs that member's
+   own terminal release — exactly once, under the chain's single gate
+   hold, before any waiter is signalled. */
+static void bulk_commit_chain_fold_member(BulkChainMember *mem) {
+    ReqShard *rs = mem->rs;
+    rs->retained = 0;
+    for (size_t i = 0; i < rs->nwindows; i++)
+        rs->retained |= rs->windows[i].published && !rs->windows[i].cleared;
+    if (rs->retained) {
+        int *out = rs->kind == BULK_MUTATION_UPSERT
+                 ? rs->opts.upsert.out_durability_degraded
+                 : rs->opts.delete_.out_durability_degraded;
+        if (out) *out = 1;
+        mem->in->rc = -2;
+    } else if (rs->step_failed) {
+        mem->in->rc = -1;
+        if (!mem->in->error_no) mem->in->error_no = rs->step_errno;
+    }
+    slotcask_bulk_shard_release(mem->req, rs->kf_shard_id);
+}
+
+/* One owner-preserving commit chain over every member's windows of one
+   kf shard, under the committer's single writer-gate hold:
+   P (merged) → publish per member → ONE M dir fsync → per-member
+   published seam → finalize per member → merged I/K/A/T/clear →
+   per-member fold + terminal release. Every step runs even after an
+   earlier failure; the per-member and per-window predicates make
+   ineligible work no-ops (the same rule the B1 pipeline applied via its
+   phase joins). Returns 0 only when every member folded clean; the
+   per-member outcomes are read from each member's in->rc. */
+static int bulk_commit_chain_run(BulkCommitChain *chain) {
+#ifdef TEST_BUILD
+    __atomic_add_fetch(&g_shard_test_bulk_chains, 1, __ATOMIC_RELAXED);
+#endif
+    int rc = 0;
+
+    /* 1. P flush for all members; a failure marks only the affected
+          (contributing) member's records -1. */
+    if (bulk_commit_chain_flush_payloads(chain) != 0) rc = -1;
+    for (size_t m = 0; m < chain->nmembers; m++) {
+        BulkChainMember *mem = &chain->members[m];
+        if (mem->rs->stage_failed || mem->rs->payload_failed)
+            for (size_t i = 0; i < mem->in->nrecs; i++)
+                if (mem->in->recs[i].status == 0)
+                    mem->in->recs[i].status = -1;
+    }
+
+    /* 2. Publish each member's windows, then one M directory fsync for
+          the chain. */
+    for (size_t m = 0; m < chain->nmembers; m++) {
+        BulkChainMember *mem = &chain->members[m];
+        if (mem->rs->stage_failed || mem->rs->payload_failed) continue;
+        if (slotcask_bulk_publish_shard(mem->req,
+                                        chain->kf_shard_id) != 0) {
+            mem->rs->step_failed = 1;
+            if (!mem->rs->step_errno)
+                mem->rs->step_errno = errno ? errno : EIO;
+        }
+    }
+    if (bulk_commit_chain_flush_marker_dir(chain) != 0) rc = -1;
+
+    /* Per-member published seam: this member's markers are published and
+       dir-durable; its finalize has not run. Same surface the B1
+       pipeline offered, per member. */
+    for (size_t m = 0; m < chain->nmembers; m++) {
+        BulkChainMember *mem = &chain->members[m];
+        ReqShard *rs = mem->rs;
+        int any_pub = 0;
+        for (size_t i = 0; i < rs->nwindows; i++)
+            any_pub |= rs->windows[i].published;
+        if (any_pub && !rs->marker_dir_failed) {
+            char pause_phase[64];
+            snprintf(pause_phase, sizeof(pause_phase),
+                     "shard-published-%03x", (unsigned)chain->kf_shard_id);
+            SHARD_TEST_PHASE_PAUSE(SHARD_TEST_PHASE_SHARD_PUBLISHED);
+            durability_test_pause(chain->db->data_dir, pause_phase);
+        }
+    }
+
+    /* 3. Finalize each member's published windows with that member's
+          transaction and shard (its idempotent forward retry runs
+          inside). */
+    for (size_t m = 0; m < chain->nmembers; m++) {
+        BulkChainMember *mem = &chain->members[m];
+        if (slotcask_bulk_finalize_shard(mem->req,
+                                         chain->kf_shard_id) != 0) {
+            mem->rs->step_failed = 1;
+            if (!mem->rs->step_errno)
+                mem->rs->step_errno = errno ? errno : EIO;
+        }
+    }
+
+    /* 4. One chain K/index/A/T/clear flush over aggregate temporary
+          touch/location sets; each window keeps its own marker path and
+          hook state throughout. */
+    if (bulk_commit_chain_flush_commit(chain) != 0) rc = -1;
+
+    /* 5. Fold each member's outcome independently and release every
+          member before the writer gate is unlocked (the pipeline
+          signals waiters only after this returns). */
+    for (size_t m = 0; m < chain->nmembers; m++)
+        bulk_commit_chain_fold_member(&chain->members[m]);
+    return rc;
+}
+
+static void bulk_commit_chain_destroy(BulkCommitChain *chain) {
+    if (!chain) return;
+    memset(chain, 0, sizeof(*chain));
+}
+
+enum { BGW_WAITING = 0, BGW_ADMITTED = 1 };
+
+struct BulkGateWaiter {
+    SlotcaskBulkRequest    *req;
+    SlotcaskBulkShardInput *in;
+    pthread_mutex_t         mu;
+    pthread_cond_t          cv;
+    int                     state;     /* WAITING or ADMITTED */
+    int                     in_queue;
+    int                     done;
+};
+
+static int bulk_gate_waiter_push(SlotcaskDb *db, int shard,
+                                 BulkGateWaiter *w) {
+    BulkGateWaiterQ *q = &db->writer_gate_waiters[shard];
+    pthread_mutex_lock(&q->mu);
+    if (q->n >= BULK_MERGE_MAX_JOINERS + 1) {
+        w->in_queue = 0;
+        pthread_mutex_unlock(&q->mu);
+        return 0;
+    }
+    q->slot[q->n++] = w;
+    w->in_queue = 1;
+    pthread_mutex_unlock(&q->mu);
+    return 1;
+}
+
+static void bulk_gate_waiter_unpush(SlotcaskDb *db, int shard,
+                                    BulkGateWaiter *w) {
+    BulkGateWaiterQ *q = &db->writer_gate_waiters[shard];
+    pthread_mutex_lock(&q->mu);
+    if (w->in_queue) {
+        for (size_t i = 0; i < q->n; i++) {
+            if (q->slot[i] != w) continue;
+            memmove(&q->slot[i], &q->slot[i + 1],
+                    (q->n - i - 1) * sizeof(q->slot[0]));
+            q->n--;
+            break;
+        }
+        w->in_queue = 0;
+    }
+    pthread_mutex_unlock(&q->mu);
+}
+
+/* Admit up to `cap` queued waiters whose input targets `shard` with
+   input kind `in_kind` (SLOTCASK_BULK_INPUT_*). FIFO order preserved;
+   retained nodes compacted by forward copying. Runs under the caller's
+   writer-gate hold; the queue mutex is taken inside it, never the
+   reverse. `in_kind` is intentionally the SlotcaskBulkShardInput enum,
+   NOT BulkMutationKind — the two enums' values differ. */
+static size_t bulk_gate_waiter_take_matching(
+        SlotcaskDb *db, int shard, int in_kind,
+        BulkGateWaiter **out, size_t cap) {
+    BulkGateWaiterQ *q = &db->writer_gate_waiters[shard];
+    size_t taken = 0, kept = 0;
+    pthread_mutex_lock(&q->mu);
+    for (size_t i = 0; i < q->n; i++) {
+        BulkGateWaiter *w = q->slot[i];
+        if (taken < cap && w->in && w->in->kf_shard_id == shard &&
+            (int)w->in->kind == in_kind) {
+            pthread_mutex_lock(&w->mu);
+            w->state = BGW_ADMITTED;
+            w->in_queue = 0;
+            pthread_mutex_unlock(&w->mu);
+            out[taken++] = w;
+        } else {
+            q->slot[kept++] = w;
+        }
+    }
+    q->n = kept;
+    pthread_mutex_unlock(&q->mu);
+    return taken;
 }
 
 /* Order input pointers by kf_shard_id so the task set matches
@@ -7433,7 +7796,50 @@ static void slotcask_bulk_shard_pipeline(SlotcaskBulkRequest *req,
     int s = in->kf_shard_id;
     ReqShard *rs = &req->shards[s];
 
+    /* B3b: register as a chain candidate BEFORE taking the gate, so the
+       current holder can admit this request at its take seam. push
+       precedes writer_gate_lock, so a waiter parked at the GATE_WAIT
+       test pause is already queued — the tests' barrier. */
+    BulkGateWaiter w;
+    memset(&w, 0, sizeof(w));
+    w.req = req;
+    w.in = in;
+    w.state = BGW_WAITING;
+    pthread_mutex_init(&w.mu, NULL);
+    pthread_cond_init(&w.cv, NULL);
+    int queued = bulk_gate_waiter_push(db, s, &w);
+
     writer_gate_lock(db, s);
+
+    if (queued) {
+        pthread_mutex_lock(&w.mu);
+        int admitted = w.state == BGW_ADMITTED;
+        int done = w.done;
+        while (admitted && !done) {
+            /* Unreachable while the committer signals before its gate
+               unlock, but the persistent done flag makes the wakeup
+               lossless if scheduling ever interleaves differently. */
+            pthread_cond_wait(&w.cv, &w.mu);
+            done = w.done;
+        }
+        pthread_mutex_unlock(&w.mu);
+        if (admitted) {
+            /* The committer staged, committed, folded, and released this
+               shard under its own gate hold; only the gate is left to
+               us. Never stage again, run another chain, or touch this
+               request's state. */
+            writer_gate_unlock(db, s);
+            pthread_mutex_destroy(&w.mu);
+            pthread_cond_destroy(&w.cv);
+            return;
+        }
+        /* We hold the gate and no holder was at the take seam while we
+           waited for it (only a gate holder admits), so the node is
+           stale; retire it and run the normal path. */
+        bulk_gate_waiter_unpush(db, s, &w);
+        pthread_mutex_destroy(&w.mu);
+        pthread_cond_destroy(&w.cv);
+    }
 
     /* Stage (gate replay + folded pre-grow + staging). A stage failure
        has already marked every record -1 inside
@@ -7448,96 +7854,57 @@ static void slotcask_bulk_shard_pipeline(SlotcaskBulkRequest *req,
     }
     commit_phase_us_record(&g_bulk_stage_us_total, t0st);
 
-    /* P barrier for this shard only. Failure is a hard error for THIS
-       shard: publish is skipped for it (rs->payload_failed) and its
-       records report -1; sibling shards are untouched. */
-    if (!rs->stage_failed) {
-        if (slotcask_bulk_shard_flush_payloads(req, s) != 0) {
-            rs->payload_failed = 1;
-            rs->step_failed = 1;
-            if (!rs->step_errno) rs->step_errno = errno ? errno : EIO;
+    /* B3b take seam: park surface for the merge tests, then admit queued
+       same-kind requests, stage each once under this gate, and run ONE
+       owner-preserving chain over all members. The complete member set
+       is installed before any joiner is staged; admission already
+       happened under the queue mutex with the capacity check, so
+       chain_add cannot fail. */
+    BulkCommitChain chain;
+    bulk_commit_chain_init(&chain, db, s);
+    SHARD_TEST_PHASE_PAUSE(SHARD_TEST_PHASE_PRE_MERGE);
+    BulkGateWaiter *joiners[BULK_MERGE_MAX_JOINERS];
+    size_t njoiners = bulk_gate_waiter_take_matching(db, s, (int)in->kind,
+                                                     joiners,
+                                                     BULK_MERGE_MAX_JOINERS);
+    bulk_commit_chain_add(&chain, req, in, rs, NULL);
+    for (size_t j = 0; j < njoiners; j++) {
+        BulkGateWaiter *jd = joiners[j];
+        bulk_commit_chain_add(&chain, jd->req, jd->in,
+                              &jd->req->shards[s], jd);
+    }
+    for (size_t j = 0; j < njoiners; j++) {
+        BulkGateWaiter *jd = joiners[j];
+        uint64_t t0js = now_us();
+        if (slotcask_bulk_stage_shard(jd->req, s, jd->in->recs,
+                jd->in->nrecs,
+                jd->in->kind == SLOTCASK_BULK_INPUT_UPSERT
+                    ? &jd->in->opts.upsert : NULL,
+                jd->in->kind == SLOTCASK_BULK_INPUT_DELETE
+                    ? &jd->in->opts.delete_ : NULL) != 0) {
+            ReqShard *jrs = &jd->req->shards[s];
+            jrs->step_failed = 1;
+            if (!jrs->step_errno) jrs->step_errno = errno ? errno : EIO;
         }
+        commit_phase_us_record(&g_bulk_stage_us_total, t0js);
     }
-    if (rs->stage_failed || rs->payload_failed)
-        for (size_t i = 0; i < in->nrecs; i++)
-            if (in->recs[i].status == 0) in->recs[i].status = -1;
+    (void)bulk_commit_chain_run(&chain);
+    bulk_commit_chain_destroy(&chain);
 
-    /* Publish windows (skipped when stage/P failed), then this shard's
-       M dir fsync. */
-    if (!rs->stage_failed && !rs->payload_failed) {
-        if (slotcask_bulk_publish_shard(req, s) != 0) {
-            rs->step_failed = 1;
-            if (!rs->step_errno) rs->step_errno = errno ? errno : EIO;
-        }
+    /* Signal each admitted waiter only after every member's fold and
+       release: gate held → waiter mu → done=1 → broadcast → unlock the
+       waiter mutex, and only then the writer gate. The waiter checks
+       state and done under mu; the persistent done flag prevents a lost
+       wakeup. The committer never destroys another thread's waiter
+       mutex or condition variable. */
+    for (size_t j = 0; j < njoiners; j++) {
+        BulkGateWaiter *jd = joiners[j];
+        pthread_mutex_lock(&jd->mu);
+        jd->done = 1;
+        pthread_cond_broadcast(&jd->cv);
+        pthread_mutex_unlock(&jd->mu);
     }
-    if (slotcask_bulk_shard_flush_marker_dir(req, s) != 0) {
-        rs->marker_dir_failed = 1;
-        rs->step_failed = 1;
-        if (!rs->step_errno) rs->step_errno = errno ? errno : EIO;
-    }
-
-    /* Per-shard published seam: this shard's markers are published and
-       dir-durable; its finalize has not run. Supersedes the
-       request-wide REQ_PUBLISHED / "req-published" seam. */
-    {
-        int any_pub = 0;
-        for (size_t i = 0; i < rs->nwindows; i++)
-            any_pub |= rs->windows[i].published;
-        if (any_pub && !rs->marker_dir_failed) {
-            char pause_phase[64];
-            snprintf(pause_phase, sizeof(pause_phase),
-                     "shard-published-%03x", (unsigned)s);
-            SHARD_TEST_PHASE_PAUSE(SHARD_TEST_PHASE_SHARD_PUBLISHED);
-            durability_test_pause(req->db->data_dir, pause_phase);
-        }
-    }
-
-    /* Finalize (A/I/K/T apply per window, syncs deferred into the
-       commit step; the idempotent forward retry of a failed window
-       runs inside). */
-    if (slotcask_bulk_finalize_shard(req, s) != 0) {
-        rs->step_failed = 1;
-        if (!rs->step_errno) rs->step_errno = errno ? errno : EIO;
-    }
-
-    /* Commit barriers + clear for this shard. */
-    if (slotcask_bulk_shard_flush_commit(req, s) != 0) {
-        rs->step_failed = 1;
-        if (!rs->step_errno) rs->step_errno = errno ? errno : EIO;
-    }
-
-    /* Per-shard outcome fold, BEFORE the gate release: retained windows
-       own the terminal state (degraded flag, rc -2); hard-failed shards
-       report rc -1; clean shards rc 0. */
-    rs->retained = 0;
-    for (size_t i = 0; i < rs->nwindows; i++)
-        rs->retained |= rs->windows[i].published && !rs->windows[i].cleared;
-    if (rs->retained) {
-        int *out = rs->kind == BULK_MUTATION_UPSERT
-                 ? rs->opts.upsert.out_durability_degraded
-                 : rs->opts.delete_.out_durability_degraded;
-        if (out) *out = 1;
-        in->rc = -2;
-    } else if (rs->step_failed) {
-        in->rc = -1;
-    }
-
-    /* Snapshot the fold before per-shard release invalidates/frees its
-       owned state. */
-    int retained = rs->retained;
-    int step_failed = rs->step_failed;
-    int step_errno = rs->step_errno;
-
-    /* Terminal hooks + per-shard frees UNDER the gate (G4), then
-       release: the next gate holder can never observe this request's
-       hook state or staged resources. */
-    slotcask_bulk_shard_release(req, s);
     writer_gate_unlock(db, s);
-
-    if (retained) req->any_pending = 1;
-    if (step_failed || retained) req->any_failed = 1;
-    if (step_failed && !req->saved_errno && step_errno)
-        req->saved_errno = step_errno;
 }
 
 typedef struct {
@@ -7571,6 +7938,7 @@ int slotcask_bulk_request_execute(SlotcaskDb *db,
             return -1;
         }
         inputs[i].rc = 0;
+        inputs[i].error_no = 0;
         int *degraded = inputs[i].kind == SLOTCASK_BULK_INPUT_UPSERT
                       ? inputs[i].opts.upsert.out_durability_degraded
                       : inputs[i].opts.delete_.out_durability_degraded;
@@ -7627,16 +7995,20 @@ int slotcask_bulk_request_execute(SlotcaskDb *db,
     free(tasks);
     free(order);
 
-    /* Snapshot the aggregate before request_end frees req. */
-    int any_pending = req->any_pending;
-    int any_failed = req->any_failed;
-    int saved_errno = req->saved_errno;
-    slotcask_bulk_request_end(req);
-    if (any_pending) { errno = EINPROGRESS; return -1; }
-    if (any_failed) {
-        errno = saved_errno ? saved_errno : EIO;
-        return -1;
+    /* B3b: per-shard outcomes live in inputs[]; the request object no
+       longer aggregates across tasks. */
+    int pending = 0, failed = 0, first_errno = 0;
+    for (size_t i = 0; i < ninputs; i++) {
+        if (inputs[i].rc == -2) pending = 1;
+        else if (inputs[i].rc == -1) {
+            failed = 1;
+            if (!first_errno && inputs[i].error_no)
+                first_errno = inputs[i].error_no;
+        }
     }
+    slotcask_bulk_request_end(req);
+    if (pending) { errno = EINPROGRESS; return -1; }
+    if (failed) { errno = first_errno ? first_errno : EIO; return -1; }
     return 0;
 }
 
