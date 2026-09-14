@@ -250,6 +250,29 @@ release       : terminal hooks (commit_done / release_window) and frees,
                 then the writer gate
 ```
 
+**B3b — commit-chain merge.** Before taking the gate, a bulk pipeline
+task registers itself in its shard's bounded admission queue (5 slots).
+The current gate holder — after its own stage, before its commit work —
+admits up to four already-queued same-kind requests targeting the same
+shard, stages each once under the gate it already holds, and runs ONE
+owner-preserving commit chain over all members' windows: the P payload
+sync, the M directory fsync, and the I/K/A/T/clear commit barriers are
+each performed once for the whole chain over merged (sorted, deduped)
+touch/location/slot sets, while stage, publish, finalize, fold, and
+terminal cleanup stay per member through each member's own
+`SlotcaskBulkRequest` / `BulkMutationTxn` / `ReqShard` (no window ever
+moves between requests; marker identity keeps each member's own request
+nonce). Uncontended requests are unchanged — a solo request is a
+one-member chain performing exactly the passes listed above. Member
+cleanup is per-owner: each member's fold writes its own
+`SlotcaskBulkShardInput.rc`/`error_no` and its own release path runs
+under the chain's single gate hold before any admitted waiter is
+signalled; an admitted waiter's task returns without staging. Mixed
+upsert/delete requests and queue-full overflow serialize normally
+(own chain each). Failure scoping below is unchanged and applies per
+member; a merged-barrier failure (e.g. the chain's P or K sync) marks
+exactly the contributing members.
+
 Failure stays shard- and window-scoped: a stage or payload-flush failure is
 a hard error for that shard only (records report -1, no markers); one
 window's publish failure doesn't stop its siblings; anything failing after a

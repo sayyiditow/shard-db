@@ -46,7 +46,7 @@ In that envelope, a general-purpose SQL engine carries overhead you don't need: 
 | Joins | **Yes** | Yes | No | Yes |
 | Aggregates + group by | **Yes** | Yes | Limited | Yes |
 | Cursor pagination (O(1) deep pages) | **Yes** | Requires keyset | No | Requires keyset |
-| ACID transactions | Per-record | **Yes** | Partial | **Yes** |
+| ACID transactions | Per-record / per-window | **Yes** | Partial | **Yes** |
 | Distributed | No | Extensions | **Cluster** | No |
 | Primary use case | Server DB, typed records, fast text search | General-purpose RDBMS | Cache, message broker | Embedded app storage |
 
@@ -54,7 +54,7 @@ In that envelope, a general-purpose SQL engine carries overhead you don't need: 
 
 | Area | Highlights |
 |---|---|
-| **Throughput** | ~5M / ~8.4M K/V ops/sec single-thread / 5-conn parallel bulk insert (CSV, 10M records). 5.7M / 1.9M / 1.4M / 822k op/s bulk EXISTS / DELETE / GET / UPDATE (10K keys per TCP request). Sub-5ms indexed find / count / aggregate at 1M rows. |
+| **Throughput** | 2.09M / 3.17M rows/sec single / 5-conn parallel bulk insert (CSV, 10M records). 5.0M / 63k / 1.7M / 26k ops/sec bulk EXISTS / DELETE / GET / UPDATE (10K keys per TCP request). Sub-ms indexed find / count / aggregate at 1M rows. |
 | **Indexes** | B+ tree (eq, range, prefix, all 38 operators), bitmap (auto-promote for bool + enum, popcount fast paths), trigram (substring search on varchar; planner auto-picks btree-leaf for short patterns, trigram for long). |
 | **Operators (38)** | eq / neq / range / between, like / contains / starts / ends, in / not_in, regex, exists, len_*, ilike / icontains, eq_field — all use the index when one is available. |
 | **Planner** | AND-intersection across 2+ indexed leaves without per-record fetch for `count`. Lock-free OR-union via KeySet. Rarest-first selection for trigram intersect. |
@@ -62,7 +62,7 @@ In that envelope, a general-purpose SQL engine carries overhead you don't need: 
 | **Storage** | Per-shard btree layout, VARIABLE-format segments (2026.06.4+) — writes route by hash, reads fan out across `splits/4` shards in parallel; k-way streaming merge for ordered queries. Trailing-zero field trimming shrinks varchar records by 50–90% on typical workloads; `compact` command rewrites existing segments. |
 | **Multi-tenancy** | `dir` parameter + tokens scoped global / per-tenant / per-object × `r` / `rw` / `rwx` permissions. |
 | **Transport** | Native TLS 1.3 (single binary, single port, OpenSSL-backed) or reverse-proxy termination — both first-class. |
-| **Reliability** | Crash-safe (atomic flag-flip writes, msync on shutdown, recovery sweep at startup). External-merge-sort index build — bounded memory at any scale. |
+| **Reliability** | Crash-safe durable commits: fsynced per-record commit, or marker-guarded per-window batch commits with forward-replay-only crash recovery — a crash at any point converges to exactly the windows whose markers were durable. External-merge-sort index build — bounded memory at any scale. |
 | **Tools** | `shard-cli` ncurses TUI over the same TCP+TLS wire (separate binary, no daemon source linked). |
 
 Detailed feature reference: [docs/index.md](docs/index.md).
@@ -131,44 +131,40 @@ Prebuilt binaries for Linux x64/arm64 and macOS Apple Silicon (Node ≥ 18, Bun 
 
 The daemon compares `$DB_ROOT/.version` against its compiled-in version and runs this release's full index rebuild in-process on upgrade. The standalone `./migrate` binary is removed as of 2026.08.1. The minimum supported source release is 2026.07.3; that floor is recorded for operators but is informational and not enforced in this release because earlier releases did not write `.version`. `./shard-db reindex` remains available for on-demand use. For the 2026.05.1 reissue specifically, see [the 2026.05.1 changelog entry](docs/reference/changelog.md#202605132026-05-02-reissued) for the full list of breaking changes (read response shapes are bare values now: `get`, `exists`, `count`, `size` no longer wrap in JSON; `get-multi` returns a dict; `find`/`fetch` gain `format:"dict"`).
 
-Single-key writes are atomic, durable, and isolated by the per-object lock, but shard-db has no multi-statement or cross-object transaction scope; its ACID properties are therefore per-record/per-object.
+## ACID & durability
+
+Commits are durable by default. The guarantees are per-record and per-commit-window — shard-db has no multi-statement or cross-object transaction scope.
+
+- **Atomicity.** A single-record write commits atomically. A bulk request commits atomically per commit-window: the window's checksummed commit-intent marker is fsynced into the keyfile directory *before* any secondary-index or keyfile apply, so a window is either fully applied by forward replay or not visible at all. There is no rollback path — recovery replays forward, never back.
+- **Consistency.** The typed schema is enforced on every write; CAS predicates (`if`, `if_not_exists`) compare-and-swap at commit time. Indexed writes persist their durable intent before the index diff applies; an apply failure writes an abort sidecar and restores the old value — OLD stays visible, never a half-updated record.
+- **Isolation.** One writer per keyfile shard at a time (per-shard writer gates; concurrent same-shard bulk requests are merged into one commit chain). Readers never block and never observe a partial record — a record flips from OLD to NEW atomically. Schema mutations take an exclusive object lock.
+- **Durability.** A single-record commit is fsync-durable before the ACK (~19.5 ms p50 end-to-end measured); bulk requests batch the per-window syncs (coalesced across concurrent requests) before acknowledging. After a crash — even SIGKILL or power loss — startup forward-replays exactly the windows whose markers were durable; retained markers are replayed by the next writer's gate entry and cleared only after their bytes are directory-durable.
 
 ## Performance snapshot
 
-10M K/V records · 16-byte key, varchar(100) value · AMD Ryzen 7 7840U · NVMe ext4 (TCP-end-to-end measurements):
+10M K/V records · 16-byte key, varchar(100) value · AMD Ryzen 7 7840U (8C/16T) · NVMe ext4 · 2026-09-14 engine (TCP-end-to-end measurements):
 
 | Workload | Result |
 |---|---|
-| Bulk insert (CSV, 10M, 1 conn) | **4.60 M/sec** |
-| Bulk insert (CSV, 10M, 5 conns × 2M) | **8.97 M/sec** |
-| Bulk insert (CSV, 1M invoice schema, 5 conns × 200k, no idx) | **2.48 M/sec** |
-| Bulk insert (CSV, 1M invoice schema, 5 conns × 200k, 14 idx) | **435 k/sec** |
-| Bulk EXISTS (10K keys per request) | **4.10 M/sec** |
-| Bulk DELETE (10K keys per request) | **1.76 M/sec** |
-| Bulk GET (10K keys per request) | **1.49 M/sec** |
-| Bulk UPDATE (10K keys per request) | **989 k/sec** |
-| Indexed `find` (1M users, limit 10) | **<1 ms** |
-| Indexed `count` / `aggregate` (warm cache) | **<1–296 ms** |
-| Single-conn GET ×10k (req-resp, 1 conn) | **33 k ops/sec** (28µs/op) |
-| Disk footprint (10M K/V records) | 2.2 GB |
+| Bulk insert (CSV, 10M, 1 conn) | **2.09 M/sec** |
+| Bulk insert (CSV, 10M, 5 conns × 2M) | **3.17 M/sec** |
+| Bulk insert (JSON, 10M, 5 conns × 2M) | **2.93 M/sec** |
+| Bulk EXISTS (10K keys per request) | **5.03 M ops/sec** |
+| Bulk GET (10K keys per request) | **1.68 M ops/sec** |
+| Bulk DELETE (10K keys per request) | **63 k ops/sec** |
+| Bulk UPDATE (10K keys per request) | **26 k ops/sec** |
+| Single-conn GET ×10k (req-resp, 1 conn) | **29 k ops/sec** (30µs/op) |
+| Parallel GET (5 conns × 10k) | **135 k ops/sec** |
+| Indexed `eq` / composite find (1M-row wide object, limit 10) | **0.17–0.5 ms** |
+| Indexed `count` (1M rows) | **0.18 ms** |
+| Durable single-record commit (full ACID, p50) | **19.5 ms** |
+| Disk footprint (10M K/V records) | 1.8 GB |
 
-### 25M cold-bench highlights (2026.05.4)
-
-Same hardware, post `sync && drop_caches` between runs. Query patterns that exercise the new fast paths landed this release:
-
-| Cold query (25M users) | Result |
-|---|---|
-| `sum X` single-spec on indexed int/long/short/numeric (each) | **~200 ms** (~10× vs 2026.05.3) |
-| `group by username, count limit 10` (high-card varchar idx) | **3.6 ms** (~1570× vs 2026.05.3) |
-| `group by email, sum(balance) limit 10` (varchar + indexed numeric agg) | **4.1 ms** (~1800× vs 2026.05.3) |
-| First-cold full-scan `count starts bio 'Software'` (non-idx varchar) | ~800 ms (~1.6× vs 2026.05.3) |
-| `agg WHERE active=false (count+avg)` | 1.1 s (~2.5× vs 2026.05.3) |
-
-The 1500-1800× wins on the group_by limit shape come from the new streaming k-way merge — earlier paths built a 25M-entry hash table just to truncate to `limit=10`. The 10× wins on single-spec sum come from a tight leaf walker that bypasses `BtRangeIter`'s per-entry overhead plus `MADV_SEQUENTIAL` on the btree mmap during the walk (the per-btree default `MADV_RANDOM` is right for point lookups but suppresses readahead on sequential scans).
+Note the trade the numbers make explicit: absolute bulk-insert throughput is lower than pre-2026.09 releases because every commit window now pays real durability (fsynced markers, segment and keyfile syncs) — single-record writes are durable per commit (~19.5 ms), and batched inserts amortize it per window.
 
 Reads are measured strict request-response (no pipelining); pipelining client-side will push throughput higher. The single-conn ceiling is dominated by TCP+JSON framing (~30 µs/op) — bulk paths bypass that and are the right tool for high-throughput multi-key workloads. Bench harness: [`src/bench/`](src/bench/) (C-level timing).
 
-Full breakdown across 5 workloads + tuning notes: [docs/operations/benchmarks.md](docs/operations/benchmarks.md).
+Full breakdown across 3 workloads + splits/tuning notes: [docs/operations/benchmarks.md](docs/operations/benchmarks.md).
 
 ## Documentation
 
