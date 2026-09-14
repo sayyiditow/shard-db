@@ -258,6 +258,15 @@ static void rf_fill_hc_opts(SlotcaskBulkOpts *o, RfHookCtl *c) {
     o->bulk_hook_ctx = c;
 }
 
+/* Check-only value_compute (accepts every OLD, never touches
+ * rec->value) — the same OLD-dependent shape query_bulk's bulk-update
+ * wiring uses, marking the input chain-inadmissible for scenario 19. */
+static int rf_accept_value_compute(const SlotcaskOldRecord *old,
+                                   SlotcaskBulkRec *rec) {
+    (void)old; (void)rec;
+    return 0;
+}
+
 /* Build one input per touched shard (records bucketed by their real kf
  * shard, ascending) and run one deferred request. */
 static int rf_run_request(RfDb *w, RfBatch *b, SlotcaskBulkOpts *opts) {
@@ -327,7 +336,7 @@ static void *rf_req_thread(void *raw) {
     SlotcaskBulkOpts opts;
     rf_fill_opts(&opts, NULL);
     a->rc = rf_run_request(a->w, a->b, &opts);
-    a->done = 1;
+    __atomic_store_n(&a->done, 1, __ATOMIC_SEQ_CST);
     return NULL;
 }
 
@@ -344,7 +353,7 @@ struct RfTwoShardArgs {
 static void *rf_two_shard_req_thread(void *raw) {
     struct RfTwoShardArgs *a = raw;
     a->rc = slotcask_bulk_request_execute(&a->w->db, a->ins, 2);
-    a->done = 1;
+    __atomic_store_n(&a->done, 1, __ATOMIC_SEQ_CST);
     return NULL;
 }
 
@@ -361,7 +370,7 @@ static void *rf_one_shard_req_thread(void *raw) {
     struct RfOneShardArgs *a = raw;
     a->rc = slotcask_bulk_request_execute(&a->w->db, a->in, 1);
     a->err = errno;
-    a->done = 1;
+    __atomic_store_n(&a->done, 1, __ATOMIC_SEQ_CST);
     return NULL;
 }
 
@@ -419,7 +428,7 @@ static void *rf_writer_thread(void *raw) {
     } else {
         a->rc = slotcask_pregrow_kf(&a->w->db, 64);
     }
-    a->done = 1;
+    __atomic_store_n(&a->done, 1, __ATOMIC_SEQ_CST);
     return NULL;
 }
 
@@ -455,7 +464,7 @@ static void *rf_nested_req_task(void *raw) {
     SlotcaskBulkOpts opts;
     rf_fill_opts(&opts, NULL);
     n->rc = rf_run_request(n->w, n->b, &opts);
-    n->done = 1;
+    __atomic_store_n(&n->done, 1, __ATOMIC_SEQ_CST);
     return NULL;
 }
 
@@ -1619,6 +1628,71 @@ static int test_request_flush_batching_run(void) {
         ASSERT_TRUE(rf_record_visible(&w, keysb[0], "v75-0000"),
                     "18 B visible after replay");
         ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "18 markers cleared");
+    }
+
+    /* ── Scenario 19 (B3b rev 3): OLD-dependent inputs are never
+     * admitted into a chain ── A (committer) parks at PRE_MERGE; B
+     * carries a value_compute (the bulk-update shape: its payload and
+     * skip/update decision depend on OLD, which a merged chain
+     * evaluates before the committer's apply). B must NOT be admitted:
+     * chains == 2, each request commits on its own. Red before the
+     * rev-3 fix: B was admitted (chains == 1) and both writers applied
+     * against the same pre-A OLD — the lost update the coverage run
+     * caught in test-bulk-update-json. */
+    {
+        static RfBatch ba, bb;
+        static char keysa[16][24], valsa[16][24];
+        static SlotcaskBulkRec recsa[16];
+        static SlotcaskBulkRec perma[16];
+        static char keysb[16][24], valsb[16][24];
+        static SlotcaskBulkRec recsb[16];
+        static SlotcaskBulkRec permb[16];
+        ba.keys = keysa; ba.vals = valsa; ba.recs = recsa; ba.perm = perma;
+        bb.keys = keysb; bb.vals = valsb; bb.recs = recsb; bb.perm = permb;
+        rf_batch_fill(&ba, 76, 16, "v76", 0);
+        rf_batch_fill(&bb, 77, 16, "v77", 0);
+
+        shard_test_ctl_reset();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_PRE_MERGE;
+        g_shard_test_pause_occurrence = 1;
+
+        static SlotcaskBulkShardInput ina, inb;
+        SlotcaskBulkOpts oa, ob;
+        rf_fill_opts(&oa, NULL);
+        rf_fill_opts(&ob, NULL);
+        oa.value_compute = rf_accept_value_compute;   /* OLD-dependent */
+        ob.value_compute = rf_accept_value_compute;
+        memset(&ina, 0, sizeof(ina));
+        ina.kf_shard_id = 0; ina.recs = recsa; ina.nrecs = ba.n;
+        ina.kind = SLOTCASK_BULK_INPUT_UPSERT; ina.opts.upsert = oa;
+        memset(&inb, 0, sizeof(inb));
+        inb.kf_shard_id = 0; inb.recs = recsb; inb.nrecs = bb.n;
+        inb.kind = SLOTCASK_BULK_INPUT_UPSERT; inb.opts.upsert = ob;
+
+        static struct RfOneShardArgs ta, tb;
+        ta.w = &w; ta.in = &ina; ta.done = 0; ta.rc = 0; ta.err = 0;
+        tb.w = &w; tb.in = &inb; tb.done = 0; tb.rc = 0; tb.err = 0;
+        pthread_t tha, thb;
+        ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_one_shard_req_thread,
+                                     &ta), 0, "19 spawn A");
+        rf_wait_pause_hit();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_GATE_WAIT;
+        g_shard_test_pause_occurrence = 1;
+        ASSERT_EQ_INT(pthread_create(&thb, NULL, rf_one_shard_req_thread,
+                                     &tb), 0, "19 spawn B");
+        rf_wait_pause_hits_at_least(2);
+        atomic_store(&g_shard_test_pause_release, 1);
+        pthread_join(tha, NULL);
+        pthread_join(thb, NULL);
+        long chains = atomic_load(&g_shard_test_bulk_chains);
+        ASSERT_EQ_INT((int)chains, 2,
+                      "19 OLD-dependent waiter serialized (not admitted)");
+        ASSERT_EQ_INT(ta.rc, 0, "19 A rc 0");
+        ASSERT_EQ_INT(tb.rc, 0, "19 B rc 0");
+        ASSERT_TRUE(rf_record_visible(&w, keysa[0], "v76-0000") &&
+                    rf_record_visible(&w, keysb[0], "v77-0000"),
+                    "19 both requests' records visible");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "19 no markers retained");
     }
 
     rf_db_close(&w);

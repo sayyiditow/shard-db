@@ -55,8 +55,8 @@ long g_shard_test_fail_phase = -1;
 long g_shard_test_fail_occurrence;
 int  g_shard_test_fail_postlink;
 int  g_shard_test_fail_sticky;
-int  g_shard_test_pause_phase = -1;
-int  g_shard_test_pause_occurrence = 1;
+_Atomic int g_shard_test_pause_phase = -1;
+_Atomic int g_shard_test_pause_occurrence = 1;
 _Atomic int g_shard_test_pause_hits;
 _Atomic int g_shard_test_pause_release;
 _Atomic int g_shard_test_bulk_lookup_gap;
@@ -7744,12 +7744,31 @@ static void bulk_gate_waiter_unpush(SlotcaskDb *db, int shard,
     pthread_mutex_unlock(&q->mu);
 }
 
+/* B3b rev 3: chain admissibility. Only plain full-payload unindexed
+   upsert inputs may share a chain. Anything whose outcome or payload
+   depends on OLD — bulk-update value_compute (which folds criteria and
+   CAS `if` re-verification), if_not_exists / require_existing
+   conditions, indexed pre_commit diffs — and all delete-kind inputs
+   plan against pre-commit state, which a merged chain does not give
+   them (every member publishes before any member finalizes; a merged
+   pair would both evaluate conditions against the pre-A OLD — the
+   lost update CI's coverage run caught). Excluded waiters stay queued
+   and serialize on the gate exactly as pre-B3b. */
+static int bulk_input_chain_admissible(const SlotcaskBulkShardInput *in) {
+    if (in->kind != SLOTCASK_BULK_INPUT_UPSERT) return 0;
+    const SlotcaskBulkOpts *o = &in->opts.upsert;
+    return !o->if_not_exists && !o->require_existing &&
+           o->value_compute == NULL && o->pre_commit == NULL;
+}
+
 /* Admit up to `cap` queued waiters whose input targets `shard` with
-   input kind `in_kind` (SLOTCASK_BULK_INPUT_*). FIFO order preserved;
-   retained nodes compacted by forward copying. Runs under the caller's
-   writer-gate hold; the queue mutex is taken inside it, never the
-   reverse. `in_kind` is intentionally the SlotcaskBulkShardInput enum,
-   NOT BulkMutationKind — the two enums' values differ. */
+   input kind `in_kind` (SLOTCASK_BULK_INPUT_*) and is
+   chain-admissible (bulk_input_chain_admissible). FIFO order
+   preserved; retained nodes compacted by forward copying. Runs under
+   the caller's writer-gate hold; the queue mutex is taken inside it,
+   never the reverse. `in_kind` is intentionally the
+   SlotcaskBulkShardInput enum, NOT BulkMutationKind — the two enums'
+   values differ. */
 static size_t bulk_gate_waiter_take_matching(
         SlotcaskDb *db, int shard, int in_kind,
         BulkGateWaiter **out, size_t cap) {
@@ -7759,7 +7778,8 @@ static size_t bulk_gate_waiter_take_matching(
     for (size_t i = 0; i < q->n; i++) {
         BulkGateWaiter *w = q->slot[i];
         if (taken < cap && w->in && w->in->kf_shard_id == shard &&
-            (int)w->in->kind == in_kind) {
+            (int)w->in->kind == in_kind &&
+            bulk_input_chain_admissible(w->in)) {
             pthread_mutex_lock(&w->mu);
             w->state = BGW_ADMITTED;
             w->in_queue = 0;

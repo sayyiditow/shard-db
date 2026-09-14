@@ -54,8 +54,13 @@ extern int  g_shard_test_fail_sticky;      /* fail every hit >= occurrence,
                                              * (e.g. disk full) that also
                                              * defeats the coordinator's own
                                              * inline forward-replay retry. */
-extern int  g_shard_test_pause_phase;      /* -1 = disabled */
-extern int  g_shard_test_pause_occurrence; /* 1-based */
+/* _Atomic: tests re-arm these while worker threads are inside
+ * shard_test_phase_pause — plain ints are a data race TSan correctly
+ * flags (test controls, not engine state). Plain lvalue reads/writes of
+ * an _Atomic int are seq_cst atomic operations, so all existing call
+ * sites stay valid unchanged. */
+extern _Atomic int g_shard_test_pause_phase;      /* -1 = disabled */
+extern _Atomic int g_shard_test_pause_occurrence; /* 1-based */
 extern _Atomic int g_shard_test_pause_hits;
 extern _Atomic int g_shard_test_pause_release;
 /* Task B1 regression hook (docs/plans/2026-08-28-eliminate-tsan-supp.md):

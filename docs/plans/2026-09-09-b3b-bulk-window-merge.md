@@ -1,14 +1,44 @@
 # B3b — cross-request bulk commit-chain merge
 
-Date: 2026-09-09 (revision 2, 2026-09-11)  
-Status: draft for re-approval — revision 1 was halted by its own Task 0
-coupling audit (`PLAN_NOTES.md`, 2026-09-11); this revision supplies the
-complete chain-aware interface that audit demanded. Not approved or
-executable until the human approves this revision.  
+Date: 2026-09-09 (revision 3, 2026-09-14)  
+Status: revision 3 — executed on `perf/b3b-bulk-chain-merge`; this
+revision adds the chain-admissibility rule required by the coverage-run
+lost-update finding (see Revision 3 below).  
 Follows: `2026-09-09-b3a-path-epoch-syncs.md`, merged (ddcf600). B3c
 (single-record group commit) remains out of scope.
 
-## Revision 2 — what changed and why
+## Revision 3 (2026-09-14, post-merge CI finding) — chain admissibility
+
+CI's coverage run exposed a **lost update** in merged chains
+(`test-bulk-update-json`: "exactly one CAS writer updates/skips" — both
+writers reported `updated:1`). Root cause: in a merged chain every
+member **publishes** — where bulk-update criteria/CAS conditions and
+`if_not_exists`/`require_existing` are evaluated against OLD, and where
+indexed `pre_commit` diffs read OLD — **before any member finalizes**
+(applies). Writer B's conditions therefore evaluated against the pre-A
+state; pre-B3b, B's whole pipeline serialized after A's apply and saw
+A's result. Not a flake: the gcov-slowed coverage build made B queue in
+time to be admitted deterministically; the fast build passed by timing.
+
+The decision (human-approved, Option 1 — conservative): **only plain
+full-payload unindexed upsert inputs are chain-admissible.** A waiter is
+admitted only when its input is upsert-kind with `if_not_exists == 0`,
+`require_existing == 0`, `value_compute == NULL`, and `pre_commit ==
+NULL`; everything whose outcome or payload depends on OLD (bulk-update
+`value_compute`/criteria, `if_not_exists`, `require_existing`, indexed
+`pre_commit` diffs) and all delete-kind inputs stay queued and serialize
+on the gate exactly as pre-B3b. The committer always runs — solo when it
+admits nothing (its own conditions evaluate against the true chain-start
+OLD, same as pre-B3b). Zero impact on the measured workload: the K/V
+bench numbers (2.21/3.17 M rows/s) are plain full-payload unindexed
+inserts, fully merged before and after. Excluded request classes keep
+B3a's path-keyed sync coalescing. A deterministic regression test
+(scenario 19: an OLD-dependent waiter must not be admitted —
+`chains == 2`) is part of Task 1's set; red on the un-fixed chain
+(B admitted, `chains == 1`), no gcov needed — the PRE_MERGE/GATE_WAIT
+choreography forces the merge.
+
+## Revision 2 (2026-09-11) — what changed and why
 
 Revision 1 assumed the six per-shard phase helpers were mechanical
 generalizations: iterate chain members and call the existing helpers. The
@@ -929,12 +959,29 @@ static void bulk_gate_waiter_unpush(SlotcaskDb *db, int shard,
     pthread_mutex_unlock(&q->mu);
 }
 
+/* B3b rev 3: chain admissibility. Only plain full-payload unindexed
+   upsert inputs may share a chain. Anything whose outcome or payload
+   depends on OLD — bulk-update value_compute (which folds criteria and
+   CAS `if` re-verification), if_not_exists / require_existing
+   conditions, indexed pre_commit diffs — and all delete-kind inputs
+   plan against pre-commit state, which a merged chain does not give
+   them (every member publishes before any member finalizes). Excluded
+   waiters stay queued and serialize on the gate exactly as pre-B3b. */
+static int bulk_input_chain_admissible(const SlotcaskBulkShardInput *in) {
+    if (in->kind != SLOTCASK_BULK_INPUT_UPSERT) return 0;
+    const SlotcaskBulkOpts *o = &in->opts.upsert;
+    return !o->if_not_exists && !o->require_existing &&
+           o->value_compute == NULL && o->pre_commit == NULL;
+}
+
 /* Admit up to `cap` queued waiters whose input targets `shard` with
-   input kind `in_kind` (SLOTCASK_BULK_INPUT_*). FIFO order preserved;
-   retained nodes compacted by forward copying. Runs under the caller's
-   writer-gate hold; the queue mutex is taken inside it, never the
-   reverse. `in_kind` is intentionally the SlotcaskBulkShardInput enum,
-   NOT BulkMutationKind — the two enums' values differ. */
+   input kind `in_kind` (SLOTCASK_BULK_INPUT_*) and is
+   chain-admissible (bulk_input_chain_admissible). FIFO order
+   preserved; retained nodes compacted by forward copying. Runs under
+   the caller's writer-gate hold; the queue mutex is taken inside it,
+   never the reverse. `in_kind` is intentionally the
+   SlotcaskBulkShardInput enum, NOT BulkMutationKind — the two enums'
+   values differ. */
 static size_t bulk_gate_waiter_take_matching(
         SlotcaskDb *db, int shard, int in_kind,
         BulkGateWaiter **out, size_t cap) {
@@ -944,7 +991,8 @@ static size_t bulk_gate_waiter_take_matching(
     for (size_t i = 0; i < q->n; i++) {
         BulkGateWaiter *w = q->slot[i];
         if (taken < cap && w->in && w->in->kf_shard_id == shard &&
-            (int)w->in->kind == in_kind) {
+            (int)w->in->kind == in_kind &&
+            bulk_input_chain_admissible(w->in)) {
             pthread_mutex_lock(&w->mu);
             w->state = BGW_ADMITTED;
             w->in_queue = 0;
@@ -1253,7 +1301,11 @@ The implementation must prove and test all of these:
   gate (G1 counter assertion in scenarios 13–15; the chain runs entirely
   under the committer's single hold).
 - Same-kind requests only; mixed upsert/delete requests serialize
-  normally. (Scenario 14.)
+  normally. (Scenario 14.) Rev 3: only plain full-payload unindexed
+  upserts are admitted at all — condition- or OLD-dependent inputs
+  (bulk-update value_compute/criteria, `if_not_exists`,
+  `require_existing`, indexed pre_commit) and deletes serialize exactly
+  as pre-B3b. (Scenario 19.)
 - Empty queue is behaviorally equivalent to B2 (solo-chain equivalence
   argument in D1; the existing `test-request-flush-batching` scenarios
   1–12 must stay green unchanged).
