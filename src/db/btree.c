@@ -1914,6 +1914,8 @@ static int bt_mutation_lock_for(const char *path, pthread_mutex_t **out) {
     if (g_bt_mutation_lock_bucket_count == 0 &&
         bt_mutation_locks_grow_locked(BT_MUTATION_LOCK_INITIAL_BUCKETS) != 0)
         goto oom;
+    if (g_bt_mutation_lock_bucket_count == 0)
+        goto oom;
     size_t slot = bt_path_hash(path) % g_bt_mutation_lock_bucket_count;
     for (BtMutationLockEntry *entry = g_bt_mutation_lock_buckets[slot];
          entry; entry = entry->next) {
@@ -1926,6 +1928,8 @@ static int bt_mutation_lock_for(const char *path, pthread_mutex_t **out) {
     if (g_bt_mutation_lock_count >=
         g_bt_mutation_lock_bucket_count * 3u / 4u &&
         bt_mutation_locks_grow_locked(g_bt_mutation_lock_bucket_count * 2u) != 0)
+        goto oom;
+    if (g_bt_mutation_lock_bucket_count == 0)
         goto oom;
     slot = bt_path_hash(path) % g_bt_mutation_lock_bucket_count;
     BtMutationLockEntry *entry = calloc(1, sizeof(*entry));

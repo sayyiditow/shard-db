@@ -546,6 +546,7 @@ static int kfcache_acquire_ex(SlotcaskKfHandle *h, const char *path,
        shard_db_open/embedded.c) falls back to the process's one exposed
        instance, mirroring objlock.c's get_lock/objlock_init pattern. */
     if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+    if (!g_db) { errno = ENODEV; return -1; }
 
 retry_kfcache_acquire:
     if (!g_kfcache) {
@@ -642,7 +643,25 @@ retry_kfcache_acquire:
         }
     }
     if (kf_open_inflight_found >= 0) {
-        pthread_cond_wait(&g_kf_open_inflight_cond, &g_kfcache_lock);
+        /* The condition can wake spuriously. Recheck the matching in-flight
+           opener while retaining g_kfcache_lock before proceeding. */
+        do {
+            int wait_rc = pthread_cond_wait(&g_kf_open_inflight_cond,
+                                            &g_kfcache_lock);
+            if (wait_rc != 0) {
+                pthread_mutex_unlock(&g_kfcache_lock);
+                errno = wait_rc;
+                return -1;
+            }
+            kf_open_inflight_found = -1;
+            for (int i = 0; i < KF_OPEN_INFLIGHT_SLOTS; i++) {
+                if (g_kf_open_inflight[i].used &&
+                    strcmp(g_kf_open_inflight[i].path, path) == 0) {
+                    kf_open_inflight_found = i;
+                    break;
+                }
+            }
+        } while (kf_open_inflight_found >= 0);
         pthread_mutex_unlock(&g_kfcache_lock);
         goto retry_kfcache_acquire;
     }
@@ -669,6 +688,10 @@ retry_kfcache_acquire:
             __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
         pthread_rwlock_t *lock = &g_kfcache[slot].rwlock;
         pthread_mutex_unlock(&g_kfcache_lock);
+        /* The cache entry has been published. Release the in-flight
+           admission slot before taking the entry lock so the cleanup
+           handler never acquires g_kfcache_lock while this rwlock is held. */
+        kf_open_inflight_release(&kf_inflight_slot);
         /* nonblocking is unreachable here: the miss-path gate above
            (line ~524) already returns -1 for nonblocking before
            kf_open_file() is ever called, so nonblocking is always 0
@@ -794,6 +817,10 @@ retry_kfcache_acquire:
        mapping; identity verification detects that and retries safely. */
     pthread_rwlock_t *lock = &e->rwlock;
     pthread_mutex_unlock(&g_kfcache_lock);
+    /* The cache entry is now visible to other openers. Release the in-flight
+       admission slot before taking the entry lock so the cleanup handler
+       cannot acquire g_kfcache_lock while this rwlock is held. */
+    kf_open_inflight_release(&kf_inflight_slot);
     /* nonblocking is unreachable here for the same reason as the re-probe
        branch above: the miss-path gate already returned -1 for nonblocking
        before we ever reached the open+install code (CID 1700136, 2 of 2). */
@@ -1362,6 +1389,7 @@ static int kfcache_acquire_direct_ex(SlotcaskKfHandle *h, SlotRef *ref,
        unbound TLS g_db must bind here, or it indexes a garbage table
        (the slow path below already binds; objlock.c:41 precedent). */
     if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+    if (!g_db) { errno = ENODEV; return -1; }
 
     if (ref && ref->slot >= 0) {
         int s = ref->slot;
@@ -1678,6 +1706,7 @@ int segcache_acquire(SlotcaskSegHandle *h, const char *path,
        get_lock: a thread that never bound its own g_db falls back to the
        process's one exposed instance. */
     if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+    if (!g_db) { errno = ENODEV; return -1; }
 
 retry_segcache_acquire:
     if (!g_segcache) {
@@ -1961,6 +1990,7 @@ int segcache_acquire_direct(SlotcaskSegHandle *h, SlotRef *ref,
     /* Warm path touches g_segcache = g_db->segcache: bind an unbound
        TLS g_db here too (same rationale as kfcache_acquire_direct_ex). */
     if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+    if (!g_db) { errno = ENODEV; return -1; }
     if (ref && ref->slot >= 0) {
         int s = ref->slot;
         SegCacheEntry *e = &g_segcache[s];
@@ -3030,6 +3060,13 @@ static int kf_marker_replay_delete_entry_locked(const char *eff_root,
 
     if (!kf_marker_op_valid(marker) || marker->op != KF_MARKER_OP_DELETE)
         goto out;
+    /* The marker is authenticated by its checksum, but its physical slot is
+       still untrusted on-disk input.  Validate it before any recovery diff
+       can use it as an array index. */
+    if (marker->kf_slot >= kh->capacity) {
+        errno = EILSEQ;
+        goto out;
+    }
     if (read_marker_old_live(data_dir, marker, &old_rec) != 0) {
         /* Segment already tombstoned by a prior partial replay: complete
            only if the kf slot is tombstoned too — the forward delete then
@@ -3085,6 +3122,19 @@ static int kf_marker_replay_entry_locked(const char *eff_root,
     const KfMarkerSlot *marker = &ms_al;
 
     if (!kh || !kh->writer || !kf_marker_op_valid(marker)) {
+        errno = EILSEQ;
+        return -1;
+    }
+    /* Inserts may carry UINT32_MAX until replay derives the physical slot;
+       deletes and updates must always name an existing slot. */
+    if (marker->op == KF_MARKER_OP_DELETE ||
+        (marker->op == KF_MARKER_OP_UPSERT && marker->has_old)) {
+        if (marker->kf_slot >= kh->capacity) {
+            errno = EILSEQ;
+            return -1;
+        }
+    } else if (marker->kf_slot != UINT32_MAX &&
+               marker->kf_slot >= kh->capacity) {
         errno = EILSEQ;
         return -1;
     }
@@ -4100,6 +4150,8 @@ typedef struct {
    pool from flag=2 slots, and position reserve_off past the last live slot
    in the highest-numbered segment. Returns 0 on success, -1 on error. */
 static int recover_one_stream(SlotcaskDb *db, int sid) {
+    if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+    if (!g_db) { errno = ENODEV; return -1; }
     char dir[PATH_MAX];
     stream_dir_for(dir, db->data_dir, sid);
     DIR *d = opendir(dir);

@@ -5350,6 +5350,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
     }
     bulk_upd_json_key_refs_free(key_refs, key_ref_count);
     key_refs = NULL;
+    key_ref_count = 0;
 
     if (rec_count == 0) {
         bulk_upd_json_emit_response(matched, 0, skipped, errors, error_count);
