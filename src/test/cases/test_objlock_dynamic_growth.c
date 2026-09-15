@@ -33,7 +33,8 @@
 static _Atomic int g_growth_rd_ready;
 static _Atomic int g_growth_rd_release;
 static _Atomic int g_growth_reader_lock_failed;
-static _Atomic int g_growth_writer_entered;
+static _Atomic int g_growth_writer_acquired;
+static _Atomic int g_growth_writer_release;
 
 static void *growth_rd_wait_worker(void *arg) {
     const char *obj = (const char *)arg;
@@ -49,11 +50,16 @@ static void *growth_rd_wait_worker(void *arg) {
 }
 
 /* Runs objlock_wrlock off-thread; asserts stay on main (t_ctx is
-   __thread). Acquiring is recorded, releasing is left to main. */
+   __thread). The writer PARKS holding the lock and releases it itself
+   (same thread) on main's flag — releasing someone else's wrlock from
+   main would be a cross-thread unlock, which TSan correctly flags. */
 static void *growth_wr_worker(void *arg) {
     const char *obj = (const char *)arg;
-    if (objlock_wrlock("growth-root", obj) == 0)
-        atomic_store(&g_growth_writer_entered, 1);
+    if (objlock_wrlock("growth-root", obj) == 0) {
+        atomic_store(&g_growth_writer_acquired, 1);
+        while (atomic_load(&g_growth_writer_release) == 0) usleep(1000);
+        objlock_wrunlock("growth-root", obj);
+    }
     return NULL;
 }
 
@@ -79,7 +85,8 @@ static int test_objlock_dynamic_growth_run(void) {
     atomic_store(&g_growth_rd_ready, 0);
     atomic_store(&g_growth_rd_release, 0);
     atomic_store(&g_growth_reader_lock_failed, 0);
-    atomic_store(&g_growth_writer_entered, 0);
+    atomic_store(&g_growth_writer_acquired, 0);
+    atomic_store(&g_growth_writer_release, 0);
 
     pthread_create(&reader, NULL, growth_rd_wait_worker, (void *)key);
     wait_for(&g_growth_rd_ready, 1, 30000);
@@ -91,18 +98,21 @@ static int test_objlock_dynamic_growth_run(void) {
        enters within microseconds — this assertion is what catches that,
        deterministically. */
     pthread_create(&writer, NULL, growth_wr_worker, (void *)key);
-    wait_for(&g_growth_writer_entered, 1, 500); /* poll up to 500ms */
-    ASSERT_EQ_INT(atomic_load(&g_growth_writer_entered), 0,
+    wait_for(&g_growth_writer_acquired, 1, 500); /* poll up to 500ms */
+    ASSERT_EQ_INT(atomic_load(&g_growth_writer_acquired), 0,
                   "writer stayed blocked while the reader held the rdlock - a fail-open lock would enter immediately");
 
     /* Release the reader; the blocked writer must now acquire
        (unbounded wait -- no timing assumption in the pass direction). */
     atomic_store(&g_growth_rd_release, 1);
     pthread_join(reader, NULL);
-    wait_for(&g_growth_writer_entered, 1, 30000);
-    ASSERT_EQ_INT(atomic_load(&g_growth_writer_entered), 1,
+    wait_for(&g_growth_writer_acquired, 1, 30000);
+    ASSERT_EQ_INT(atomic_load(&g_growth_writer_acquired), 1,
                   "writer acquired after the reader released - real mutual exclusion past the old 256-object ceiling");
-    objlock_wrunlock("growth-root", key);
+
+    /* The writer releases its own lock in its own thread (cross-thread
+       release would trip TSan). */
+    atomic_store(&g_growth_writer_release, 1);
     pthread_join(writer, NULL);
 
     /* Injected allocation failure must fail closed. */
