@@ -90,11 +90,10 @@ typedef struct {
 } RegEntry;
 
 /* objlock.c */
-#define OBJLOCK_BUCKETS 256
+#define OBJLOCK_INITIAL_CAP 1024
 typedef struct {
     char name[512];
     pthread_rwlock_t rwlock;
-    _Atomic int used;
 } ObjLockEntry;
 
 /* Shared by every fixed-size file-cache table above (BtCacheEntry,
@@ -389,8 +388,10 @@ struct ShardDb {
                                    flag clears (success or failure) */
 
     /* object lock table */
-    ObjLockEntry    objlocks[OBJLOCK_BUCKETS];
-    pthread_mutex_t objlock_table_lock;
+    ObjLockEntry   **objlock_dir;
+    uint32_t         objlock_dir_cap;
+    uint32_t         objlock_dir_count;
+    pthread_mutex_t  objlock_table_lock;
 
     /* IP set (server.c) */
     char            ip_set[IP_SET_BUCKETS][46];
@@ -542,8 +543,13 @@ extern ShardDb *g_shard_db_instance;
 #define g_reg_cond                  (g_db->reg_cond)
 
 /* objlock.c */
-#define g_objlocks                  (g_db->objlocks)
+#define g_objlock_dir               (g_db->objlock_dir)
+#define g_objlock_dir_cap           (g_db->objlock_dir_cap)
+#define g_objlock_dir_count         (g_db->objlock_dir_count)
 #define g_objlock_table_lock        (g_db->objlock_table_lock)
+
+/* test-only: fail the Nth guarded objlock allocation (OOM injection) */
+void objlock_test_set_fail_alloc(int fail_n);
 
 /* server.c */
 #define g_ip_set                    (g_db->ip_set)

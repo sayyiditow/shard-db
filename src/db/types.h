@@ -1376,9 +1376,10 @@ void schema_caches_shutdown(void);
 
 /* objlock.c — per-object rwlock + rebuild crash recovery */
 void objlock_init(void);
-void objlock_rdlock(const char *db_root, const char *object);
+void objlock_shutdown(void);
+int objlock_rdlock(const char *db_root, const char *object);   /* 0 ok, -1 alloc failure */
 void objlock_rdunlock(const char *db_root, const char *object);
-void objlock_wrlock(const char *db_root, const char *object);
+int objlock_wrlock(const char *db_root, const char *object);   /* 0 ok, -1 alloc failure */
 void objlock_wrunlock(const char *db_root, const char *object);
 int rebuild_recovery(const char *db_root);
 int db_root_lock_acquire(const char *db_root, int *out_fd);

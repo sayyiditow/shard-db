@@ -206,6 +206,7 @@ static void db_cleanup_before_pools(ShardDb *db) {
     schema_caches_shutdown();
     bt_cache_shutdown();
     bm_cache_shutdown();
+    objlock_shutdown();
     slotcask_shutdown();
     free(db->token_set);
     free(db->token_scope);
@@ -654,7 +655,11 @@ int shard_db_recover_before_stamp(const char *db_root,
                  db_root, entries[i].dir);
         snprintf(data_dir, sizeof(data_dir), "%s/%s/%s",
                  db_root, entries[i].dir, entries[i].object);
-        objlock_wrlock(eff_root, entries[i].object);
+        if (objlock_wrlock(eff_root, entries[i].object) != 0) {
+            LOG_ERROR(LOG_SUB_SLOTCASK, "recover: objlock_wrlock failed for '%s'", entries[i].object);
+            free(entries);
+            return -1;
+        }
         int rc = marker_recovery_sweep_object(eff_root, data_dir,
                                                entries[i].object,
                                                out_markers_replayed);
@@ -892,6 +897,8 @@ void shard_db_destroy_after_storage(ShardDb *db) {
     free(db->token_scope_obj);
     free(db->token_perm);
     free(db->token_set_used);
+
+    objlock_shutdown();
 
     db_mutexes_destroy();
     if (db->slots_inited) sem_destroy(&db->query_slots);

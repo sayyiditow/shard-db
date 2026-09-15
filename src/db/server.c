@@ -634,7 +634,11 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
        trade-off; NQL reads now pay the same (small, shared-lock) cost JSON
        reads do. If NQL ever grows a write mode, that mode's case still needs
        nothing extra here — this now covers all of them uniformly. */
-    objlock_rdlock(db_root, cmd.obj);
+    if (objlock_rdlock(db_root, cmd.obj) != 0) {
+        OUT("{\"error\":\"object lock unavailable\"}\n");
+        nql_free_command(&cmd);
+        return;
+    }
     switch (cmd.mode) {
     case NQL_COUNT:
         if (cmd.explain)
@@ -1435,7 +1439,12 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
            therefore the same (eff_root, object) lock key readers use. */
         char drop_eff_root[PATH_MAX];
         build_effective_root(drop_eff_root, sizeof(drop_eff_root), dir);
-        objlock_wrlock(drop_eff_root, object);
+        if (objlock_wrlock(drop_eff_root, object) != 0) {
+            OUT("{\"error\":\"objlock_wrlock failed for drop-object\"}\n");
+            free(ie_s);
+            free(mode); free(dir); free(object);
+            return;
+        }
         if (g_db && g_schema_wrlock_test_delay_ms > 0) {
             char marker_path[PATH_MAX];
             snprintf(marker_path, sizeof(marker_path),
@@ -1500,7 +1509,11 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
        below (it returns before create/drop-object style commands would want a
        lock at all), so it takes its own. */
     if (strcmp(mode, "describe-object") == 0) {
-        objlock_rdlock(db_root, object);
+        if (objlock_rdlock(db_root, object) != 0) {
+            OUT("{\"error\":\"objlock_rdlock failed for describe-object\"}\n");
+            free(mode); free(dir); free(object);
+            return;
+        }
         cmd_describe_object(g_db_root, dir, object);
         objlock_rdunlock(db_root, object);
         free(mode); free(dir); free(object);
@@ -1517,8 +1530,19 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
        added here later without a lock is a use-after-free, not a data race. */
     int took_wrlock = mode_is_schema(mode);
     int took_rdlock = !took_wrlock;
-    if (took_wrlock) objlock_wrlock(db_root, object);
-    else if (took_rdlock) objlock_rdlock(db_root, object);
+    if (took_wrlock) {
+        if (objlock_wrlock(db_root, object) != 0) {
+            OUT("{\"error\":\"objlock_wrlock failed for %s\"}\n", mode);
+            free(mode); free(dir); free(object);
+            return;
+        }
+    } else if (took_rdlock) {
+        if (objlock_rdlock(db_root, object) != 0) {
+            OUT("{\"error\":\"objlock_rdlock failed for %s\"}\n", mode);
+            free(mode); free(dir); free(object);
+            return;
+        }
+    }
     if (took_wrlock && g_db && g_schema_wrlock_test_delay_ms > 0) {
         /* Synchronous marker: unlike LOG_INFO (written by the async log
            thread), its presence proves the test delay has started and has
@@ -2354,11 +2378,27 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
        vacuum\tobj / recount\tobj / truncate\tobj / backup\tobj
        put-file\tobj\tpath / get-file-path\tobj\tfilename
     */
-    /* Per-object locking for this dispatch — same policy as JSON mode. */
+    /* Per-object locking for this dispatch — same policy as JSON mode.
+       Exception: "restore" self-locks — cmd_restore takes the object's
+       wrlock internally (the JSON restore branch likewise dispatches
+       before the generic take and takes no outer lock). restore is not
+       in mode_is_schema, so classifying it as !fast_wr would rdlock here
+       and then read-to-write-upgrade inside cmd_restore — a self-deadlock
+       on the same rwlock. */
+    int fast_restore = strcasecmp(cmd, "restore") == 0;
     int fast_wr = mode_is_schema(cmd);
-    int fast_rd = !fast_wr;
-    if (fast_wr) objlock_wrlock(eff_root, object);
-    else if (fast_rd) objlock_rdlock(eff_root, object);
+    int fast_rd = !fast_wr && !fast_restore;
+    if (fast_wr) {
+        if (objlock_wrlock(eff_root, object) != 0) {
+            OUT("Error: lock unavailable\n");
+            goto timing;
+        }
+    } else if (fast_rd) {
+        if (objlock_rdlock(eff_root, object) != 0) {
+            OUT("Error: lock unavailable\n");
+            goto timing;
+        }
+    }
 
     if (strcasecmp(cmd, "get") == 0) {
         cmd_get(eff_root, object, arg1, strlen(arg1));
@@ -2785,7 +2825,10 @@ static void *warmup_kf_task_fn(void *arg) {
        wrongly-shaped one. */
     char kf_path[PATH_MAX];
     int slots_per_shard;
-    objlock_rdlock(t->eff, t->obj);
+    if (objlock_rdlock(t->eff, t->obj) != 0) {
+        LOG_ERROR(LOG_SUB_SERVER, "warmup: objlock_rdlock failed for '%s'", t->obj);
+        return NULL; /* best-effort warmup: skip this object */
+    }
     if (g_db && g_warmup_test_delay_ms > 0) {
         LOG_INFO(LOG_SUB_WARMUP, "WARMUP-TEST-DELAY: shard_idx=%d starting", t->shard_idx);
         struct timespec delay_ts = { g_warmup_test_delay_ms / 1000,
@@ -2961,7 +3004,10 @@ static void *warmup_thread(void *arg) {
                Taking the lock first forces us to wait out any in-flight
                vacuum, then re-resolve sdb fresh from the registry — which
                is guaranteed live for as long as we hold the rdlock. */
-            objlock_rdlock(dir_path, de->d_name);
+            if (objlock_rdlock(dir_path, de->d_name) != 0) {
+                LOG_ERROR(LOG_SUB_SERVER, "warmup: objlock_rdlock failed for '%s'", de->d_name);
+                continue;
+            }
             SlotcaskDb *sdb = warmup_object_open(a->db_root,
                                                  dirs_copy[di], de->d_name);
             if (!sdb) { objlock_rdunlock(dir_path, de->d_name); continue; }
@@ -3086,7 +3132,10 @@ static void auto_vacuum_sweep_one(const char *dir_name, const char *eff,
         "AUTO-VACUUM start %s/%s (live=%d deleted=%d pct=%d)",
         dir_name, obj_name, count, deleted, pct_observed);
     uint64_t obj_t0 = now_ms();
-    objlock_wrlock(eff, obj_name);
+    if (objlock_wrlock(eff, obj_name) != 0) {
+        LOG_ERROR(LOG_SUB_VACUUM, "AUTO-VACUUM %s/%s: objlock_wrlock failed; skipping", dir_name, obj_name);
+        return;
+    }
     int vacuum_rc = cmd_vacuum(eff, obj_name, 0, 0);
     objlock_wrunlock(eff, obj_name);
     LOG_INFO(LOG_SUB_VACUUM, "AUTO-VACUUM done %s/%s rc=%d in %lums",
@@ -3199,7 +3248,10 @@ static void auto_reshard_sweep_one(const char *dir_name, const char *eff,
         "— object locked for the duration",
         dir_name, obj_name, sch.splits, target, live);
     uint64_t obj_t0 = now_ms();
-    objlock_wrlock(eff, obj_name);
+    if (objlock_wrlock(eff, obj_name) != 0) {
+        LOG_ERROR(LOG_SUB_VACUUM, "AUTO-RESHARD %s/%s: objlock_wrlock failed; skipping", dir_name, obj_name);
+        return;
+    }
     int rc = cmd_vacuum(eff, obj_name, 0, target);
     objlock_wrunlock(eff, obj_name);
     if (rc == 0) {
