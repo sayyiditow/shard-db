@@ -30,91 +30,208 @@
    name.
 */
 
-/* ObjLockEntry + OBJLOCK_BUCKETS moved to shard_db_internal.h;
-   g_objlocks, g_objlock_table_lock moved to ShardDb struct */
+/* ObjLockEntry + OBJLOCK_INITIAL_CAP live in shard_db_internal.h;
+   g_objlock_dir/-cap/-count and g_objlock_table_lock live in the
+   ShardDb struct */
 
 static uint32_t obj_str_hash(const char *s) {
     return (uint32_t)XXH3_64bits(s, strlen(s));
 }
 
-void objlock_init(void) {
-    if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
-    for (int i = 0; i < OBJLOCK_BUCKETS; i++) {
-        atomic_init(&g_objlocks[i].used, 0);
-        g_objlocks[i].name[0] = '\0';
-    }
+static int g_objlock_test_fail_alloc;
+
+void objlock_test_set_fail_alloc(int fail_n) {
+    g_objlock_test_fail_alloc = fail_n;
 }
 
-/* Find or create the rwlock for a given object. Returns NULL only if
-   the table is completely full (OBJLOCK_BUCKETS objects), which would
-   mean thousands of distinct objects — not a realistic scenario. */
-static pthread_rwlock_t *get_lock(const char *db_root, const char *object) {
-    if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
-    char key[512];
-    snprintf(key, sizeof(key), "%s:%s", db_root, object);
-    uint32_t idx = obj_str_hash(key) % OBJLOCK_BUCKETS;
+static int objlock_should_fail_alloc(void) {
+    if (g_objlock_test_fail_alloc > 0 && --g_objlock_test_fail_alloc == 0) return 1;
+    return 0;
+}
 
-    /* Fast path: lockless probe for existing entry. acquire-load on
-       `used` pairs with the slow-path release-store so strcmp on
-       `name` reads a coherent snapshot. */
-    for (int i = 0; i < OBJLOCK_BUCKETS; i++) {
-        int slot = (idx + i) % OBJLOCK_BUCKETS;
-        if (!atomic_load_explicit(&g_objlocks[slot].used, memory_order_acquire))
-            break;
-        if (strcmp(g_objlocks[slot].name, key) == 0)
-            return &g_objlocks[slot].rwlock;
+/* Directory growth: doubles at 50% load, mirroring the kf-shard
+   "50% load -> double slots_per_shard" pattern (see AGENTS.md). Entries
+   are never moved or freed by a grow -- only the array of pointers is
+   reallocated and rehashed; existing ObjLockEntry addresses (and any
+   rwlock currently held by a caller) stay valid. Caller holds
+   g_objlock_table_lock. Returns 0 on success, -1 on allocation failure
+   (directory left unchanged). */
+static int objlock_dir_grow_locked(void) {
+    if (g_objlock_dir_cap > UINT32_MAX / 2) { errno = EOVERFLOW; return -1; }
+    uint32_t new_cap = g_objlock_dir_cap ? g_objlock_dir_cap * 2 : OBJLOCK_INITIAL_CAP;
+    if (objlock_should_fail_alloc()) return -1;
+    ObjLockEntry **new_dir = calloc(new_cap, sizeof(*new_dir));
+    if (!new_dir) return -1;
+    for (uint32_t i = 0; i < g_objlock_dir_cap; i++) {
+        ObjLockEntry *e = g_objlock_dir[i];
+        if (!e) continue;
+        uint32_t idx = obj_str_hash(e->name) % new_cap;
+        while (new_dir[idx]) idx = (idx + 1) % new_cap;
+        new_dir[idx] = e;
     }
+    free(g_objlock_dir);
+    g_objlock_dir = new_dir;
+    g_objlock_dir_cap = new_cap;
+    return 0;
+}
 
-    /* Slow path: take table lock, re-probe, and insert if still missing */
-    pthread_mutex_lock(&g_objlock_table_lock);
-    for (int i = 0; i < OBJLOCK_BUCKETS; i++) {
-        int slot = (idx + i) % OBJLOCK_BUCKETS;
-        int u = atomic_load_explicit(&g_objlocks[slot].used,
-                                      memory_order_relaxed);
-        if (u && strcmp(g_objlocks[slot].name, key) == 0) {
-            pthread_mutex_unlock(&g_objlock_table_lock);
-            return &g_objlocks[slot].rwlock;
-        }
-        if (!u) {
-            strncpy(g_objlocks[slot].name, key, sizeof(g_objlocks[slot].name) - 1);
-            g_objlocks[slot].name[sizeof(g_objlocks[slot].name) - 1] = '\0';
-            /* Default-attribute (reader-preferring) rwlock: objlock's API
-               permits recursive read locks, which
-               PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP does not support
-               safely (see docs/plans/2026-07-29-cache-rwlock-writer-preference.md),
-               so this stays unchanged even where the four file caches switch
-               to writer-preferring. */
-            pthread_rwlock_init(&g_objlocks[slot].rwlock, NULL);
-            /* Release ordering: name + rwlock_init complete before
-               any concurrent fast-path acquire-load sees used==1. */
-            atomic_store_explicit(&g_objlocks[slot].used, 1, memory_order_release);
-            pthread_mutex_unlock(&g_objlock_table_lock);
-            return &g_objlocks[slot].rwlock;
-        }
+/* Find-or-create the entry for `key`. Caller holds g_objlock_table_lock.
+   Grows the directory first if load would exceed 50%. Returns NULL on
+   allocation failure (grow or entry alloc) -- directory left in a valid,
+   usable (if unchanged) state. */
+static ObjLockEntry *objlock_resolve_locked(const char *key) {
+    if (!g_objlock_dir) return NULL; /* objlock_init() never called or failed */
+    if ((uint64_t)(g_objlock_dir_count + 1) * 2 > g_objlock_dir_cap) {
+        if (objlock_dir_grow_locked() != 0) return NULL;
     }
-    pthread_mutex_unlock(&g_objlock_table_lock);
-    LOG_ERROR(LOG_SUB_SERVER, "objlock get_lock: table full (%d buckets), object '%s' will run WITHOUT rwlock protection", OBJLOCK_BUCKETS, key);
+    uint32_t idx = obj_str_hash(key) % g_objlock_dir_cap;
+    uint32_t start = idx;
+    do {
+        ObjLockEntry *e = g_objlock_dir[idx];
+        if (!e) break;
+        if (strcmp(e->name, key) == 0) return e;
+        idx = (idx + 1) % g_objlock_dir_cap;
+    } while (idx != start);
+    /* `break` above fired (dir[idx] is empty -- insert there; this
+       includes idx==start when the first probe is empty) or the loop
+       wrapped with every slot occupied. Only the wrap is a broken
+       invariant (the 50% pre-grow guarantees a free slot): fail closed. */
+    if (idx == start && g_objlock_dir[idx]) return NULL;
+
+    if (objlock_should_fail_alloc()) return NULL;
+    ObjLockEntry *e = calloc(1, sizeof(*e));
+    if (!e) return NULL;
+    snprintf(e->name, sizeof(e->name), "%s", key);
+    /* Default-attribute (reader-preferring) rwlock: objlock's API
+       permits recursive read locks, which
+       PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP does not support
+       safely (see docs/plans/2026-07-29-cache-rwlock-writer-preference.md),
+       so this stays default-attr even where the four file caches switch
+       to writer-preferring. (Carried over from the pre-rewrite
+       get_lock() -- do not drop.) */
+    pthread_rwlock_init(&e->rwlock, NULL);
+    g_objlock_dir[idx] = e;
+    g_objlock_dir_count++;
+    return e;
+}
+
+/* Lookup only -- never allocates, never grows. Used by the unlock path,
+   which must resolve an entry that was already successfully locked
+   earlier (and so is guaranteed present, since entries are immortal). */
+static ObjLockEntry *objlock_lookup_locked(const char *key) {
+    if (!g_objlock_dir || g_objlock_dir_cap == 0) return NULL;
+    uint32_t idx = obj_str_hash(key) % g_objlock_dir_cap;
+    uint32_t start = idx;
+    do {
+        ObjLockEntry *e = g_objlock_dir[idx];
+        if (!e) return NULL;
+        if (strcmp(e->name, key) == 0) return e;
+        idx = (idx + 1) % g_objlock_dir_cap;
+    } while (idx != start);
     return NULL;
 }
 
-void objlock_rdlock(const char *db_root, const char *object) {
-    pthread_rwlock_t *l = get_lock(db_root, object);
-    if (l) pthread_rwlock_rdlock(l);
+void objlock_init(void) {
+    if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+    if (g_objlock_dir) return; /* idempotent -- tests call objlock_init()
+                                  directly against the runner's shared
+                                  process-local instance */
+    g_objlock_dir = calloc(OBJLOCK_INITIAL_CAP, sizeof(*g_objlock_dir));
+    if (!g_objlock_dir) {
+        /* Init-time OOM is an instance-creation failure, NOT the runtime
+           fail-closed contract: the instance cannot serve without its
+           lock directory, so refuse to start rather than run unlocked
+           (peer init paths like kfcache_init don't even check). Runtime
+           resolve failures DO report to their callers as -1. */
+        fprintf(stderr, "shard-db: objlock_init: out of memory allocating initial directory\n");
+        abort();
+    }
+    g_objlock_dir_cap = OBJLOCK_INITIAL_CAP;
+    g_objlock_dir_count = 0;
+}
+
+/* Entries are immortal for the life of the process/instance -- freed only
+   here, at teardown. No eviction, no refcounting, no stale-name races.
+
+   Quiescence contract (the same requirement bt_cache_shutdown /
+   slotcask_shutdown already carry: they free state an in-flight
+   operation may be using too): no thread may still hold an objlock
+   when this runs. The daemon stop path satisfies this by joining the
+   request-worker pool (server.c), draining in-flight writes, and
+   stopping background threads before any teardown; embedded callers
+   must ensure every shard_db_query() has returned before calling
+   shard_db_close(). */
+void objlock_shutdown(void) {
+    /* Early-out BEFORE the mutex: dir == NULL means never inited or
+       already torn down, and a prior teardown chain may already have
+       destroyed the mutex via db_mutexes_destroy(). */
+    if (!g_objlock_dir) return;
+    pthread_mutex_lock(&g_objlock_table_lock);
+    if (g_objlock_dir) {
+        for (uint32_t i = 0; i < g_objlock_dir_cap; i++) {
+            if (g_objlock_dir[i]) {
+                pthread_rwlock_destroy(&g_objlock_dir[i]->rwlock);
+                free(g_objlock_dir[i]);
+            }
+        }
+        free(g_objlock_dir);
+        g_objlock_dir = NULL;
+        g_objlock_dir_cap = 0;
+        g_objlock_dir_count = 0;
+    }
+    pthread_mutex_unlock(&g_objlock_table_lock);
+}
+
+/* Shared acquire-side body: bind g_db, build the key, resolve (creating
+   the entry on first use) under the table mutex. Returns NULL on
+   allocation failure, already logged. */
+static ObjLockEntry *objlock_entry_acquire(const char *db_root, const char *object) {
+    if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+    char key[512];
+    snprintf(key, sizeof(key), "%s:%s", db_root, object);
+    pthread_mutex_lock(&g_objlock_table_lock);
+    ObjLockEntry *e = objlock_resolve_locked(key);
+    pthread_mutex_unlock(&g_objlock_table_lock);
+    if (!e)
+        LOG_ERROR(LOG_SUB_SERVER, "objlock: allocation failure resolving '%s'", key);
+    return e;
+}
+
+/* Shared release-side body: lookup-only (never allocates, never grows).
+   A NULL resolve is a caller bug (mismatched lock/unlock), logged. */
+static void objlock_entry_release(const char *db_root, const char *object) {
+    char key[512];
+    snprintf(key, sizeof(key), "%s:%s", db_root, object);
+    pthread_mutex_lock(&g_objlock_table_lock);
+    ObjLockEntry *e = objlock_lookup_locked(key);
+    pthread_mutex_unlock(&g_objlock_table_lock);
+    if (!e) {
+        LOG_ERROR(LOG_SUB_SERVER, "objlock unlock: no entry for '%s' (mismatched lock/unlock?)", key);
+        return;
+    }
+    pthread_rwlock_unlock(&e->rwlock);
+}
+
+int objlock_rdlock(const char *db_root, const char *object) {
+    ObjLockEntry *e = objlock_entry_acquire(db_root, object);
+    if (!e) return -1;
+    pthread_rwlock_rdlock(&e->rwlock);
+    return 0;
 }
 
 void objlock_rdunlock(const char *db_root, const char *object) {
-    pthread_rwlock_t *l = get_lock(db_root, object);
-    if (l) pthread_rwlock_unlock(l);
+    objlock_entry_release(db_root, object);
 }
 
-void objlock_wrlock(const char *db_root, const char *object) {
-    pthread_rwlock_t *l = get_lock(db_root, object);
-    if (l) pthread_rwlock_wrlock(l);
+int objlock_wrlock(const char *db_root, const char *object) {
+    ObjLockEntry *e = objlock_entry_acquire(db_root, object);
+    if (!e) return -1;
+    pthread_rwlock_wrlock(&e->rwlock);
+    return 0;
 }
 
 void objlock_wrunlock(const char *db_root, const char *object) {
-    pthread_rwlock_t *l = get_lock(db_root, object);
-    if (l) pthread_rwlock_unlock(l);
+    objlock_entry_release(db_root, object);
 }
 
 int db_root_lock_acquire(const char *db_root, int *out_fd) {

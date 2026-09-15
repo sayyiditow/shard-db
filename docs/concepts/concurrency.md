@@ -149,6 +149,12 @@ Layered on top of the per-shard locks. Every JSON request gets classified:
 
 This serializes schema rebuilds against everything else without holding a long-lived lock during normal traffic.
 
+The lock table itself is a pointer-indirected, growable open-addressed directory (initial capacity 1024 `db_root:object` entries, doubling at 50% load). Each entry is individually heap-allocated and **never moved or freed until process shutdown**, so a directory grow only reallocates the array of pointers — no in-flight lock holder is ever invalidated, and because entries are immortal (no eviction), no pin/refcount/stale-name machinery is needed.
+
+`objlock_rdlock()`/`objlock_wrlock()` return `int`: `0` on success, `-1` if growing the directory or allocating the entry failed (out of memory). Callers must abort the operation on `-1` rather than proceed unprotected. `objlock_rdunlock()`/`objlock_wrunlock()` remain `void` — they only ever resolve an entry that a successful lock created, so they cannot allocate and cannot practically fail.
+
+At teardown, entries are freed under the same no-in-flight-operations quiescence the cache shutdowns (`bt_cache_shutdown`/`slotcask_shutdown`) already require: the daemon stop path joins the request-worker pool, drains in-flight writes, and stops background threads before teardown; embedded callers must ensure every `shard_db_query()` has returned before calling `shard_db_close()`.
+
 ## Write drain on shutdown
 
 `./shard-db stop` sets `server_running = 0` (atomic) to refuse new connections and waits up to 30 seconds for the `in_flight_writes` atomic to reach zero. This guarantees that every write that entered the server before shutdown either committed or returned an error — no half-written records.

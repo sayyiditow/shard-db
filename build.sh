@@ -313,6 +313,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_dispatch_leak_paths.c \
     src/test/cases/test_removed_storage_surfaces.c \
     src/test/cases/test_keyset.c \
+    src/test/cases/test_objlock_dynamic_growth.c \
     src/test/cases/test_objlock_unit.c \
     src/test/cases/test_query_plan_in_oom.c \
     src/test/cases/test_parallel.c \

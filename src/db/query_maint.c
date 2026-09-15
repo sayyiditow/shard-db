@@ -548,7 +548,10 @@ int cmd_restore(const char *db_root, const char *object,
         OUT("{\"error\":\"backup not found: %s\"}\n", from); return 1;
     }
 
-    objlock_wrlock(db_root, object);
+    if (objlock_wrlock(db_root, object) != 0) {
+        OUT("{\"error\":\"objlock_wrlock failed for restore\"}\n");
+        return 1;
+    }
 
     const char *subs[] = { "data", "indexes", "metadata" };
     char src_sub[PATH_MAX], dst_sub[PATH_MAX];

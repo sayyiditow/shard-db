@@ -4792,7 +4792,11 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
            rebuild_object_v2 (vacuum) holds
            this lock already via the server dispatch; reindex must take it
            explicitly here since it bypasses that dispatch path. */
-        objlock_wrlock(eff_root, obj);
+        if (objlock_wrlock(eff_root, obj) != 0) {
+            LOG_ERROR(LOG_SUB_SERVER, "reindex: objlock_wrlock failed for '%s'", obj);
+            objects_failed++;
+            continue;
+        }
         int n = 0;
         int rebuild_rc = reindex_object_checked(eff_root, obj,
                                                 composites_only, &n);

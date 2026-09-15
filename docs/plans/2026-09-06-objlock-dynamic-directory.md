@@ -3,9 +3,29 @@
 ## Status
 
 **READY FOR HUMAN APPROVAL.** Not yet executed — no code changed, no tests
-run. Anchors below are quoted text, verified 2026-09-06 against the tree at
-branch `perf/request-level-commit-batching` (HEAD `bc1dede`). Line numbers
-are navigation aids only and will drift — grep the quoted text.
+run. Anchors below are quoted text, originally verified 2026-09-06 against
+branch `perf/request-level-commit-batching` (HEAD `bc1dede`) and
+re-verified 2026-09-15 against `main` (HEAD `676d7a5`, post B3a/B3b
+merges): all 12 call sites, the struct/macro/prototype anchors, both
+shutdown anchors, and the test-harness idioms match. Line numbers are
+navigation aids only and will drift — grep the quoted text.
+
+Revised 2026-09-15 after a blind review pass. Fixes folded in: Task 1's
+red-run procedure rewritten (the full test cannot compile on base);
+deterministic red evidence specified; verified error idioms for sites
+1-5 and 7; Task 5's shutdown-ordering halt-check resolved; Task 8's
+initial-cap contradiction and premise corrected.
+
+Revised again 2026-09-15 after a second review pass. Fixes folded in:
+Task 5 now wires `objlock_shutdown()` into BOTH teardown roots —
+`shard_db_destroy_after_storage()` (shared by `shard_db_close` and the
+two direct server.c calls at server.c:3728/3831) as well as
+`db_cleanup_before_pools` — so the daemon stop path cannot leak the
+heap entries (LSan gate); Task 1 registers the new test file in
+build.sh's hand-enumerated test-source list (otherwise the new cases
+never compile and the acceptance criteria are silently ineffective);
+the teardown quiescence contract is specified explicitly (Task 4,
+Task 8, edge cases).
 
 Do not execute until the human approves this plan explicitly. This plan is
 scoped to exactly three things, per explicit instruction: (a) a
@@ -16,19 +36,22 @@ fail-open NULL-return bug so callers cannot proceed unprotected. It does
 cache (BtCache/BmCache/KfCache/SegCache) — those are separate tables with
 separate lifecycles, out of scope.
 
-A second agent is concurrently executing
-`docs/plans/2026-09-05-request-level-commit-batching.md` on
-`perf/request-level-commit-batching`. This plan branches off `main`
-instead — execution starts only after that batching work finishes and
-merges, on a fresh branch off `main`, not a continuation of the batching
-branch. This plan touches `src/db/objlock.c`,
+The request-level commit batching work
+(`docs/plans/2026-09-05-request-level-commit-batching.md`) has landed
+through B3a/B3b (merged to `main` as of 2026-09-15); the auto-widen-kf
+ceiling plan (2026-09-14) is future work and not part of this effort.
+This plan branches off `main` on a fresh branch — never a continuation
+of the batching branch. If any further batching stage lands before
+execution starts, re-run the audit greps below before editing. This
+plan touches `src/db/objlock.c`,
 `src/db/shard_db_internal.h` (objlock-only region), `src/db/types.h`
-(objlock-only prototypes), `src/db/embedded.c` (shutdown wiring only), the
-12 objlock call sites enumerated below, `docs/concepts/concurrency.md`, and
-adds two new test files. It does not touch commit/durability/marker code,
+(objlock-only prototypes), `src/db/embedded.c` (shutdown wiring only),
+`build.sh` (one line in the test-source list), the 12 objlock call
+sites enumerated below, `docs/concepts/concurrency.md`, and adds one
+new test file registering two cases. It does not touch commit/durability/marker code,
 slotcask bulk-window logic, or query_bulk.c beyond reading its
 alloc-failure-injection idiom as a pattern to mirror — no expected file
-overlap with the concurrent batching work. If a diff conflict appears
+overlap with any further batching stages. If a diff conflict appears
 anyway when this plan is executed, treat it as a merge concern to resolve
 at execution time, not a reason to change this plan's design.
 
@@ -111,7 +134,7 @@ so it cannot allocate and cannot practically fail; a `NULL` resolve there
 indicates a caller bug (mismatched lock/unlock), which is logged, not
 propagated as a new error path.
 
-## Call-site / consumer audit (verified 2026-09-06; executor re-runs the greps before editing)
+## Call-site / consumer audit (verified 2026-09-06, re-verified 2026-09-15 against `main` @ `676d7a5`; executor still re-runs the greps before editing)
 
 All production call sites of `objlock_rdlock`/`objlock_wrlock` (the two
 functions changing signature). `objlock_rdunlock`/`objlock_wrunlock` keep
@@ -212,21 +235,56 @@ call site's task below for the exact patch.
 
 ## Task 1 — regression test proving the current bug (red on base)
 
-Test-first: write `src/test/cases/test_objlock_dynamic_growth.c` against
-the **current** (pre-fix) `objlock.c` first, confirm it fails for the
-expected reason, then proceed to Tasks 2-6 (the fix), then confirm it
-passes.
+The full test body below uses the post-fix API (int-returning lock
+calls, `objlock_test_set_fail_alloc`), so it **cannot compile against
+the pre-fix tree**. The red proof is therefore two-step:
 
-This test cannot literally instantiate the old fixed-256 table from
-outside `objlock.c` (no test hook exists to shrink the cap), so the red
-run is proven differently: temporarily build with `OBJLOCK_BUCKETS`
-(or, post-fix, `OBJLOCK_INITIAL_CAP`) set to a tiny value via a one-line
-local edit — e.g. temporarily change the constant to `4` — rebuild, run
-this test, and confirm the mutual-exclusion assertion fails (or the
-process logs "table full ... WITHOUT rwlock protection" from the old
-code, confirming the fail-open path is live); then revert the temporary
-constant edit before continuing. Paste both the failing-run output and
-the reverted diff as evidence.
+**Step 1 (red, on base).** Write a temporary base-compatible variant of
+the test — identical scenario, but statement-form lock calls only (no
+`int rc = ...` capture) and with the injected-allocation-failure section
+removed. It cannot instantiate the old fixed-256 table from outside
+`objlock.c` (no test hook exists to shrink the cap), so temporarily
+change `OBJLOCK_BUCKETS` in `shard_db_internal.h` to `4` via a one-line
+local edit, rebuild, and run the variant. **Primary red evidence is the
+old code's log line** — `objlock get_lock: table full (%d buckets),
+object '%s' will run WITHOUT rwlock protection` — which is the fail-open
+path firing and is deterministic. Do **not** rely on the
+mutual-exclusion assertion as the red detector: on the fail-open build
+the wrlock returns immediately instead of blocking, so the releaser
+thread may not have run yet when main asserts and the assert can pass
+spuriously. Then revert the temporary constant edit. Paste the
+failing-run output (showing the log line) and the reverted diff as
+evidence accompanying the uncommitted diff for review.
+
+**Step 2 (green, with the fix).** Proceed to Tasks 2-6, then write the
+full test below — now compilable against the new API — and confirm it
+passes against the real (default-capacity) build. Post-fix, the
+mutual-exclusion assertion *is* deterministic (the wrlock can only
+return after the reader released, and the releaser recorded its
+observation before flipping the release flag), so it carries weight in
+the final test even though it cannot carry the red run.
+
+**Build registration (required — a second review finding).** `build.sh`
+hand-enumerates the test sources in the `shard-db-test` gcc list (the
+comment above it reads "Future test cases under src/test/cases/ get
+listed here"); a new case file that is not listed never compiles or
+registers, and `run-all` would silently skip it. Anchor (current,
+build.sh, `src/test/cases/test_objlock_unit.c \` line inside the
+`shard-db-test` link):
+
+```make
+    src/test/cases/test_objlock_unit.c \
+```
+
+Insert immediately before it:
+
+```make
+    src/test/cases/test_objlock_dynamic_growth.c \
+```
+
+One source file registers both cases (`test-objlock-dynamic-growth`,
+`test-objlock-fail-alloc-recovery` — see Task 7). Verify with
+`./build/bin/shard-db-test list` showing both names.
 
 ```c
 #include "test_runner.h"
@@ -282,10 +340,11 @@ static int test_objlock_dynamic_growth_run(void) {
 
     /* Real mutual-exclusion proof on a key past the old ceiling: a reader
        parks inside its rdlock; main's wrlock must block until the reader
-       (via the releaser thread) lets go. On the fail-open path this key's
-       lock was skipped entirely, so objlock_wrlock here would return
-       immediately without g_growth_observed_rd_held having been set yet
-       — this assertion is what catches that. */
+       (via the releaser thread) lets go — so by the time wrlock returns,
+       the releaser has provably run and observed==1 is deterministic
+       post-fix. (On the fail-open pre-fix path this assert is racy and
+       may pass spuriously; the red run keys on the table-full log line
+       instead — see Task 1 Step 1.) */
     const char *key = names[PAST_CEILING_INDEX];
     pthread_t reader, releaser;
     atomic_store(&g_growth_rd_ready, 0);
@@ -462,11 +521,22 @@ static ObjLockEntry *objlock_resolve_locked(const char *key) {
         if (strcmp(e->name, key) == 0) return e;
         idx = (idx + 1) % g_objlock_dir_cap;
     } while (idx != start);
+    if (idx == start) return NULL; /* table full -- unreachable: the 50%
+                                      pre-grow above guarantees a free
+                                      slot; reaching here means the
+                                      invariant broke, fail closed */
 
     if (objlock_should_fail_alloc()) return NULL;
     ObjLockEntry *e = calloc(1, sizeof(*e));
     if (!e) return NULL;
     snprintf(e->name, sizeof(e->name), "%s", key);
+    /* Default-attribute (reader-preferring) rwlock: objlock's API
+       permits recursive read locks, which
+       PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP does not support
+       safely (see docs/plans/2026-07-29-cache-rwlock-writer-preference.md),
+       so this stays default-attr even where the four file caches switch
+       to writer-preferring. (Carried over verbatim from the pre-rewrite
+       get_lock() -- do not drop in the rewrite.) */
     pthread_rwlock_init(&e->rwlock, NULL);
     g_objlock_dir[idx] = e;
     g_objlock_dir_count++;
@@ -504,8 +574,21 @@ void objlock_init(void) {
 }
 
 /* Entries are immortal for the life of the process/instance -- freed only
-   here, at shutdown. No eviction, no refcounting, no stale-name races. */
+   here, at teardown. No eviction, no refcounting, no stale-name races.
+
+   Quiescence contract (the same requirement bt_cache_shutdown /
+   slotcask_shutdown already carry: they free state an in-flight
+   operation may be using too): no thread may still hold an objlock
+   when this runs. The daemon stop path satisfies this by joining the
+   request-worker pool (server.c:3803), draining in-flight writes, and
+   stopping background threads before any teardown; embedded callers
+   must ensure every shard_db_query() has returned before calling
+   shard_db_close(). */
 void objlock_shutdown(void) {
+    /* Early-out BEFORE the mutex: dir == NULL means never inited or
+       already torn down, and a prior teardown chain may already have
+       destroyed the mutex via db_mutexes_destroy(). */
+    if (!g_objlock_dir) return;
     pthread_mutex_lock(&g_objlock_table_lock);
     if (g_objlock_dir) {
         for (uint32_t i = 0; i < g_objlock_dir_cap; i++) {
@@ -612,30 +695,43 @@ Replace with:
     slotcask_shutdown();
 ```
 
-Anchor 2, inside `shard_db_close` (current):
+Anchor 2, inside `shard_db_destroy_after_storage` (current):
 
 ```c
-    bt_cache_shutdown();
-    bm_cache_shutdown();
-    slotcask_shutdown();
-    schema_caches_shutdown();
+    free(db->token_set_used);
+
+    db_mutexes_destroy();
 ```
 
 Replace with:
 
 ```c
-    bt_cache_shutdown();
-    bm_cache_shutdown();
+    free(db->token_set_used);
+
     objlock_shutdown();
-    slotcask_shutdown();
-    schema_caches_shutdown();
+
+    db_mutexes_destroy();
 ```
 
-Both sites place `objlock_shutdown()` before `db_mutexes_destroy()` (which
-destroys `g_objlock_table_lock` itself) — verify at execution time that
-neither anchor's surrounding function reorders `db_mutexes_destroy()`
-ahead of this point; if it does, treat as an anchor mismatch per Embedded
-execution rules (write `PLAN_NOTES.md`, halt).
+Why both: this codebase has two independent teardown chains, and
+`objlock_shutdown()` must sit in both or the daemon leaks every
+heap-allocated entry (LSan gate fails). Verified 2026-09-15 on `main`:
+
+- `db_cleanup_before_pools` (embedded.c:203) is the init-failure chain
+  (error paths at embedded.c:753, 767, 791) and frees `db` itself — it
+  never routes through `shard_db_destroy_after_storage`.
+- `shard_db_destroy_after_storage` (embedded.c:886) is the shared final
+  teardown with three callers: `shard_db_close` (embedded.c:919), the
+  server's startup-failure stop (server.c:3728), and the daemon stop
+  path (server.c:3831). Wiring it here covers all three; `shard_db_close`
+  itself needs no edit.
+
+Both insertion points run `objlock_shutdown()` before
+`db_mutexes_destroy()` destroys `g_objlock_table_lock` — in
+`db_cleanup_before_pools` the destroy is a few lines after the anchor
+(embedded.c:216); in `shard_db_destroy_after_storage` it is immediately
+after. objlock_shutdown's pre-lock early-out (Task 4) keeps a second
+call on an already-torn-down chain from touching the destroyed mutex.
 
 ## Task 6 — call-site fixes (all 12, fail-closed)
 
@@ -647,10 +743,12 @@ failed (nothing was acquired).
 1. `embedded.c`, `shard_db_recover_before_stamp` — this loop already
    checks a `rc` after the wrlock/wrunlock pair and does
    `if (rc != 0) { free(entries); return -1; }`; extend the same
-   short-circuit to the lock call itself:
+   short-circuit to the lock call itself (note: `LOG_SUB_RECOVERY` does
+   not exist in the tree — the recovery sweep itself logs under
+   `LOG_SUB_SLOTCASK`, so use that):
    ```c
    if (objlock_wrlock(eff_root, entries[i].object) != 0) {
-       LOG_ERROR(LOG_SUB_RECOVERY, "recover: objlock_wrlock failed for '%s'", entries[i].object);
+       LOG_ERROR(LOG_SUB_SLOTCASK, "recover: objlock_wrlock failed for '%s'", entries[i].object);
        free(entries);
        return -1;
    }
@@ -658,34 +756,38 @@ failed (nothing was acquired).
    objlock_wrunlock(eff_root, entries[i].object);
    ```
 
-2. `query_maint.c`, `cmd_restore`:
+2. `query_maint.c`, `cmd_restore` (verified 2026-09-15: `int`-returning;
+   its existing error idiom is `OUT` an error line + `return 1`, as in
+   the "backup not found" branch — there is no `err_json` helper):
    ```c
    if (objlock_wrlock(db_root, object) != 0) {
-       return err_json("objlock_wrlock failed for restore");
+       OUT("{\"error\":\"objlock_wrlock failed for restore\"}\n");
+       return 1;
    }
    ```
-   (use whatever this function's existing error-JSON helper is named —
-   confirm exact helper name at execution time via the function's other
-   error returns; do not guess a name not present in the file.)
 
-3. `server.c`, `dispatch_nql_query`:
+3. `server.c`, `dispatch_nql_query` (verified 2026-09-15: `static void`;
+   its existing early-return-on-error pattern is the "invalid object
+   name" branch near the top of the function — `OUT` an error line,
+   `nql_free_command(&cmd)`, `return`):
    ```c
    if (objlock_rdlock(db_root, cmd.obj) != 0) {
-       /* existing error-reply path for this function, e.g. */
-       nql_reply_error(...);
+       OUT("{\"error\":\"object lock unavailable\"}\n");
+       nql_free_command(&cmd);
        return;
    }
    ```
-   Confirm the function's actual error-reply mechanism at execution time
-   (it is `void`-returning; find its existing early-return-on-error
-   pattern and mirror it verbatim).
 
 4. `server.c`, `dispatch_json_query`, drop-object branch — mirror the
    branch's existing JSON-error-reply idiom on failure, skip the drop, no
-   `objlock_wrunlock` call.
+   `objlock_wrunlock` call. The error return must still free the
+   branch's owned heap strings — `free(ie_s); free(mode); free(dir);
+   free(object);` — exactly as the branch's normal tail does; skipping
+   them fails the LSan gate.
 
 5. `server.c`, `dispatch_json_query`, describe-object branch — same
-   pattern as #4.
+   pattern as #4, freeing `mode`, `dir`, and `object` before the error
+   return.
 
 6. `server.c`, `dispatch_json_query`, generic dispatch path:
    ```c
@@ -707,20 +809,23 @@ failed (nothing was acquired).
    cleared explicitly).
 
 7. `server.c`, `server_process_fast` — this function has an existing
-   `goto timing;` idiom for early error returns; use it:
+   `goto timing;` idiom for early error returns; use it. Verified
+   2026-09-15: the unlock block (`if (fast_wr) objlock_wrunlock(...)`)
+   sits before the `timing:` label (server.c:2424), so the jump already
+   bypasses both the dispatch body and the unlock, and
+   `fast_wr`/`fast_rd` are not read after the label — no flag-clearing
+   is needed:
    ```c
    int fast_wr = mode_is_schema(cmd);
    int fast_rd = !fast_wr;
    if (fast_wr) {
        if (objlock_wrlock(eff_root, object) != 0) {
            OUT("Error: lock unavailable\n");
-           fast_wr = 0; /* prevent the function's later objlock_wrunlock */
            goto timing;
        }
    } else if (fast_rd) {
        if (objlock_rdlock(eff_root, object) != 0) {
            OUT("Error: lock unavailable\n");
-           fast_rd = 0;
            goto timing;
        }
    }
@@ -764,14 +869,14 @@ failed (nothing was acquired).
     }
     ```
 
-Executor note: sites 2-7 reference "existing error-reply/idiom" rather
-than fully dictating the patch, because the exact helper names
-(`err_json`, `nql_reply_error`, etc.) must be confirmed against the live
-file at execution time rather than guessed here — grep each function for
-its other early-return-on-error branches and mirror them exactly. If a
-site's existing error machinery doesn't obviously fit (e.g. no error-reply
-helper exists on that path), stop and ask rather than improvising a new
-one.
+Executor note: sites 1, 2, 3, and 7 now quote idioms verified against
+`main` on 2026-09-15; sites 4-6 still say "existing error-reply idiom"
+because those branches' reply text should mirror their neighbors — grep
+each function for its other early-return-on-error branches and mirror
+them exactly, including their tail `free()` calls (the LSan gate fails
+on a missed free). If a site's existing error machinery doesn't
+obviously fit (e.g. no error-reply helper exists on that path), stop and
+ask rather than improvising a new one.
 
 ## Task 7 — OOM-injection unit test
 
@@ -799,36 +904,68 @@ TEST_REGISTER("test-objlock-fail-alloc-recovery", test_objlock_fail_alloc_recove
 
 ## Task 8 — docs sync
 
-`docs/concepts/concurrency.md`'s existing "Per-object rwlock ('objlock')"
-section describes the old fixed-256-bucket table and `void`-returning
-lock calls. Update it in the same diff (not deferred) to describe:
-- the pointer-indirected growable directory (initial cap 256, doubles at
-  50% load, entries never move or free until process shutdown);
+`docs/concepts/concurrency.md`'s "Per-object rwlock ('objlock')" section
+describes lock *policy* (which ops take rd vs wr) — it does **not**
+document the table's implementation, and no stale fixed-256 or void-API
+text exists anywhere in `docs/` or `README.md` (verified 2026-09-15;
+`limits.md`'s only objlock mention, the edit-field row, stays true).
+The update is therefore additive: append to that section, in the same
+diff (not deferred):
+- the pointer-indirected growable directory (initial cap **1024**,
+  doubles at 50% load, entries never move or free until process
+  shutdown);
 - immortal entries (no eviction) as the reason no stale-name/pin/refcount
   machinery is needed;
 - the new `int`-returning `objlock_rdlock`/`objlock_wrlock` contract
   (0 success, -1 allocation failure — caller must abort the operation) and
   that `objlock_rdunlock`/`objlock_wrunlock` remain `void` (lookup-only,
-  cannot fail in practice).
+  cannot fail in practice);
+- the teardown contract: entries are heap-allocated and freed only at
+  shutdown, under the same no-in-flight-operations quiescence the cache
+  shutdowns (`bt_cache_shutdown`/`slotcask_shutdown`) already require —
+  the daemon stop path joins the request-worker pool, drains in-flight
+  writes, and stops background threads before teardown; embedded
+  callers must ensure every `shard_db_query()` has returned before
+  `shard_db_close()`.
 
-Executor: read the current section in full before editing and quote its
-existing text as the anchor, rather than guessing its wording from this
-plan.
+**Preserve verbatim** the existing paragraph (~concurrency.md:126)
+stating objlock deliberately keeps default-attribute (platform-default)
+rwlocks because its API permits recursive read locks — the rewrite keeps
+NULL-attr init, so it stays true. Likewise keep the add-index/
+remove-index rationale paragraph unchanged.
+
+Out of scope for this diff but required at release: a changelog entry
+(`docs/reference/changelog.md` "Unreleased" + `docs/release-notes/`) and
+the `SHARD_DB_VERSION` bump in `src/db/version.h` — handled by the
+release checklist, not this plan.
 
 ## Acceptance criteria
 
+- Task 1 red evidence captured and included with the diff for review:
+  the shrunken-base run's `table full ... WITHOUT rwlock protection` log
+  line, plus the reverted `OBJLOCK_BUCKETS` constant diff.
 - All 12 call sites compile against the new `int`-returning signatures;
   no call site ignores the return value.
 - `test-objlock-unit` (existing) still passes unmodified.
 - `test-objlock-dynamic-growth` and `test-objlock-fail-alloc-recovery`
-  (new) pass.
+  (new) pass, and both names appear in `./build/bin/shard-db-test list`
+  (build.sh's test-source list includes the new file — a missing
+  registration would make the two criteria above silently vacuous).
 - Full suite green: `SKIP_TESTS=1 ./build.sh` then
   `./build/bin/shard-db-test run-all`.
 - ASan+UBSan and TSan gates: 3 consecutive clean `run-all` runs each, per
   Embedded execution rules.
-- `docs/concepts/concurrency.md` updated in the same diff.
+- `docs/concepts/concurrency.md` updated in the same diff (additive;
+  default-attribute-rwlock paragraph preserved verbatim).
 - No unrelated changes to `db_root_lock_acquire`, `g_dirs`, or any file
   cache.
+- Human follow-up before release (not an executor task; this repo's rule
+  is that the user runs benches): a bench spot-check (`bench-kv` /
+  `bench-kv-parallel`). The rewrite trades the old lock-free fast-path
+  probe for a short global-mutex hold on every request's lock/unlock —
+  sound (the hold is tiny vs. the rwlock op that follows), but it lands
+  immediately after the B3a/B3b perf work, so confirm no throughput
+  regression before cutting the release.
 
 ## Edge cases & invariants
 
@@ -850,6 +987,19 @@ plan.
   scenario introduced by this change) logs and returns; this is
   unchanged behavior from today's `get_lock()`-returns-NULL-on-miss case
   translated to the new lookup path — not a new failure mode.
+- **Every teardown chain frees the directory and entries** —
+  `objlock_shutdown()` lives in both teardown roots:
+  `db_cleanup_before_pools` (the init-failure chain) and
+  `shard_db_destroy_after_storage` (shared by `shard_db_close`, the
+  server's startup-failure stop at server.c:3728, and the daemon stop
+  path at server.c:3831). Missing either root leaks every entry and
+  fails the LSan gate. Entry destruction requires the quiescence
+  contract documented on `objlock_shutdown` (Task 4): the daemon path
+  joins request workers before teardown; embedded callers must have no
+  in-flight `shard_db_query()` when they call `shard_db_close()`. An
+  in-flight query holding an objlock at close is the same class of
+  misuse as holding a kfcache/btcache entry across close — not a new
+  requirement this change introduces, but now stated explicitly.
 - **`objlock_init()` is idempotent** — required because
   `test_objlock_unit.c` calls it directly against the runner's shared
   process-local `ShardDb` (per AGENTS.md's reuse-the-runner's-instance
@@ -861,3 +1011,55 @@ plan.
   real db objects, just a name string + rwlock; immortality means they
   persist for the rest of the test process, same as `test_objlock_unit.c`
   already does today.
+
+## Execution addendum — second review round (2026-09-15)
+
+Findings from the post-execution review, all fixed in the same
+uncommitted diff:
+
+1. **Legacy fast-path restore self-deadlock (pre-existing, High).**
+   `server_process_fast` classified `restore` as a plain read
+   (`restore` is absent from `mode_is_schema`) and rdlock'd it, then
+   called `cmd_restore`, which takes the object's wrlock internally — a
+   read-to-write upgrade on the same rwlock that blocks indefinitely.
+   The JSON restore branch never had this problem (it dispatches before
+   the generic take and takes no outer lock). Fixed by excluding
+   `restore` from the fast path's lock classification: restore
+   self-locks inside `cmd_restore`, identically to the JSON branch.
+   Note for the future: `cmd_reindex` also self-locks, but neither
+   dispatch path pre-locks it (the JSON `reindex` mode returns before
+   the generic take; the fast path does not dispatch reindex).
+
+2. **Regression test hardened (High).** The original mutual-exclusion
+   assert could pass spuriously against a fail-open implementation (the
+   releaser thread raced the writer's return). Replaced with a
+   deterministic design: while the reader holds the rdlock, a writer
+   thread must NOT acquire for 500ms (fail-open enters within
+   microseconds — no pass-direction timing assumption), then MUST
+   acquire after the reader releases (unbounded wait). The reader
+   worker's lock return value is now captured via an atomic and asserted
+   on main (workers cannot use t_ctx); on lock failure the worker
+   returns immediately without the matching unlock, so an unexpected
+   allocation failure cannot produce an unmatched unlock.
+
+3. **Red evidence made durable.** The prior evidence lived in /tmp and
+   was lost to a host reboot. Re-captured in an isolated worktree at
+   the base commit (3996 fail-open log lines, all four probe calls on
+   `obj-1500` unprotected) and recorded in
+   [2026-09-06-objlock-dynamic-directory.red-evidence.md](2026-09-06-objlock-dynamic-directory.red-evidence.md).
+
+4. **Judgement calls.** `objlock_test_set_fail_alloc` moved from the
+   installed `types.h` to `shard_db_internal.h`, where every other test
+   knob lives. The duplicated acquire/release bodies in the four public
+   objlock functions are factored into `objlock_entry_acquire` /
+   `objlock_entry_release`. `objlock_init`'s abort-on-OOM is documented
+   as deliberate: init-time OOM is an instance-creation failure (the
+   instance cannot serve without its lock directory), distinct from the
+   runtime fail-closed contract — peer init paths (e.g. kfcache_init)
+   don't check their calloc at all.
+
+Gate status after these fixes: default build + full `run-all` green
+(re-run below); the ASan/UBSan and TSan gates are to be run by the
+human reviewer on this final diff (TSan previously passed 3× at
+`--jobs 2` with `SHARD_TEST_WATCHDOG_SEC=600` on the pre-fix diff;
+full parallelism crashed the host).
