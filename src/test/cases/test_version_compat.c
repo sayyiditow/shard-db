@@ -24,7 +24,7 @@ static int test_version_compatibility_table(void) {
                                           SHARD_DB_REQUIRED_SOURCE_VERSION),
                   SHARD_DB_VERSION_INVALID,
                   "non-empty root without marker refuses");
-    ASSERT_EQ_INT(shard_db_version_decide("2026.08.1", 1, 0,
+    ASSERT_EQ_INT(shard_db_version_decide(SHARD_DB_REQUIRED_SOURCE_VERSION, 1, 0,
                                           SHARD_DB_VERSION,
                                           SHARD_DB_REQUIRED_SOURCE_VERSION),
                   SHARD_DB_VERSION_STAMP,
@@ -39,7 +39,7 @@ static int test_version_compatibility_table(void) {
                                           SHARD_DB_REQUIRED_SOURCE_VERSION),
                   SHARD_DB_VERSION_TOO_OLD,
                   "older version refuses");
-    ASSERT_EQ_INT(shard_db_version_decide("2026.09.1", 1, 0,
+    ASSERT_EQ_INT(shard_db_version_decide("2099.12.1", 1, 0,
                                           SHARD_DB_VERSION,
                                           SHARD_DB_REQUIRED_SOURCE_VERSION),
                   SHARD_DB_VERSION_DOWNGRADE,
@@ -60,13 +60,15 @@ static int test_version_file_roundtrip_and_check(void) {
     ASSERT_EQ_INT(shard_db_version_check(root, NULL, 0),
                   SHARD_DB_VERSION_STAMP,
                   "filesystem-empty root is eligible for initialization");
-    ASSERT_EQ_INT(shard_db_version_file_write(root, "2026.08.1"), 0,
+    ASSERT_EQ_INT(shard_db_version_file_write(root,
+                                               SHARD_DB_REQUIRED_SOURCE_VERSION), 0,
                   "wrote source marker");
     char version[64] = {0};
     ASSERT_EQ_INT(shard_db_version_file_read(root, version, sizeof(version)),
                   SHARD_DB_VERSION_FILE_OK,
                   "read source marker");
-    ASSERT_EQ_STR(version, "2026.08.1", "source marker round trips");
+    ASSERT_EQ_STR(version, SHARD_DB_REQUIRED_SOURCE_VERSION,
+                  "source marker round trips");
     ASSERT_EQ_INT(shard_db_version_check(root, version, sizeof(version)),
                   SHARD_DB_VERSION_STAMP,
                   "source marker is eligible for advancement");
