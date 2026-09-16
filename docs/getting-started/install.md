@@ -84,9 +84,9 @@ later) upgrade with a binary swap:
 ./shard-db start
 ```
 
-2026.08.2 performs no startup migration or index rebuild. Upgrade exactly as:
+2026.09.1 performs no startup migration or index rebuild. Upgrade exactly as:
 backup → stop writes → run 2026.08.1 once → wait for its startup sweep →
-cleanly stop 2026.08.1 → replace with 2026.08.2 → start and verify.
+cleanly stop 2026.08.2 → replace with 2026.09.1 → start and verify.
 A failed 2026.08.1 sweep blocks the upgrade. The new binary requires a
 populated root to carry 2026.08.1 clean-open evidence; it refuses missing,
 malformed, older, or newer markers. A later `reindex` is explicit operator

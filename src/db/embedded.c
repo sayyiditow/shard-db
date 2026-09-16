@@ -724,7 +724,7 @@ ShardDb *shard_db_open(const char *db_root) {
         } else {
             fprintf(stderr,
                     "shard_db_open: refusing to open: non-empty DB_ROOT lacks "
-                    "valid 2026.08.1/2026.08.2 compatibility evidence\n");
+                    "valid 2026.08.2/2026.09.1 compatibility evidence\n");
         }
         db_root_lock_release(&lock_fd);
         atomic_store(&g_instance_open, 0);

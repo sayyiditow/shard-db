@@ -3509,7 +3509,7 @@ int cmd_server(const char *db_root, int daemonize) {
         } else {
             fprintf(stderr,
                     "shard-db: non-empty DB_ROOT lacks valid "
-                    "2026.08.1/2026.08.2 compatibility evidence\n");
+                    "2026.08.2/2026.09.1 compatibility evidence\n");
         }
         db_root_lock_release(&lock_fd);
         return 1;

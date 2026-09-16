@@ -2,7 +2,7 @@
 
 Upload and download arbitrary files (PDFs, images, CSVs, blobs) keyed by filename. Files live flat under `<obj>/files/<filename>` — the basename is the lookup key.
 
-> **Upgrading from pre-2026.05.2?** Storage was previously bucketed at `<obj>/files/<XX>/<XX>/<filename>`. Current supported releases use the flat layout. Complete the documented 2026.08.1 compatibility step before opening with 2026.08.2; this release performs no startup migration.
+> **Upgrading from pre-2026.05.2?** Storage was previously bucketed at `<obj>/files/<XX>/<XX>/<filename>`. Current supported releases use the flat layout. Complete the documented 2026.08.2 compatibility step before opening with 2026.09.1; this release performs no startup migration.
 
 Two variants for both upload and download:
 

@@ -6,6 +6,10 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+_No changes yet._
+
+## 2026.09.1
+
 **Per-shard bulk commit pipelines + marker V2 (2026.09).** Indexed bulk
 insert/update/delete execute as one deferred request that dispatches **one
 pipeline task per touched shard** to the I/O pool — the shards'
