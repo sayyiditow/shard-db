@@ -4309,6 +4309,7 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
        thread-local g_db, so use the same process-wide fallback already
        used elsewhere in this file. */
     if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+    if (!g_db) { errno = ENODEV; return -1; }
     db->bulk_commit_window = g_db ? g_db->bulk_commit_window : 0;
 
     if (mkdirp_local(data_dir) != 0) return -1;
@@ -5416,6 +5417,8 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
     size_t span = end - begin;
     int *old_idx = NULL;
     KfInsertPlan *reserved_plans = NULL;
+    BulkDelCand *cands = NULL;
+    int *cand_base = NULL, *cand_cnt = NULL, *cand_done = NULL;
     size_t nreserved = 0;
 
     SHARD_TEST_PHASE_PAUSE(SHARD_TEST_PHASE_P);
@@ -5437,8 +5440,6 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
        segcache handle per (stream, file) run after the loop. The
        per-record verify round trips dominated bulk-delete planning. */
     int delete_kind = (shard->kind == BULK_MUTATION_DELETE);
-    BulkDelCand *cands = NULL;
-    int *cand_base = NULL, *cand_cnt = NULL, *cand_done = NULL;
     int ncand = 0;
     if (delete_kind) {
         cands     = malloc(span * 4 * sizeof(*cands));
@@ -5614,7 +5615,7 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
         if (!fb_idx) {
             for (size_t i = begin; i < end; i++) recs[i].status = -1;
             errno = ENOMEM;
-            return -1;
+            goto oom;
         }
         for (size_t i = begin; i < end; i++) {
             SlotcaskBulkRec *r = &recs[i];
@@ -5791,6 +5792,10 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
 
 oom:
 hard_fail:
+    free(cands);
+    free(cand_base);
+    free(cand_cnt);
+    free(cand_done);
     free(old_idx);
     free(reserved_plans);
     return -1;
@@ -7452,7 +7457,7 @@ static int bulk_commit_chain_flush_commit(BulkCommitChain *chain) {
             if (all[i].type != IT_BITMAP) npaths++;
         if (npaths > 0) {
             char *path_buf = malloc(npaths * PATH_MAX);
-            const char **paths = malloc(npaths * sizeof(*paths));
+            const char **paths = calloc(npaths, sizeof(*paths));
             if (!path_buf || !paths) {
                 free(all); free(path_buf); free(paths);
                 return -1;
@@ -7470,6 +7475,11 @@ static int bulk_commit_chain_flush_commit(BulkCommitChain *chain) {
                                    eff_root, object, all[i].field, shard);
                 paths[w2] = path_buf + w2 * PATH_MAX;
                 w2++;
+            }
+            if (w2 != npaths) {
+                free(all); free(path_buf); free(paths);
+                errno = EINVAL;
+                return -1;
             }
             int frc = index_sync_path_set(paths, npaths);
             free(path_buf); free(paths);

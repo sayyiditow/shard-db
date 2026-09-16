@@ -133,6 +133,7 @@ static ObjLockEntry *objlock_lookup_locked(const char *key) {
 
 void objlock_init(void) {
     if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+    if (!g_db) return;
     if (g_objlock_dir) return; /* idempotent -- tests call objlock_init()
                                   directly against the runner's shared
                                   process-local instance */
@@ -162,10 +163,12 @@ void objlock_init(void) {
    must ensure every shard_db_query() has returned before calling
    shard_db_close(). */
 void objlock_shutdown(void) {
-    /* Early-out BEFORE the mutex: dir == NULL means never inited or
-       already torn down, and a prior teardown chain may already have
-       destroyed the mutex via db_mutexes_destroy(). */
-    if (!g_objlock_dir) return;
+    if (!g_db) return;
+    /* The table directory is instance state shared with acquire/release.
+       Take the table lock before inspecting it so shutdown cannot race a
+       concurrent lookup or directory growth. The teardown contract requires
+       this function to run before db_mutexes_destroy() and only after all
+       callers have quiesced. */
     pthread_mutex_lock(&g_objlock_table_lock);
     if (g_objlock_dir) {
         for (uint32_t i = 0; i < g_objlock_dir_cap; i++) {
@@ -187,6 +190,10 @@ void objlock_shutdown(void) {
    allocation failure, already logged. */
 static ObjLockEntry *objlock_entry_acquire(const char *db_root, const char *object) {
     if (!g_db && g_shard_db_instance) g_db = g_shard_db_instance;
+    if (!g_db) {
+        errno = ENODEV;
+        return NULL;
+    }
     char key[512];
     snprintf(key, sizeof(key), "%s:%s", db_root, object);
     pthread_mutex_lock(&g_objlock_table_lock);
@@ -200,6 +207,7 @@ static ObjLockEntry *objlock_entry_acquire(const char *db_root, const char *obje
 /* Shared release-side body: lookup-only (never allocates, never grows).
    A NULL resolve is a caller bug (mismatched lock/unlock), logged. */
 static void objlock_entry_release(const char *db_root, const char *object) {
+    if (!g_db) return;
     char key[512];
     snprintf(key, sizeof(key), "%s:%s", db_root, object);
     pthread_mutex_lock(&g_objlock_table_lock);
