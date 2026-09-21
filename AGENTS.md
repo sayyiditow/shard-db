@@ -232,7 +232,7 @@ Errors always: `{"error":"..."}` — clients branch on JSON type to disambiguate
 - `"timeout_ms":N` — per-request override of global `TIMEOUT` (thread-local; doesn't leak across requests). 0/absent = global. Applies to find/count/aggregate/bulk-delete/bulk-update.
 - `"format":"csv"` — raw CSV text (not JSON-wrapped) on find/fetch/aggregate/get-multi/keys/exists-multi. Optional `delimiter` (single char, default `,`, accepts `\t` literal). RFC 4180 minus multiline. `csv + join` → tabular CSV (`<driver>.<field>` and `<as>.<field>` columns).
 - `"format":"dict"` — `{key:{...}}` on find/fetch. Rejects join.
-- `"cursor":null` (or `{}`) — opt into keyset cursor on find. Requires indexed `order_by`. Rejects `format:"csv"` and `join`. See [find.md](docs/query-protocol/find.md) for cursor protocol.
+- `"cursor":null` (or `{}`) — opt into keyset cursor on find. Requires indexed `order_by`; multi-field `order_by` (CSV/array, ≤4 fields, per-field `:asc/:desc` suffixes allowed) requires the exact composite index with fixed-width non-final parts, and one shared direction across fields (mixed directions fall back to the buffered sort without a cursor). Rejects `format:"csv"` and `join`. See [find.md](docs/query-protocol/find.md) for cursor protocol.
 
 ### Auth (scope × permission)
 

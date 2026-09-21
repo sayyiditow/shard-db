@@ -527,14 +527,23 @@ int nql_parse_command(const char *src, NqlCommand *out) {
             char *spec = argv[++i]; i++;
             char *colon = strrchr(spec, ':');
             if (colon) {
+                /* Trailing ":asc"/":desc" is a shared direction only when
+                   the field part is colon-free; otherwise the colons are
+                   per-field suffixes parsed by the query layer. */
+                char cut = *colon;
                 *colon = '\0';
-                if (spec[0] == '\0') {
-                    snprintf(out->err, sizeof out->err, "--order-by requires a field name before ':'");
-                    return -1;
-                }
-                if (normalize_order_dir(colon + 1, out->order_dir, sizeof out->order_dir) != 0) {
-                    snprintf(out->err, sizeof out->err, "invalid order direction '%s'; use 'asc' or 'desc'", colon + 1);
-                    return -1;
+                if (strchr(spec, ':') == NULL) {
+                    if (spec[0] == '\0') {
+                        snprintf(out->err, sizeof out->err, "--order-by requires a field name before ':'");
+                        return -1;
+                    }
+                    if (normalize_order_dir(colon + 1, out->order_dir, sizeof out->order_dir) != 0) {
+                        snprintf(out->err, sizeof out->err, "invalid order direction '%s'; use 'asc' or 'desc'", colon + 1);
+                        return -1;
+                    }
+                } else {
+                    *colon = cut;   /* per-field suffixes; keep whole spec */
+                    snprintf(out->order_dir, sizeof out->order_dir, "asc");
                 }
             }
             else         snprintf(out->order_dir,sizeof out->order_dir,"asc");

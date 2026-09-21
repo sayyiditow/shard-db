@@ -35,8 +35,8 @@ Required: `mode`, `dir`, `object`, `criteria`.
 | `limit` | int | `GLOBAL_LIMIT` | Max records to return. |
 | `fields` | string OR array | all | Projection. `"name,email"` or `["name","email"]`. |
 | `excludedKeys` | string OR array | none | Skip these keys from results. Comma-separated or array. |
-| `order_by` | string | — | Sort by this field; matches are buffered and sorted before pagination. |
-| `order` | `"asc"` or `"desc"` | `"asc"` | Sort direction when `order_by` is set. |
+| `order_by` | string (CSV) or array of strings | — | Sort by one or more fields (`"a,b"` or `["a","b"]`, max 4, shared direction). Each part may carry its own `:asc`/`:desc` suffix. Without `cursor`, matches are buffered and sorted before pagination. Multi-field cursor pagination requires the exact composite index (see [Cursor rules](#cursor-rules)). |
+| `order` | `"asc"` or `"desc"` | `"asc"` | Shared sort direction when `order_by` is set; per-field suffixes override it per part. |
 | `total` | bool | false | When `cursor` pagination is active, also return the total match count in a single round-trip. Adds O(1) metadata cost. |
 | `format` | `"rows"` / `"csv"` / `"dict"` | JSON array | See response shapes below. Ignored when `join` is present (always tabular). |
 | `join` | array | none | See [joins](joins.md). |
@@ -275,9 +275,25 @@ To get both the page results and the total match count in a single request:
 
 The `total` field contains the complete match count against the criteria, allowing UI pagination controls to render "Page 1 of N" immediately. `total` has negligible cost (O(1) metadata read) and only applies when cursor pagination is active (`cursor:null` or `cursor:{...}`).
 
+### Multi-field cursor
+
+```json
+{"mode":"find","dir":"default","object":"orders","criteria":[],
+ "order_by":["tenant","day"],"order":"asc","limit":100,"cursor":null}
+{"rows":[…],"cursor":{"tenant":"7","day":"2026-09-01","key":"ord_4912"}}
+```
+
+Paging is by the tuple `(tenant, day, key)` — O(limit) at any depth.
+Create the composite first: `add-index default orders tenant+day`. Without
+a cursor field in the request, multi-field `order_by` still works via the
+buffered sort (no index needed), including mixed per-field directions
+(`["tenant:asc","day:desc"]`); the cursor form requires one shared
+direction across all fields.
+
 ### Cursor rules
 
-- `order_by` field **must be indexed** — cursor queries reject otherwise with a clear error.
+- `order_by` field(s) **must be indexed** — single-field cursor requires that field's index; multi-field cursor requires the exact composite index `f1+f2+…+fN` and rejects `varchar` in any non-final part (fixed-width parts keep byte order equal to tuple order). Errors name the index to add.
+- Per-field directions (`"a:asc","b:desc"` or `["a:asc","b:desc"]`) are allowed; parts without a suffix inherit the shared `order`. Cursor pagination requires all fields to share one direction (the composite btree is a single byte order); mixed-direction queries fall back to the buffered sort (no cursor). More than 4 fields is rejected.
 - Cursor tie-breaks on `hash16(primary_key)` when multiple rows share the same `order_by` value, so pagination is stable across ties.
 - `cursor:null` or `cursor:{}` in the request opts into cursor mode (page 1, walks from start/end).
 - Omitting `cursor` entirely keeps backward-compat behaviour (unwrapped array, buffer-sort for `order_by`).

@@ -1733,7 +1733,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *fmt = json_obj_strdup(&req, "format");
         char *delim = json_obj_strdup(&req, "delimiter");
         char *join = json_obj_strdup_raw(&req, "join");
-        char *ob = json_obj_strdup(&req, "order_by");
+        char *ob = json_obj_string_or_array(&req, "order_by");
         char *od = json_obj_strdup(&req, "order");
         char *cur = json_obj_strdup_raw(&req, "cursor");
         int off = off_s ? atoi(off_s) : 0;
