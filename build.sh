@@ -225,6 +225,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_request_timeout.c \
     src/test/cases/test_and_intersection.c \
     src/test/cases/test_find_cursor.c \
+    src/test/cases/test_multi_order_cursor.c \
     src/test/cases/test_schema_export.c \
     src/test/cases/test_bulk_cas.c \
     src/test/cases/test_token_perms.c \

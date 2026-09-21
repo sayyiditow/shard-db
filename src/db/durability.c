@@ -93,10 +93,13 @@ int durability_msync_range(void *base, size_t offset, size_t len) {
         __atomic_store_n(&page_size, ps, __ATOMIC_RELAXED);
     }
     uintptr_t addr = (uintptr_t)base + offset;
-    uintptr_t aligned = addr & ~((uintptr_t)page_size - 1);
+    /* Arithmetic uses the atomic-loaded local, never the plain static —
+       a plain read here would race another thread's __atomic_store_n
+       above. */
+    uintptr_t aligned = addr & ~((uintptr_t)ps - 1);
     size_t front_pad = (size_t)(addr - aligned);
     size_t sync_len = len + front_pad;
-    sync_len = (sync_len + (size_t)page_size - 1) & ~((size_t)page_size - 1);
+    sync_len = (sync_len + (size_t)ps - 1) & ~((size_t)ps - 1);
     return durability_msync((void *)aligned, sync_len);
 }
 

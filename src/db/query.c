@@ -5824,19 +5824,181 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
 
 /* find <object> <criteria_json> [offset] [limit] [fields]
    criteria_json: [{"field":"name","op":"contains","value":"ali"},{"field":"age","op":"gte","value":"18"}] */
+/* ========== Multi-field order_by (shared by cursor + buffer-sort) ======
+   order_by accepts a CSV string ("a,b") or, on the wire, a JSON array that
+   server.c flattens to CSV via json_obj_string_or_array. One shared sort
+   direction. Cursor mode additionally requires the exact composite index
+   "a+b+…" and fixed-width (non-varchar) encodings for every non-final
+   part: composite leaf values are enc(f1)‖…‖enc(fN)‖hash16 with varchar
+   parts as raw content bytes, so only fixed-width prefixes guarantee that
+   byte order equals tuple order. */
+#define MAX_ORDER_FIELDS 4
+
+typedef struct {
+    char              name[256];
+    int               idx;    /* typed-schema index, -1 = unresolved */
+    const TypedField *tf;
+    int               dir;    /* resolved: 0=asc, 1=desc */
+} OrderSpecPart;
+
+typedef struct {
+    int           n;
+    OrderSpecPart parts[MAX_ORDER_FIELDS];
+} OrderSpec;
+
+/* Split the order_by CSV into trimmed part names with optional per-part
+   direction suffixes ("name:asc" / "name:desc"; a bare name inherits
+   shared_desc). Returns 0 on success, -1 with *err set. Purely lexical —
+   no schema access. Field names never contain ':' (the CLI's own
+   --order-by parser has always relied on that), so a suffix is
+   unambiguous. */
+static int order_by_split(const char *csv,
+                          OrderSpecPart parts[],
+                          int *nparts, const char **err) {
+    *nparts = 0;
+    if (!csv || !csv[0]) { *err = "cursor requires order_by"; return -1; }
+    const char *p = csv;
+    while (*p) {
+        if (*nparts >= MAX_ORDER_FIELDS) {
+            *err = "order_by supports at most 4 fields"; return -1;
+        }
+        /* trim leading spaces */
+        while (*p == ' ' || *p == '\t') p++;
+        char *dst = parts[(*nparts)].name;
+        int len = 0;
+        while (*p && *p != ',') {
+            if (len >= 255) { *err = "order_by field name too long"; return -1; }
+            dst[len++] = *p++;
+        }
+        /* trim trailing spaces */
+        while (len > 0 && (dst[len-1] == ' ' || dst[len-1] == '\t')) len--;
+        dst[len] = '\0';
+        if (len == 0) { *err = "order_by contains an empty field name"; return -1; }
+        /* optional per-part direction suffix (last ':') */
+        parts[(*nparts)].dir = -1;
+        for (int l = len - 1; l >= 0; l--) {
+            if (dst[l] != ':') continue;
+            const char *d = dst + l + 1;
+            if (strcmp(d, "asc") == 0)       parts[(*nparts)].dir = 0;
+            else if (strcmp(d, "desc") == 0) parts[(*nparts)].dir = 1;
+            else {
+                *err = "invalid per-field order direction; use asc or desc";
+                return -1;
+            }
+            if (l == 0) { *err = "order_by contains an empty field name"; return -1; }
+            dst[l] = '\0';
+            break;
+        }
+        (*nparts)++;
+        if (*p == ',') {
+            p++;
+            if (!*p) { *err = "order_by contains an empty field name"; return -1; }
+        }
+    }
+    if (*nparts == 0) { *err = "order_by contains an empty field name"; return -1; }
+    return 0;
+}
+
+/* Split + resolve every part against the typed schema, merging the shared
+   direction with per-part suffixes (suffix wins). Single-field queries
+   keep full legacy behavior: an unresolved name returns success with
+   idx=-1 so the caller's legacy fallbacks (btree_idx_exists check,
+   decode_field) apply unchanged. Multi-field requires every part to
+   resolve. */
+static int order_spec_resolve(const FieldSchema *fs,
+                              const char *order_by_csv,
+                              int shared_desc,
+                              OrderSpec *out,
+                              const char **err) {
+    memset(out, 0, sizeof(*out));
+    if (order_by_split(order_by_csv, out->parts,
+                       &out->n, err) != 0) return -1;
+    for (int i = 0; i < out->n; i++)
+        if (out->parts[i].dir < 0) out->parts[i].dir = shared_desc ? 1 : 0;
+    if (out->n == 1 && (!fs || !fs->ts)) { out->parts[0].idx = -1; return 0; }
+    for (int i = 0; i < out->n; i++) {
+        out->parts[i].idx = -1;
+        out->parts[i].tf  = NULL;
+        if (fs && fs->ts) {
+            for (int j = 0; j < fs->ts->nfields; j++) {
+                if (strcmp(fs->ts->fields[j].name, out->parts[i].name) == 0) {
+                    out->parts[i].idx = j;
+                    out->parts[i].tf  = &fs->ts->fields[j];
+                    break;
+                }
+            }
+        }
+        if (out->parts[i].idx < 0) {
+            if (out->n == 1) return 0;   /* legacy single-field fallback */
+            *err = "multi-field order_by field is not in the typed schema";
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* "a,b,c" → "a+b+c" (the composite index directory name). */
+static void order_spec_composite_name(const OrderSpec *os,
+                                      char *out, size_t cap) {
+    size_t pos = 0;
+    out[0] = '\0';
+    for (int i = 0; i < os->n && pos < cap; i++) {
+        int w = snprintf(out + pos, cap - pos, "%s%s",
+                         i ? "+" : "", os->parts[i].name);
+        if (w < 0 || (size_t)w >= cap - pos) return;
+        pos += (size_t)w;
+    }
+}
+
+/* 1 = every non-final part has a fixed-width index encoding. */
+static int order_spec_nonfinal_fixed(const OrderSpec *os) {
+    for (int i = 0; i + 1 < os->n; i++)
+        if (os->parts[i].tf && os->parts[i].tf->type == FT_VARCHAR) return 0;
+    return 1;
+}
+
+/* 1 = all parts share one direction. The composite btree is a single byte
+   order (forward = ASC, reverse = DESC), so this is the prerequisite for
+   serving a query from the index walk. */
+static int order_spec_uniform(const OrderSpec *os) {
+    for (int i = 1; i < os->n; i++)
+        if (os->parts[i].dir != os->parts[0].dir) return 0;
+    return 1;
+}
+
 /* ===== Ordered find: buffer matches, sort, emit slice =====
    Used when caller sets order_by on find mode. Joins are not supported in
    this path (caller rejects the combination). Full-scan based; an indexed
    ordered scan is a v2 item. */
+/* One order_by part's sort payload for a buffered row. Typed fields carry
+   their memcmp-natural index-key encoding (exact for every type — a
+   double conversion of the rendered string loses precision past 2^53,
+   e.g. 17-digit datetimems values); the legacy untyped single field
+   carries its decoded string instead. */
+typedef struct {
+    uint8_t *key;       /* typed index-key bytes; NULL on the legacy path */
+    size_t   key_len;
+    char    *str;       /* legacy decoded string */
+    int      dir;       /* 0=asc, 1=desc */
+} RowSortKey;
+
 typedef struct {
     char *key;
     size_t key_len;
     uint8_t *record;        /* malloc'd copy of [key bytes | value bytes] */
     size_t value_len;       /* length of the value portion */
-    char *sort_str;         /* extracted sort field as string (may be NULL) */
-    double sort_num;        /* numeric form, valid iff sort_is_num */
-    int sort_is_num;
+    RowSortKey keys[MAX_ORDER_FIELDS];
+    int nsort;
 } OrderedRow;
+
+/* Release one row's per-part sort payloads. Also used on the extraction
+   scratch before ownership transfers into a row. */
+static void row_sort_keys_release(RowSortKey *keys) {
+    for (int i = 0; i < MAX_ORDER_FIELDS; i++) {
+        free(keys[i].key);
+        free(keys[i].str);
+    }
+}
 
 typedef struct {
     OrderedRow *rows;
@@ -5844,12 +6006,12 @@ typedef struct {
     size_t cap;
     CriteriaNode *tree;
     FieldSchema *fs;
-    int order_field_idx;    /* index in typed schema, -1 if field unknown/untyped */
-    const char *order_field_name;
+    const OrderSpec *ospec;  /* resolved parts (n = 0 without order_by) */
+    const char *order_field_name;    /* full order_by string (legacy single-field fallback) */
+    int nsort;
     ExcludedKeys *excluded;
     QueryDeadline *deadline;
     int dl_counter;
-    int order_is_numeric;
     size_t buffer_bytes;    /* running total for QUERY_BUFFER_MB cap */
     /* Lock-free reads (line 7959 fast-skip in the per-record callback;
        line 8553 post-scan check) intentionally don't take oc->lock — _Atomic
@@ -5882,22 +6044,46 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
     const uint8_t *raw = block + hdr->key_len;
     if (!criteria_match_tree(raw, hdr->value_len, oc->tree, oc->fs)) return 0;
 
-    /* Extract sort key */
-    char *sv = NULL;
-    if (oc->fs && oc->fs->ts && oc->order_field_idx >= 0) {
-        sv = typed_get_field_str(oc->fs->ts, raw, (int)hdr->value_len, oc->order_field_idx);
-    } else {
-        sv = decode_field((const char *)raw, hdr->value_len, oc->order_field_name, oc->fs);
+    /* Extract per-part sort keys (see RowSortKey: typed parts use their
+       index-key encoding, the legacy untyped single field its decoded
+       string). */
+    RowSortKey sv[MAX_ORDER_FIELDS];
+    size_t sv_bytes = 0;
+    for (int i = 0; i < MAX_ORDER_FIELDS; i++) {
+        sv[i].key = NULL; sv[i].key_len = 0;
+        sv[i].str = NULL; sv[i].dir = 0;
+    }
+    for (int i = 0; i < oc->nsort; i++) {
+        const OrderSpecPart *p = &oc->ospec->parts[i];
+        sv[i].dir = p->dir;
+        if (oc->fs && oc->fs->ts && p->idx >= 0 && p->tf) {
+            size_t cap = (size_t)p->tf->size > 16 ? (size_t)p->tf->size : 16;
+            sv[i].key = malloc(cap);
+            if (sv[i].key) {
+                typed_field_to_index_key(oc->fs->ts, raw,
+                                         (size_t)hdr->value_len, p->idx,
+                                         sv[i].key, &sv[i].key_len);
+                /* A zero-length key is valid — an empty varchar encodes to
+                   no content bytes — and must compare against non-empty
+                   values, never collapse to the legacy-string path. */
+                sv_bytes += sv[i].key_len;
+            }
+        } else if (i == 0) {
+            /* legacy single-field fallback (untyped/unknown name) */
+            sv[0].str = decode_field((const char *)raw, hdr->value_len,
+                                     oc->order_field_name, oc->fs);
+            if (sv[0].str) sv_bytes += strlen(sv[0].str) + 1;
+        }
     }
 
     size_t rec_len = (size_t)hdr->key_len + (size_t)hdr->value_len;
-    size_t row_bytes = sizeof(OrderedRow) + hdr->key_len + rec_len + (sv ? strlen(sv) + 1 : 0);
+    size_t row_bytes = sizeof(OrderedRow) + hdr->key_len + rec_len + sv_bytes;
 
     pthread_mutex_lock(&oc->lock);
     if (oc->buffer_bytes + row_bytes > g_query_buffer_max_bytes) {
         oc->budget_exceeded = 1;
         pthread_mutex_unlock(&oc->lock);
-        free(sv);
+        row_sort_keys_release(sv);
         return 1;  /* stop scan */
     }
     oc->buffer_bytes += row_bytes;
@@ -5910,7 +6096,7 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
             oc->cap = 0;
             oc->budget_exceeded = 1;
             pthread_mutex_unlock(&oc->lock);
-            free(sv);
+            row_sort_keys_release(sv);
             return 1;
         }
         oc->rows = t;
@@ -5924,9 +6110,13 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
     r->value_len = hdr->value_len;
     r->record = malloc(rec_len);
     memcpy(r->record, block, rec_len);
-    r->sort_str = sv;
-    r->sort_is_num = oc->order_is_numeric;
-    r->sort_num = (oc->order_is_numeric && sv) ? atof(sv) : 0.0;
+    r->nsort = oc->nsort;
+    for (int i = 0; i < MAX_ORDER_FIELDS; i++) {
+        r->keys[i].key = sv[i].key;
+        r->keys[i].key_len = sv[i].key_len;
+        r->keys[i].str = sv[i].str;
+        r->keys[i].dir = sv[i].dir;
+    }
     pthread_mutex_unlock(&oc->lock);
     return 0;
 }
@@ -5934,21 +6124,28 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
 static int cmp_row_asc(const void *a, const void *b) {
     const OrderedRow *ra = (const OrderedRow *)a;
     const OrderedRow *rb = (const OrderedRow *)b;
-    if (ra->sort_is_num) {
-        if (ra->sort_num < rb->sort_num) return -1;
-        if (ra->sort_num > rb->sort_num) return  1;
-        return 0;
+    int n = ra->nsort < rb->nsort ? ra->nsort : rb->nsort;
+    for (int i = 0; i < n; i++) {
+        const RowSortKey *ka = &ra->keys[i];
+        const RowSortKey *kb = &rb->keys[i];
+        int c;
+        if (ka->key && kb->key) {
+            /* Typed part: memcmp over the index-key encoding, with the
+               standard length tiebreak (matches the btree's own varlen
+               compare). */
+            size_t m = ka->key_len < kb->key_len ? ka->key_len : kb->key_len;
+            c = memcmp(ka->key, kb->key, m);
+            if (c == 0)
+                c = ka->key_len < kb->key_len ? -1 :
+                    ka->key_len > kb->key_len ?  1 : 0;
+        } else {
+            const char *sa = ka->str ? ka->str : "";
+            const char *sb = kb->str ? kb->str : "";
+            c = strcmp(sa, sb);
+        }
+        if (c) return ka->dir ? -c : c;
     }
-    const char *sa = ra->sort_str ? ra->sort_str : "";
-    const char *sb = rb->sort_str ? rb->sort_str : "";
-    return strcmp(sa, sb);
-}
-static int cmp_row_desc(const void *a, const void *b) { return -cmp_row_asc(a, b); }
-
-static int typed_field_is_numeric(uint8_t ft) {
-    return ft == FT_INT || ft == FT_LONG || ft == FT_SHORT || ft == FT_DOUBLE ||
-           ft == FT_NUMERIC || ft == FT_DATE || ft == FT_DATETIME ||
-           ft == FT_DATETIMEMS || ft == FT_BOOL || ft == FT_BYTE;
+    return 0;
 }
 
 /* ========== Find cursor (keyset pagination) ==========
@@ -5969,8 +6166,8 @@ static int typed_field_is_numeric(uint8_t ft) {
      position, matching standard keyset semantics) */
 typedef struct {
     int    present;
-    char   value[1024];      /* textual value of the order_by field */
-    size_t vlen;
+    int    nparts;
+    struct { char value[1024]; size_t vlen; } part[MAX_ORDER_FIELDS];
     char   key[1024];        /* primary key string */
     size_t klen;
 } FindCursor;
@@ -5986,7 +6183,8 @@ typedef struct {
 static int parse_cursor_object(const char *cursor_json, const char *order_by,
                                FindCursor *out, const char **err) {
     out->present = 0;
-    out->vlen = 0;
+    out->nparts = 0;
+    for (int i = 0; i < MAX_ORDER_FIELDS; i++) out->part[i].vlen = 0;
     out->klen = 0;
     if (!cursor_json || !cursor_json[0]) return 1;
 
@@ -6020,13 +6218,21 @@ static int parse_cursor_object(const char *cursor_json, const char *order_by,
         *err = "cursor requires order_by";
         return -1;
     }
-    char *vv = json_obj_strdup(&c, order_by);
-    if (!vv) { *err = "cursor missing order_by field value"; return -1; }
-    size_t vlen = strlen(vv);
-    if (vlen >= sizeof(out->value)) { free(vv); *err = "cursor value too long"; return -1; }
-    memcpy(out->value, vv, vlen + 1);
-    out->vlen = vlen;
-    free(vv);
+    OrderSpecPart names[MAX_ORDER_FIELDS];
+    int  nparts = 0;
+    if (order_by_split(order_by, names, &nparts, err) != 0) return -1;
+    for (int i = 0; i < nparts; i++) {
+        char *vv = json_obj_strdup(&c, names[i].name);
+        if (!vv) { *err = "cursor missing order_by field value"; return -1; }
+        size_t vlen = strlen(vv);
+        if (vlen >= sizeof(out->part[i].value)) {
+            free(vv); *err = "cursor value too long"; return -1;
+        }
+        memcpy(out->part[i].value, vv, vlen + 1);
+        out->part[i].vlen = vlen;
+        free(vv);
+    }
+    out->nparts = nparts;
 
     out->present = 1;
     return 0;
@@ -6064,9 +6270,14 @@ typedef struct {
     const TypedField *order_tf;         /* for value-str extraction */
     int               order_field_idx;
 
-    /* Captured last-emitted cursor (raw bytes). Heap-owned, freed by caller. */
-    char          *last_value_str;
+    /* Captured last-emitted cursor: one JSON-escaped string per order_by
+       part. Heap-owned, freed by caller. */
+    char          *last_value[MAX_ORDER_FIELDS];
     char          *last_key_str;
+
+    /* Multi-field order_by parts (single-field paths: n == 1). NULL on
+       paths that never emit a cursor token. */
+    const OrderSpec *ospec;
 
     /* Offset semantics for ordered find. Decremented per entry that would
        otherwise emit; emit only fires once skip_remaining hits zero. When
@@ -6258,15 +6469,20 @@ static int cursor_find_cb(const char *val, size_t vlen,
     /* Capture this row's (order_by_value, key) as the next-page cursor. Each
        emit overwrites, so after the walk the stored pair is the last row
        emitted — which is exactly what we send back. */
-    free(c->last_value_str);
+    for (int i = 0; i < MAX_ORDER_FIELDS; i++) {
+        free(c->last_value[i]);
+        c->last_value[i] = NULL;
+    }
     free(c->last_key_str);
-    /* When order_tf is non-NULL it was resolved from c->fs->ts, so both
-       pointers are non-NULL here in practice — the explicit checks mirror
-       the defensive pattern at the OrderedCollectCtx callback (line 8000)
-       and silence Coverity's flow-insensitive FORWARD_NULL on c->fs. */
-    c->last_value_str = (c->order_tf && c->fs && c->fs->ts)
-        ? json_escape_field(typed_get_field_str(c->fs->ts, raw, (int)value_len, c->order_field_idx))
-        : NULL;
+    /* Decode each part from the fetched record (never from index bytes).
+       c->ospec is NULL only on paths that never emit a token. */
+    if (c->ospec && c->fs && c->fs->ts) {
+        for (int i = 0; i < c->ospec->n; i++) {
+            c->last_value[i] = json_escape_field(
+                typed_get_field_str(c->fs->ts, raw, (int)value_len,
+                                    c->ospec->parts[i].idx));
+        }
+    }
     c->last_key_str = strndup(key_buf, klen);
 
     c->printed++;
@@ -6869,7 +7085,7 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
 
     free(heap);
     free(fc.fullbuf);
-    free(cc.last_value_str);
+    for (int i = 0; i < MAX_ORDER_FIELDS; i++) free(cc.last_value[i]);
     free(cc.last_key_str);
     return fc.n_matched;
 }
@@ -7287,16 +7503,73 @@ static int cmd_find_do(const char *db_root, const char *object,
 
     {
         char verr[256];
-        if (validate_criteria_tree_fields(tree, driver_fs.ts, verr, sizeof(verr)) < 0 ||
-            (proj_count > 0 && validate_field_list(proj_fields, proj_count, driver_fs.ts,
-                                                   "projection", verr, sizeof(verr)) < 0) ||
-            (order_by && order_by[0] && validate_field(driver_fs.ts, order_by,
-                                                       "order_by", verr, sizeof(verr)) < 0)) {
+        int vbad =
+            validate_criteria_tree_fields(tree, driver_fs.ts,
+                                          verr, sizeof(verr)) < 0 ||
+            (proj_count > 0 && validate_field_list(proj_fields, proj_count,
+                                                   driver_fs.ts,
+                                                   "projection", verr,
+                                                   sizeof(verr)) < 0);
+        /* order_by may be a CSV list ("a,b") with per-part ":asc/:desc"
+           suffixes — split first, then validate each bare field name.
+           Split-level errors (too many fields, empty part, bad suffix)
+           surface here, before any dispatch. */
+        if (!vbad && order_by && order_by[0]) {
+            OrderSpecPart oparts[MAX_ORDER_FIELDS];
+            int  on = 0;
+            const char *oerr = NULL;
+            if (order_by_split(order_by, oparts, &on, &oerr) != 0) {
+                OUT("{\"error\":\"%s\"}\n", oerr);
+                free_joins(joins, njoins);
+                free_excluded(&excluded);
+                return -1;
+            }
+            for (int i = 0; i < on && !vbad; i++) {
+                if (validate_field(driver_fs.ts, oparts[i].name, "order_by",
+                                   verr, sizeof(verr)) < 0)
+                    vbad = 1;
+            }
+        }
+        if (vbad) {
             OUT("{\"error\":\"%s\"}\n", verr);
             free_joins(joins, njoins);
             free_excluded(&excluded);
             return -1;
         }
+    }
+
+    /* Resolve order_by parts once (already validated above): names,
+       typed-schema indexes, and merged directions. Consumed by the cursor
+       branch, the D2 fetch-sort guard, and the buffered fallback. Plain
+       finds without order_by keep an empty OrderSpec (n = 0) and are
+       untouched — every ospec consumer sits behind a path that requires
+       order_by (cursor parse errors out first; D2 / indexed-walk /
+       buffered are gated by fp.order / has_order). */
+    OrderSpec ospec;
+    memset(&ospec, 0, sizeof(ospec));
+    if (order_by && order_by[0]) {
+        int shared_desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
+                                         strcmp(order_dir, "DESC") == 0));
+        const char *ospec_err = NULL;
+        if (order_spec_resolve(&driver_fs, order_by, shared_desc,
+                               &ospec, &ospec_err) != 0) {
+            OUT("{\"error\":\"%s\"}\n",
+                ospec_err ? ospec_err : "invalid order_by");
+            free_joins(joins, njoins);
+            free_excluded(&excluded);
+            return -1;
+        }
+    }
+    /* Normalize a single-field order_by ("name:dir" suffix stripped) so
+       every downstream single-field consumer (planner hint, indexed-walk
+       fast path, D2) sees the bare field name. Multi-field CSV keeps
+       flowing unchanged: no index matches it, so those paths fall through
+       to the buffered sort. */
+    char order_norm[256];
+    if (order_by && order_by[0] && ospec.n == 1 &&
+        strcmp(ospec.parts[0].name, order_by) != 0) {
+        snprintf(order_norm, sizeof(order_norm), "%s", ospec.parts[0].name);
+        order_by = order_norm;
     }
 
     compile_criteria_tree(tree, driver_fs.ts);
@@ -7339,15 +7612,39 @@ static int cmd_find_do(const char *db_root, const char *object,
         }
 
         /* order_by must be indexed (hard requirement for cursor). */
-        if (!btree_idx_exists(db_root, object, order_by, sch.splits)) {
-            OUT("{\"error\":\"cursor requires order_by field to be indexed\",\"field\":\"%s\"}\n",
-                order_by);
-            free_joins(joins, njoins); free_excluded(&excluded);
-            return -1;
+        char composite_name[1100] = "";   /* set below when n > 1 */
+        if (ospec.n == 1) {
+            if (!btree_idx_exists(db_root, object, order_by, sch.splits)) {
+                OUT("{\"error\":\"cursor requires order_by field to be indexed\",\"field\":\"%s\"}\n",
+                    order_by);
+                free_joins(joins, njoins); free_excluded(&excluded);
+                return -1;
+            }
+        } else {
+            if (!order_spec_uniform(&ospec)) {
+                OUT("{\"error\":\"cursor pagination requires one shared order direction across all order_by fields\","
+                    "\"order_by\":\"%s\"}\n", order_by);
+                free_joins(joins, njoins); free_excluded(&excluded);
+                return -1;
+            }
+            if (!order_spec_nonfinal_fixed(&ospec)) {
+                OUT("{\"error\":\"multi-field order_by requires all but the last field to be fixed-width (non-varchar)\","
+                    "\"order_by\":\"%s\"}\n", order_by);
+                free_joins(joins, njoins); free_excluded(&excluded);
+                return -1;
+            }
+            order_spec_composite_name(&ospec, composite_name, sizeof(composite_name));
+            if (!btree_idx_exists(db_root, object, composite_name, sch.splits)) {
+                OUT("{\"error\":\"multi-field order_by requires a composite index\",\"index\":\"%s\"}\n",
+                    composite_name);
+                free_joins(joins, njoins); free_excluded(&excluded);
+                return -1;
+            }
         }
 
-        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
-                                   strcmp(order_dir, "DESC") == 0));
+        /* Per-part suffixes override the shared order; uniformity was
+           validated above, so part 0's direction is the walk direction. */
+        int desc = ospec.parts[0].dir;
 
         /* Resolve order_by's TypedField for encoding + value extraction. */
         const TypedField *order_tf = NULL;
@@ -7362,19 +7659,25 @@ static int cmd_find_do(const char *db_root, const char *object,
             }
         }
 
-        /* parse_cursor_object has no schema access, so its order_by value is
-           still JSON-escaped text. Decode it before using it as the index
-           seek bound. */
-        if (cur.present && order_tf && order_tf->type == FT_VARCHAR) {
-            char *unesc = NULL; size_t ulen = 0;
-            if (json_unescape_cstring(cur.value, cur.vlen, &unesc, &ulen) != 0) {
-                OUT("{\"error\":\"cursor order_by value has a malformed JSON escape\"}\n");
-                free_joins(joins, njoins); free_excluded(&excluded);
-                return -1;
+        /* parse_cursor_object has no schema access, so its order_by values
+           are still JSON-escaped text. Unescape varchar parts before index
+           encoding. */
+        if (cur.present) {
+            for (int i = 0; i < ospec.n; i++) {
+                if (ospec.parts[i].tf && ospec.parts[i].tf->type == FT_VARCHAR) {
+                    char *unesc = NULL; size_t ulen = 0;
+                    if (json_unescape_cstring(cur.part[i].value,
+                                              cur.part[i].vlen,
+                                              &unesc, &ulen) != 0) {
+                        OUT("{\"error\":\"cursor order_by value has a malformed JSON escape\"}\n");
+                        free_joins(joins, njoins); free_excluded(&excluded);
+                        return -1;
+                    }
+                    memcpy(cur.part[i].value, unesc, ulen + 1);
+                    cur.part[i].vlen = ulen;
+                    free(unesc);
+                }
             }
-            memcpy(cur.value, unesc, ulen + 1);
-            cur.vlen = ulen;
-            free(unesc);
         }
 
         /* Encode cursor value bytes for walk bounds. If cursor absent (page 1),
@@ -7384,14 +7687,29 @@ static int cmd_find_do(const char *db_root, const char *object,
         size_t  cur_value_len = 0;
         int     has_cur_bytes = 0;
         if (cur.present) {
-            if (order_tf) {
-                encode_field_for_index(order_tf, cur.value, cur.vlen,
-                                       cur_value_buf, &cur_value_len);
-            } else {
-                /* Composite/unknown — raw bytes. */
-                size_t cap = sizeof(cur_value_buf);
-                cur_value_len = cur.vlen < cap ? cur.vlen : cap;
-                memcpy(cur_value_buf, cur.value, cur_value_len);
+            /* Concatenate per-part encodings. With all non-final parts
+               fixed-width, byte order of the concatenation equals tuple
+               order, so cursor_find_cb's existing single-value compare +
+               hash16 tiebreak paginates the tuple correctly. */
+            for (int i = 0; i < ospec.n; i++) {
+                size_t plen = 0;
+                if (cur_value_len >= sizeof(cur_value_buf)) break;
+                if (ospec.parts[i].tf) {
+                    encode_field_for_index(ospec.parts[i].tf,
+                                           cur.part[i].value,
+                                           cur.part[i].vlen,
+                                           cur_value_buf + cur_value_len,
+                                           &plen);
+                    if (plen > sizeof(cur_value_buf) - cur_value_len)
+                        plen = sizeof(cur_value_buf) - cur_value_len;
+                } else {
+                    plen = cur.part[i].vlen;
+                    if (plen > sizeof(cur_value_buf) - cur_value_len)
+                        plen = sizeof(cur_value_buf) - cur_value_len;
+                    memcpy(cur_value_buf + cur_value_len,
+                           cur.part[i].value, plen);
+                }
+                cur_value_len += plen;
             }
             has_cur_bytes = 1;
         }
@@ -7473,6 +7791,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                 c1_ks = cursor_fp.prefilter_card;
             if (prefer_fetch_sort(c1_ks, cursor_N_live, offset, limit,
                                   cursor_fp.source_is_bitmap) &&
+                 ospec.n == 1 &&
                  order_tf && driver_fs.ts && order_field_idx >= 0) {
             size_t n_pre = keyset_size(cursor_prefilter_ks);
             struct timespec t1, t2, t3, t4;
@@ -7672,6 +7991,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                 cc.printed         = 0;
                 cc.order_tf        = order_tf;
                 cc.order_field_idx = order_field_idx;
+                cc.ospec           = &ospec;
                 cc.skip_remaining  = offset > 0 ? offset : 0;
                 cc.offset_mode     = 1;
                 cc.deadline        = &cdl;
@@ -7684,10 +8004,19 @@ static int cmd_find_do(const char *db_root, const char *object,
                                        sp_rows[i].hash, NULL, &cc) < 0) break;
                 }
                 OUT(dict_fmt ? "}" : "]");
-                if (cc.printed >= limit && cc.last_value_str
-                    && cc.last_key_str) {
-                    OUT(",\"cursor\":{\"%s\":\"%s\",\"key\":\"%s\"}",
-                        order_by, cc.last_value_str, cc.last_key_str);
+                if (cc.printed >= limit && cc.last_key_str) {
+                    int vals_ok = 1;
+                    for (int i = 0; i < ospec.n; i++)
+                        if (!cc.last_value[i]) vals_ok = 0;
+                    if (vals_ok) {
+                        OUT(",\"cursor\":{");
+                        for (int i = 0; i < ospec.n; i++)
+                            OUT("%s\"%s\":\"%s\"", i ? "," : "",
+                                ospec.parts[i].name, cc.last_value[i]);
+                        OUT(",\"key\":\"%s\"}", cc.last_key_str);
+                    } else {
+                        OUT(",\"cursor\":null");
+                    }
                 } else {
                     OUT(",\"cursor\":null");
                 }
@@ -7706,7 +8035,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                 }
                 OUT("}\n");
                 free(sp_rows);
-                free(cc.last_value_str);
+                for (int i = 0; i < MAX_ORDER_FIELDS; i++) free(cc.last_value[i]);
                 free(cc.last_key_str);
                 keyset_free(cursor_prefilter_ks);
                 free_joins(joins, njoins);
@@ -7739,6 +8068,7 @@ static int cmd_find_do(const char *db_root, const char *object,
         cc.printed     = 0;
         cc.order_tf    = order_tf;
         cc.order_field_idx = order_field_idx;
+        cc.ospec       = &ospec;
         cc.deadline    = &cdl;
         cc.prefilter_ks = cursor_prefilter_ks;
         cc.parent_out   = g_out;
@@ -7747,8 +8077,15 @@ static int cmd_find_do(const char *db_root, const char *object,
            clients get a single stable shape regardless of format. dict_fmt
            swaps the inner array for an object. */
         OrderWalkBounds owb;
-        order_walk_bounds(tree, &driver_fs, order_by, &owb);
+        if (ospec.n == 1) {
+            order_walk_bounds(tree, &driver_fs, order_by, &owb);
+        } else {
+            /* Multi-field: walk the composite's full range; range/eq
+               bound folding into the walk is single-field only. */
+            memset(&owb, 0, sizeof(owb));
+        }
         OUT(dict_fmt ? "{\"rows\":{" : "{\"rows\":[");
+        const char *walk_idx = (ospec.n == 1) ? order_by : composite_name;
         if (desc) {
             /* DESC: start (upper) = cursor when resuming, else window-high or
                max; stop (lower) = window-low or "". */
@@ -7759,7 +8096,7 @@ static int cmd_find_do(const char *db_root, const char *object,
             const char *lo_b = owb.has_lo ? (const char *)owb.lo : "";
             size_t lo_l = owb.has_lo ? owb.lo_len : 0;
             int    lo_e = owb.has_lo ? owb.lo_excl : 0;
-            btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
+            btree_idx_walk_ordered(db_root, object, walk_idx, sch.splits,
                                    lo_b, lo_l, lo_e,
                                    hi_b, hi_l, hi_e,
                                    1, cursor_find_cb, &cc);
@@ -7773,7 +8110,7 @@ static int cmd_find_do(const char *db_root, const char *object,
             const char *hi_b = owb.has_hi ? (const char *)owb.hi : "\xff\xff\xff\xff";
             size_t hi_l = owb.has_hi ? owb.hi_len : 4;
             int    hi_e = owb.has_hi ? owb.hi_excl : 0;
-            btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
+            btree_idx_walk_ordered(db_root, object, walk_idx, sch.splits,
                                    lo_b, lo_l, lo_e,
                                    hi_b, hi_l, hi_e,
                                    0, cursor_find_cb, &cc);
@@ -7782,9 +8119,19 @@ static int cmd_find_do(const char *db_root, const char *object,
 
         /* Emit next-page cursor if we actually hit the limit (there might be
            more). If printed < limit the walk drained to the end → null. */
-        if (cc.printed >= limit && cc.last_value_str && cc.last_key_str) {
-            OUT(",\"cursor\":{\"%s\":\"%s\",\"key\":\"%s\"}",
-                order_by, cc.last_value_str, cc.last_key_str);
+        if (cc.printed >= limit && cc.last_key_str) {
+            int vals_ok = 1;
+            for (int i = 0; i < ospec.n; i++)
+                if (!cc.last_value[i]) vals_ok = 0;
+            if (vals_ok) {
+                OUT(",\"cursor\":{");
+                for (int i = 0; i < ospec.n; i++)
+                    OUT("%s\"%s\":\"%s\"", i ? "," : "", ospec.parts[i].name,
+                        cc.last_value[i]);
+                OUT(",\"key\":\"%s\"}", cc.last_key_str);
+            } else {
+                OUT(",\"cursor\":null");
+            }
         } else {
             OUT(",\"cursor\":null");
         }
@@ -7804,7 +8151,7 @@ static int cmd_find_do(const char *db_root, const char *object,
         OUT("}\n");
 
         if (cursor_prefilter_ks) keyset_free(cursor_prefilter_ks);
-        free(cc.last_value_str);
+        for (int i = 0; i < MAX_ORDER_FIELDS; i++) free(cc.last_value[i]);
         free(cc.last_key_str);
         free_joins(joins, njoins);
         free_excluded(&excluded);
@@ -7975,7 +8322,8 @@ static int cmd_find_do(const char *db_root, const char *object,
         return 0;
     } else if (fp.order == FP_ORDER_SORT &&
                !has_joins && !rows_fmt && !csv_delim &&
-               fp.n_source > 0) {
+               fp.n_source > 0 &&
+               (!order_by || strchr(order_by, ',') == NULL)) {
         /* ===== D2: fetch-and-sort with streaming top-N =====
            When plan_filter selected FP_ORDER_SORT the seed leaf's
            candidate set is bounded (estimable + not saturated).  Stream
@@ -7998,8 +8346,7 @@ static int cmd_find_do(const char *db_root, const char *object,
            rows_fmt (table envelope), no csv_delim (header row). Those
            cases fall through to idx_find_parallel's legacy ordered-
            collect + sort path. */
-        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
-                                  strcmp(order_dir, "DESC") == 0));
+        int desc = ospec.parts[0].dir;   /* per-part :asc/:desc suffixes override the shared order */
         size_t d2_matched = find_via_fetch_sort(
             db_root, object, &sch,
             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
@@ -8056,8 +8403,7 @@ static int cmd_find_do(const char *db_root, const char *object,
             }
         }
 
-        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
-                                  strcmp(order_dir, "DESC") == 0));
+        int desc = ospec.parts[0].dir;   /* per-part :asc/:desc suffixes override the shared order */
 
         if (!csv_delim) {
             /* Build the pre-filter KeySet from the planner-chosen
@@ -8258,7 +8604,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                     }
 
                     free(rows);
-                    free(cc.last_value_str);
+                    for (int i = 0; i < MAX_ORDER_FIELDS; i++) free(cc.last_value[i]);
                     free(cc.last_key_str);
                     keyset_free(prefilter_ks);
 
@@ -8334,7 +8680,7 @@ static int cmd_find_do(const char *db_root, const char *object,
             }
 
             if (prefilter_ks) keyset_free(prefilter_ks);
-            free(cc.last_value_str);
+            for (int i = 0; i < MAX_ORDER_FIELDS; i++) free(cc.last_value[i]);
             free(cc.last_key_str);
             free_joins(joins, njoins);
             free_excluded(&excluded);
@@ -8348,27 +8694,18 @@ static int cmd_find_do(const char *db_root, const char *object,
            or format=csv (CSV emit isn't wired into cursor_find_cb yet).
            Buffers all matches, qsort by order_by, slices [offset, offset+limit]. */
 
-        int order_idx = -1;
-        int order_is_num = 0;
-        if (driver_fs.ts) {
-            for (int i = 0; i < driver_fs.ts->nfields; i++) {
-                if (strcmp(driver_fs.ts->fields[i].name, order_by) == 0) {
-                    order_idx = i;
-                    order_is_num = typed_field_is_numeric(driver_fs.ts->fields[i].type);
-                    break;
-                }
-            }
-        }
+        /* ospec (validated, direction-merged) was resolved once in
+           cmd_find_do; the buffered path consumes it directly. */
 
         OrderedCollectCtx oc;
         memset(&oc, 0, sizeof(oc));
         oc.tree = tree;
         oc.fs = (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL;
-        oc.order_field_idx = order_idx;
+        oc.ospec = &ospec;
+        oc.nsort = ospec.n;
         oc.order_field_name = order_by;
         oc.excluded = &excluded;
         oc.deadline = &dl;
-        oc.order_is_numeric = order_is_num;
         pthread_mutex_init(&oc.lock, NULL);
 
         scan_dispatch(db_root, object, &sch, data_dir, ordered_collect_cb, &oc);
@@ -8376,7 +8713,8 @@ static int cmd_find_do(const char *db_root, const char *object,
         if (oc.budget_exceeded) {
             LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: query buffer cap exceeded during ordered sort/fetch (object=%s)", object);
             for (size_t i = 0; i < oc.count; i++) {
-                free(oc.rows[i].key); free(oc.rows[i].record); free(oc.rows[i].sort_str);
+                free(oc.rows[i].key); free(oc.rows[i].record);
+                row_sort_keys_release(oc.rows[i].keys);
             }
             free(oc.rows);
             pthread_mutex_destroy(&oc.lock);
@@ -8386,9 +8724,8 @@ static int cmd_find_do(const char *db_root, const char *object,
             return -1;
         }
 
-        int desc = (order_dir && (strcmp(order_dir, "desc") == 0 || strcmp(order_dir, "DESC") == 0));
         if (oc.count > 1)
-            qsort(oc.rows, oc.count, sizeof(OrderedRow), desc ? cmp_row_desc : cmp_row_asc);
+            qsort(oc.rows, oc.count, sizeof(OrderedRow), cmp_row_asc);
 
         size_t start = offset > 0 ? (size_t)offset : 0;
         size_t end = (limit > 0) ? start + (size_t)limit : oc.count;
@@ -8466,7 +8803,7 @@ static int cmd_find_do(const char *db_root, const char *object,
         for (size_t i = 0; i < oc.count; i++) {
             free(oc.rows[i].key);
             free(oc.rows[i].record);
-            free(oc.rows[i].sort_str);
+            row_sort_keys_release(oc.rows[i].keys);
         }
         free(oc.rows);
         pthread_mutex_destroy(&oc.lock);
