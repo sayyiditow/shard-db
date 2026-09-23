@@ -65,11 +65,24 @@ Response is a JSON object with `plan`, `order`, `total_cheap`, `table_rows`, `so
 
 | Function | Needs `field` | Notes |
 |---|---|---|
-| `count` | optional | Without `field`, counts all records in the group. With `field`, counts non-null/non-empty. |
-| `sum` | yes | Numeric types only (`int`, `long`, `short`, `double`, `numeric`). Result is a `double` for speed. Cast back in the app if needed. |
-| `avg` | yes | `sum / count`, returned as double. |
-| `min` | yes | Numeric or varchar. |
-| `max` | yes | Numeric or varchar. |
+| `count` | optional | Without `field`, counts all records. With a concrete field, counts present values; the per-type unset markers (empty varchar, all-zero calendar values, midnight time `00:00:00`, all-zero uuid) are excluded. Numeric zero is a real value and counts. Composite field expressions are rejected. |
+| `sum` | yes | Supports `int`, `long`, `short`, `float`, `double`, `numeric`, `bool`, `byte`, and `timestamp`; result is a JSON number. |
+| `avg` | yes | Same supported types as `sum`; returns `sum / count` as a JSON number. |
+| `min` | yes | Numeric types, varchar, and calendar types. Varchar/calendar results are lexicographic text. |
+| `max` | yes | Numeric types, varchar, and calendar types. Varchar/calendar results are lexicographic text. |
+
+`date`, `datetime`, and `datetimems` reject `sum` and `avg`. `time`, `uuid`,
+`enum`, `ipv4`, and `ipv6` support `count` only. Unsupported combinations
+return:
+
+```json
+{"error":"aggregate <function> unsupported for field type <type>"}
+```
+
+Calendar result representations are exact strings: `date` is `yyyyMMdd`,
+`datetime` is `yyyyMMddHHmmss`, and `datetimems` is `yyyyMMddHHmmssfff`.
+`timestamp` remains a JSON number containing epoch milliseconds. Empty textual
+`min`/`max` results are JSON `null` and empty CSV cells.
 
 `alias` is **required** — it names the output column. Without it the result would be ambiguous across multiple aggregates on the same field.
 
@@ -119,6 +132,16 @@ Post-aggregation filter. Fields referenced must be aggregate aliases (or group-b
 ```
 
 Multiple `having` clauses are AND-combined.
+
+`having` may reference aggregate aliases or group-by fields. Numeric values use
+numeric comparison; varchar and calendar values use length-aware bytewise
+lexicographic comparison for `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `between`,
+`in`, and `not_in`. A missing textual aggregate never matches a `having`
+condition, including `neq` and `not_in`. `having` leaves are validated before
+scanning: an unknown field returns
+`{"error":"unknown field '<field>' in having (no matching field, alias, or group_by)"}`
+and pattern/length/regex operators on aggregate results return
+`{"error":"aggregate having unsupported for field type <type>"}`.
 
 ## Cost
 

@@ -13,7 +13,7 @@
  *   rank     (short)   = i mod 100            sum = 49500,   avg = 49.5,  min = 0,    max = 99
  *   level    (byte)    = i mod 256            sum = 124000,  min = 0,     max = 255
  *   balance  (numeric: 2dp) = i.00            sum = 500500,  min = 1.00,  max = 1000.00
- *   birthday (date)    = 20000101 + i (dummy) min/max only — sum-on-date is degenerate
+ *   birthday (date)    = 20000101 + i (dummy) min/max only — quoted canonical strings
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -156,13 +156,15 @@ static int test_agg_leaf_only_walk_run(void) {
     tc_request(tc,
         "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"agg_t\","
         "\"aggregates\":[{\"fn\":\"min\",\"field\":\"birthday\",\"alias\":\"m\"}]}", &resp);
-    ASSERT_TRUE(agg_value_eq(resp, "m", "20000102"), "min birthday = 20000102");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"m\":\"20000102\"") != NULL,
+                "min birthday = \"20000102\" (quoted canonical string)");
     free(resp); resp = NULL;
 
     tc_request(tc,
         "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"agg_t\","
         "\"aggregates\":[{\"fn\":\"max\",\"field\":\"birthday\",\"alias\":\"M\"}]}", &resp);
-    ASSERT_TRUE(agg_value_eq(resp, "M", "20001101"), "max birthday = 20001101");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"M\":\"20001101\"") != NULL,
+                "max birthday = \"20001101\" (quoted canonical string)");
     free(resp); resp = NULL;
 
     tc_close(tc);

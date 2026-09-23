@@ -61,14 +61,9 @@ static int test_agg_int_groupby_multi_run(void) {
         "\"group_by\":[\"a\",\"b\"],"
         "\"aggregates\":[{\"fn\":\"count\",\"alias\":\"n\"}],"
         "\"format\":\"csv\"}", &resp);
-    /* Note: typed_field_to_buf_raw renders an int field with value 0 as
-       the empty string in its CSV cell — a pre-existing display choice in
-       config.c / query.c. The integer raw-hash fast path stores the full
-       4-byte BE encoding regardless, so (0,5) (5,0) (5,5) remain distinct
-       buckets even though the CSV cell for zero is empty. */
     ASSERT_CONTAINS(resp, "a,b,n", "case1: CSV header");
-    ASSERT_CONTAINS(resp, ",5,3", "case1: bucket (a=0,b=5) count=3");
-    ASSERT_CONTAINS(resp, "5,,2", "case1: bucket (a=5,b=0) count=2");
+    ASSERT_CONTAINS(resp, "0,5,3", "case1: bucket (a=0,b=5) count=3");
+    ASSERT_CONTAINS(resp, "5,0,2", "case1: bucket (a=5,b=0) count=2");
     ASSERT_CONTAINS(resp, "5,5,1", "case1: bucket (a=5,b=5) count=1");
     free(resp); resp = NULL;
 
