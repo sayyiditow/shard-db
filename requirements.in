@@ -7,7 +7,7 @@ mkdocs-material==9.7.7
 # Pin urllib3 to fix CodeQL vulnerabilities:
 # - Decompression-bomb safeguards bypassed in streaming API
 # - Sensitive headers forwarded across origins in proxied redirects
-urllib3>=2.7.0
+urllib3>=2.8.0
 
 # Pin idna >=3.20 — Dependabot #4: "Specially crafted inputs to
 # idna.encode() can bypass CVE-2024-3651 fix" affects every prior 3.x
