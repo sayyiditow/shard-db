@@ -98,6 +98,15 @@ int durability_msync_range(void *base, size_t offset, size_t len) {
        above. */
     uintptr_t aligned = addr & ~((uintptr_t)ps - 1);
     size_t front_pad = (size_t)(addr - aligned);
+    /* The page round-up below is exact only while len + front_pad +
+       (ps - 1) fits size_t. Guard it explicitly: unreachable for every
+       current caller (lengths are bounded by mapping sizes), but a
+       future caller with an unbounded length must fail cleanly rather
+       than wrap into a garbage msync length. */
+    if (len > SIZE_MAX - front_pad - ((size_t)ps - 1)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
     size_t sync_len = len + front_pad;
     sync_len = (sync_len + (size_t)ps - 1) & ~((size_t)ps - 1);
     return durability_msync((void *)aligned, sync_len);
