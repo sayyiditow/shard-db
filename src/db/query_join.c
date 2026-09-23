@@ -220,7 +220,7 @@ int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
             ? g_zero_field_65537
             : driver_raw + tf->offset;
         return typed_field_to_buf_raw(tf, fp,
-                                      buf, bufsz);
+                                      buf, bufsz, 0);
     }
     return 0;
 }
@@ -353,11 +353,11 @@ static int buf_field_value(const TypedField *tf, const uint8_t *field_ptr,
     case FT_ENUM:
         /* Enum's display string is a JSON string (quoted, escaped).
            DATE/DATETIME are also strings on the wire. */
-        n = typed_field_to_buf_raw(tf, field_ptr, tmp, sizeof(tmp));
+        n = typed_field_to_buf_raw(tf, field_ptr, tmp, sizeof(tmp), 0);
         if (n <= 0) return snprintf_bounded(buf, bufsz, "null");
         return snprintf_bounded(buf, bufsz, "\"%s\"", tmp);
     default:
-        n = typed_field_to_buf_raw(tf, field_ptr, tmp, sizeof(tmp));
+        n = typed_field_to_buf_raw(tf, field_ptr, tmp, sizeof(tmp), 0);
         if (n <= 0) return snprintf_bounded(buf, bufsz, "null");
         return snprintf_bounded(buf, bufsz, "%s", tmp);
     }
@@ -512,7 +512,7 @@ size_t build_joined_csv_row(const char *key,
                 ? g_zero_field_65537
                 : rraw + rtf->offset;
             int n = typed_field_to_buf_raw(rtf, rfp,
-                                           tmp, sizeof(tmp));
+                                           tmp, sizeof(tmp), 0);
             if (n > 0) pos += csv_cell_to_buf(tmp, csv_delim, buf + pos, bufsz - pos);
         }
     }

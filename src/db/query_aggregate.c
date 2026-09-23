@@ -174,7 +174,89 @@ typedef struct {
     double min;
     double max;
     int64_t count;
+    char *text_min;
+    size_t text_min_len;
+    char *text_max;
+    size_t text_max_len;
+    int text_present;
 } AggAccum;
+
+typedef enum {
+    AGG_VALUE_UNSUPPORTED = -1,
+    AGG_VALUE_MISSING = 0,
+    AGG_VALUE_PRESENT = 1
+} AggValueStatus;
+
+typedef enum {
+    AGG_RESULT_NUMBER,
+    AGG_RESULT_TEXT
+} AggResultKind;
+
+typedef struct {
+    AggResultKind kind;
+    int present;
+    double number;
+    const char *text;
+    size_t text_len;
+} AggResult;
+
+/* Aggregate × type classification shared by every execution path.
+   Text types carry string aggregates (varchar/calendar min+max);
+   every other type is either numeric-capable or rejects non-count
+   aggregates at validation. */
+static int agg_type_is_text(enum FieldType t) {
+    return t == FT_VARCHAR || t == FT_DATE || t == FT_DATETIME || t == FT_DATETIMEMS;
+}
+
+/* count(field) presence doctrine: these types carry an encoded unset
+   marker (empty varchar content, all-zero calendar, midnight time,
+   all-zero uuid) that count(field) must exclude. Mirrors the OP_EXISTS
+   semantics in match_typed and get. Numeric zero is a real value and
+   every fixed-width numeric type counts every record. */
+static int agg_count_inspects_presence(enum FieldType t) {
+    return t == FT_VARCHAR || t == FT_DATE || t == FT_DATETIME ||
+           t == FT_DATETIMEMS || t == FT_TIME || t == FT_UUID;
+}
+
+/* Length-aware byte comparison — the same order as btree byte order
+   (memcmp to the shorter length, then length decides). */
+static int agg_text_cmp(const char *a, size_t alen, const char *b, size_t blen) {
+    size_t n = alen < blen ? alen : blen;
+    int r = n ? memcmp(a, b, n) : 0;
+    return r ? r : (alen < blen ? -1 : alen > blen ? 1 : 0);
+}
+
+/* Encoded unset-marker test for the presence-doctrine types. Callers
+   must have verified the field bytes are fully present first. */
+static int agg_field_is_unset(const TypedField *f, const uint8_t *p) {
+    switch (f->type) {
+    case FT_VARCHAR:    return varchar_eff_len(p, f->size) <= 0;
+    case FT_DATE:       return ld_be_i32(p) == 0;
+    case FT_DATETIME:   return ld_be_i32(p) == 0 && ld_be_u16(p + 4) == 0;
+    case FT_DATETIMEMS: return ld_be_i32(p) == 0 && ld_be_u32(p + 4) == 0;
+    case FT_TIME:       return p[0] == 0 && p[1] == 0 && p[2] == 0;
+    case FT_UUID: {
+        int unset = 1;
+        for (int i = 0; i < 16; i++)
+            if (p[i] != 0) { unset = 0; break; }
+        return unset;
+    }
+    default: return 0;
+    }
+}
+
+/* Shared field-span resolver for the record-fed aggregate callbacks:
+   returns the field bytes pointer and sets *avail to how many field
+   bytes the record actually carries. A truncated field degrades to
+   *avail < field size, so every converter's available<size check
+   classifies it MISSING — never a fabricated zero. */
+static const uint8_t *agg_field_ptr(const uint8_t *rec, size_t rec_len,
+                                    const TypedField *tf, size_t *avail) {
+    *avail = ((size_t)tf->offset < rec_len)
+        ? rec_len - (size_t)tf->offset : 0;
+    return (*avail >= (size_t)tf->size)
+        ? rec + tf->offset : g_zero_field_65537;
+}
 
 /* Inline raw-key cap for the integer group_by fast path. Sized to fit
    common all-integer multi-field group_bys: 4×long, 8×int, or any mix
@@ -521,7 +603,7 @@ TOPN_ELIG_VIS int eligible_for_topn_stream(
 
 /* Forward declarations for helpers defined later in this file that the
  * streaming top-N executor needs. */
-static int  decode_index_key_to_double(const TypedField *f,
+static AggValueStatus decode_index_key_to_double(const TypedField *f,
                                         const uint8_t *key, size_t klen,
                                         double *out);
 static void fmt_double(char *buf, size_t sz, double v);
@@ -643,7 +725,7 @@ static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
         double v;
         if (decode_index_key_to_double(c->gb_tf,
                                         (const uint8_t *)enc_val, enc_val_len,
-                                        &v)) {
+                                        &v) == AGG_VALUE_PRESENT) {
             c->current_sum += v;
             if (!c->current_min_set || v < c->current_min) {
                 c->current_min = v;
@@ -840,7 +922,7 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
              * where group_vals are always emitted as JSON strings. */
             double dv = 0.0;
             if (decode_index_key_to_double(ctx.gb_tf, (const uint8_t *)gkeys[i],
-                                            gklens[i], &dv)) {
+                                            gklens[i], &dv) == AGG_VALUE_PRESENT) {
                 char dbuf[64];
                 fmt_double(dbuf, sizeof(dbuf), dv);
                 OUT("\"%s\":\"%s\"", group_by_field, dbuf);
@@ -937,7 +1019,7 @@ typedef struct {
    DOUBLE/DATE/DATETIME/zero-length VARCHAR) to preserve legacy skip-empty behavior.
    FT_NUMERIC and FT_BOOL always return non-zero. */
 int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
-                                  char *buf, size_t bufsz) {
+                                  char *buf, size_t bufsz, int keep_zero) {
     switch (f->type) {
     case FT_VARCHAR: {
         int len = varchar_eff_len(p, f->size);
@@ -949,27 +1031,27 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
     }
     case FT_LONG: {
         int64_t v = ld_be_i64(p);
-        if (v == 0) return 0;
+        if (!keep_zero && v == 0) return 0;
         return snprintf(buf, bufsz, "%lld", (long long)v);
     }
     case FT_INT: {
         int32_t v = ld_be_i32(p);
-        if (v == 0) return 0;
+        if (!keep_zero && v == 0) return 0;
         return snprintf(buf, bufsz, "%d", v);
     }
     case FT_SHORT: {
         int16_t v = ld_be_i16(p);
-        if (v == 0) return 0;
+        if (!keep_zero && v == 0) return 0;
         return snprintf(buf, bufsz, "%d", v);
     }
     case FT_DOUBLE: {
         double v; memcpy(&v, p, 8);
-        if (v == 0.0) return 0;
+        if (!keep_zero && v == 0) return 0;
         return snprintf(buf, bufsz, "%g", v);
     }
     case FT_FLOAT: {
         float v; memcpy(&v, p, 4);
-        if (v == 0.0f) return 0;
+        if (!keep_zero && v == 0) return 0;
         return snprintf(buf, bufsz, "%g", (double)v);
     }
     case FT_BOOL:
@@ -1065,49 +1147,57 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
    btree without a per-record slot lookup.
 
    Encoding inverses (mirrors encode_field_for_index in config.c):
-     LONG/INT/SHORT/DATE: BE signed-int with top bit XOR'd → undo XOR.
-     DOUBLE: IEEE-754 total-order encoding → if top bit set (was positive)
-             flip top bit; else flip all bits.
-     DATETIME: 4 BE bytes int32 (top-bit-flipped) date + 2 BE bytes uint16
-               seconds-of-day; output matches typed_field_to_double's
-               "d*1e6 + t" form (t is left as raw seconds-of-day, same
-               as the typed-record path which reads the field offset bytes).
+     LONG/TIMESTAMP/INT/SHORT: BE signed-int with top bit XOR'd → undo XOR.
+     DOUBLE/FLOAT: IEEE-754 total-order encoding → if top bit set (was
+             positive) flip top bit; else flip all bits.
      NUMERIC: BE int64 top-bit-flipped, divided by 10^scale.
      BOOL/BYTE: single byte stored directly.
-   Returns 1 on success / 0 when the encoded buffer is too short for the
-   field type (skipped by callers, matching the typed_field_to_double
-   "missing field" semantics). Skip varchar — degenerate atof on names. */
-static int decode_index_key_to_double(const TypedField *f,
+
+   Status semantics (AggValueStatus):
+     AGG_VALUE_PRESENT for a decoded numeric value — including zero,
+     which is a real value (the old decode-time zero skip is gone).
+     AGG_VALUE_MISSING when the leaf bytes are shorter than the type's
+     encoded width, or when a calendar field decodes to its all-zero
+     unset marker.
+     AGG_VALUE_UNSUPPORTED for types that never aggregate numerically
+     (calendar/binary/varchar — calendar min/max uses
+     decode_index_key_to_text instead, varchar compares raw bytes). */
+static AggValueStatus decode_index_key_to_double(const TypedField *f,
                                       const uint8_t *p, size_t plen,
                                       double *out) {
     switch (f->type) {
     case FT_LONG: {
-        if (plen < 8) return 0;
+        if (plen < 8) return AGG_VALUE_MISSING;
         uint64_t u = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
                      ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
                      ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
                      ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
         int64_t v = (int64_t)(u ^ (1ULL << 63));
-        if (v == 0) return 0;
-        *out = (double)v; return 1;
+        *out = (double)v; return AGG_VALUE_PRESENT;
+    }
+    case FT_TIMESTAMP: {
+        if (plen < 8) return AGG_VALUE_MISSING;
+        uint64_t u = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+                     ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+                     ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+                     ((uint64_t)p[6] << 8)  | (uint64_t)p[7];
+        *out = (double)(int64_t)(u ^ (1ULL << 63)); return AGG_VALUE_PRESENT;
     }
     case FT_INT: {
-        if (plen < 4) return 0;
+        if (plen < 4) return AGG_VALUE_MISSING;
         uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                      ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
         int32_t v = (int32_t)(u ^ 0x80000000u);
-        if (v == 0) return 0;
-        *out = (double)v; return 1;
+        *out = (double)v; return AGG_VALUE_PRESENT;
     }
     case FT_SHORT: {
-        if (plen < 2) return 0;
+        if (plen < 2) return AGG_VALUE_MISSING;
         uint16_t u = ((uint16_t)p[0] << 8) | (uint16_t)p[1];
         int16_t v = (int16_t)(u ^ 0x8000u);
-        if (v == 0) return 0;
-        *out = (double)v; return 1;
+        *out = (double)v; return AGG_VALUE_PRESENT;
     }
     case FT_DOUBLE: {
-        if (plen < 8) return 0;
+        if (plen < 8) return AGG_VALUE_MISSING;
         uint64_t bits = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
                         ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
                         ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
@@ -1115,73 +1205,122 @@ static int decode_index_key_to_double(const TypedField *f,
         if (bits & (1ULL << 63)) bits ^= (1ULL << 63);
         else bits = ~bits;
         double v; memcpy(&v, &bits, 8);
-        if (v == 0.0) return 0;
-        *out = v; return 1;
+        *out = v; return AGG_VALUE_PRESENT;
     }
     case FT_FLOAT: {
-        if (plen < 4) return 0;
+        if (plen < 4) return AGG_VALUE_MISSING;
         uint32_t bits = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                         ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
         if (bits & 0x80000000u) bits ^= 0x80000000u;
         else bits = ~bits;
         float v; memcpy(&v, &bits, 4);
-        if (v == 0.0f) return 0;
-        *out = (double)v; return 1;
+        *out = (double)v; return AGG_VALUE_PRESENT;
     }
     case FT_BOOL:
-        if (plen < 1) return 0;
-        *out = (double)(p[0] ? 1 : 0); return 1;
+        if (plen < 1) return AGG_VALUE_MISSING;
+        *out = (double)(p[0] ? 1 : 0); return AGG_VALUE_PRESENT;
     case FT_BYTE:
-        if (plen < 1) return 0;
-        *out = (double)p[0]; return 1;
+        if (plen < 1) return AGG_VALUE_MISSING;
+        *out = (double)p[0]; return AGG_VALUE_PRESENT;
     case FT_DATE: {
-        if (plen < 4) return 0;
+        if (plen < 4) return AGG_VALUE_MISSING;
         uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                      ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
         int32_t v = (int32_t)(u ^ 0x80000000u);
-        if (v == 0) return 0;
-        *out = (double)v; return 1;
+        if (v == 0) return AGG_VALUE_MISSING;
+        return AGG_VALUE_UNSUPPORTED;
     }
     case FT_DATETIME: {
-        if (plen < 6) return 0;
+        if (plen < 6) return AGG_VALUE_MISSING;
         uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                      ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
         int32_t d = (int32_t)(u ^ 0x80000000u);
         uint16_t t = ((uint16_t)p[4] << 8) | (uint16_t)p[5];
-        if (d == 0 && t == 0) return 0;
-        *out = (double)d * 1000000.0 + (double)t; return 1;
+        if (d == 0 && t == 0) return AGG_VALUE_MISSING;
+        return AGG_VALUE_UNSUPPORTED;
     }
     case FT_DATETIMEMS: {
-        if (plen < 8) return 0;
+        if (plen < 8) return AGG_VALUE_MISSING;
         uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                      ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
         int32_t d = (int32_t)(u ^ 0x80000000u);
         uint32_t ms = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
                       ((uint32_t)p[6] << 8)  |  (uint32_t)p[7];
-        if (d == 0 && ms == 0) return 0;
-        *out = (double)d * 100000000.0 + (double)ms;
-        return 1;
+        if (d == 0 && ms == 0) return AGG_VALUE_MISSING;
+        return AGG_VALUE_UNSUPPORTED;
     }
-    case FT_TIME: return 0;  /* not summable */
+    case FT_TIME: return AGG_VALUE_UNSUPPORTED;
     case FT_NUMERIC: {
-        if (plen < 8) return 0;
+        if (plen < 8) return AGG_VALUE_MISSING;
         uint64_t u = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
                      ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
                      ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
                      ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
         int64_t v = (int64_t)(u ^ (1ULL << 63));
-        *out = (double)v / (double)f->numeric_scale_mult; return 1;
+        *out = (double)v / (double)f->numeric_scale_mult;
+        return AGG_VALUE_PRESENT;
     }
     case FT_UUID:
         /* UUIDs aren't summable */
-        return 0;
+        return AGG_VALUE_UNSUPPORTED;
     case FT_IPV4:
         /* IPv4 addresses aren't summable. */
-        return 0;
+        return AGG_VALUE_UNSUPPORTED;
     case FT_IPV6:
         /* IPv6 addresses aren't summable. */
-        return 0;
-    default: return 0;
+        return AGG_VALUE_UNSUPPORTED;
+    case FT_VARCHAR:
+    case FT_ENUM:
+    default: return AGG_VALUE_UNSUPPORTED;
+    }
+}
+
+/* Decode an indexed varchar/calendar key into the canonical textual value. */
+static AggValueStatus decode_index_key_to_text(const TypedField *f,
+                                               const uint8_t *p, size_t plen,
+                                               char *out, size_t *out_len) {
+    if (!f || !p || !out || !out_len) return AGG_VALUE_MISSING;
+    switch (f->type) {
+    case FT_VARCHAR:
+        if (plen == 0) return AGG_VALUE_MISSING;
+        memcpy(out, p, plen);
+        out[plen] = '\0';
+        *out_len = plen;
+        return AGG_VALUE_PRESENT;
+    case FT_DATE: {
+        if (plen < 4) return AGG_VALUE_MISSING;
+        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3];
+        int32_t d = (int32_t)(u ^ 0x80000000u);
+        if (d == 0) return AGG_VALUE_MISSING;
+        *out_len = (size_t)snprintf(out, 9, "%08d", d);
+        return AGG_VALUE_PRESENT;
+    }
+    case FT_DATETIME: {
+        if (plen < 6) return AGG_VALUE_MISSING;
+        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3];
+        int32_t d = (int32_t)(u ^ 0x80000000u);
+        uint16_t t = ((uint16_t)p[4] << 8) | p[5];
+        if (d == 0 && t == 0) return AGG_VALUE_MISSING;
+        *out_len = (size_t)snprintf(out, 15, "%08d%02d%02d%02d", d,
+                                    t / 3600, (t % 3600) / 60, t % 60);
+        return AGG_VALUE_PRESENT;
+    }
+    case FT_DATETIMEMS: {
+        if (plen < 8) return AGG_VALUE_MISSING;
+        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3];
+        int32_t d = (int32_t)(u ^ 0x80000000u);
+        uint32_t ms = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                      ((uint32_t)p[6] << 8) | p[7];
+        if (d == 0 && ms == 0) return AGG_VALUE_MISSING;
+        *out_len = (size_t)snprintf(out, 18, "%08d%02d%02d%02d%03d", d,
+                                    ms / 3600000, (ms % 3600000) / 60000,
+                                    (ms % 60000) / 1000, ms % 1000);
+        return AGG_VALUE_PRESENT;
+    }
+    default: return AGG_VALUE_UNSUPPORTED;
     }
 }
 
@@ -1562,7 +1701,8 @@ static int hsm_get(const HashStrMap *m, const uint8_t hash[16],
    completeness regardless of selectivity. */
 
 /* Forward declaration for wfc_batch_cb */
-static int typed_field_to_double(const TypedField *f, const uint8_t *p, double *out);
+static AggValueStatus typed_field_to_double(const TypedField *f, const uint8_t *p,
+                                            size_t available, double *out);
 
 typedef struct {
     CriteriaNode     *tree;
@@ -1601,10 +1741,10 @@ static int wfc_batch_cb(const uint8_t hash16[16],
     (void)hash16; (void)key; (void)klen;
     WfcBatchCtx *bc = (WfcBatchCtx *)ctx;
     if (!criteria_match_tree(value, vlen, bc->tree, bc->fs)) return 0;
-    const uint8_t *agg_p = ((size_t)bc->agg_tf->offset + (size_t)bc->agg_tf->size > vlen)
-        ? g_zero_field_65537 : (const uint8_t *)value + bc->agg_tf->offset;
+    size_t agg_avail;
+    const uint8_t *agg_p = agg_field_ptr(value, vlen, bc->agg_tf, &agg_avail);
     double v;
-    if (!typed_field_to_double(bc->agg_tf, agg_p, &v))
+    if (typed_field_to_double(bc->agg_tf, agg_p, agg_avail, &v) != AGG_VALUE_PRESENT)
         return 0;
     pthread_mutex_lock(&bc->mu);
     if (!*bc->found ||
@@ -1720,9 +1860,9 @@ static void *wfc_worker(void *arg) {
             }
 
             double v;
-            if (!decode_index_key_to_double(w->agg_tf,
+            if (decode_index_key_to_double(w->agg_tf,
                                             (const uint8_t *)val,
-                                            vlen, &v)) continue;
+                                            vlen, &v) != AGG_VALUE_PRESENT) continue;
 
             last_len = vlen > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : vlen;
             memcpy(last_val, val, last_len);
@@ -1784,8 +1924,8 @@ static void *awc_shard_worker(void *raw) {
         if (query_deadline_tick(a->deadline, &a->dl_counter)) break;
         if (!keyset_contains(a->crit_ks, hash16)) continue;
         double v;
-        if (!decode_index_key_to_double(a->tf, (const uint8_t *)val,
-                                        vlen, &v)) continue;
+        if (decode_index_key_to_double(a->tf, (const uint8_t *)val,
+                                        vlen, &v) != AGG_VALUE_PRESENT) continue;
         for (int k = 0; k < a->nsibs; k++) {
             int idx = a->sibs[k];
             a->counts[idx]++;
@@ -1799,68 +1939,117 @@ static void *awc_shard_worker(void *raw) {
     return NULL;
 }
 
-/* Extract a typed field as a double for SUM/AVG/MIN/MAX accumulation.
-   Returns 1 if the field is "present" (non-zero/non-empty), 0 if missing
-   (so the record is excluded from the aggregate — matches legacy behavior). */
-static int typed_field_to_double(const TypedField *f, const uint8_t *p, double *out) {
+/* Extract a typed field as a double for numeric aggregate operations. */
+static AggValueStatus typed_field_to_double(const TypedField *f, const uint8_t *p,
+                                            size_t available, double *out) {
+    if (!f || !p || available < (size_t)f->size) return AGG_VALUE_MISSING;
     switch (f->type) {
     case FT_LONG: {
         int64_t v = ld_be_i64(p);
-        if (v == 0) return 0;
-        *out = (double)v; return 1;
+        *out = (double)v; return AGG_VALUE_PRESENT;
     }
     case FT_INT: {
         int32_t v = ld_be_i32(p);
-        if (v == 0) return 0;
-        *out = (double)v; return 1;
+        *out = (double)v; return AGG_VALUE_PRESENT;
     }
     case FT_SHORT: {
         int16_t v = ld_be_i16(p);
-        if (v == 0) return 0;
-        *out = (double)v; return 1;
+        *out = (double)v; return AGG_VALUE_PRESENT;
     }
     case FT_DOUBLE: {
         double v; memcpy(&v, p, 8);
-        if (v == 0.0) return 0;
-        *out = v; return 1;
+        *out = v; return AGG_VALUE_PRESENT;
+    }
+    case FT_FLOAT: {
+        float v; memcpy(&v, p, 4);
+        *out = (double)v; return AGG_VALUE_PRESENT;
     }
     case FT_NUMERIC: {
         int64_t v = ld_be_i64(p);
-        *out = (double)v / (double)f->numeric_scale_mult; return 1;
+        *out = (double)v / (double)f->numeric_scale_mult; return AGG_VALUE_PRESENT;
     }
-    case FT_BOOL: *out = (double)(p[0] ? 1 : 0); return 1;
-    case FT_BYTE: *out = (double)p[0]; return 1;
+    case FT_BOOL: *out = (double)(p[0] ? 1 : 0); return AGG_VALUE_PRESENT;
+    case FT_BYTE: *out = (double)p[0]; return AGG_VALUE_PRESENT;
+    case FT_TIMESTAMP:
+        *out = (double)ld_be_i64(p); return AGG_VALUE_PRESENT;
     case FT_DATE: {
-        int32_t v = ld_be_i32(p);
-        if (v == 0) return 0;
-        *out = (double)v; return 1;
+        return AGG_VALUE_UNSUPPORTED;
     }
     case FT_DATETIME: {
-        int32_t d = ld_be_i32(p);
-        uint16_t t = ld_be_u16(p + 4);
-        if (d == 0 && t == 0) return 0;
-        *out = (double)d * 1000000.0 + (double)t; return 1;
+        return AGG_VALUE_UNSUPPORTED;
     }
-    case FT_DATETIMEMS: {
-        int32_t d = ld_be_i32(p);
-        uint32_t ms = ld_be_u32(p + 4);
-        if (d == 0 && ms == 0) return 0;
-        *out = (double)d * 100000000.0 + (double)ms;
-        return 1;
+    case FT_DATETIMEMS:
+    case FT_TIME:
+    case FT_UUID:
+    case FT_ENUM:
+    case FT_IPV4:
+    case FT_IPV6:
+    case FT_VARCHAR:
+    default: return AGG_VALUE_UNSUPPORTED;
     }
-    case FT_TIME: return 0;  /* not summable */
-    case FT_UUID: return 0;  /* not summable */
-    case FT_IPV4: return 0;  /* not summable */
-    case FT_IPV6: return 0;  /* not summable */
+}
+
+static AggValueStatus typed_field_to_text(const TypedField *f, const uint8_t *p,
+                                          size_t available, char *buf,
+                                          size_t bufsz, size_t *out_len) {
+    if (!f || !p || !buf || bufsz == 0 || available < (size_t)f->size)
+        return AGG_VALUE_MISSING;
+    int n = 0;
+    switch (f->type) {
     case FT_VARCHAR: {
         int len = varchar_eff_len(p, f->size);
-        if (len == 0) return 0;
-        char tmp[64]; int n = len < 63 ? len : 63;
-        memcpy(tmp, p + 2, n); tmp[n] = '\0';
-        *out = atof(tmp); return 1;
+        if (len <= 0) return AGG_VALUE_MISSING;
+        if ((size_t)len >= bufsz) len = (int)bufsz - 1;
+        memcpy(buf, p + 2, (size_t)len);
+        n = len;
+        break;
     }
-    default: return 0;
+    case FT_DATE: {
+        int32_t d = ld_be_i32(p);
+        if (d == 0) return AGG_VALUE_MISSING;
+        n = snprintf(buf, bufsz, "%08d", d);
+        break;
     }
+    case FT_DATETIME: {
+        int32_t d = ld_be_i32(p); uint16_t t = ld_be_u16(p + 4);
+        if (d == 0 && t == 0) return AGG_VALUE_MISSING;
+        n = snprintf(buf, bufsz, "%08d%02d%02d%02d", d,
+                     t / 3600, (t % 3600) / 60, t % 60);
+        break;
+    }
+    case FT_DATETIMEMS: {
+        int32_t d = ld_be_i32(p); uint32_t ms = ld_be_u32(p + 4);
+        if (d == 0 && ms == 0) return AGG_VALUE_MISSING;
+        n = snprintf(buf, bufsz, "%08d%02u%02u%02u%03u", d,
+                     ms / 3600000, (ms % 3600000) / 60000,
+                     (ms % 60000) / 1000, ms % 1000);
+        break;
+    }
+    default:
+        return AGG_VALUE_UNSUPPORTED;
+    }
+    if (n < 0) return AGG_VALUE_MISSING;
+    if ((size_t)n >= bufsz) n = (int)bufsz - 1;
+    buf[n] = '\0';
+    if (out_len) *out_len = (size_t)n;
+    return AGG_VALUE_PRESENT;
+}
+
+static void agg_text_offer(AggCtx *ctx, AggAccum *a, enum AggFn fn,
+                           const char *text, size_t len) {
+    char **dst = fn == AGG_MIN ? &a->text_min : &a->text_max;
+    size_t *dst_len = fn == AGG_MIN ? &a->text_min_len : &a->text_max_len;
+    int replace = !a->text_present ||
+        (fn == AGG_MIN
+            ? agg_text_cmp(text, len, *dst, *dst_len) < 0
+            : agg_text_cmp(text, len, *dst, *dst_len) > 0);
+    if (replace) {
+        char *copy = agg_arena_strdup(&ctx->arena, text, len);
+        if (!copy) { ctx->budget_exceeded = 1; return; }
+        *dst = copy;
+        *dst_len = len;
+    }
+    a->text_present = 1;
 }
 
 static uint32_t agg_hash(const char *s) {
@@ -2078,12 +2267,12 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         gbuf[i][0] = '\0';
         if (ctx->group_tfs[i]) {
             const TypedField *gtf = ctx->group_tfs[i];
-            const uint8_t *fp = ((size_t)gtf->offset + (size_t)gtf->size >
-                                  (size_t)hdr->value_len)
-                ? g_zero_field_65537
-                : raw + gtf->offset;
-            typed_field_to_buf_raw(gtf, fp,
-                                   gbuf[i], sizeof(gbuf[i]));
+            if ((size_t)gtf->offset + (size_t)gtf->size > (size_t)hdr->value_len) {
+                /* truncated field — missing group value, not a fake zero */
+            } else {
+                typed_field_to_buf_raw(gtf, raw + gtf->offset,
+                                       gbuf[i], sizeof(gbuf[i]), 1);
+            }
         } else {
             /* Composite/unknown — fallback to decode_field */
             char *s = decode_field((const char *)raw, hdr->value_len,
@@ -2112,11 +2301,10 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         for (int i = 0; i < ctx->ngroups && kp < AGG_INT_KEY_CAP; i++) {
             if (ctx->group_tfs[i]) {
                 const TypedField *gtf = ctx->group_tfs[i];
-                const uint8_t *fp = ((size_t)gtf->offset + (size_t)gtf->size >
-                                     (size_t)hdr->value_len)
-                    ? g_zero_field_65537
-                    : raw + gtf->offset;
-                int len = typed_field_to_raw(gtf, fp,
+                if ((size_t)gtf->offset + (size_t)gtf->size >
+                    (size_t)hdr->value_len)
+                    break;  /* truncated here — every later field is too */
+                int len = typed_field_to_raw(gtf, raw + gtf->offset,
                                              raw_key + kp,
                                              (size_t)(AGG_INT_KEY_CAP - kp));
                 if (len > 0) kp += len;
@@ -2141,19 +2329,20 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
     for (int i = 0; i < ctx->nspecs; i++) {
         AggAccum *a = &bkt->accums[i];
         if (ctx->specs[i].fn == AGG_COUNT) {
-            /* count(*) (no field) and count(non-varchar typed field) →
-               every record counts. count(varchar field) → only records
-               where the varchar has non-empty content (elen > 0), matching
-               the OP_EXISTS semantics on varchar. Non-varchar typed fields
-               always carry a value, so the field arg is informational. */
+            /* count(*) (no field) counts every record. count(field) counts
+               records whose stored value is not the type's encoded unset
+               marker — empty varchar, all-zero calendar, midnight time,
+               all-zero uuid (agg_count_inspects_presence). Fixed-width
+               numeric fields always carry a value, so they count every
+               record, zeros included. */
             if (ctx->specs[i].field[0] && ctx->spec_tfs[i] &&
-                ctx->spec_tfs[i]->type == FT_VARCHAR) {
+                agg_count_inspects_presence(ctx->spec_tfs[i]->type)) {
                 const TypedField *cvtf = ctx->spec_tfs[i];
-                const uint8_t *cvp = ((size_t)cvtf->offset + (size_t)cvtf->size >
-                                      (size_t)hdr->value_len)
-                    ? g_zero_field_65537 : raw + cvtf->offset;
-                int elen = varchar_eff_len(cvp, cvtf->size);
-                if (elen <= 0) continue;
+                size_t avail;
+                const uint8_t *cvp = agg_field_ptr(raw, hdr->value_len,
+                                                   cvtf, &avail);
+                if (avail < (size_t)cvtf->size || agg_field_is_unset(cvtf, cvp))
+                    continue;
             }
             a->count++;
             continue;
@@ -2163,15 +2352,20 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         int present = 0;
         if (ctx->spec_tfs[i]) {
             const TypedField *stf = ctx->spec_tfs[i];
-            const uint8_t *sp = ((size_t)stf->offset + (size_t)stf->size >
-                                 (size_t)hdr->value_len)
-                ? g_zero_field_65537 : raw + stf->offset;
-            present = typed_field_to_double(stf, sp, &v);
+            size_t avail;
+            const uint8_t *sp = agg_field_ptr(raw, hdr->value_len, stf, &avail);
+            if ((ctx->specs[i].fn == AGG_MIN || ctx->specs[i].fn == AGG_MAX) &&
+                agg_type_is_text(stf->type)) {
+                char text[1024]; size_t text_len = 0;
+                if (typed_field_to_text(stf, sp, avail, text, sizeof(text),
+                                        &text_len) == AGG_VALUE_PRESENT)
+                    agg_text_offer(ctx, a, ctx->specs[i].fn, text, text_len);
+                continue;
+            }
+            present = typed_field_to_double(stf, sp, avail, &v) == AGG_VALUE_PRESENT;
         } else {
-            char *fv = decode_field((const char *)raw, hdr->value_len,
-                                    ctx->specs[i].field, ctx->fs);
-            if (fv && fv[0]) { v = atof(fv); present = 1; }
-            free(fv);
+            /* Composite aggregate fields are rejected during validation. */
+            present = 0;
         }
         if (present) {
             a->count++;
@@ -2256,31 +2450,214 @@ static int parse_group_by(const char *json, char out[][256]) {
     return n;
 }
 
-/* Get aggregate value by alias from a bucket, for having filter */
-static double agg_bucket_value(AggBucket *bkt, AggSpec *specs, int nspecs, const char *alias) {
-    for (int i = 0; i < nspecs; i++) {
-        if (strcmp(specs[i].alias, alias) == 0) {
-            AggAccum *a = &bkt->accums[i];
-            switch (specs[i].fn) {
-                case AGG_COUNT: return (double)a->count;
-                case AGG_SUM:   return a->sum;
-                case AGG_AVG:   return a->count > 0 ? a->sum / a->count : 0.0;
-                case AGG_MIN:   return a->count > 0 ? a->min : 0.0;
-                case AGG_MAX:   return a->count > 0 ? a->max : 0.0;
+static const char *agg_field_type_name(enum FieldType t) {
+    switch (t) {
+    case FT_VARCHAR: return "varchar";
+    case FT_LONG: return "long";
+    case FT_INT: return "int";
+    case FT_SHORT: return "short";
+    case FT_DOUBLE: return "double";
+    case FT_FLOAT: return "float";
+    case FT_BOOL: return "bool";
+    case FT_BYTE: return "byte";
+    case FT_NUMERIC: return "numeric";
+    case FT_DATE: return "date";
+    case FT_DATETIME: return "datetime";
+    case FT_DATETIMEMS: return "datetimems";
+    case FT_TIME: return "time";
+    case FT_TIMESTAMP: return "timestamp";
+    case FT_UUID: return "uuid";
+    case FT_ENUM: return "enum";
+    case FT_IPV4: return "ipv4";
+    case FT_IPV6: return "ipv6";
+    default: return "unknown";
+    }
+}
+
+static int agg_validate_spec(const AggSpec *spec, const TypedSchema *ts,
+                             char *err, size_t errsz) {
+    if (spec->fn == AGG_COUNT && spec->field[0] == '\0') return 0;
+    if (strchr(spec->field, '+')) {
+        snprintf(err, errsz, "aggregate %s unsupported for field type composite",
+                 spec->fn == AGG_COUNT ? "count" :
+                 spec->fn == AGG_SUM ? "sum" : spec->fn == AGG_AVG ? "avg" :
+                 spec->fn == AGG_MIN ? "min" : "max");
+        return -1;
+    }
+    int fi = typed_field_index(ts, spec->field);
+    if (fi < 0) return 0; /* validate_field reports the unknown field */
+    enum FieldType t = ts->fields[fi].type;
+    int numeric = (t == FT_LONG || t == FT_INT || t == FT_SHORT ||
+                   t == FT_DOUBLE || t == FT_FLOAT || t == FT_BOOL ||
+                   t == FT_BYTE || t == FT_NUMERIC || t == FT_TIMESTAMP);
+    int text_minmax = agg_type_is_text(t);
+    int allowed = spec->fn == AGG_COUNT ||
+                  ((spec->fn == AGG_SUM || spec->fn == AGG_AVG) && numeric) ||
+                  ((spec->fn == AGG_MIN || spec->fn == AGG_MAX) &&
+                   (numeric || text_minmax));
+    if (!allowed) {
+        const char *fn = spec->fn == AGG_SUM ? "sum" :
+                         spec->fn == AGG_AVG ? "avg" :
+                         spec->fn == AGG_MIN ? "min" : "max";
+        snprintf(err, errsz, "aggregate %s unsupported for field type %s",
+                 fn, agg_field_type_name(t));
+        return -1;
+    }
+    return 0;
+}
+
+/* Validate one having leaf against the statically known result kind of
+   the field it names. The field must resolve to an aggregate alias or a
+   group_by field — anything else errors here instead of silently
+   comparing 0 in agg_bucket_value. The operator must be legal for the
+   kind: comparison/set/exists operators on both kinds (text compares
+   lexicographically via agg_text_matches), and nothing else — pattern,
+   length, field-vs-field, and regex operators have no meaningful
+   semantics on aggregate results. Runs before any scanning so a bad
+   having is a clean validation error, never a silently-wrong result. */
+static int agg_having_leaf_ok(const AggCtx *ctx, const SearchCriterion *c,
+                              char *err, size_t errsz) {
+    int kind = -1;   /* -1 unresolved, 0 numeric, 1 text */
+    const char *tname = "unknown";
+    for (int g = 0; g < ctx->ngroups; g++) {
+        if (strcmp(ctx->group_fields[g], c->field) == 0) {
+            if (ctx->group_tfs[g]) {
+                kind = agg_type_is_text(ctx->group_tfs[g]->type) ? 1 : 0;
+                tname = agg_field_type_name(ctx->group_tfs[g]->type);
             }
+            break;
         }
     }
-    return 0.0;
+    for (int i = 0; kind < 0 && i < ctx->nspecs; i++) {
+        if (strcmp(ctx->specs[i].alias, c->field) != 0) continue;
+        if (ctx->specs[i].fn == AGG_COUNT || ctx->specs[i].fn == AGG_SUM ||
+            ctx->specs[i].fn == AGG_AVG) {
+            kind = 0; tname = "number";
+            break;
+        }
+        /* min/max kind follows the aggregated field's type. */
+        if (ctx->spec_tfs[i]) {
+            kind = agg_type_is_text(ctx->spec_tfs[i]->type) ? 1 : 0;
+            tname = agg_field_type_name(ctx->spec_tfs[i]->type);
+        }
+        break;
+    }
+    if (kind < 0) {
+        snprintf(err, errsz,
+                 "unknown field '%s' in having (no matching field, alias, or group_by)",
+                 c->field);
+        return -1;
+    }
+    switch (c->op) {
+    case OP_EQUAL: case OP_NOT_EQUAL:
+    case OP_LESS: case OP_GREATER: case OP_LESS_EQ: case OP_GREATER_EQ:
+    case OP_BETWEEN: case OP_IN: case OP_NOT_IN:
+    case OP_EXISTS: case OP_NOT_EXISTS:
+        return 0;
+    default:
+        snprintf(err, errsz,
+                 "aggregate having unsupported for field type %s", tname);
+        return -1;
+    }
+}
+
+/* Walk every leaf of the having criteria (tree form or flat JSON form)
+   through agg_having_leaf_ok. */
+static int agg_having_tree_ok(const AggCtx *ctx, const CriteriaNode *n,
+                              char *err, size_t errsz) {
+    if (!n) return 0;
+    switch (n->kind) {
+    case CNODE_LEAF:
+        return agg_having_leaf_ok(ctx, &n->leaf, err, errsz);
+    case CNODE_AND:
+    case CNODE_OR:
+        for (int i = 0; i < n->n_children; i++)
+            if (agg_having_tree_ok(ctx, n->children[i], err, errsz) < 0)
+                return -1;
+        return 0;
+    }
+    return 0;
+}
+
+static AggResult agg_bucket_value(const AggCtx *ctx, AggBucket *bkt,
+                                  const char *name) {
+    AggResult missing = { AGG_RESULT_NUMBER, 0, 0.0, NULL, 0 };
+    for (int g = 0; g < ctx->ngroups; g++) {
+        if (strcmp(ctx->group_fields[g], name) == 0) {
+            const char *v = bkt->group_vals[g];
+            if (ctx->group_tfs[g] && agg_type_is_text(ctx->group_tfs[g]->type))
+                return (AggResult){ AGG_RESULT_TEXT, v[0] != '\0', 0.0, v, strlen(v) };
+            return (AggResult){ AGG_RESULT_NUMBER, v[0] != '\0', atof(v), NULL, 0 };
+        }
+    }
+    for (int i = 0; i < ctx->nspecs; i++) {
+        if (strcmp(ctx->specs[i].alias, name) == 0) {
+            const AggSpec *spec = &ctx->specs[i];
+            AggAccum *a = &bkt->accums[i];
+            if (spec->fn == AGG_COUNT)
+                return (AggResult){ AGG_RESULT_NUMBER, 1, (double)a->count, NULL, 0 };
+            if (spec->fn == AGG_SUM)
+                return (AggResult){ AGG_RESULT_NUMBER, 1, a->sum, NULL, 0 };
+            if (spec->fn == AGG_AVG)
+                return (AggResult){ AGG_RESULT_NUMBER, a->count > 0,
+                                    a->count > 0 ? a->sum / a->count : 0.0,
+                                    NULL, 0 };
+            if (ctx->spec_tfs[i] && agg_type_is_text(ctx->spec_tfs[i]->type))
+                return (AggResult){ AGG_RESULT_TEXT, a->text_present, 0.0,
+                                    spec->fn == AGG_MIN ? a->text_min : a->text_max,
+                                    spec->fn == AGG_MIN ? a->text_min_len : a->text_max_len };
+            return (AggResult){ AGG_RESULT_NUMBER, a->count > 0,
+                                spec->fn == AGG_MIN ? a->min : a->max, NULL, 0 };
+        }
+    }
+    return missing;
+}
+
+static int agg_text_matches(const AggResult *r, const SearchCriterion *c) {
+    if (!r->present) return c->op == OP_NOT_EXISTS;
+    const char *v = r->text; size_t vl = r->text_len;
+    size_t ql = strlen(c->value);
+    int cmp = agg_text_cmp(v, vl, c->value, ql);
+    switch (c->op) {
+    case OP_EQUAL: return cmp == 0;
+    case OP_NOT_EQUAL: return cmp != 0;
+    case OP_LESS: return cmp < 0;
+    case OP_GREATER: return cmp > 0;
+    case OP_LESS_EQ: return cmp <= 0;
+    case OP_GREATER_EQ: return cmp >= 0;
+    case OP_BETWEEN: {
+        int lo = agg_text_cmp(v, vl, c->value, strlen(c->value));
+        int hi = agg_text_cmp(v, vl, c->value2, strlen(c->value2));
+        return (c->min_exclusive ? lo > 0 : lo >= 0) &&
+               (c->max_exclusive ? hi < 0 : hi <= 0);
+    }
+    case OP_IN:
+        for (int i = 0; i < c->in_count; i++)
+            if (agg_text_cmp(v, vl, c->in_values[i], strlen(c->in_values[i])) == 0) return 1;
+        return 0;
+    case OP_NOT_IN:
+        for (int i = 0; i < c->in_count; i++)
+            if (agg_text_cmp(v, vl, c->in_values[i], strlen(c->in_values[i])) == 0) return 0;
+        return 1;
+    case OP_EXISTS: return 1;
+    default: return 0;
+    }
+}
+
+static int agg_result_matches(const AggResult *r, const SearchCriterion *c) {
+    if (r->kind == AGG_RESULT_TEXT) return agg_text_matches(r, c);
+    if (!r->present) return c->op == OP_NOT_EXISTS;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.6f", r->number);
+    return match_criterion(buf, c);
 }
 
 /* Check having criteria against a bucket */
-static int agg_having_match(AggBucket *bkt, AggSpec *specs, int nspecs,
+static int agg_having_match(const AggCtx *ctx, AggBucket *bkt,
                             SearchCriterion *having, int nhaving) {
     for (int i = 0; i < nhaving; i++) {
-        double val = agg_bucket_value(bkt, specs, nspecs, having[i].field);
-        char val_str[64];
-        snprintf(val_str, sizeof(val_str), "%.6f", val);
-        if (!match_criterion(val_str, &having[i])) return 0;
+        AggResult val = agg_bucket_value(ctx, bkt, having[i].field);
+        if (!agg_result_matches(&val, &having[i])) return 0;
     }
     return 1;
 }
@@ -2288,24 +2665,22 @@ static int agg_having_match(AggBucket *bkt, AggSpec *specs, int nspecs,
 /* Tree-aware having evaluation — supports OR, nested AND/OR.
    Mirrors criteria_match_tree() but evaluates against aggregate bucket
    values instead of raw record bytes. */
-static int agg_having_match_tree(AggBucket *bkt, AggSpec *specs, int nspecs,
+static int agg_having_match_tree(const AggCtx *ctx, AggBucket *bkt,
                                   const CriteriaNode *n) {
     if (!n) return 1;
     switch (n->kind) {
     case CNODE_LEAF: {
-        double val = agg_bucket_value(bkt, specs, nspecs, n->leaf.field);
-        char val_str[64];
-        snprintf(val_str, sizeof(val_str), "%.6f", val);
-        return match_criterion(val_str, &n->leaf);
+        AggResult val = agg_bucket_value(ctx, bkt, n->leaf.field);
+        return agg_result_matches(&val, &n->leaf);
     }
     case CNODE_AND:
         for (int i = 0; i < n->n_children; i++)
-            if (!agg_having_match_tree(bkt, specs, nspecs, n->children[i]))
+            if (!agg_having_match_tree(ctx, bkt, n->children[i]))
                 return 0;
         return 1;
     case CNODE_OR:
         for (int i = 0; i < n->n_children; i++)
-            if (agg_having_match_tree(bkt, specs, nspecs, n->children[i]))
+            if (agg_having_match_tree(ctx, bkt, n->children[i]))
                 return 1;
         return 0;
     }
@@ -2368,6 +2743,12 @@ static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
                 if (sa->count > 0) {
                     if (sa->min < da->min) da->min = sa->min;
                     if (sa->max > da->max) da->max = sa->max;
+                }
+                if (sa->text_present) {
+                    if (sa->text_min)
+                        agg_text_offer(dst, da, AGG_MIN, sa->text_min, sa->text_min_len);
+                    if (sa->text_max)
+                        agg_text_offer(dst, da, AGG_MAX, sa->text_max, sa->text_max_len);
                 }
             }
         }
@@ -2560,6 +2941,7 @@ static char g_sort_field[256];
 static int g_sort_desc;
 static int g_sort_ngroups;
 static char (*g_sort_group_fields)[256];
+static const AggCtx *g_sort_ctx;
 
 static int agg_sort_cmp(const void *a, const void *b) {
     AggBucket *ba = *(AggBucket **)a;
@@ -2573,16 +2955,23 @@ static int agg_sort_cmp(const void *a, const void *b) {
         }
     }
     if (ga >= 0) {
+        /* Group values keep their stored string form: lexicographic
+           byte order for text and integer renderings alike. */
         int cmp = strcmp(ba->group_vals[ga], bb->group_vals[gb]);
         return g_sort_desc ? -cmp : cmp;
     }
 
     /* Otherwise it's an aggregate alias */
-    double va = agg_bucket_value(ba, g_sort_specs, g_sort_nspecs, g_sort_field);
-    double vb = agg_bucket_value(bb, g_sort_specs, g_sort_nspecs, g_sort_field);
-    if (va < vb) return g_sort_desc ? 1 : -1;
-    if (va > vb) return g_sort_desc ? -1 : 1;
-    return 0;
+    AggResult va = agg_bucket_value(g_sort_ctx, ba, g_sort_field);
+    AggResult vb = agg_bucket_value(g_sort_ctx, bb, g_sort_field);
+    int cmp;
+    if (va.kind == AGG_RESULT_TEXT || vb.kind == AGG_RESULT_TEXT)
+        cmp = agg_text_cmp(va.present ? va.text : "", va.present ? va.text_len : 0,
+                           vb.present ? vb.text : "", vb.present ? vb.text_len : 0);
+    else if (va.number < vb.number) cmp = -1;
+    else if (va.number > vb.number) cmp = 1;
+    else cmp = 0;
+    return g_sort_desc ? -cmp : cmp;
 }
 
 static void agg_free(AggCtx *ctx) {
@@ -2608,6 +2997,84 @@ static void fmt_double(char *buf, size_t sz, double v) {
         while (end > dot && *end == '0') *end-- = '\0';
         if (end == dot) *end = '\0';
     }
+}
+
+/* Kind-aware emitters for min/max specs whose field is a text type
+   (varchar/calendar). Textual results emit the arena-held canonical
+   string — quoted JSON or a raw CSV cell — or JSON null / an empty CSV
+   cell when no value was seen. Each returns 1 when it produced the
+   output (textual spec) so the caller skips the numeric path, 0 when
+   the spec is numeric and must render through fmt_double. */
+static int agg_csv_minmax_text(const AggSpec *spec, const AggAccum *a,
+                               const TypedField *tf, char csv_delim) {
+    if ((spec->fn != AGG_MIN && spec->fn != AGG_MAX) ||
+        !tf || !agg_type_is_text(tf->type))
+        return 0;
+    const char *tv = spec->fn == AGG_MIN ? a->text_min : a->text_max;
+    csv_emit_cell(a->text_present && tv ? tv : "", csv_delim);
+    return 1;
+}
+
+static int agg_json_minmax_text(const AggSpec *spec, const AggAccum *a,
+                                const TypedField *tf) {
+    if ((spec->fn != AGG_MIN && spec->fn != AGG_MAX) ||
+        !tf || !agg_type_is_text(tf->type))
+        return 0;
+    if (a->text_present) {
+        const char *tv = spec->fn == AGG_MIN ? a->text_min : a->text_max;
+        char *esc = json_escape_const(tv ? tv : "");
+        OUT("\"%s\":\"%s\"", spec->alias, esc ? esc : "");
+        free(esc);
+    } else {
+        OUT("\"%s\":null", spec->alias);
+    }
+    return 1;
+}
+
+static int agg_minmax_text_indexed(const char *db_root, const char *object,
+                                   const Schema *sch, const AggSpec *spec,
+                                   const TypedField *tf, const char *format,
+                                   const char *delimiter, int want_total) {
+    int desc = spec->fn == AGG_MAX;
+    char best[1024]; size_t best_len = 0; int have = 0;
+    int nidx = index_splits_for(sch->splits);
+    for (int s = 0; s < nidx; s++) {
+        char path[PATH_MAX];
+        build_idx_path(path, sizeof(path), db_root, object, spec->field, s);
+        BtRangeIter *it = btree_range_iter_open(path, "", 0, 0,
+                                                "\xff\xff\xff\xff", 4, 0, desc);
+        if (!it) continue;
+        const char *val; size_t vlen; const uint8_t *hash16;
+        while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+            (void)hash16;
+            char text[1024]; size_t len = 0;
+            if (vlen >= sizeof(text)) continue;
+            if (decode_index_key_to_text(tf, (const uint8_t *)val, vlen,
+                                         text, &len) != AGG_VALUE_PRESENT)
+                continue;
+            if (!have || (desc ? agg_text_cmp(text, len, best, best_len) > 0
+                              : agg_text_cmp(text, len, best, best_len) < 0)) {
+                memcpy(best, text, len + 1); best_len = len; have = 1;
+            }
+            break;
+        }
+        btree_range_iter_close(it);
+    }
+    char delim = format && strcmp(format, "csv") == 0 ? parse_csv_delim(delimiter) : 0;
+    if (delim) {
+        csv_emit_cell(spec->alias, delim); OUT("\n");
+        csv_emit_cell(have ? best : "", delim); OUT("\n");
+    } else if (have) {
+        char *esc = json_escape_const(best);
+        if (want_total) OUT("{\"rows\":{\"%s\":\"%s\"},\"total\":1}\n", spec->alias, esc ? esc : "");
+        else OUT("{\"%s\":\"%s\"}\n", spec->alias, esc ? esc : "");
+        free(esc);
+    } else if (want_total) {
+        OUT("{\"rows\":{\"%s\":null},\"total\":1}\n", spec->alias);
+    } else {
+        OUT("{\"%s\":null}\n", spec->alias);
+    }
+    return 1;
 }
 
 /* Same-field MIN/MAX fast path: when the agg field == the (single,
@@ -2685,7 +3152,7 @@ static int agg_minmax_same_field_btree(
         while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
             double v;
             if (decode_index_key_to_double(agg_tf,
-                                            (const uint8_t *)val, vlen, &v)) {
+                                            (const uint8_t *)val, vlen, &v) == AGG_VALUE_PRESENT) {
                 if (!have)        { best = v; have = 1; }
                 else if (desc)    { if (v > best) best = v; }
                 else              { if (v < best) best = v; }
@@ -3076,6 +3543,14 @@ static void *part_merge_worker(void *arg) {
                     if (sa->min < da->min) da->min = sa->min;
                     if (sa->max > da->max) da->max = sa->max;
                 }
+                if (sa->text_present) {
+                    if (sa->text_min)
+                        agg_text_offer(&p->local, da, AGG_MIN,
+                                       sa->text_min, sa->text_min_len);
+                    if (sa->text_max)
+                        agg_text_offer(&p->local, da, AGG_MAX,
+                                       sa->text_max, sa->text_max_len);
+                }
             }
             /* Stash main bucket pointer in src->group_key for hbk translate
                (same trick as the serial merge path). */
@@ -3114,7 +3589,7 @@ typedef struct {
 static int agg_leaf_sum_cb(const char *val, size_t vlen, void *raw) {
     AggLeafSumCtx *c = (AggLeafSumCtx *)raw;
     double v;
-    if (decode_index_key_to_double(c->tf, (const uint8_t *)val, vlen, &v)) {
+    if (decode_index_key_to_double(c->tf, (const uint8_t *)val, vlen, &v) == AGG_VALUE_PRESENT) {
         c->sum += v;
         c->count++;
     }
@@ -3155,7 +3630,7 @@ static void *agg_single_shard_worker(void *raw) {
     const char *val; size_t vlen; const uint8_t *hash16;
     while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
         double v;
-        if (!decode_index_key_to_double(a->tf, (const uint8_t *)val, vlen, &v))
+        if (decode_index_key_to_double(a->tf, (const uint8_t *)val, vlen, &v) != AGG_VALUE_PRESENT)
             continue;
         if (!a->have) { a->accum = v; a->have = 1; a->count = 1; }
         else {
@@ -3239,10 +3714,10 @@ static int vs_lookup_cb(const uint8_t hash16[16],
         if (fn == AGG_COUNT) continue;
         const TypedField *tf = c->spec_tfs[i];
         if (!tf) continue;
-        const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > vlen)
-            ? g_zero_field_65537 : rec + tf->offset;
+        size_t avail;
+        const uint8_t *fp = agg_field_ptr(rec, vlen, tf, &avail);
         double v;
-        if (!typed_field_to_double(tf, fp, &v)) continue;
+        if (typed_field_to_double(tf, fp, avail, &v) != AGG_VALUE_PRESENT) continue;
         switch (fn) {
         case AGG_SUM:
         case AGG_AVG:
@@ -3381,7 +3856,7 @@ static void emit_min_max_via_keyset(const char *db_root, const char *object,
             double v;
             if (decode_index_key_to_double(agg_tf,
                                            (const uint8_t *)val,
-                                           vlen, &v)) {
+                                           vlen, &v) == AGG_VALUE_PRESENT) {
                 if (!have) { best = v; have = 1; }
                 else if (desc) { if (v > best) best = v; }
                 else           { if (v < best) best = v; }
@@ -3505,26 +3980,26 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                                verr, sizeof(verr)) < 0) {
                 OUT("{\"error\":\"%s\"}\n", verr); return -1;
             }
+            if (agg_validate_spec(&specs[i], fs.ts, verr, sizeof(verr)) < 0) {
+                OUT("{\"error\":\"%s\"}\n", verr); return -1;
+            }
         }
         /* order_by validated below after group_by parse — it may reference
            an aggregate alias or a group_by field, not just a typed field. */
     }
 
     /* Fast path: count-only with no criteria and no group_by → metadata.
-       Skipped when count has a varchar field — that needs a per-record
-       elen>0 check (count(varchar) only counts non-empty content), which
-       live_count can't satisfy. Other typed fields and the field-less
-       form still take this O(1) path. */
+       Skip fields whose presence semantics require inspecting the value. */
     int no_group = (!group_by_json || group_by_json[0] == '\0' || strcmp(group_by_json, "[]") == 0);
     int no_having = !having_tree && (!having_json || having_json[0] == '\0');
     if (!tree && no_group && no_having && nspecs == 1 && specs[0].fn == AGG_COUNT) {
-        int needs_varchar_filter = 0;
+        int needs_presence_filter = 0;
         if (specs[0].field[0] && fs.ts && !strchr(specs[0].field, '+')) {
             int fi = typed_field_index(fs.ts, specs[0].field);
-            if (fi >= 0 && fs.ts->fields[fi].type == FT_VARCHAR)
-                needs_varchar_filter = 1;
+            if (fi >= 0 && agg_count_inspects_presence(fs.ts->fields[fi].type))
+                needs_presence_filter = 1;
         }
-        if (!needs_varchar_filter) {
+        if (!needs_presence_filter) {
             int n = get_live_count(db_root, object);
             if (want_total)
                 OUT("{\"rows\":{\"%s\":%d},\"total\":1}\n", specs[0].alias, n);
@@ -3555,7 +4030,15 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
          specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
         fs.ts && specs[0].field[0] && !strchr(specs[0].field, '+')) {
         int fi = typed_field_index(fs.ts, specs[0].field);
-        if (fi >= 0 && fs.ts->fields[fi].type != FT_VARCHAR &&
+        if (fi >= 0 && (specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
+            agg_type_is_text(fs.ts->fields[fi].type) &&
+            btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
+            agg_minmax_text_indexed(db_root, object, &sch, &specs[0],
+                                    &fs.ts->fields[fi], format, delimiter,
+                                    want_total);
+            return 0;
+        }
+        if (fi >= 0 && !agg_type_is_text(fs.ts->fields[fi].type) &&
             btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
             const TypedField *tf = &fs.ts->fields[fi];
             int n_idx = index_splits_for(sch.splits);
@@ -3617,7 +4100,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
                         double v;
                         if (decode_index_key_to_double(tf, (const uint8_t *)val,
-                                                       vlen, &v)) {
+                                                       vlen, &v) == AGG_VALUE_PRESENT) {
                             if (!have) { accum = v; have = 1; count = 1; }
                             else {
                                 switch (fn) {
@@ -3683,7 +4166,9 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     if (strchr(sp->field, '+')) { eligible = 0; break;
                     }
                     int fi = typed_field_index(fs.ts, sp->field);
-                    if (fi >= 0 && fs.ts->fields[fi].type == FT_VARCHAR) {
+                    /* Presence-doctrine counts need per-record marker
+                       checks — bail to the general scan path. */
+                    if (fi >= 0 && agg_count_inspects_presence(fs.ts->fields[fi].type)) {
                         eligible = 0; break;
                     }
                 }
@@ -3697,7 +4182,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 eligible = 0; break;
             }
             int fi = typed_field_index(fs.ts, sp->field);
-            if (fi < 0 || fs.ts->fields[fi].type == FT_VARCHAR ||
+            if (fi < 0 || agg_type_is_text(fs.ts->fields[fi].type) ||
                 !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
                 eligible = 0; break;
             }
@@ -3740,8 +4225,8 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     const char *val; size_t vlen; const uint8_t *hash16;
                     while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
                         double v;
-                        if (!decode_index_key_to_double(tf, (const uint8_t *)val,
-                                                       vlen, &v)) continue;
+                        if (decode_index_key_to_double(tf, (const uint8_t *)val,
+                                                       vlen, &v) != AGG_VALUE_PRESENT) continue;
                         for (int k = 0; k < nsibs; k++) {
                             int idx = sibs[k];
                             counts[idx]++;
@@ -3830,7 +4315,25 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             eligible_for_topn_stream(db_root, object, specs, nspecs,
                                       gb_csv, order_by, limit,
                                       having_tree ? "1" : having_json,
-                                      format)) {
+                                      format) &&
+            /* The streaming heap stores only numeric metrics. Disable the
+               optimization when order_by resolves to a textual aggregate,
+               or when any min/max spec aggregates a textual field (given
+               top-N eligibility such specs sit on the group field, where
+               the leaf decode yields no numeric value). Count-only and
+               numeric-aggregate streams over a textual group field keep
+               the documented streaming fallback. */
+            ({ int text_order = 0;
+               for (int si = 0; si < nspecs; si++) {
+                   if (specs[si].fn != AGG_MIN && specs[si].fn != AGG_MAX)
+                       continue;
+                   if (!specs[si].field[0] || strchr(specs[si].field, '+'))
+                       continue;
+                   int fi = typed_field_index(fs.ts, specs[si].field);
+                   if (fi >= 0 && agg_type_is_text(fs.ts->fields[fi].type))
+                       text_order = 1;
+               }
+               !text_order; })) {
             QueryDeadline topn_dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
             int rc = agg_run_topn_stream(db_root, object, &sch, &fs,
                                           specs, nspecs, gb_csv,
@@ -3924,12 +4427,38 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
     for (int i = 0; i < ctx.nspecs && i < MAX_AGG_SPECS; i++) {
         ctx.spec_tfs[i] = NULL;
         /* Resolve TypedField for COUNT specs too — agg_scan_cb's
-           count(varchar field) elen>0 check needs ctx.spec_tfs to know
-           the field's type. Composite ("a+b") still falls through to
-           decode_field. */
+           count(field) presence-doctrine check needs ctx.spec_tfs to
+           know the field's type. Composite ("a+b") still resolves NULL. */
         if (ctx.specs[i].field[0] && fs.ts && !strchr(ctx.specs[i].field, '+')) {
             int idx = typed_field_index(fs.ts, ctx.specs[i].field);
             if (idx >= 0) ctx.spec_tfs[i] = &fs.ts->fields[idx];
+        }
+    }
+
+    /* Pre-scan having validation: every leaf's field must resolve to an
+       aggregate alias or group_by field, and its operator must fit the
+       statically known result kind — before any scan or index walk. */
+    if (having_tree || (having_json && having_json[0])) {
+        char verr[256];
+        int hv_bad = 0;
+        if (having_tree) {
+            hv_bad = agg_having_tree_ok(&ctx, having_tree, verr, sizeof(verr)) < 0;
+        } else {
+            SearchCriterion *hv = NULL; int nhv = 0;
+            /* Parse failures surface at the existing late-parse site. */
+            if (parse_criteria_json(having_json, &hv, &nhv) == 0) {
+                for (int i = 0; i < nhv; i++) {
+                    if (agg_having_leaf_ok(&ctx, &hv[i], verr, sizeof(verr)) < 0) {
+                        hv_bad = 1; break;
+                    }
+                }
+                free_criteria(hv, nhv);
+            }
+        }
+        if (hv_bad) {
+            OUT("{\"error\":\"%s\"}\n", verr);
+            agg_free(&ctx);
+            return -1;
         }
     }
 
@@ -3950,7 +4479,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             sf_leaf_node = tree->children[0];
         int sf_agg_fi = typed_field_index(fs.ts, specs[0].field);
         if (sf_leaf_node && sf_agg_fi >= 0 &&
-            fs.ts->fields[sf_agg_fi].type != FT_VARCHAR &&
+            !agg_type_is_text(fs.ts->fields[sf_agg_fi].type) &&
             btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
             const TypedField *agg_tf = &fs.ts->fields[sf_agg_fi];
             SearchCriterion *crit = &sf_leaf_node->leaf;
@@ -3977,7 +4506,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         fs.ts && specs[0].field[0] && !strchr(specs[0].field, '+')) {
         int agg_fi = typed_field_index(fs.ts, specs[0].field);
         if (agg_fi >= 0 &&
-            fs.ts->fields[agg_fi].type != FT_VARCHAR &&
+            !agg_type_is_text(fs.ts->fields[agg_fi].type) &&
             btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
             const TypedField *agg_tf = &fs.ts->fields[agg_fi];
             int n_idx = index_splits_for(sch.splits);
@@ -4059,7 +4588,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             crit_leaf_node = tree->children[0];
         int agg_fi = typed_field_index(fs.ts, specs[0].field);
         if (crit_leaf_node && agg_fi >= 0 &&
-            fs.ts->fields[agg_fi].type != FT_VARCHAR &&
+            !agg_type_is_text(fs.ts->fields[agg_fi].type) &&
             btree_idx_exists(db_root, object, specs[0].field, sch.splits) &&
             leaf_is_indexed(&crit_leaf_node->leaf, db_root, object, NULL, 0)) {
             const TypedField *agg_tf = &fs.ts->fields[agg_fi];
@@ -4122,7 +4651,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         fs.ts && specs[0].field[0] && !strchr(specs[0].field, '+')) {
         int agg_fi = typed_field_index(fs.ts, specs[0].field);
         if (agg_fi >= 0 &&
-            fs.ts->fields[agg_fi].type != FT_VARCHAR &&
+            !agg_type_is_text(fs.ts->fields[agg_fi].type) &&
             btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
             const TypedField *agg_tf = &fs.ts->fields[agg_fi];
             SearchCriterion *isect_leaves[MAX_INTERSECT_LEAVES];
@@ -4195,10 +4724,12 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         for (int i = 0; i < nspecs; i++) {
             if (specs[i].fn != AGG_COUNT) { count_only = 0; break;
                     }
-            /* count(varchar field) needs per-record elen>0 check, which
-               idx_count_cb can't do — bail to the legacy two-side path. */
+            /* Presence-doctrine counts (varchar/date/datetime/datetimems/
+               time/uuid) need per-record marker checks, which
+               live_count − count(eq) can't do — bail to the legacy
+               two-side path (whose record scans apply the doctrine). */
             if (specs[i].field[0] && ctx.spec_tfs[i] &&
-                ctx.spec_tfs[i]->type == FT_VARCHAR) {
+                agg_count_inspects_presence(ctx.spec_tfs[i]->type)) {
                 count_only = 0; break;
             }
         }
@@ -4360,7 +4891,9 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     if (strchr(sp->field, '+')) { aw_eligible = 0; break;
                     }
                     int fi = typed_field_index(fs.ts, sp->field);
-                    if (fi >= 0 && fs.ts->fields[fi].type == FT_VARCHAR) {
+                    /* Presence-doctrine counts need per-record marker
+                       checks — bail to the general scan path. */
+                    if (fi >= 0 && agg_count_inspects_presence(fs.ts->fields[fi].type)) {
                         aw_eligible = 0; break;
                     }
                 }
@@ -4374,8 +4907,10 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             if (!sp->field[0] || strchr(sp->field, '+')) {
                 aw_eligible = 0; break;
             }
+            /* This walk accumulates leaf bytes as doubles only. Textual
+               min/max must route to the general text-aware path. */
             int fi = typed_field_index(fs.ts, sp->field);
-            if (fi < 0 || fs.ts->fields[fi].type == FT_VARCHAR ||
+            if (fi < 0 || agg_type_is_text(fs.ts->fields[fi].type) ||
                 !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
                 aw_eligible = 0; break;
             }
@@ -4931,15 +5466,17 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
             AggSpec *sp = &ctx.specs[i];
             if (sp->fn == AGG_COUNT) {
                 if (sp->field[0] && ctx.spec_tfs[i] &&
-                    ctx.spec_tfs[i]->type == FT_VARCHAR) {
+                    agg_count_inspects_presence(ctx.spec_tfs[i]->type)) {
                     igb_eligible = 0; break;
-                     /* count(varchar): per-record elen */
+                     /* presence-doctrine count: per-record marker check */
                 }
                 continue;
             }
-            /* sum/avg/min/max: need indexed non-varchar agg field. */
+            /* sum/avg/min/max: need an indexed numeric agg field. The
+               pass-2 walk accumulates leaf bytes as doubles only, so
+               textual min/max must route to the general scan path. */
             if (!ctx.spec_tfs[i] ||
-                ctx.spec_tfs[i]->type == FT_VARCHAR ||
+                agg_type_is_text(ctx.spec_tfs[i]->type) ||
                 strchr(sp->field, '+') ||
                 !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
                 igb_eligible = 0; break;
@@ -5828,9 +6365,9 @@ igb_pass2:
                             if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break;
                     }
                             double v;
-                            if (!decode_index_key_to_double(atf,
+                            if (decode_index_key_to_double(atf,
                                                            (const uint8_t *)val,
-                                                           vlen, &v)) continue;
+                                                           vlen, &v) != AGG_VALUE_PRESENT) continue;
                             memcpy(ring[filled].hash, hash16, 16);
                             ring[filled].v = v;
                             __builtin_prefetch(&hbk.entries[hbk_index(&hbk, hash16)], 0, 0);
@@ -5899,7 +6436,7 @@ igb_skip:
     if (having_tree) {
         int dst = 0;
         for (int i = 0; i < nbuckets; i++) {
-            if (agg_having_match_tree(buckets[i], specs, nspecs, having_tree))
+            if (agg_having_match_tree(&ctx, buckets[i], having_tree))
                 buckets[dst++] = buckets[i];
         }
         nbuckets = dst;
@@ -5914,7 +6451,7 @@ igb_skip:
         if (nhaving > 0) {
             int dst = 0;
             for (int i = 0; i < nbuckets; i++) {
-                if (agg_having_match(buckets[i], specs, nspecs, having, nhaving))
+                if (agg_having_match(&ctx, buckets[i], having, nhaving))
                     buckets[dst++] = buckets[i];
             }
             nbuckets = dst;
@@ -5944,7 +6481,11 @@ igb_skip:
         g_sort_desc = order_desc;
         g_sort_ngroups = ctx.ngroups;
         g_sort_group_fields = ctx.group_fields;
+        g_sort_ctx = &ctx;
         qsort(buckets, nbuckets, sizeof(AggBucket *), agg_sort_cmp);
+        /* The comparator's context points into this frame — drop it as
+           soon as the sort is done so no later use can see stale state. */
+        g_sort_ctx = NULL;
     }
 
     /* Apply limit — capture pre-limit group count for total. */
@@ -5975,6 +6516,8 @@ igb_skip:
                 if (ctx.ngroups > 0 || i > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
                 AggAccum *a = &b->accums[i];
                 char vbuf[64];
+                if (agg_csv_minmax_text(&specs[i], a, ctx.spec_tfs[i], csv_delim))
+                    continue;
                 switch (specs[i].fn) {
                     case AGG_COUNT: snprintf(vbuf, sizeof(vbuf), "%ld", a->count); break;
                     case AGG_SUM:   fmt_double(vbuf, sizeof(vbuf), a->sum); break;
@@ -6015,10 +6558,12 @@ igb_skip:
                     OUT("\"%s\":%s", specs[i].alias, vbuf);
                     break;
                 case AGG_MIN:
+                    if (agg_json_minmax_text(&specs[i], a, ctx.spec_tfs[i])) break;
                     fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->min : 0.0);
                     OUT("\"%s\":%s", specs[i].alias, vbuf);
                     break;
                 case AGG_MAX:
+                    if (agg_json_minmax_text(&specs[i], a, ctx.spec_tfs[i])) break;
                     fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->max : 0.0);
                     OUT("\"%s\":%s", specs[i].alias, vbuf);
                     break;
@@ -6046,6 +6591,10 @@ igb_skip:
                 AggAccum *a = &b->accums[i];
                 if (!first) OUT(",");
                 char vbuf[64];
+                if (agg_json_minmax_text(&specs[i], a, ctx.spec_tfs[i])) {
+                    first = 0;
+                    continue;
+                }
                 switch (specs[i].fn) {
                     case AGG_COUNT:
                         OUT("\"%s\":%ld", specs[i].alias, a->count);

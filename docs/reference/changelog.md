@@ -6,7 +6,13 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
-_No changes yet._
+Aggregate type handling is now explicit and type-correct: zero-valued numeric
+fields participate in aggregates and retain real `0` group keys; varchar and
+calendar `min`/`max` return textual values; unsupported combinations return
+structured errors; and temporal `IN`/`NOT_IN` criteria work for both datetime
+precisions. Calendar aggregate output is quoted, and empty textual aggregates
+render as `null` (or an empty CSV cell). This is a wire-visible breaking
+change for clients that depended on the former numeric-zero fallbacks.
 
 ## 2026.09.1
 

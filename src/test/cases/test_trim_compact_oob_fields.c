@@ -80,7 +80,9 @@ static int test_trim_compact_oob_field4_run(void) {
         "{\"field\":\"f0\",\"op\":\"eq\",\"value\":\"nonexistent\"}]}}");
     tc_request(tc, req, &resp);
     ASSERT_CONTAINS(resp, "\"cnt\":1", "aggregate counts trimmed record");
-    ASSERT_CONTAINS(resp, "\"f2\":\"0\"", "group key reads trimmed f2 as default 0, not OOB garbage");
+    /* Task 3 of the aggregate-type-correctness plan: a truncated field is
+       a MISSING group value, not a fake zero — and never OOB garbage. */
+    ASSERT_CONTAINS(resp, "\"f2\":\"\"", "group key reads trimmed f2 as missing, not a fake zero or OOB garbage");
     free(resp); free(req); free(f1); tc_close(tc); test_env_stop(&env);
     return t_ctx->failed > 0 ? 1 : 0;
 }

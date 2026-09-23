@@ -401,7 +401,7 @@ int keyset_to_collected_hashes(KeySet *ks, int splits,
 
 /* query_aggregate.c — typed field encode/decode (used by query.c join paths) */
 int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
-                           char *buf, size_t bufsz);
+                           char *buf, size_t bufsz, int keep_zero);
 int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
                       char *buf, size_t bufsz, int skip_zero);
 

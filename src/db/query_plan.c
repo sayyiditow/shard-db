@@ -521,6 +521,22 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
             for (int i = 0; i < c->in_count; i++)
                 cc->in_i64[i] = (int64_t)parse_date_i32(c->in_values[i]);
             break;
+        case FT_DATETIME:
+            cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
+            for (int i = 0; i < c->in_count; i++) {
+                int32_t d; uint16_t t;
+                parse_datetime(c->in_values[i], &d, &t);
+                cc->in_i64[i] = (int64_t)d * 100000LL + (int64_t)t;
+            }
+            break;
+        case FT_DATETIMEMS:
+            cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
+            for (int i = 0; i < c->in_count; i++) {
+                int32_t d; uint32_t ms;
+                parse_datetimems(c->in_values[i], &d, &ms);
+                cc->in_i64[i] = (int64_t)d * 100000000LL + (int64_t)ms;
+            }
+            break;
         case FT_TIME:
             cc->in_time = malloc(sizeof(uint8_t[3]) * c->in_count);
             for (int i = 0; i < c->in_count; i++)
@@ -549,7 +565,7 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
                                                           strlen(c->in_values[i]));
             break;
         default:
-            /* VARCHAR, DATETIME: values stay raw strings via c->in_values,
+            /* VARCHAR: values stay raw strings via c->in_values,
                but lengths are fixed for the life of this compiled criterion —
                precompute once here instead of strlen() per record in the
                match loop (match_typed_varchar's OP_IN/OP_NOT_IN cases). */
@@ -1036,7 +1052,8 @@ int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc
         case OP_NOT_EXISTS: return d == 0 && t == 0;
         default:
             if (d == 0 && t == 0) return 0;
-            return cmp_op_i64(v, q1, q2, cc->op, NULL, 0, cc);
+            return cmp_op_i64(v, q1, q2, cc->op,
+                              cc->in_i64, cc->in_count, cc);
         }
     }
     case FT_DATETIMEMS: {
@@ -1050,7 +1067,8 @@ int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc
         case OP_NOT_EXISTS: return d == 0 && ms == 0;
         default:
             if (d == 0 && ms == 0) return 0;
-            return cmp_op_i64(v, q1, q2, cc->op, NULL, 0, cc);
+            return cmp_op_i64(v, q1, q2, cc->op,
+                              cc->in_i64, cc->in_count, cc);
         }
     }
     case FT_TIME: {
