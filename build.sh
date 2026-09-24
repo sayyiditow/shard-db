@@ -130,6 +130,10 @@ gcc $MODE_CFLAGS -o build/bin/embedded_lock_harness \
     src/test/embedded_lock_harness.c build/bin/libshard-db.a \
     -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS \
     -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o build/bin/datetime-migration-fixture \
+    src/test/datetime_migration_fixture.c build/bin/libshard-db.a \
+    -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS \
+    -lpthread -lssl -lcrypto
 gcc $MODE_CFLAGS -o build/bin/embedded_bg_harness \
     src/test/embedded_bg_harness.c build/bin/libshard-db.a \
     -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS \
@@ -311,6 +315,9 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_ipv6.c \
     src/test/cases/test_trigram_index.c \
     src/test/cases/test_config_encode.c \
+    src/test/cases/test_version_gate.c \
+    src/test/cases/test_datetime_migration.c \
+    src/test/cases/test_datetime_evening.c \
     src/test/cases/test_error_paths.c \
     src/test/cases/test_explain.c \
     src/test/cases/test_dispatch_leak_paths.c \

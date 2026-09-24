@@ -138,6 +138,9 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
                        void *ctxp);
 int update_schema_conf_splits_streams(const char *db_root, const char *object,
                                      int new_splits, int new_streams);
+int selective_reindex_dirty(const char *db_root, const char *object,
+                            char dirty_names[][128], int n_dirty,
+                            int *out_rebuilt, int *out_skipped);
 int parse_field_line(const char *line, TypedField *out);
 void transform_field_value(const TypedField *old_f,
                            const TypedField *new_f,
@@ -234,6 +237,10 @@ static inline int16_t ld_be_i16(const uint8_t *p) {
 }
 static inline uint16_t ld_be_u16(const uint8_t *p) {
     return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
+static inline uint32_t ld_be_u24(const uint8_t *p) {
+    return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) |
+           (uint32_t)p[2];
 }
 static inline uint32_t ld_be_u32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |

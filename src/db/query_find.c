@@ -704,6 +704,9 @@ typedef struct {
                    overflow caught pre-flight.
      FT_NUMERIC  — int64 BE scaled by 10^S. Rescale on S change.
      FT_FLOAT/DOUBLE — natural widen by IEEE 754 cast (caller validates).
+     FT_DATETIME  — 6B → 7B widen only: zero-extend the 2-byte BE
+                   seconds-of-day into 3 bytes. Other size pairs take the
+                   defensive prefix copy.
      other types — same size required; defensive memcpy. */
 void transform_field_value(const TypedField *old_f,
                                    const TypedField *new_f,
@@ -791,6 +794,21 @@ void transform_field_value(const TypedField *old_f,
         }
         memcpy(dst, src, old_f->size < new_f->size ? old_f->size : new_f->size);
         return;
+    case FT_DATETIME: {
+        /* 6 → 7 widen: zero-extend the 2-byte BE seconds-of-day into 3
+           bytes. Values already truncated by the old encoder keep their
+           stored meaning. */
+        if (old_f->size == 6 && new_f->size == 7) {
+            uint32_t seconds = ((uint32_t)src[4] << 8) | (uint32_t)src[5];
+            memcpy(dst, src, 4);
+            dst[4] = (uint8_t)(seconds >> 16);
+            dst[5] = (uint8_t)(seconds >> 8);
+            dst[6] = (uint8_t)seconds;
+            return;
+        }
+        memcpy(dst, src, old_f->size < new_f->size ? old_f->size : new_f->size);
+        return;
+    }
     default:
         /* Same-size paths fell through above. Anything else: best-effort
            prefix copy. Caller should have refused. */

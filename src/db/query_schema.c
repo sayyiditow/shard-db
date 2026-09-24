@@ -269,9 +269,9 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
 /* Selective reindex driver — walks index.conf and only rebuilds indexes
    whose referenced fields appear in dirty_names[]. Returns (rebuilt,
    skipped) via out params. */
-static int selective_reindex_dirty(const char *db_root, const char *object,
-                                   char dirty_names[][128], int n_dirty,
-                                   int *out_rebuilt, int *out_skipped) {
+int selective_reindex_dirty(const char *db_root, const char *object,
+                            char dirty_names[][128], int n_dirty,
+                            int *out_rebuilt, int *out_skipped) {
     *out_rebuilt = 0; *out_skipped = 0;
     if (n_dirty <= 0) return 0;
     char ic_path[PATH_MAX];
@@ -718,7 +718,7 @@ static int validate_field_type(const char *field_spec) {
     if (strcmp(type, "bool") == 0)   return 1;
     if (strcmp(type, "byte") == 0)   return 1;
     if (strcmp(type, "date") == 0)   return 4;
-    if (strcmp(type, "datetime") == 0) return 6;
+    if (strcmp(type, "datetime") == 0) return 7;
     if (strcmp(type, "datetimems") == 0) return 8;
     if (strcmp(type, "time") == 0)    return 3;
     if (strcmp(type, "timestamp") == 0) return 8;

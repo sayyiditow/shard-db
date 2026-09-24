@@ -45,8 +45,8 @@ static int32_t parse_date_i32(const char *s) {
     return (int32_t)atoi(clean);
 }
 
-/* Parse "yyyyMMddHHmmss" (tolerant) → date (int32) + time (uint16 seconds). */
-static void parse_datetime(const char *s, int32_t *out_date, uint16_t *out_time) {
+/* Parse "yyyyMMddHHmmss" (tolerant) → date (int32) + time (uint32 seconds). */
+static void parse_datetime(const char *s, int32_t *out_date, uint32_t *out_time) {
     char clean[16]; int ci = 0;
     for (const char *c = s; *c && ci < 14; c++)
         if (*c >= '0' && *c <= '9') clean[ci++] = *c;
@@ -57,7 +57,7 @@ static void parse_datetime(const char *s, int32_t *out_date, uint16_t *out_time)
     int hh = (clean[8]-'0')*10 + (clean[9]-'0');
     int mm = (clean[10]-'0')*10 + (clean[11]-'0');
     int ss = (clean[12]-'0')*10 + (clean[13]-'0');
-    *out_time = (uint16_t)(hh * 3600 + mm * 60 + ss);
+    *out_time = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
 }
 
 /* Parse "yyyyMMddHHmmssfff" (digit-only, right-zero-padded if short) into
@@ -375,7 +375,7 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         cc->i2 = parse_date_i32(c->value2);
         break;
     case FT_DATETIME: {
-        int32_t d; uint16_t t;
+        int32_t d; uint32_t t;
         parse_datetime(c->value, &d, &t); cc->i1 = d; cc->t1 = t;
         parse_datetime(c->value2, &d, &t); cc->i2 = d; cc->t2 = t;
         break;
@@ -524,7 +524,7 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         case FT_DATETIME:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
             for (int i = 0; i < c->in_count; i++) {
-                int32_t d; uint16_t t;
+                int32_t d; uint32_t t;
                 parse_datetime(c->in_values[i], &d, &t);
                 cc->in_i64[i] = (int64_t)d * 100000LL + (int64_t)t;
             }
@@ -867,8 +867,8 @@ static int cmp_typed_field_pair(const uint8_t *a, const uint8_t *b,
     case FT_DATE:    { int32_t va = ld_be_i32(a), vb = ld_be_i32(b);
                        return va < vb ? -1 : (va > vb ? 1 : 0); }
     case FT_DATETIME: {
-        int64_t va = (int64_t)ld_be_i32(a) * 100000LL + ld_be_u16(a + 4);
-        int64_t vb = (int64_t)ld_be_i32(b) * 100000LL + ld_be_u16(b + 4);
+        int64_t va = (int64_t)ld_be_i32(a) * 100000LL + ld_be_u24(a + 4);
+        int64_t vb = (int64_t)ld_be_i32(b) * 100000LL + ld_be_u24(b + 4);
         return va < vb ? -1 : (va > vb ? 1 : 0);
     }
     case FT_DATETIMEMS: {
@@ -1042,7 +1042,7 @@ int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc
     }
     case FT_DATETIME: {
         int64_t d = (int64_t)ld_be_i32(p);
-        uint16_t t = ld_be_u16(p + 4);
+        uint32_t t = ld_be_u24(p + 4);
         /* Compose into single int64 for ordered compare: date*100000 + seconds */
         int64_t v = d * 100000LL + (int64_t)t;
         int64_t q1 = cc->i1 * 100000LL + (int64_t)cc->t1;

@@ -84,16 +84,13 @@ later) upgrade with a binary swap:
 ./shard-db start
 ```
 
-2026.09.1 performs no startup migration or index rebuild. Upgrade exactly as:
-backup → stop writes → run 2026.08.1 once → wait for its startup sweep →
-cleanly stop 2026.08.2 → replace with 2026.09.1 → start and verify.
-A failed 2026.08.1 sweep blocks the upgrade. The new binary requires a
-populated root to carry 2026.08.1 clean-open evidence; it refuses missing,
-malformed, older, or newer markers. A later `reindex` is explicit operator
-work, not an automatic compatibility action. Low-numbered segment files are
-valid for new VARIABLE objects; `048000+` files are valid legacy output from
-the 2026.08.1 conversion. Neither filename range identifies a format, and
-operators must not rename or delete those files during upgrade.
+2026.09.2 performs the datetime-width migration automatically when opening a
+2026.09.1-compatible root; backup first, then start the new binary and verify
+the root. Other objects are left unchanged, and indexes for migrated datetime
+fields are rebuilt inside the migration transaction. Low-numbered segment
+files are valid for new VARIABLE objects; `048000+` files are valid legacy
+output from the 2026.08.1 conversion. Neither filename range identifies a
+format, and operators must not rename or delete those files during upgrade.
 
 Operators who upgraded from a pre-2026.07.1 build affected by kf
 corruption must run the 2026.07.1 release's `rebuild-kf` against a

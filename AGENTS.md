@@ -106,7 +106,7 @@ Driven by fields.conf. One slot = sum of field sizes (fixed).
 | `double` | 8 bytes IEEE 754 |
 | `bool / byte` | 1 byte |
 | `date` | 4 bytes BE int32 (`yyyyMMdd`) |
-| `datetime` | 6 bytes (BE int32 yyyyMMdd + BE uint16 packed HHmmss) |
+| `datetime` | 7 bytes (BE int32 yyyyMMdd + BE uint24 seconds-of-day, 0..86399) |
 | `datetimems` | 8 bytes (BE int32 yyyyMMdd + BE uint32 ms-of-day) |
 | `ipv4` | 4 bytes, network byte order |
 | `ipv6` | 16 bytes, network byte order |
@@ -179,10 +179,15 @@ that release's `./migrate` to convert v1 → v2; this version refuses
 any v1 object at load.
 
 2026.05.5 also rolls B+ tree magic `'BTRG'` → `'BTRH'` for the
-`(value, hash)` sort order. 2026.09.1 performs strict compatibility gating:
+`(value, hash)` sort order. 2026.09.2 performs strict compatibility gating:
 an empty root initializes directly, while a populated root must contain
-2026.08.2 clean-open evidence. Startup does not migrate data or rebuild
-indexes; use `./shard-db reindex` explicitly when required. The standalone
+2026.08.2 clean-open evidence. A populated root with
+`2026.08.2 ≤ .version < 2026.09.2` migrates at startup — legacy 6-byte
+`datetime` fields are rewritten to the 7-byte representation and their
+indexes rebuilt transactionally — then the root is stamped. A populated
+2026.08.2 root previously took the accept-without-rewrite fast path and
+now migrates like any other old root. Use `./shard-db reindex` explicitly
+for unrelated index maintenance. The standalone
 `./migrate`, `migrate-varlen`, and storage migration JSON modes are removed.
 The minimum supported source release is 2026.08.2.
 

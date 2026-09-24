@@ -232,7 +232,7 @@ static int agg_field_is_unset(const TypedField *f, const uint8_t *p) {
     switch (f->type) {
     case FT_VARCHAR:    return varchar_eff_len(p, f->size) <= 0;
     case FT_DATE:       return ld_be_i32(p) == 0;
-    case FT_DATETIME:   return ld_be_i32(p) == 0 && ld_be_u16(p + 4) == 0;
+    case FT_DATETIME:   return ld_be_i32(p) == 0 && ld_be_u24(p + 4) == 0;
     case FT_DATETIMEMS: return ld_be_i32(p) == 0 && ld_be_u32(p + 4) == 0;
     case FT_TIME:       return p[0] == 0 && p[1] == 0 && p[2] == 0;
     case FT_UUID: {
@@ -1079,7 +1079,7 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
     }
     case FT_DATETIME: {
         int32_t d = ld_be_i32(p);
-        uint16_t t = ld_be_u16(p + 4);
+        uint32_t t = ld_be_u24(p + 4);
         if (d == 0 && t == 0) return 0;
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         return snprintf(buf, bufsz, "%08d%02d%02d%02d", d, hh, mm, ss);
@@ -1235,7 +1235,7 @@ static AggValueStatus decode_index_key_to_double(const TypedField *f,
         uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                      ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
         int32_t d = (int32_t)(u ^ 0x80000000u);
-        uint16_t t = ((uint16_t)p[4] << 8) | (uint16_t)p[5];
+        uint32_t t = ld_be_u24(p + 4);
         if (d == 0 && t == 0) return AGG_VALUE_MISSING;
         return AGG_VALUE_UNSUPPORTED;
     }
@@ -1301,7 +1301,7 @@ static AggValueStatus decode_index_key_to_text(const TypedField *f,
         uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                      ((uint32_t)p[2] << 8) | p[3];
         int32_t d = (int32_t)(u ^ 0x80000000u);
-        uint16_t t = ((uint16_t)p[4] << 8) | p[5];
+        uint32_t t = ld_be_u24(p + 4);
         if (d == 0 && t == 0) return AGG_VALUE_MISSING;
         *out_len = (size_t)snprintf(out, 15, "%08d%02d%02d%02d", d,
                                     t / 3600, (t % 3600) / 60, t % 60);
@@ -1402,7 +1402,7 @@ int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
                      ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
         int32_t d = (int32_t)(u ^ 0x80000000u);
-        uint16_t t = ((uint16_t)p[4] << 8) | (uint16_t)p[5];
+        uint32_t t = ld_be_u24(p + 4);
         if (skip_zero && d == 0 && t == 0) return 0;
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         return snprintf(buf, bufsz, "%08d%02d%02d%02d", d, hh, mm, ss);
@@ -2011,7 +2011,7 @@ static AggValueStatus typed_field_to_text(const TypedField *f, const uint8_t *p,
         break;
     }
     case FT_DATETIME: {
-        int32_t d = ld_be_i32(p); uint16_t t = ld_be_u16(p + 4);
+        int32_t d = ld_be_i32(p); uint32_t t = ld_be_u24(p + 4);
         if (d == 0 && t == 0) return AGG_VALUE_MISSING;
         n = snprintf(buf, bufsz, "%08d%02d%02d%02d", d,
                      t / 3600, (t % 3600) / 60, t % 60);

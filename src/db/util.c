@@ -787,7 +787,7 @@ int shard_db_version_decide(const char *disk_version, int version_present,
     int current_cmp = shard_db_version_compare(disk_version, current_version);
     if (current_cmp > 0) return SHARD_DB_VERSION_DOWNGRADE;
     if (current_cmp == 0) return SHARD_DB_VERSION_NOOP;
-    if (strcmp(disk_version, required_source_version) == 0)
-        return SHARD_DB_VERSION_STAMP;
+    if (shard_db_version_compare(disk_version, required_source_version) >= 0)
+        return SHARD_DB_VERSION_MIGRATE;
     return SHARD_DB_VERSION_TOO_OLD;
 }

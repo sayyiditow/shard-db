@@ -78,9 +78,27 @@ static int test_config_encode_run(void) {
     memset(out, 0, 64); encode_field_len(&f_date, "2026-05-13", 10, out);
     ASSERT_EQ_INT(out[3], 0xA1, "date dashes");
 
-    TypedField f_dt = make_f(FT_DATETIME, 6, 0);
+    TypedField f_dt = make_f(FT_DATETIME, 7, 0);
+    /* 12:30:00 = 45000 = 0x00AFC8. */
     memset(out, 0, 64); encode_field_len(&f_dt, "20260513123000", 14, out);
-    ASSERT_TRUE(out[0] != 0 || out[4] != 0, "datetime packed");
+    ASSERT_EQ_INT(out[4], 0x00, "datetime secs b2");
+    ASSERT_EQ_INT(out[5], 0xAF, "datetime secs b1");
+    ASSERT_EQ_INT(out[6], 0xC8, "datetime secs b0");
+    /* 18:12:15 = 65535, the old uint16 maximum. */
+    memset(out, 0, 64); encode_field_len(&f_dt, "20240102181215", 14, out);
+    ASSERT_EQ_INT(out[4], 0x00, "181215 b2");
+    ASSERT_EQ_INT(out[5], 0xFF, "181215 b1");
+    ASSERT_EQ_INT(out[6], 0xFF, "181215 b0");
+    /* 18:12:16 = 65536, the first wrapped instant in the old format. */
+    memset(out, 0, 64); encode_field_len(&f_dt, "20240102181216", 14, out);
+    ASSERT_EQ_INT(out[4], 0x01, "181216 b2");
+    ASSERT_EQ_INT(out[5], 0x00, "181216 b1");
+    ASSERT_EQ_INT(out[6], 0x00, "181216 b0");
+    /* 23:59:59 = 86399 = 0x01517F. */
+    memset(out, 0, 64); encode_field_len(&f_dt, "20240102235959", 14, out);
+    ASSERT_EQ_INT(out[4], 0x01, "235959 b2");
+    ASSERT_EQ_INT(out[5], 0x51, "235959 b1");
+    ASSERT_EQ_INT(out[6], 0x7F, "235959 b0");
 
     TypedField f_time = make_f(FT_TIME, 3, 0);
     memset(out, 0, 64); encode_field_len(&f_time, "12:30:00", 8, out);
