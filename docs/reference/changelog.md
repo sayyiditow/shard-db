@@ -4,7 +4,7 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
-## Unreleased
+## 2026.09.2
 
 Calendar `datetime` storage widens from 6 to 7 bytes (int32 BE `yyyyMMdd` +
 3-byte BE seconds-of-day), fixing the silent wrap that stored evening times
