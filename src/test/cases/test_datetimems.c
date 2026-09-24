@@ -1,7 +1,7 @@
 /* test-datetimems — exercises the FT_DATETIMEMS field type. Storage is
  * 8 bytes: BE int32 yyyyMMdd date + BE uint32 ms-of-day (0..86399999).
  * Wire format is the 17-digit string "yyyyMMddHHmmssfff". Distinct from
- * FT_DATETIME (second precision, 6 bytes) and FT_TIMESTAMP (epoch ms,
+ * FT_DATETIME (second precision, 7 bytes) and FT_TIMESTAMP (epoch ms,
  * no calendar semantics).
  */
 #define _GNU_SOURCE

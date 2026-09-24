@@ -3515,7 +3515,8 @@ int cmd_server(const char *db_root, int daemonize) {
         db_root_lock_release(&lock_fd);
         return 1;
     }
-    int stamp_required = version_decision == SHARD_DB_VERSION_STAMP;
+    int stamp_required = version_decision == SHARD_DB_VERSION_STAMP ||
+                          version_decision == SHARD_DB_VERSION_MIGRATE;
 
     /* Allocate and initialise the ShardDb instance. Must happen before
        any code that uses g_* macros (which are now field accesses via
@@ -3587,6 +3588,12 @@ int cmd_server(const char *db_root, int daemonize) {
     if (shard_db_validate_before_stamp(db_root) != 0) {
         fprintf(stderr,
                 "shard-db: refusing to start: metadata validation failed\n");
+        db_root_lock_release(&lock_fd);
+        return 1;
+    }
+    if (version_decision == SHARD_DB_VERSION_MIGRATE &&
+        shard_db_startup_migrate(db_root) != 0) {
+        fprintf(stderr, "shard-db: startup datetime migration failed\n");
         db_root_lock_release(&lock_fd);
         return 1;
     }

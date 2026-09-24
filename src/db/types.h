@@ -134,7 +134,7 @@ enum FieldType {
     FT_BYTE,        /* byte — 1 byte uint8 */
     FT_NUMERIC,     /* numeric:P,S — 8 bytes int64 × 10^S */
     FT_DATE,        /* date — 4 bytes int32 yyyyMMdd big-endian */
-    FT_DATETIME,    /* datetime — 6 bytes packed yyyyMMddHHmmss big-endian */
+    FT_DATETIME,    /* datetime — 7 bytes: BE yyyyMMdd + BE seconds-of-day */
     FT_DATETIMEMS,  /* datetimems — 8 bytes: int32 BE yyyyMMdd date + uint32 BE
                        ms-of-day (0..86399999). Wire format is the 17-digit
                        string "yyyyMMddHHmmssfff". */
@@ -326,7 +326,7 @@ typedef struct CompiledCriterion {
     uint8_t  ipv6_val2[16];
     uint8_t  time_val[3];
     uint8_t  time_val2[3];
-    uint16_t t1, t2;
+    uint32_t t1, t2;
     int32_t  dm1, dm2;  /* FT_DATETIMEMS ms-of-day bounds (0..86399999) */
     uint8_t  b1;
 
@@ -1390,6 +1390,7 @@ int shard_db_version_check(const char *db_root,
                            char *out_disk_version, size_t out_sz);
 /* Atomic compatibility commit, called only after recovery and validation. */
 int shard_db_version_stamp(const char *db_root);
+int shard_db_startup_migrate(const char *db_root);
 int shard_db_version_file_read(const char *db_root, char *out, size_t out_sz);
 int shard_db_version_file_write(const char *db_root, const char *version);
 int shard_db_recover_before_stamp(const char *db_root,

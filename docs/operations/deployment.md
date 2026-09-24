@@ -260,7 +260,7 @@ systemctl stop shard-db
 systemctl start shard-db
 ```
 
-2026.09.1 uses a strict upgrade boundary and performs no startup migration or index rebuild. The runbook is: backup → stop writes → cleanly stop 2026.08.2 → replace with 2026.09.1 → start and verify. A populated root must have 2026.08.2 clean-open evidence; missing, malformed, older, or newer markers are refused. `./shard-db reindex` remains an explicit operator action. Low-numbered files are valid for new VARIABLE objects and `048000+` files are valid legacy 2026.08.1 conversion output; neither filename range is a format marker, and files must not be renamed or deleted during upgrade.
+2026.09.2 uses the compatibility gate and automatically migrates legacy datetime fields from the 2026.09.1 layout before stamping the root. The runbook is: backup → stop writes → cleanly stop 2026.09.1 → replace with 2026.09.2 → start and verify. Other objects remain unchanged; migrated datetime indexes are rebuilt transactionally. Low-numbered files are valid for new VARIABLE objects and `048000+` files are valid legacy 2026.08.1 conversion output; neither filename range is a format marker, and files must not be renamed or deleted during upgrade.
 
 **Upgrading from a pre-2026.05.5 install with legacy v1 (probe-into-slot) objects.** This binary refuses v1 objects at load. Run the migration on the previous release first:
 

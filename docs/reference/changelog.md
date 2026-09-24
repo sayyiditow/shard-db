@@ -6,6 +6,22 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+Calendar `datetime` storage widens from 6 to 7 bytes (int32 BE `yyyyMMdd` +
+3-byte BE seconds-of-day), fixing the silent wrap that stored evening times
+(`18:12:16`–`23:59:59`) as early-morning values on insert, read, indexing,
+criteria, ordering, and aggregates since the type was introduced. The wire
+format is unchanged (`yyyyMMddHHmmss`) and `datetimems` is untouched. On
+first start, 2026.09.2 transactionally migrates every populated root in the
+`2026.08.2`–`2026.09.1` band: 6-byte datetime objects are rebuilt in place,
+their indexes rebuilt, and a `#datetime_7byte` marker appended to
+`fields.conf` before the root is stamped. Values already truncated by the
+old encoder keep their stored (wrapped) meaning — the migration preserves
+what the old bytes represent and cannot restore lost seconds. Behavior
+change: a populated `2026.08.2` root previously took the
+accept-without-rewrite fast path; it now migrates like any other old root.
+Pass through 2026.09.2 before the next release, which raises the minimum
+supported source version to `2026.09.2` and refuses un-migrated roots.
+
 Aggregate type handling is now explicit and type-correct: zero-valued numeric
 fields participate in aggregates and retain real `0` group keys; varchar and
 calendar `min`/`max` return textual values; unsupported combinations return

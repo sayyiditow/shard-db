@@ -27,8 +27,8 @@ static int test_version_compatibility_table(void) {
     ASSERT_EQ_INT(shard_db_version_decide(SHARD_DB_REQUIRED_SOURCE_VERSION, 1, 0,
                                           SHARD_DB_VERSION,
                                           SHARD_DB_REQUIRED_SOURCE_VERSION),
-                  SHARD_DB_VERSION_STAMP,
-                  "required source version stamps");
+                  SHARD_DB_VERSION_MIGRATE,
+                  "required source version migrates");
     ASSERT_EQ_INT(shard_db_version_decide(SHARD_DB_VERSION, 1, 0,
                                           SHARD_DB_VERSION,
                                           SHARD_DB_REQUIRED_SOURCE_VERSION),
@@ -70,8 +70,8 @@ static int test_version_file_roundtrip_and_check(void) {
     ASSERT_EQ_STR(version, SHARD_DB_REQUIRED_SOURCE_VERSION,
                   "source marker round trips");
     ASSERT_EQ_INT(shard_db_version_check(root, version, sizeof(version)),
-                  SHARD_DB_VERSION_STAMP,
-                  "source marker is eligible for advancement");
+                  SHARD_DB_VERSION_MIGRATE,
+                  "source marker is eligible for migration");
     ASSERT_EQ_INT(shard_db_version_stamp(root), SHARD_DB_VERSION_STAMP_OK,
                   "compatibility stamp succeeds");
     ASSERT_EQ_INT(shard_db_version_check(root, version, sizeof(version)),

@@ -1,6 +1,7 @@
 #include "types.h"
 #include "slotcask.h"
 #include "bitmap.h"
+#include "query_internal.h"
 #include <semaphore.h>
 #include <dirent.h>
 
@@ -635,6 +636,129 @@ int shard_db_validate_before_stamp(const char *db_root) {
     return failed ? -1 : 0;
 }
 
+typedef struct {
+    const char *db_root;
+    const char *object;
+    const char *object_dir;
+    char dirty_names[MAX_FIELDS][128];
+    int n_dirty;
+} DatetimeMigrationFinalizeCtx;
+
+static int datetime_migration_has_marker(const char *fields_path) {
+    FILE *f = fopen(fields_path, "r");
+    if (!f) return -1;
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, "#datetime_7byte") == 0) {
+            found = 1;
+            break;
+        }
+    }
+    int rc = ferror(f) ? -1 : found;
+    fclose(f);
+    return rc;
+}
+
+static int datetime_migration_apply_metadata(void *ctx_) {
+    DatetimeMigrationFinalizeCtx *ctx = (DatetimeMigrationFinalizeCtx *)ctx_;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/fields.conf", ctx->object_dir) >=
+        (int)sizeof(path)) return -1;
+    FILE *f = fopen(path, "a");
+    if (!f) return -1;
+    int ok = fprintf(f, "#datetime_7byte\n") >= 0 && fflush(f) == 0;
+    if (ok) ok = fsync(fileno(f)) == 0;
+    if (fclose(f) != 0) ok = 0;
+    return ok ? 0 : -1;
+}
+
+static int datetime_migration_rebuild_indexes(void *ctx_, int *out_rebuilt) {
+    DatetimeMigrationFinalizeCtx *ctx = (DatetimeMigrationFinalizeCtx *)ctx_;
+    int skipped = 0;
+    return selective_reindex_dirty(ctx->db_root, ctx->object,
+                                   ctx->dirty_names, ctx->n_dirty,
+                                   out_rebuilt, &skipped);
+}
+
+int shard_db_startup_migrate(const char *db_root) {
+    StartupSchemaEntry *entries = NULL;
+    size_t count = 0;
+    if (startup_read_schema(db_root, &entries, &count) != 0) return -1;
+
+    for (size_t i = 0; i < count; i++) {
+        char effective_root[PATH_MAX];
+        char object_dir[PATH_MAX];
+        char fields_path[PATH_MAX];
+        snprintf(effective_root, sizeof(effective_root), "%s/%s",
+                 db_root, entries[i].dir);
+        snprintf(object_dir, sizeof(object_dir), "%s/%s",
+                 effective_root, entries[i].object);
+        snprintf(fields_path, sizeof(fields_path), "%s/fields.conf", object_dir);
+
+        int marked = datetime_migration_has_marker(fields_path);
+        if (marked < 0) { free(entries); return -1; }
+        if (marked > 0) continue;
+
+        TypedSchema *current = load_typed_schema(effective_root, entries[i].object);
+        if (!current) continue;
+
+        TypedSchema old_ts = *current;
+        TypedSchema new_ts = *current;
+        int has_datetime = 0;
+        DatetimeMigrationFinalizeCtx ctx = {
+            .db_root = effective_root,
+            .object = entries[i].object,
+            .object_dir = object_dir,
+        };
+        int old_offset = 0;
+        for (int f = 0; f < current->nfields; f++) {
+            if (current->fields[f].type == FT_DATETIME) {
+                has_datetime = 1;
+                old_ts.fields[f].size = 6;
+                if (ctx.n_dirty < MAX_FIELDS) {
+                    snprintf(ctx.dirty_names[ctx.n_dirty],
+                             sizeof(ctx.dirty_names[ctx.n_dirty]), "%s",
+                             current->fields[f].name);
+                    ctx.n_dirty++;
+                }
+            }
+            old_ts.fields[f].offset = old_offset;
+            old_offset += old_ts.fields[f].size;
+        }
+        if (!has_datetime) continue;
+        old_ts.total_size = old_offset;
+
+        Schema old_sch = load_schema(effective_root, entries[i].object);
+        Schema new_sch = old_sch;
+        old_sch.max_value = old_ts.total_size;
+        old_sch.slot_size = (24 + old_sch.max_key + old_sch.max_value + 7) & ~7;
+        if (old_sch.slot_size < 32) old_sch.slot_size = 32;
+        new_sch.max_value = new_ts.total_size;
+        new_sch.slot_size = (24 + new_sch.max_key + new_sch.max_value + 7) & ~7;
+        if (new_sch.slot_size < 32) new_sch.slot_size = 32;
+
+        int new_to_old[MAX_FIELDS];
+        for (int f = 0; f < new_ts.nfields; f++) new_to_old[f] = f;
+        RebuildFinalizeOps finalize = {
+            .apply_metadata = datetime_migration_apply_metadata,
+            .rebuild_indexes = datetime_migration_rebuild_indexes,
+            .ctx = &ctx,
+            .indexes_may_change = 1,
+        };
+        if (rebuild_object_v2(effective_root, entries[i].object,
+                              &old_sch, &old_ts, &new_sch, &new_ts,
+                              new_to_old, 1, 0, 0, NULL, 0,
+                              &finalize) != 0) {
+            free(entries);
+            return -1;
+        }
+    }
+    free(entries);
+    return 0;
+}
+
 int shard_db_recover_before_stamp(const char *db_root,
                                   int *out_markers_replayed) {
     if (!out_markers_replayed) return -1;
@@ -731,7 +855,8 @@ ShardDb *shard_db_open(const char *db_root) {
         atomic_store(&g_instance_open, 0);
         return NULL;
     }
-    int stamp_required = version_decision == SHARD_DB_VERSION_STAMP;
+    int stamp_required = version_decision == SHARD_DB_VERSION_STAMP ||
+                          version_decision == SHARD_DB_VERSION_MIGRATE;
 
     ShardDb *db = shard_db_open_internal(db_root);
     if (!db) {
@@ -757,6 +882,16 @@ ShardDb *shard_db_open(const char *db_root) {
         return NULL;
     }
     (void)markers_replayed;
+
+    if (version_decision == SHARD_DB_VERSION_MIGRATE &&
+        shard_db_startup_migrate(db_root) != 0) {
+        fprintf(stderr, "shard_db_open: startup datetime migration failed\n");
+        g_shard_db_instance = NULL;
+        g_db = NULL;
+        db_cleanup_before_pools(db);
+        atomic_store(&g_instance_open, 0);
+        return NULL;
+    }
 
     if (stamp_required &&
         shard_db_version_stamp(db_root) != SHARD_DB_VERSION_STAMP_OK) {

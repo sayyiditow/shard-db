@@ -1407,7 +1407,7 @@ void parse_field_type(const char *spec, TypedField *f) {
         f->size = 4;
     } else if (strcmp(spec, "datetime") == 0) {
         f->type = FT_DATETIME;
-        f->size = 6;
+        f->size = 7;
     } else if (strcmp(spec, "datetimems") == 0) {
         f->type = FT_DATETIMEMS;
         f->size = 8;
@@ -1740,8 +1740,10 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         int hh = (clean[8]-'0')*10 + (clean[9]-'0');
         int mm = (clean[10]-'0')*10 + (clean[11]-'0');
         int ss = (clean[12]-'0')*10 + (clean[13]-'0');
-        uint16_t t = (uint16_t)(hh * 3600 + mm * 60 + ss);
-        out[4] = (t >> 8) & 0xFF; out[5] = t & 0xFF;
+        uint32_t t = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
+        out[4] = (uint8_t)(t >> 16);
+        out[5] = (uint8_t)(t >> 8);
+        out[6] = (uint8_t)t;
         break;
     }
     case FT_DATETIMEMS: {
@@ -1883,7 +1885,7 @@ void encode_field(const TypedField *f, const char *val, uint8_t *out) {
      numeric  — 8 bytes BE int64 × 10^S with top-bit flipped
      date     — 4 bytes BE int32 with top-bit flipped (dates are always
                 positive but flip kept for consistency with other signed types)
-     datetime — 4 bytes BE flipped-int32 date + 2 bytes BE uint16 time
+     datetime — 4 bytes BE flipped-int32 date + 3 bytes BE seconds-of-day
      double   — 8 bytes BE with IEEE-754 total-order transform */
 void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
                             uint8_t *out, size_t *out_len) {
@@ -2006,9 +2008,11 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         int hh = (clean[8]-'0')*10 + (clean[9]-'0');
         int mm = (clean[10]-'0')*10 + (clean[11]-'0');
         int ss = (clean[12]-'0')*10 + (clean[13]-'0');
-        uint16_t t = (uint16_t)(hh * 3600 + mm * 60 + ss);
-        out[4] = (t >> 8) & 0xFF; out[5] = t & 0xFF;
-        *out_len = 6;
+        uint32_t t = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
+        out[4] = (uint8_t)(t >> 16);
+        out[5] = (uint8_t)(t >> 8);
+        out[6] = (uint8_t)t;
+        *out_len = 7;
         break;
     }
     case FT_DATETIMEMS: {
@@ -2177,10 +2181,10 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
         break;
     }
     case FT_DATETIME: {
-        /* int32 BE date (flip) + uint16 BE time (already unsigned). */
-        memcpy(out, src, 6);
+        /* int32 BE date (flip) + 3-byte BE seconds (unsigned). */
+        memcpy(out, src, 7);
         out[0] ^= 0x80;
-        *out_len = 6;
+        *out_len = 7;
         break;
     }
     case FT_DATETIMEMS: {
@@ -3004,7 +3008,8 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         uint32_t ud = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
                       ((uint32_t)data[2] << 8) | data[3];
         int32_t d = (int32_t)ud;   /* see FT_LONG: unsigned accumulate (UB gate) */
-        uint16_t t = ((uint16_t)data[4] << 8) | data[5];
+        uint32_t t = ((uint32_t)data[4] << 16) |
+                     ((uint32_t)data[5] << 8) | data[6];
         if (d == 0 && t == 0) return 0;
         int hh = t / 3600;
         int mm = (t % 3600) / 60;
@@ -3274,7 +3279,8 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         const uint8_t *d = src;
         int32_t dv = ((int32_t)d[0] << 24) | ((int32_t)d[1] << 16) |
                      ((int32_t)d[2] << 8) | d[3];
-        uint16_t t = ((uint16_t)d[4] << 8) | d[5];
+        uint32_t t = ((uint32_t)d[4] << 16) |
+                     ((uint32_t)d[5] << 8) | d[6];
         if (dv == 0 && t == 0) return NULL;
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         char *out = malloc(15);

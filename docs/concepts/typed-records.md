@@ -48,7 +48,7 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 | `bool` | `active:bool` | 1 | `0` = false, `1` = true. |
 | `byte` | `level:byte` | 1 | Unsigned 8-bit. |
 | `date` | `dob:date` | 4 | `yyyyMMdd` as int32 BE (e.g., `20260418`). |
-| `datetime` | `created:datetime` | 6 | `yyyyMMdd` (int32 BE) + `HHmmss` (uint16 BE packed). |
+| `datetime` | `created:datetime` | 7 | `yyyyMMdd` (int32 BE) + seconds-of-day (uint24 BE, 0..86399). Widened from 6 bytes in 2026.09.2; startup migration rewrites old objects. |
 | `datetimems` | `created_at:datetimems` | 8 | `yyyyMMdd` (int32 BE) + `ms-of-day` (uint32 BE, `0..86399999`). Wire format is the 17-digit string `"yyyyMMddHHmmssfff"`. |
 | `time` | `t:time` | 3 | Seconds-of-day packed as 3 big-endian bytes. Parsed from `HH:MM:SS`. Malformed input encodes 0. |
 | `timestamp` | `created_at:timestamp` | 8 | Unix epoch **milliseconds** as int64 BE. Storage layout is identical to `long`; the type carries the additional semantic that `:auto_create` / `:auto_update` emit `clock_gettime(CLOCK_REALTIME)` in ms. Suitable for API timelines, event ordering, telemetry — anything where `Date.now()`-style values are the lingua franca. Distinct from `datetime` (which is calendar-packed and can't represent pre-1970 / post-9999). Available since 2026.05.6. |
