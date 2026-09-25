@@ -8,7 +8,7 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Recent releases
 
-- **[2026.09.2](docs/release-notes/2026.09.2.md)** — Full-day `datetime` precision with transactional startup migration for legacy roots, explicit type-correct aggregate handling, and npm binding version 1.0.21.
+- **[2026.09.2](docs/release-notes/2026.09.2.md)** — Full-day `datetime` precision with transactional startup migration for legacy roots, explicit type-correct aggregate handling, startup-migration tolerance for stale schema entries, and npm binding version 1.0.22.
 - **[2026.09.1](docs/release-notes/2026.09.1.md)** — Per-shard bulk commit pipelines, Marker V2 durability, batched index syncing, bitmap-primary query deadlock fix, expanded concurrency hardening, and Coverity fixes.
 - **[2026.08.2](docs/release-notes/2026.08.2.md)** — Breaking VARIABLE-only storage boundary, strict 2026.08.1 clean-open prerequisite, removal of startup migration, migration APIs, and standalone `compact`; transactional `vacuum compact:true` is the supported full rebuild.
 
