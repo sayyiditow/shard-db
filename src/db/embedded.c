@@ -697,6 +697,17 @@ int shard_db_startup_migrate(const char *db_root) {
                  effective_root, entries[i].object);
         snprintf(fields_path, sizeof(fields_path), "%s/fields.conf", object_dir);
 
+        struct stat obj_st;
+        if (stat(object_dir, &obj_st) != 0) {
+            /* Stale schema.conf entry — tenant/object never materialized or
+               was removed without pruning schema.conf. Skip it (soft), same
+               policy as shard_db_validate_before_stamp; a materialized
+               object with an unreadable fields.conf below stays fatal. */
+            if (errno == ENOENT) continue;
+            free(entries);
+            return -1;
+        }
+
         int marked = datetime_migration_has_marker(fields_path);
         if (marked < 0) { free(entries); return -1; }
         if (marked > 0) continue;

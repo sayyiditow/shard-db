@@ -16,7 +16,10 @@ first start, 2026.09.2 transactionally migrates every populated root in the
 their indexes rebuilt, and a `#datetime_7byte` marker appended to
 `fields.conf` before the root is stamped. Values already truncated by the
 old encoder keep their stored (wrapped) meaning — the migration preserves
-what the old bytes represent and cannot restore lost seconds. Behavior
+what the old bytes represent and cannot restore lost seconds. Stale
+`schema.conf` entries (dirs listed but no longer materialized on disk) are
+skipped by startup validation and the startup migration rather than
+aborting the open. Behavior
 change: a populated `2026.08.2` root previously took the
 accept-without-rewrite fast path; it now migrates like any other old root.
 Pass through 2026.09.2 before the next release, which raises the minimum
