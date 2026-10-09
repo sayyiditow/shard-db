@@ -79,12 +79,14 @@ typedef struct __attribute__((packed)) {
      splits ≤ 4096   → 64K  slots/shard  (3 GB - 6 GB total — very large)
    Each tier targets ~50 % load at the documented 78K-200K rec/shard
    sweet spot. Per-shard auto-resplit at 80 % load doubles slots in place
-   (no global rehash) up to SLOTCASK_MAX_SLOTS_PER_SHARD = 16M. The
-   floor for all tiers is 64K so even max-splits objects have headroom.
+   (no global rehash) with NO ceiling: growth is uncapped for the life
+   of the object (2026-10-07 growth-model decision); the nightly
+   auto-reshard sweep rebalances big objects into more splits. Resplit
+   cost scales with the shard's entry count (~4-5 s at ~25M entries).
+   The floor for all tiers is 64K so even max-splits objects have headroom.
    Tuning history: started at 2M flat, dropped to 512K, then 128K flat,
    now per-tier so the kf stays bounded at all splits.
    Public via slotcask_default_slots_for_splits(). */
-#define SLOTCASK_MAX_SLOTS_PER_SHARD      (16u * 1024 * 1024)
 size_t slotcask_default_slots_for_splits(int splits);
 
 /* Keyfile entry header (24 B, packed). hash16 + 1B flag + 1B stream_id +
@@ -267,6 +269,16 @@ typedef struct SlotcaskDb {
     /* Registry reference count; see slotcask_registry_get/put. */
     uint64_t reg_refs;
 
+    /* W1: bitmask of recommended levels already logged by the reshard
+       hint (reshard_hint_check). Levels are powers of two (8..4096),
+       so bit = log2(level) — bits 3..12. 0 = nothing logged yet for
+       this open. _Atomic: the check runs from parallel shard workers
+       and per-shard insert paths with no common lock; fetch_or claims
+       a level exactly once. The registry path callocs the struct
+       (zero-init); slotcask_open memsets the whole struct. Resets on
+       daemon restart — fine for a hint. */
+    _Atomic unsigned reshard_hint_logged;
+
     SlotcaskStream *streams;
 
     /* Per-shard kf slot refs — populated at slotcask_open time, updated
@@ -308,6 +320,9 @@ typedef struct SlotcaskDb {
    success. NOT for production use. */
 int slotcask_test_set_kf_total(SlotcaskDb *db, int shard_id,
                                uint64_t total, uint64_t deleted);
+/* W1: TEST access to the kf slot radix sort (static in slotcask.c) —
+   unit-tests the adaptive pass count above 2^24. */
+void slotcask_test_radix_sort_sizes(size_t *a, size_t *scratch, size_t n);
 
 /* Sum the per-shard kf headers into total/deleted. live = total - deleted.
    Reads the 24-byte header of each kf shard under the rdlock — at splits=4096

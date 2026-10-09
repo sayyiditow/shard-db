@@ -37,7 +37,7 @@ Placed in the working directory where you run shard-db (usually `build/bin/db.en
 | `AUTO_VACUUM_INTERVAL_SEC` | `3600` | Auto-vacuum poll cadence in seconds. Floor 60. Sleep is sliced into 1-second chunks so SIGTERM brings the thread down within a second. |
 | `VACUUM_RECOMMEND_TOMBSTONE_PCT` | `10` | Tombstone ratio at which `vacuum-check` flags an object for cleanup (`deleted * 100 ≥ total * N`). Also drives auto-vacuum when enabled — same threshold for both manual and automated paths. |
 | `VACUUM_RECOMMEND_MIN_DELETED` | `1000` | Absolute floor on `deleted` count below which `vacuum-check` does **not** recommend cleanup, even if the percentage clears. Prevents tiny objects from triggering vacuum overhead that exceeds the work saved. |
-| `AUTO_RESHARD_ENABLE` | `0` | `1` = enable a background thread that, once per calendar day during `AUTO_RESHARD_HOUR`, grows an object's `splits` when its live record count outgrows the recommended sizing table (see [Tuning → Recommended splits](../operations/tuning.md)). Runs a full reshard (`vacuum --splits=N`), which holds the exclusive objlock for the duration — unlike `AUTO_VACUUM`, which never touches `--splits`. |
+| `AUTO_RESHARD_ENABLE` | `1` | `1` = enable a background thread that, once per calendar day during `AUTO_RESHARD_HOUR`, grows an object's `splits` when its live record count outgrows the recommended sizing table (see [Tuning → Recommended splits](../operations/tuning.md); the `RESHARD-HINT` log line reports the same recommendation inline at growth events). Runs a full reshard (`vacuum --splits=N`), which holds the exclusive objlock for the duration — unlike `AUTO_VACUUM`, which never touches `--splits`. `0` disables the sweep; capacity growth itself is uncapped either way. |
 | `AUTO_RESHARD_HOUR` | `3` | Server-local hour (`0`-`23`) the auto-reshard sweep is allowed to run in, once per calendar day. |
 | `AUTO_RESHARD_THROTTLE_MS` | `0` | Milliseconds to pause after each successful reshard before the same sweep tick considers its next candidate object. `0` = no pacing (reshards still run strictly one at a time either way; this only adds a gap between them). |
 | `TLS_ENABLE` | `0` | `1` = require TLS 1.3 on `PORT`; plaintext clients rejected at handshake. See [Operations → Deployment → Native TLS](../operations/deployment.md). |
@@ -81,9 +81,9 @@ export AUTO_VACUUM_INTERVAL_SEC=3600
 export VACUUM_RECOMMEND_TOMBSTONE_PCT=10
 export VACUUM_RECOMMEND_MIN_DELETED=1000
 
-# Auto-reshard — opt-in, grows splits automatically when an object outgrows
-# its sizing (off by default)
-export AUTO_RESHARD_ENABLE=0
+# Auto-reshard — on by default: widens splits automatically when an object
+# outgrows its sizing (set to 0 to disable the nightly sweep)
+export AUTO_RESHARD_ENABLE=1
 export AUTO_RESHARD_HOUR=3
 
 # Native TLS — leave TLS_ENABLE=0 unless terminating TLS in-process
@@ -195,7 +195,7 @@ $DB_ROOT/
 
 The slotcask engine separates **keys** from **values**:
 
-- `data/kf/NNN.kf` — keyfile shards. Each is a 24-byte file header (`SKF1` magic + version + live count + tombstone count) followed by a packed array of 24-byte slot headers. Slot count per shard is tiered on `splits` — 1M at `splits ≤ 16`, 256K at `splits ≤ 128`, 128K at `splits ≤ 1024`, 64K at `splits ≤ 4096`. Shards auto-resplit in-place (doubling capacity) at 75 % fill, up to a per-shard ceiling of 16M slots.
+- `data/kf/NNN.kf` — keyfile shards. Each is a 24-byte file header (`SKF1` magic + version + live count + tombstone count) followed by a packed array of 24-byte slot headers. Slot count per shard is tiered on `splits` — 1M at `splits ≤ 16`, 256K at `splits ≤ 128`, 128K at `splits ≤ 1024`, 64K at `splits ≤ 4096` (initial sizing only). Shards auto-resplit in-place (doubling capacity) at 75 % fill with no ceiling — growth continues for the life of the object.
 - `data/streams/NNN/NNNNNN.dat` — append-only segment files. Each stream has its own subdirectory; segments rotate at 128 MB. Writers in different streams don't contend. The number of streams is fixed at `create-object` time from `nproc` (≤ 8 → nproc; ≤ 16 → 8; else 16).
 
 Each indexed field is split into `index_splits_for(splits)` btree files — non-linear curve in `src/db/types.h`: `8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`. Writes route by record hash to a single idx-shard; reads fan out across all shards in parallel.

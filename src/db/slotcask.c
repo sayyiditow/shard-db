@@ -51,6 +51,14 @@
 long g_shard_test_sync_counts[SHARD_TEST_PHASE_COUNT];
 _Atomic long g_shard_test_gate_held_max;
 _Atomic long g_shard_test_bulk_chains;
+/* W1: TEST_BUILD seams for the per-shard kf slot tier. initial
+ * replaces slotcask_default_slots_for_splits() at slotcask_open; max
+ * imposes a test-only growth cap on the pre-grow/stage loops (0 =
+ * uncapped, the production behavior — there is no production cap).
+ * _Atomic: written on the control thread, read on request threads;
+ * the channel ACK is not C synchronization. */
+_Atomic size_t g_shard_test_kf_initial_slots;
+_Atomic size_t g_shard_test_kf_max_slots;
 long g_shard_test_fail_phase = -1;
 long g_shard_test_fail_occurrence;
 int  g_shard_test_fail_postlink;
@@ -2289,6 +2297,52 @@ typedef struct {
     size_t      add_records;
 } SlotcaskPregrowArg;
 
+/* W1: effective per-shard growth cap. Production is UNCAPPED (the
+ * human's 2026-10-07 growth-model decision): SIZE_MAX lets the 75%
+ * projected-load condition be the only terminator. TEST_BUILD tests
+ * lower it via the seam to make loop wiring observable. */
+static size_t kf_max_slots(void) {
+#ifdef TEST_BUILD
+    size_t test_max = atomic_load(&g_shard_test_kf_max_slots);
+    if (test_max) return test_max;
+#endif
+    return SIZE_MAX;
+}
+
+/* W1: after a growth event, check whether the OBJECT has outgrown its
+ * splits per the sizing table, and log an actionable hint at most
+ * once per recommended level, per open. Concurrent shard workers race
+ * here with no common lock, so the level is claimed with a single
+ * atomic_fetch_or on a bitmask (levels are powers of two, so bit =
+ * log2(level)): exactly one worker can claim a level, and a stale or
+ * reordered recommendation cannot re-log a claimed level. The header
+ * sum is ~1 ms cold, behind a rare event; the nightly sweep acts on
+ * the same table. */
+static void reshard_hint_check(SlotcaskDb *db) {
+    if (!db || db->num_shards <= 0 || db->num_shards >= MAX_SPLITS)
+        return;
+    uint64_t total = 0, deleted = 0;
+    if (slotcask_sum_kf_totals(db, &total, &deleted) != 0) return;
+    long long live = (long long)(total - deleted);
+    int target = reshard_target_for_count(live);
+    if (target <= db->num_shards) return;
+    unsigned bit = 0;
+    for (unsigned v = (unsigned)target; v > 1; v >>= 1) bit++;
+    unsigned mask = 1u << bit;
+    unsigned prev = atomic_fetch_or(&db->reshard_hint_logged, mask);
+    if (prev & mask) return;      /* this level was already hinted */
+    char eff_root[PATH_MAX], object[256];
+    split_data_dir(db->data_dir, eff_root, sizeof(eff_root),
+                   object, sizeof(object));
+    LOG_INFO(LOG_SUB_SLOTCASK,
+             "RESHARD-HINT: %s/%s holds ~%llu live records at splits=%d "
+             "— the sizing table recommends splits=%d. Run "
+             "`vacuum --splits=%d` now, or let the nightly auto-reshard "
+             "handle it (AUTO_RESHARD_ENABLE, default on).",
+             eff_root, object, (unsigned long long)live,
+             db->num_shards, target, target);
+}
+
 static void *slotcask_pregrow_worker(void *raw) {
     SlotcaskPregrowArg *a = (SlotcaskPregrowArg *)raw;
     /* Pre-grow mutates kf shard capacity outside the bulk transaction
@@ -2308,13 +2362,14 @@ static void *slotcask_pregrow_worker(void *raw) {
         uint64_t projected = cur_total + (uint64_t)a->add_records;
         /* 75% load trigger matches kf_put_new's inline check. Resplit in
            a loop in case projected load exceeds even the doubled cap. */
-        while (kh.capacity < SLOTCASK_MAX_SLOTS_PER_SHARD &&
+        while (kh.capacity < kf_max_slots() &&
                projected * 4 >= (uint64_t)kh.capacity * 3) {
             if (kfcache_resplit_locked(&kh, kh.capacity * 2) != 0) break;
         }
     }
     kfcache_release(&kh);
     writer_gate_unlock(a->db, a->kf_shard_id);
+    reshard_hint_check(a->db);
     return NULL;
 }
 
@@ -2493,7 +2548,8 @@ static int kf_plan_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh, const uint8
         uint64_t total = kh->hdr->total;
         uint64_t cap = (uint64_t)kh->capacity;
         if (cap > 0 && total * 4 >= cap * 3) {
-            (void)kfcache_resplit_locked(kh, kh->capacity * 2);
+            if (kfcache_resplit_locked(kh, kh->capacity * 2) == 0)
+                reshard_hint_check(db);
         }
     }
 
@@ -2562,7 +2618,8 @@ static int kf_plan_window_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh,
         uint64_t total = kh->hdr->total;
         uint64_t cap = (uint64_t)kh->capacity;
         if (cap > 0 && total * 4 >= cap * 3) {
-            (void)kfcache_resplit_locked(kh, kh->capacity * 2);
+            if (kfcache_resplit_locked(kh, kh->capacity * 2) == 0)
+                reshard_hint_check(db);
         }
     }
 
@@ -4301,6 +4358,11 @@ int slotcask_open(SlotcaskDb *db, const char *data_dir,
     db->num_streams = num_streams;
     db->slot_size = slot_size;
     db->slots_per_shard = slotcask_default_slots_for_splits(num_shards);
+#ifdef TEST_BUILD
+    size_t test_initial = atomic_load(&g_shard_test_kf_initial_slots);
+    if (test_initial)
+        db->slots_per_shard = test_initial;
+#endif
     /* bulk_commit_window lives on ShardDb (config.c/db.env-facing); this
        SlotcaskDb is a separate struct with its own copy that every window-
        chunking read site falls back to 4096 for when zero. slotcask_open()
@@ -6190,15 +6252,23 @@ static int size_cmp(const void *a, const void *b) {
     return x < y ? -1 : x > y ? 1 : 0;
 }
 
-/* LSD radix sort for kf slot indices: values are < 2^24 (the
-   SLOTCASK_MAX_SLOTS_PER_SHARD ceiling), so three 8-bit counting passes
-   suffice and there are no comparator calls. qsort's function-pointer
-   comparator over hash-scattered slot vectors was ~2% of bench cycles.
-   Scratch must hold n elements; caller falls back to qsort on OOM. */
+/* LSD radix sort for kf slot indices. Per-shard growth is uncapped
+   (2026-10-07 growth-model decision), so slot indices have no constant
+   bound — the pass count adapts to the largest value (the old fixed
+   three-pass/2^24 assumption silently mis-sorted past 16M slots in one
+   shard). No comparator calls; the final memcpy handles odd pass
+   parity. qsort's function-pointer comparator over hash-scattered slot
+   vectors was ~2% of bench cycles. Scratch must hold n elements;
+   caller falls back to qsort on OOM. */
 static void radix_sort_sizes(size_t *a, size_t *scratch, size_t n) {
     if (n < 2) return;
+    size_t maxv = 0;
+    for (size_t i = 0; i < n; i++)
+        if (a[i] > maxv) maxv = a[i];
+    int npasses = 1;
+    while (maxv >= 0x100) { maxv >>= 8; npasses++; }
     size_t *src = a, *dst = scratch;
-    for (int pass = 0; pass < 3; pass++) {
+    for (int pass = 0; pass < npasses; pass++) {
         size_t count[256] = {0};
         int shift = pass * 8;
         for (size_t i = 0; i < n; i++)
@@ -6216,6 +6286,13 @@ static void radix_sort_sizes(size_t *a, size_t *scratch, size_t n) {
         dst = t;
     }
     if (src != a) memcpy(a, src, n * sizeof(*a));
+}
+
+/* TEST-ONLY: direct access to the kf slot radix sort so the unit test
+   can exercise the >2^24 pass-count behavior without materializing
+   16M+ real entries. */
+void slotcask_test_radix_sort_sizes(size_t *a, size_t *scratch, size_t n) {
+    radix_sort_sizes(a, scratch, n);
 }
 
 static int bulk_apply_and_sync_kf_locked(BulkMutationTxn *txn,
@@ -7078,12 +7155,13 @@ static int slotcask_bulk_stage_shard(SlotcaskBulkRequest *req,
        loop because one doubling may still be insufficient. */
     if (kh.hdr) {
         uint64_t projected = kh.hdr->total + (uint64_t)n;
-        while (kh.capacity < SLOTCASK_MAX_SLOTS_PER_SHARD &&
+        while (kh.capacity < kf_max_slots() &&
                projected * 4 >= (uint64_t)kh.capacity * 3) {
             if (kfcache_resplit_locked(&kh, kh.capacity * 2) != 0) break;
         }
     }
     kfcache_release(&kh);
+    reshard_hint_check(req->db);
 
     /* Per-shard transaction assembly — the verified preludes of
        slotcask_bulk_upsert_in_kfshard / slotcask_bulk_delete_in_kfshard,

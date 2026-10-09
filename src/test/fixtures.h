@@ -56,6 +56,10 @@ int test_env_test_hook_install_kind(TestEnv *env, int kind);
 int test_env_test_hook_wait(TestEnv *env, int *out_phase);
 int test_env_test_hook_release(TestEnv *env);
 int test_env_test_hook_clear(TestEnv *env);
+/* W1: arm the per-shard kf slot tier seams in the TEST_BUILD daemon
+   (initial slots at open, test-only growth cap in pre-grow/stage).
+   0/0 disarms. Requires a test-server daemon (test_control_fd >= 0). */
+int test_env_ctl_set_kf_seams(TestEnv *env, size_t initial, size_t max);
 
 /* SIGKILL the daemon immediately and reap. Does NOT clean up db_root.
    Mirrors a crash — no graceful drain, no in-flight write completion.

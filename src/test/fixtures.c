@@ -755,8 +755,10 @@ int tu_pdb_drop_object(ShardDb *db, const char *dir, const char *object) {
    Helpers never retry, poll, sleep, use a fixed pathname, or mutate
    process-wide environment state. */
 typedef struct {
-    uint32_t kind;   /* INSTALL=1, RELEASE=2, CLEAR=3, ACK=4, REACHED=5 */
+    uint32_t kind;   /* INSTALL..REACHED; SET_GLOBALS=6 */
     int32_t  phase;  /* REACHED: 0=stale snapshot, 1=under kf wrlock; else 0 */
+    uint64_t a;      /* SET_GLOBALS: initial slots (0 = default) */
+    uint64_t b;      /* SET_GLOBALS: test-only max slots (0 = uncapped) */
 } TestHookMessage;
 
 enum {
@@ -765,6 +767,7 @@ enum {
     TEST_HOOK_CLEAR   = 3,
     TEST_HOOK_ACK     = 4,
     TEST_HOOK_REACHED = 5,
+    TEST_HOOK_SET_GLOBALS = 6,
 };
 
 static int test_hook_write_full(int fd, const void *buf, size_t n) {
@@ -807,6 +810,20 @@ int test_env_test_hook_install(TestEnv *env) {
 int test_env_test_hook_install_kind(TestEnv *env, int kind) {
     if (!env || env->test_control_fd < 0) return -1;
     TestHookMessage msg = { .kind = TEST_HOOK_INSTALL, .phase = kind };
+    if (test_hook_write_full(env->test_control_fd, &msg, sizeof(msg)) != 0)
+        return -1;
+    TestHookMessage rep = {0};
+    if (test_hook_read_full(env->test_control_fd, &rep, sizeof(rep)) != 0)
+        return -1;
+    if (rep.kind != TEST_HOOK_ACK) return -1;
+    return 0;
+}
+
+int test_env_ctl_set_kf_seams(TestEnv *env, size_t initial, size_t max) {
+    if (!env || env->test_control_fd < 0) return -1;
+    TestHookMessage msg = { .kind = TEST_HOOK_SET_GLOBALS,
+                            .phase = 0, .a = (uint64_t)initial,
+                            .b = (uint64_t)max };
     if (test_hook_write_full(env->test_control_fd, &msg, sizeof(msg)) != 0)
         return -1;
     TestHookMessage rep = {0};

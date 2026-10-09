@@ -16,7 +16,7 @@ Hard caps and practical bounds. Everything here is enforced at compile time unle
 | `MAX_AGG_SPECS` | 32 | Max aggregate specs in one `aggregate` query. |
 | `MAX_CRITERIA_DEPTH` | 16 | Maximum nesting depth of AND/OR criteria trees. |
 | `MAX_INTERSECT_LEAVES` | 8 | Maximum number of indexed AND-leaves the planner will intersect via `PRIMARY_INTERSECT`. Trees with more eligible leaves fall back to `PRIMARY_LEAF`. |
-| `SLOTCASK_MAX_SLOTS_PER_SHARD` | 16 777 216 (16M) | Per-kf-shard slot ceiling. Resplits stop here; further inserts to a full shard refuse and require `vacuum --splits=N` to widen the keyspace. |
+| Per-kf-shard slot growth | unbounded | Auto-resplit doubles a shard's slots at ~75–80 % load for the life of the object — inserts never refuse for capacity. When the sizing table says the object outgrew its splits, a `RESHARD-HINT` log line fires and the nightly auto-reshard sweep (default on) widens it. |
 | `SLOTCASK_MAX_STREAMS` | 16 | Maximum streams per object (segment-write lanes). Actual count picked from nproc at `create-object` time. |
 | `SLOTCASK_SEG_MAX_BYTES` | 128 MB | Segment file rotation point. |
 | kf resplit trigger | 75 % (inline) / 50 % (pre-grow) | Shard doubles in place when `header.total × 4 ≥ capacity × 3` (75 %, inline path). Bulk-insert pre-grow triggers at 50 % (`count × 2 ≥ slots`). |

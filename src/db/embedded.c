@@ -36,7 +36,10 @@ static void db_mutexes_init(void) {
     pthread_mutex_init(&g_token_lock,            NULL);
 }
 
-static void db_defaults_set(ShardDb *db) {
+/* W1: exported for test_kf_auto_defaults — the defaults unit case
+   asserts the knob default on a scratch instance (a process hosts
+   one ShardDb, so the case must not boot a second). */
+void db_defaults_set(ShardDb *db) {
     db->db_root_lock_fd            = -1;
     db->timeout                   = 30;
     db->port                      = 9199;
@@ -69,6 +72,10 @@ static void db_defaults_set(ShardDb *db) {
     db->durability_test_pause_phase[0] = '\0';
     db->durability_test_pause_ms       = 0;
     memcpy(db->warmup_mode, "async", 6);
+    /* W1: nightly reshard sweep default-on — with growth uncapped it
+     * is the mechanism that keeps shards near the sweet spot. The
+     * db.env parse below overrides it. */
+    db->auto_reshard_enable             = 1;
 }
 
 /* shard_db_open_internal: allocate, configure, and initialise all
