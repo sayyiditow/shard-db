@@ -20,8 +20,14 @@
 #define _GNU_SOURCE
 #endif
 #ifndef _XOPEN_SOURCE
-#define _XOPEN_SOURCE 700   /* nftw + struct ftw (ftw.h hides them under
+#define _XOPEN_SOURCE 700   /* nftw + struct FTW (ftw.h hides them under
                              * _GNU_SOURCE alone) */
+#endif
+#ifdef __APPLE__
+/* On macOS, _XOPEN_SOURCE 700 alone pins __DARWIN_C_LEVEL to 700, which
+ * hides mkdtemp (needs >= 200809L). _DARWIN_C_SOURCE restores the full
+ * level; glibc ignores the macro. */
+#define _DARWIN_C_SOURCE
 #endif
 #include "test_runner.h"
 #include "test_assert.h"
