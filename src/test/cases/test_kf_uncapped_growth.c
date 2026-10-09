@@ -28,12 +28,14 @@
 #include "slotcask.h"
 #include "shard_test_ctl.h"
 
+#include <errno.h>
 #include <ftw.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>   /* getpid */
 
 /* W1 review fix: no shell interpolation — cleanup is an nftw
  * depth-first walk (remove files, then the dir), so SHARD_TEST_TMPDIR
