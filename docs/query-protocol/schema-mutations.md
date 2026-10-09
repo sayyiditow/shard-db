@@ -113,7 +113,7 @@ The dict form (`{"k1":{...},"k2":{...}}`) has keys baked into the wire shape —
 
 ## add-field
 
-Append new fields to an existing object.
+Append new fields to an existing object. Each spec line is limited to 65,535 bytes (see [limits](../reference/limits.md)); requests containing a longer spec fail with an explicit error.
 
 ```json
 {
@@ -160,7 +160,7 @@ When the new field's spec includes a default modifier, the rebuild walk applies 
 
 ## edit-field
 
-Edit one or more existing fields in place — same-type only. Used to grow/shrink a `varchar`, widen/narrow an integer family field, change a `numeric`'s scale, widen `float → double`, or append / rename / widen an `enum`.
+Edit one or more existing fields in place — same-type only. Used to grow/shrink a `varchar`, widen/narrow an integer family field, change a `numeric`'s scale, widen `float → double`, or append / rename / widen an `enum`. Each spec line is limited to 65,535 bytes (see [limits](../reference/limits.md)); requests containing a longer spec fail with an explicit error.
 
 ```json
 {

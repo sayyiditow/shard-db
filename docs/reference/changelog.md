@@ -6,6 +6,28 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+Field definitions (`fields.conf` lines and the `fields[]` strings of
+create-object / add-field / edit-field) are now accepted up to 65,535
+bytes, up from an undocumented 510-byte create gate whose companion
+loader buffers (512-byte line reader, 255-byte type-portion buffer)
+silently dropped or split long fields on every schema reload — long
+`enum(...)` value lists were the practical casualty (125 four-char
+values = 632 bytes was rejected at create; even ~300-byte lists
+corrupted the schema on restart). The cap is enforced identically by
+the wire validators and every fields.conf reader/rewriter, so an
+accepted schema re-reads faithfully; readers refuse to load or rewrite
+a fields.conf containing an over-long line instead of misparsing it.
+add-field / edit-field requests containing an over-long spec now fail
+with an explicit error instead of silently dropping it. Objects whose
+field definitions exceed the old 510-byte limit must not be opened by
+older binaries — those truncate the line at load. Related tightening:
+a `:default=` literal is capped at the engine's 255-byte default-value
+buffer — create-object / add-field / edit-field now reject longer
+literals instead of accepting and silently truncating them, and
+edit-field refuses a rewrite that would silently drop an over-long
+default already on disk (older-binary or hand-edited lines load with a
+truncation warning).
+
 Per-shard kf growth is **uncapped**: the documented 16M-per-shard slot
 ceiling no longer exists. All growth paths (bulk pre-grow, bulk stage,
 and the inline resplits) double a shard's slot capacity at the 75–80 %

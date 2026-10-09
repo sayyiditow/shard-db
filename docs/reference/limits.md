@@ -34,6 +34,8 @@ Changing these requires recompiling. Most don't need to change.
 | Total record payload | derived | Sum of typed-field sizes (`value_size` in `describe-object`). Not user-configurable. Stored in segment files; the 24-byte seg header + `klen` bytes of key precede it. |
 | Per-kf-shard live records (default tier) | 12.8M | Resplit ceiling × 80 % load. A `splits=4096` object can hold tens of billions of live records before any single shard hits the ceiling. |
 | Fields per object | 256 | `MAX_FIELDS`. Includes tombstoned fields until compact. |
+| Field-definition length | 65 535 bytes | One `fields.conf` line — the same string in `create-object` / `add-field` / `edit-field` `fields[]`. Bounds the enum value list (≈13k four-char values; the 65,535-value enum ceiling is storage-side — the line cap binds first for longer values). Enforced identically on the wire and on reload, so an accepted schema re-reads faithfully. **Downgrade hazard:** binaries older than 2026.10 truncate `fields.conf` lines at 511 bytes at load — objects with field definitions above the old limit must not be opened by older binaries. |
+| Default-literal length | 255 bytes | A `:default=<literal>` is carried in a 256-byte `TypedField.default_val`. `create-object` / `add-field` / `edit-field` reject longer literals with an explicit error (previously they were accepted and silently truncated). Lines on disk with longer literals — older binaries or hand edits — load with a logged truncation warning, and `edit-field` refuses a rewrite that would silently drop one. |
 
 ## Query-level limits
 

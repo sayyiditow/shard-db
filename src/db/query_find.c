@@ -638,12 +638,15 @@ int parse_field_line(const char *line, TypedField *out) {
        both add-field's rebuild append AND edit-field carry computed
        defaults through end-to-end. Without this, parse_field_type would
        see "int:default=99" and return FT_NONE (no exact-match), making
-       cmd_edit_fields reject every :default= edit. */
-    char clean_spec[256];
-    strncpy(clean_spec, colon + 1, sizeof(clean_spec) - 1);
-    clean_spec[sizeof(clean_spec) - 1] = '\0';
+       cmd_edit_fields reject every :default= edit. Heap copy: the type
+       portion can be up to MAX_FIELD_DEF bytes (enum value lists) and
+       parse_default_modifier mutates the buffer — the caller reuses the
+       original line verbatim for the fields.conf write. */
+    char *clean_spec = strdup(colon + 1);
+    if (!clean_spec) return 0;
     parse_default_modifier(clean_spec, out);
     parse_field_type(clean_spec, out);
+    free(clean_spec);
     return out->type != FT_NONE && out->size > 0;
 }
 
@@ -982,7 +985,7 @@ int rebuild_object_v2(const char *db_root, const char *object,
                       const Schema *new_sch, TypedSchema *new_ts,
                       int *new_to_old, int slot_changed,
                       int splits_changed, int drop_tombstoned,
-                      char added_lines[][256], int n_added,
+                      char (*added_lines)[MAX_FIELD_DEF], int n_added,
                       const RebuildFinalizeOps *finalize) {
     char obj_dir[PATH_MAX];
     if (snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object) >=
@@ -1121,15 +1124,34 @@ int rebuild_object_v2(const char *db_root, const char *object,
             failure = "Failed to stage fields.conf.new";
             goto txn_fail;
         }
-        char line[512];
-        while (fgets(line, sizeof(line), fin)) {
-            char stripped[512];
-            strncpy(stripped, line, sizeof(stripped) - 1);
-            stripped[sizeof(stripped) - 1] = '\0';
-            stripped[strcspn(stripped, "\n")] = '\0';
-            if (stripped[0] == '\0' || stripped[0] == '#') { fputs(line, fout); continue; }
-            if (drop_tombstoned && strstr(stripped, ":removed")) continue;
+        for (;;) {
+            int rderr = 0;
+            char *line = conf_read_line(fin, MAX_FIELD_DEF, &rderr);
+            if (!line) {
+                if (rderr) {
+                    /* Fail closed: an existing field definition we cannot
+                       read whole would be written back as fragments. */
+                    fclose(fin);
+                    fclose(fout);
+                    unlink(fpath_new);
+                    failure = "fields.conf line exceeds limit; refusing to rewrite";
+                    goto txn_fail;
+                }
+                break;   /* EOF */
+            }
+            if (line[0] == '\0' || line[0] == '#') {
+                fputs(line, fout);
+                fputc('\n', fout);   /* conf_read_line strips the newline */
+                free(line);
+                continue;
+            }
+            if (drop_tombstoned && strstr(line, ":removed")) {
+                free(line);
+                continue;
+            }
             fputs(line, fout);
+            fputc('\n', fout);   /* conf_read_line strips the newline */
+            free(line);
         }
         for (int a = 0; a < n_added; a++) fprintf(fout, "%s\n", added_lines[a]);
         fclose(fin);
@@ -1216,7 +1238,7 @@ txn_fail:
 
 int rebuild_object(const char *db_root, const char *object,
                    int new_splits_arg, int drop_tombstoned,
-                   char added_lines[][256], int n_added,
+                   char (*added_lines)[MAX_FIELD_DEF], int n_added,
                    int new_streams_arg) {
     Schema old_sch = load_schema(db_root, object);
     if (old_sch.splits <= 0) {
@@ -1262,6 +1284,7 @@ int rebuild_object(const char *db_root, const char *object,
         new_ts.nfields++;
     }
     /* Append newly-added fields — they start zero-valued in existing records. */
+    int appended_at = new_ts.nfields;
     for (int a = 0; a < n_added; a++) {
         if (new_ts.nfields >= MAX_FIELDS) {
             OUT("{\"error\":\"Too many fields (max %d)\"}\n", MAX_FIELDS);
@@ -1270,12 +1293,14 @@ int rebuild_object(const char *db_root, const char *object,
         TypedField tf;
         memset(&tf, 0, sizeof(tf));
         if (!parse_field_line(added_lines[a], &tf)) {
+            free_enum_values(&tf);
             OUT("{\"error\":\"Invalid field line: %s\"}\n", added_lines[a]);
             return 1;
         }
         /* Reject duplicate names against existing active fields */
         for (int i = 0; i < new_ts.nfields; i++) {
             if (strcmp(new_ts.fields[i].name, tf.name) == 0) {
+                free_enum_values(&tf);
                 OUT("{\"error\":\"Field [%s] already exists\"}\n", tf.name);
                 return 1;
             }
@@ -1314,10 +1339,17 @@ int rebuild_object(const char *db_root, const char *object,
     }
 
     /* v2 path runs an entirely separate rebuild over slotcask files. */
-    return rebuild_object_v2(db_root, object, &old_sch, old_ts,
-                              &new_sch, &new_ts, new_to_old,
-                              slot_changed, splits_changed,
-                              drop_tombstoned, added_lines, n_added, NULL);
+    int rc = rebuild_object_v2(db_root, object, &old_sch, old_ts,
+                               &new_sch, &new_ts, new_to_old,
+                               slot_changed, splits_changed,
+                               drop_tombstoned, added_lines, n_added, NULL);
+    /* new_ts's appended fields own heap enum value lists (parse_field_line),
+       and v2 needs them alive while it recomposes records — free only the
+       appended tail, on success and failure. The copied prefix aliases the
+       cached old_ts and must never be freed here. */
+    for (int a = 0; a < n_added; a++)
+        free_enum_values(&new_ts.fields[appended_at + a]);
+    return rc;
 }
 
 int is_number(const char *s) {

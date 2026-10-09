@@ -1317,6 +1317,12 @@ void free_enum_values(TypedField *f) {
    tf->default_val on entry; on a no-modifier call it leaves them
    alone. Callers that want a guaranteed clean slate should zero those
    fields before invoking. */
+int field_default_too_long(const char *field_spec) {
+    const char *d = strstr(field_spec, ":default=");
+    if (!d) return 0;
+    return strlen(d + 9) >= sizeof(((TypedField *)0)->default_val);
+}
+
 int parse_default_modifier(char *type_spec_inout, TypedField *tf) {
     if (!type_spec_inout || !tf) return 0;
     char *dflt;
@@ -1339,7 +1345,13 @@ int parse_default_modifier(char *type_spec_inout, TypedField *tf) {
             const char *ns = dval + 4;
             const char *ne = strchr(ns, ')');
             size_t nl = (size_t)(ne - ns);
-            if (nl >= sizeof(tf->default_val)) nl = sizeof(tf->default_val) - 1;
+            if (nl >= sizeof(tf->default_val)) {
+                LOG_WARN(LOG_SUB_CONFIG,
+                         "field spec: default seq name exceeds %d bytes and "
+                         "will be truncated",
+                         (int)sizeof(tf->default_val) - 1);
+                nl = sizeof(tf->default_val) - 1;
+            }
             memcpy(tf->default_val, ns, nl);
             tf->default_val[nl] = '\0';
         } else if (strcmp(dval, "uuid()") == 0) {
@@ -1349,11 +1361,25 @@ int parse_default_modifier(char *type_spec_inout, TypedField *tf) {
             const char *ns = dval + 7;
             const char *ne = strchr(ns, ')');
             size_t nl = (size_t)(ne - ns);
-            if (nl >= sizeof(tf->default_val)) nl = sizeof(tf->default_val) - 1;
+            if (nl >= sizeof(tf->default_val)) {
+                LOG_WARN(LOG_SUB_CONFIG,
+                         "field spec: default random(N) spec exceeds %d bytes "
+                         "and will be truncated",
+                         (int)sizeof(tf->default_val) - 1);
+                nl = sizeof(tf->default_val) - 1;
+            }
             memcpy(tf->default_val, ns, nl);
             tf->default_val[nl] = '\0';
         } else {
             tf->default_kind = DK_LITERAL;
+            if (strlen(dval) >= sizeof(tf->default_val)) {
+                /* Reachable only for on-disk lines written by older
+                 * binaries or hand edits — the wire gates reject these. */
+                LOG_WARN(LOG_SUB_CONFIG,
+                         "fields.conf: :default= literal exceeds %d bytes "
+                         "and will be truncated",
+                         (int)sizeof(tf->default_val) - 1);
+            }
             strncpy(tf->default_val, dval, sizeof(tf->default_val) - 1);
             tf->default_val[sizeof(tf->default_val) - 1] = '\0';
         }
@@ -1507,6 +1533,56 @@ void parse_field_type(const char *spec, TypedField *f) {
 
 /* Cache for typed schemas — moved to ShardDb struct */
 
+/* Read one '\n'-terminated line into a malloc'd buffer (see types.h).
+   Growing buffer, doubling from 512 B. A line whose content reaches
+   max_len before its newline fails with EOVERFLOW and consumes the rest
+   of the line, so fields.conf readers can fail closed instead of
+   mis-parsing a truncated line (a truncated enum( loses its ')' and the
+   field silently vanishes from the loaded schema). */
+char *conf_read_line(FILE *fp, size_t max_len, int *err) {
+    if (err) *err = 0;
+    size_t cap = 512, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { if (err) *err = ENOMEM; return NULL; }
+    for (;;) {
+        if (cap - len < 2 || len >= max_len) {
+            if (len >= max_len) {
+                int c;
+                while ((c = fgetc(fp)) != EOF && c != '\n') {}
+                free(buf);
+                if (err) *err = EOVERFLOW;
+                return NULL;
+            }
+            char *nb = realloc(buf, cap * 2);
+            if (!nb) { free(buf); if (err) *err = ENOMEM; return NULL; }
+            buf = nb;
+            cap *= 2;
+        }
+        if (!fgets(buf + len, (int)(cap - len), fp)) {
+            if (ferror(fp)) { int e = errno; free(buf); if (err) *err = e; return NULL; }
+            if (len == 0) { free(buf); return NULL; }   /* clean EOF */
+            if (len >= max_len) {                       /* unterminated over-cap final line */
+                free(buf);
+                if (err) *err = EOVERFLOW;
+                return NULL;
+            }
+            return buf;                                 /* final line, no '\n' */
+        }
+        size_t chunk = strlen(buf + len);
+        char *nl = memchr(buf + len, '\n', chunk);
+        if (nl) {
+            if ((size_t)(nl - buf) >= max_len) {
+                free(buf);
+                if (err) *err = EOVERFLOW;
+                return NULL;
+            }
+            *nl = '\0';
+            return buf;
+        }
+        len += chunk;
+    }
+}
+
 TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     char cache_key[512];
     snprintf(cache_key, sizeof(cache_key), "%s:%s", db_root, object);
@@ -1552,17 +1628,35 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     ts.nfields = 0;
     int offset = 0;
 
-    char line[512];
-    while (fgets(line, sizeof(line), f) && ts.nfields < MAX_FIELDS) {
-        line[strcspn(line, "\n")] = '\0';
-        if (line[0] == '\0' || line[0] == '#') continue;
+    for (;;) {
+        int rderr = 0;
+        char *line = conf_read_line(f, MAX_FIELD_DEF, &rderr);
+        if (!line) {
+            if (rderr) {
+                /* Fail closed: a line we cannot read whole would parse as a
+                   truncated spec and silently drop/shift fields. Free the
+                   enum value lists parsed from earlier lines first — `ts`
+                   is stack-local and about to be abandoned. */
+                LOG_ERROR(LOG_SUB_CONFIG,
+                          "fields.conf line exceeds %d bytes — refusing to "
+                          "load a schema we cannot parse faithfully",
+                          MAX_FIELD_DEF - 1);
+                for (int i = 0; i < ts.nfields; i++)
+                    free_enum_values(&ts.fields[i]);
+                fclose(f);
+                return NULL;   /* not cached; next load retries the file */
+            }
+            break;   /* EOF */
+        }
+        if (ts.nfields >= MAX_FIELDS) { free(line); break; }
+        if (line[0] == '\0' || line[0] == '#') { free(line); continue; }
 
         TypedField *tf = &ts.fields[ts.nfields];
         /* Parse "name:type[:param][:removed]" */
         char *colon = strchr(line, ':');
-        if (!colon) continue; /* no type = skip (legacy format) */
+        if (!colon) { free(line); continue; } /* no type = skip (legacy format) */
 
-        size_t name_len = colon - line;
+        size_t name_len = (size_t)(colon - line);
         if (name_len >= 256) name_len = 255;
         memcpy(tf->name, line, name_len);
         tf->name[name_len] = '\0';
@@ -1574,14 +1668,16 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
         tf->removed = 0;
         tf->default_kind = DK_NONE;
         tf->default_val[0] = '\0';
-        char type_spec[256];
-        strncpy(type_spec, colon + 1, sizeof(type_spec) - 1);
-        type_spec[sizeof(type_spec) - 1] = '\0';
+        /* Type portion — parsed in place. parse_default_modifier /
+           parse_field_type only mutate the buffer to strip modifiers,
+           and nothing reuses `line` after this block. The type portion
+           of a spec can be up to MAX_FIELD_DEF bytes (enum value lists)
+           — it must never be copied into a smaller buffer. */
+        char *type_spec = colon + 1;
         size_t ts_len = strlen(type_spec);
         if (ts_len >= 8 && strcmp(type_spec + ts_len - 8, ":removed") == 0) {
             type_spec[ts_len - 8] = '\0';
             tf->removed = 1;
-            ts_len -= 8;
         }
 
         /* Default modifiers — strip from type_spec before parse_field_type.
@@ -1590,6 +1686,7 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
         parse_default_modifier(type_spec, tf);
 
         parse_field_type(type_spec, tf);
+        free(line);
         if (tf->type == FT_NONE || tf->size <= 0) continue;
 
         tf->offset = offset;
@@ -3567,6 +3664,12 @@ static int valid_field_name(const char *name) {
     return 1;
 }
 
+/* __attribute__((cleanup)) helper for MAX_FIELD_DEF spec-row arrays.
+   GCC passes the cleanup the ADDRESS of the variable, so the parameter is
+   a pointer to the row pointer and the heap block is *lines — free(that),
+   never the variable itself. */
+static void free_spec_lines(char (**lines)[MAX_FIELD_DEF]) { free(*lines); }
+
 /* ========== add-field ==========
    Appends one or more new fields to the end of fields.conf and triggers
    a full shard rebuild to enlarge slot_size. Existing records get zero
@@ -3575,7 +3678,7 @@ static int valid_field_name(const char *name) {
    Caller must hold objlock_wrlock on the object. */
 
 int cmd_add_fields(const char *db_root, const char *object,
-                   char lines[][256], int nlines) {
+                   char (*lines)[MAX_FIELD_DEF], int nlines) {
     if (nlines <= 0) {
         OUT("{\"error\":\"No fields specified\"}\n");
         return 1;
@@ -3608,6 +3711,11 @@ int cmd_add_fields(const char *db_root, const char *object,
             OUT("{\"error\":\"Cannot add field with ':removed' marker\"}\n");
             return 1;
         }
+        if (field_default_too_long(lines[a])) {
+            OUT("{\"error\":\"field [%s]: :default= literal too long (max 255 bytes)\"}\n",
+                name);
+            return 1;
+        }
         /* Duplicate-name check against existing fields (including tombstoned) */
         for (int i = 0; i < ts->nfields; i++) {
             if (strcmp(ts->fields[i].name, name) == 0) {
@@ -3630,11 +3738,19 @@ int cmd_add_fields(const char *db_root, const char *object,
            is captured on tf for the backfill pass (see rebuild_object_v2). */
         TypedField tf;
         memset(&tf, 0, sizeof(tf));
-        char clean_spec[256];
-        strncpy(clean_spec, colon + 1, sizeof(clean_spec) - 1);
-        clean_spec[sizeof(clean_spec) - 1] = '\0';
+        /* Heap copy — parse_default_modifier mutates the buffer, and
+           lines[a] is written verbatim to fields.conf later, so the
+           original must stay intact. The type portion can be up to
+           MAX_FIELD_DEF bytes; it must never be copied into a smaller
+           buffer. */
+        char *clean_spec = strdup(colon + 1);
+        if (!clean_spec) {
+            OUT("{\"error\":\"out of memory\"}\n");
+            return 1;
+        }
         parse_default_modifier(clean_spec, &tf);
         parse_field_type(clean_spec, &tf);
+        free(clean_spec);
         if (tf.type == FT_NONE || tf.size <= 0) {
             OUT("{\"error\":\"Invalid type in: %s\"}\n", lines[a]);
             return 1;
@@ -3651,15 +3767,21 @@ int cmd_add_fields(const char *db_root, const char *object,
             if (tf.type == FT_VARCHAR) {
                 int cap = tf.size - 2;  /* uint16 length prefix */
                 if (n_bytes <= 0 || hex_chars > cap) {
+                    free_enum_values(&tf);
                     OUT("{\"error\":\"random(%d) produces %d hex chars but field [%s] holds only %d\"}\n",
                         n_bytes, hex_chars, name, cap);
                     return 1;
                 }
             } else if (n_bytes <= 0) {
+                free_enum_values(&tf);
                 OUT("{\"error\":\"random(N) requires N > 0 in: %s\"}\n", lines[a]);
                 return 1;
             }
         }
+        /* parse_field_type heap-allocated tf's enum value list; tf is a
+           per-iteration throwaway — release it here or the next memset
+           leaks it. */
+        free_enum_values(&tf);
     }
 
     /* rebuild_object appends lines to fields.conf and rewrites shards atomically. */
@@ -3780,13 +3902,29 @@ int cmd_remove_fields(const char *db_root, const char *object,
         return 1;
     }
 
-    char lines[MAX_FIELDS][512];
+    char (*lines)[MAX_FIELD_DEF] __attribute__((cleanup(free_spec_lines))) =
+        calloc(MAX_FIELDS, MAX_FIELD_DEF);
+    if (!lines) {
+        fclose(f);
+        OUT("{\"error\":\"out of memory\"}\n");
+        return 1;
+    }
     int nlines = 0;
-    while (nlines < MAX_FIELDS && fgets(lines[nlines], sizeof(lines[0]), f)) {
-        lines[nlines][strcspn(lines[nlines], "\n")] = '\0';
+    int rderr = 0;
+    while (nlines < MAX_FIELDS) {
+        int e = 0;
+        char *rd_line = conf_read_line(f, MAX_FIELD_DEF, &e);
+        if (!rd_line) { rderr = e; break; }
+        memcpy(lines[nlines], rd_line, strlen(rd_line) + 1);
+        free(rd_line);
         nlines++;
     }
     fclose(f);
+    if (rderr) {
+        OUT("{\"error\":\"fields.conf line exceeds %d bytes — refusing to rewrite\"}\n",
+            MAX_FIELD_DEF - 1);
+        return 1;
+    }
 
     /* Validate each requested field exists and isn't already tombstoned */
     int found[MAX_FIELDS] = {0};
@@ -3871,12 +4009,23 @@ int cmd_rename_field(const char *db_root, const char *object,
 
     /* Read all lines; track whether old_name is found and whether new_name
        already exists (as an active, non-tombstoned field). */
-    char lines[MAX_FIELDS][512];
+    char (*lines)[MAX_FIELD_DEF] __attribute__((cleanup(free_spec_lines))) =
+        calloc(MAX_FIELDS, MAX_FIELD_DEF);
+    if (!lines) {
+        fclose(f);
+        OUT("{\"error\":\"out of memory\"}\n");
+        return 1;
+    }
     int nlines = 0;
     int found_old = 0;
     int new_conflict = 0;
-    while (nlines < MAX_FIELDS && fgets(lines[nlines], sizeof(lines[0]), f)) {
-        lines[nlines][strcspn(lines[nlines], "\n")] = '\0';
+    int rderr = 0;
+    while (nlines < MAX_FIELDS) {
+        int e = 0;
+        char *rd_line = conf_read_line(f, MAX_FIELD_DEF, &e);
+        if (!rd_line) { rderr = e; break; }
+        memcpy(lines[nlines], rd_line, strlen(rd_line) + 1);
+        free(rd_line);
         const char *ln = lines[nlines];
         if (ln[0] && ln[0] != '#') {
             const char *colon = strchr(ln, ':');
@@ -3890,6 +4039,11 @@ int cmd_rename_field(const char *db_root, const char *object,
         nlines++;
     }
     fclose(f);
+    if (rderr) {
+        OUT("{\"error\":\"fields.conf line exceeds %d bytes — refusing to rewrite\"}\n",
+            MAX_FIELD_DEF - 1);
+        return 1;
+    }
 
     if (!found_old) {
         OUT("{\"error\":\"Field [%s] not found in fields.conf\"}\n", old_name);

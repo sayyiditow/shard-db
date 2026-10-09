@@ -130,7 +130,7 @@ int rebuild_object_v2(const char *db_root, const char *object,
                       const Schema *new_sch, TypedSchema *new_ts,
                       int *new_to_old, int slot_changed,
                       int splits_changed, int drop_tombstoned,
-                      char added_lines[][256], int n_added,
+                      char (*added_lines)[MAX_FIELD_DEF], int n_added,
                       const RebuildFinalizeOps *finalize);
 int v2_rebuild_walk_cb(const uint8_t hash16[16],
                        const void *key, size_t klen,
