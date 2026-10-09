@@ -212,6 +212,18 @@ typedef struct {
 } TypedSchema;
 #define MAX_LINE    65536
 
+/* Max bytes of one field-definition spec (fields.conf line grammar:
+   "name:type[:param][:default=...][:removed]"). This single cap must be
+   enforced identically by the wire gates (create-object / add-field /
+   edit-field) and by every fields.conf reader and rewriter: a spec
+   accepted on the wire is written verbatim to fields.conf and re-read
+   verbatim on every schema load, so a reader with a smaller line buffer
+   than the wire gate corrupts the schema on reload. 64 KiB fits ~13k
+   four-char enum values (the 65,535-value enum ceiling is storage-side;
+   the line cap binds first for longer values). Worst-case per-request
+   schema scratch is MAX_FIELDS * MAX_FIELD_DEF = 16 MiB transient heap. */
+#define MAX_FIELD_DEF 65536
+
 /* Zone A entry: 24 bytes. Payload (key+value) lives in Zone B at a fixed offset. */
 typedef struct __attribute__((packed)) {
     uint8_t  hash[16];
@@ -822,6 +834,21 @@ int idx_should_auto_bitmap(int had_explicit_type, enum FieldType field_type);
    on schema invalidation / re-parse. */
 int  enum_value_index(const TypedField *f, const char *val, size_t vlen);
 void free_enum_values(TypedField *f);
+
+/* Read one '\n'-terminated line from fp into a malloc'd buffer.
+   Returns the line without its trailing '\n' (caller frees), or NULL:
+   clean EOF sets *err = 0, a read error sets *err = errno, and a line
+   whose content reaches max_len before its newline sets *err = EOVERFLOW
+   (the rest of the offending line is consumed). Never returns a line of
+   max_len bytes or longer. Deliberately not getline(): no feature-macro
+   regime questions on macOS. */
+char *conf_read_line(FILE *fp, size_t max_len, int *err);
+
+/* True when the spec's ":default=" tail exceeds TypedField.default_val's
+   255-byte capacity. parse_default_modifier would silently truncate such
+   a literal (and the applied default with it), so every wire gate calls
+   this and rejects the spec instead. */
+int field_default_too_long(const char *field_spec);
 void load_dirs(void);
 int is_valid_dir(const char *dir);
 int dir_name_ok(const char *dir);
@@ -1272,7 +1299,7 @@ int reshard_target_for_count(long long live);
    (only meaningful for v2 storage). Used by vacuum's streams-mismatch path. */
 int rebuild_object(const char *db_root, const char *object,
                    int new_splits, int drop_tombstoned,
-                   char added_lines[][256], int n_added,
+                   char (*added_lines)[MAX_FIELD_DEF], int n_added,
                    int new_streams_arg);
 int cmd_recount(const char *db_root, const char *object);
 int cmd_shard_stats(const char *db_root, const char *object, int as_table);
@@ -1351,7 +1378,7 @@ int cmd_rename_field(const char *db_root, const char *object,
 int cmd_remove_fields(const char *db_root, const char *object,
                       char names[][256], int nnames);
 int cmd_add_fields(const char *db_root, const char *object,
-                   char lines[][256], int nlines);
+                   char (*lines)[MAX_FIELD_DEF], int nlines);
 /* Edits one or more existing fields in-place — same-type only. Allowed
    edits: varchar grow/shrink (shrink refused pre-flight if any live
    value's content exceeds the new cap), int/long/short widen/narrow
@@ -1366,7 +1393,7 @@ int cmd_add_fields(const char *db_root, const char *object,
    at the cost of touching unaffected indexes). Caller holds
    objlock_wrlock. */
 int cmd_edit_fields(const char *db_root, const char *object,
-                    char lines[][256], int nlines,
+                    char (*lines)[MAX_FIELD_DEF], int nlines,
                     int allow_rename, int dry_run);
 void invalidate_schema_caches(const char *db_root, const char *object);
 /* Frees every entry in the process-global schema/fields/typed/index caches

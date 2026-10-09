@@ -57,7 +57,7 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 | `ipv6` | `addr:ipv6` | 16 | Raw 16-byte IPv6 address, network byte order. Parsed from canonical IPv6 string (e.g. `2001:db8::1`). Malformed input encodes 0. Byte-lexicographic order matches numeric IPv6 order. |
 | `numeric` | `price:numeric:P,S` | 8 | Scaled int64 BE: stored value = value × 10^S. P is total digits (informational), S is scale. |
 | `currency` | `amount:currency` | 8 | Alias for `numeric:19,4`. |
-| `enum` | `color:enum(red,green,blue)` | 1 or 2 | Declared closed value list. Stored as the value's 0-based byte index; **1 byte** for ≤256 values, **2 bytes BE** for 257–65535. Wire format is the display string (`"red"`); the engine validates against the list on insert. Commas inside enum values aren't supported in v1. Bitmap index is opt-in (declare `color:bitmap`, or the bare field name which promotes to bitmap). Available since 2026.05.7. |
+| `enum` | `color:enum(red,green,blue)` | 1 or 2 | Declared closed value list. Stored as the value's 0-based byte index; **1 byte** for ≤256 values, **2 bytes BE** for 257–65535. Wire format is the display string (`"red"`); the engine validates against the list on insert. Commas inside enum values aren't supported in v1. Bitmap index is opt-in (declare `color:bitmap`, or the bare field name which promotes to bitmap). Available since 2026.05.7. Value lists share the 65,535-byte field-definition cap (see [limits](../reference/limits.md)) — ≈13k four-char values. |
 
 ### varchar sizing
 
@@ -93,7 +93,7 @@ Append default modifiers after the type spec. They trigger server-side when the 
 | `auto_create` | Server timestamp on **INSERT** only | `created:datetime:auto_create` (calendar-packed) or `created_at:timestamp:auto_create` (epoch ms, 2026.05.6+) |
 | `auto_update` | Server timestamp on **INSERT and every UPDATE** | `modified:datetime:auto_update` or `updated_at:timestamp:auto_update` |
 
-A single field can carry at most one of: `default=...`, `auto_create`, `auto_update`.
+A single field can carry at most one of: `default=...`, `auto_create`, `auto_update`. A `:default=<literal>` is limited to 255 bytes (see [limits](../reference/limits.md)); longer literals are rejected at `create-object` / `add-field` / `edit-field` rather than silently truncated.
 
 ### Pattern: versioned records with CAS
 

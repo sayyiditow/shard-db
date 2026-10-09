@@ -694,6 +694,12 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
 /* ========== JSON QUERY DISPATCH ========== */
 
 /* Dispatch a JSON query object: {"mode":"get","object":"users","key":"k1",...} */
+/* __attribute__((cleanup)) helper for MAX_FIELD_DEF spec-row arrays.
+   GCC passes the cleanup the ADDRESS of the variable, so the parameter is
+   a pointer to the row pointer and the heap block is *lines — free(that),
+   never the variable itself. */
+static void free_spec_lines(char (**lines)[MAX_FIELD_DEF]) { free(*lines); }
+
 void dispatch_json_query(const char *raw_db_root, const char *json, const char *client_ip) {
     /* Concurrency cap: take a slot up-front; release on any return path
        via the cleanup attribute. Bounds peak query-buffer RAM at
@@ -1941,64 +1947,88 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *fields_arr = json_obj_strdup_raw(&req, "fields");
         if (!fields_arr) { OUT("{\"error\":\"Missing 'fields' array\"}\n"); }
         else {
-            char lines[MAX_FIELDS][256];
-            int nlines = 0;
-            const char *p = fields_arr;
-            while (*p && nlines < MAX_FIELDS) {
-                while (*p == '[' || *p == ',' || *p == ' ' || *p == '\t') p++;
-                if (*p == ']' || *p == '\0') break;
-                if (*p == '"') {
-                    p++;
-                    const char *start = p;
-                    while (*p && *p != '"') p++;
-                    size_t l = p - start;
-                    if (l > 0 && l < 256) {
-                        memcpy(lines[nlines], start, l);
-                        lines[nlines][l] = '\0';
-                        nlines++;
-                    }
-                    if (*p == '"') p++;
-                } else p++;
+            char (*lines)[MAX_FIELD_DEF] __attribute__((cleanup(free_spec_lines))) =
+                calloc(MAX_FIELDS, MAX_FIELD_DEF);
+            if (!lines) {
+                OUT("{\"error\":\"out of memory\"}\n");
+                free(fields_arr);
+            } else {
+                int nlines = 0;
+                int too_long = 0;
+                const char *p = fields_arr;
+                while (*p && nlines < MAX_FIELDS) {
+                    while (*p == '[' || *p == ',' || *p == ' ' || *p == '\t') p++;
+                    if (*p == ']' || *p == '\0') break;
+                    if (*p == '"') {
+                        p++;
+                        const char *start = p;
+                        while (*p && *p != '"') p++;
+                        size_t l = p - start;
+                        if (l > 0 && l < MAX_FIELD_DEF) {
+                            memcpy(lines[nlines], start, l);
+                            lines[nlines][l] = '\0';
+                            nlines++;
+                        } else if (l >= MAX_FIELD_DEF) {
+                            too_long = 1;
+                        }
+                        if (*p == '"') p++;
+                    } else p++;
+                }
+                if (too_long)
+                    OUT("{\"error\":\"field definition longer than %d bytes\"}\n",
+                        MAX_FIELD_DEF - 1);
+                else if (nlines == 0) OUT("{\"error\":\"No fields in 'fields' array\"}\n");
+                else cmd_add_fields(db_root, object, lines, nlines);
+                free(fields_arr);
             }
-            if (nlines == 0) OUT("{\"error\":\"No fields in 'fields' array\"}\n");
-            else cmd_add_fields(db_root, object, lines, nlines);
-            free(fields_arr);
         }
     } else if (strcmp(mode, "edit-field") == 0) {
         /* fields is a JSON array of spec lines, e.g. ["name:varchar:200","age:long"] */
         char *fields_arr = json_obj_strdup_raw(&req, "fields");
         if (!fields_arr) { OUT("{\"error\":\"Missing 'fields' array\"}\n"); }
         else {
-            char lines[MAX_FIELDS][256];
-            int nlines = 0;
-            const char *p = fields_arr;
-            while (*p && nlines < MAX_FIELDS) {
-                while (*p == '[' || *p == ',' || *p == ' ' || *p == '\t') p++;
-                if (*p == ']' || *p == '\0') break;
-                if (*p == '"') {
-                    p++;
-                    const char *start = p;
-                    while (*p && *p != '"') p++;
-                    size_t l = p - start;
-                    if (l > 0 && l < 256) {
-                        memcpy(lines[nlines], start, l);
-                        lines[nlines][l] = '\0';
-                        nlines++;
-                    }
-                    if (*p == '"') p++;
-                } else p++;
+            char (*lines)[MAX_FIELD_DEF] __attribute__((cleanup(free_spec_lines))) =
+                calloc(MAX_FIELDS, MAX_FIELD_DEF);
+            if (!lines) {
+                OUT("{\"error\":\"out of memory\"}\n");
+                free(fields_arr);
+            } else {
+                int nlines = 0;
+                int too_long = 0;
+                const char *p = fields_arr;
+                while (*p && nlines < MAX_FIELDS) {
+                    while (*p == '[' || *p == ',' || *p == ' ' || *p == '\t') p++;
+                    if (*p == ']' || *p == '\0') break;
+                    if (*p == '"') {
+                        p++;
+                        const char *start = p;
+                        while (*p && *p != '"') p++;
+                        size_t l = p - start;
+                        if (l > 0 && l < MAX_FIELD_DEF) {
+                            memcpy(lines[nlines], start, l);
+                            lines[nlines][l] = '\0';
+                            nlines++;
+                        } else if (l >= MAX_FIELD_DEF) {
+                            too_long = 1;
+                        }
+                        if (*p == '"') p++;
+                    } else p++;
+                }
+                /* Optional `allow_rename` flag for FT_ENUM rename edits.
+                   Without it, any rename at an existing enum position is
+                   rejected. */
+                int allow_rename = json_obj_is_true(&req, "allow_rename");
+                char *dry_s = json_obj_strdup(&req, "dry_run");
+                int dry = json_obj_is_true(&req, "dry_run") ||
+                          (dry_s && strcmp(dry_s, "1") == 0);
+                free(dry_s);
+                if (too_long)
+                    OUT("{\"error\":\"field definition longer than %d bytes\"}\n",
+                        MAX_FIELD_DEF - 1);
+                else if (nlines == 0) OUT("{\"error\":\"No fields in 'fields' array\"}\n");
+                else cmd_edit_fields(db_root, object, lines, nlines, allow_rename, dry);
+                free(fields_arr);
             }
-            /* Optional `allow_rename` flag for FT_ENUM rename edits.
-               Without it, any rename at an existing enum position is
-               rejected. */
-            int allow_rename = json_obj_is_true(&req, "allow_rename");
-            char *dry_s = json_obj_strdup(&req, "dry_run");
-            int dry = json_obj_is_true(&req, "dry_run") ||
-                      (dry_s && strcmp(dry_s, "1") == 0);
-            free(dry_s);
-            if (nlines == 0) OUT("{\"error\":\"No fields in 'fields' array\"}\n");
-            else cmd_edit_fields(db_root, object, lines, nlines, allow_rename, dry);
-            free(fields_arr);
         }
     } else if (strcmp(mode, "remove-field") == 0) {
         /* fields is a JSON array of field names, e.g. ["email","age"] */

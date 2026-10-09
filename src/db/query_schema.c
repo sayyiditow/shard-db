@@ -188,12 +188,23 @@ static int default_modifiers_for_line(const char *line, char *out_buf, size_t ou
     return 1;
 }
 
+/* True if the line carries a :default=/:auto_create/:auto_update modifier
+   (mirrors default_modifiers_for_line's grammar). Combined with that
+   helper's refuse-to-truncate, a modifier too large for the carry buffer
+   means an edit rewrite would silently drop it — callers must refuse. */
+static int line_has_default_modifier(const char *line) {
+    static const char *const mods[] = { ":default=", ":auto_create", ":auto_update", NULL };
+    for (int i = 0; mods[i]; i++)
+        if (strstr(line, mods[i])) return 1;
+    return 0;
+}
+
 /* Rewrite fields.conf in place, replacing each edited line with its new
    spec. Edited lines preserve the trailing :removed marker if present
    (edit-field rejects tombstoned fields up front, so this is defensive).
    Lines unaffected by the edit pass through unchanged. */
 static int rewrite_fields_conf_for_edit(const char *obj_dir,
-                                         char edit_lines[][256], int n_edits) {
+                                         char (*edit_lines)[MAX_FIELD_DEF], int n_edits) {
     char fpath[PATH_MAX], fpath_new[PATH_MAX];
     snprintf(fpath,     sizeof(fpath),     "%s/fields.conf", obj_dir);
     snprintf(fpath_new, sizeof(fpath_new), "%s/fields.conf.new", obj_dir);
@@ -219,28 +230,42 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
         if (fout) fclose(fout);
         return -1;
     }
-    char line[512];
-    while (fgets(line, sizeof(line), fin)) {
-        char stripped[512];
-        strncpy(stripped, line, sizeof(stripped) - 1);
-        stripped[sizeof(stripped) - 1] = '\0';
-        stripped[strcspn(stripped, "\n")] = '\0';
-        if (stripped[0] == '\0' || stripped[0] == '#') {
+    for (;;) {
+        int rderr = 0;
+        char *line = conf_read_line(fin, MAX_FIELD_DEF, &rderr);
+        if (!line) {
+            if (rderr) {
+                LOG_ERROR(LOG_SUB_CONFIG,
+                          "rewrite_fields_conf_for_edit: fields.conf line exceeds "
+                          "%d bytes — refusing to rewrite a schema we cannot "
+                          "parse faithfully", MAX_FIELD_DEF - 1);
+                fclose(fin);
+                fclose(fout);
+                unlink(fpath_new);
+                return -1;
+            }
+            break;   /* EOF */
+        }
+        if (line[0] == '\0' || line[0] == '#') {
             fputs(line, fout);
+            fputc('\n', fout);   /* conf_read_line strips the newline */
+            free(line);
             continue;
         }
-        const char *colon = strchr(stripped, ':');
-        size_t nlen = colon ? (size_t)(colon - stripped) : strlen(stripped);
+        const char *colon = strchr(line, ':');
+        size_t nlen = colon ? (size_t)(colon - line) : strlen(line);
         int matched = -1;
         for (int e = 0; e < n_edits; e++) {
             size_t elen = strlen(edit_names[e]);
-            if (nlen == elen && memcmp(stripped, edit_names[e], elen) == 0) {
+            if (nlen == elen && memcmp(line, edit_names[e], elen) == 0) {
                 matched = e;
                 break;
             }
         }
         if (matched < 0) {
             fputs(line, fout);
+            fputc('\n', fout);   /* conf_read_line strips the newline */
+            free(line);
             continue;
         }
         /* Carry default modifiers (:default=…, :auto_create, :auto_update)
@@ -248,13 +273,30 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
            them. Lets `edit-field age:long` change the type without wiping
            an existing `:default=42`. */
         char old_mods[256] = "";
-        default_modifiers_for_line(stripped, old_mods, sizeof(old_mods));
+        default_modifiers_for_line(line, old_mods, sizeof(old_mods));
+        /* A modifier that exceeds the carry buffer can't be re-emitted —
+           writing the replacement without it would silently drop the
+           field's default. Refuse the whole rewrite instead (the on-disk
+           line can only exceed the buffer via older binaries or hand
+           edits; the wire gates reject such specs). */
+        if (!old_mods[0] && line_has_default_modifier(line)) {
+            LOG_ERROR(LOG_SUB_CONFIG,
+                      "rewrite_fields_conf_for_edit: a field line carries a "
+                      "default modifier larger than %d bytes — refusing to "
+                      "rewrite (an edit would drop it)",
+                      (int)sizeof(old_mods) - 1);
+            fclose(fin);
+            fclose(fout);
+            unlink(fpath_new);
+            return -1;
+        }
         char new_mods[256] = "";
         int new_has = default_modifiers_for_line(edit_lines[matched], new_mods, sizeof(new_mods));
         if (!new_has && old_mods[0])
             fprintf(fout, "%s%s\n", edit_lines[matched], old_mods);
         else
             fprintf(fout, "%s\n", edit_lines[matched]);
+        free(line);
     }
     fclose(fin);
     fclose(fout);
@@ -354,7 +396,7 @@ typedef struct {
     const char *db_root;
     const char *object;
     const char *obj_dir;
-    char (*edit_lines)[256];
+    char (*edit_lines)[MAX_FIELD_DEF];
     int n_edits;
     char (*dirty_names)[128];
     int n_dirty;
@@ -378,7 +420,7 @@ static int edit_finalize_indexes(void *ctx_, int *out_rebuilt) {
 }
 
 int cmd_edit_fields(const char *db_root, const char *object,
-                    char lines[][256], int n_edits,
+                    char (*lines)[MAX_FIELD_DEF], int n_edits,
                     int allow_rename, int dry_run) {
     if (n_edits <= 0) {
         OUT("{\"error\":\"No fields specified\"}\n");
@@ -418,6 +460,12 @@ int cmd_edit_fields(const char *db_root, const char *object,
         }
         if (!edit_valid_name(parsed[e].name)) {
             OUT("{\"error\":\"Invalid field name: %s\"}\n", parsed[e].name);
+            for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
+            return 1;
+        }
+        if (field_default_too_long(lines[e])) {
+            OUT("{\"error\":\"field [%s]: :default= literal too long (max 255 bytes)\"}\n",
+                parsed[e].name);
             for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
@@ -681,16 +729,31 @@ int cmd_edit_fields(const char *db_root, const char *object,
     return 0;
 }
 
+/* __attribute__((cleanup)) helper for cmd_create_object's field_specs.
+   GCC passes the cleanup the address of the variable, so the parameter
+   is a pointer to the array, not the decayed char **. */
+static void free_field_specs(char *(*specs)[MAX_FIELDS]) {
+    for (int i = 0; i < MAX_FIELDS; i++) free((*specs)[i]);
+}
+
+static int validate_field_type_clean(char *buf);
+
 /* Validate a field type spec like "name:varchar:30" or "age:int".
    Returns the storage size (>0) on success, 0 on invalid. */
 static int validate_field_type(const char *field_spec) {
     const char *colon = strchr(field_spec, ':');
     if (!colon || colon == field_spec) return 0; /* no type separator or empty name */
 
-    /* Work on a copy so we can strip modifiers */
-    char buf[512];
-    strncpy(buf, colon + 1, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    /* Heap copy so the type portion can be MAX_FIELD_DEF-sized (enum value
+       lists). _clean mutates buf in place (strips modifiers). */
+    char *buf = strdup(colon + 1);
+    if (!buf) return 0;
+    int rc = validate_field_type_clean(buf);
+    free(buf);
+    return rc;
+}
+
+static int validate_field_type_clean(char *buf) {
 
     /* Strip :removed */
     size_t blen = strlen(buf);
@@ -879,8 +942,10 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     }
     p++;
 
-    /* First pass: validate all fields before creating anything */
-    char field_specs[MAX_FIELDS][512];
+    /* First pass: validate all fields before creating anything. Rows are
+       heap strings (a MAX_FIELD_DEF-sized spec must fit); the cleanup
+       attribute frees every row on any of this function's early exits. */
+    char *field_specs[MAX_FIELDS] __attribute__((cleanup(free_field_specs))) = {0};
     int nfields = 0;
     int total_value_size = 0;
 
@@ -902,8 +967,14 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
             OUT("{\"error\":\"too many fields (max %d)\"}\n", MAX_FIELDS);
             return 1;
         }
-        if (flen <= 0 || flen >= 511) {
-            OUT("{\"error\":\"invalid field definition (empty or too long)\"}\n");
+        if (flen <= 0 || flen >= MAX_FIELD_DEF) {
+            OUT("{\"error\":\"invalid field definition (empty or longer than %d bytes)\"}\n",
+                MAX_FIELD_DEF - 1);
+            return 1;
+        }
+        field_specs[nfields] = malloc((size_t)flen + 1);
+        if (!field_specs[nfields]) {
+            OUT("{\"error\":\"out of memory\"}\n");
             return 1;
         }
         memcpy(field_specs[nfields], start, flen);
@@ -947,6 +1018,14 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                     field_specs[nfields], (int)dlen, dval);
                 return 1;
             }
+        }
+
+        /* A :default= literal beyond default_val's 255-byte capacity would
+           be silently truncated at parse/insert time — reject instead. */
+        if (field_default_too_long(field_specs[nfields])) {
+            OUT("{\"error\":\"field [%s]: :default= literal too long (max 255 bytes)\"}\n",
+                field_specs[nfields]);
+            return 1;
         }
 
         total_value_size += field_size;
