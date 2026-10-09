@@ -1284,6 +1284,7 @@ int rebuild_object(const char *db_root, const char *object,
         new_ts.nfields++;
     }
     /* Append newly-added fields — they start zero-valued in existing records. */
+    int appended_at = new_ts.nfields;
     for (int a = 0; a < n_added; a++) {
         if (new_ts.nfields >= MAX_FIELDS) {
             OUT("{\"error\":\"Too many fields (max %d)\"}\n", MAX_FIELDS);
@@ -1292,12 +1293,14 @@ int rebuild_object(const char *db_root, const char *object,
         TypedField tf;
         memset(&tf, 0, sizeof(tf));
         if (!parse_field_line(added_lines[a], &tf)) {
+            free_enum_values(&tf);
             OUT("{\"error\":\"Invalid field line: %s\"}\n", added_lines[a]);
             return 1;
         }
         /* Reject duplicate names against existing active fields */
         for (int i = 0; i < new_ts.nfields; i++) {
             if (strcmp(new_ts.fields[i].name, tf.name) == 0) {
+                free_enum_values(&tf);
                 OUT("{\"error\":\"Field [%s] already exists\"}\n", tf.name);
                 return 1;
             }
@@ -1336,10 +1339,17 @@ int rebuild_object(const char *db_root, const char *object,
     }
 
     /* v2 path runs an entirely separate rebuild over slotcask files. */
-    return rebuild_object_v2(db_root, object, &old_sch, old_ts,
-                              &new_sch, &new_ts, new_to_old,
-                              slot_changed, splits_changed,
-                              drop_tombstoned, added_lines, n_added, NULL);
+    int rc = rebuild_object_v2(db_root, object, &old_sch, old_ts,
+                               &new_sch, &new_ts, new_to_old,
+                               slot_changed, splits_changed,
+                               drop_tombstoned, added_lines, n_added, NULL);
+    /* new_ts's appended fields own heap enum value lists (parse_field_line),
+       and v2 needs them alive while it recomposes records — free only the
+       appended tail, on success and failure. The copied prefix aliases the
+       cached old_ts and must never be freed here. */
+    for (int a = 0; a < n_added; a++)
+        free_enum_values(&new_ts.fields[appended_at + a]);
+    return rc;
 }
 
 int is_number(const char *s) {

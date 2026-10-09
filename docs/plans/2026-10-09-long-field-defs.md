@@ -108,6 +108,25 @@ refuse and leave the file intact). Pre-fix run: 5 failed / 48 passed
 (`/tmp/r3-prefix-fail.txt` — all three gates accepted the long default;
 the G edit dropped it from disk). Post-fix: 53/53; full suite 16,062/462;
 sanitizer gates rerun on this diff.
+
+Round-4 (2026-10-09, post-push): CI Sanitizers (ASan+UBSan) failed with
+`780 byte(s) leaked in 61 allocation(s)` — reproduced locally under CI's
+exact command. Root cause (pre-existing on main, first exercised by the
+new add-field-with-enum coverage): `rebuild_object`'s append loop moves
+freshly parsed `TypedField`s into the stack `new_ts`, and nobody ever
+frees `new_ts`'s heap members — query_find.c had zero
+`free_typed_schema`/`free_enum_values` calls. `new_ts` mixes ownership:
+its copied prefix aliases the cached `old_ts` (must never be freed
+here), while only the appended tail is freshly owned, and it must stay
+alive through `rebuild_object_v2` (record recomposition reads the enum
+lists). Fix: capture `appended_at` before the append loop, free the
+tail after the v2 dispatch returns (success or failure), and free the
+in-loop `tf` on the error returns that follow a successful parse.
+`cmd_edit_fields` was already leak-free (it frees `parsed[]`, which
+aliases its `new_ts`). Verified: CI-flags ASan run leak-free and green;
+normal gate — regression 53/53, full suite 16,062/462. Per human
+instruction, the full ASan/TSan ×3 local gate is deferred to CI for
+this round.
 **Branch:** `fix/long-field-defs` (created at execution start, off `main`)
 **Execution mode:** per AGENTS.md standing exception — leave work **uncommitted**; reviewing agent + human review the raw `git diff`.
 
