@@ -104,6 +104,10 @@ void slotcask_test_count_gap_park(void);
    park waits on the control-channel condvar (see test_control.c). */
 extern _Atomic int g_shard_test_find_flush_gate;
 extern _Atomic int g_shard_test_find_flush_gate_hit;
+/* W1: per-shard kf slot tier seams (defined in slotcask.c under
+ * TEST_BUILD). _Atomic: control-thread writes, request-thread reads. */
+extern _Atomic size_t g_shard_test_kf_initial_slots;
+extern _Atomic size_t g_shard_test_kf_max_slots;
 typedef void (*shard_db_test_gate_fn)(void *ctx);
 void shard_db_test_set_find_flush_gate_hook(shard_db_test_gate_fn fn, void *ctx);
 
@@ -123,6 +127,8 @@ static inline void shard_test_ctl_reset(void) {
     atomic_store(&g_shard_test_bulk_lookup_gap_release, 0);
     atomic_store(&g_shard_test_count_gap, 0);
     atomic_store(&g_shard_test_count_gap_hit, 0);
+    atomic_store(&g_shard_test_kf_initial_slots, 0);
+    atomic_store(&g_shard_test_kf_max_slots, 0);
     atomic_store(&g_shard_test_gate_held_max, 0);
     atomic_store(&g_shard_test_bulk_chains, 0);
 }

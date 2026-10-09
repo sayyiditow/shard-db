@@ -198,35 +198,35 @@ What `splits` does **not** control:
 
 - Total data size. Seg files (`<obj>/seg/<stream>/NNNN.seg`) roll over at `SLOTCASK_SEG_MAX_BYTES` and accumulate without bound. A 100 GB object on `splits=8` is fine on disk; the only question is whether the kf shards stay snappy.
 
-The right value is driven by **per-shard kf load** (live + tombstoned slots), not records-per-shard in the v1 sense. Each kf shard auto-resplits in-place when its slot fill crosses 75 %, doubling capacity up to `SLOTCASK_MAX_SLOTS_PER_SHARD = 16M` slots. So a single kf shard tops out at ~12.8M live entries (16M × 80 %) and ~384 MB on disk — beyond that the next insert refuses and the operator must `vacuum --splits=N` to widen the keyspace.
+The right value is driven by **per-shard kf load** (live + tombstoned slots), not records-per-shard in the v1 sense. Each kf shard auto-resplits in-place when its slot fill crosses 75 %, doubling capacity — **with no ceiling**: growth continues for the life of the object and inserts never refuse for capacity. Resplit cost scales with the shard's entry count (~4–5 s at ~25M entries), which is why the sizing guidance below keeps shards small even though growth itself is automatic.
 
-### Keyfile sizing — initial + ceiling per shard
+### Keyfile sizing — initial slots per shard
 
 Slot count per shard is tiered on `splits` (see `slotcask_default_slots_for_splits()` in `slotcask.h`):
 
-| `splits` range | Initial slots/shard | Initial bytes/shard | Per-shard ceiling (live entries) | Per-shard ceiling (bytes) |
-|----------------|--------------------:|--------------------:|---------------------------------:|--------------------------:|
-| ≤ 16           | 1 048 576 (1M)      | 24 MB               | 12.8M                            | 384 MB                    |
-| ≤ 128          | 262 144 (256K)      | 6 MB                | 12.8M                            | 384 MB                    |
-| ≤ 1024         | 131 072 (128K)      | 3 MB                | 12.8M                            | 384 MB                    |
-| ≤ 4096         | 65 536 (64K)        | 1.5 MB              | 12.8M                            | 384 MB                    |
+| `splits` range | Initial slots/shard | Initial bytes/shard |
+|----------------|--------------------:|--------------------:|
+| ≤ 16           | 1 048 576 (1M)      | 24 MB               |
+| ≤ 128          | 262 144 (256K)      | 6 MB                |
+| ≤ 1024         | 131 072 (128K)      | 3 MB                |
+| ≤ 4096         | 65 536 (64K)        | 1.5 MB              |
 
-(All tiers share the same `SLOTCASK_MAX_SLOTS_PER_SHARD = 16M` ceiling. Resplits stay in-place — each doubling rebuilds one shard, not the whole keyspace.)
+(The tier table is the *initial* sizing only — every tier doubles without limit as the object grows. Resplits stay in-place — each doubling rebuilds one shard, not the whole keyspace.)
 
 ### Recommended `splits` by record count
 
-| Expected live records | Recommended `splits` | Live records / kf shard | Per-shard headroom |
-|-----------------------|----------------------|------------------------:|--------------------|
-| up to 1M              | 8                    | ~125K                   | ~100× before resplit ceiling |
-| 1–10M                 | 16                   | 63K – 625K              | ~20× headroom |
-| 10–50M                | 16                   | 625K – 3.1M             | ~4× headroom |
-| 50–200M               | 64                   | 780K – 3.1M             | ~4× headroom |
-| 200M–1B               | 1024                 | 195K – 977K             | ~13× headroom |
-| 1B–5B                 | 2048                 | 488K – 2.4M             | ~5× headroom |
-| 5B–10B                | 4096 (MAX_SPLITS)    | 1.2M – 2.4M             | ~5× headroom |
-| 10B+                  | 4096, partition by object | n/a — partition the object | — |
+| Expected live records | Recommended `splits` | Live records / kf shard |
+|-----------------------|----------------------|------------------------:|
+| up to 1M              | 8                    | ~125K                   |
+| 1–10M                 | 16                   | 63K – 625K              |
+| 10–50M                | 16                   | 625K – 3.1M             |
+| 50–200M               | 64                   | 780K – 3.1M             |
+| 200M–1B               | 1024                 | 195K – 977K             |
+| 1B–5B                 | 2048                 | 488K – 2.4M             |
+| 5B–10B                | 4096 (MAX_SPLITS)    | 1.2M – 2.4M             |
+| 10B+                  | 4096, partition by object | n/a — partition the object |
 
-Numbers are aimed at keeping each kf shard well below its per-shard ceiling so resplits stay cheap and concurrent inserts don't queue behind a wrlock-held doubling. The exact records/shard band is forgiving — kf lookup stays O(1) at any load below the resplit threshold.
+Numbers are aimed at keeping each kf shard near the sweet spot so resplit doublings stay rare and cheap. The exact records/shard band is forgiving — kf lookup stays O(1) at any load below the resplit threshold, and growth itself never refuses.
 
 The 10–50M and 50–200M rows were revised (2026-09-14) after ingest measurement showed the previous 64-at-10M advice was slower than 16 on every axis — see the measured table below. The trade is deliberate: fewer shards leave ~4× resplit headroom at the top of each band instead of ~16×, and the widening ladder (shard-stats hint, `AUTO_RESHARD`, online `vacuum --splits=N`) moves you up as the live count grows.
 
@@ -242,17 +242,17 @@ The table above is a *ceiling-planning* tool, not a growth-prediction one. Every
 
 Parallel ingest peaked at **splits ≈ core count** (16 on the bench host) and fell off on both sides: an over-split 1M-row object collapsed to 0.34 M rows/s at splits=64, and at 10M rows splits=64 was the only sizing that lost to a single connection — gate parallelism above core count goes unused while every request still pays 4× the commit barriers. For comparison, the same 1M/splits=8 shape measured 1.04 M rows/s parallel on the pre-B3b tree; the commit-chain merge roughly doubles it.
 
-So the operational rule is: **start at 8; for ingest-heavy objects treat core count as the practical ceiling on `splits`; raise `splits` only when the record count approaches where the table above tells you to.** Capacity growth is automatic (per-shard in-place resplit at 75–80% load, `AUTO_RESHARD_ENABLE` nightly widening, online `vacuum --splits=N`) — but each shard holds at most ~12.8M live entries (16M slots × 80 %) before inserts refuse, so the band table is also your capacity plan: 8 shards ≈ 102M records, 16 ≈ 205M, and so on up the ladder toward ~52B at `MAX_SPLITS`. If you know an object will hold tens of millions of records before it exists, create it with the band's `splits` up front — that choice is free at `create-object` time, while widening a 100M-record object later is an online rehash worth planning.
+So the operational rule is: **start at 8; for ingest-heavy objects treat core count as the practical ceiling on `splits`; raise `splits` only when the record count approaches where the table above tells you to.** Capacity growth is automatic and unbounded (per-shard in-place resplit at 75–80% load, `AUTO_RESHARD_ENABLE` nightly widening — default on — and online `vacuum --splits=N` if you want it sooner): objects grow for as long as the disk holds out, with no capacity refusals. The band table is then an *efficiency* plan, not a capacity one — shards near the sweet spot keep resplits cheap; if you know an object will hold tens of millions of records before it exists, create it with the band's `splits` up front — that choice is free at `create-object` time, while widening a 100M-record object later is an online rehash worth planning.
 
-Defaults: `create-object` with no `splits` gives **8** (fine for sub-10M objects — the ~80 % case). For objects already at 50M+ rows set `splits` explicitly per the table above; otherwise let the daemon nag you and `vacuum --splits=N` later, or turn on `AUTO_RESHARD_ENABLE=1` (see [configuration.md](../getting-started/configuration.md)) to have a nightly job do it for you automatically.
+Defaults: `create-object` with no `splits` gives **8** (fine for sub-10M objects — the ~80 % case). For objects already at 50M+ rows set `splits` explicitly per the table above; otherwise let the daemon nag you and `vacuum --splits=N` later, or let the nightly auto-reshard do it for you automatically (on by default; `AUTO_RESHARD_ENABLE=0` to disable — see [configuration.md](../getting-started/configuration.md)).
 
-> **The daemon will tell you when to re-split.** Run `./shard-db shard-stats <dir> <object>` periodically. The hint is driven by the object's *total* live record count against the same sizing table above (the identical lookup `AUTO_RESHARD_ENABLE`'s nightly sweep uses, see [Configuration](../getting-started/configuration.md)) — it fires whenever that count recommends a bigger `splits` than the object currently has, regardless of how evenly load is spread across shards. Separately, if max/min shard skew exceeds 4× the output flags `shard load is skewed — check key distribution` — a distribution/key-hashing health check, not a sizing recommendation. At `MAX_SPLITS=4096` and still nagging (10B+ live records), partition the object instead.
+> **The daemon will tell you when to re-split.** Two signals, same sizing table. First, the `RESHARD-HINT` log line: at each growth event (a shard doubling, a pregrow) the daemon checks the object's *total* live record count against the same lookup the nightly sweep uses, and — the first time a given recommendation level is reached — logs `RESHARD-HINT: <obj> holds ~N live records at splits=S — the sizing table recommends splits=R. Run vacuum --splits=R now, or let the nightly auto-reshard handle it.` Second, `./shard-db shard-stats <dir> <object>` reports the same recommendation on demand, regardless of how evenly load is spread across shards. Separately, if max/min shard skew exceeds 4× the output flags `shard load is skewed — check key distribution` — a distribution/key-hashing health check, not a sizing recommendation. At `MAX_SPLITS=4096` and still nagging (10B+ live records), partition the object instead.
 
 ### When kf size starts to matter
 
 kf lookups are O(1) average (linear probing under ≤ 80 % load = ~1.25 probes), so a "big" kf isn't inherently slow. What does cost time:
 
-- **Resplit duration.** A shard at the 16M-slot ceiling rebuilds in ~80–160 ms (single-threaded, holds the shard's wrlock). At smaller shard sizes it's milliseconds. The resplit blocks inserts to that one shard only; reads and inserts on every other shard continue.
+- **Resplit duration.** Resplit cost scales with the shard's entry count: ~80–160 ms at the 1M-slot tier (single-threaded, holds the shard's wrlock), ~4–5 s at ~25M entries and scaling up from there. The resplit blocks inserts to that one shard only; reads and inserts on every other shard continue. Uncapped growth means big shards pay bigger resplits — the sizing table + nightly sweep keep shards near the sweet spot so this stays rare.
 - **Cold mmap.** Each kf shard is a separate mmap region in `kfcache` (sized from `FCACHE_MAX`). If your active object × shards count exceeds the cache, lookups fault in 4 KB pages from disk — ~170 slots per page, so still ~1 fault per cold lookup. Watch `kfcache.hits / (hits + misses)` in `stats`; raise `FCACHE_MAX` if < 90 %.
 - **Concurrent inserts during resplit.** Resplit holds the kf shard's wrlock. If a hot shard resplits during a bulk-insert burst, writes to that shard pause. Mitigation: pick `splits` so the initial slot capacity comfortably covers your ingest rate before the first auto-resplit fires.
 
@@ -266,7 +266,7 @@ Beyond the kf-fill nags above, `shard-stats` also surfaces shard-load skew:
 
 - Tombstoned / live ratio > 10 % and live > 1000 → `vacuum-check` flags it. Run `vacuum` (Direction-C seg compaction — rewrites live records into fresh seg files, frees the old ones).
 - After `remove-field` → `vacuum` (drops the field's bytes from every record on the rewrite).
-- A single kf shard approaching the 16M-slot ceiling, or skewed shard load → `vacuum --splits=N` to widen the keyspace and rehash.
+- Shard load skewed, or the `RESHARD-HINT` line fired and you want the widening *now* instead of at the nightly sweep → `vacuum --splits=N` to widen the keyspace and rehash.
 
 `vacuum` takes a write lock for the rebuild duration. Schedule during low-traffic windows on big objects.
 

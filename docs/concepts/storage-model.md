@@ -134,7 +134,7 @@ When a kf shard's `header.total × 4 ≥ capacity × 3` (≥ 75 % fill), it doub
 
 The resplit holds the shard's wrlock; concurrent inserts to that one shard pause for the duration (~80–160 ms at 16M slots, milliseconds at smaller sizes). Reads and inserts on every other shard continue uninterrupted.
 
-There is **no per-shard slot cap** in normal operation — the shard keeps doubling until the global `SLOTCASK_MAX_SLOTS_PER_SHARD = 16M` ceiling, at which point `kf_put_new` refuses further inserts and the operator must `vacuum --splits=N` to widen the keyspace. At 80 % load that's ~12.8M live records per shard; a `splits=4096` object can hold tens of billions of live records before any single shard hits the ceiling — well into "you should be partitioning" territory.
+There is **no per-shard slot cap**: the shard keeps doubling for the life of the object, and inserts never refuse for capacity. At 80 % load a doubling tier holds ~12.8M live records per shard, and the resplit cost scales with the shard's entry count (~4–5 s at ~25M entries), which is the practical reason not to let one shard grow forever: when the object's live count outgrows its splits, the sizing table recommends more of them — the daemon logs a `RESHARD-HINT` line at the growth event, and the nightly auto-reshard sweep (default on; `AUTO_RESHARD_ENABLE=0` to disable) widens the object into the recommended `splits` automatically. A `splits=4096` object spans tens of billions of live records — well into "you should be partitioning" territory.
 
 **What is capped:** `MAX_SPLITS = 4096` is the maximum number of kf shard *files* per object (`NNN.kf` is three hex digits). Beyond that, partition the object.
 

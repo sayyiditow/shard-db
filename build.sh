@@ -313,6 +313,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_enum.c \
     src/test/cases/test_ipv4.c \
     src/test/cases/test_ipv6.c \
+    src/test/cases/test_kf_auto_defaults.c \
+    src/test/cases/test_kf_uncapped_growth.c \
     src/test/cases/test_trigram_index.c \
     src/test/cases/test_config_encode.c \
     src/test/cases/test_version_gate.c \

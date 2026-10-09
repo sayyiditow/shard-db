@@ -32,6 +32,7 @@ enum {
     TEST_HOOK_CLEAR   = 3,
     TEST_HOOK_ACK     = 4,
     TEST_HOOK_REACHED = 5,
+    TEST_HOOK_SET_GLOBALS = 6,
 };
 
 /* INSTALL message phase selects which daemon-side hook to arm.
@@ -42,8 +43,10 @@ enum {
 #define TEST_HOOK_KIND_FIND_FLUSH_GATE 2
 
 typedef struct {
-    uint32_t kind;   /* INSTALL=1, RELEASE=2, CLEAR=3, ACK=4, REACHED=5 */
+    uint32_t kind;   /* INSTALL..REACHED; SET_GLOBALS=6 */
     int32_t  phase;  /* REACHED: 0=stale snapshot, 1=under kf wrlock; else 0 */
+    uint64_t a;      /* SET_GLOBALS: initial slots (0 = default) */
+    uint64_t b;      /* SET_GLOBALS: test-only max slots (0 = uncapped) */
 } TestHookMessage;
 
 typedef struct {
@@ -208,6 +211,10 @@ static void *test_control_thread_main(void *arg) {
             pthread_cond_broadcast(&c->cond);
             pthread_mutex_unlock(&c->lock);
             break;
+        case TEST_HOOK_SET_GLOBALS:
+            atomic_store(&g_shard_test_kf_initial_slots, (size_t)msg.a);
+            atomic_store(&g_shard_test_kf_max_slots, (size_t)msg.b);
+            break;
         case TEST_HOOK_CLEAR:
             slotcask_test_set_after_old_hook(NULL, NULL);
             shard_db_test_set_count_gap_hook(NULL, NULL);
@@ -224,7 +231,7 @@ static void *test_control_thread_main(void *arg) {
         }
 
         if (msg.kind == TEST_HOOK_INSTALL || msg.kind == TEST_HOOK_RELEASE ||
-            msg.kind == TEST_HOOK_CLEAR) {
+            msg.kind == TEST_HOOK_CLEAR || msg.kind == TEST_HOOK_SET_GLOBALS) {
             TestHookMessage ack = { .kind = TEST_HOOK_ACK, .phase = 0 };
             if (test_control_write_full(c->fd, &ack, sizeof(ack)) != 0) break;
         } else {

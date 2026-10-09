@@ -569,6 +569,11 @@ void objlock_test_set_fail_alloc(int fail_n);
 
 /* Internal open — used by cmd_server and shard_db_open. */
 ShardDb *shard_db_open_internal(const char *db_root);
+
+/* W1: instance-default knobs applied at allocation, before the db.env
+   parse. Exported so the defaults unit case can assert them directly
+   without booting a second instance. */
+void db_defaults_set(ShardDb *db);
 void shard_db_destroy_after_storage(ShardDb *db);
 
 /* Server-wide instance set by cmd_server before any threads spawn.

@@ -4,6 +4,26 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## Unreleased
+
+Per-shard kf growth is **uncapped**: the documented 16M-per-shard slot
+ceiling no longer exists. All growth paths (bulk pre-grow, bulk stage,
+and the inline resplits) double a shard's slot capacity at the 75–80 %
+load trigger for the life of the object, and inserts never refuse for
+capacity — an object grows for as long as the disk holds out, with no
+opt-in required. The nightly auto-reshard sweep is now **default on**
+(`AUTO_RESHARD_ENABLE=1`; set `0` to disable): it rebalances objects
+whose live record count outgrows their splits, keeping shards near the
+sweet spot so resplit doublings stay cheap. A new `RESHARD-HINT` log
+line fires at most once per recommendation level per daemon start when
+a growth event shows the object outgrew its splits (`vacuum
+--splits=N` now, or wait for the nightly sweep). Correctness fix
+required by the uncapped model: `radix_sort_sizes` now adapts its pass
+count to the largest slot index — the old fixed three-pass form
+silently mis-sorted once a single shard grew past 16,777,216 slots.
+Resplit cost scales with the shard's entry count (~4–5 s at ~25M
+entries) — the sizing table + sweep keep shards near the sweet spot.
+
 ## 2026.09.2
 
 Calendar `datetime` storage widens from 6 to 7 bytes (int32 BE `yyyyMMdd` +
