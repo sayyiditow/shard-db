@@ -23,12 +23,6 @@
 #define _XOPEN_SOURCE 700   /* nftw + struct FTW (ftw.h hides them under
                              * _GNU_SOURCE alone) */
 #endif
-#ifdef __APPLE__
-/* On macOS, _XOPEN_SOURCE 700 alone pins __DARWIN_C_LEVEL to 700, which
- * hides mkdtemp (needs >= 200809L). _DARWIN_C_SOURCE restores the full
- * level; glibc ignores the macro. */
-#define _DARWIN_C_SOURCE
-#endif
 #include "test_runner.h"
 #include "test_assert.h"
 #include "slotcask.h"
@@ -41,10 +35,10 @@
 #include <sys/stat.h>
 #include <time.h>
 
-/* W1 review fix: no shell interpolation — mkdtemp creates the
- * directory (0700, collision-free) and an nftw depth-first walk
- * removes it, so SHARD_TEST_TMPDIR metacharacters or spaces can
- * neither execute anything nor split the path. */
+/* W1 review fix: no shell interpolation — cleanup is an nftw
+ * depth-first walk (remove files, then the dir), so SHARD_TEST_TMPDIR
+ * metacharacters or spaces can neither execute anything nor split the
+ * path. */
 static int rm_rf_callback(const char *fpath, const struct stat *sb,
                           int typeflag, struct FTW *ftwbuf) {
     (void)sb; (void)typeflag; (void)ftwbuf;
@@ -56,11 +50,19 @@ static void rm_rf(const char *path) {
     nftw(path, rm_rf_callback, 16, FTW_DEPTH | FTW_PHYS);
 }
 
+/* W1 review fix: no shell interpolation — the tmpdir is created with
+ * mkdir() (0700, EEXIST-retried for collision-free names) — portable
+ * across glibc and macOS feature-macro regimes (CI round two). */
 static void unique_tmpdir(char out[256]) {
     const char *base = getenv("SHARD_TEST_TMPDIR");
     if (!base || !*base) base = "/tmp";
-    snprintf(out, 256, "%s/shard_kf_growth_XXXXXX", base);
-    if (!mkdtemp(out)) out[0] = '\0';
+    for (int attempt = 0; attempt < 64; attempt++) {
+        snprintf(out, 256, "%s/shard_kf_growth_%d_%ld_%d",
+                 base, (int)getpid(), (long)time(NULL), attempt);
+        if (mkdir(out, 0700) == 0) return;
+        if (errno != EEXIST) break;
+    }
+    out[0] = '\0';
 }
 
 static size_t shard0_capacity(const char *dir) {
@@ -76,7 +78,7 @@ static size_t shard0_capacity(const char *dir) {
 static int test_kf_uncapped_growth_run(void) {
     char dir[256];
     unique_tmpdir(dir);
-    ASSERT_TRUE(dir[0] != '\0', "mkdtemp tmpdir created");
+    ASSERT_TRUE(dir[0] != '\0', "tmpdir created");
     if (!dir[0]) return 1;
     slotcask_init(64, 64);
 
