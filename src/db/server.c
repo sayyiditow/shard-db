@@ -3533,8 +3533,11 @@ int cmd_server(const char *db_root, int daemonize) {
                     disk_version, SHARD_DB_VERSION, disk_version);
         } else if (version_decision == SHARD_DB_VERSION_TOO_OLD) {
             fprintf(stderr,
-                    "shard-db: refusing to start: this database requires "
-                    "shard-db %s or newer.\n",
+                    "shard-db: refusing to start: database was last opened "
+                    "by shard-db %s; this binary requires clean-open evidence "
+                    "from %s or newer — install shard-db %s, start it once "
+                    "against this DB_ROOT, then upgrade.\n",
+                    disk_version, SHARD_DB_REQUIRED_SOURCE_VERSION,
                     SHARD_DB_REQUIRED_SOURCE_VERSION);
         } else {
             fprintf(stderr,
@@ -3545,8 +3548,7 @@ int cmd_server(const char *db_root, int daemonize) {
         db_root_lock_release(&lock_fd);
         return 1;
     }
-    int stamp_required = version_decision == SHARD_DB_VERSION_STAMP ||
-                          version_decision == SHARD_DB_VERSION_MIGRATE;
+    int stamp_required = version_decision == SHARD_DB_VERSION_STAMP;
 
     /* Allocate and initialise the ShardDb instance. Must happen before
        any code that uses g_* macros (which are now field accesses via
@@ -3618,12 +3620,6 @@ int cmd_server(const char *db_root, int daemonize) {
     if (shard_db_validate_before_stamp(db_root) != 0) {
         fprintf(stderr,
                 "shard-db: refusing to start: metadata validation failed\n");
-        db_root_lock_release(&lock_fd);
-        return 1;
-    }
-    if (version_decision == SHARD_DB_VERSION_MIGRATE &&
-        shard_db_startup_migrate(db_root) != 0) {
-        fprintf(stderr, "shard-db: startup datetime migration failed\n");
         db_root_lock_release(&lock_fd);
         return 1;
     }

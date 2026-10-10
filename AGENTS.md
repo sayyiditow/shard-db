@@ -179,17 +179,18 @@ that release's `./migrate` to convert v1 → v2; this version refuses
 any v1 object at load.
 
 2026.05.5 also rolls B+ tree magic `'BTRG'` → `'BTRH'` for the
-`(value, hash)` sort order. 2026.09.2 performs strict compatibility gating:
-an empty root initializes directly, while a populated root must contain
-2026.08.2 clean-open evidence. A populated root with
-`2026.08.2 ≤ .version < 2026.09.2` migrates at startup — legacy 6-byte
-`datetime` fields are rewritten to the 7-byte representation and their
-indexes rebuilt transactionally — then the root is stamped. A populated
-2026.08.2 root previously took the accept-without-rewrite fast path and
-now migrates like any other old root. Use `./shard-db reindex` explicitly
-for unrelated index maintenance. The standalone
-`./migrate`, `migrate-varlen`, and storage migration JSON modes are removed.
-The minimum supported source release is 2026.08.2.
+`(value, hash)` sort order. 2026.09.2 introduced strict compatibility
+gating, and 2026.10.1 keeps it while dropping startup migration entirely:
+an empty root initializes directly; a populated root must contain
+2026.09.2 clean-open evidence — such roots open as-is and are re-stamped
+to the current version. Populated roots with evidence older than
+2026.09.2 refuse with an upgrade hint: install 2026.09.2, start it once
+against the DB_ROOT (it migrates legacy 6-byte `datetime` fields to the
+7-byte representation and rebuilds their indexes), then upgrade. Use
+`./shard-db reindex` explicitly for unrelated index maintenance. The
+standalone `./migrate`, `migrate-varlen`, and storage migration JSON
+modes are removed, as is the in-binary migration path. The minimum
+supported source release is 2026.09.2.
 
 **Bulk-insert at scale**: pre-grow (2026.05.x) makes bulk-insert ~2× faster on every path. Parallel still wins for max throughput — C-bench (2026-09-14, post-B3b) shows CSV K/V at 2.09 M/sec single vs **3.17 M/sec at 5 conns × 2M** (1.52× single; absolute numbers sit ~2.5× below the pre-2026.09 headlines because every commit window now fsyncs markers, segments, and kf). The "single beats parallel" claim that briefly appeared in earlier docs was a bash-bench artifact (shell forked `$BIN query` subprocesses per chunk ×5; each fork costs 10–30 ms). With C pthreads, the original `R ≈ N/200K, 5 ≤ conns` rule still holds, and ingest peaks at `splits ≈ core count` — over-splitting taxes every request (see docs/operations/tuning.md).
 

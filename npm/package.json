@@ -29,7 +29,7 @@
   },
   "dependencies": {
     "node-gyp-build": "^4.8.4",
-    "undici": "^8.10.0"
+    "undici": "^8.11.2"
   },
   "engines": {
     "node": ">=18.0.0",

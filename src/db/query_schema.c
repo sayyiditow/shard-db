@@ -285,6 +285,7 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
                       "default modifier larger than %d bytes — refusing to "
                       "rewrite (an edit would drop it)",
                       (int)sizeof(old_mods) - 1);
+            free(line);
             fclose(fin);
             fclose(fout);
             unlink(fpath_new);

@@ -1290,10 +1290,18 @@ static int bulk_ins_run(const char *db_root, const char *object,
     (void)nfields; /* indexes are walked per-shard later via load_index_fields */
 
     TypedSchema *ts = load_typed_schema(db_root, object);
+    if (!ts) {
+        /* Missing/untyped/unparseable fields.conf (including the fail-closed
+           over-long-line refusal) — there is no record layout to encode
+           against, so the batch cannot proceed. */
+        fprintf(stderr, "Error: object [%s] has no typed schema; cannot bulk-insert\n",
+                object);
+        return 1;
+    }
 
     /* Invariant check hoisted out of the per-record loop — ts->total_size
        and sc.max_value don't change during a bulk insert. */
-    if (ts && ts->total_size > sc.max_value) {
+    if (ts->total_size > sc.max_value) {
         fprintf(stderr, "Error: typed record size %d exceeds max_value %d\n",
                 ts->total_size, sc.max_value);
         return 1;

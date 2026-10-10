@@ -1417,7 +1417,6 @@ int shard_db_version_check(const char *db_root,
                            char *out_disk_version, size_t out_sz);
 /* Atomic compatibility commit, called only after recovery and validation. */
 int shard_db_version_stamp(const char *db_root);
-int shard_db_startup_migrate(const char *db_root);
 int shard_db_version_file_read(const char *db_root, char *out, size_t out_sz);
 int shard_db_version_file_write(const char *db_root, const char *version);
 int shard_db_recover_before_stamp(const char *db_root,

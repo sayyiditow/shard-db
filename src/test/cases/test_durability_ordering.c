@@ -1049,11 +1049,15 @@ static int test_durability_bulk_window_applied_recovers(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-/* B1 crash regression: shard 0 has committed and cleared, shard 1 has a
-   directory-durable marker but has not finalized, and shard 2 has not
-   started. After SIGKILL, startup must retain shard 0, replay shard 1, and
-   leave shard 2 absent. This three-category state cannot occur under the
-   request-wide wave coordinator. */
+/* B1 crash regression: shard 1 parks at its shard-published seam (marker
+   durable, pre-finalize) while shards 0 and 2 race concurrently — since
+   the wave coordinator was replaced by per-shard pipelines, only shard 1's
+   publication is synchronized with the SIGKILL. The parent's poll+kill can
+   therefore land before an unsynchronized shard has published its marker;
+   such a shard was never acked, so losing its rows is legal. Post-crash
+   expectations are derived from durable evidence: every marker published
+   before the kill must replay exactly its 2 rows and be fully indexed;
+   an unpublished shard contributes 0 or 2 rows. */
 static int test_durability_bulk_pipeline_multishard_crash(void) {
     TestEnv env = {0};
     if (test_env_start(&env) != 0) return 1;
@@ -1106,8 +1110,24 @@ static int test_durability_bulk_pipeline_multishard_crash(void) {
                     "(shard 1 parked pre-finalize)");
     }
     char mpaths_before[8][PATH_MAX];
-    ASSERT_TRUE(scan_kf_markers(saved_db_root, object, mpaths_before, 8) >= 1,
-                  "shard 1 has at least its durable marker at the pause");
+    int n_before = scan_kf_markers(saved_db_root, object, mpaths_before, 8);
+    ASSERT_TRUE(n_before >= 1,
+                "shard 1 has at least its durable marker at the pause");
+    /* Which shards published before the kill — the baseline for the
+       post-replay expectations. Marker filename is %03x_marker.dat. */
+    int published[8] = {0};
+    int n_published = 0;
+    for (int m = 0; m < n_before && m < 8; m++) {
+        const char *base = strrchr(mpaths_before[m], '/');
+        base = base ? base + 1 : mpaths_before[m];
+        unsigned shard = 0;
+        if (sscanf(base, "%3x", &shard) == 1 && shard < 8 &&
+            !published[shard]) {
+            published[shard] = 1;
+            n_published++;
+        }
+    }
+    ASSERT_TRUE(published[1], "shard 1 parked after publishing its marker");
 
     test_env_kill(&env);
     unlink(pause_marker);
@@ -1118,26 +1138,33 @@ static int test_durability_bulk_pipeline_multishard_crash(void) {
     if (env.daemon_pid > 0) {
         ASSERT_EQ_INT(request_marker_recovery_ran(&env), 1,
                       "startup replay ran for shard 1");
-        ASSERT_EQ_INT(request_count(&env, object), 6,
-                      "every record present after replay of every "
-                      "unresolved marker");
         char mpaths[8][PATH_MAX];
         ASSERT_EQ_INT(scan_kf_markers(saved_db_root, object, mpaths, 8), 0,
-                      "replayed shard-1 marker cleared");
+                      "replayed marker cleared");
+
+        /* Every marker published before the kill replayed exactly its 2
+           rows; a shard that had not yet published was never acked and
+           commits 0 or 2 rows (under CI contention the kill can land
+           before the unsynchronized shards 0/2 publish). */
+        int total = request_count(&env, object);
+        ASSERT_TRUE(total >= 2 * n_published && total <= 6 &&
+                    (total - 2 * n_published) % 2 == 0,
+                    "published shards replayed exactly; unpublished shards "
+                    "commit 0 or 2 rows");
 
         TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
         TestClient *tc = tc_connect(&cfg);
         ASSERT_NOT_NULL(tc, "connect after multi-shard recovery");
         if (tc) {
             char req[512], *resp = NULL;
+            int lo = -1, hi = -1;
             snprintf(req, sizeof(req),
                 "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"%s\","
                 "\"criteria\":[{\"field\":\"score\",\"op\":\"lte\",\"value\":\"3\"}]}",
                 object);
             ASSERT_EQ_INT(tc_request(tc, req, &resp), 0,
                           "query recovered shard-0/1 index entries");
-            ASSERT_EQ_INT(tu_parse_count(resp), 4,
-                          "all committed/replayed rows are indexed");
+            lo = tu_parse_count(resp);
             free(resp); resp = NULL;
             snprintf(req, sizeof(req),
                 "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"%s\","
@@ -1145,9 +1172,11 @@ static int test_durability_bulk_pipeline_multishard_crash(void) {
                 object);
             ASSERT_EQ_INT(tc_request(tc, req, &resp), 0,
                           "query untouched shard-2 score range");
-            ASSERT_EQ_INT(tu_parse_count(resp), 2,
-                          "shard 2 either committed pre-crash or replayed "
-                          "from its own marker — exactly its 2 rows");
+            hi = tu_parse_count(resp);
+            free(resp); resp = NULL;
+            ASSERT_TRUE(lo >= 0 && hi >= 0 && lo + hi == total,
+                        "every visible row is indexed exactly once "
+                        "(published markers replay with their indexes)");
             free(resp);
             tc_close(tc);
         }

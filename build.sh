@@ -130,10 +130,6 @@ gcc $MODE_CFLAGS -o build/bin/embedded_lock_harness \
     src/test/embedded_lock_harness.c build/bin/libshard-db.a \
     -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS \
     -lpthread -lssl -lcrypto
-gcc $MODE_CFLAGS -o build/bin/datetime-migration-fixture \
-    src/test/datetime_migration_fixture.c build/bin/libshard-db.a \
-    -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS \
-    -lpthread -lssl -lcrypto
 gcc $MODE_CFLAGS -o build/bin/embedded_bg_harness \
     src/test/embedded_bg_harness.c build/bin/libshard-db.a \
     -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS \
@@ -319,7 +315,6 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_trigram_index.c \
     src/test/cases/test_config_encode.c \
     src/test/cases/test_version_gate.c \
-    src/test/cases/test_datetime_migration.c \
     src/test/cases/test_datetime_evening.c \
     src/test/cases/test_error_paths.c \
     src/test/cases/test_explain.c \
@@ -641,4 +636,4 @@ echo "Deploy: copy build/bin/ contents to your install dir (e.g. /opt/shard-db/b
 echo "First-time setup: cp db.env.example db.env, edit, then ./shard-db start."
 BUILD_VERSION=$(sed -n 's/^#define SHARD_DB_VERSION "\(.*\)"/\1/p' src/db/version.h)
 BUILD_REQUIRED_SOURCE_VERSION=$(sed -n 's/^#define SHARD_DB_REQUIRED_SOURCE_VERSION "\(.*\)"/\1/p' src/db/version.h)
-echo "Upgrades: this build is shard-db $BUILD_VERSION. A filesystem-empty DB_ROOT initializes directly; every non-empty root must have valid clean-open evidence at or after shard-db $BUILD_REQUIRED_SOURCE_VERSION and before this binary's version. This release migrates populated 2026.08.2 and 2026.09.1 roots at startup. Run './shard-db version' to inspect a binary without starting it. Legacy v1 objects (pre-2026.05.5) still require the historical 2026.05.4 ./migrate upgrade path before this binary can open them."
+echo "Upgrades: this build is shard-db $BUILD_VERSION. A filesystem-empty DB_ROOT initializes directly; every non-empty root must have valid clean-open evidence at or after shard-db $BUILD_REQUIRED_SOURCE_VERSION and before this binary's version. This release does not migrate: roots must carry shard-db 2026.09.2 clean-open evidence — older roots must first be opened once by 2026.09.2, then upgraded. Run './shard-db version' to inspect a binary without starting it. Legacy v1 objects (pre-2026.05.5) still require the historical 2026.05.4 ./migrate upgrade path before this binary can open them."

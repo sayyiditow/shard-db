@@ -6,6 +6,16 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+2026.10.1 raises the minimum supported source release to **2026.09.2**
+and removes the in-binary startup migration. A populated root must carry
+2026.09.2 clean-open evidence: such roots open as-is and are re-stamped
+to the current version. Populated roots with older evidence refuse with
+an upgrade hint instead of migrating — **install 2026.09.2 first, start
+it once against the DB_ROOT** (that release rewrites legacy 6-byte
+`datetime` fields and rebuilds their indexes), **then upgrade to this
+release**. The datetime-migration machinery and the standalone
+migration modes remain removed; there is no in-binary migration path.
+
 Field definitions (`fields.conf` lines and the `fields[]` strings of
 create-object / add-field / edit-field) are now accepted up to 65,535
 bytes, up from an undocumented 510-byte create gate whose companion

@@ -787,7 +787,12 @@ int shard_db_version_decide(const char *disk_version, int version_present,
     int current_cmp = shard_db_version_compare(disk_version, current_version);
     if (current_cmp > 0) return SHARD_DB_VERSION_DOWNGRADE;
     if (current_cmp == 0) return SHARD_DB_VERSION_NOOP;
+    /* [required, current) is by construction the floor release's on-disk
+       format — it opens as-is and is re-stamped to the current version
+       (SHARD_DB_VERSION_STAMP). Since 2026.10.1 there is no startup
+       migration: roots below the required version refuse with an upgrade
+       hint instead. */
     if (shard_db_version_compare(disk_version, required_source_version) >= 0)
-        return SHARD_DB_VERSION_MIGRATE;
+        return SHARD_DB_VERSION_STAMP;
     return SHARD_DB_VERSION_TOO_OLD;
 }
