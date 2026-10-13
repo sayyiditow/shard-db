@@ -51,7 +51,7 @@ jobs:
             --prefix="shard-db-${{ github.ref_name }}/" \
             -o "$tarball" HEAD
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifact-source
           path: shard-db-*-source.tar.gz
@@ -99,7 +99,7 @@ jobs:
           tar -czf "$tarball" -C build/bin \
             shard-db shard-cli db.env.example
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifact-${{ matrix.target.name }}
           path: shard-db-*-${{ matrix.target.name }}.tar.gz
