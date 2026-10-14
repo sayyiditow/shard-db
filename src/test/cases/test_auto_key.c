@@ -533,7 +533,10 @@ static int test_auto_key_run(void) {
         &resp);
     ASSERT_CONTAINS(resp, "\"key\":\"11111111-2222-4333-8444-555566667777\"",
                     "cursor page renders UUID wire key");
+    /* 2026.10.2 §2.5: cursor tokens are versioned (v2) with a per-field
+       tier array; the wire key renders unchanged. */
     ASSERT_CONTAINS(resp, "\"cursor\":{\"name\":\"Scap Alpha\","
+                          "\"tiers\":[0],"
                           "\"key\":\"11111111-2222-4333-8444-555566667777\"}",
                     "cursor stores UUID wire key");
     free(resp); resp = NULL;

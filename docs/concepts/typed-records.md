@@ -107,6 +107,81 @@ A single field can carry at most one of: `default=...`, `auto_create`, `auto_upd
 
 Combined with `{"mode":"update", "if":{"version":42}}` gives you optimistic concurrency control without app-side locking. The `default=seq(version_counter)` runs on **insert only** — an update never re-runs the insert default, so the CAS revision must be supplied or incremented explicitly by the caller (e.g. by `{"value":{"version":43}}`), or by a separately implemented update policy.
 
+## NULL values (2026.10.2)
+
+Typed fields are **nullable**. A record carries a per-record null bitmap
+(`1 + ceil(nfields/8)` bytes, directly after the segment value header)
+with one bit per field: bit set = the field is NULL. On-disk the value
+region is `[bm_nbytes][bitmap bytes][field bytes]`; the bitmap prefix is
+transparent to readers — field offsets are field-region-relative, and a
+NULL field's stored bytes are canonical zeros that never decode.
+
+### Writing NULLs
+
+- **Insert / bulk-insert:** an explicit JSON `null` for a field stores
+  NULL; a field **omitted** from the value (with no default) also stores
+  NULL.
+- **Update / bulk-update:** an explicit `null` clears the field to NULL;
+  a field omitted from the update value **carries the old value forward**
+  (including a previous NULL). The same §2.7 conversion drives CAS,
+  replay, and rebuilds.
+- Raw (unquoted) JSON `null` is rejected where a value is required
+  (`eq`/`between` bounds, `in` members); the quoted string `"null"` is a
+  legitimate varchar value. NULL checks use the `exists` / `not_exists`
+  operators.
+
+### Reading NULLs
+
+- `get`/`find` render a NULL field as JSON `null`.
+- `eq`, `in`, ranges, `like`, etc. never match a NULL field; the negative
+  predicates (`neq`, `not_in`, `not_like`, …) don't match it either — a
+  NULL belongs to neither a positive value predicate nor its negation.
+- `exists` is true when the field holds any non-NULL value; `not_exists`
+  matches NULL. On legacy (pre-2026.10.2) records the query-existence
+  predicate is generation-correct: zero-value markers (`""` varchar,
+  midnight, zero date) read as absent for text-style checks exactly as
+  they always have, so indexed and unindexed results agree on
+  mixed-generation data.
+
+### NULLs and indexes (BTRI)
+
+An indexed field stores **one key per record, including NULLs**: value
+keys are `[0x00][sortable bytes]`, NULL keys are the single byte
+`[0x01]`. This is the `'BTRH'` → `'BTRI'` format bump (composite keys
+interleave one tier byte per component). Practical consequences:
+
+- `not_exists` on an indexed field is a full scan (correct, not
+  index-driven); `exists` drives the tier-0 walk with per-record
+  verification.
+- Ranges stop below the NULL tier — `gt 0` never returns NULL rows.
+- Ordered finds place NULL rows **last ASC / first DESC**, and keyset
+  cursor tokens carry a per-field tier byte (the `"tiers"` array) so
+  pagination crosses the NULL boundary without repeating or skipping.
+- Bitmap-indexed fields store no entry for NULL (a bitmap cannot
+  enumerate "no bit set"): `exists`/`not_exists` and NULL groups on
+  bitmap-indexed fields fall back to full scans. Documented, rare.
+- An object whose indexes are still `'BTRH'` is upgraded automatically:
+  the **2026.10.2 startup migration** reindexes every indexed object
+  (strictly, fail-closed) before serving and stamps completion; a
+  `'BTRH'` index file also refuses per-request as defense-in-depth.
+
+### NULLs in aggregates
+
+- `sum` / `avg` / `min` / `max` skip NULLs (SQL semantics); `avg` of an
+  all-NULL group renders `null`.
+- `group_by` gives NULL its **own group**, rendered as bare JSON `null` —
+  `NULL`, `""`, and the literal `"null"` are three distinct buckets.
+- `count(field)` counts non-NULL values; `count(*)` is a row count.
+
+### Legacy conversion
+
+Rewriting a legacy record into the nullmap format (bulk-update merge,
+vacuum recompose, schema-mutation rebuilds) follows one rule: an explicit
+null beats the old value; an omitted field carries the old value forward;
+a legacy **absent** marker (field bytes beyond the record region) converts
+to NULL. New fields added by add-field are never NULL — existing records
+read zeros/backfill, never NULL.
+
 ## On-disk encoding
 
 Record payloads are encoded by `typed_encode()` (in `config.c`), which packs each field in declaration order. A reader uses `typed_decode()` — also cached per object via `g_typed_cache` — to unpack without re-reading the schema.

@@ -145,7 +145,7 @@ typedef struct {
 
 static int crash_verify_live_cb(const uint8_t hash16[16], const void *key,
                                 size_t klen, const void *value, size_t vlen,
-                                void *raw) {
+                                uint8_t hdr2, void *raw) {
     CrashVerifyCtx *ctx = (CrashVerifyCtx *)raw;
     if (klen == 2 && memcmp(key, "kA", 2) == 0) {
         ctx->a_records++;

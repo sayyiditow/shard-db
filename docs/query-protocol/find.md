@@ -169,8 +169,16 @@ Per-shard btree layout: each indexed field is sharded into `index_splits_for(spl
 | `between` | Inclusive range | numeric, date, datetime, varchar (lexicographic) | `{"field":"age","op":"between","value":"18","value2":"65"}` |
 | `in` | Value in CSV set | all | `{"field":"status","op":"in","value":"active,pending"}` |
 | `nin` / `not_in` | Value not in set | all | `{"field":"role","op":"nin","value":"bot,test"}` |
-| `exists` | Field present / non-empty | all | `{"field":"phone","op":"exists"}` |
-| `nexists` / `not_exists` | Field missing / empty | all | `{"field":"deleted_at","op":"nexists"}` (forces full scan — missing fields aren't in the index) |
+| `exists` | Field holds a non-NULL value | all | `{"field":"phone","op":"exists"}` |
+| `nexists` / `not_exists` | Field is NULL | all | `{"field":"deleted_at","op":"nexists"}` (forces full scan) |
+
+NULL semantics (2026.10.2): value predicates never match a NULL field,
+and their negations (`neq`, `not_in`, `not_like`, …) don't either — a
+NULL belongs to neither side. Raw unquoted JSON `null` is rejected as an
+operand; quoted `"null"` is a string. Ordered finds place NULL rows last
+ASC / first DESC, and cursor tokens carry a per-field `tiers` array so
+pagination crosses the NULL boundary cleanly. See
+[typed-records](../concepts/typed-records.md#null-values-2026102).
 
 ### Varchar matching — case-sensitive (default)
 

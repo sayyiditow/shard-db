@@ -260,6 +260,46 @@ int json_get_fields_unescaped(const char *json, const char **keys, int nkeys,
     return rc;
 }
 
+/* 1 iff the raw JSON value span is the unquoted literal null. Must be
+   called BEFORE quote stripping — quoted "null" is a string value. */
+int json_span_is_null(const char *v, size_t len) {
+    return v && len == 4 && v[0] == 'n' && v[1] == 'u' && v[2] == 'l' &&
+           v[3] == 'l';
+}
+
+/* json_get_fields + per-field null detection + varchar unescape.
+   out_null[i] = 1 ⇔ field i's raw span was unquoted null (out[i] is
+   then NULL and no unescape is attempted for it). Same -1 contract as
+   json_get_fields_unescaped for malformed escapes. */
+int json_get_fields_null_aware(const char *json, const char **keys, int nkeys,
+                               const enum FieldType *field_types, char **out,
+                               uint8_t *out_null) {
+    json_get_fields(json, keys, nkeys, out);
+    int rc = 0;
+    for (int i = 0; i < nkeys; i++) {
+        out_null[i] = 0;
+        if (!out[i]) continue;
+        if (json_span_is_null(out[i], strlen(out[i]))) {
+            /* Unquoted JSON null — report it, drop the span. */
+            free(out[i]);
+            out[i] = NULL;
+            out_null[i] = 1;
+            continue;
+        }
+        if (field_types[i] != FT_VARCHAR) continue;
+        char *unesc = NULL; size_t ulen = 0;
+        if (json_unescape_cstring(out[i], strlen(out[i]), &unesc, &ulen) != 0) {
+            free(out[i]);
+            out[i] = NULL;
+            rc = -1;
+            continue;
+        }
+        free(out[i]);
+        out[i] = unesc;
+    }
+    return rc;
+}
+
 /* ========== Base64 (RFC 4648) ========== */
 
 static const char B64_ENC[] =

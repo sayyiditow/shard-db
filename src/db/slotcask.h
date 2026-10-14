@@ -265,7 +265,8 @@ typedef struct SlotcaskDb {
     size_t  slots_per_shard; /* per-shard kf capacity floor; individual
                                 shards may have grown larger via auto-resplit */
     int     bulk_commit_window; /* records per commit window; 0 = default
-                                      (4096). db.env BULK_COMMIT_WINDOW. */
+                                      (16384, the KFM2 marker entry ceiling).
+                                      db.env BULK_COMMIT_WINDOW. */
     /* Registry reference count; see slotcask_registry_get/put. */
     uint64_t reg_refs;
 
@@ -394,6 +395,13 @@ int slotcask_get(SlotcaskDb *db,
                  const void *key, size_t klen,
                  void **val_out, size_t *vlen_out);
 
+/* Same read, also surfacing the record's generation byte (segment header
+   byte 19: SREC_FLAG_NULLMAP or 0). out_hdr2 may be NULL. */
+int slotcask_get_ex(SlotcaskDb *db,
+                    const void *key, size_t klen,
+                    void **val_out, size_t *vlen_out,
+                    uint8_t *out_hdr2);
+
 /* Stripped-down lookup. Returns 1 if the key exists (not tombstoned), 0 if
    missing, -1 on I/O error. No value copy. */
 int slotcask_exists(SlotcaskDb *db, const void *key, size_t klen);
@@ -426,7 +434,52 @@ typedef struct {
        past pre_commit return. */
     const uint8_t *value;
     size_t         vlen;
+    /* Segment record header byte 19 for the OLD record (SREC_FLAG_NULLMAP
+       generation flag). 0 = legacy record. Filled by slotcask whenever it
+       materializes OLD. */
+    uint8_t        hdr2;
 } SlotcaskOldRecord;
+
+/* Defined in types.h; slotcask.h may be included before types.h
+   (SlotRef pattern above), so the update helpers below forward-declare it. */
+struct TypedSchema;
+
+/* §2.7 NEW-from-OLD composition core, shared by single update and every
+   bulk-update form so the legacy→nullmap conversion cannot drift.
+   Composes NEW (always the current nullmap layout) into out_buf — caller
+   guarantees ts->total_size writable bytes — from OLD plus dense per-field
+   patches. Per field i (out_null ordering rule: explicit null beats a
+   value; field_vals[i] is NULL whenever field_null[i] is set):
+     field_null && field_null[i]  → NULL: bit set, field bytes zero
+     field_vals && field_vals[i]  → encode at prefix+offset (bit clear)
+     neither                      → carry OLD forward, preserving rendering:
+                                    OLD nullmap bit ⇒ NULL; legacy
+                                    legacy_field_absent ⇒ NULL (bytes
+                                    zeroed); else bounded copy.
+   Returns 0, or -1 when OLD's view is structurally invalid (fail closed;
+   the caller must reject the write). Implemented in storage.c. */
+int update_compose_new_from_old(const struct TypedSchema *ts,
+                                const SlotcaskOldRecord *old,
+                                uint8_t *out_buf,
+                                char *const *field_vals,
+                                const uint8_t *field_null);
+/* auto_update stamp shared by single and bulk update: writes now() at the
+   nullmap-prefixed destination and clears the field's NULL bit — a stamp
+   materializes a value, so an auto_update field never carries NULL.
+   Implemented in storage.c. */
+void update_stamp_auto_update_fields(const struct TypedSchema *ts, uint8_t *out_buf);
+/* §2.9 auto_create preserve/stamp for ONE field, shared by the single
+   insert path and the bulk-insert value_compute. existed ⇒ OLD was
+   present; o_view_ok ⇒ its typed_record_view outputs are valid. Preserve
+   transfers complete field state (bytes AND nullness): OLD null ⇒ zero
+   dst + set bit; legacy absent ⇒ same; otherwise clear bit and bounded-
+   copy OLD bytes over the zeroed dst. Fresh insert stamps now() at the
+   prefixed offset and clears the bit. Implemented in storage.c. */
+void auto_create_field_transfer(const struct TypedSchema *ts, uint8_t *out_buf,
+                                int i, int existed, int o_view_ok,
+                                const uint8_t *o_base, const uint8_t *o_bm,
+                                int o_bm_bytes, size_t o_region,
+                                uint8_t o_hdr2);
 
 /* Return 1 to proceed; 0 to abort with condition_not_met. NULL = always proceed. */
 typedef int (*slotcask_check_fn)(const SlotcaskOldRecord *old, void *ctx);
@@ -535,6 +588,10 @@ typedef struct {
        converged synchronously. The caller must return the distinct pending
        outcome; it must not report a successful mutation. */
     int                      *out_durability_degraded;
+    /* Segment header byte 19 for the NEW record (SREC_FLAG_NULLMAP when
+       the value was produced by the nullmap encoders). Zero-init = legacy
+       generation. The bulk primitive copies it to the record header. */
+    uint8_t                   record_hdr2;
 } SlotcaskUpsertOpts;
 
 /* ============================================================ Bulk upsert
@@ -568,6 +625,10 @@ typedef struct {
        Lifetime: caller owns the buffer; must outlive the bulk call. */
     const void *old_value;
     size_t      old_vlen;
+    /* Segment header byte 19 for the NEW record (SREC_FLAG_NULLMAP or 0)
+       and for a caller-provided old_value. Zero-init = legacy. */
+    uint8_t     hdr2;
+    uint8_t     old_hdr2;
     /* output: callee fills */
     int         status;                /* 0=ok, -2=cond_not_met, -1=error */
     int         was_update;
@@ -596,7 +657,7 @@ typedef int (*slotcask_bulk_value_fn)(const SlotcaskOldRecord *old,
                                        SlotcaskBulkRec *rec);
 
 /* Two-phase, window-scoped hooks for indexed bulk-insert windows
- * (db->bulk_commit_window records per commit window; 0 = default 4096).
+ * (db->bulk_commit_window records per commit window; 0 = default 16384).
  *
  * prepare_window — fires once per window, on the bulk worker thread,
  *   BEFORE the window's batch marker exists. active[] lists indices into
@@ -869,6 +930,7 @@ typedef struct {
        no old record). Caller frees. */
     uint8_t *current_value;
     size_t   current_vlen;
+    uint8_t  current_hdr2;   /* generation of current_value (segment byte 19) */
 } SlotcaskUpsertResult;
 
 /* Returns 0 on success (record written), -1 on hard error, -2 on
@@ -963,6 +1025,7 @@ typedef struct {
     int      condition_not_met;
     uint8_t *current_value;
     size_t   current_vlen;
+    uint8_t  current_hdr2;
 } SlotcaskDeleteResult;
 
 int slotcask_delete_with_hooks(SlotcaskDb *db,
@@ -1034,11 +1097,12 @@ void slotcask_registry_shutdown(void);
  * data past the cb (collecting keys for later emit) must copy it.
  */
 
-/* cb returns 0 to continue, 1 to stop the walk early. */
+/* cb returns 0 to continue, 1 to stop the walk early. hdr2 = segment
+   record header byte 19 (SREC_FLAG_NULLMAP generation flag, 0 = legacy). */
 typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
                                const void *key, size_t klen,
                                const void *value, size_t vlen,
-                               void *ctx);
+                               uint8_t hdr2, void *ctx);
 
 /* Strictly validate every flag=1 kf entry against its backing segment.
    Caller must hold objlock_wrlock, so a failed check cannot be a concurrent
@@ -1061,7 +1125,7 @@ int slotcask_walk_live(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx);
 typedef int (*SlotcaskScanSlotCb)(uint32_t slot, const uint8_t hash16[16],
                                    const void *key, size_t klen,
                                    const void *value, size_t vlen,
-                                   void *ctx);
+                                   uint8_t hdr2, void *ctx);
 int slotcask_walk_one_shard_slots_locked(SlotcaskDb *db, int kf_shard_id,
                                           const SlotcaskKfHandle *kh,
                                           SlotcaskScanSlotCb cb, void *ctx);

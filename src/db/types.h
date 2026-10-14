@@ -204,12 +204,78 @@ typedef struct {
     int    enum_width;  /* 1 if n_enum_values <= 256, else 2 (BE) */
 } TypedField;
 
-typedef struct {
+typedef struct TypedSchema {
     TypedField fields[MAX_FIELDS];
     int nfields;
-    int total_size;     /* sum of all field sizes = value size */
+    int total_size;     /* nullmap prefix + sum of all field sizes = value size */
     int typed;
+    int nullmap_prefix; /* 1 + ceil(nfields/8) value-region head bytes; encoders
+                           write [u8 bm_nbytes][bits] there, field bytes after.
+                           0 only before load completes — every loaded schema
+                           and every hand-built TypedSchema must set it. */
 } TypedSchema;
+
+/* ===== Null bitmap record support (2026.10.2) ===== */
+
+/* Segment record header byte 19 (reserved): bit 0 = value region carries
+   a field-null bitmap ([u8 bm_nbytes][bits...]) ahead of the field bytes.
+   Bits 1-7 must be zero on disk; unknown bits fail closed. */
+#define SREC_FLAG_NULLMAP 0x01
+
+static inline int typed_nullmap_bytes(int nfields) {
+    return (nfields + 7) / 8;
+}
+
+/* Field-region base for a typed record value. Nullmap records carry
+   [u8 bm_nbytes][bm bytes] ahead of the field bytes; legacy records start
+   directly at the field region. TypedField.offset is field-region-
+   relative for both generations. Only for already-validated records —
+   untrusted input goes through typed_record_view. */
+static inline const uint8_t *typed_field_base(const uint8_t *value,
+                                              uint8_t hdr2) {
+    if (!(hdr2 & SREC_FLAG_NULLMAP)) return value;
+    return value + 1 + value[0];
+}
+
+static inline const uint8_t *typed_bitmap_of(const uint8_t *value,
+                                             uint8_t hdr2) {
+    return (hdr2 & SREC_FLAG_NULLMAP) ? value + 1 : NULL;
+}
+
+static inline int typed_field_null(const uint8_t *bm, int bm_bytes, int i) {
+    if (!bm || i < 0 || (i >> 3) >= bm_bytes) return 0;
+    return (bm[i >> 3] >> (i & 7)) & 1;
+}
+
+static inline void typed_set_null(uint8_t *bm, int bm_bytes, int i) {
+    if (i < 0 || (i >> 3) >= bm_bytes) return;
+    bm[i >> 3] |= (uint8_t)(1u << (i & 7));
+}
+
+static inline void typed_clear_null(uint8_t *bm, int bm_bytes, int i) {
+    if (i < 0 || (i >> 3) >= bm_bytes) return;
+    bm[i >> 3] &= (uint8_t)~(1u << (i & 7));
+}
+
+/* Validated view of a typed record's value region. EVERY consumer uses
+   this before any bitmap access or field-region pointer arithmetic —
+   raw `value[0]` reads on flagged records are not permitted (a corrupt
+   bm_nbytes — 0, >32, or 1+bm_nbytes > vlen — must never reach pointer
+   math; the update-path old_region subtraction underflows otherwise).
+   Returns 0 and fills the outs on success; -1 on a structurally
+   invalid record (unknown hdr2 bits, bad bm_nbytes, short vlen).
+   Legacy records (hdr2 without SREC_FLAG_NULLMAP) always succeed:
+   base = value, bm = NULL, region = vlen. Implemented in config.c. */
+int typed_record_view(const uint8_t *value, size_t vlen, uint8_t hdr2,
+                      const uint8_t **out_base, const uint8_t **out_bm,
+                      int *out_bm_bytes, size_t *out_region);
+/* Rendering predicate for legacy records: 1 if the legacy decoder would
+   SKIP this field's bytes. Used ONLY to port a legacy record into
+   nullmap form (§2.7 update conversion, §2.10 rebuild conversion)
+   without changing what clients see — query existence uses
+   legacy_field_query_exists (query_plan.c) instead. Implemented in
+   storage.c. */
+int legacy_field_absent(const TypedField *f, const uint8_t *p);
 #define MAX_LINE    65536
 
 /* Max bytes of one field-definition spec (fields.conf line grammar:
@@ -659,6 +725,9 @@ void durability_test_fsync_reset(void);
 void durability_test_fsync_fail_on_call(int call_number, int err);
 void index_test_spill_open_fail_errno(int err);
 void index_test_conf_publish_fail_stage(int stage);
+/* One-shot: the next checked reindex build fails with this errno before
+   touching any index file (BTRI startup-migration failure case). */
+void index_test_fail_next_build(int en);
 /* After N successful durable index mutations, make the next completed
    mutation report EIO. The mutation is intentionally performed first so
    callers can exercise partial index apply and its abort/recovery path. */
@@ -774,6 +843,15 @@ char *json_obj_string_or_array(const JsonObj *o, const char *key);
 int json_get_fields(const char *json, const char **keys, int nkeys, char **out_values);
 int json_get_fields_unescaped(const char *json, const char **keys, int nkeys,
                               const enum FieldType *field_types, char **out);
+/* 1 iff the raw JSON value span is the unquoted literal null (util.c).
+   Call before quote stripping — quoted "null" is a string value. */
+int json_span_is_null(const char *v, size_t len);
+/* json_get_fields + per-field unquoted-null detection + varchar unescape.
+   out_null[i] = 1 ⇔ field i's raw span was unquoted null; out[i] is then
+   NULL. Same -1 contract as json_get_fields_unescaped. */
+int json_get_fields_null_aware(const char *json, const char **keys, int nkeys,
+                               const enum FieldType *field_types, char **out,
+                               uint8_t *out_null);
 char *extract_field_value(const char *json, const char *field_name);
 
 /* Base64 (util.c, RFC 4648 standard alphabet) */
@@ -868,16 +946,19 @@ size_t typed_encode_trim_len(const TypedSchema *ts, const uint8_t *buf,
 /* SlotcaskTrimFn-compatible wrapper; ctx = const TypedSchema *. */
 size_t schema_trim_fn(const void *val, size_t vlen, void *ctx);
 
-char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len);
+char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
+                   uint8_t hdr2);
 /* Stream variant — writes the JSON object directly to `out` without
    allocating an intermediate string. Use on the GET hot path; saves one
-   malloc + one memcpy per response vs. typed_decode + OUT("%s\n"). */
-void  typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
-                          int data_len, FILE *out);
+   malloc + one memcpy per response vs. typed_decode + OUT("%s\n").
+   Returns 0 on success, -1 (errno=EILSEQ) on a corrupt flagged record —
+   callers must fail the request, never emit a partial object. */
+int   typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
+                          int data_len, FILE *out, uint8_t hdr2);
 /* data_len is the number of valid bytes in data (may be < ts->total_size for
    trim-encoded records). Fields beyond data_len return NULL (== empty/default). */
 char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
-                           int data_len, int field_idx);
+                           int data_len, int field_idx, uint8_t hdr2);
 extern const uint8_t g_zero_field_65537[65537];
 void encode_field(const TypedField *f, const char *val, uint8_t *out);
 void encode_field_len(const TypedField *f, const char *val, size_t vlen, uint8_t *out);
@@ -910,9 +991,19 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
     Composite ("a+b+c"): typed binary concatenated values
     (typed_field_to_index_key per sub-field).
    Returns 1 on success with malloc'd *out_val and *out_len set; caller frees.
-   Returns 0 if any sub-field is missing/empty or spec is unknown. */
+   Returns 0 if any sub-field is missing/empty or spec is unknown.
+   build_index_payload_from_record_into (the fixed-buffer form) returns
+   -1 when the payload needs more than out_cap — capacity, not absence:
+   callers must fall back to the allocating wrapper, never skip the key. */
+int build_index_payload_from_record_into(const TypedSchema *ts, const uint8_t *record,
+                                          size_t record_len, uint8_t hdr2, const char *spec,
+                                          uint8_t *out, size_t out_cap,
+                                          size_t *out_len);
+int build_index_payload_from_record(const TypedSchema *ts, const uint8_t *record,
+                                     size_t record_len, uint8_t hdr2, const char *spec,
+                                     uint8_t **out_val, size_t *out_len);
 int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
-                                size_t record_len, const char *spec,
+                                size_t record_len, uint8_t hdr2, const char *spec,
                                 uint8_t **out_val, size_t *out_len);
 
 /* Build an index key from a JSON object for a (possibly composite) spec.
@@ -1161,6 +1252,14 @@ int reindex_object_checked(const char *eff_root, const char *object,
 int reindex_object_checked_ex(const char *eff_root, const char *object,
                               int composites_only, int *out_count,
                               int *out_errno);
+/* Strict form for the 2026.10.2 BTRI startup migration: succeeds only
+   when the build reports INDEX_BUILD_OK AND every requested shard was
+   durably published (all_requested_shards_published). An unconfirmed
+   build is a failure here, never a pass — the startup migration stamps
+   completion only on this strict result. */
+int reindex_object_durable_checked_ex(const char *eff_root, const char *object,
+                                      int composites_only, int *out_count,
+                                      int *out_errno);
 int cmd_remove_index(const char *db_root, const char *object, const char *field);
 int cmd_remove_indexes(const char *db_root, const char *object, const char *fields_json);
 
@@ -1176,15 +1275,20 @@ typedef struct {
     Schema auto_key_schema_snapshot;  /* full Schema snapshot for format_wire_key */
 } FieldSchema;
 void init_field_schema(FieldSchema *fs, const char *db_root, const char *object);
-char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSchema *fs);
-char *decode_value(const char *raw, size_t raw_len, FieldSchema *fs);
+char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSchema *fs,
+                   uint8_t hdr2);
+char *decode_value(const char *raw, size_t raw_len, FieldSchema *fs, uint8_t hdr2);
 char *json_escape_field(char *v);
 /* Return a complete JSON value for a projected typed field. Numeric typed
    fields are returned as bare JSON numbers; all other projected values are
    escaped and quoted. Ownership of `v` is consumed. */
 char *json_projected_value(char *v, const TypedField *field);
 char *json_projected_field(const char *raw, size_t raw_len, const char *field,
-                           FieldSchema *fs);
+                           FieldSchema *fs, uint8_t hdr2);
+/* Unprojected rows-format cell for typed field idx: JSON-quoted value, or
+   the bare literal null for a NULL field on a nullmap record (§2.3). */
+char *json_typed_row_cell(const TypedSchema *ts, const uint8_t *raw,
+                          int raw_len, int idx, uint8_t hdr2);
 char *json_escape_const(const char *v);
 
 /* Typed-binary fast path: compile criteria against a TypedSchema once, then
@@ -1192,7 +1296,8 @@ char *json_escape_const(const char *v);
    back to decode_field + match_criterion internally. */
 CompiledCriterion *compile_criteria(const SearchCriterion *in, int n, const TypedSchema *ts);
 void free_compiled_criteria(CompiledCriterion *arr, int n);
-int  match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc, FieldSchema *fs);
+int  match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc, FieldSchema *fs,
+                uint8_t hdr2);
 int  match_criterion(const char *val_str, const SearchCriterion *c);
 
 /* query.c */
@@ -1224,6 +1329,7 @@ typedef struct {
     size_t         klen;
     const uint8_t *val;
     size_t         vlen;
+    uint8_t        hdr2;    /* segment header byte 19 (generation flag) */
 } RecordRef;
 
 int  read_record_ref(const char *db_root, const char *object,
@@ -1466,8 +1572,10 @@ void compile_criteria_tree(CriteriaNode *root, const TypedSchema *ts);
 
 /* Recursive match: AND short-circuits on first false, OR on first true. Passing
    NULL means "no criteria" → match-all (returns 1). */
-int criteria_match_tree(const uint8_t *rec, size_t data_len, const CriteriaNode *node, FieldSchema *fs);
-int cas_check(TypedSchema *ts, const uint8_t *value_ptr, int value_len, SearchCriterion *crit, int ncrit);
+int criteria_match_tree(const uint8_t *rec, size_t data_len, const CriteriaNode *node, FieldSchema *fs,
+                       uint8_t hdr2);
+int cas_check(TypedSchema *ts, const uint8_t *value_ptr, int value_len, uint8_t hdr2,
+              SearchCriterion *crit, int ncrit);
 
 
 /* config.c globals — moved to ShardDb struct (shard_db_internal.h) */
@@ -1517,10 +1625,10 @@ int cmp_btentry_fn(const void *a, const void *b);
 /* index.c — index-key extractors (out_val alloc'd, caller frees; _into
    variant writes into out of capacity out_cap and returns -1 on overflow). */
 int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
-                                size_t record_len, const char *spec,
+                                size_t record_len, uint8_t hdr2, const char *spec,
                                 uint8_t **out_val, size_t *out_len);
 int build_index_key_from_record_into(const TypedSchema *ts, const uint8_t *record,
-                                      size_t record_len, const char *spec,
+                                      size_t record_len, uint8_t hdr2, const char *spec,
                                       uint8_t *out, size_t out_cap,
                                       size_t *out_len);
 

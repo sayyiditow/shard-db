@@ -102,7 +102,7 @@ typedef struct {
 static int mmap_walk_cb(const uint8_t hash16[16],
                         const void *key, size_t klen,
                         const void *value, size_t vlen,
-                        void *raw_ctx) {
+                        uint8_t hdr2, void *raw_ctx) {
     (void)key; (void)klen; (void)value; (void)vlen;
     WalkCtx *wc = (WalkCtx *)raw_ctx;
     hset_insert(wc->set, hash16);

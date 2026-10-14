@@ -125,17 +125,32 @@ static int field_value_fits_new(const TypedField *old_f,
 static int edit_preflight_walk_cb(const uint8_t hash16[16],
                                   const void *key, size_t klen,
                                   const void *value, size_t vlen,
-                                  void *ctx_v) {
+                                  uint8_t hdr2, void *ctx_v) {
     (void)hash16; (void)key; (void)klen;
     EditPreflightCtx *ctx = (EditPreflightCtx *)ctx_v;
     if (ctx->failed) return 1;
+    /* §2.7: field bytes sit nullmap_prefix into the record for nullmap
+       generations — resolve the field-region base through the record's
+       own view before any per-field read. */
+    const uint8_t *fbase = (const uint8_t *)value;
+    const uint8_t *bm = NULL;
+    int bm_bytes = 0;
+    size_t region = vlen;
+    if (hdr2) {
+        if (typed_record_view((const uint8_t *)value, vlen, hdr2,
+                              &fbase, &bm, &bm_bytes, &region) != 0)
+            return 0;   /* corrupt record — not this edit's problem */
+    }
     for (int e = 0; e < ctx->n_edits; e++) {
         int oi = ctx->edited_old_idx[e];
         const TypedField *of = &ctx->old_ts->fields[oi];
         const TypedField *nf = &ctx->new_ts->fields[oi];
-        if (of->offset + (size_t)of->size > vlen) continue;  /* defensive */
+        /* NULL fields stay NULL through the resize (§2.10) — always fit. */
+        if ((hdr2 & SREC_FLAG_NULLMAP) && typed_field_null(bm, bm_bytes, oi))
+            continue;
+        if (of->offset + (size_t)of->size > region) continue;  /* defensive */
         char reason[192];
-        if (!field_value_fits_new(of, nf, (const uint8_t *)value + of->offset,
+        if (!field_value_fits_new(of, nf, fbase + of->offset,
                                    reason, sizeof(reason))) {
             strncpy(ctx->fail_field, of->name, sizeof(ctx->fail_field) - 1);
             ctx->fail_field[sizeof(ctx->fail_field) - 1] = '\0';
@@ -610,6 +625,11 @@ int cmd_edit_fields(const char *db_root, const char *object,
         new_to_old[i] = i;
     }
     new_ts.total_size = noff;
+    /* §2.10: hand-built schemas must carry the nullmap prefix and the
+       prefix-inclusive total_size (matching load_typed_schema) — the
+       rebuild's trim/encode hooks run against THIS schema. */
+    new_ts.nullmap_prefix = 1 + typed_nullmap_bytes(new_ts.nfields);
+    new_ts.total_size += new_ts.nullmap_prefix;
 
     /* Per-edit dirty tracking. A field is dirty when its encoding actually
        changed; only those fields' indexes need to be rebuilt. */

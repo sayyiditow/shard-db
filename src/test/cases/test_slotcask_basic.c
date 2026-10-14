@@ -183,7 +183,7 @@ static int test_slotcask_basic_run(void) {
        inserted 1 (user_999) — net 9 live records. */
     struct { int n; } walk_ctx = {0};
     int walk_inc(const uint8_t hash[16], const void *key, size_t klen,
-                 const void *value, size_t vlen, void *ctx);
+                 const void *value, size_t vlen, uint8_t hdr2, void *ctx);
     rc = slotcask_walk_live(&db, walk_inc, &walk_ctx);
     ASSERT_EQ_INT(rc, 0, "walk_live returns 0");
     ASSERT_EQ_INT(walk_ctx.n, 9, "walk_live visited 9 live records");
@@ -197,14 +197,14 @@ static int test_slotcask_basic_run(void) {
            by that hash. */
         struct { uint8_t hash[16]; int found; } seek = {{0}, 0};
         int find_user999(const uint8_t hash[16], const void *key, size_t klen,
-                         const void *value, size_t vlen, void *ctx);
+                         const void *value, size_t vlen, uint8_t hdr2, void *ctx);
         rc = slotcask_walk_live(&db, find_user999, &seek);
         ASSERT_EQ_INT(seek.found, 1, "found user_999 during walk");
 
         /* Now look up by that hash directly. */
         struct { int n; size_t got_vlen; uint8_t got_first; } hl = {0, 0, 0};
         int hash_lookup_cb(const uint8_t hash[16], const void *key, size_t klen,
-                           const void *value, size_t vlen, void *ctx);
+                           const void *value, size_t vlen, uint8_t hdr2, void *ctx);
         rc = slotcask_lookup_by_hash(&db, seek.hash, hash_lookup_cb, &hl);
         ASSERT_EQ_INT(rc, 0, "lookup_by_hash returns 0");
         ASSERT_EQ_INT(hl.n, 1, "lookup_by_hash found exactly one record");
@@ -218,7 +218,7 @@ static int test_slotcask_basic_run(void) {
                             0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf2, 0xf1, 0xf0};
         struct { int n; } hl = {0};
         int hash_count_cb(const uint8_t hash[16], const void *key, size_t klen,
-                          const void *value, size_t vlen, void *ctx);
+                          const void *value, size_t vlen, uint8_t hdr2, void *ctx);
         rc = slotcask_lookup_by_hash(&db, fake, hash_count_cb, &hl);
         ASSERT_EQ_INT(rc, 0, "lookup_by_hash on absent hash → 0");
         ASSERT_EQ_INT(hl.n, 0, "lookup_by_hash on absent hash invokes cb 0 times");
@@ -233,7 +233,7 @@ static int test_slotcask_basic_run(void) {
 /* ===== Phase 3A callback definitions ===== */
 
 int walk_inc(const uint8_t hash[16], const void *key, size_t klen,
-             const void *value, size_t vlen, void *ctx) {
+             const void *value, size_t vlen, uint8_t hdr2, void *ctx) {
     (void)hash; (void)key; (void)klen; (void)value; (void)vlen;
     struct walk_ctx_t { int n; };
     ((struct walk_ctx_t *)ctx)->n++;
@@ -241,7 +241,7 @@ int walk_inc(const uint8_t hash[16], const void *key, size_t klen,
 }
 
 int find_user999(const uint8_t hash[16], const void *key, size_t klen,
-                 const void *value, size_t vlen, void *ctx) {
+                 const void *value, size_t vlen, uint8_t hdr2, void *ctx) {
     (void)value; (void)vlen;
     struct seek_t { uint8_t hash[16]; int found; };
     struct seek_t *s = (struct seek_t *)ctx;
@@ -253,7 +253,7 @@ int find_user999(const uint8_t hash[16], const void *key, size_t klen,
 }
 
 int hash_lookup_cb(const uint8_t hash[16], const void *key, size_t klen,
-                   const void *value, size_t vlen, void *ctx) {
+                   const void *value, size_t vlen, uint8_t hdr2, void *ctx) {
     (void)hash; (void)key; (void)klen;
     struct hl_t { int n; size_t got_vlen; uint8_t got_first; };
     struct hl_t *h = (struct hl_t *)ctx;
@@ -264,7 +264,7 @@ int hash_lookup_cb(const uint8_t hash[16], const void *key, size_t klen,
 }
 
 int hash_count_cb(const uint8_t hash[16], const void *key, size_t klen,
-                  const void *value, size_t vlen, void *ctx) {
+                  const void *value, size_t vlen, uint8_t hdr2, void *ctx) {
     (void)hash; (void)key; (void)klen; (void)value; (void)vlen;
     struct c_t { int n; };
     ((struct c_t *)ctx)->n++;

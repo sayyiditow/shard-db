@@ -52,7 +52,8 @@ static int test_varlen_scan_resync_run(void) {
     uint32_t vlen = 0;
     int sok = seg_scan_varlen_struct_ok(buf, sizeof(buf), resume_off,
                                          max_slot_size,
-                                         &rec_size, &flag, &klen, &vlen);
+                                         &rec_size, &flag, &klen, &vlen,
+                                         NULL);
     ASSERT_TRUE(sok, "resync target is structurally valid");
     ASSERT_EQ_INT((int)flag, 1, "resync target has flag==1 (live)");
     ASSERT_EQ_INT((int)klen, 2, "resync target key length matches C");

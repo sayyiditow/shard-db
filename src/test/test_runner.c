@@ -315,6 +315,13 @@ static int run_all_parallel(TestCaseEntry **cases, int n, int jobs) {
     for (int i = 0; i < jobs; i++) slots[i].result_fd = -1;
 
     long limit_ms = 180000;
+#ifdef BUILD_TSAN
+    /* TSan slows the whole suite roughly 5-10x; the auto-reshard throttle
+       case alone (2 × 1.05M seeded records) runs ~280s under it. Sanitizer
+       builds start from a wider watchdog so the documented gate invocation
+       needs no env tweak — SHARD_TEST_WATCHDOG_SEC still overrides. */
+    limit_ms = 1200000;
+#endif
     const char *env = getenv("SHARD_TEST_WATCHDOG_SEC");
     if (env && atoi(env) > 0) limit_ms = (long)atoi(env) * 1000L;
 

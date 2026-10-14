@@ -650,8 +650,8 @@ int kf_batch_marker_read_path_for_test(const char *path,
 typedef int (*RecoveryIndexDiffFn)(const char *eff_root, const char *object,
                                    int kf_shard, uint32_t kf_slot,
                                    const uint8_t *hash,
-                                   const uint8_t *old_value, size_t old_vlen,
-                                   const uint8_t *new_value, size_t new_vlen,
+                                   const uint8_t *old_value, size_t old_vlen, uint8_t old_hdr2,
+                                   const uint8_t *new_value, size_t new_vlen, uint8_t new_hdr2,
                                    char *err_buf, size_t err_buf_len);
 extern RecoveryIndexDiffFn g_recovery_index_diff_fn;
 
@@ -683,5 +683,13 @@ int object_has_pending_markers(const char *data_dir);
    clean-shutdown startup. Declared here so TEST_BUILD cases can assert on
    it without racing the .shard-db.clean file's deletion. */
 extern int g_marker_recovery_ran;
+
+#ifdef TEST_BUILD
+/* Test-only injection for the BTRI migration completion stamp (db.env
+   BTRI_STAMP_TEST_FAIL): 1 = stamp-file fsync failure, 2 = post-rename
+   stamp-directory fsync failure. Armed by the startup-migration cases in
+   test_null_migration.c; no-op at 0. */
+void btri_stamp_test_inject(int mode);
+#endif
 
 #endif /* SHARD_DB_INTERNAL_H */

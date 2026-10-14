@@ -322,7 +322,9 @@ static int test_aggregate_type_matrix_run(void) {
         "datetimems sum rejected");
 
     /* ===== varchar: lexicographic min/max, quoting, escaping =====
-       byte order: "10" < "12.5" < "2" < a"b\c < ünïcode */
+       byte order: "10" < "12.5" < "2" < a"b\c < ünïcode. r3's empty
+       varchar is an unset marker for text min/max (same doctrine as
+       count(field)) — it is never the min offer. */
     agg_has(tc,
         AGG_BASE ",\"aggregates\":[{\"fn\":\"min\",\"field\":\"v\",\"alias\":\"mn\"},"
                  "{\"fn\":\"max\",\"field\":\"v\",\"alias\":\"mx\"}]}",

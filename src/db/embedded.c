@@ -643,15 +643,127 @@ int shard_db_validate_before_stamp(const char *db_root) {
     return failed ? -1 : 0;
 }
 
+/* ── BTRI migration completion stamp (§2.4.3, 2026.10.2) ──
+   Lives alongside the other root evidence files. Written once, only
+   after every requested index shard was durably published (strict
+   reindex entry point) and the KFM2 replay succeeded; starts after
+   that skip the migration entirely. Durability: fsync the stamp file
+   before rename and its containing directory after rename — either
+   error fails startup. A directory-fsync failure can leave a renamed
+   stamp visible, but every index was already durable before it. */
+#define BTRI_MIGRATION_STAMP    ".btri-migrated"
+
+#ifdef TEST_BUILD
+/* Test-only injection for the stamp-write failure cases (db.env
+   BTRI_STAMP_TEST_FAIL): 1 = fail the stamp-file fsync, 2 = fail the
+   post-rename stamp-directory fsync. Startup must refuse to serve under
+   either; mode 2 leaves a visible-but-unconfirmed stamp behind. */
+static _Atomic int g_btri_stamp_test_fail;
+void btri_stamp_test_inject(int mode) {
+    atomic_store_explicit(&g_btri_stamp_test_fail, mode > 0 ? mode : 0,
+                          memory_order_release);
+}
+#endif
+
+static int btri_migration_stamp_exists(const char *db_root) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", db_root, BTRI_MIGRATION_STAMP);
+    return access(path, F_OK) == 0 ? 1 : 0;
+}
+
+static int btri_migration_stamp_write(const char *db_root) {
+    char tmp[PATH_MAX], final[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s/%s.tmp", db_root, BTRI_MIGRATION_STAMP);
+    snprintf(final, sizeof(final), "%s/%s", db_root, BTRI_MIGRATION_STAMP);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    dprintf(fd, "btri-migration complete (binary %s)\n", SHARD_DB_VERSION);
+    int sync_rc = fsync(fd);
+    int close_rc = close(fd);
+#ifdef TEST_BUILD
+    if (atomic_load_explicit(&g_btri_stamp_test_fail,
+                             memory_order_acquire) == 1) {
+        sync_rc = -1;
+    }
+#endif
+    if (sync_rc != 0 || close_rc != 0) {
+        (void)unlink(tmp);
+        return -1;
+    }
+    if (rename(tmp, final) != 0) {
+        (void)unlink(tmp);
+        return -1;
+    }
+    int dfd = open(db_root, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) return -1;
+    sync_rc = fsync(dfd);
+    close_rc = close(dfd);
+#ifdef TEST_BUILD
+    if (atomic_load_explicit(&g_btri_stamp_test_fail,
+                             memory_order_acquire) == 2) {
+        sync_rc = -1;
+    }
+#endif
+    return (sync_rc == 0 && close_rc == 0) ? 0 : -1;
+}
+
 int shard_db_recover_before_stamp(const char *db_root,
                                   int *out_markers_replayed) {
     if (!out_markers_replayed) return -1;
     *out_markers_replayed = 0;
     if (rebuild_recovery(db_root) != 0) return -1;
 
+    /* ── BTRI reindex migration (five-step ordering, §2.4.3) ──
+       Runs after artifact recovery (rebuild_recovery above) and before
+       the clean-flag early-return: a cleanly-stopped pre-2026.10.2 root
+       has no artifacts and no markers but still carries 'BTRH' indexes.
+       Runs before the KFM2 sweeps below so replay applies its index
+       windows against 'BTRI'. The completion stamp is written only
+       after the strict rebuilds AND the replay both succeed. */
+    int btri_migration_ran = 0;
+    if (!btri_migration_stamp_exists(db_root)) {
+        StartupSchemaEntry *ments = NULL;
+        size_t mcount = 0;
+        if (startup_read_schema(db_root, &ments, &mcount) != 0) return -1;
+        for (size_t i = 0; i < mcount; i++) {
+            char eff_root[PATH_MAX];
+            snprintf(eff_root, sizeof(eff_root), "%s/%s",
+                     db_root, ments[i].dir);
+            if (objlock_wrlock(eff_root, ments[i].object) != 0) {
+                LOG_ERROR(LOG_SUB_REINDEX,
+                          "btri-migrate: objlock_wrlock failed for '%s/%s'",
+                          ments[i].dir, ments[i].object);
+                free(ments);
+                return -1;
+            }
+            int n = 0, eno = 0;
+            int rc = reindex_object_durable_checked_ex(eff_root,
+                                                       ments[i].object,
+                                                       0, &n, &eno);
+            objlock_wrunlock(eff_root, ments[i].object);
+            if (rc != 0) {
+                LOG_ERROR(LOG_SUB_REINDEX,
+                          "btri-migrate: strict reindex failed for %s/%s "
+                          "(errno=%d); startup refused — partially "
+                          "published shards are retried whole at next start",
+                          ments[i].dir, ments[i].object, eno);
+                free(ments);
+                return -1;
+            }
+        }
+        free(ments);
+        btri_migration_ran = 1;
+    }
+
     int was_clean = clean_flag_exists(db_root);
     if (clean_flag_remove(db_root) != 0) return -1;
-    if (was_clean) return 0;
+    if (was_clean) {
+        /* Clean stop: no markers can be pending, so the migration (if it
+           ran) is the last recovery work — stamp completion and serve. */
+        if (btri_migration_ran &&
+            btri_migration_stamp_write(db_root) != 0) return -1;
+        return 0;
+    }
 
     StartupSchemaEntry *entries = NULL;
     size_t count = 0;
@@ -676,6 +788,14 @@ int shard_db_recover_before_stamp(const char *db_root,
             free(entries);
             return -1;
         }
+    }
+    /* Replay completed against 'BTRI' — only now is the migration stamp
+       durable (a replay failure above leaves no stamp, so the next start
+       re-runs the whole strict migration). */
+    if (btri_migration_ran &&
+        btri_migration_stamp_write(db_root) != 0) {
+        free(entries);
+        return -1;
     }
     free(entries);
     return 0;

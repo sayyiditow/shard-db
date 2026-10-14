@@ -424,6 +424,27 @@ int load_db_root(char *out, size_t outlen) {
 #ifdef TEST_BUILD
         } else if (strncmp(p, "INDEXED_ABORT_FAIL_AFTER=", 25) == 0) {
             index_test_abort_fail_after(atoi(p + 25));
+        } else if (strncmp(p, "INDEX_TEST_FAIL_NEXT_BUILD=", 27) == 0) {
+            /* Test-only knob: the next checked reindex build fails with
+               this errno before touching any index file (one-shot per
+               process). Drives the BTRI startup-migration failure case.
+               Not a documented production setting. */
+            index_test_fail_next_build(atoi(p + 27));
+        } else if (strncmp(p, "BT_TEST_PUBLISH_FAIL_STAGE=", 27) == 0) {
+            /* Test-only knob: fails the next btree replacement publication
+               at 1=pre-rename or 2=post-rename parent-durability reporting
+               (daemon-level — arms the seam the in-process cases set via
+               btree_test_publish_fail_stage). Drives the BTRI startup-
+               migration failure cases. Not a documented production
+               setting. */
+            btree_test_publish_fail_stage(atoi(p + 27));
+        } else if (strncmp(p, "BTRI_STAMP_TEST_FAIL=", 21) == 0) {
+            /* Test-only knob: injects a failure into the BTRI migration
+               completion stamp write — 1 = stamp-file fsync failure,
+               2 = post-rename stamp-directory fsync failure. Startup must
+               refuse to serve under either. Not a documented production
+               setting. */
+            btri_stamp_test_inject(atoi(p + 21));
 #endif
         } else if (strncmp(p, "LOG_DIR=", 8) == 0) {
             p += 8;
@@ -1696,6 +1717,13 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     }
     fclose(f);
     ts.total_size = offset;
+    /* Null bitmap prefix: encoders write [u8 bm_nbytes][bits] at the head
+       of the value region, field bytes after (2026.10.2 null plan).
+       total_size includes the prefix so buffer sizing, max_value, and
+       slot_size derivation grow with it; TypedField.offset values stay
+       field-region-relative. */
+    ts.nullmap_prefix = 1 + typed_nullmap_bytes(ts.nfields);
+    ts.total_size += ts.nullmap_prefix;
 
     /* Store in cache, capture the slot we wrote to so we can return the
        pointer without doing a second (lock-free) linear-probe lookup. */
@@ -2369,9 +2397,48 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
     }
 }
 
+/* 1 iff the provided span parses cleanly for the sentinel-typed fields
+   (uuid/ipv4/ipv6). A malformed span encodes to the all-zero sentinel;
+   under nullmap rendering a bit-clear zero would surface as a visible
+   0.0.0.0 / :: / nil-uuid, so the JSON encoders store NULL instead —
+   the historical "unset sentinel" convention. A well-formed 0.0.0.0 /
+   :: / nil uuid parses and stays a real (bit-clear) zero value. */
+static int sentinel_span_parses(enum FieldType t, const char *val, size_t vlen) {
+    switch (t) {
+    case FT_IPV4: {
+        char ipbuf[16]; uint8_t sink[4];
+        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
+        memcpy(ipbuf, val, n); ipbuf[n] = '\0';
+        return n > 0 && inet_pton(AF_INET, ipbuf, sink) == 1;
+    }
+    case FT_IPV6: {
+        char ipbuf[46]; uint8_t sink[16];
+        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
+        memcpy(ipbuf, val, n); ipbuf[n] = '\0';
+        return n > 0 && inet_pton(AF_INET6, ipbuf, sink) == 1;
+    }
+    case FT_UUID: {
+        int pos = 0;
+        for (size_t i = 0; i < vlen && pos < 32; i++) {
+            char c = val[i];
+            if (c == '-') continue;
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F'))) return 0;
+            pos++;
+        }
+        return pos == 32;
+    }
+    default:
+        return 1;
+    }
+}
+
 int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_size) {
     if (!ts || !ts->typed || out_size < ts->total_size) return -1;
     memset(out, 0, ts->total_size);
+    /* Null bitmap head — no defaults pass here, so bits are only set by
+       explicit JSON null spans below. */
+    out[0] = (uint8_t)typed_nullmap_bytes(ts->nfields);
 
     /* Walk the JSON object exactly once. For each top-level field we
        encounter, match against the schema inline and call encode_field_len
@@ -2411,8 +2478,21 @@ int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_
             /* Strip surrounding quotes for string values; numeric/bool/
                array/object literals pass through as-is. */
             const char *ev = vstart; size_t el = vlen;
-            if (el >= 2 && ev[0] == '"' && ev[el - 1] == '"') { ev++; el -= 2; }
+            int was_quoted = (el >= 2 && ev[0] == '"' && ev[el - 1] == '"');
+            if (was_quoted) { ev++; el -= 2; }
+            if (!was_quoted && json_span_is_null(vstart, vlen)) {
+                /* JSON null — set the bit; bytes stay zero from the memset. */
+                typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
+                break;
+            }
             if (el > 0) {
+                if (!sentinel_span_parses(ts->fields[i].type, ev, el)) {
+                    /* Malformed uuid/ipv4/ipv6 — the historic unset
+                       sentinel. Store NULL (bit set) rather than a
+                       visible zero value on nullmap records. */
+                    typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
+                    break;
+                }
                 /* Varchar values carry JSON escapes (\" \n \\ \uXXXX
                    etc.) — must decode before storage or round-trips
                    come back double-escaped. Other types' values are
@@ -2421,15 +2501,15 @@ int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_
                     char *unesc = NULL; size_t unesc_len = 0;
                     if (json_unescape_string(ev, el, &unesc, &unesc_len) == 0) {
                         encode_field_len(&ts->fields[i], unesc, unesc_len,
-                                          out + ts->fields[i].offset);
+                                          out + ts->nullmap_prefix + ts->fields[i].offset);
                         free(unesc);
                     } else {
                         encode_field_len(&ts->fields[i], ev, el,
-                                          out + ts->fields[i].offset);
+                                          out + ts->nullmap_prefix + ts->fields[i].offset);
                     }
                 } else {
                     encode_field_len(&ts->fields[i], ev, el,
-                                      out + ts->fields[i].offset);
+                                      out + ts->nullmap_prefix + ts->fields[i].offset);
                 }
             }
             break;
@@ -2877,6 +2957,9 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                           char *err_buf, size_t err_buf_size) {
     if (!ts || !ts->typed || out_size < ts->total_size) return -1;
     memset(out, 0, ts->total_size);
+    /* Null bitmap head: [u8 bm_nbytes][bits...] — every field starts
+       non-NULL (bytes zeroed); the walk and the defaults pass set bits. */
+    out[0] = (uint8_t)typed_nullmap_bytes(ts->nfields);
     if (err_buf && err_buf_size > 0) err_buf[0] = '\0';
 
     /* Same inline-match walk as typed_encode, but with a bitmap of which
@@ -2912,8 +2995,26 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                 if ((int)flen != ts->fields[i].name_len) continue;
                 if (memcmp(fname, ts->fields[i].name, flen) != 0) continue;
                 const char *ev = vstart; size_t el = vlen;
-                if (el >= 2 && ev[0] == '"' && ev[el - 1] == '"') { ev++; el -= 2; }
+                int was_quoted = (el >= 2 && ev[0] == '"' && ev[el - 1] == '"');
+                if (was_quoted) { ev++; el -= 2; }
+                seen[i] = 1;   /* provided — including explicit "" — suppresses defaults */
+                if (!was_quoted && json_span_is_null(vstart, vlen)) {
+                    /* JSON null — store NULL: bit set, field bytes stay
+                       zero (the memset above already zeroed them). Wins
+                       over :default= (seen[i] suppresses the defaults
+                       pass). Skips enum membership validation — null is
+                       not a value miss. */
+                    typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
+                    break;
+                }
                 if (el > 0) {
+                    if (!sentinel_span_parses(ts->fields[i].type, ev, el)) {
+                        /* Malformed uuid/ipv4/ipv6 — the historic unset
+                           sentinel. Store NULL (bit set) rather than a
+                           visible zero value on nullmap records. */
+                        typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
+                        break;
+                    }
                     /* Enum: strict membership check before the encode.
                        Unknown values are silently zeroed by encode_field_len
                        (legacy convention for other typed fields). For enum
@@ -2949,11 +3050,11 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                             return -2;
                         }
                         encode_field_len(&ts->fields[i], unesc, unesc_len,
-                                          out + ts->fields[i].offset);
+                                          out + ts->nullmap_prefix + ts->fields[i].offset);
                         free(unesc);
                     } else {
                         encode_field_len(&ts->fields[i], ev, el,
-                                          out + ts->fields[i].offset);
+                                          out + ts->nullmap_prefix + ts->fields[i].offset);
                     }
                     seen[i] = 1;
                 }
@@ -2962,10 +3063,15 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
         }
     }
 
-    /* Fields the client didn't provide → apply configured default if any. */
+    /* Fields the client didn't provide → apply configured default if any.
+       No default ⇒ NULL (the point of the bitmap). */
     for (int i = 0; i < ts->nfields; i++) {
         if (ts->fields[i].removed || seen[i]) continue;
-        if (ts->fields[i].default_kind == DK_NONE) continue;
+        if (ts->fields[i].default_kind == DK_NONE) {
+            /* Omitted, no default → NULL for nullmap records. */
+            typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
+            continue;
+        }
         char gen_buf[256];
         const char *dv = generate_default(&ts->fields[i], gen_buf, sizeof(gen_buf),
                                           db_root, object);
@@ -2981,14 +3087,19 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                          ts->fields[i].name);
             return -2;
         }
-        encode_field(&ts->fields[i], dv, out + ts->fields[i].offset);
+        encode_field(&ts->fields[i], dv,
+                     out + ts->nullmap_prefix + ts->fields[i].offset);
     }
     return ts->total_size;
 }
 
 /* ---- Decode: binary → JSON ---- */
 
-static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *buf, int buflen) {
+/* render_zeros: set for nullmap records (the bitmap is authoritative —
+   a bit-clear zero is a real value and must render). Legacy records pass
+   0 and keep the skip-on-zero absence heuristics. */
+static int decode_field_to_buf(const TypedField *f, const uint8_t *data,
+                               char *buf, int buflen, int render_zeros) {
     switch (f->type) {
     case FT_VARCHAR: {
         /* Layout: [uint16 BE length][content]. Content bytes are
@@ -3003,7 +3114,11 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         int content_max = f->size - 2;
         if (content_max < 0) content_max = 0;
         if (len > content_max) len = content_max;  /* defensive */
-        if (len == 0) return 0;
+        if (len == 0) {
+            if (!render_zeros) return 0;
+            buf[0] = '"'; buf[1] = '"'; buf[2] = '\0';
+            return 2;
+        }
         if (buflen < 4) {
             LOG_ERROR(LOG_SUB_CONFIG, "decode_field_to_buf: buffer too small for field [%s] (buflen=%d, need>=4)", f->name, buflen);
             return -1;  /* "" + NUL */
@@ -3027,7 +3142,10 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         int64_t v = (int64_t)u;   /* unsigned accumulate: shifting a signed
                                      value into its sign bit was UB for
                                      negative fields (strict gate) */
-        if (v == 0) return 0; /* skip zero */
+        if (v == 0) { /* skip zero — legacy only */
+            if (!render_zeros) return 0;
+            return snprintf(buf, buflen, "0");
+        }
         return snprintf(buf, buflen, "%lld", (long long)v);
     }
     case FT_TIMESTAMP: {
@@ -3045,7 +3163,10 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
                      ((uint64_t)data[4] << 24) | ((uint64_t)data[5] << 16) |
                      ((uint64_t)data[6] << 8) | data[7];
         int64_t v = (int64_t)u;   /* see FT_LONG: unsigned accumulate */
-        if (v == 0) return 0;
+        if (v == 0) {
+            if (!render_zeros) return 0;
+            return snprintf(buf, buflen, "0");
+        }
         return snprintf(buf, buflen, "%lld", (long long)v);
     }
     case FT_INT: {
@@ -3061,13 +3182,19 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
     case FT_DOUBLE: {
         double v;
         memcpy(&v, data, 8);
-        if (v == 0.0) return 0;
+        if (v == 0.0) {
+            if (!render_zeros) return 0;
+            return snprintf(buf, buflen, "0");
+        }
         return snprintf(buf, buflen, "%g", v);
     }
     case FT_FLOAT: {
         float v;
         memcpy(&v, data, 4);
-        if (v == 0.0f) return 0;
+        if (v == 0.0f) {
+            if (!render_zeros) return 0;
+            return snprintf(buf, buflen, "0");
+        }
         return snprintf(buf, buflen, "%g", (double)v);
     }
     case FT_BOOL: {
@@ -3098,7 +3225,10 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         uint32_t u = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
                      ((uint32_t)data[2] << 8) | data[3];
         int32_t v = (int32_t)u;   /* see FT_LONG: unsigned accumulate (UB gate) */
-        if (v == 0) return 0;
+        if (v == 0) {
+            if (!render_zeros) return 0;
+            return snprintf(buf, buflen, "\"00000000\"");
+        }
         return snprintf(buf, buflen, "\"%08d\"", v); /* "yyyyMMdd" */
     }
     case FT_DATETIME: {
@@ -3107,7 +3237,10 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         int32_t d = (int32_t)ud;   /* see FT_LONG: unsigned accumulate (UB gate) */
         uint32_t t = ((uint32_t)data[4] << 16) |
                      ((uint32_t)data[5] << 8) | data[6];
-        if (d == 0 && t == 0) return 0;
+        if (d == 0 && t == 0) {
+            if (!render_zeros) return 0;
+            return snprintf(buf, buflen, "\"00000000000000\"");
+        }
         int hh = t / 3600;
         int mm = (t % 3600) / 60;
         int ss = t % 60;
@@ -3119,7 +3252,10 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         int32_t d = (int32_t)ud;   /* see FT_LONG: unsigned accumulate (UB gate) */
         uint32_t ms = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
                       ((uint32_t)data[6] << 8) | data[7];
-        if (d == 0 && ms == 0) return 0;
+        if (d == 0 && ms == 0) {
+            if (!render_zeros) return 0;
+            return snprintf(buf, buflen, "\"00000000000000000\"");
+        }
         int hh = ms / 3600000;
         int mm = (ms % 3600000) / 60000;
         int ss = (ms % 60000) / 1000;
@@ -3128,7 +3264,10 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
     }
     case FT_TIME: {
         uint32_t secs = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | data[2];
-        if (secs == 0 && data[0]==0 && data[1]==0 && data[2]==0) return 0;
+        if (secs == 0 && data[0]==0 && data[1]==0 && data[2]==0) {
+            if (!render_zeros) return 0;
+            return snprintf(buf, buflen, "\"00:00:00\"");
+        }
         int hh = secs / 3600;
         int mm = (secs % 3600) / 60;
         int ss = secs % 60;
@@ -3138,15 +3277,21 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
         /* Emit JSON-quoted canonical form ("xxxxxxxx-...-xxxxxxxxxxxx").
            All-zero bytes = unset; skip empty. */
         const uint8_t *b = data;
-        if (uuid_is_zero(b)) return 0;
+        if (uuid_is_zero(b)) {
+            if (!render_zeros) return 0;
+            return snprintf(buf, buflen,
+                            "\"00000000-0000-0000-0000-000000000000\"");
+        }
         if (buflen < 39) return 0; /* 36 hex + 2 quotes + NUL */
         char inner[37];
         uuid_format_canonical(inner, sizeof(inner), b);
         return snprintf(buf, buflen, "\"%s\"", inner);
     }
     case FT_IPV4: {
-        if (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 0)
-            return 0;
+        if (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 0) {
+            if (!render_zeros) return 0;
+            return snprintf(buf, buflen, "\"0.0.0.0\"");
+        }
         char ipstr[INET_ADDRSTRLEN];
         if (!inet_ntop(AF_INET, data, ipstr, sizeof(ipstr)))
             return 0;
@@ -3155,7 +3300,10 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
     case FT_IPV6: {
         int allzero = 1;
         for (int bi = 0; bi < 16; bi++) if (data[bi] != 0) { allzero = 0; break; }
-        if (allzero) return 0;
+        if (allzero) {
+            if (!render_zeros) return 0;
+            return snprintf(buf, buflen, "\"::\"");
+        }
         char ipstr[INET6_ADDRSTRLEN];
         if (!inet_ntop(AF_INET6, data, ipstr, sizeof(ipstr)))
             return 0;
@@ -3195,8 +3343,19 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data, char *b
     }
 }
 
-char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len) {
+char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
+                   uint8_t hdr2) {
     if (!ts || !ts->typed) return NULL;
+    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
+    int bm_bytes = 0; size_t field_region_len = 0;
+    int render_zeros = 0;
+    if (data_len < 0 ||
+        typed_record_view(data, (size_t)data_len, hdr2, &fbase, &bm,
+                          &bm_bytes, &field_region_len) != 0) {
+        errno = EILSEQ;   /* corrupt flagged record — error, not JSON null */
+        return NULL;
+    }
+    render_zeros = (hdr2 & SREC_FLAG_NULLMAP) ? 1 : 0;
     /* Size the outer record-JSON buffer based on actual field types.
        Pre-2026.05.6 this was a flat `nfields * 300` heuristic, which
        silently truncated mid-field on records carrying a large
@@ -3227,12 +3386,23 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len) {
         const TypedField *f = &ts->fields[i];
         if (f->removed) continue;  /* tombstoned — not visible to consumers */
 
-        /* For trim-encoded records, fields past data_len are zero/default.
-           Use a static zero buffer so decode_field_to_buf always has valid input. */
+        /* For trim-encoded records, fields past the field region are
+           zero/default. Use a static zero buffer so decode_field_to_buf
+           always has valid input. */
         static const uint8_t zero_field[65537]; /* BSS — always zero-initialised */
-        const uint8_t *field_src = (f->offset + f->size <= data_len)
-            ? data + f->offset
+        const uint8_t *field_src = ((size_t)f->offset + (size_t)f->size <= field_region_len)
+            ? fbase + f->offset
             : zero_field;
+
+        /* NULL bit ⇒ emit JSON null (key present), canonical-NULL bytes
+           are an encoder bug (defensive LOG at debug noise level omitted —
+           render null regardless). */
+        if (typed_field_null(bm, bm_bytes, i)) {
+            if (!first && pos + 1 < est) buf[pos++] = ',';
+            SB_APPEND(buf, pos, est, "\"%s\":null", f->name);
+            first = 0;
+            continue;
+        }
 
         /* Stack buffer covers non-varchar fields (numbers / bool / dates
            fit comfortably). Varchar may need 6 * content_max + 2 bytes
@@ -3249,7 +3419,7 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len) {
                 else        { vbufsz = need; }
             }
         }
-        int vlen = decode_field_to_buf(f, field_src, vbuf, vbufsz);
+        int vlen = decode_field_to_buf(f, field_src, vbuf, vbufsz, render_zeros);
         if (vlen <= 0) { if (vbuf != vbuf_stack) free(vbuf); continue; }
 
         if (!first && pos + 1 < est) buf[pos++] = ',';
@@ -3262,9 +3432,18 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len) {
     return buf;
 }
 
-void typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
-                         int data_len, FILE *out) {
-    if (!ts || !ts->typed || !out) return;
+int typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
+                        int data_len, FILE *out, uint8_t hdr2) {
+    if (!ts || !ts->typed || !out) return -1;
+    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
+    int bm_bytes = 0; size_t field_region_len = 0;
+    if (data_len < 0 ||
+        typed_record_view(data, (size_t)data_len, hdr2, &fbase, &bm,
+                          &bm_bytes, &field_region_len) != 0) {
+        errno = EILSEQ;   /* corrupt flagged record — fail, never emit */
+        return -1;
+    }
+    int render_zeros = (hdr2 & SREC_FLAG_NULLMAP) ? 1 : 0;
     fputc('{', out);
     int first = 1;
     for (int i = 0; i < ts->nfields; i++) {
@@ -3272,9 +3451,16 @@ void typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
         if (f->removed) continue;
 
         static const uint8_t zero_field[65537];
-        const uint8_t *field_src = (f->offset + f->size <= data_len)
-            ? data + f->offset
+        const uint8_t *field_src = ((size_t)f->offset + (size_t)f->size <= field_region_len)
+            ? fbase + f->offset
             : zero_field;
+
+        if (typed_field_null(bm, bm_bytes, i)) {
+            if (!first) fputc(',', out);
+            fprintf(out, "\"%s\":null", f->name);
+            first = 0;
+            continue;
+        }
 
         char vbuf_stack[512];
         char *vbuf = vbuf_stack;
@@ -3287,7 +3473,7 @@ void typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
                 else        { vbufsz = need; }
             }
         }
-        int vlen = decode_field_to_buf(f, field_src, vbuf, vbufsz);
+        int vlen = decode_field_to_buf(f, field_src, vbuf, vbufsz, render_zeros);
         if (vlen <= 0) { if (vbuf != vbuf_stack) free(vbuf); continue; }
 
         if (!first) fputc(',', out);
@@ -3296,27 +3482,62 @@ void typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
         if (vbuf != vbuf_stack) free(vbuf);
     }
     fputc('}', out);
+    return 0;
 }
 
-/* Return the minimum byte length needed to represent all fields in buf[0..full_len).
-   Scans backward through non-removed fields; returns the end offset of the last
-   field that contains any non-zero byte, rounded to that field's boundary.
-   Returns 0 if every field is zero (record is empty / default). */
+/* Validated view of a typed record's value region — see types.h. Every
+   consumer of a possibly-untrusted (value, vlen, hdr2) triple goes
+   through here before bitmap access or field-region pointer math: a
+   corrupt bm_nbytes must fail closed instead of underflowing a region
+   subtraction or walking off the allocation. */
+int typed_record_view(const uint8_t *value, size_t vlen, uint8_t hdr2,
+                      const uint8_t **out_base, const uint8_t **out_bm,
+                      int *out_bm_bytes, size_t *out_region) {
+    if (!value || !out_base || !out_bm || !out_bm_bytes || !out_region)
+        return -1;
+    *out_bm = NULL; *out_bm_bytes = 0;
+    if (hdr2 & ~SREC_FLAG_NULLMAP) return -1;
+    if (!(hdr2 & SREC_FLAG_NULLMAP)) {
+        *out_base = value; *out_region = vlen; return 0;
+    }
+    if (vlen < 1) return -1;
+    int bm_bytes = value[0];
+    if (bm_bytes < 1 || bm_bytes > 32) return -1;      /* plan §4.2 bounds */
+    if ((size_t)bm_bytes + 1 > vlen) return -1;        /* no underflow */
+    *out_base  = value + 1 + bm_bytes;
+    *out_bm    = value + 1;
+    *out_bm_bytes = bm_bytes;
+    *out_region = vlen - 1 - (size_t)bm_bytes;
+    return 0;
+}
+
+/* Return the minimum byte length needed to represent the record.
+   Legacy schemas (nullmap_prefix == 0): unchanged behavior — 0 when
+   every field is zero. Nullmap schemas: work in field-region
+   coordinates (buf + prefix ..), add the prefix once at the return;
+   result is always in [prefix, full_len] — a nullmap record is never
+   trimmed below its bitmap (a NULL trailing field's zero bytes trim
+   away; its bit must survive) and never reports more than it was
+   given. */
 size_t typed_encode_trim_len(const TypedSchema *ts, const uint8_t *buf,
                               size_t full_len) {
     if (!ts || !ts->typed || !buf || full_len == 0) return 0;
+    size_t prefix = (size_t)ts->nullmap_prefix;   /* 0 for legacy */
+    if (full_len < prefix) return full_len;       /* defensive */
+    size_t min_ret = prefix;
+    const uint8_t *fields = buf + prefix;
+    size_t region = full_len - prefix;            /* single subtraction */
     for (int i = ts->nfields - 1; i >= 0; i--) {
         const TypedField *f = &ts->fields[i];
         if (f->removed) continue;
         size_t end = (size_t)f->offset + (size_t)f->size;
-        if (end > full_len) continue;  /* field outside buf — skip */
-        /* Check if this field has any non-zero byte */
-        const uint8_t *fp = buf + f->offset;
+        if (end > region) continue;   /* field outside stored region — skip */
+        const uint8_t *fp = fields + f->offset;
         for (size_t b = 0; b < (size_t)f->size; b++) {
-            if (fp[b]) return end;  /* found non-zero — trim point is this field's end */
+            if (fp[b]) return min_ret + end;  /* prefix added once, here */
         }
     }
-    return 0;  /* all fields zero */
+    return min_ret;   /* legacy: 0 (unchanged); nullmap: whole bitmap */
 }
 
 /* SlotcaskTrimFn-compatible wrapper around typed_encode_trim_len.
@@ -3331,20 +3552,33 @@ size_t schema_trim_fn(const void *val, size_t vlen, void *ctx) {
 /* data_len is the number of valid bytes in data (may be < ts->total_size for
    trim-encoded records). Fields extending past data_len return NULL. */
 char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
-                           int data_len, int field_idx) {
+                           int data_len, int field_idx, uint8_t hdr2) {
     if (!ts || field_idx < 0 || field_idx >= ts->nfields) return NULL;
     const TypedField *f = &ts->fields[field_idx];
     if (f->removed) return NULL;
+
+    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
+    int bm_bytes = 0; size_t field_region_len = 0;
+    if (data_len < 0 ||
+        typed_record_view(data, (size_t)data_len, hdr2, &fbase, &bm,
+                          &bm_bytes, &field_region_len) != 0) {
+        errno = EILSEQ;   /* corrupt flagged record — caller must fail */
+        return NULL;
+    }
+    int render_zeros = (hdr2 & SREC_FLAG_NULLMAP) ? 1 : 0;
+    /* NULL bit ⇒ absent string (the CAS/match_criterion convention — same
+       as a trim-absent field). Callers distinguishing corruption from
+       absence check errno. */
+    if (typed_field_null(bm, bm_bytes, field_idx)) return NULL;
 
     /* For trim-encoded records: any field that ends past stored bytes → treat as zero/empty.
        Uses the same condition as the original typed_decode break, which is
        f->offset + f->size > data_len rather than f->offset >= data_len — this is
        correct for both field-boundary trim and any hypothetical byte-level trim. */
     static const uint8_t zero_field[65537];
-    const uint8_t *src = (data_len >= 0 &&
-                            (size_t)f->offset + (size_t)f->size > (size_t)data_len)
+    const uint8_t *src = ((size_t)f->offset + (size_t)f->size > field_region_len)
         ? zero_field
-        : data + f->offset;
+        : fbase + f->offset;
 
     char buf[512];
     int len;
@@ -3355,7 +3589,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         int slen = ((int)p[0] << 8) | (int)p[1];
         int content_max = f->size - 2;
         if (slen > content_max) slen = content_max;
-        if (slen == 0) return NULL;
+        if (slen == 0) return render_zeros ? strdup("") : NULL;
         char *out = malloc(slen + 1);
         memcpy(out, p + 2, slen);
         out[slen] = '\0';
@@ -3367,7 +3601,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         const uint8_t *d = src;
         int32_t v = ((int32_t)d[0] << 24) | ((int32_t)d[1] << 16) |
                     ((int32_t)d[2] << 8) | d[3];
-        if (v == 0) return NULL;
+        if (v == 0) return render_zeros ? strdup("00000000") : NULL;
         char *out = malloc(9);
         snprintf(out, 9, "%08d", v);
         return out;
@@ -3378,7 +3612,8 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
                      ((int32_t)d[2] << 8) | d[3];
         uint32_t t = ((uint32_t)d[4] << 16) |
                      ((uint32_t)d[5] << 8) | d[6];
-        if (dv == 0 && t == 0) return NULL;
+        if (dv == 0 && t == 0)
+            return render_zeros ? strdup("00000000000000") : NULL;
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         char *out = malloc(15);
         snprintf(out, 15, "%08d%02d%02d%02d", dv, hh, mm, ss);
@@ -3390,7 +3625,8 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
                      ((int32_t)d[2] << 8) | d[3];
         uint32_t ms = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) |
                       ((uint32_t)d[6] << 8) | d[7];
-        if (dv == 0 && ms == 0) return NULL;
+        if (dv == 0 && ms == 0)
+            return render_zeros ? strdup("00000000000000000") : NULL;
         int hh = ms / 3600000, mm = (ms % 3600000) / 60000,
             ss = (ms % 60000) / 1000, fff = ms % 1000;
         char *out = malloc(18);
@@ -3404,7 +3640,8 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
     case FT_TIME: {
         const uint8_t *d = src;
         uint32_t secs = ((uint32_t)d[0] << 16) | ((uint32_t)d[1] << 8) | d[2];
-        if (secs == 0 && d[0]==0 && d[1]==0 && d[2]==0) return NULL;
+        if (secs == 0 && d[0]==0 && d[1]==0 && d[2]==0)
+            return render_zeros ? strdup("00:00:00") : NULL;
         int hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
         char *out = malloc(9);
         snprintf(out, 9, "%02d:%02d:%02d", hh, mm, ss);
@@ -3412,7 +3649,9 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
     }
     case FT_UUID: {
         const uint8_t *b = src;
-        if (uuid_is_zero(b)) return NULL;
+        if (uuid_is_zero(b))
+            return render_zeros
+                ? strdup("00000000-0000-0000-0000-000000000000") : NULL;
         char *out = malloc(37);
         uuid_format_canonical(out, 37, b);
         return out;
@@ -3420,7 +3659,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
     case FT_IPV4: {
         const uint8_t *ip = src;
         if (ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0)
-            return NULL;
+            return render_zeros ? strdup("0.0.0.0") : NULL;
         char *out = malloc(INET_ADDRSTRLEN);
         if (!out) {
             LOG_ERROR(LOG_SUB_CONFIG, "typed_get_field_str: malloc(INET_ADDRSTRLEN) failed for field [%s]", f->name);
@@ -3437,7 +3676,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         const uint8_t *ip = src;
         int allzero = 1;
         for (int bi = 0; bi < 16; bi++) if (ip[bi] != 0) { allzero = 0; break; }
-        if (allzero) return NULL;
+        if (allzero) return render_zeros ? strdup("::") : NULL;
         char *out = malloc(INET6_ADDRSTRLEN);
         if (!out) {
             LOG_ERROR(LOG_SUB_CONFIG, "typed_get_field_str: malloc(INET6_ADDRSTRLEN) failed for field [%s]", f->name);
@@ -3476,11 +3715,11 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
            Make that text the raw value returned by this API, rather than
            allowing projection callers to receive a JSON fragment or quote
            the number as a string. */
-        len = decode_field_to_buf(f, src, buf, sizeof(buf));
+        len = decode_field_to_buf(f, src, buf, sizeof(buf), render_zeros);
         if (len <= 0) return NULL;
         return strdup(buf);
     default:
-        len = decode_field_to_buf(f, src, buf, sizeof(buf));
+        len = decode_field_to_buf(f, src, buf, sizeof(buf), render_zeros);
         if (len <= 0) return NULL;
         return strdup(buf);
     }

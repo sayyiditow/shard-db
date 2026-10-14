@@ -379,27 +379,6 @@ void encode_criterion_value(const TypedField *tf,
     encode_field_for_index(tf, val, vlen, buf, out_len);
 }
 
-/* Count-mode shortcut: operator has a positive counterpart so
-   count(neg) = count(*) - count(pos) is cheaper. NEQ / NOT_IN hit a
-   targeted positive set instead of walking the complement; NOT_EXISTS
-   also fixes a pre-existing count-inversion (the old path returned the
-   full index size instead of the inverse). */
-static int op_is_negatable(enum SearchOp op) {
-    return op == OP_NOT_EQUAL || op == OP_NOT_LIKE || op == OP_NOT_CONTAINS ||
-           op == OP_NOT_IN || op == OP_NOT_EXISTS;
-}
-
-static enum SearchOp op_invert(enum SearchOp op) {
-    switch (op) {
-    case OP_NOT_EQUAL:    return OP_EQUAL;
-    case OP_NOT_LIKE:     return OP_LIKE;
-    case OP_NOT_CONTAINS: return OP_CONTAINS;
-    case OP_NOT_IN:       return OP_IN;
-    case OP_NOT_EXISTS:   return OP_EXISTS;
-    default:              return op;
-    }
-}
-
 /* Ops where btree_dispatch falls through to the default full-leaf scan
    (no precise range), so the callback must validate per entry against
    the criterion. The CI variants (ILIKE/ICONTAINS/...) join because the
@@ -411,7 +390,12 @@ int op_needs_check_primary(enum SearchOp op) {
            op == OP_ILIKE || op == OP_ICONTAINS ||
            op == OP_ISTARTS_WITH || op == OP_IENDS_WITH ||
            op == OP_INOT_LIKE || op == OP_INOT_CONTAINS ||
-           op == OP_REGEX || op == OP_NOT_REGEX;
+           op == OP_REGEX || op == OP_NOT_REGEX ||
+           /* §2.4.2: an exists leaf drives the tier-0 walk, but legacy
+              zero-markers (empty varchar, midnight, zero date) sit in
+              tier 0 too — every candidate is verified per record with
+              the generation-correct query-existence predicate. */
+           op == OP_EXISTS;
 }
 
 /* True if the op is a length comparator answerable from (val, vlen) alone —
@@ -520,18 +504,23 @@ typedef struct {
     void         *ctx;
 } BtreeOdShardArg;
 
-static int btree_od_leaf_cb(const uint8_t *value, size_t vlen,
-                             const uint8_t hash16[16], void *raw_ctx)
+/* §2.4.2: the O_DIRECT full-leaf scan delivers the value-tier view —
+   strip the tier byte, skip NULL-tier entries (mirror of index.c's
+   btri_value_tier_cb, which the mmap walk paths use). */
+static int btree_od_tier_cb(const uint8_t *value, size_t vlen,
+                            const uint8_t hash16[16], void *raw_ctx)
 {
     BtreeOdShardArg *arg = (BtreeOdShardArg *)raw_ctx;
+    if (vlen == 0) return 0;
+    if ((uint8_t)value[0] != 0x00) return 0;
     /* bt_result_cb and od_leaf_cb have identical runtime layout. */
-    return arg->cb((const char *)value, vlen, hash16, arg->ctx);
+    return arg->cb((const char *)value + 1, vlen - 1, hash16, arg->ctx);
 }
 
 static void *btree_od_shard_worker(void *raw)
 {
     BtreeOdShardArg *arg = (BtreeOdShardArg *)raw;
-    btree_leaf_scan_o_direct(arg->idx_path, btree_od_leaf_cb, arg);
+    btree_leaf_scan_o_direct(arg->idx_path, btree_od_tier_cb, arg);
     /* Flush any thread-local count accumulator just as shard_walk_worker
        does (index.c:129). No-op for callbacks that don't use TLS. */
     idx_count_cb_flush_thread();
@@ -913,11 +902,11 @@ typedef struct {
 static int count_batch_cb(const uint8_t hash[16],
                            const void *key, size_t klen,
                            const void *value, size_t vlen,
-                           void *ctx_ptr) {
+                           uint8_t hdr2, void *ctx_ptr) {
     (void)hash; (void)key; (void)klen;
     CountBatchCbCtx *c = (CountBatchCbCtx *)ctx_ptr;
     if (query_deadline_tick(c->sc->deadline, &c->sc->dl_counter)) return 1;
-    if (criteria_match_tree((const uint8_t *)value, vlen, c->sc->tree, c->sc->fs)) {
+    if (criteria_match_tree((const uint8_t *)value, vlen, c->sc->tree, c->sc->fs, hdr2)) {
         __atomic_add_fetch(c->local, 1, __ATOMIC_RELAXED);
     }
     return 0;
@@ -1283,7 +1272,7 @@ typedef struct BatchFetchBuf_ {
     int (*record_cb)(const uint8_t hash16[16],
                      const void *key, size_t klen,
                      const void *value, size_t vlen,
-                     void *ctx);
+                     uint8_t hdr2, void *ctx);
     void       *record_ctx;
     volatile int stop;
 } BatchFetchBuf;
@@ -1575,14 +1564,30 @@ static void chunk_walk_fanout(const ChunkShared *sh_tmpl,
     ChunkShared sh = *sh_tmpl;
     ChunkWalkArg *args = calloc((size_t)n, sizeof(ChunkWalkArg));
     if (!args) return;
+    /* §2.4.2: every fanout caller passes RAW payload bounds; stored BTRI
+       keys are [0x00][payload]. Prefix the 0x00 tier byte once here. The
+       unbounded-above sentinel (\xff*4) becomes [0x00][\xff*4] — the
+       5-byte form btree.c's desc-iterator accepts, and it clamps below
+       the NULL tier automatically. Resume bounds inside chunk_walk_worker
+       reuse stored keys (already tiered) and bypass this path. */
+    char lo_tiered[BT_MAX_VAL_LEN], hi_tiered[BT_MAX_VAL_LEN];
+    size_t lo_t = 0, hi_t = 0;
+    if (lo && lo_len) {
+        lo_t = (lo_len + 1 > sizeof(lo_tiered)) ? sizeof(lo_tiered) : lo_len + 1;
+        lo_tiered[0] = 0x00;
+        memcpy(lo_tiered + 1, lo, lo_t - 1);
+    }
+    if (hi && hi_len) {
+        hi_t = (hi_len + 1 > sizeof(hi_tiered)) ? sizeof(hi_tiered) : hi_len + 1;
+        hi_tiered[0] = 0x00;
+        memcpy(hi_tiered + 1, hi, hi_t - 1);
+    }
     for (int s = 0; s < n; s++) {
         ChunkWalkArg *a = &args[s];
         a->sh = &sh;
         build_idx_path(a->path, sizeof(a->path), db_root, object, field, s);
-        size_t cpy = lo_len > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : lo_len;
-        memcpy(a->lo, lo, cpy); a->lo_len = cpy; a->lo_excl = lo_excl;
-        cpy = hi_len > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : hi_len;
-        memcpy(a->hi, hi, cpy); a->hi_len = cpy; a->hi_excl = hi_excl;
+        memcpy(a->lo, lo_tiered, lo_t); a->lo_len = lo_t; a->lo_excl = lo_excl;
+        memcpy(a->hi, hi_tiered, hi_t); a->hi_len = hi_t; a->hi_excl = hi_excl;
     }
     parallel_for_io(chunk_walk_worker, args, n, sizeof(ChunkWalkArg));
     free(args);
@@ -1662,7 +1667,7 @@ typedef struct {
 static int stream_find_record_cb(const uint8_t hash16[16],
                                   const void *key, size_t klen,
                                   const void *value, size_t vlen,
-                                  void *ctx) {
+                                  uint8_t hdr2, void *ctx) {
     (void)hash16;
     StreamFindCtx *sc = (StreamFindCtx *)ctx;
     g_out = sc->parent_out;
@@ -1676,7 +1681,7 @@ static int stream_find_record_cb(const uint8_t hash16[16],
 
     if (is_excluded(sc->excluded, keybuf)) return 0;
 
-    if (!criteria_match_tree(value, vlen, sc->tree, sc->fs)) return 0;
+    if (!criteria_match_tree(value, vlen, sc->tree, sc->fs, hdr2)) return 0;
 
     pthread_mutex_lock(&sc->lock);
     int my_seq = ++sc->passed;
@@ -1687,7 +1692,7 @@ static int stream_find_record_cb(const uint8_t hash16[16],
         if (sc->csv_delim) {
             csv_emit_row(keybuf, raw, (uint32_t)vlen,
                           sc->proj_count > 0 ? sc->proj_fields : NULL,
-                          sc->proj_count, sc->fs, sc->csv_delim);
+                          sc->proj_count, sc->fs, sc->csv_delim, hdr2);
         } else if (sc->dict_fmt) {
             OUT("%s\"%s\":", sc->printed ? "," : "", keybuf);
             if (sc->proj_count > 0) {
@@ -1695,7 +1700,7 @@ static int stream_find_record_cb(const uint8_t hash16[16],
                 int first = 1;
                 for (int j = 0; j < sc->proj_count; j++) {
                     char *pv = json_projected_field((const char *)raw, (uint32_t)vlen,
-                                             sc->proj_fields[j], sc->fs);
+                                             sc->proj_fields[j], sc->fs, hdr2);
                     if (!pv) continue;
                     OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[j], pv);
                     first = 0;
@@ -1703,7 +1708,7 @@ static int stream_find_record_cb(const uint8_t hash16[16],
                 }
                 OUT("}");
             } else {
-                char *v = decode_value((const char *)raw, (uint32_t)vlen, sc->fs);
+                char *v = decode_value((const char *)raw, (uint32_t)vlen, sc->fs, hdr2);
                 OUT("%s", v);
                 free(v);
             }
@@ -1712,7 +1717,7 @@ static int stream_find_record_cb(const uint8_t hash16[16],
             int first = 1;
             for (int j = 0; j < sc->proj_count; j++) {
                 char *pv = json_projected_field((const char *)raw, (uint32_t)vlen,
-                                         sc->proj_fields[j], sc->fs);
+                                         sc->proj_fields[j], sc->fs, hdr2);
                 if (!pv) continue;
                 OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[j], pv);
                 first = 0;
@@ -1720,7 +1725,7 @@ static int stream_find_record_cb(const uint8_t hash16[16],
             }
             OUT("}}");
         } else {
-            char *v = decode_value((const char *)raw, (uint32_t)vlen, sc->fs);
+            char *v = decode_value((const char *)raw, (uint32_t)vlen, sc->fs, hdr2);
             OUT("%s{\"key\":\"%s\",\"value\":%s}", sc->printed ? "," : "", keybuf, v);
             free(v);
         }
@@ -1853,9 +1858,13 @@ static void bm_defer_drain_if_armed(bt_result_cb cb, SlotcaskDb *sdb) {
 
 /* Primary-leaf match for the chunked streaming executor — mirrors the
  * primary-check half of stream_find_cb so both executors agree on which
- * entries become fetch candidates. */
+ * entries become fetch candidates. Walked entries are stored BTRI keys:
+ * strip the tier byte and skip NULL-tier entries (§2.4.2, value-tier
+ * candidate production — same rule as index.c btri_value_tier_cb). */
 static int stream_primary_filter(const char *val, size_t vlen, void *raw_ctx) {
     StreamFindCtx *sc = (StreamFindCtx *)raw_ctx;
+    if (vlen == 0 || (uint8_t)val[0] != 0x00) return 0;
+    val++; vlen--;
     if (!sc->primary_crit || !sc->check_primary) return 1;
     if (op_is_length(sc->primary_crit->op))
         return match_length_vlen(vlen, sc->primary_crit) ? 1 : 0;
@@ -2224,7 +2233,7 @@ static int composite_prefix_cb(const char *val, size_t vlen,
 
     /* Post-filter: apply the full criteria tree (seed leaf trivially passes
        since we're inside its prefix; any extra AND leaves still need checking). */
-    if (c->tree && !criteria_match_tree(raw, value_len, c->tree, c->fs)) {
+    if (c->tree && !criteria_match_tree(raw, value_len, c->tree, c->fs, rr.hdr2)) {
         release_record_ref(&rr);
         return 0;
     }
@@ -2248,7 +2257,7 @@ static int composite_prefix_cb(const char *val, size_t vlen,
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
                 char *pv = json_projected_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs);
+                                        c->proj_fields[i], c->fs, rr.hdr2);
                 if (!pv) continue;
                 OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
@@ -2256,7 +2265,7 @@ static int composite_prefix_cb(const char *val, size_t vlen,
             }
             OUT("}");
         } else {
-            char *dv = decode_value((const char *)raw, value_len, c->fs);
+            char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
             OUT("%s", dv ? dv : "{}");
             free(dv);
         }
@@ -2265,7 +2274,7 @@ static int composite_prefix_cb(const char *val, size_t vlen,
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
             char *pv = json_projected_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs);
+                                    c->proj_fields[i], c->fs, rr.hdr2);
             if (!pv) continue;
             OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
@@ -2273,7 +2282,7 @@ static int composite_prefix_cb(const char *val, size_t vlen,
         }
         OUT("}}");
     } else {
-        char *dv = decode_value((const char *)raw, value_len, c->fs);
+        char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
         OUT("%s{\"key\":\"%s\",\"value\":%s}",
             c->printed ? "," : "", key_buf, dv ? dv : "{}");
         free(dv);
@@ -2287,7 +2296,7 @@ static int composite_prefix_cb(const char *val, size_t vlen,
 static int composite_prefix_record_cb(const uint8_t hash16[16],
                                        const void *key, size_t klen,
                                        const void *value, size_t vlen,
-                                       void *ctx) {
+                                       uint8_t hdr2, void *ctx) {
     (void)hash16;
     CompositePrefixCtx *c = (CompositePrefixCtx *)ctx;
     g_out = c->parent_out;
@@ -2298,7 +2307,7 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
         if (is_excluded(c->excluded, keybuf)) return 0;
     }
 
-    if (c->tree && !criteria_match_tree(value, vlen, c->tree, c->fs)) return 0;
+    if (c->tree && !criteria_match_tree(value, vlen, c->tree, c->fs, hdr2)) return 0;
 
     pthread_mutex_lock(&c->lock);
     if (c->skip_remaining > 0) {
@@ -2317,7 +2326,7 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
                 char *pv = json_projected_field((const char *)value, (uint32_t)vlen,
-                                        c->proj_fields[i], c->fs);
+                                        c->proj_fields[i], c->fs, hdr2);
                 if (!pv) continue;
                 OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
@@ -2325,7 +2334,7 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
             }
             OUT("}");
         } else {
-            char *dv = decode_value((const char *)value, (uint32_t)vlen, c->fs);
+            char *dv = decode_value((const char *)value, (uint32_t)vlen, c->fs, hdr2);
             OUT("%s", dv ? dv : "{}");
             free(dv);
         }
@@ -2334,7 +2343,7 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
             char *pv = json_projected_field((const char *)value, (uint32_t)vlen,
-                                    c->proj_fields[i], c->fs);
+                                    c->proj_fields[i], c->fs, hdr2);
             if (!pv) continue;
             OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
@@ -2342,7 +2351,7 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
         }
         OUT("}}");
     } else {
-        char *dv = decode_value((const char *)value, (uint32_t)vlen, c->fs);
+        char *dv = decode_value((const char *)value, (uint32_t)vlen, c->fs, hdr2);
         OUT("%s{\"key\":\"%s\",\"value\":%s}",
             c->printed ? "," : "", key_buf, dv ? dv : "{}");
         free(dv);
@@ -2452,16 +2461,21 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
                 if (lowv) {
                     uint8_t enc[1024]; size_t el = 0;
                     encode_criterion_value(ord_tf, lowv, strlen(lowv), enc, &el);
-                    if (pfx + el <= sizeof(lo)) {
-                        memcpy(lo + pfx, enc, el); len_lo = pfx + el;
+                    /* BTRI: the appended component needs its tier byte
+                       ([t1][v1][t2][v2], §2.4.2) — see the single-value
+                       fold below for the missed-range rationale. */
+                    if (pfx + 1 + el <= sizeof(lo)) {
+                        lo[pfx] = 0x00;
+                        memcpy(lo + pfx + 1, enc, el); len_lo = pfx + 1 + el;
                         min_excl = low_excl;
                     }
                 }
                 if (highv) {
                     uint8_t enc[1024]; size_t el = 0;
                     encode_criterion_value(ord_tf, highv, strlen(highv), enc, &el);
-                    if (pfx + el <= sizeof(hi)) {
-                        memcpy(hi + pfx, enc, el); len_hi = pfx + el;
+                    if (pfx + 1 + el <= sizeof(hi)) {
+                        hi[pfx] = 0x00;
+                        memcpy(hi + pfx + 1, enc, el); len_hi = pfx + 1 + el;
                         max_excl = high_excl;
                     }
                 }
@@ -2471,10 +2485,16 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
                 CompositeRangeStorage *storage = &range_storage[ci];
                 build_idx_path(storage->path, sizeof(storage->path),
                                db_root, object, composite_field, s);
-                memcpy(storage->lo, lo, len_lo);
-                storage->lo_len = len_lo;
-                memcpy(storage->hi, hi, len_hi);
-                storage->hi_len = len_hi;
+                /* BTRI: this walk calls btree_walk_ordered_ranges directly
+                   — no tier-prefixing wrapper — so every bound needs its
+                   own leading tier byte to compare against stored
+                   [0x00][payload…] keys. */
+                storage->lo[0] = 0x00;
+                memcpy(storage->lo + 1, lo, len_lo);
+                storage->lo_len = len_lo + 1;
+                storage->hi[0] = 0x00;
+                memcpy(storage->hi + 1, hi, len_hi);
+                storage->hi_len = len_hi + 1;
 
                 ranges[ci].path = storage->path;
                 ranges[ci].min_val = (const char *)storage->lo;
@@ -2571,18 +2591,24 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
         if (lowv) {
             uint8_t enc[1024]; size_t el = 0;
             encode_criterion_value(ord_tf, lowv, strlen(lowv), enc, &el);
-            if (pfx_len + el <= sizeof(buf_lo_sv)) {
-                memcpy(buf_lo_sv + pfx_len, enc, el);
-                len_lo_sv = pfx_len + el;
+            /* BTRI composite keys interleave a tier byte before EVERY
+               component ([t1][v1][t2][v2], §2.4.2) — the appended order_by
+               encoding needs its own 0x00 or the seek's payload byte
+               compares against stored tier bytes and the range misses. */
+            if (pfx_len + 1 + el <= sizeof(buf_lo_sv)) {
+                buf_lo_sv[pfx_len] = 0x00;
+                memcpy(buf_lo_sv + pfx_len + 1, enc, el);
+                len_lo_sv = pfx_len + 1 + el;
                 min_excl = low_excl;
             }
         }
         if (highv) {
             uint8_t enc[1024]; size_t el = 0;
             encode_criterion_value(ord_tf, highv, strlen(highv), enc, &el);
-            if (pfx_len + el <= sizeof(buf_hi)) {
-                memcpy(buf_hi + pfx_len, enc, el);
-                len_hi = pfx_len + el;
+            if (pfx_len + 1 + el <= sizeof(buf_hi)) {
+                buf_hi[pfx_len] = 0x00;
+                memcpy(buf_hi + pfx_len + 1, enc, el);
+                len_hi = pfx_len + 1 + el;
                 max_excl = high_excl;
             }
         }
@@ -2845,7 +2871,7 @@ static int order_index_walk_cb(const char *val, size_t vlen,
 
     /* Post-filter: apply the FULL criteria tree — unlike D1 nothing is
        guaranteed to match by the walk range alone. */
-    if (c->tree && !criteria_match_tree(raw, value_len, c->tree, c->fs)) {
+    if (c->tree && !criteria_match_tree(raw, value_len, c->tree, c->fs, rr.hdr2)) {
         release_record_ref(&rr);
         return 0;
     }
@@ -2869,7 +2895,7 @@ static int order_index_walk_cb(const char *val, size_t vlen,
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
                 char *pv = json_projected_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs);
+                                        c->proj_fields[i], c->fs, rr.hdr2);
                 if (!pv) continue;
                 OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
@@ -2877,7 +2903,7 @@ static int order_index_walk_cb(const char *val, size_t vlen,
             }
             OUT("}");
         } else {
-            char *dv = decode_value((const char *)raw, value_len, c->fs);
+            char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
             OUT("%s", dv ? dv : "{}");
             free(dv);
         }
@@ -2886,7 +2912,7 @@ static int order_index_walk_cb(const char *val, size_t vlen,
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
             char *pv = json_projected_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs);
+                                    c->proj_fields[i], c->fs, rr.hdr2);
             if (!pv) continue;
             OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
@@ -2894,7 +2920,7 @@ static int order_index_walk_cb(const char *val, size_t vlen,
         }
         OUT("}}");
     } else {
-        char *dv = decode_value((const char *)raw, value_len, c->fs);
+        char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
         OUT("%s{\"key\":\"%s\",\"value\":%s}",
             c->printed ? "," : "", key_buf, dv ? dv : "{}");
         free(dv);
@@ -2921,14 +2947,18 @@ static int find_via_order_index_walk(const char *db_root, const char *object,
 {
     /* Bound the walk by any range/eq leaf on order_by so a sparse windowed
        query stops at the window instead of scanning the whole index. The
-       per-record criteria_match_tree still runs, so this only narrows the walk. */
+       per-record criteria_match_tree still runs, so this only narrows the
+       walk. Unbounded sides pass through OPEN (NULL,0): the ordered walk
+       must deliver NULL-tier rows at the ASC tail / DESC head (§2.5) — the
+       legacy \xff*4 sentinel would ride btree_idx_walk_ordered's [0x00]
+       prefix and clamp the walk below the NULL tier. */
     OrderWalkBounds owb;
     order_walk_bounds(tree, fs, order_by, &owb);
-    const char *lo = owb.has_lo ? (const char *)owb.lo : "";
+    const char *lo = owb.has_lo ? (const char *)owb.lo : NULL;
     size_t      lo_len  = owb.has_lo ? owb.lo_len  : 0;
     int         lo_excl = owb.has_lo ? owb.lo_excl : 0;
-    const char *hi = owb.has_hi ? (const char *)owb.hi : "\xff\xff\xff\xff";
-    size_t      hi_len  = owb.has_hi ? owb.hi_len  : 4;
+    const char *hi = owb.has_hi ? (const char *)owb.hi : NULL;
+    size_t      hi_len  = owb.has_hi ? owb.hi_len  : 0;
     int         hi_excl = owb.has_hi ? owb.hi_excl : 0;
 
     /* Set up the callback context. */
@@ -3646,6 +3676,17 @@ int pick_index_for_leaf(const char *db_root, const char *object,
     int has_bitmap  = field_has_index_type(db_root, object, c->field, IT_BITMAP);
     int has_trigram = field_has_index_type(db_root, object, c->field, IT_TRIGRAM);
 
+    /* §2.4.2: btree exists drives the tier-0 walk + per-record verify.
+       Bitmap/trigram cannot enumerate existence (no "any bit set" bitmap
+       entry; trigram postings are substring-shaped — and a legacy midnight
+       or zero date would ride its value bitmap straight past the
+       query-existence predicate), so those full-scan. */
+    if (c->op == OP_EXISTS) {
+        return (has_btree && btree_idx_exists(db_root, object, c->field,
+                                              sch.splits))
+               ? IT_BTREE : -1;
+    }
+
     if (op_prefers_trigram(c->op)) {
         size_t plen = strlen(c->value);
         if (has_btree && plen < TG_PREFER_BTREE_LEN) {
@@ -3787,11 +3828,10 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
                                         const TypedField *tf,
                                         QueryDeadline *dl) {
     /* Bitmap serves eq and IN through the fast value-walk; everything
-       else (range, LIKE, CONTAINS, REGEX, len_X, exists, i-variants)
-       goes through the generic dict-scan path below — matches btree
-       parity: any indexed op routes through index files, never falls
-       back to a data-shard scan. NEQ + NOT_IN arrive here pre-inverted
-       by the count-mode subtraction shortcut (op_invert → eq/IN). */
+       else (range, LIKE, CONTAINS, REGEX, len_X, exists, i-variants,
+       NEQ, NOT_IN) goes through the generic dict-scan path below —
+       matches btree parity: any indexed op routes through index files,
+       never falls back to a data-shard scan. */
     if (leaf->op != OP_EQUAL && leaf->op != OP_IN) {
         Schema sc_g = load_schema(db_root, object);
         SlotcaskSchemaInfo info_g = {
@@ -4861,17 +4901,19 @@ typedef struct {
     size_t   n;
     uint8_t **keys; size_t *klens;
     uint8_t **vals; size_t *vlens;
+    uint8_t *hdr2s;             /* per-record generation byte */
     int     *found;
 } KefFetchCtx;
 
 static int kef_fetch_cb(const uint8_t hash16[16],
                          const void *key, size_t klen,
                          const void *value, size_t vlen,
-                         void *ctx_ptr) {
+                         uint8_t hdr2, void *ctx_ptr) {
     KefFetchCtx *c = (KefFetchCtx *)ctx_ptr;
     for (size_t i = 0; i < c->n; i++) {
         if (memcmp(hash16, c->hashes[i], 16) == 0) {
             c->keys[i] = malloc(klen);
+            c->hdr2s[i] = hdr2;
             if (c->keys[i]) { memcpy(c->keys[i], key, klen); c->klens[i] = klen; }
             c->vals[i] = malloc(vlen);
             if (c->vals[i]) { memcpy(c->vals[i], value, vlen); c->vlens[i] = vlen; }
@@ -4935,15 +4977,16 @@ static int keyset_emit_find(const char *db_root, const char *object,
     uint8_t **fkeys = calloc(n_fetch, sizeof(*fkeys));
     size_t  *fklens = calloc(n_fetch, sizeof(*fklens));
     uint8_t **fvals = calloc(n_fetch, sizeof(*fvals));
+    uint8_t *fhdr2s = calloc(n_fetch, sizeof(*fhdr2s));
     size_t  *fvlens = calloc(n_fetch, sizeof(*fvlens));
     int     *ffound = calloc(n_fetch, sizeof(*ffound));
     if (!fkeys || !fklens || !fvals || !fvlens || !ffound) {
         free(hashes); free(key_to_fetch);
-        free(fkeys); free(fklens); free(fvals); free(fvlens); free(ffound);
+        free(fkeys); free(fklens); free(fvals); free(fvlens); free(fhdr2s); free(ffound);
         return 0;
     }
 
-    KefFetchCtx fctx = { hashes, n_fetch, fkeys, fklens, fvals, fvlens, ffound };
+    KefFetchCtx fctx = { hashes, n_fetch, fkeys, fklens, fvals, fvlens, fhdr2s, ffound };
 
 #define KEF_BATCH 1024
     {
@@ -4979,7 +5022,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
 
             const uint8_t *raw = fvals[fi];
             uint32_t value_len = (uint32_t)fvlens[fi];
-            if (need_rematch && !criteria_match_tree(raw, value_len, tree, fs)) continue;
+            if (need_rematch && !criteria_match_tree(raw, value_len, tree, fs, fhdr2s[fi])) continue;
 
             {  /* Single-iteration block — no probe loop in the dispatched path. */
 
@@ -4997,7 +5040,8 @@ static int keyset_emit_find(const char *db_root, const char *object,
                         for (int i = 0; i < njoins; i++) {
                             char lk[1024];
                             int llen = extract_local_key(&joins[i], raw, (size_t)value_len,
-                                                         fs ? fs->ts : NULL, lk, sizeof(lk));
+                                                         fs ? fs->ts : NULL,
+                                                         fhdr2s[fi], lk, sizeof(lk));
                             int jfound = 0;
                             if (llen > 0) {
                                 jfound = lookup_remote(&joins[i], db_root, lk, (size_t)llen,
@@ -5015,7 +5059,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                         if (njoins > 0 && csv_delim) {
                             char buf[16384];
                             size_t n = build_joined_csv_row(
-                                keybuf, raw, (size_t)value_len, fs,
+                                keybuf, raw, (size_t)value_len, fs, fhdr2s[fi],
                                 proj_count > 0 ? proj_fields : NULL, proj_count,
                                 joins, njoins, jrr, csv_delim,
                                 buf, sizeof(buf));
@@ -5027,7 +5071,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             size_t wrote = buf_driver_values(
                                                 raw, (size_t)value_len, fs,
                                                 proj_count > 0 ? proj_fields : NULL,
-                                                proj_count,
+                                                proj_count, fhdr2s[fi],
                                                 buf + pos, sizeof(buf) - pos);
                             pos += wrote;
                             if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
@@ -5042,6 +5086,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                                         SB_APPEND(buf, pos, sizeof(buf), ",null");
                                 } else {
                                     wrote = buf_join_values(&joins[i], jraws[i], jrr[i].vlen,
+                                                            jrr[i].hdr2,
                                                             buf + pos, sizeof(buf) - pos);
                                     pos += wrote;
                                     if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
@@ -5052,22 +5097,22 @@ static int keyset_emit_find(const char *db_root, const char *object,
                         } else if (csv_delim) {
                             csv_emit_row(keybuf, raw, value_len,
                                          proj_count > 0 ? proj_fields : NULL,
-                                         proj_count, fs, csv_delim);
+                                         proj_count, fs, csv_delim, fhdr2s[fi]);
                         } else if (rows_fmt) {
                             OUT("%s[\"%s\"", printed ? "," : "", keybuf);
                             if (proj_count > 0) {
                                 for (int j = 0; j < proj_count; j++) {
                                     char *pv = json_projected_field((const char *)raw, value_len,
-                                                            proj_fields[j], fs);
+                                                            proj_fields[j], fs, fhdr2s[fi]);
                                     OUT(",%s", pv ? pv : "\"\"");
                                     free(pv);
                                 }
                             } else if (fs && fs->ts) {
                                 for (int j = 0; j < fs->ts->nfields; j++) {
                                     if (fs->ts->fields[j].removed) continue;
-                                    char *pv = json_projected_value(
-                                        typed_get_field_str(fs->ts, raw, (int)value_len, j),
-                                        &fs->ts->fields[j]);
+                                    char *pv = json_typed_row_cell(fs->ts, raw,
+                                                                   (int)value_len, j,
+                                                                   fhdr2s[fi]);
                                     OUT(",%s", pv ? pv : "\"\"");
                                     free(pv);
                                 }
@@ -5080,7 +5125,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                                 int first = 1;
                                 for (int j = 0; j < proj_count; j++) {
                                     char *pv = json_projected_field((const char *)raw, value_len,
-                                                            proj_fields[j], fs);
+                                                            proj_fields[j], fs, fhdr2s[fi]);
                                     if (!pv) continue;
                                     OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
                                     first = 0;
@@ -5088,7 +5133,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                                 }
                                 OUT("}");
                             } else {
-                                char *v = decode_value((const char *)raw, value_len, fs);
+                                char *v = decode_value((const char *)raw, value_len, fs, fhdr2s[fi]);
                                 OUT("%s", v);
                                 free(v);
                             }
@@ -5097,7 +5142,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             int first = 1;
                             for (int j = 0; j < proj_count; j++) {
                                 char *pv = json_projected_field((const char *)raw, value_len,
-                                                        proj_fields[j], fs);
+                                                        proj_fields[j], fs, fhdr2s[fi]);
                                 if (!pv) continue;
                                 OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
                                 first = 0;
@@ -5105,7 +5150,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
                             }
                             OUT("}}");
                         } else {
-                            char *v = decode_value((const char *)raw, value_len, fs);
+                            char *v = decode_value((const char *)raw, value_len, fs, fhdr2s[fi]);
                             OUT("%s{\"key\":\"%s\",\"value\":%s}", printed ? "," : "", keybuf, v);
                             free(v);
                         }
@@ -5126,7 +5171,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
         free(fkeys[i]); free(fvals[i]);
     }
     free(hashes); free(key_to_fetch);
-    free(fkeys); free(fklens); free(fvals); free(fvlens); free(ffound);
+    free(fkeys); free(fklens); free(fvals); free(fvlens); free(fhdr2s); free(ffound);
 
     return printed;
 }
@@ -5227,11 +5272,11 @@ typedef struct {
 static int or_count_batch_cb(const uint8_t hash16[16],
                               const void *key, size_t klen,
                               const void *value, size_t vlen,
-                              void *ctx_ptr) {
+                              uint8_t hdr2, void *ctx_ptr) {
     (void)hash16; (void)key; (void)klen;
     OrCountCtx *c = (OrCountCtx *)ctx_ptr;
     if (query_deadline_tick(c->dl, &c->dl_counter)) return 1;
-    if (criteria_match_tree((const uint8_t *)value, vlen, c->tree, c->fs))
+    if (criteria_match_tree((const uint8_t *)value, vlen, c->tree, c->fs, hdr2))
         __sync_fetch_and_add(&c->count, 1);
     return 0;
 }
@@ -5269,7 +5314,7 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
                 if (ks->state[b] != 2) continue;
                 RecordRef rr;
                 if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
-                if (criteria_match_tree(rr.val, rr.vlen, tree, fs)) n++;
+                if (criteria_match_tree(rr.val, rr.vlen, tree, fs, rr.hdr2)) n++;
                 release_record_ref(&rr);
             }
             keyset_free(ks);
@@ -5512,58 +5557,11 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
 
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
 
-    {
-        CriteriaNode *exists_leaf = NULL;
-        if (tree->kind == CNODE_LEAF) exists_leaf = tree;
-        else if (tree->kind == CNODE_AND && tree->n_children == 1 &&
-                 tree->children[0]->kind == CNODE_LEAF)
-            exists_leaf = tree->children[0];
-        if (exists_leaf && fs.ts &&
-            (exists_leaf->leaf.op == OP_EXISTS ||
-             exists_leaf->leaf.op == OP_NOT_EXISTS)) {
-            int fi = typed_field_index(fs.ts, exists_leaf->leaf.field);
-            if (fi >= 0 && fs.ts->fields[fi].type != FT_VARCHAR) {
-                int total = get_live_count(db_root, object);
-                OUT("%d\n", exists_leaf->leaf.op == OP_EXISTS ? total : 0);
-                return 0;
-            }
-            if (fi >= 0 && fs.ts->fields[fi].type == FT_VARCHAR &&
-                exists_leaf->leaf.op == OP_NOT_EXISTS &&
-                btree_idx_exists(db_root, object, exists_leaf->leaf.field,
-                                 sch.splits)) {
-                SearchCriterion pos = exists_leaf->leaf;
-                pos.op = OP_EXISTS;
-                size_t pos_n = idx_count_for_leaf(db_root, object, &sch,
-                                                  &fs, &pos, &dl);
-                if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-                else {
-                    int total = get_live_count(db_root, object);
-                    size_t neg = ((size_t)total > pos_n)
-                                  ? (size_t)total - pos_n : 0;
-                    OUT("%zu\n", neg);
-                }
-                return 0;
-            }
-        }
-
-        if (exists_leaf && fs.ts &&
-            (exists_leaf->leaf.op == OP_IN || exists_leaf->leaf.op == OP_NOT_IN)) {
-            int fi = typed_field_index(fs.ts, exists_leaf->leaf.field);
-            if (fi >= 0 && fs.ts->fields[fi].type == FT_BOOL) {
-                int saw_t = 0, saw_f = 0;
-                for (int k = 0; k < exists_leaf->leaf.in_count; k++) {
-                    char c0 = exists_leaf->leaf.in_values[k][0];
-                    if (c0 == 't' || c0 == 'T' || c0 == '1') saw_t = 1;
-                    else                                     saw_f = 1;
-                }
-                if (saw_t && saw_f) {
-                    int total = get_live_count(db_root, object);
-                    OUT("%d\n", exists_leaf->leaf.op == OP_IN ? total : 0);
-                    return 0;
-                }
-            }
-        }
-    }
+    /* No count shortcuts: exists/not_exists/bool-in/metadata complements
+       all bypassed per-record NULL matching (a NULL field is neither a
+       positive nor a negative value match). Every predicate count routes
+       through the planner + generation-correct per-record verification,
+       same as find. Empty criteria keeps its O(1) metadata path. */
 
     size_t N_live = (size_t)get_live_count(db_root, object);
     FilterPlan fp = plan_filter(tree, db_root, object, &fs, sch.splits,
@@ -5582,18 +5580,7 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
 
         const TypedField *pc_tf = resolve_idx_field(fs.ts, pc->field);
 
-        if (is_single_leaf && op_is_negatable(op)) {
-            SearchCriterion pos = *pc;
-            pos.op = op_invert(op);
-            size_t pos_count = idx_count_for_leaf(db_root, object, &sch,
-                                                  &fs, &pos, &dl);
-            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-            else {
-                int total = get_live_count(db_root, object);
-                size_t neg = ((size_t)total > pos_count) ? (size_t)total - pos_count : 0;
-                OUT("%zu\n", neg);
-            }
-        } else if (is_single_leaf) {
+        if (is_single_leaf) {
             size_t count = idx_count_for_leaf(db_root, object, &sch,
                                               &fs, pc, &dl);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
@@ -5987,6 +5974,7 @@ typedef struct {
     size_t key_len;
     uint8_t *record;        /* malloc'd copy of [key bytes | value bytes] */
     size_t value_len;       /* length of the value portion */
+    uint8_t hdr2;           /* record generation (SREC_FLAG_NULLMAP) */
     RowSortKey keys[MAX_ORDER_FIELDS];
     int nsort;
 } OrderedRow;
@@ -6021,6 +6009,43 @@ typedef struct {
     pthread_mutex_t lock;
 } OrderedCollectCtx;
 
+/* §2.7: typed_field_to_index_key expects the field-region base; record
+   bytes sit nullmap_prefix in for nullmap generations. Resolve via the
+   record's own view, then encode. Zero-length output = view rejected the
+   record (corrupt) — callers treat it as the empty-key case.
+   §2.5/Task 8d: the output is the FULL tiered index key — [0x00][payload]
+   for values, the bare [0x01] byte for NULL — byte-identical to what the
+   btree stores, so buffered-sort keys interoperate with the cursor
+   resume compare and NULL rows order past values exactly like the index. */
+static void typed_field_to_index_key_rec(const TypedSchema *ts,
+                                         const uint8_t *record,
+                                         size_t record_len, uint8_t hdr2,
+                                         int field_idx,
+                                         uint8_t *out, size_t *out_len) {
+    const uint8_t *fbase = record;
+    size_t region = record_len;
+    const uint8_t *bm = NULL;
+    int bm_bytes = 0;
+    if (hdr2) {
+        if (typed_record_view(record, record_len, hdr2, &fbase, &bm,
+                              &bm_bytes, &region) != 0) {
+            *out_len = 0;
+            return;
+        }
+    }
+    if ((hdr2 & SREC_FLAG_NULLMAP) && field_idx >= 0 &&
+        typed_field_null(bm, bm_bytes, field_idx)) {
+        out[0] = 0x01;
+        *out_len = 1;
+        return;
+    }
+    out[0] = 0x00;
+    size_t blen = 0;
+    typed_field_to_index_key(ts, fbase, region, field_idx,
+                             out + 1, &blen);
+    *out_len = blen + 1;
+}
+
 static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
     OrderedCollectCtx *oc = (OrderedCollectCtx *)ctx;
     /* coverity[lock_evasion] coverity[missing_lock] intentional fast-skip —
@@ -6042,7 +6067,7 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
     if (is_excluded(oc->excluded, keybuf)) return 0;
 
     const uint8_t *raw = block + hdr->key_len;
-    if (!criteria_match_tree(raw, hdr->value_len, oc->tree, oc->fs)) return 0;
+    if (!criteria_match_tree(raw, hdr->value_len, oc->tree, oc->fs, (uint8_t)(hdr->flag >> 8))) return 0;
 
     /* Extract per-part sort keys (see RowSortKey: typed parts use their
        index-key encoding, the legacy untyped single field its decoded
@@ -6060,9 +6085,10 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
             size_t cap = (size_t)p->tf->size > 16 ? (size_t)p->tf->size : 16;
             sv[i].key = malloc(cap);
             if (sv[i].key) {
-                typed_field_to_index_key(oc->fs->ts, raw,
-                                         (size_t)hdr->value_len, p->idx,
-                                         sv[i].key, &sv[i].key_len);
+                typed_field_to_index_key_rec(oc->fs->ts, raw,
+                                             (size_t)hdr->value_len,
+                                             (uint8_t)(hdr->flag >> 8), p->idx,
+                                             sv[i].key, &sv[i].key_len);
                 /* A zero-length key is valid — an empty varchar encodes to
                    no content bytes — and must compare against non-empty
                    values, never collapse to the legacy-string path. */
@@ -6071,7 +6097,8 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
         } else if (i == 0) {
             /* legacy single-field fallback (untyped/unknown name) */
             sv[0].str = decode_field((const char *)raw, hdr->value_len,
-                                     oc->order_field_name, oc->fs);
+                                     oc->order_field_name, oc->fs,
+                                     (uint8_t)(hdr->flag >> 8));
             if (sv[0].str) sv_bytes += strlen(sv[0].str) + 1;
         }
     }
@@ -6108,6 +6135,7 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
     memcpy(r->key, block, hdr->key_len);
     r->key[hdr->key_len] = '\0';
     r->value_len = hdr->value_len;
+    r->hdr2 = (uint8_t)(hdr->flag >> 8);   /* emit re-decodes with it */
     r->record = malloc(rec_len);
     memcpy(r->record, block, rec_len);
     r->nsort = oc->nsort;
@@ -6168,6 +6196,8 @@ typedef struct {
     int    present;
     int    nparts;
     struct { char value[1024]; size_t vlen; } part[MAX_ORDER_FIELDS];
+    int    part_tier[MAX_ORDER_FIELDS]; /* §2.5: per-field tier byte (v2 tokens) */
+    int    version;                     /* 1 = legacy (all tiers 0), 2 = tiered */
     char   key[1024];        /* primary key string */
     size_t klen;
 } FindCursor;
@@ -6206,6 +6236,17 @@ static int parse_cursor_object(const char *cursor_json, const char *order_by,
     }
     if (!saw_any_pair) return 0;                     /* page 1, empty object */
 
+    /* Token version (§2.5): "v":2 tokens carry a per-field "tiers" array
+       ([0x00] value / [0x01] NULL per order_by component). Legacy tokens
+       (no "v") imply tier 0 for every part. Unknown versions fail closed. */
+    /* Tiered tokens carry a per-field "tiers" array; its PRESENCE is the
+       v2 discriminator — a bare "v" version key would collide with an
+       order_by field literally named "v" (the mini JSON helpers
+       first-match keys). Legacy tokens (no "tiers") imply tier 0 for
+       every part. Malformed tier arrays fail closed. */
+    out->version = strstr(cursor_json, "\"tiers\"") ? 2 : 1;
+    for (int i = 0; i < MAX_ORDER_FIELDS; i++) out->part_tier[i] = 0;
+
     char *kv = json_obj_strdup(&c, "key");
     if (!kv || !kv[0]) { free(kv); *err = "cursor missing 'key' field"; return -1; }
     size_t klen = strlen(kv);
@@ -6233,6 +6274,30 @@ static int parse_cursor_object(const char *cursor_json, const char *order_by,
         free(vv);
     }
     out->nparts = nparts;
+    if (out->version == 2) {
+        /* §2.5 tiered tokens: parse "tiers":[0|1,...] — one entry per
+           order_by part, fail-closed on shape errors. */
+        const char *tiers_key = strstr(cursor_json, "\"tiers\"");
+        if (!tiers_key) { *err = "cursor missing 'tiers' array"; return -1; }
+        const char *arr = strchr(tiers_key + 8, '[');
+        const char *arr_end = arr ? strchr(arr, ']') : NULL;
+        if (!arr || !arr_end) { *err = "cursor malformed 'tiers' array"; return -1; }
+        int ti = 0;
+        for (const char *q = arr + 1; q <= arr_end; q++) {
+            if (*q == '0' || *q == '1') {
+                if (ti >= nparts) { *err = "cursor 'tiers' arity mismatch"; return -1; }
+                out->part_tier[ti++] = (*q == '1');
+            } else if (*q == ',' || *q == ' ' || *q == '\t') {
+                continue;
+            } else if (*q == ']') {
+                break;
+            } else {
+                *err = "cursor 'tiers' entries must be 0 or 1";
+                return -1;
+            }
+        }
+        if (ti != nparts) { *err = "cursor 'tiers' arity mismatch"; return -1; }
+    }
 
     out->present = 1;
     return 0;
@@ -6273,6 +6338,7 @@ typedef struct {
     /* Captured last-emitted cursor: one JSON-escaped string per order_by
        part. Heap-owned, freed by caller. */
     char          *last_value[MAX_ORDER_FIELDS];
+    int            last_tiers[MAX_ORDER_FIELDS]; /* §2.5 per-part tier of the last emitted row */
     char          *last_key_str;
 
     /* Multi-field order_by parts (single-field paths: n == 1). NULL on
@@ -6332,12 +6398,19 @@ static int cursor_find_cb(const char *val, size_t vlen,
        cursor.value OR (value == cursor.value AND hash16 > cursor.hash16).
        Mirror-flip for DESC. */
     if (c->has_cursor) {
-        /* Length-aware compare: memcmp up to min length, then length tiebreak. */
-        size_t mlen = vlen < c->cursor_value_len ? vlen : c->cursor_value_len;
-        int vcmp = memcmp(val, c->cursor_value_bytes, mlen);
-        if (vcmp == 0) {
-            if (vlen < c->cursor_value_len) vcmp = -1;
-            else if (vlen > c->cursor_value_len) vcmp = 1;
+        /* §2.5: walked keys and cursor bytes share the same tiered shape
+           ([t1][v1][t2][v2]; NULL component = tier byte, no payload), so
+           the length-aware memcmp compares tuples exactly — including
+           NULL components — and the hash16 tiebreak resolves tie groups
+           (rows sharing the full order_by tuple) in both directions. */
+        int vcmp;
+        {
+            size_t mlen = vlen < c->cursor_value_len ? vlen : c->cursor_value_len;
+            vcmp = memcmp(val, c->cursor_value_bytes, mlen);
+            if (vcmp == 0) {
+                if (vlen < c->cursor_value_len) vcmp = -1;
+                else if (vlen > c->cursor_value_len) vcmp = 1;
+            }
         }
         if (!c->desc) {
             if (vcmp < 0) return 0;                     /* shouldn't happen with range bounds */
@@ -6389,7 +6462,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
        stays correct because the btree walk only visits entries that would
        pass a range/eq on the indexed field, and range checks in the tree
        agree with the range in the walk. */
-    if (c->remaining && !criteria_match_tree(raw, value_len, c->remaining, c->fs)) {
+    if (c->remaining && !criteria_match_tree(raw, value_len, c->remaining, c->fs, rr.hdr2)) {
         release_record_ref(&rr);
         return 0;
     }
@@ -6413,16 +6486,15 @@ static int cursor_find_cb(const char *val, size_t vlen,
         if (c->proj_count > 0) {
             for (int i = 0; i < c->proj_count; i++) {
                 char *pv = json_projected_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs);
+                                        c->proj_fields[i], c->fs, rr.hdr2);
                 OUT(",%s", pv ? pv : "\"\"");
                 free(pv);
             }
         } else if (c->fs && c->fs->ts) {
             for (int i = 0; i < c->fs->ts->nfields; i++) {
                 if (c->fs->ts->fields[i].removed) continue;
-                char *pv = json_projected_value(
-                    typed_get_field_str(c->fs->ts, raw, (int)value_len, i),
-                    &c->fs->ts->fields[i]);
+                char *pv = json_typed_row_cell(c->fs->ts, raw,
+                                               (int)value_len, i, rr.hdr2);
                 OUT(",%s", pv ? pv : "\"\"");
                 free(pv);
             }
@@ -6435,7 +6507,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
             int first = 1;
             for (int i = 0; i < c->proj_count; i++) {
                 char *pv = json_projected_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs);
+                                        c->proj_fields[i], c->fs, rr.hdr2);
                 if (!pv) continue;
                 OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
                 first = 0;
@@ -6443,7 +6515,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
             }
             OUT("}");
         } else {
-            char *dv = decode_value((const char *)raw, value_len, c->fs);
+            char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
             OUT("%s", dv ? dv : "{}");
             free(dv);
         }
@@ -6452,7 +6524,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
         int first = 1;
         for (int i = 0; i < c->proj_count; i++) {
             char *pv = json_projected_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs);
+                                    c->proj_fields[i], c->fs, rr.hdr2);
             if (!pv) continue;
             OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
             first = 0;
@@ -6460,7 +6532,7 @@ static int cursor_find_cb(const char *val, size_t vlen,
         }
         OUT("}}");
     } else {
-        char *dv = decode_value((const char *)raw, value_len, c->fs);
+        char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
         OUT("%s{\"key\":\"%s\",\"value\":%s}",
             c->printed ? "," : "", key_buf, dv ? dv : "{}");
         free(dv);
@@ -6477,10 +6549,23 @@ static int cursor_find_cb(const char *val, size_t vlen,
     /* Decode each part from the fetched record (never from index bytes).
        c->ospec is NULL only on paths that never emit a token. */
     if (c->ospec && c->fs && c->fs->ts) {
+        /* §2.5: capture each part's NULL tier from the record bitmap so
+           the v2 token reconstructs the tiered resume key exactly. */
+        const uint8_t *tbm = NULL; int tbm_bytes = 0;
+        if (rr.hdr2 & SREC_FLAG_NULLMAP) {
+            const uint8_t *tbase = NULL; size_t tregion = 0;
+            (void)typed_record_view(raw, value_len, rr.hdr2, &tbase, &tbm,
+                                    &tbm_bytes, &tregion);
+        }
         for (int i = 0; i < c->ospec->n; i++) {
             c->last_value[i] = json_escape_field(
                 typed_get_field_str(c->fs->ts, raw, (int)value_len,
-                                    c->ospec->parts[i].idx));
+                                    c->ospec->parts[i].idx, rr.hdr2));
+            c->last_tiers[i] =
+                ((rr.hdr2 & SREC_FLAG_NULLMAP) &&
+                 c->ospec->parts[i].idx >= 0 &&
+                 typed_field_null(tbm, tbm_bytes,
+                                  c->ospec->parts[i].idx)) ? 1 : 0;
         }
     }
     c->last_key_str = strndup(key_buf, klen);
@@ -6584,7 +6669,7 @@ typedef struct {
 static int d2_batch_cb(const uint8_t hash16[16],
                         const void *key, size_t klen,
                         const void *value, size_t vlen,
-                        void *ctx_ptr) {
+                        uint8_t hdr2, void *ctx_ptr) {
     (void)key; (void)klen;
     D2BatchCtx *ctx = (D2BatchCtx *)ctx_ptr;
     if (ctx->deadline && query_deadline_tick(ctx->deadline, ctx->dl_counter)) return 1;
@@ -6600,17 +6685,17 @@ static int d2_batch_cb(const uint8_t hash16[16],
 
     /* Run criteria match tree on this record */
     if (ctx->tree && !criteria_match_tree((const uint8_t *)value, vlen,
-                                           ctx->tree, ctx->fs))
+                                           ctx->tree, ctx->fs, hdr2))
         return 0;  /* reject — leave passed[i]=0 */
 
     /* Pass: extract sort key at the ORIGINAL row position.
        Compaction happens after all callbacks complete (see call site). */
     ctx->passed[i] = 1;
     __sync_fetch_and_add(ctx->n_kept, 1);
-    typed_field_to_index_key(ctx->ts, (const uint8_t *)value, vlen,
-                             ctx->order_field_idx,
-                             ctx->rows[i].sort_key,
-                             &ctx->rows[i].sort_key_len);
+    typed_field_to_index_key_rec(ctx->ts, (const uint8_t *)value, vlen, hdr2,
+                                 ctx->order_field_idx,
+                                 ctx->rows[i].sort_key,
+                                 &ctx->rows[i].sort_key_len);
     return 0;
 }
 
@@ -6668,13 +6753,13 @@ typedef struct {
 static int cursor_fetch_cb(const uint8_t hash[16],
                             const void *key, size_t klen,
                             const void *value, size_t vlen,
-                            void *ctx_ptr) {
+                            uint8_t hdr2, void *ctx_ptr) {
     (void)key; (void)klen;
     CursorFetchCtx *ctx = (CursorFetchCtx *)ctx_ptr;
     if (query_deadline_tick(ctx->deadline, &ctx->dl_counter)) return 1;
 
     if (ctx->tree && !criteria_match_tree((const uint8_t *)value, vlen,
-                                           ctx->tree, ctx->fs))
+                                           ctx->tree, ctx->fs, hdr2))
         return 0;
 
     /* Append to results array */
@@ -6695,9 +6780,9 @@ static int cursor_fetch_cb(const uint8_t hash[16],
     }
     SmallPrefilterRow *row = &ctx->results[ctx->result_count++];
     memcpy(row->hash, hash, 16);
-    typed_field_to_index_key(ctx->ts, (const uint8_t *)value, vlen,
-                             ctx->order_field_idx,
-                             row->sort_key, &row->sort_key_len);
+    typed_field_to_index_key_rec(ctx->ts, (const uint8_t *)value, vlen, hdr2,
+                                 ctx->order_field_idx,
+                                 row->sort_key, &row->sort_key_len);
     pthread_mutex_unlock(&ctx->lock);
     return 0;
 }
@@ -6896,12 +6981,12 @@ static void d2_topn_push(SmallPrefilterRow *heap, int *n, int cap,
 static int fetch_sort_batch_cb(const uint8_t hash16[16],
                                 const void *key, size_t klen,
                                 const void *value, size_t vlen,
-                                void *ctx_ptr) {
+                                uint8_t hdr2, void *ctx_ptr) {
     FetchSortCtx *c = (FetchSortCtx *)ctx_ptr;
     if (query_deadline_tick(c->dl, &c->dl_counter)) return 1;
 
     if (c->tree && !criteria_match_tree((const uint8_t *)value, vlen,
-                                         c->tree, c->fs)) return 0;
+                                         c->tree, c->fs, hdr2)) return 0;
     if (c->excluded && c->excluded->count > 0) {
         char keybuf[1100];
         format_query_wire_key(c->fs, key, klen, keybuf);
@@ -6912,9 +6997,9 @@ static int fetch_sort_batch_cb(const uint8_t hash16[16],
 
     SmallPrefilterRow cur;
     memcpy(cur.hash, hash16, 16);
-    typed_field_to_index_key(c->fs->ts, (const uint8_t *)value, vlen,
-                             c->order_field_idx,
-                             cur.sort_key, &cur.sort_key_len);
+    typed_field_to_index_key_rec(c->fs->ts, (const uint8_t *)value, vlen, hdr2,
+                                 c->order_field_idx,
+                                 cur.sort_key, &cur.sort_key_len);
 
     pthread_mutex_lock(&c->lock);
     if (c->heap_cap > 0) {
@@ -7220,7 +7305,7 @@ static KeySet *build_keyset_from_plan(const FilterPlan *fp,
 static int bulk_criteria_indexed_cb(const uint8_t hash16[16],
                                      const void *key, size_t klen,
                                      const void *value, size_t vlen,
-                                     void *raw_ctx) {
+                                     uint8_t hdr2, void *raw_ctx) {
     (void)hash16;
     BulkCriteriaCtx *bc = (BulkCriteriaCtx *)raw_ctx;
     if (bc->budget_exceeded) return 0;
@@ -7228,7 +7313,7 @@ static int bulk_criteria_indexed_cb(const uint8_t hash16[16],
     if (query_deadline_tick(bc->deadline, &bc->dl_counter)) return 0;
 
     /* Re-verify full criteria tree (index may be slightly stale) */
-    if (!criteria_match_tree(value, vlen, bc->tree, bc->fs)) return 0;
+    if (!criteria_match_tree(value, vlen, bc->tree, bc->fs, hdr2)) return 0;
 
     char *k = malloc(klen + 1);
     if (!k) return 0;
@@ -7687,27 +7772,47 @@ static int cmd_find_do(const char *db_root, const char *object,
         size_t  cur_value_len = 0;
         int     has_cur_bytes = 0;
         if (cur.present) {
-            /* Concatenate per-part encodings. With all non-final parts
-               fixed-width, byte order of the concatenation equals tuple
-               order, so cursor_find_cb's existing single-value compare +
-               hash16 tiebreak paginates the tuple correctly. */
+            /* §2.5: interleave a tier byte before each part's encoding —
+               byte-identical to the stored composite key shape
+               ([t1][v1][t2][v2]), so cursor_find_cb's length-aware
+               memcmp + hash16 tiebreak compares tuples exactly and the
+               resume crosses NULL components with no special case. A
+               NULL part carries tier 1 and no payload. Legacy v1 tokens
+               imply tier 0 everywhere. */
             for (int i = 0; i < ospec.n; i++) {
+                if (cur_value_len + 1 >= sizeof(cur_value_buf)) break;
+                cur_value_buf[cur_value_len++] =
+                    (char)(cur.part_tier[i] ? 0x01 : 0x00);
                 size_t plen = 0;
-                if (cur_value_len >= sizeof(cur_value_buf)) break;
-                if (ospec.parts[i].tf) {
-                    encode_field_for_index(ospec.parts[i].tf,
-                                           cur.part[i].value,
-                                           cur.part[i].vlen,
-                                           cur_value_buf + cur_value_len,
-                                           &plen);
+                if (!cur.part_tier[i]) {
+                    if (ospec.parts[i].tf) {
+                        encode_field_for_index(ospec.parts[i].tf,
+                                               cur.part[i].value,
+                                               cur.part[i].vlen,
+                                               cur_value_buf + cur_value_len,
+                                               &plen);
+                        if (plen > sizeof(cur_value_buf) - cur_value_len)
+                            plen = sizeof(cur_value_buf) - cur_value_len;
+                    } else {
+                        plen = cur.part[i].vlen;
+                        if (plen > sizeof(cur_value_buf) - cur_value_len)
+                            plen = sizeof(cur_value_buf) - cur_value_len;
+                        memcpy(cur_value_buf + cur_value_len,
+                               cur.part[i].value, plen);
+                    }
+                } else if (ospec.parts[i].tf &&
+                           ospec.parts[i].tf->type != FT_VARCHAR) {
+                    /* §2.4.1: a NULL fixed-width component stores
+                       [0x01] + width zero bytes (canonical NULL padding,
+                       sign-flip NOT applied). The resume tuple must be
+                       byte-identical to the stored key — a bare [0x01]
+                       compares above the padding zeros and below the next
+                       component's tier byte, so cursor_find_cb's
+                       length-aware memcmp would misorder the NULL run. */
+                    plen = (size_t)ospec.parts[i].tf->size;
                     if (plen > sizeof(cur_value_buf) - cur_value_len)
                         plen = sizeof(cur_value_buf) - cur_value_len;
-                } else {
-                    plen = cur.part[i].vlen;
-                    if (plen > sizeof(cur_value_buf) - cur_value_len)
-                        plen = sizeof(cur_value_buf) - cur_value_len;
-                    memcpy(cur_value_buf + cur_value_len,
-                           cur.part[i].value, plen);
+                    memset(cur_value_buf + cur_value_len, 0, plen);
                 }
                 cur_value_len += plen;
             }
@@ -7939,15 +8044,16 @@ static int cmd_find_do(const char *db_root, const char *object,
                             if (read_record_ref(db_root, object, &sch,
                                                 sp_rows[i].hash, &rr) != 0) continue;
                             if (tree && !criteria_match_tree((const uint8_t *)rr.val, rr.vlen,
-                                                              tree, &driver_fs)) {
+                                                              tree, &driver_fs, rr.hdr2)) {
                                 release_record_ref(&rr);
                                 continue;
                             }
                             if (n_kept != (int)i)
                                 memcpy(sp_rows[n_kept].hash, sp_rows[i].hash, 16);
-                            typed_field_to_index_key(driver_fs.ts,
+                            typed_field_to_index_key_rec(driver_fs.ts,
                                                      (const uint8_t *)rr.val,
-                                                     rr.vlen, order_field_idx,
+                                                     rr.vlen, rr.hdr2,
+                                                     order_field_idx,
                                                      sp_rows[n_kept].sort_key,
                                                      &sp_rows[n_kept].sort_key_len);
                             n_kept++;
@@ -8007,13 +8113,22 @@ static int cmd_find_do(const char *db_root, const char *object,
                 if (cc.printed >= limit && cc.last_key_str) {
                     int vals_ok = 1;
                     for (int i = 0; i < ospec.n; i++)
-                        if (!cc.last_value[i]) vals_ok = 0;
+                        /* A NULL part (tier 1) has no value string — that
+                           is captured state, not a missing capture. Killing
+                           the token here strands the NULL-tier rows behind
+                           it (§2.5: values sort before NULLs ASC). */
+                        if (!cc.last_value[i] && !cc.last_tiers[i]) vals_ok = 0;
                     if (vals_ok) {
+                        /* v2 token with per-field tiers (§2.5). */
                         OUT(",\"cursor\":{");
                         for (int i = 0; i < ospec.n; i++)
                             OUT("%s\"%s\":\"%s\"", i ? "," : "",
-                                ospec.parts[i].name, cc.last_value[i]);
-                        OUT(",\"key\":\"%s\"}", cc.last_key_str);
+                                ospec.parts[i].name,
+                                cc.last_value[i] ? cc.last_value[i] : "");
+                        OUT(",\"tiers\":[");
+                        for (int i = 0; i < ospec.n; i++)
+                            OUT("%s%d", i ? "," : "", cc.last_tiers[i]);
+                        OUT("],\"key\":\"%s\"}", cc.last_key_str);
                     } else {
                         OUT(",\"cursor\":null");
                     }
@@ -8087,14 +8202,26 @@ static int cmd_find_do(const char *db_root, const char *object,
         OUT(dict_fmt ? "{\"rows\":{" : "{\"rows\":[");
         const char *walk_idx = (ospec.n == 1) ? order_by : composite_name;
         if (desc) {
-            /* DESC: start (upper) = cursor when resuming, else window-high or
-               max; stop (lower) = window-low or "". */
-            const char *hi_b = has_cur_bytes ? (const char *)cur_value_buf
-                             : (owb.has_hi ? (const char *)owb.hi : "\xff\xff\xff\xff");
-            size_t hi_l = has_cur_bytes ? cur_value_len : (owb.has_hi ? owb.hi_len : 4);
-            int    hi_e = has_cur_bytes ? 0 : (owb.has_hi ? owb.hi_excl : 0);
-            const char *lo_b = owb.has_lo ? (const char *)owb.lo : "";
-            size_t lo_l = owb.has_lo ? owb.lo_len : 0;
+            /* DESC: start (upper) = cursor when resuming, else window-high
+               or OPEN. The legacy \xff*4 max-sentinel is wrong here: the
+               ordered walk prefixes caller bounds with the 0x00 tier byte,
+               so the sentinel becomes a tier-0 ceiling and the NULL rows
+               that lead a DESC stream never join the walk. An unconstrained
+               first page must pass an open upper bound (§2.4.2/§2.5); a
+               criteria-supplied window-high stays (a genuine value ceiling
+               correctly excludes the NULL tier). On resume the walk is
+               OPEN — the resume bytes carry tier bytes the wrapper would
+               re-prefix, and cursor_find_cb's exact tiered tuple compare
+               does the filtering (§2.5). */
+            const char *hi_b = (has_cur_bytes || !owb.has_hi) ? NULL
+                             : (const char *)owb.hi;
+            size_t hi_l = (has_cur_bytes || !owb.has_hi) ? 0 : owb.hi_len;
+            int    hi_e = owb.has_hi ? owb.hi_excl : 0;
+            /* Mirror of the ASC note: on resume the unbounded low side is
+               open so the walk reaches every remaining NULL-tier row. */
+            const char *lo_b = (has_cur_bytes || !owb.has_lo) ? NULL
+                             : (const char *)owb.lo;
+            size_t lo_l = (has_cur_bytes || !owb.has_lo) ? 0 : owb.lo_len;
             int    lo_e = owb.has_lo ? owb.lo_excl : 0;
             btree_idx_walk_ordered(db_root, object, walk_idx, sch.splits,
                                    lo_b, lo_l, lo_e,
@@ -8102,13 +8229,17 @@ static int cmd_find_do(const char *db_root, const char *object,
                                    1, cursor_find_cb, &cc);
         } else {
             /* ASC: start (lower) = cursor when resuming, else window-low or "";
-               stop (upper) = window-high or max. */
-            const char *lo_b = has_cur_bytes ? (const char *)cur_value_buf
+               stop (upper) = window-high or max. On resume BOTH unbounded
+               sides are open — the sentinel would clamp the walk below
+               the NULL tier, and NULL rows must join the stream (§2.5;
+               cursor_find_cb filters exactly). */
+            const char *lo_b = has_cur_bytes ? NULL
                              : (owb.has_lo ? (const char *)owb.lo : "");
-            size_t lo_l = has_cur_bytes ? cur_value_len : (owb.has_lo ? owb.lo_len : 0);
-            int    lo_e = has_cur_bytes ? 0 : (owb.has_lo ? owb.lo_excl : 0);
-            const char *hi_b = owb.has_hi ? (const char *)owb.hi : "\xff\xff\xff\xff";
-            size_t hi_l = owb.has_hi ? owb.hi_len : 4;
+            size_t lo_l = has_cur_bytes ? 0 : (owb.has_lo ? owb.lo_len : 0);
+            int    lo_e = 0;
+            const char *hi_b = (has_cur_bytes || !owb.has_hi) ? NULL
+                             : (const char *)owb.hi;
+            size_t hi_l = (has_cur_bytes || !owb.has_hi) ? 0 : owb.hi_len;
             int    hi_e = owb.has_hi ? owb.hi_excl : 0;
             btree_idx_walk_ordered(db_root, object, walk_idx, sch.splits,
                                    lo_b, lo_l, lo_e,
@@ -8122,13 +8253,20 @@ static int cmd_find_do(const char *db_root, const char *object,
         if (cc.printed >= limit && cc.last_key_str) {
             int vals_ok = 1;
             for (int i = 0; i < ospec.n; i++)
-                if (!cc.last_value[i]) vals_ok = 0;
+                /* NULL part (tier 1) carries no value string — see the
+                   ASC-note above; the token must still be emitted. */
+                if (!cc.last_value[i] && !cc.last_tiers[i]) vals_ok = 0;
             if (vals_ok) {
+                /* v2 token: per-field tier bytes so page N+1 rebuilds the
+                   tiered resume key exactly (§2.5). */
                 OUT(",\"cursor\":{");
                 for (int i = 0; i < ospec.n; i++)
                     OUT("%s\"%s\":\"%s\"", i ? "," : "", ospec.parts[i].name,
-                        cc.last_value[i]);
-                OUT(",\"key\":\"%s\"}", cc.last_key_str);
+                        cc.last_value[i] ? cc.last_value[i] : "");
+                OUT(",\"tiers\":[");
+                for (int i = 0; i < ospec.n; i++)
+                    OUT("%s%d", i ? "," : "", cc.last_tiers[i]);
+                OUT("],\"key\":\"%s\"}", cc.last_key_str);
             } else {
                 OUT(",\"cursor\":null");
             }
@@ -8549,15 +8687,16 @@ static int cmd_find_do(const char *db_root, const char *object,
                             if (read_record_ref(db_root, object, &sch,
                                                  rows[i].hash, &rr) != 0) continue;
                             if (tree && !criteria_match_tree((const uint8_t *)rr.val, rr.vlen,
-                                                               tree, &driver_fs)) {
+                                                               tree, &driver_fs, rr.hdr2)) {
                                 release_record_ref(&rr);
                                 continue;
                             }
                             if (n_kept != (int)i)
                                 memcpy(rows[n_kept].hash, rows[i].hash, 16);
-                            typed_field_to_index_key(driver_fs.ts,
+                            typed_field_to_index_key_rec(driver_fs.ts,
                                                      (const uint8_t *)rr.val,
-                                                     rr.vlen, order_field_idx,
+                                                     rr.vlen, rr.hdr2,
+                                                     order_field_idx,
                                                      rows[n_kept].sort_key,
                                                      &rows[n_kept].sort_key_len);
                             n_kept++;
@@ -8654,11 +8793,14 @@ static int cmd_find_do(const char *db_root, const char *object,
             {
                 OrderWalkBounds owb;
                 order_walk_bounds(tree, &driver_fs, order_by, &owb);
-                const char *lo_b = owb.has_lo ? (const char *)owb.lo : "";
+                /* No keyset cursor on this path (offset_mode) — unbounded
+                   sides pass through OPEN so NULL-tier rows join the
+                   ordered stream (§2.5). */
+                const char *lo_b = owb.has_lo ? (const char *)owb.lo : NULL;
                 size_t lo_l = owb.has_lo ? owb.lo_len : 0;
                 int    lo_e = owb.has_lo ? owb.lo_excl : 0;
-                const char *hi_b = owb.has_hi ? (const char *)owb.hi : "\xff\xff\xff\xff";
-                size_t hi_l = owb.has_hi ? owb.hi_len : 4;
+                const char *hi_b = owb.has_hi ? (const char *)owb.hi : NULL;
+                size_t hi_l = owb.has_hi ? owb.hi_len : 0;
                 int    hi_e = owb.has_hi ? owb.hi_excl : 0;
                 btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
                                        lo_b, lo_l, lo_e,
@@ -8740,7 +8882,7 @@ static int cmd_find_do(const char *db_root, const char *object,
             if (csv_delim) {
                 csv_emit_row(wire_key, val, r->value_len,
                              proj_count > 0 ? proj_fields : NULL,
-                             proj_count, &driver_fs, csv_delim);
+                             proj_count, &driver_fs, csv_delim, r->hdr2);
                 printed++;
                 continue;
             }
@@ -8748,16 +8890,17 @@ static int cmd_find_do(const char *db_root, const char *object,
                 OUT("%s[\"%s\"", printed ? "," : "", wire_key);
                 if (proj_count > 0) {
                     for (int j = 0; j < proj_count; j++) {
-                        char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
+                        char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs, r->hdr2);
                         OUT(",%s", pv ? pv : "\"\"");
                         free(pv);
                     }
                 } else if (driver_fs.ts) {
                     for (int j = 0; j < driver_fs.ts->nfields; j++) {
                         if (driver_fs.ts->fields[j].removed) continue;
-                        char *pv = json_projected_value(
-                            typed_get_field_str(driver_fs.ts, val, (int)r->value_len, j),
-                            &driver_fs.ts->fields[j]);
+                        char *pv = json_typed_row_cell(driver_fs.ts,
+                                                       (const uint8_t *)val,
+                                                       (int)r->value_len, j,
+                                                       r->hdr2);
                         OUT(",%s", pv ? pv : "\"\"");
                         free(pv);
                     }
@@ -8769,7 +8912,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                     OUT("{");
                     int first = 1;
                     for (int j = 0; j < proj_count; j++) {
-                        char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
+                        char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs, r->hdr2);
                         if (!pv) continue;
                         OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
                         first = 0;
@@ -8777,7 +8920,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                     }
                     OUT("}");
                 } else {
-                    char *v = decode_value((const char *)val, r->value_len, &driver_fs);
+                    char *v = decode_value((const char *)val, r->value_len, &driver_fs, r->hdr2);
                     OUT("%s", v);
                     free(v);
                 }
@@ -8785,7 +8928,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                 OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", wire_key);
                 int first = 1;
                 for (int j = 0; j < proj_count; j++) {
-                    char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs);
+                    char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs, r->hdr2);
                     if (!pv) continue;
                     OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
                     first = 0;
@@ -8793,7 +8936,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                 }
                 OUT("}}");
             } else {
-                char *v = decode_value((const char *)val, r->value_len, &driver_fs);
+                char *v = decode_value((const char *)val, r->value_len, &driver_fs, r->hdr2);
                 OUT("%s{\"key\":\"%s\",\"value\":%s}", printed ? "," : "", wire_key, v);
                 free(v);
             }

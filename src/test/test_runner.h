@@ -50,7 +50,9 @@ int test_run_one(const char *name);
    file, and flushes it after reaping the child, so concurrent tests' output
    never interleaves and their process-global test state cannot race. The
    parent _exit(124)s after killing active children if any one exceeds
-   SHARD_TEST_WATCHDOG_SEC (default 180s). Returns total fail count. */
+   SHARD_TEST_WATCHDOG_SEC (default 180s; 1200s in TSan builds, where the
+   instrumentation slows heavy cases past the release-budget default).
+   Returns total fail count. */
 int test_run_all(const char *filter, const char *exclude, int jobs);
 
 #endif

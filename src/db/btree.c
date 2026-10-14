@@ -2497,10 +2497,16 @@ static int iter_next_fwd(BtRangeIter *it) {
             continue;
         }
 
-        int cmp_max = val_cmp(it->fwd_leaf.key_buf, it->fwd_leaf.key_len,
-                              it->max_val, it->max_len);
-        if (cmp_max > 0) { it->fwd_page_id = 0; return 0; }
-        if (it->max_exclusive && cmp_max == 0) { it->fwd_page_id = 0; return 0; }
+        /* max_len == 0 is the iter's unbounded-above convention (BTRI
+           ordered walks pass NULL,0 so the NULL tier [0x01]... is walked
+           at the ASC tail — §2.5). Explicit bounds always carry the
+           [0x00] tier prefix, so len 0 can only mean "no upper bound". */
+        if (it->max_len > 0) {
+            int cmp_max = val_cmp(it->fwd_leaf.key_buf, it->fwd_leaf.key_len,
+                                  it->max_val, it->max_len);
+            if (cmp_max > 0) { it->fwd_page_id = 0; return 0; }
+            if (it->max_exclusive && cmp_max == 0) { it->fwd_page_id = 0; return 0; }
+        }
         if (it->min_exclusive &&
             val_cmp(it->fwd_leaf.key_buf, it->fwd_leaf.key_len,
                     it->min_val, it->min_len) == 0) continue;
@@ -2541,7 +2547,17 @@ static int iter_init_desc_leaves(BtRangeIter *it) {
     /* Convention: max_val = "\xff\xff\xff\xff" (4 bytes) means
        "unbounded above" — caller wants a full-range desc walk. Skip
        the descent and go straight to the rightmost leaf. */
-    int unbounded = (it->max_len == 4 &&
+    /* BTRI: callers prefix bounds with the 0x00 tier byte — the sentinel
+       becomes [0x00][ff ff ff ff] (5 bytes). Accept the legacy bare form
+       defensively. max_len == 0 is the iter's unbounded-above convention
+       (BTRI ordered walks pass NULL,0 so the NULL tier [0x01]... leads the
+       DESC walk — §2.5). */
+    int unbounded = (it->max_len == 0) ||
+                    (it->max_len == 5 &&
+                     it->max_val[0] == 0x00 &&
+                     it->max_val[1] == (char)0xff && it->max_val[2] == (char)0xff &&
+                     it->max_val[3] == (char)0xff && it->max_val[4] == (char)0xff) ||
+                    (it->max_len == 4 &&
                      it->max_val[0] == (char)0xff && it->max_val[1] == (char)0xff &&
                      it->max_val[2] == (char)0xff && it->max_val[3] == (char)0xff);
     if (unbounded) {
@@ -2620,13 +2636,16 @@ static int iter_load_desc_snap(BtRangeIter *it) {
         if (ph->count == 0) continue;
 
         /* Cheap left-bound check: anchor at slot 0 carries the leaf's first
-           full key. If first_key > max_val every entry here is past max — skip. */
+           full key. If first_key > max_val every entry here is past max — skip.
+           max_len == 0 = unbounded above: never skip. */
         LeafIter peek;
         leaf_iter_init(&peek, page);
         if (!leaf_iter_next(&peek)) continue;
-        int peek_vs_max = val_cmp(peek.key_buf, peek.key_len, it->max_val, it->max_len);
-        if (peek_vs_max > 0) continue;
-        if (it->max_exclusive && peek_vs_max == 0 && ph->count == 1) continue;
+        if (it->max_len > 0) {
+            int peek_vs_max = val_cmp(peek.key_buf, peek.key_len, it->max_val, it->max_len);
+            if (peek_vs_max > 0) continue;
+            if (it->max_exclusive && peek_vs_max == 0 && ph->count == 1) continue;
+        }
 
         free(it->desc_snaps);
         it->desc_snaps = malloc((size_t)ph->count * sizeof(DescEntrySnap));
@@ -2671,9 +2690,11 @@ static int iter_next_desc(BtRangeIter *it) {
         }
         DescEntrySnap *s = &it->desc_snaps[it->desc_snap_i--];
 
-        int cmp_max = val_cmp(s->key, s->key_len, it->max_val, it->max_len);
-        if (cmp_max > 0) continue;
-        if (it->max_exclusive && cmp_max == 0) continue;
+        if (it->max_len > 0) {
+            int cmp_max = val_cmp(s->key, s->key_len, it->max_val, it->max_len);
+            if (cmp_max > 0) continue;
+            if (it->max_exclusive && cmp_max == 0) continue;
+        }
 
         int cmp_min = val_cmp(s->key, s->key_len, it->min_val, it->min_len);
         if (cmp_min < 0) return 0;  /* below min — every leftward entry is smaller */

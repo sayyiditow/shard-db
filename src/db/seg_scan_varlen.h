@@ -26,22 +26,26 @@ static inline size_t seg_scan_varlen_size(uint16_t klen, uint32_t vlen) {
 }
 
 /* Validate the record header at map[pos]: flag <= 2, header + rec_size
-   fits within map_size, and rec_size itself <= max_slot_size. Does NOT
-   verify the hash. max_slot_size is the owning object's cached
-   SlotcaskDb.slot_size; it is deliberately not the segment file cap.
-   Returns 1 and fills *out_rec_size/out_flag/
-   out_klen/out_vlen on success; returns 0 on failure (outputs
-   unspecified). */
+   fits within map_size, and rec_size itself <= max_slot_size. Byte 19
+   (generation) must carry only SREC_FLAG_NULLMAP — unknown bits fail
+   closed. Does NOT verify the hash. max_slot_size is the owning object's
+   cached SlotcaskDb.slot_size; it is deliberately not the segment file
+   cap. out_hdr2 may be NULL (caller doesn't need the flag). Returns 1
+   and fills *out_rec_size/out_flag/out_klen/out_vlen (+*out_hdr2 when
+   non-NULL) on success; returns 0 on failure (outputs unspecified). */
 static inline int seg_scan_varlen_struct_ok(const uint8_t *map, size_t map_size,
                                              size_t pos, size_t max_slot_size,
                                              size_t *out_rec_size,
                                              uint8_t *out_flag, uint16_t *out_klen,
-                                             uint32_t *out_vlen) {
+                                             uint32_t *out_vlen,
+                                             uint8_t *out_hdr2) {
     if (pos + 24 > map_size) return 0;
     if (max_slot_size < 32) return 0;
     const uint8_t *rec = map + pos;
     uint8_t flag = rec[18];
     if (flag > 2) return 0;
+    uint8_t hdr2 = rec[19];
+    if (hdr2 & ~SREC_FLAG_NULLMAP) return 0;
     uint16_t klen;
     uint32_t vlen;
     memcpy(&klen, rec + 16, 2);
@@ -53,6 +57,7 @@ static inline int seg_scan_varlen_struct_ok(const uint8_t *map, size_t map_size,
     *out_flag = flag;
     *out_klen = klen;
     *out_vlen = vlen;
+    if (out_hdr2) *out_hdr2 = hdr2;
     return 1;
 }
 
@@ -108,7 +113,7 @@ static inline int seg_scan_varlen_resync(const uint8_t *map, size_t map_size,
         uint32_t vlen;
         if (!seg_scan_varlen_struct_ok(map, map_size, cand, max_slot_size,
                                         &rec_size,
-                                        &flag, &klen, &vlen)) {
+                                        &flag, &klen, &vlen, NULL)) {
             continue;
         }
         if (flag == 0) continue;

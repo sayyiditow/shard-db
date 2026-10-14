@@ -21,7 +21,10 @@
 #include <stddef.h>
 
 #define BT_HASH_SIZE    16      /* raw xxh128 bytes */
-#define BT_MAX_VAL_LEN  512    /* max value length */
+#define BT_MAX_VAL_LEN  544    /* max value length (tier byte(s) + BTRH-era 512
+                                   payload + composite component headroom at the
+                                   subs[16] cap — every previously indexable
+                                   value stays indexable) */
 
 /* File magic. "BTRH" (current, 2026.05.5+) = (value, hash) leaf sort +
    internal-page separators include hash, so single-key delete lands
@@ -33,7 +36,9 @@
 #define BT_MAGIC_V1  0x42545245u  /* legacy: string-keyed */
 #define BT_MAGIC_V2  0x42545246u  /* legacy: binary keys without prev_leaf */
 #define BT_MAGIC_V3  0x42545247u  /* legacy: BTRG, prev_leaf + last_leaf_page */
-#define BT_MAGIC     0x42545248u  /* current: BTRH — (value, hash) sort */
+#define BT_MAGIC     0x42545249u  /* current: BTRI — (tier, value, hash) keys
+                                       (2026.10.2 null plan; BTRH files refuse
+                                       on open — startup migration reindexes) */
 
 /* Configurable page size — set before first use */
 extern int bt_page_size; /* default 4096, set from db.env INDEX_PAGE_SIZE */

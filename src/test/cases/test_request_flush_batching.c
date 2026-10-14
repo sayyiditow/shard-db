@@ -127,6 +127,30 @@ static void rf_key_shard0(const char *prefix, int i, char *out, size_t cap) {
     }
 }
 
+/* Find two distinct shard-0 keys with the same initial kf probe slot. */
+static int rf_colliding_keys(size_t kf_cap, char out_a[32], char out_b[32]) {
+    int *seen = malloc(kf_cap * sizeof(*seen));
+    if (!seen) return -1;
+    for (size_t i = 0; i < kf_cap; i++) seen[i] = -1;
+    for (int i = 0; i < 2000000; i++) {
+        char key[32];
+        uint8_t hash[16];
+        snprintf(key, sizeof(key), "rf-collision-%d", i);
+        compute_hash_raw(key, strlen(key), hash);
+        if (compute_record_shard(hash, RF_SPLITS) != 0) continue;
+        size_t slot = kf_slot_for(hash, kf_cap);
+        if (seen[slot] >= 0) {
+            snprintf(out_a, 32, "rf-collision-%d", seen[slot]);
+            snprintf(out_b, 32, "%s", key);
+            free(seen);
+            return 0;
+        }
+        seen[slot] = i;
+    }
+    free(seen);
+    return -1;
+}
+
 /* ── window hooks ────────────────────────────────────────────────────── */
 
 static int rf_noop_prepare(SlotcaskBulkRec *recs, const size_t *active,
@@ -1693,6 +1717,112 @@ static int test_request_flush_batching_run(void) {
                     rf_record_visible(&w, keysb[0], "v77-0000"),
                     "19 both requests' records visible");
         ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "19 no markers retained");
+    }
+
+    /* ── Scenario 20: merged requests reserve one immutable physical
+     * slot per key before marker publication. Two distinct keys with the same
+     * initial probe slot must receive different recorded kf slots; those are
+     * the slots consumed by bitmap/index hooks and persisted in KFM2. */
+    {
+        char ka[32], kb[32];
+        ASSERT_EQ_INT(rf_colliding_keys(w.db.slots_per_shard, ka, kb), 0,
+                      "20 find two keys with one initial kf slot");
+        char va[] = "collision-a", vb[] = "collision-b";
+        SlotcaskBulkRec ra, rb;
+        memset(&ra, 0, sizeof(ra));
+        memset(&rb, 0, sizeof(rb));
+        ra.key = ka; ra.klen = strlen(ka); ra.value = va; ra.vlen = strlen(va);
+        rb.key = kb; rb.klen = strlen(kb); rb.value = vb; rb.vlen = strlen(vb);
+
+        SlotcaskBulkOpts oa, ob;
+        rf_fill_opts(&oa, NULL);
+        rf_fill_opts(&ob, NULL);
+        SlotcaskBulkShardInput ina, inb;
+        memset(&ina, 0, sizeof(ina));
+        memset(&inb, 0, sizeof(inb));
+        ina.kf_shard_id = 0; ina.recs = &ra; ina.nrecs = 1;
+        ina.kind = SLOTCASK_BULK_INPUT_UPSERT; ina.opts.upsert = oa;
+        inb.kf_shard_id = 0; inb.recs = &rb; inb.nrecs = 1;
+        inb.kind = SLOTCASK_BULK_INPUT_UPSERT; inb.opts.upsert = ob;
+
+        shard_test_ctl_reset();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_PRE_MERGE;
+        g_shard_test_pause_occurrence = 1;
+        struct RfOneShardArgs ta = { .w = &w, .in = &ina };
+        struct RfOneShardArgs tb = { .w = &w, .in = &inb };
+        pthread_t tha, thb;
+        ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_one_shard_req_thread,
+                                     &ta), 0, "20 spawn A");
+        rf_wait_pause_hit();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_GATE_WAIT;
+        g_shard_test_pause_occurrence = 1;
+        ASSERT_EQ_INT(pthread_create(&thb, NULL, rf_one_shard_req_thread,
+                                     &tb), 0, "20 spawn B");
+        rf_wait_pause_hits_at_least(2);
+        atomic_store(&g_shard_test_pause_release, 1);
+        pthread_join(tha, NULL);
+        pthread_join(thb, NULL);
+
+        ASSERT_EQ_INT(ta.rc, 0, "20 A rc 0");
+        ASSERT_EQ_INT(tb.rc, 0, "20 B rc 0");
+        ASSERT_EQ_INT((int)atomic_load(&g_shard_test_bulk_chains), 1,
+                      "20 requests share one chain");
+        ASSERT_TRUE(ra.kf_slot != rb.kf_slot,
+                    "20 colliding keys reserve distinct immutable slots");
+        ASSERT_TRUE(rf_record_visible(&w, ka, va) &&
+                    rf_record_visible(&w, kb, vb),
+                    "20 both colliding records visible");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "20 no markers retained");
+    }
+
+    /* ── Scenario 21: two requests for the same key cannot share a
+     * publish-before-finalize chain. The waiter serializes and performs a
+     * normal upsert after the first request is fully visible. */
+    {
+        char key[32];
+        rf_key_shard0("rf-same-key", 21, key, sizeof(key));
+        char va[] = "same-a", vb[] = "same-b";
+        SlotcaskBulkRec ra, rb;
+        memset(&ra, 0, sizeof(ra));
+        memset(&rb, 0, sizeof(rb));
+        ra.key = key; ra.klen = strlen(key); ra.value = va; ra.vlen = strlen(va);
+        rb.key = key; rb.klen = strlen(key); rb.value = vb; rb.vlen = strlen(vb);
+        SlotcaskBulkOpts oa, ob;
+        rf_fill_opts(&oa, NULL);
+        rf_fill_opts(&ob, NULL);
+        SlotcaskBulkShardInput ina, inb;
+        memset(&ina, 0, sizeof(ina));
+        memset(&inb, 0, sizeof(inb));
+        ina.kf_shard_id = 0; ina.recs = &ra; ina.nrecs = 1;
+        ina.kind = SLOTCASK_BULK_INPUT_UPSERT; ina.opts.upsert = oa;
+        inb.kf_shard_id = 0; inb.recs = &rb; inb.nrecs = 1;
+        inb.kind = SLOTCASK_BULK_INPUT_UPSERT; inb.opts.upsert = ob;
+
+        shard_test_ctl_reset();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_PRE_MERGE;
+        g_shard_test_pause_occurrence = 1;
+        struct RfOneShardArgs ta = { .w = &w, .in = &ina };
+        struct RfOneShardArgs tb = { .w = &w, .in = &inb };
+        pthread_t tha, thb;
+        ASSERT_EQ_INT(pthread_create(&tha, NULL, rf_one_shard_req_thread,
+                                     &ta), 0, "21 spawn A");
+        rf_wait_pause_hit();
+        g_shard_test_pause_phase = SHARD_TEST_PHASE_GATE_WAIT;
+        g_shard_test_pause_occurrence = 1;
+        ASSERT_EQ_INT(pthread_create(&thb, NULL, rf_one_shard_req_thread,
+                                     &tb), 0, "21 spawn B");
+        rf_wait_pause_hits_at_least(2);
+        atomic_store(&g_shard_test_pause_release, 1);
+        pthread_join(tha, NULL);
+        pthread_join(thb, NULL);
+
+        ASSERT_EQ_INT(ta.rc, 0, "21 A rc 0");
+        ASSERT_EQ_INT(tb.rc, 0, "21 B rc 0");
+        ASSERT_EQ_INT((int)atomic_load(&g_shard_test_bulk_chains), 2,
+                      "21 same-key requests serialize");
+        ASSERT_TRUE(rf_record_visible(&w, key, vb),
+                    "21 serialized second upsert wins");
+        ASSERT_EQ_INT(rt_marker_scan(w.base), 0, "21 no markers retained");
     }
 
     rf_db_close(&w);

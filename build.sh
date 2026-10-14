@@ -75,7 +75,7 @@ case "$BUILD_MODE" in
         DO_STRIP=0
         ;;
     tsan)
-        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=thread -fno-PIE -no-pie $WARN_CFLAGS"
+        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=thread -fno-PIE -no-pie -DBUILD_TSAN=1 $WARN_CFLAGS"
         MODE_LDFLAGS="-fsanitize=thread -no-pie"
         DO_STRIP=0
         ;;
@@ -307,6 +307,15 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_bitmap_kfcache_lock_order.c \
     src/test/cases/test_bm_intersect_count.c \
     src/test/cases/test_enum.c \
+    src/test/cases/test_null_bugs.c \
+    src/test/cases/test_null_storage.c \
+    src/test/cases/test_null_migration.c \
+    src/test/cases/test_null_criteria.c \
+    src/test/cases/test_null_index.c \
+    src/test/cases/test_null_bulk.c \
+    src/test/cases/test_null_agg_order.c \
+    src/test/cases/test_null_review_fixes.c \
+    src/test/cases/test_null_legacy_rebuild.c \
     src/test/cases/test_long_field_def.c \
     src/test/cases/test_ipv4.c \
     src/test/cases/test_ipv6.c \
