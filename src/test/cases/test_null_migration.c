@@ -236,6 +236,14 @@ static void stamp_remove(const char *db_root) {
     ASSERT_EQ_INT(unlink(p), 0, "remove migration stamp");
 }
 
+/* Nanosecond mtime: glibc names the field st_mtim, Darwin st_mtimespec —
+   both struct timespec, so one accessor covers both. */
+#ifdef __APPLE__
+#define ST_MTIM(st) ((st).st_mtimespec)
+#else
+#define ST_MTIM(st) ((st).st_mtim)
+#endif
+
 /* mtime (sec+nsec) of every idx shard, summarised so (b) can assert
    "no shard was rewritten". */
 static int idx_mtime_sum(const char *db_root, const char *obj,
@@ -254,8 +262,8 @@ static int idx_mtime_sum(const char *db_root, const char *obj,
         snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
         struct stat st;
         if (stat(p, &st) != 0) { closedir(d); return -1; }
-        sum += (long long)st.st_mtim.tv_sec * 1000000000LL
-             + (long long)st.st_mtim.tv_nsec;
+        sum += (long long)ST_MTIM(st).tv_sec * 1000000000LL
+             + (long long)ST_MTIM(st).tv_nsec;
         n++;
     }
     closedir(d);
@@ -560,15 +568,24 @@ static int test_null_migration_e_marker_order(void) {
     tc = mig_connect(m.port);
     ASSERT_NOT_NULL(tc, "connect 2");
     if (tc) {
-        /* Send-only: the request parks inside the paused shard chain. */
+        /* Send-only: the request parks inside the paused shard chain.
+           Track the remaining space explicitly — feeding snprintf's return
+           back in lets a (here impossible) truncation underflow the size
+           argument. Clamp so the bound holds by construction. */
         char bulk[4096];
         int off = snprintf(bulk, sizeof(bulk),
             "{\"mode\":\"bulk-insert\",\"dir\":\"mig\",\"object\":\"mo\","
             "\"records\":{");
-        for (int i = 6; i <= 45; i++)
-            off += snprintf(bulk + off, sizeof(bulk) - (size_t)off,
-                            "%s\"r%d\":{\"k\":\"%d\"}", i > 6 ? "," : "", i, i);
-        snprintf(bulk + off, sizeof(bulk) - (size_t)off, "}}");
+        int rem = (int)sizeof(bulk) - off;
+        for (int i = 6; i <= 45 && rem > 0; i++) {
+            int n = snprintf(bulk + off, (size_t)rem,
+                             "%s\"r%d\":{\"k\":\"%d\"}", i > 6 ? "," : "", i, i);
+            if (n < 0) break;
+            if (n >= rem) n = rem - 1;
+            off += n; rem -= n;
+        }
+        if (rem > 2)
+            snprintf(bulk + off, (size_t)rem, "}}");
         ASSERT_EQ_INT(tc_send(tc, bulk), 0, "send paused bulk");
         /* durability_test_pause writes the marker under the object dir
            (SlotcaskDb.data_dir = <tenant>/<object>), not the DB_ROOT. */
