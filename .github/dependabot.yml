@@ -24,6 +24,18 @@ updates:
       - "github-actions"
     commit-message:
       prefix: "ci"
+    groups:
+      # CodeQL rejects a workflow whose github/codeql-action steps run
+      # different versions ("configuration file for version X, but running
+      # version Y"), and codeql.yml uses both init and analyze — so a
+      # single-step bump leaves the other step behind and fails every run
+      # until its twin PR lands. One grouped PR moves all subactions
+      # together. (Pattern omits the slash: Dependabot doesn't document
+      # whether * crosses "/" in dependency names, and the prefix form
+      # matches under either reading.)
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
 
   # Python packages used by the docs build (mkdocs-material today; any
   # future tooling we add to requirements.txt comes along for free).
