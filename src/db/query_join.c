@@ -192,10 +192,23 @@ int resolve_joins(JoinSpec *joins, int n, const char *db_root,
 }
 
 /* Extract the local field value from a driver record into buf.
-   Handles composite (a+b → concat values). Returns written length (0 = empty). */
+   Handles composite (a+b → concat values). Returns written length (0 = empty).
+   A NULL local field also returns 0: NULL joins nothing, and probing the
+   zero-encoded bytes would falsely match a remote zero-valued key. */
 int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
                              size_t driver_len, const TypedSchema *driver_ts,
+                             uint8_t driver_hdr2,
                              char *buf, size_t bufsz) {
+    /* Field bytes sit nullmap_prefix into the record for nullmap
+       generations — resolve the field-region base once (§2.7). */
+    const uint8_t *fbase = driver_raw;
+    const uint8_t *bm = NULL; int bm_bytes = 0;
+    size_t region = driver_len;
+    if (driver_hdr2) {
+        if (typed_record_view(driver_raw, driver_len, driver_hdr2,
+                              &fbase, &bm, &bm_bytes, &region) != 0)
+            return 0;
+    }
     if (j->local_is_composite) {
         char fb[256]; strncpy(fb, j->local_field, 255); fb[255] = '\0';
         int pos = 0;
@@ -204,8 +217,18 @@ int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
         while (tok) {
             int idx = driver_ts ? typed_field_index(driver_ts, tok) : -1;
             if (idx < 0) { tok = strtok_r(NULL, "+", &save); continue; }
+            /* Any NULL component nulls the whole composite (SQL equality) —
+               a zero-filled probe would match a remote zero key. */
+            if (driver_hdr2 && typed_field_null(bm, bm_bytes, idx)) return 0;
+            /* BTRI composite keys interleave a tier byte before EVERY
+               component ([t1][v1][t2][v2], §2.4.1). The remote probe seek
+               prefixes only the FIRST tier (shard_walk_worker), so this
+               builder emits the inter-component bytes between payload
+               parts — a missing tier makes the payload byte compare
+               against the stored tier byte and every probe misses. */
+            if (pos > 0 && pos + 1 < (int)bufsz) buf[pos++] = '\x00';
             size_t blen = 0;
-            typed_field_to_index_key(driver_ts, driver_raw, driver_len, idx,
+            typed_field_to_index_key(driver_ts, fbase, region, idx,
                                       (uint8_t *)buf + pos, &blen);
             if (blen == 0) { tok = strtok_r(NULL, "+", &save); continue; }
             if (pos + (int)blen < (int)bufsz) { pos += (int)blen; }
@@ -216,9 +239,13 @@ int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
     }
     if (j->local_tf) {
         const TypedField *tf = j->local_tf;
-        const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > driver_len)
+        if (driver_hdr2 && driver_ts &&
+            typed_field_null(bm, bm_bytes,
+                             (int)(tf - driver_ts->fields)))
+            return 0;
+        const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > region)
             ? g_zero_field_65537
-            : driver_raw + tf->offset;
+            : fbase + tf->offset;
         return typed_field_to_buf_raw(tf, fp,
                                       buf, bufsz, 0);
     }
@@ -364,48 +391,75 @@ static int buf_field_value(const TypedField *tf, const uint8_t *field_ptr,
 }
 
 /* Write one join's contribution (,val,val,...) to buf. remote_raw NULL → nulls.
+   remote_hdr2 is the remote record's generation flag — field offsets are
+   field-region-relative, so the view slide must run before any field read.
    Returns bytes written; always < bufsz (see snprintf_bounded above). */
 int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw, size_t remote_len,
-                           char *buf, size_t bufsz) {
+                    uint8_t remote_hdr2, char *buf, size_t bufsz) {
     int pos = 0;
     if (j->include_remote_key) {
         /* v1: emit null — local field gives the value; extend later if needed */
         pos += snprintf_bounded(buf + pos, bufsz - pos, ",null");
     }
+    /* Validated field-region view (§2.1) — resolved once, shared by the
+       loop. A structurally invalid remote record renders nulls (the
+       fetch path fails the request separately for corruption). */
+    const uint8_t *rbase = NULL; const uint8_t *rbm = NULL;
+    int rbm_bytes = 0; size_t rregion = 0;
+    int view_ok = remote_raw &&
+        typed_record_view(remote_raw, remote_len, remote_hdr2,
+                          &rbase, &rbm, &rbm_bytes, &rregion) == 0;
     for (int k = 0; k < j->proj_count; k++) {
         if (pos >= (int)bufsz - 1) break;
         pos += snprintf_bounded(buf + pos, bufsz - pos, ",");
-        if (!remote_raw || !j->proj_tfs[k])
+        if (!remote_raw || !view_ok || !j->proj_tfs[k]) {
             pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
-        else {
-            const TypedField *tf = j->proj_tfs[k];
-            const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > remote_len)
-                ? g_zero_field_65537
-                : remote_raw + tf->offset;
-            pos += buf_field_value(tf, fp,
-                                   buf + pos, bufsz - pos);
+            continue;
         }
+        const TypedField *tf = j->proj_tfs[k];
+        int tidx = j->remote_fs.ts ? (int)(tf - j->remote_fs.ts->fields) : -1;
+        if (tidx >= 0 && typed_field_null(rbm, rbm_bytes, tidx)) {
+            pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
+            continue;
+        }
+        const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > rregion)
+            ? g_zero_field_65537
+            : rbase + tf->offset;
+        pos += buf_field_value(tf, fp,
+                               buf + pos, bufsz - pos);
     }
     return pos;
 }
 
 /* Write driver-side row values (,val,val,...) after the key.
+   driver_hdr2 is the driver record's generation flag — the view slide must
+   run before any field read (field offsets are field-region-relative).
    Returns bytes written; always < bufsz (see snprintf_bounded above). */
 int buf_driver_values(const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs,
                              const char **driver_proj, int driver_proj_count,
-                             char *buf, size_t bufsz) {
+                             uint8_t driver_hdr2, char *buf, size_t bufsz) {
     int pos = 0;
+    /* Validated field-region view (§2.1), resolved once. */
+    const uint8_t *dbase = NULL; const uint8_t *dbm = NULL;
+    int dbm_bytes = 0; size_t dregion = 0;
+    int dview_ok = driver_raw && driver_fs && driver_fs->ts &&
+        typed_record_view(driver_raw, driver_len, driver_hdr2,
+                          &dbase, &dbm, &dbm_bytes, &dregion) == 0;
     if (driver_proj_count > 0) {
         for (int i = 0; i < driver_proj_count; i++) {
             if (pos >= (int)bufsz - 1) break;
             pos += snprintf_bounded(buf + pos, bufsz - pos, ",");
-            if (driver_fs && driver_fs->ts) {
+            if (dview_ok) {
                 int idx = typed_field_index(driver_fs->ts, driver_proj[i]);
                 if (idx >= 0) {
                     const TypedField *tf = &driver_fs->ts->fields[idx];
-                    const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > driver_len)
+                    if (typed_field_null(dbm, dbm_bytes, idx)) {
+                        pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
+                        continue;
+                    }
+                    const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > dregion)
                         ? g_zero_field_65537
-                        : driver_raw + tf->offset;
+                        : dbase + tf->offset;
                     pos += buf_field_value(tf, fp,
                                            buf + pos, bufsz - pos);
                     continue;
@@ -413,15 +467,19 @@ int buf_driver_values(const uint8_t *driver_raw, size_t driver_len, FieldSchema 
             }
             pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
         }
-    } else if (driver_fs && driver_fs->ts) {
+    } else if (dview_ok) {
         for (int i = 0; i < driver_fs->ts->nfields; i++) {
             if (driver_fs->ts->fields[i].removed) continue;
             if (pos >= (int)bufsz - 1) break;
             pos += snprintf_bounded(buf + pos, bufsz - pos, ",");
             const TypedField *tf = &driver_fs->ts->fields[i];
-            const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > driver_len)
+            if (typed_field_null(dbm, dbm_bytes, i)) {
+                pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
+                continue;
+            }
+            const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > dregion)
                 ? g_zero_field_65537
-                : driver_raw + tf->offset;
+                : dbase + tf->offset;
             pos += buf_field_value(tf, fp,
                                    buf + pos, bufsz - pos);
         }
@@ -463,7 +521,7 @@ static size_t csv_cell_to_buf(const char *val, char delim, char *out, size_t out
    Joins with no remote match emit empty cells. Returns chars written. */
 size_t build_joined_csv_row(const char *key,
                                    const uint8_t *driver_raw, size_t driver_len,
-                                   FieldSchema *driver_fs,
+                                   FieldSchema *driver_fs, uint8_t driver_hdr2,
                                    const char **proj_fields, int proj_count,
                                    const JoinSpec *joins, int njoins,
                                    const RecordRef *jrefs,
@@ -479,7 +537,7 @@ size_t build_joined_csv_row(const char *key,
             if (pos < bufsz - 1) buf[pos++] = csv_delim;
             int idx = typed_field_index(driver_fs->ts, proj_fields[i]);
             char *v = (idx >= 0)
-                ? typed_get_field_str(driver_fs->ts, driver_raw, (int)driver_len, idx)
+                ? typed_get_field_str(driver_fs->ts, driver_raw, (int)driver_len, idx, driver_hdr2)
                 : NULL;
             (void)tmp;
             pos += csv_cell_to_buf(v, csv_delim, buf + pos, bufsz - pos);
@@ -489,7 +547,7 @@ size_t build_joined_csv_row(const char *key,
         for (int i = 0; i < driver_fs->ts->nfields; i++) {
             if (driver_fs->ts->fields[i].removed) continue;
             if (pos < bufsz - 1) buf[pos++] = csv_delim;
-            char *v = typed_get_field_str(driver_fs->ts, driver_raw, (int)driver_len, i);
+            char *v = typed_get_field_str(driver_fs->ts, driver_raw, (int)driver_len, i, driver_hdr2);
             pos += csv_cell_to_buf(v, csv_delim, buf + pos, bufsz - pos);
             free(v);
         }
@@ -500,17 +558,26 @@ size_t build_joined_csv_row(const char *key,
         const JoinSpec *j = &joins[i];
         const uint8_t *rraw = jrefs ? jrefs[i].val : NULL;
         size_t rlen = jrefs ? jrefs[i].vlen : 0;
+        uint8_t rhdr2 = jrefs ? jrefs[i].hdr2 : 0;
+        /* Validated field-region view (§2.1) — resolved once per join. */
+        const uint8_t *rbase = NULL; const uint8_t *rbm = NULL;
+        int rbm_bytes = 0; size_t rregion = 0;
+        int rview_ok = rraw &&
+            typed_record_view(rraw, rlen, rhdr2,
+                              &rbase, &rbm, &rbm_bytes, &rregion) == 0;
         if (j->include_remote_key) {
             if (pos < bufsz - 1) buf[pos++] = csv_delim;
             /* Empty cell — local field carries the value (matches JSON's null). */
         }
         for (int k = 0; k < j->proj_count; k++) {
             if (pos < bufsz - 1) buf[pos++] = csv_delim;
-            if (!rraw || !j->proj_tfs[k]) continue;
+            if (!rraw || !rview_ok || !j->proj_tfs[k]) continue;
             const TypedField *rtf = j->proj_tfs[k];
-            const uint8_t *rfp = ((size_t)rtf->offset + (size_t)rtf->size > rlen)
+            int rtidx = j->remote_fs.ts ? (int)(rtf - j->remote_fs.ts->fields) : -1;
+            if (rtidx >= 0 && typed_field_null(rbm, rbm_bytes, rtidx)) continue;
+            const uint8_t *rfp = ((size_t)rtf->offset + (size_t)rtf->size > rregion)
                 ? g_zero_field_65537
-                : rraw + rtf->offset;
+                : rbase + rtf->offset;
             int n = typed_field_to_buf_raw(rtf, rfp,
                                            tmp, sizeof(tmp), 0);
             if (n > 0) pos += csv_cell_to_buf(tmp, csv_delim, buf + pos, bufsz - pos);
@@ -601,9 +668,10 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
     const char *raw = (const char *)block + hdr->key_len;
 
     /* Criteria match + join resolution are thread-local reads, lock-free. */
+    uint8_t rec_hdr2 = (uint8_t)(hdr->flag >> 8);
     int match = sc->fast_cc
-        ? match_typed((const uint8_t *)raw, hdr->value_len, sc->fast_cc, sc->fs)
-        : criteria_match_tree((const uint8_t *)raw, hdr->value_len, sc->tree, sc->fs);
+        ? match_typed((const uint8_t *)raw, hdr->value_len, sc->fast_cc, sc->fs, rec_hdr2)
+        : criteria_match_tree((const uint8_t *)raw, hdr->value_len, sc->tree, sc->fs, rec_hdr2);
 
     if (match) {
         RecordRef     *join_refs = NULL;
@@ -616,7 +684,8 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                 char lk[1024];
                 int llen = extract_local_key(&sc->joins[i], (const uint8_t *)raw,
                                              (size_t)hdr->value_len,
-                                             sc->fs ? sc->fs->ts : NULL, lk, sizeof(lk));
+                                             sc->fs ? sc->fs->ts : NULL,
+                                             rec_hdr2, lk, sizeof(lk));
                 int found = 0;
                 if (llen > 0) {
                     found = lookup_remote(&sc->joins[i], sc->db_root, lk, (size_t)llen,
@@ -648,6 +717,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                     char row[16384];
                     size_t n = build_joined_csv_row(
                         key, (const uint8_t *)raw, (size_t)hdr->value_len, sc->fs,
+                        (uint8_t)(hdr->flag >> 8),
                         sc->proj_count > 0 ? sc->proj_fields : NULL, sc->proj_count,
                         sc->joins, sc->njoins, join_refs, sc->csv_delim,
                         row, sizeof(row));
@@ -659,31 +729,33 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                                        sc->printed ? "," : "", key);
                     pos += buf_driver_values((const uint8_t *)raw, (size_t)hdr->value_len, sc->fs,
                                              sc->proj_count > 0 ? sc->proj_fields : NULL,
-                                             sc->proj_count,
+                                             sc->proj_count, (uint8_t)(hdr->flag >> 8),
                                              row + pos, sizeof(row) - pos);
                     for (int i = 0; i < sc->njoins && pos < (int)sizeof(row) - 2; i++)
                         pos += buf_join_values(&sc->joins[i], join_raws[i], join_refs[i].vlen,
+                                               join_refs[i].hdr2,
                                                row + pos, sizeof(row) - pos);
                     snprintf_bounded(row + pos, sizeof(row) - pos, "]");
                     OUT("%s", row);
                 } else if (sc->csv_delim) {
                     csv_emit_row(key, (const uint8_t *)raw, hdr->value_len,
                                  sc->proj_count > 0 ? sc->proj_fields : NULL,
-                                 sc->proj_count, sc->fs, sc->csv_delim);
+                                 sc->proj_count, sc->fs, sc->csv_delim, (uint8_t)(hdr->flag >> 8));
                 } else if (sc->rows_fmt) {
                     OUT("%s[\"%s\"", sc->printed ? "," : "", key);
                     if (sc->proj_count > 0) {
                         for (int i = 0; i < sc->proj_count; i++) {
-                            char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs);
+                            char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs, (uint8_t)(hdr->flag >> 8));
                             OUT(",%s", pv ? pv : "\"\"");
                             free(pv);
                         }
                     } else if (sc->fs && sc->fs->ts) {
                         for (int i = 0; i < sc->fs->ts->nfields; i++) {
                             if (sc->fs->ts->fields[i].removed) continue;
-                            char *pv = json_projected_value(
-                                typed_get_field_str(sc->fs->ts, (const uint8_t *)raw, (int)hdr->value_len, i),
-                                &sc->fs->ts->fields[i]);
+                            char *pv = json_typed_row_cell(sc->fs->ts,
+                                                           (const uint8_t *)raw,
+                                                           (int)hdr->value_len, i,
+                                                           (uint8_t)(hdr->flag >> 8));
                             OUT(",%s", pv ? pv : "\"\"");
                             free(pv);
                         }
@@ -695,7 +767,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                         OUT("{");
                         int first = 1;
                         for (int i = 0; i < sc->proj_count; i++) {
-                            char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs);
+                            char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs, (uint8_t)(hdr->flag >> 8));
                             if (!pv) continue;
                             OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[i], pv);
                             first = 0;
@@ -703,7 +775,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                         }
                         OUT("}");
                     } else {
-                        char *val = decode_value(raw, hdr->value_len, sc->fs);
+                        char *val = decode_value(raw, hdr->value_len, sc->fs, (uint8_t)(hdr->flag >> 8));
                         OUT("%s", val);
                         free(val);
                     }
@@ -711,7 +783,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                     OUT("%s{\"key\":\"%s\",\"value\":{", sc->printed ? "," : "", key);
                     int first = 1;
                     for (int i = 0; i < sc->proj_count; i++) {
-                        char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs);
+                        char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs, (uint8_t)(hdr->flag >> 8));
                         if (!pv) continue;
                         OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[i], pv);
                         first = 0;
@@ -719,7 +791,7 @@ int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
                     }
                     OUT("}}");
                 } else {
-                    char *val = decode_value(raw, hdr->value_len, sc->fs);
+                    char *val = decode_value(raw, hdr->value_len, sc->fs, (uint8_t)(hdr->flag >> 8));
                     OUT("%s{\"key\":\"%s\",\"value\":%s}", sc->printed ? "," : "", key, val);
                     free(val);
                 }

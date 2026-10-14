@@ -197,8 +197,11 @@ static int reopen_retry_cb(const char *value, size_t vlen,
                            BtOrderedWalkHandle *wh, void *ctx_v) {
     (void)hash;
     ReopenRetryCtx *ctx = ctx_v;
+    /* BTRI ordered walks deliver tiered keys — the payload rides after
+       the 0x00 tier byte. Record the last byte (payload for 1-byte F
+       values under both the tiered and raw layouts). */
     if (vlen > 0 && ctx->count < (int)sizeof(ctx->seen) - 1)
-        ctx->seen[ctx->count++] = value[0];
+        ctx->seen[ctx->count++] = value[vlen - 1];
     if (ctx->count == 1) {
         btree_test_fail_next_range_open_shard(ctx->fail_shard);
         btree_ordered_walk_release_for_blocking(wh);
@@ -237,14 +240,18 @@ static int test_ordered_walk_failed_reopen_stays_retired_run(void) {
                 "find hash for index shard 0");
     ASSERT_TRUE(find_hash_on_idx_shard(shard1_hash, 1, "retry_s1"),
                 "find hash for index shard 1");
+    /* BTRI keys are [tier][payload]: btree_idx_insert stores what it is
+       given, and btree_idx_walk_ordered prefixes its caller bounds with
+       the 0x00 tier byte — so the inserts must be tiered to fall in the
+       walk's range at all. */
     ASSERT_EQ_INT(btree_idx_insert(root, object, field, SKIP_SPLITS,
-                                   "1", 1, shard0_hash),
+                                   "\x00" "1", 2, shard0_hash),
                   0, "insert F=1 on surviving shard");
     ASSERT_EQ_INT(btree_idx_insert(root, object, field, SKIP_SPLITS,
-                                   "3", 1, shard0_hash),
+                                   "\x00" "3", 2, shard0_hash),
                   0, "insert F=3 on surviving shard");
     ASSERT_EQ_INT(btree_idx_insert(root, object, field, SKIP_SPLITS,
-                                   "2", 1, shard1_hash),
+                                   "\x00" "2", 2, shard1_hash),
                   0, "insert F=2 on shard whose reopen will fail");
 
     ReopenRetryCtx ctx = { .fail_shard = 1 };

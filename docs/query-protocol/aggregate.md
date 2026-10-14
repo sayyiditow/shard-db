@@ -88,6 +88,16 @@ Calendar result representations are exact strings: `date` is `yyyyMMdd`,
 
 ## Response
 
+### NULL semantics (2026.10.2)
+
+`sum` / `avg` / `min` / `max` skip NULLs (SQL semantics); `avg` of an
+all-NULL group renders `null`; `count(field)` counts non-NULL values
+while bare `count` is a row count. `group_by` gives NULL its **own
+group**, rendered as bare JSON `null` — `NULL`, `""`, and the literal
+`"null"` are three distinct buckets, and indexed and scan paths return
+identical buckets. Full semantics:
+[typed-records](../concepts/typed-records.md#null-values-2026102).
+
 ### Whole-table (no `group_by`)
 
 ```json

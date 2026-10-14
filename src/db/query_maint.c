@@ -59,7 +59,7 @@ typedef struct {
 static int tg_estimate_cb(uint32_t slot, const uint8_t hash16[16],
                           const void *key, size_t klen,
                           const void *value, size_t vlen,
-                          void *ctx) {
+                          uint8_t hdr2, void *ctx) {
     (void)slot; (void)hash16; (void)key; (void)klen;
     TgEstimateCtx *c = (TgEstimateCtx *)ctx;
     if (c->sampled >= c->max_sample) return -1;

@@ -99,6 +99,14 @@ Changing these requires recompiling. Most don't need to change.
 | Token scopes | global / per-tenant / per-object | Determined by which `tokens.conf` file the line lives in. |
 | Token permissions | `r` / `rw` / `rwx` | Suffix on the token line. No suffix = `rwx` (backward-compat). |
 
+## Per-record overhead (2026.10.2)
+
+Every typed record carries a per-record null bitmap of
+`1 + ceil(nfields/8)` bytes (one count byte + one bit per declared
+field), stored at the head of the segment value region. At the default
+scale this is 1–33 bytes per record depending on field count; a NULL
+field's stored bytes are canonical zeros, so payload size is unchanged.
+
 ## Not supported
 
 - **Transactions across records.** Use [CAS](../query-protocol/cas.md) per record (including bulk forms).

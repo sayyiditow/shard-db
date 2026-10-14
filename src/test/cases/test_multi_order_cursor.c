@@ -392,6 +392,8 @@ static int test_multi_order_cursor_run(void) {
         "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"mo\","
         "\"criteria\":[],\"order_by\":\"tenant\",\"order\":\"asc\","
         "\"limit\":5,\"cursor\":null}", &resp);
+    /* 2026.10.2 §2.5: cursor tokens are versioned (v2) and carry a
+       per-field tier byte array so resume crosses NULL groups. */
     ASSERT_CONTAINS(resp, "\"cursor\":{\"tenant\":\"", "single-field token");
     free(resp); resp = NULL;
 

@@ -8,7 +8,7 @@ User-facing docs live under `docs/`.
 
 - **Execution mode:** leave work **uncommitted** after plan execution — the reviewing agent + human MUST review the raw `git diff` first; nothing is committed until that review pass is done.
 - **Build/test commands for plans:** build with `SKIP_TESTS=1 ./build.sh`; test with `./build/bin/shard-db-test run[-all]`.
-- **Dynamic-safety tooling for this repo (CORE-PROCESS.md's "Definition of done" gate):** ASan+UBSan and TSan, via `BUILD_MODE`. Any diff touching locks, shared/cached state (kfcache, segcache, bitmap cache, btree cache), object lifetimes, or background threads must be run locally under both before being called done — not deferred to CI. ASan+UBSan uses the normal default all-core parallelism. TSan is resource-constrained on this workstation and must use `--jobs 2` for every full-suite invocation. Run each full suite three consecutive times:
+- **Dynamic-safety tooling for this repo (pre-push gate; this local run is what discharges CORE-PROCESS.md's "Definition of done" gate at hand-back):** ASan+UBSan and TSan, via `BUILD_MODE`. Run both **once per branch, after ALL fixes are done, immediately before pushing to git / opening the PR — never between individual fix rounds.** A mid-loop sanitizer run is wasted work: the next fix invalidates it, and each intermediate round needs only the normal full suite (plus targeted case runs) — the full suite stays mandatory for every change. The gate still covers every diff that touches locks, shared/cached state (kfcache, segcache, bitmap cache, btree cache), object lifetimes, or background threads; those diffs must have a passing local run of both suites before the branch is pushed — not deferred to CI. ASan+UBSan uses the normal default all-core parallelism. TSan is resource-constrained on this workstation and must use `--jobs 2` for every full-suite invocation. Run each full suite three consecutive times:
   - `BUILD_MODE=asan SKIP_TESTS=1 ./build.sh`, then three fresh runs of `./build/bin/shard-db-test run-all` (no env options needed — see below).
   - `BUILD_MODE=tsan SKIP_TESTS=1 ./build.sh`, then three fresh runs of `TSAN_OPTIONS="second_deadlock_stack=1:print_stacktrace=1" ./build/bin/shard-db-test run-all --jobs 2` (no suppressions file — `.tsan.supp` was eliminated 2026-08-30; every prior finding is fixed or restructured).
   - **Strictness is baked into the asan build** (`-fno-sanitize-recover=undefined`): UBSan runtime errors abort at the point of error, ASan halts on the first memory error, and LSan fails the exit code on leaks — a bare run-all is the gate. **No `halt_on_error=0` anywhere in gate invocations**: findings must fail the run, not print and continue (a collect-all gate masks leaks/runtime errors behind tolerated child exit codes; the 2026-08-27 ASan gate passed 3× that way while `slotcask_bulk_fetch_resolved` leaked on every call). If a finding aborts a daemon mid-suite, that is the gate working; fix it, then rerun. Reruns after each fix surface subsequent findings. TSan needs no equivalent flag — its default already exits nonzero when any report fired (suppressed findings excluded). Debugging aid only: `UBSAN_OPTIONS=print_stacktrace=1` adds a call stack to UBSan's one-line report.
@@ -97,20 +97,30 @@ Deep dives: [docs/concepts/storage-model.md](docs/concepts/storage-model.md), [d
 
 ## Typed binary record format
 
-Driven by fields.conf. One slot = sum of field sizes (fixed).
+Driven by fields.conf. One slot = sum of field sizes (fixed). Every
+record carries a per-record null bitmap (`1 + ceil(nfields/8)` bytes at
+the head of the value region; bit set = NULL) — see
+docs/concepts/typed-records.md for NULL write/read/index/aggregate
+semantics.
 
 | Type | Encoding |
 |---|---|
 | `varchar:N` | `[uint16 BE length][content]` → on-disk N+2 bytes. Max content **65535**. |
 | `int / long / short` | 4 / 8 / 2 bytes BE signed |
 | `double` | 8 bytes IEEE 754 |
+| `float` | 4 bytes IEEE 754 |
 | `bool / byte` | 1 byte |
 | `date` | 4 bytes BE int32 (`yyyyMMdd`) |
 | `datetime` | 7 bytes (BE int32 yyyyMMdd + BE uint24 seconds-of-day, 0..86399) |
 | `datetimems` | 8 bytes (BE int32 yyyyMMdd + BE uint32 ms-of-day) |
+| `time` | 3 bytes BE uint24 seconds-of-day (`HH:MM:SS`) |
+| `timestamp` | 8 bytes BE int64 (Unix epoch **ms**; the `auto_create`/`auto_update` carrier) |
+| `uuid` | 16 bytes binary (36-char dashed wire form) |
 | `ipv4` | 4 bytes, network byte order |
 | `ipv6` | 16 bytes, network byte order |
 | `numeric:P,S` | 8 bytes BE int64 × 10^S |
+| `currency` | alias for `numeric:19,4` |
+| `enum(v1,v2,...)` | 1 byte (≤256 values) or 2 bytes BE value index; wire format is the display string |
 
 Field defaults (in fields.conf): `:default=<literal>`, `:auto_create`, `:auto_update`, `:default=seq(<name>)`, `:default=uuid()`, `:default=random(N)`. Reference: [docs/concepts/typed-records.md](docs/concepts/typed-records.md).
 
@@ -191,6 +201,17 @@ against the DB_ROOT (it migrates legacy 6-byte `datetime` fields to the
 standalone `./migrate`, `migrate-varlen`, and storage migration JSON
 modes are removed, as is the in-binary migration path. The minimum
 supported source release is 2026.09.2.
+
+2026.10.2 adds real NULL for typed fields (per-record null bitmap,
+`1 + ceil(nfields/8)` bytes; see docs/concepts/typed-records.md) and
+rolls B+ tree magic `'BTRH'` → `'BTRI'` for tiered NULL index keys. The
+upgrade is a **startup migration**: on first start the daemon reindexes
+every indexed object through a strict durability-checked entry point
+(any failure or unconfirmed publication fails startup; partially
+published shards retry whole), replays pending KFM2 markers against the
+rebuilt indexes, then durably stamps completion (`.btri-migrated` at
+the DB_ROOT) and serves. Subsequent starts skip the migration. No
+operator action; the 2026.09.2 eligibility gate is unchanged.
 
 **Bulk-insert at scale**: pre-grow (2026.05.x) makes bulk-insert ~2× faster on every path. Parallel still wins for max throughput — C-bench (2026-09-14, post-B3b) shows CSV K/V at 2.09 M/sec single vs **3.17 M/sec at 5 conns × 2M** (1.52× single; absolute numbers sit ~2.5× below the pre-2026.09 headlines because every commit window now fsyncs markers, segments, and kf). The "single beats parallel" claim that briefly appeared in earlier docs was a bash-bench artifact (shell forked `$BIN query` subprocesses per chunk ×5; each fork costs 10–30 ms). With C pthreads, the original `R ≈ N/200K, 5 ≤ conns` rule still holds, and ingest peaks at `splits ≈ core count` — over-splitting taxes every request (see docs/operations/tuning.md).
 

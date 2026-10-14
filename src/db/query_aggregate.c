@@ -30,13 +30,13 @@ typedef struct {
 static int keyset_emit_agg_cb(const uint8_t hash[16],
                                const void *key, size_t klen,
                                const void *value, size_t vlen,
-                               void *ctx_ptr) {
+                               uint8_t hdr2, void *ctx_ptr) {
     KeysetEmitAggCtx *ctx = (KeysetEmitAggCtx *)ctx_ptr;
     if (query_deadline_tick(ctx->dl, &ctx->dl_counter)) return 1;
 
     SlotHeader hdr = {0};
     memcpy(hdr.hash, hash, 16);
-    hdr.flag = 1;
+    hdr.flag = 1 | (((unsigned)hdr2 & 0xFF) << 8);
     hdr.key_len = (uint16_t)klen;
     hdr.value_len = (uint32_t)vlen;
     uint8_t stk[2048];
@@ -75,7 +75,7 @@ static void keyset_emit_agg(const char *db_root, const char *object,
             if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
             SlotHeader hdr = {0};
             memcpy(hdr.hash, ks->keys[b], 16);
-            hdr.flag = 1;
+            hdr.flag = 1 | (((unsigned)rr.hdr2 & 0xFF) << 8);
             hdr.key_len = (uint16_t)rr.klen;
             hdr.value_len = (uint32_t)rr.vlen;
             uint8_t stk[2048];
@@ -250,12 +250,27 @@ static int agg_field_is_unset(const TypedField *f, const uint8_t *p) {
    bytes the record actually carries. A truncated field degrades to
    *avail < field size, so every converter's available<size check
    classifies it MISSING — never a fabricated zero. */
+/* Field pointer within a typed record. Generation-aware (2026.10.2 null
+   plan): nullmap records slide to the field-region base; the bitmap is
+   surfaced via *out_null so accumulators can skip NULLs (§2.5). */
 static const uint8_t *agg_field_ptr(const uint8_t *rec, size_t rec_len,
-                                    const TypedField *tf, size_t *avail) {
-    *avail = ((size_t)tf->offset < rec_len)
-        ? rec_len - (size_t)tf->offset : 0;
+                                    const TypedField *tf, size_t *avail,
+                                    uint8_t hdr2, int *out_null) {
+    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
+    int bm_bytes = 0; size_t region = 0;
+    *out_null = 0;
+    if (typed_record_view(rec, rec_len, hdr2, &fbase, &bm,
+                          &bm_bytes, &region) != 0) {
+        *avail = 0;
+        return g_zero_field_65537;
+    }
+    /* NULL determination needs the schema index — call sites that have it
+       test typed_field_null(bm, bm_bytes, idx) directly (Task 8). */
+    (void)bm; (void)bm_bytes;
+    *avail = ((size_t)tf->offset < region)
+        ? region - (size_t)tf->offset : 0;
     return (*avail >= (size_t)tf->size)
-        ? rec + tf->offset : g_zero_field_65537;
+        ? fbase + tf->offset : g_zero_field_65537;
 }
 
 /* Inline raw-key cap for the integer group_by fast path. Sized to fit
@@ -265,7 +280,9 @@ static const uint8_t *agg_field_ptr(const uint8_t *rec, size_t rec_len,
 #define AGG_INT_KEY_CAP 32
 
 typedef struct AggBucket {
-    char *group_key;            /* concatenated group values separated by \x1F */
+    char *group_key;            /* tagged components, \x1F-separated (may hold NULs) */
+    int   group_key_len;        /* tagged key length (embedded NULs — never strcmp) */
+    uint8_t *group_nulls;       /* per-component NULL tag (Task 8 NULL own-group) */
     char **group_vals;          /* individual group values for output */
     AggAccum *accums;           /* one per aggregate */
     struct AggBucket *next;     /* hash chain */
@@ -608,6 +625,12 @@ static AggValueStatus decode_index_key_to_double(const TypedField *f,
                                         double *out);
 static void fmt_double(char *buf, size_t sz, double v);
 
+/* §2.4.2 tier clamp: an open-ended upper bound for a VALUE walk (min/max,
+ * sum/top-N-over-values) stops before the first [0x01]-prefixed (NULL-tier)
+ * key — length 1, exclusive. Never padded: NULL varchar is exactly [0x01],
+ * and the length tie-break sorts it below [0x01,0x00]. */
+static const char AGG_VALUE_TIER_CEIL[1] = { 0x01 };
+
 /* ========== Streaming top-N aggregate executor (Phase 1) ==========
  *
  * Pre: eligible_for_topn_stream returned 1.
@@ -683,6 +706,15 @@ static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
     TopNWalkCtx *c = (TopNWalkCtx *)ctx_v;
 
     if (query_deadline_tick(c->dl, &c->dl_counter)) return -1;
+    /* BTRI: the ordered walk delivers tiered keys ([0x00] value / [0x01]
+       NULL). The NULL tier forms its own group (§2.4.5/Task 8) — the
+       single [0x01] key (length 1) is the NULL group's identity; the
+       tiered key stays intact through the heap: the varchar emit strips
+       the tier for the label (and renders null for the NULL group), and
+       the numeric emit's decode_index_key_to_double re-strips internally
+       (MISSING for the NULL key — accumulators then skip it). */
+    if (enc_val_len == 0) return 0;
+
     if (c->prefilter) {
         int in = keyset_contains(c->prefilter, hash16);
         /* Normal prefilter: skip rows NOT in the match-set. Inverted
@@ -860,9 +892,11 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
     ctx.dl             = dl;
     ctx.gb_tf          = resolve_idx_field(fs->ts, group_by_field);
 
+    /* Open upper bound: the ordered walk must reach the NULL tier so a
+       NULL group_by forms its own (tagged) group (§2.4.5/Task 8). */
     btree_idx_walk_ordered(db_root, object, group_by_field, sch->splits,
-                            "", 0, 0,
-                            "\xff\xff\xff\xff", 4, 0,
+                            NULL, 0, 0,
+                            NULL, 0, 0,
                             0 /* asc */,
                             topn_walk_cb, &ctx);
 
@@ -908,10 +942,20 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
         char val_buf[1032];
         int  vl = 0;
         if (gb_is_varchar) {
-            /* Index stores raw string content for varchar. */
-            vl = (int)gklens[i];
+            /* Index stores [tier][raw string content] for varchar — strip
+               the tier byte for the label (numeric keys take the other
+               branch, whose decode strips the tier itself). The NULL
+               group's key is the bare [0x01] tier byte: render null. */
+            const char *raw = gkeys[i];
+            size_t raw_len = gklens[i];
+            if (raw_len == 1 && (uint8_t)raw[0] == 0x01) {
+                OUT("\"%s\":null", group_by_field);
+                goto emit_aggs_i;
+            }
+            if (raw_len > 0 && (uint8_t)raw[0] == 0x00) { raw++; raw_len--; }
+            vl = (int)raw_len;
             if (vl > (int)(sizeof(val_buf) - 1)) vl = (int)(sizeof(val_buf) - 1);
-            memcpy(val_buf, gkeys[i], (size_t)vl);
+            memcpy(val_buf, raw, (size_t)vl);
             val_buf[vl] = '\0';
             char *esc = json_escape_const(val_buf);
             OUT("\"%s\":\"%s\"", group_by_field, esc ? esc : "");
@@ -940,6 +984,7 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
             free(esc);
         }
 
+        emit_aggs_i:
         /* Emit aggregate values. */
         for (int s = 0; s < nspecs; s++) {
             char vbuf[64];
@@ -984,6 +1029,7 @@ typedef struct {
     char group_fields[MAX_FIELDS][256];
     int ngroups;
     const TypedField *group_tfs[MAX_FIELDS];  /* resolved typed field per group — NULL = composite/unknown */
+    int group_idx[MAX_FIELDS];                /* schema index per group field (bitmap NULL tests) */
     /* aggregates */
     AggSpec *specs;
     int nspecs;
@@ -1165,6 +1211,11 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
 static AggValueStatus decode_index_key_to_double(const TypedField *f,
                                       const uint8_t *p, size_t plen,
                                       double *out) {
+    /* BTRI leaf entries are [tier][payload]: strip the tier, and skip
+       NULL-tier entries (numeric accumulators skip NULLs). Foreign tier
+       bytes fail closed as MISSING. Payload decode follows. */
+    if (!p || plen == 0 || p[0] != 0x00) return AGG_VALUE_MISSING;
+    p++; plen--;
     switch (f->type) {
     case FT_LONG: {
         if (plen < 8) return AGG_VALUE_MISSING;
@@ -1280,6 +1331,13 @@ static AggValueStatus decode_index_key_to_text(const TypedField *f,
                                                const uint8_t *p, size_t plen,
                                                char *out, size_t *out_len) {
     if (!f || !p || !out || !out_len) return AGG_VALUE_MISSING;
+    /* BTRI tier dispatch (§2.4.5): strip 0x00; NULL tier skipped here.
+       An empty varchar payload is MISSING for text min/max — the per-type
+       unset-marker doctrine is generation- and route-independent (matches
+       typed_field_to_text and count(field)); grouping keeps PRESENT-empty
+       via the group-key decode instead. */
+    if (plen == 0 || p[0] != 0x00) return AGG_VALUE_MISSING;
+    p++; plen--;
     switch (f->type) {
     case FT_VARCHAR:
         if (plen == 0) return AGG_VALUE_MISSING;
@@ -1470,9 +1528,12 @@ int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
                         (long long)whole, f->numeric_scale, (long long)frac);
     }
     case FT_VARCHAR: {
-        /* Index stores raw varchar bytes. Empty-string semantics match
-           the index's skip-zero rule: zero-length entries don't appear
-           in the btree, so any leaf we see has plen > 0. */
+        /* Index stores raw varchar bytes. BTRI: an empty varchar stores
+           the tier byte alone, so group-by callers reach this case with
+           plen == 0 — PRESENT-empty (§2.4.5). Return 0 WITHOUT touching
+           buf; group-by callers initialize the label themselves and
+           treat 0 as the empty string, while min/max readers treat 0 as
+           skip. Callers that need "" pre-initialized do so. */
         if (plen == 0) return 0;
         size_t cl = plen < bufsz - 1 ? plen : bufsz - 1;
         memcpy(buf, p, cl);
@@ -1631,6 +1692,27 @@ static void hsm_free(HashStrMap *m) {
     m->cap = m->mask = m->arena_used = m->arena_cap = 0;
 }
 
+/* Parse a tagged group component ([u8 is_null][u32 BE len][text]) as
+   stored in the secondary-group maps. Returns the text span and its
+   NULL flag. Malformed entries parse as empty non-NULL (the map is
+   only written by sec_map_build_worker, so this is defensive only). */
+static void hsm_parse_tagged(const char *val, size_t vlen,
+                             int *out_null, const char **out_text,
+                             size_t *out_text_len) {
+    *out_null = 0;
+    *out_text = "";
+    *out_text_len = 0;
+    if (vlen < 5) return;
+    uint32_t bl = ((uint32_t)(uint8_t)val[1] << 24) |
+                  ((uint32_t)(uint8_t)val[2] << 16) |
+                  ((uint32_t)(uint8_t)val[3] << 8) |
+                  (uint32_t)(uint8_t)val[4];
+    if (5 + (size_t)bl > vlen) return;
+    *out_null = val[0] ? 1 : 0;
+    *out_text = val + 5;
+    *out_text_len = bl;
+}
+
 /* Append a string to the arena (growing it if needed) and place an
    entry into the map. Linear probing on collision. Returns 0 on success,
    -1 on allocation failure. */
@@ -1708,6 +1790,7 @@ typedef struct {
     CriteriaNode     *tree;
     FieldSchema      *fs;
     const TypedField *agg_tf;
+    int               agg_tf_idx;  /* schema index of agg_tf — bitmap NULL test */
     int               desc;     /* 0 = MIN (ASC walk), 1 = MAX (DESC) */
     double           *best;
     int              *found;
@@ -1737,12 +1820,19 @@ typedef struct {
 static int wfc_batch_cb(const uint8_t hash16[16],
                          const void *key, size_t klen,
                          const void *value, size_t vlen,
-                         void *ctx) {
+                         uint8_t hdr2, void *ctx) {
     (void)hash16; (void)key; (void)klen;
     WfcBatchCtx *bc = (WfcBatchCtx *)ctx;
-    if (!criteria_match_tree(value, vlen, bc->tree, bc->fs)) return 0;
+    if (!criteria_match_tree(value, vlen, bc->tree, bc->fs, hdr2)) return 0;
+    /* NULL skips min/max (§2.5) — the bitmap bit decides on nullmap
+       records; legacy records keep the decode-time absence contract. */
+    if (hdr2 & SREC_FLAG_NULLMAP) {
+        const uint8_t *val = (const uint8_t *)value;
+        const uint8_t *nb = typed_bitmap_of(val, hdr2);
+        if (nb && typed_field_null(nb, val[0], bc->agg_tf_idx)) return 0;
+    }
     size_t agg_avail;
-    const uint8_t *agg_p = agg_field_ptr(value, vlen, bc->agg_tf, &agg_avail);
+    const uint8_t *agg_p = agg_field_ptr(value, vlen, bc->agg_tf, &agg_avail, hdr2, &(int){0});
     double v;
     if (typed_field_to_double(bc->agg_tf, agg_p, agg_avail, &v) != AGG_VALUE_PRESENT)
         return 0;
@@ -1767,7 +1857,7 @@ static void flush_wfc_batch(SlotcaskDb *sdb, WfcArg *w,
             RecordRef rr;
             if (read_record_ref(w->db_root, w->object, w->sch,
                                 batch[i], &rr) != 0) continue;
-            wfc_batch_cb(batch[i], NULL, 0, rr.val, rr.vlen, bc);
+            wfc_batch_cb(batch[i], NULL, 0, rr.val, rr.vlen, rr.hdr2, bc);
             release_record_ref(&rr);
         }
     }
@@ -1808,6 +1898,7 @@ static void *wfc_worker(void *arg) {
         .tree   = w->tree,
         .fs     = w->fs,
         .agg_tf = w->agg_tf,
+        .agg_tf_idx = (int)(w->agg_tf - w->fs->ts->fields),
         .desc   = w->desc,
         .best   = &w->best,
         .found  = &w->found,
@@ -1819,8 +1910,8 @@ static void *wfc_worker(void *arg) {
     for (;;) {
         char lo_buf[BT_MAX_VAL_LEN];
         const char *lo = "";  size_t lo_len = 0;
-        const char *hi = "\xff\xff\xff\xff"; size_t hi_len = 4;
-        int hi_excl = 0;
+        const char *hi = AGG_VALUE_TIER_CEIL; size_t hi_len = 1;
+        int hi_excl = 1;
         if (have_last) {
             memcpy(lo_buf, last_val, last_len);
             lo = lo_buf; lo_len = last_len;   /* inclusive at resume */
@@ -1914,7 +2005,7 @@ static void *awc_shard_worker(void *raw) {
     build_idx_path(idx_path, sizeof(idx_path),
                    a->db_root, a->object, a->fld, a->shard_id);
     BtRangeIter *it = btree_range_iter_open(
-        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
+        idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, 0);
     if (!it) {
         LOG_ERROR(LOG_SUB_QUERY, "awc_shard_worker: btree_range_iter_open %s failed", idx_path);
         return NULL;
@@ -1989,9 +2080,16 @@ static AggValueStatus typed_field_to_double(const TypedField *f, const uint8_t *
     }
 }
 
+/* Text projection for text min/max. The per-type unset-marker doctrine is
+   generation-independent (matching count(field)): an empty varchar, an
+   all-zero calendar, and midnight are NOT present textual values, so they
+   never become min/max offers — on legacy and nullmap records alike. The
+   caller's bitmap NULL check runs before this function and skips NULLs. */
 static AggValueStatus typed_field_to_text(const TypedField *f, const uint8_t *p,
                                           size_t available, char *buf,
-                                          size_t bufsz, size_t *out_len) {
+                                          size_t bufsz, size_t *out_len,
+                                          uint8_t hdr2) {
+    (void)hdr2;
     if (!f || !p || !buf || bufsz == 0 || available < (size_t)f->size)
         return AGG_VALUE_MISSING;
     int n = 0;
@@ -2055,6 +2153,14 @@ static void agg_text_offer(AggCtx *ctx, AggAccum *a, enum AggFn fn,
 static uint32_t agg_hash(const char *s) {
     uint32_t h = 5381;
     while (*s) h = h * 33 + (uint8_t)*s++;
+    return h;
+}
+
+/* djb2 over an explicit length — the tagged group key holds embedded
+   NULs (BE lengths), so strlen-based hashing would truncate. */
+static uint32_t agg_hash_len(const char *s, size_t len) {
+    uint32_t h = 5381;
+    for (size_t i = 0; i < len; i++) h = h * 33 + (uint8_t)s[i];
     return h;
 }
 
@@ -2145,16 +2251,27 @@ static int agg_ht_resize(AggCtx *ctx) {
    raw_key/len provides the raw bytes for fast hash/compare, while vals
    still provides strings for output. For string keys, raw_key_len=0. */
 static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals,
-                                      const uint8_t *raw_key, int raw_key_len) {
-    /* Build composite key */
+                                      const uint8_t *raw_key, int raw_key_len,
+                                      const uint8_t *nulls) {
+    /* Build composite key — §2.4.5/Task 8 tagged components:
+       [u8 is_null][u32 BE text_length][text], NULL length zero. NULL, "",
+       and the literal "null" are three distinct keys. The tag/length bytes
+       embed NULs, so hashing and comparison are length-based, never
+       strcmp. */
     char key[4096];
     int kp = 0;
     for (int i = 0; i < nvals; i++) {
         if (i > 0) key[kp++] = '\x1F';
-        int sl = strlen(vals[i]);
-        if (kp + sl >= (int)sizeof(key) - 1) break;
-        memcpy(key + kp, vals[i], sl);
-        kp += sl;
+        int is_null = nulls ? (nulls[i] ? 1 : 0) : 0;
+        uint32_t bl = is_null ? 0 : (uint32_t)strlen(vals[i]);
+        if (kp + 5 + (int)bl >= (int)sizeof(key) - 1) break;
+        key[kp++] = (char)(is_null ? 1 : 0);
+        key[kp++] = (char)(bl >> 24);
+        key[kp++] = (char)(bl >> 16);
+        key[kp++] = (char)(bl >> 8);
+        key[kp++] = (char)bl;
+        memcpy(key + kp, vals[i], bl);
+        kp += (int)bl;
     }
     key[kp] = '\0';
 
@@ -2179,10 +2296,11 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals,
             }
         }
     } else {
-        khash = agg_hash(key);
+        khash = agg_hash_len(key, (size_t)kp);
         h = khash & (uint32_t)ctx->ht_mask;
         for (AggBucket *b = ctx->ht[h]; b; b = b->next) {
-            if (strcmp(b->group_key, key) == 0) return b;
+            if (b->group_key_len == kp &&
+                memcmp(b->group_key, key, (size_t)kp) == 0) return b;
         }
     }
 
@@ -2190,6 +2308,7 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals,
     if (ctx->shared_buffer_bytes) {
         size_t bucket_bytes = sizeof(AggBucket) + (size_t)(kp + 1) +
                               (size_t)nvals * sizeof(char *) +
+                              (size_t)nvals +                    /* group_nulls */
                               (size_t)ctx->nspecs * sizeof(AggAccum);
         for (int i = 0; i < nvals; i++) bucket_bytes += strlen(vals[i]) + 1;
         size_t prev = atomic_fetch_add_explicit(ctx->shared_buffer_bytes,
@@ -2209,11 +2328,15 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals,
     if (!b) { ctx->budget_exceeded = 1; return NULL; }
     memset(b, 0, sizeof(AggBucket));
     b->group_key = agg_arena_strdup(&ctx->arena, key, (size_t)kp);
+    b->group_key_len = kp;
     b->group_vals = agg_arena_alloc(&ctx->arena, (size_t)nvals * sizeof(char *));
-    if (!b->group_key || !b->group_vals) {
+    b->group_nulls = agg_arena_alloc(&ctx->arena, (size_t)nvals);
+    if (!b->group_key || !b->group_vals || !b->group_nulls) {
         ctx->budget_exceeded = 1;
         return NULL;
     }
+    for (int i = 0; i < nvals; i++)
+        b->group_nulls[i] = nulls ? (nulls[i] ? 1 : 0) : 0;
     /* Store raw key for integer optimization */
     if (ctx->use_int_keys && raw_key_len > 0 && raw_key_len <= AGG_INT_KEY_CAP) {
         memcpy(b->raw_key, raw_key, (size_t)raw_key_len);
@@ -2254,7 +2377,7 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
     const uint8_t *raw = block + hdr->key_len;
 
     /* Check full criteria tree (AND/OR) */
-    if (!criteria_match_tree(raw, hdr->value_len, ctx->tree, ctx->fs)) return 0;
+    if (!criteria_match_tree(raw, hdr->value_len, ctx->tree, ctx->fs, (uint8_t)(hdr->flag >> 8))) return 0;
 
     /* Extract group_by values into stack buffers (no malloc). gbuf[i][0]
        is forced to NUL up front because typed_field_to_buf_raw can return
@@ -2263,20 +2386,49 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
        leak into the string-path group_key and merge unrelated rows. */
     char gbuf[MAX_FIELDS][512];
     char *gvals[MAX_FIELDS];
+    uint8_t gnulls[MAX_FIELDS] = {0};
+    /* One validated view up front: the bitmap decides group NULL-ness
+       (Task 8: a NULL group_by field forms its own tagged bucket). */
+    const uint8_t *vbm0 = NULL;
+    int vbm0_bytes = 0;
+    uint8_t v_hdr0 = (uint8_t)(hdr->flag >> 8);
+    if (v_hdr0 & SREC_FLAG_NULLMAP) {
+        const uint8_t *vbase0 = NULL; size_t vregion0 = 0;
+        (void)typed_record_view(raw, hdr->value_len, v_hdr0, &vbase0, &vbm0,
+                                &vbm0_bytes, &vregion0);
+    }
     for (int i = 0; i < ctx->ngroups; i++) {
         gbuf[i][0] = '\0';
         if (ctx->group_tfs[i]) {
             const TypedField *gtf = ctx->group_tfs[i];
-            if ((size_t)gtf->offset + (size_t)gtf->size > (size_t)hdr->value_len) {
+            gnulls[i] = (v_hdr0 & SREC_FLAG_NULLMAP) &&
+                        ctx->group_idx[i] >= 0 &&
+                        typed_field_null(vbm0, vbm0_bytes, ctx->group_idx[i]);
+            if (gnulls[i]) {
+                /* NULL component: tagged key [01][len 0], text "" for
+                   output; decoding the zero field would fabricate a
+                   value (§2.4.5). */
+                gvals[i] = gbuf[i];
+                continue;
+            }
+            size_t avail;
+            /* agg_field_ptr resolves the field-region base (nullmap records
+               slide by the bitmap prefix) and returns the zero field on a
+               short record — avail < size is the truncated case. */
+            const uint8_t *gp = agg_field_ptr(raw, hdr->value_len, gtf,
+                                              &avail, (uint8_t)(hdr->flag >> 8),
+                                              &(int){0});
+            if (avail < (size_t)gtf->size) {
                 /* truncated field — missing group value, not a fake zero */
             } else {
-                typed_field_to_buf_raw(gtf, raw + gtf->offset,
+                typed_field_to_buf_raw(gtf, gp,
                                        gbuf[i], sizeof(gbuf[i]), 1);
             }
         } else {
             /* Composite/unknown — fallback to decode_field */
             char *s = decode_field((const char *)raw, hdr->value_len,
-                                   ctx->group_fields[i], ctx->fs);
+                                   ctx->group_fields[i], ctx->fs,
+                                   (uint8_t)(hdr->flag >> 8));
             if (s) {
                 size_t sl = strlen(s);
                 if (sl >= sizeof(gbuf[i])) sl = sizeof(gbuf[i]) - 1;
@@ -2293,7 +2445,9 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
        is only set at agg setup when the sum of field widths fits the inline
        cap, so the loop is guaranteed to consume every group field — no
        silent truncation. typed_field_to_raw emits the full natural width
-       for each field (including for v=0) so byte-equal ⇔ tuple-equal. */
+       for each field (including for v=0) so byte-equal ⇔ tuple-equal.
+       agg_field_ptr resolves the field-region base (nullmap records slide
+       by the bitmap prefix) — never index raw by gtf->offset. */
     uint8_t raw_key[AGG_INT_KEY_CAP];
     int raw_key_len = 0;
     if (ctx->use_int_keys) {
@@ -2301,11 +2455,24 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         for (int i = 0; i < ctx->ngroups && kp < AGG_INT_KEY_CAP; i++) {
             if (ctx->group_tfs[i]) {
                 const TypedField *gtf = ctx->group_tfs[i];
-                if ((size_t)gtf->offset + (size_t)gtf->size >
-                    (size_t)hdr->value_len)
+                /* Task 8 tag byte keeps NULL tuples distinct from
+                   zero-valued ones in the fast integer path. */
+                if (kp + 1 >= AGG_INT_KEY_CAP) break;
+                raw_key[kp++] = gnulls[i] ? 1 : 0;
+                if (gnulls[i]) {
+                    int w = typed_field_int_width(gtf->type);
+                    if (w <= 0 || kp + w > AGG_INT_KEY_CAP) break;
+                    memset(raw_key + kp, 0, (size_t)w);
+                    kp += w;
+                    continue;
+                }
+                size_t avail;
+                const uint8_t *gp = agg_field_ptr(raw, hdr->value_len, gtf,
+                                                  &avail, (uint8_t)(hdr->flag >> 8),
+                                                  &(int){0});
+                if (avail < (size_t)gtf->size)
                     break;  /* truncated here — every later field is too */
-                int len = typed_field_to_raw(gtf, raw + gtf->offset,
-                                             raw_key + kp,
+                int len = typed_field_to_raw(gtf, gp, raw_key + kp,
                                              (size_t)(AGG_INT_KEY_CAP - kp));
                 if (len > 0) kp += len;
             }
@@ -2319,12 +2486,28 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
        mutex needed. */
     AggBucket *bkt;
     if (ctx->ngroups > 0) {
-        bkt = agg_find_or_create(ctx, gvals, ctx->ngroups, raw_key, raw_key_len);
+        bkt = agg_find_or_create(ctx, gvals, ctx->ngroups, raw_key, raw_key_len,
+                                 gnulls);
     } else {
         char *empty = "";
-        bkt = agg_find_or_create(ctx, &empty, 1, NULL, 0);
+        bkt = agg_find_or_create(ctx, &empty, 1, NULL, 0, NULL);
     }
     if (!bkt) return 1;  /* budget exceeded — stop scan */
+
+    /* One validated view per record; on nullmap records the bitmap decides
+       NULL for every accumulator (§2.5: NULLs skip sum/avg/min/max;
+       count(field) counts non-NULL). Legacy records keep the zero
+       heuristics untouched. A view failure leaves vbm NULL — the row then
+       behaves legacy (agg_field_ptr's zero-field fallback already covers
+       the short-record case). */
+    const uint8_t *vbm = NULL;
+    int vbm_bytes = 0;
+    uint8_t v_hdr2 = (uint8_t)(hdr->flag >> 8);
+    if (v_hdr2 & SREC_FLAG_NULLMAP) {
+        const uint8_t *vbase = NULL; size_t vregion = 0;
+        (void)typed_record_view(raw, hdr->value_len, v_hdr2, &vbase, &vbm,
+                                &vbm_bytes, &vregion);
+    }
 
     for (int i = 0; i < ctx->nspecs; i++) {
         AggAccum *a = &bkt->accums[i];
@@ -2334,15 +2517,28 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
                marker — empty varchar, all-zero calendar, midnight time,
                all-zero uuid (agg_count_inspects_presence). Fixed-width
                numeric fields always carry a value, so they count every
-               record, zeros included. */
-            if (ctx->specs[i].field[0] && ctx->spec_tfs[i] &&
-                agg_count_inspects_presence(ctx->spec_tfs[i]->type)) {
+               record, zeros included. Nullmap records: the bitmap bit is
+               the truth — a bit-clear zero counts, a NULL doesn't. */
+            if (ctx->specs[i].field[0] && ctx->spec_tfs[i]) {
                 const TypedField *cvtf = ctx->spec_tfs[i];
-                size_t avail;
-                const uint8_t *cvp = agg_field_ptr(raw, hdr->value_len,
-                                                   cvtf, &avail);
-                if (avail < (size_t)cvtf->size || agg_field_is_unset(cvtf, cvp))
+                /* NULL never counts on nullmap records — the bitmap is
+                   the truth for every type (§2.5). */
+                if (vbm &&
+                    typed_field_null(vbm, vbm_bytes,
+                                     (int)(cvtf - ctx->fs->ts->fields)))
                     continue;
+                if (agg_count_inspects_presence(cvtf->type)) {
+                    /* The per-type present-value doctrine (empty varchar,
+                       unset calendar, midnight, nil uuid) is
+                       generation-independent — a bit-clear empty string
+                       is still an unset marker. */
+                    size_t avail;
+                    const uint8_t *cvp = agg_field_ptr(raw, hdr->value_len,
+                                                       cvtf, &avail, v_hdr2, &(int){0});
+                    if (avail < (size_t)cvtf->size ||
+                        agg_field_is_unset(cvtf, cvp))
+                        continue;
+                }
             }
             a->count++;
             continue;
@@ -2353,12 +2549,16 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         if (ctx->spec_tfs[i]) {
             const TypedField *stf = ctx->spec_tfs[i];
             size_t avail;
-            const uint8_t *sp = agg_field_ptr(raw, hdr->value_len, stf, &avail);
+            const uint8_t *sp = agg_field_ptr(raw, hdr->value_len, stf, &avail, v_hdr2, &(int){0});
+            if (vbm &&
+                typed_field_null(vbm, vbm_bytes,
+                                 (int)(stf - ctx->fs->ts->fields)))
+                continue;   /* NULL skips sum/avg/min/max (§2.5) */
             if ((ctx->specs[i].fn == AGG_MIN || ctx->specs[i].fn == AGG_MAX) &&
                 agg_type_is_text(stf->type)) {
                 char text[1024]; size_t text_len = 0;
                 if (typed_field_to_text(stf, sp, avail, text, sizeof(text),
-                                        &text_len) == AGG_VALUE_PRESENT)
+                                        &text_len, v_hdr2) == AGG_VALUE_PRESENT)
                     agg_text_offer(ctx, a, ctx->specs[i].fn, text, text_len);
                 continue;
             }
@@ -2734,7 +2934,8 @@ static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
     for (size_t i = 0; i < src->ht_cap; i++) {
         for (AggBucket *b = src->ht[i]; b; b = b->next) {
             AggBucket *dbkt = agg_find_or_create(dst, b->group_vals, nvals,
-                                                  b->raw_key, b->raw_key_len);
+                                                  b->raw_key, b->raw_key_len,
+                                                  b->group_nulls);
             if (!dbkt) continue;  /* dst budget exhausted — caller checks flag */
             for (int k = 0; k < src->nspecs; k++) {
                 AggAccum *sa = &b->accums[k], *da = &dbkt->accums[k];
@@ -2776,11 +2977,11 @@ typedef struct {
 static int agg_kf_scan_cb(const uint8_t hash[16],
                           const void *key, size_t klen,
                           const void *value, size_t vlen,
-                          void *ctx) {
+                          uint8_t hdr2, void *ctx) {
     AggCtx *ac = (AggCtx *)ctx;
     SlotHeader hdr;
     memcpy(hdr.hash, hash, 16);
-    hdr.flag      = 1;
+    hdr.flag      = 1 | (((unsigned)hdr2 & 0xFF) << 8);
     hdr.key_len   = (uint16_t)klen;
     hdr.value_len = (uint32_t)vlen;
     return agg_scan_cb(&hdr, (const uint8_t *)key, ac);
@@ -2841,13 +3042,13 @@ typedef struct {
 static int agg_batch_cb(const uint8_t hash[16],
                          const void *key, size_t klen,
                          const void *value, size_t vlen,
-                         void *ctx_ptr) {
+                         uint8_t hdr2, void *ctx_ptr) {
     ShardAggCtx *sa = (ShardAggCtx *)ctx_ptr;
     if (query_deadline_tick(sa->deadline, &sa->dl_counter)) return 1;
 
     SlotHeader hdr = {0};
     memcpy(hdr.hash, hash, 16);
-    hdr.flag = 1;
+    hdr.flag = 1 | (((unsigned)hdr2 & 0xFF) << 8);
     hdr.key_len = (uint16_t)klen;
     hdr.value_len = (uint32_t)vlen;
 
@@ -3042,7 +3243,7 @@ static int agg_minmax_text_indexed(const char *db_root, const char *object,
         char path[PATH_MAX];
         build_idx_path(path, sizeof(path), db_root, object, spec->field, s);
         BtRangeIter *it = btree_range_iter_open(path, "", 0, 0,
-                                                "\xff\xff\xff\xff", 4, 0, desc);
+                                                AGG_VALUE_TIER_CEIL, 1, 1, desc);
         if (!it) continue;
         const char *val; size_t vlen; const uint8_t *hash16;
         while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
@@ -3105,7 +3306,8 @@ static int agg_minmax_same_field_btree(
     uint8_t buf1[1032], buf2[1032];
     size_t len1 = 0, len2 = 0;
     const char *min_v = "";    size_t min_l = 0; int min_x = 0;
-    const char *max_v = "\xff\xff\xff\xff"; size_t max_l = 4; int max_x = 0;
+    /* §2.4.2 tier clamp: open high side stops below the NULL tier. */
+    const char *max_v = AGG_VALUE_TIER_CEIL; size_t max_l = 1; int max_x = 1;
     switch (crit->op) {
     case OP_EQUAL:
         encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
@@ -3331,12 +3533,29 @@ static void *sec_map_build_worker(void *arg) {
         if (query_deadline_tick(w->dl, &w->dl_counter)) {
             w->aborted = 1; break;
         }
+        /* BTRI: store the TAGGED group component per hash — [u8 is_null]
+           [u32 BE len][text]. NULL-tier keys map to the tagged NULL
+           component so a secondary group field's NULL forms its own
+           bucket (a map miss stays an absent candidate, never NULL). */
+        if (vlen == 0) continue;
         if (w->crit_ks && !keyset_contains(w->crit_ks, hash16)) continue;
-        char dbuf[512];
-        int dlen = decode_idx_to_buf(w->gtf_s, (const uint8_t *)val,
-                                      vlen, dbuf, sizeof(dbuf), 0);
-        if (dlen <= 0) continue;
-        if (hsm_insert(&w->local_map, hash16, dbuf, (size_t)dlen) != 0) {
+        char centry[5 + 512];
+        int is_null = ((uint8_t)val[0] != 0x00);
+        uint32_t bl = 0;
+        if (!is_null) {
+            char dbuf[512];
+            int dlen = decode_idx_to_buf(w->gtf_s, (const uint8_t *)val + 1,
+                                          vlen - 1, dbuf, sizeof(dbuf), 0);
+            if (dlen < 0) continue;
+            bl = (uint32_t)dlen;
+            memcpy(centry + 5, dbuf, (size_t)dlen);
+        }
+        centry[0] = (char)(is_null ? 1 : 0);
+        centry[1] = (char)(bl >> 24);
+        centry[2] = (char)(bl >> 16);
+        centry[3] = (char)(bl >> 8);
+        centry[4] = (char)bl;
+        if (hsm_insert(&w->local_map, hash16, centry, 5 + (size_t)bl) != 0) {
             w->aborted = 1; break;
         }
     }
@@ -3389,37 +3608,66 @@ static void *igb_pass1_worker(void *arg) {
         return NULL;
     }
     char prev_enc[64]; size_t prev_enc_len = 0;
+    int prev_null = 0;
     struct AggBucket *prev_bkt = NULL;
     const char *val; size_t vlen; const uint8_t *hash16;
     while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
         if (query_deadline_tick(w->local.deadline, &w->dl_counter)) {
             w->aborted = 1; break;
         }
+        /* BTRI: the primary group component comes from the tiered leaf
+           key — tier-1 entries form the NULL bucket via the tagged
+           group-key representation (§2.4.5/Task 8). */
+        if (vlen == 0) continue;
+        int prim_null = ((uint8_t)val[0] != 0x00);
+        const uint8_t *prim = (const uint8_t *)val + 1;
+        size_t prim_len = vlen - 1;
         if (w->crit_ks && !keyset_contains(w->crit_ks, hash16)) continue;
         struct AggBucket *bkt;
-        if (w->n_sec == 0 && prev_bkt && vlen == prev_enc_len &&
-            memcmp(val, prev_enc, vlen) == 0) {
+        /* The run compare must include the tier: a NULL key and a
+           zero-valued key share the same zeroed payload bytes (bool
+           false [0x00][00] vs NULL [0x01][00]) — ignoring the tier
+           folds the NULL bucket into the previous value bucket. */
+        if (w->n_sec == 0 && prev_bkt && (int)prim_null == prev_null &&
+            prim_len == prev_enc_len &&
+            memcmp(prim, prev_enc, prim_len) == 0) {
             bkt = prev_bkt;
         } else {
             char gbufs[MAX_FIELDS][512];
             char *gvals[MAX_FIELDS];
+            uint8_t gnulls[MAX_FIELDS] = {0};
             uint8_t raw_key[AGG_INT_KEY_CAP];
             int raw_key_len = 0;
 
+            gnulls[0] = (uint8_t)prim_null;
+            if (prim_null) gbufs[0][0] = '\0';
             /* Check if we can use raw integer key */
-            int use_raw = w->local.use_int_keys && w->n_sec == 0 && vlen <= AGG_INT_KEY_CAP;
+            int use_raw = w->local.use_int_keys && w->n_sec == 0 && prim_len <= AGG_INT_KEY_CAP;
             if (use_raw) {
-                memcpy(raw_key, val, vlen);
-                raw_key_len = (int)vlen;
-                /* For output, still need string */
-                int n = decode_idx_to_buf(w->gtf, (const uint8_t *)val,
-                                           vlen, gbufs[0], sizeof(gbufs[0]), 0);
-                if (n <= 0) continue;
+                /* Scan-path byte identity: tag byte + zeroed natural
+                   width for NULL, tag + on-disk BE bytes otherwise. */
+                int w0 = typed_field_int_width(w->gtf->type);
+                if (w0 <= 0 || 1 + w0 > AGG_INT_KEY_CAP) use_raw = 0;
+                else {
+                    raw_key[0] = gnulls[0];
+                    if (prim_null) memset(raw_key + 1, 0, (size_t)w0);
+                    else memcpy(raw_key + 1, prim, (size_t)prim_len);
+                    raw_key_len = 1 + w0;
+                }
+            }
+            if (!prim_null) {
+                /* decode_idx_to_buf leaves the buffer untouched for a
+                   zero-length payload (an empty varchar's [0x00]-alone
+                   leaf) and returns 0 — PRESENT-empty, not missing (its
+                   internal "plen > 0 always" comment predates BTRI).
+                   Initialize the label first or the bucket key reads
+                   uninitialized stack (§2.4.5). */
+                gbufs[0][0] = '\0';
+                int n = decode_idx_to_buf(w->gtf, prim,
+                                           prim_len, gbufs[0], sizeof(gbufs[0]), 0);
+                if (n < 0) continue;
                 gvals[0] = gbufs[0];
             } else {
-                int n = decode_idx_to_buf(w->gtf, (const uint8_t *)val,
-                                           vlen, gbufs[0], sizeof(gbufs[0]), 0);
-                if (n <= 0) continue;
                 gvals[0] = gbufs[0];
             }
 
@@ -3429,23 +3677,29 @@ static void *igb_pass1_worker(void *arg) {
                 if (!hsm_get(&w->sec_maps[g], hash16, &sval, &slen)) {
                     multi_skip = 1; break;
                 }
-                size_t cl = slen < sizeof(gbufs[g + 1]) - 1
-                             ? slen : sizeof(gbufs[g + 1]) - 1;
-                memcpy(gbufs[g + 1], sval, cl);
+                int snull = 0;
+                const char *stext = ""; size_t stext_len = 0;
+                hsm_parse_tagged(sval, slen, &snull, &stext, &stext_len);
+                gnulls[g + 1] = (uint8_t)snull;
+                size_t cl = stext_len < sizeof(gbufs[g + 1]) - 1
+                             ? stext_len : sizeof(gbufs[g + 1]) - 1;
+                memcpy(gbufs[g + 1], stext, cl);
                 gbufs[g + 1][cl] = '\0';
                 gvals[g + 1] = gbufs[g + 1];
             }
             if (multi_skip) continue;
             bkt = (struct AggBucket *)agg_find_or_create(
-                    &w->local, gvals, w->local.ngroups, raw_key, raw_key_len);
+                    &w->local, gvals, w->local.ngroups, raw_key, raw_key_len,
+                    gnulls);
             if (!bkt) { w->aborted = 1; break;
                     }
-            if (w->n_sec == 0 && vlen <= sizeof(prev_enc)) {
-                memcpy(prev_enc, val, vlen);
-                prev_enc_len = vlen;
+            if (w->n_sec == 0 && prim_len <= sizeof(prev_enc)) {
+                memcpy(prev_enc, prim, prim_len);
+                prev_enc_len = prim_len;
+                prev_null = (int)prim_null;
                 prev_bkt = bkt;
             } else {
-                prev_bkt = NULL; prev_enc_len = 0;
+                prev_bkt = NULL; prev_enc_len = 0; prev_null = 0;
             }
         }
         AggBucket *ab = (AggBucket *)bkt;
@@ -3533,7 +3787,8 @@ static void *part_merge_worker(void *arg) {
         for (int i = 0; i < q->count; i++) {
             AggBucket *src = q->arr[i];
             AggBucket *mb = agg_find_or_create(&p->local, src->group_vals, p->nvals,
-                                                src->raw_key, src->raw_key_len);
+                                                src->raw_key, src->raw_key_len,
+                                                src->group_nulls);
             if (!mb) { p->aborted = 1; return NULL; }
             for (int k = 0; k < p->local.nspecs; k++) {
                 AggAccum *sa = &src->accums[k], *da = &mb->accums[k];
@@ -3621,7 +3876,7 @@ static void *agg_single_shard_worker(void *raw) {
        so iter's break-after-first is already optimal — keep the iter
        path here to reuse its DESC handling via v3 last_leaf_page. */
     BtRangeIter *it = btree_range_iter_open(
-        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, a->desc);
+        idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, a->desc);
     if (!it) {
         LOG_ERROR(LOG_SUB_QUERY, "agg_single_shard_worker: btree_range_iter_open failed");
         return NULL;
@@ -3671,6 +3926,7 @@ typedef struct {
     VSStaged              *staged;         /* base of staging array */
     const AggSpec         *specs;
     const TypedField     **spec_tfs;
+    const int             *spec_tidx;      /* schema index per spec (NULL-bit test) */
     int                    nspecs;
     const VSPendPair      *pairs;          /* sorted by hash16 */
     size_t                 n;
@@ -3701,7 +3957,7 @@ static int vs_pair_find(const VSLookupCtx *c, const uint8_t hash16[16]) {
 static int vs_lookup_cb(const uint8_t hash16[16],
                         const void *key, size_t klen,
                         const void *value, size_t vlen,
-                        void *raw) {
+                        uint8_t hdr2, void *raw) {
     (void)key; (void)klen;
     VSLookupCtx *c = (VSLookupCtx *)raw;
     int p = vs_pair_find(c, hash16);
@@ -3709,13 +3965,23 @@ static int vs_lookup_cb(const uint8_t hash16[16],
     pthread_mutex_lock(&c->mu);
     VSStaged *cur = &c->staged[c->pairs[p].slot];
     const uint8_t *rec = (const uint8_t *)value;
+    /* Bitmap view for the NULL-bit test — resolved once per record. */
+    const uint8_t *vbase = NULL, *vbm = NULL;
+    int vbm_bytes = 0; size_t vregion = 0;
+    int view_ok = typed_record_view(rec, vlen, hdr2, &vbase, &vbm,
+                                    &vbm_bytes, &vregion) == 0;
+    (void)vbase; (void)vregion;
     for (int i = 0; i < c->nspecs; i++) {
         enum AggFn fn = c->specs[i].fn;
         if (fn == AGG_COUNT) continue;
         const TypedField *tf = c->spec_tfs[i];
         if (!tf) continue;
+        /* NULL spec value skips the accumulator (§2.5: sum/avg/min/max
+           skip NULLs; avg's denominator counts non-NULL only). */
+        if (c->spec_tidx && c->spec_tidx[i] >= 0 && view_ok &&
+            typed_field_null(vbm, vbm_bytes, c->spec_tidx[i])) continue;
         size_t avail;
-        const uint8_t *fp = agg_field_ptr(rec, vlen, tf, &avail);
+        const uint8_t *fp = agg_field_ptr(rec, vlen, tf, &avail, hdr2, &(int){0});
         double v;
         if (typed_field_to_double(tf, fp, avail, &v) != AGG_VALUE_PRESENT) continue;
         switch (fn) {
@@ -3848,7 +4114,7 @@ static void emit_min_max_via_keyset(const char *db_root, const char *object,
                        object, spec->field, s);
         BtRangeIter *it = btree_range_iter_open(
             idx_path, "", 0, 0,
-            "\xff\xff\xff\xff", 4, 0, desc);
+            AGG_VALUE_TIER_CEIL, 1, 1, desc);
         if (!it) continue;
         const char *val; size_t vlen; const uint8_t *hash16;
         while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
@@ -4094,7 +4360,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     build_idx_path(idx_path, sizeof(idx_path), db_root, object,
                                    specs[0].field, s);
                     BtRangeIter *it = btree_range_iter_open(
-                        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, desc);
+                        idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, desc);
                     if (!it) continue;
                     const char *val; size_t vlen; const uint8_t *hash16;
                     while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
@@ -4208,10 +4474,14 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 int fi = typed_field_index(fs.ts, fld);
                 if (fi < 0) { processed[i] = 1; continue; }
                 const TypedField *tf = &fs.ts->fields[fi];
-                /* Collect every spec sharing this field. */
+                /* Collect every spec sharing this field — including
+                   count(field) siblings: the tier-clamped walk counts
+                   PRESENT entries, which IS the non-NULL record count
+                   (§2.5: the bitmap is the truth; live_count would
+                   over-count NULLs). */
                 int sibs[MAX_AGG_SPECS]; int nsibs = 0;
                 for (int j = i; j < nspecs; j++) {
-                    if (specs[j].fn == AGG_COUNT) continue;
+                    if (specs[j].fn == AGG_COUNT && !specs[j].field[0]) continue;
                     if (strcmp(specs[j].field, fld) != 0) continue;
                     sibs[nsibs++] = j;
                     processed[j] = 1;
@@ -4220,7 +4490,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     char idx_path[PATH_MAX];
                     build_idx_path(idx_path, sizeof(idx_path), db_root, object, fld, s);
                     BtRangeIter *it = btree_range_iter_open(
-                        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
+                        idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, 0);
                     if (!it) continue;
                     const char *val; size_t vlen; const uint8_t *hash16;
                     while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
@@ -4240,6 +4510,34 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 }
             }
 
+            /* count(field) specs whose field had no walking sibling:
+               same tier-clamped PRESENT count, own walk. */
+            for (int i = 0; i < nspecs && has_noncount; i++) {
+                if (processed[i] || specs[i].fn != AGG_COUNT ||
+                    !specs[i].field[0] || strchr(specs[i].field, '+'))
+                    continue;
+                int fi = typed_field_index(fs.ts, specs[i].field);
+                if (fi < 0) { processed[i] = 1; continue; }
+                const TypedField *tf = &fs.ts->fields[fi];
+                processed[i] = 1;
+                for (int s = 0; s < n_idx; s++) {
+                    char idx_path[PATH_MAX];
+                    build_idx_path(idx_path, sizeof(idx_path), db_root,
+                                   object, specs[i].field, s);
+                    BtRangeIter *it = btree_range_iter_open(
+                        idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, 0);
+                    if (!it) continue;
+                    const char *val; size_t vlen; const uint8_t *hash16;
+                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+                        double v;
+                        if (decode_index_key_to_double(tf, (const uint8_t *)val,
+                                                       vlen, &v) == AGG_VALUE_PRESENT)
+                            counts[i]++;
+                    }
+                    btree_range_iter_close(it);
+                }
+            }
+
             char csv_delim_local = (format && strcmp(format, "csv") == 0)
                                      ? parse_csv_delim(delimiter) : 0;
             if (csv_delim_local) {
@@ -4252,7 +4550,10 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     if (i > 0) { char d[2] = {csv_delim_local, '\0'}; OUT("%s", d); }
                     char vbuf[64];
                     switch (specs[i].fn) {
-                    case AGG_COUNT: snprintf(vbuf, sizeof(vbuf), "%ld", live); break;
+                    case AGG_COUNT:
+                        snprintf(vbuf, sizeof(vbuf), "%ld",
+                                 specs[i].field[0] ? (long)counts[i] : live);
+                        break;
                     case AGG_SUM:   fmt_double(vbuf, sizeof(vbuf), present[i] ? sums[i] : 0.0); break;
                     case AGG_AVG:   fmt_double(vbuf, sizeof(vbuf),
                                                counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0); break;
@@ -4269,7 +4570,12 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     if (i > 0) OUT(",");
                     char vbuf[64];
                     switch (specs[i].fn) {
-                    case AGG_COUNT: OUT("\"%s\":%ld", specs[i].alias, live); break;
+                    case AGG_COUNT:
+                        if (specs[i].field[0])
+                            OUT("\"%s\":%lld", specs[i].alias, (long long)counts[i]);
+                        else
+                            OUT("\"%s\":%ld", specs[i].alias, live);
+                        break;
                     case AGG_SUM:
                         fmt_double(vbuf, sizeof(vbuf), present[i] ? sums[i] : 0.0);
                         OUT("\"%s\":%s", specs[i].alias, vbuf); break;
@@ -4399,9 +4705,13 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
        composite ("a+b") or unknown field, which falls back to decode_field. */
     for (int i = 0; i < ctx.ngroups; i++) {
         ctx.group_tfs[i] = NULL;
+        ctx.group_idx[i] = -1;
         if (fs.ts && !strchr(ctx.group_fields[i], '+')) {
             int idx = typed_field_index(fs.ts, ctx.group_fields[i]);
-            if (idx >= 0) ctx.group_tfs[i] = &fs.ts->fields[idx];
+            if (idx >= 0) {
+                ctx.group_tfs[i] = &fs.ts->fields[idx];
+                ctx.group_idx[i] = idx;
+            }
         }
     }
 
@@ -4419,7 +4729,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             int w = typed_field_int_width(ctx.group_tfs[i]->type);
             if (w <= 0) { all_int = 0; break;
                     }
-            total_width += w;
+            total_width += w + 1;   /* +1: Task 8 NULL tag byte per component */
         }
         ctx.use_int_keys = (all_int && total_width <= AGG_INT_KEY_CAP);
     }
@@ -4681,185 +4991,11 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         }
     }
 
-    /* ===== NEQ algebraic shortcut =====
-       Narrow eligibility: criteria is exactly one NEQ leaf on an indexed
-       field, no group_by, no having, every spec is COUNT/SUM/AVG (algebraic
-       under subtraction; MIN/MAX excluded — no closed form for the
-       complement). Substitution: agg(neq X) = agg(*) − agg(eq X). Wins
-       because the existing NEQ-on-indexed path collects ~all hashes and
-       fetches every record, while this path runs one full scan plus a
-       (typically tiny) indexed eq scan. */
-    /* Unwrap implicit AND-of-one (which parse_criteria_tree builds for the
-       array form `[{...}]`) down to its single leaf so the NEQ shortcut and
-       the count-only fast path treat both surface forms identically. */
-    CriteriaNode *neq_leaf_node = NULL;
-    if (tree && tree->kind == CNODE_LEAF) neq_leaf_node = tree;
-    else if (tree && tree->kind == CNODE_AND && tree->n_children == 1 &&
-             tree->children[0]->kind == CNODE_LEAF)
-        neq_leaf_node = tree->children[0];
-
-    int neq_eligible = 0;
-    if (no_group && no_having &&
-        neq_leaf_node && neq_leaf_node->leaf.op == OP_NOT_EQUAL) {
-        int algebraic = 1;
-        for (int i = 0; i < nspecs; i++) {
-            if (specs[i].fn != AGG_COUNT && specs[i].fn != AGG_SUM && specs[i].fn != AGG_AVG) {
-                algebraic = 0; break;
-            }
-        }
-        if (algebraic) {
-            /* Per-shard layout — check the new <field>/<NNN>.idx layout. */
-            Schema sch_neq = load_schema(db_root, object);
-            if (btree_idx_exists(db_root, object, neq_leaf_node->leaf.field, sch_neq.splits))
-                neq_eligible = 1;
-        }
-    }
-
-    if (neq_eligible) {
-        /* COUNT-only fast path: agg(count where neq=X) = live_count - count(eq=X).
-           Skip the full-side record scan entirely (which decodes every record
-           just to increment count) and use the metadata live_count instead.
-           Saves ~150ms on a 1M table. */
-        int count_only = 1;
-        for (int i = 0; i < nspecs; i++) {
-            if (specs[i].fn != AGG_COUNT) { count_only = 0; break;
-                    }
-            /* Presence-doctrine counts (varchar/date/datetime/datetimems/
-               time/uuid) need per-record marker checks, which
-               live_count − count(eq) can't do — bail to the legacy
-               two-side path (whose record scans apply the doctrine). */
-            if (specs[i].field[0] && ctx.spec_tfs[i] &&
-                agg_count_inspects_presence(ctx.spec_tfs[i]->type)) {
-                count_only = 0; break;
-            }
-        }
-        if (count_only) {
-            SearchCriterion pos = neq_leaf_node->leaf;
-            pos.op = OP_EQUAL;
-            /* Kf-boundary count: the eq-side count is validated through
-               the record fetch, never raw index visit counting. */
-            size_t pos_n = idx_count_for_leaf(db_root, object, &sch, &fs,
-                                              &pos, &dl);
-            if (dl.timed_out) {
-                LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query deadline exceeded (NEQ split-plan position check)");
-                OUT("{\"error\":\"query_timeout\"}\n");
-                agg_free(&ctx); return -1;
-            }
-            int total = get_live_count(db_root, object);
-            size_t neg = ((size_t)total > pos_n) ? (size_t)total - pos_n : 0;
-            if (csv_delim) {
-                for (int i = 0; i < nspecs; i++) {
-                    if (i > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
-                    csv_emit_cell(specs[i].alias, csv_delim);
-                }
-                OUT("\n");
-                for (int i = 0; i < nspecs; i++) {
-                    if (i > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
-                    char vbuf[32]; snprintf(vbuf, sizeof(vbuf), "%zu", neg);
-                    csv_emit_cell(vbuf, csv_delim);
-                }
-                OUT("\n");
-            } else {
-                OUT(want_total ? "{\"rows\":{" : "{");
-                for (int i = 0; i < nspecs; i++) {
-                    if (i > 0) OUT(",");
-                    OUT("\"%s\":%zu", specs[i].alias, neg);
-                }
-                OUT(want_total ? "},\"total\":1}\n" : "}\n");
-            }
-            agg_free(&ctx); return 0;
-        }
-
-        /* Mixed COUNT/SUM/AVG: still need full-side for sum/avg.
-           Two side-aggregations: eq(X) on the original ctx (its setup is
-           already correct), and full(*) on a clone that shares specs/fs/
-           buffer-budget read-only. recompile_criteria_tree (vs the
-           cache-respecting compile_criteria_tree) is required after each
-           op flip so match_typed sees the new op rather than the stale
-           cached one. */
-        SearchCriterion *leaf = &neq_leaf_node->leaf;
-        enum SearchOp saved_op = leaf->op;
-        leaf->op = OP_EQUAL;
-        recompile_criteria_tree(tree, fs.ts);
-        int rc_eq = agg_run_plan(&ctx, tree, db_root, object, &sch);
-        leaf->op = saved_op;
-        recompile_criteria_tree(tree, fs.ts);
-
-        AggCtx ctx_full;
-        agg_ctx_clone_shared(&ctx_full, &ctx);
-        if (rc_eq == 0) (void)agg_run_plan(&ctx_full, NULL, db_root, object, &sch);
-
-        if (dl.timed_out) {
-            LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query deadline exceeded (NEQ split-plan)");
-            OUT("{\"error\":\"query_timeout\"}\n");
-            agg_ctx_free_local(&ctx_full);
-            agg_free(&ctx);
-            return -1;
-        }
-        if (ctx.budget_exceeded || ctx_full.budget_exceeded) {
-            LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query buffer cap exceeded (NEQ split-plan)");
-            OUT(QUERY_BUFFER_ERR);
-            agg_ctx_free_local(&ctx_full);
-            agg_free(&ctx);
-            return -1;
-        }
-
-        /* Pull the single bucket from each side. Either may be empty:
-           agg_eq is empty when no record matches (NEQ matches everything),
-           agg_full is empty only on an empty table. */
-        int n_eq = 0, n_full = 0;
-        AggBucket **bs_eq = agg_collect(&ctx, &n_eq);
-        AggBucket **bs_full = agg_collect(&ctx_full, &n_full);
-        AggAccum *acc_eq = (n_eq > 0) ? bs_eq[0]->accums : NULL;
-        AggAccum *acc_full = (n_full > 0) ? bs_full[0]->accums : NULL;
-
-        /* Emit single-bucket no-group output, subtracting per spec. */
-        if (csv_delim) {
-            for (int i = 0; i < nspecs; i++) {
-                if (i > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
-                csv_emit_cell(specs[i].alias, csv_delim);
-            }
-            OUT("\n");
-            for (int i = 0; i < nspecs; i++) {
-                if (i > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
-                int64_t cnt = (acc_full ? acc_full[i].count : 0) - (acc_eq ? acc_eq[i].count : 0);
-                double sum = (acc_full ? acc_full[i].sum : 0.0) - (acc_eq ? acc_eq[i].sum : 0.0);
-                char vbuf[64];
-                switch (specs[i].fn) {
-                    case AGG_COUNT: snprintf(vbuf, sizeof(vbuf), "%ld", (long)cnt); break;
-                    case AGG_SUM:   fmt_double(vbuf, sizeof(vbuf), sum); break;
-                    case AGG_AVG:   fmt_double(vbuf, sizeof(vbuf), cnt > 0 ? sum / (double)cnt : 0.0); break;
-                    default:        vbuf[0] = '\0'; break;
-                }
-                csv_emit_cell(vbuf, csv_delim);
-            }
-            OUT("\n");
-        } else {
-            OUT(want_total ? "{\"rows\":{" : "{");
-            for (int i = 0; i < nspecs; i++) {
-                if (i > 0) OUT(",");
-                int64_t cnt = (acc_full ? acc_full[i].count : 0) - (acc_eq ? acc_eq[i].count : 0);
-                double sum = (acc_full ? acc_full[i].sum : 0.0) - (acc_eq ? acc_eq[i].sum : 0.0);
-                char vbuf[64];
-                switch (specs[i].fn) {
-                    case AGG_COUNT: OUT("\"%s\":%ld", specs[i].alias, (long)cnt); break;
-                    case AGG_SUM:
-                        fmt_double(vbuf, sizeof(vbuf), sum);
-                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
-                    case AGG_AVG:
-                        fmt_double(vbuf, sizeof(vbuf), cnt > 0 ? sum / (double)cnt : 0.0);
-                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
-                    default: break;
-                }
-            }
-            OUT(want_total ? "},\"total\":1}\n" : "}\n");
-        }
-
-        free(bs_eq); free(bs_full);
-        agg_ctx_free_local(&ctx_full);
-        agg_free(&ctx);
-        return 0;
-    }
+    /* No NEQ algebraic split: agg(neq X) = agg(*) − agg(eq X) silently
+       assigns NULL fields to the full side (a NULL belongs to neither the
+       positive nor the negative value predicate). NEQ aggregates route
+       through the normal planner path with the original criteria tree;
+       matches are verified with generation-correct semantics. */
 
     /* Fast path: aggregate(s) with criteria, no group_by, no having.
        Builds a candidate KeySet from the indexed criteria (LEAF /
@@ -5206,6 +5342,13 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         vs_sdb = slotcask_registry_get(db_root, object, &info);
         if (!vs_sdb) vs_eligible = 0;
     }
+    /* Schema index per spec for the NULL-bit test in vs_lookup_cb. */
+    int vs_spec_tidx[MAX_AGG_SPECS];
+    if (vs_eligible) {
+        for (int i = 0; i < nspecs; i++)
+            vs_spec_tidx[i] = (ctx.spec_tfs[i] && fs.ts)
+                ? (int)(ctx.spec_tfs[i] - fs.ts->fields) : -1;
+    }
     if (vs_eligible) {
         int n_idx_g = index_splits_for(sch.splits);
         BtRangeIter **iters  = calloc((size_t)n_idx_g, sizeof(BtRangeIter *));
@@ -5230,16 +5373,26 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             char idx_path[PATH_MAX];
             build_idx_path(idx_path, sizeof(idx_path), db_root, object,
                             ctx.group_fields[0], s);
+            /* Whole-index walk: must reach the NULL tier — group-by forms
+               a NULL bucket from [0x01] keys (§2.4.5/Task 8). */
             iters[s] = btree_range_iter_open(
                 idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
             if (!iters[s]) { has_cur[s] = 0; continue; }
             const char *v; size_t vl; const uint8_t *h;
-            if (btree_range_iter_next(iters[s], &v, &vl, &h) == 1) {
+            /* BTRI: cursor state keeps the stored (tiered) key — k-way
+               comparisons and the flush-reopen bounds stay internally
+               consistent. NULL-tier keys ([0x01], one per NULL row) join
+               the merge like any key and commit as the tagged NULL group
+               (§2.4.5/Task 8) — skipping them here would drop the NULL
+               group from a limited aggregate the scan path reports. */
+            while (btree_range_iter_next(iters[s], &v, &vl, &h) == 1) {
+                if (vl == 0) continue;
                 size_t cap = (vl > BT_MAX_VAL_LEN) ? BT_MAX_VAL_LEN : vl;
                 memcpy(cur_keys[s], v, cap);
                 cur_klens[s] = cap;
                 memcpy(cur_hash16[s], h, 16);
                 has_cur[s] = 1;
+                break;
             }
         }
 
@@ -5297,14 +5450,17 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     }
                     total_count++;
                     const char *v; size_t vl; const uint8_t *h;
-                    if (btree_range_iter_next(iters[s], &v, &vl, &h) == 1) {
+                    int advanced = 0;
+                    while (btree_range_iter_next(iters[s], &v, &vl, &h) == 1) {
+                        if (vl == 0) continue;
                         size_t cap = (vl > BT_MAX_VAL_LEN) ? BT_MAX_VAL_LEN : vl;
                         memcpy(cur_keys[s], v, cap);
                         cur_klens[s] = cap;
                         memcpy(cur_hash16[s], h, 16);
-                    } else {
-                        has_cur[s] = 0;
+                        advanced = 1;
+                        break;
                     }
+                    if (!advanced) has_cur[s] = 0;
                 }
                 if (aborted) break;
             }
@@ -5332,6 +5488,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     .staged   = staged,
                     .specs    = specs,
                     .spec_tfs = ctx.spec_tfs,
+                    .spec_tidx = vs_spec_tidx,
                     .nspecs   = nspecs,
                 };
                 pthread_mutex_init(&lc.mu, NULL);
@@ -5352,6 +5509,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 .staged   = staged,
                 .specs    = specs,
                 .spec_tfs = ctx.spec_tfs,
+                .spec_tidx = vs_spec_tidx,
                 .nspecs   = nspecs,
             };
             pthread_mutex_init(&lc.mu, NULL);
@@ -5375,10 +5533,23 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         }
 
         /* Commit staging to ctx.ht — one bucket per emitted distinct key,
-           with accums populated for each spec. */
+           with accums populated for each spec. Labels strip the BTRI
+           tier byte (cursor state stays tiered; the bucket key is the
+           tagged component, byte-identical to the per-record scan path).
+           NULL-tier keys form the tagged NULL group (§2.4.5/Task 8). */
         for (int i = 0; i < emitted; i++) {
-            char *kvp[1] = { staged[i].key };
-            AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0);
+            char label[BT_MAX_VAL_LEN + 1];
+            size_t klen = staged[i].klen;
+            const char *ksrc = staged[i].key;
+            uint8_t knull[1] = { 0 };
+            if (klen > 0 && (uint8_t)ksrc[0] == 0x00) { ksrc++; klen--; }
+            else if (klen > 0 && (uint8_t)ksrc[0] == 0x01) {
+                knull[0] = 1; klen = 0;
+            }
+            memcpy(label, ksrc, klen);
+            label[klen] = '\0';
+            char *kvp[1] = { label };
+            AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0, knull);
             if (!b) continue;
             for (int j = 0; j < nspecs; j++) {
                 switch (specs[j].fn) {
@@ -5564,7 +5735,7 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                                           display, sizeof(display), 0) <= 0)
                         continue;
                     char *kvp[1] = { display };
-                    AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0);
+                    AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0, NULL);
                     if (!b) break;
                     for (int j = 0; j < ctx.nspecs; j++) {
                         if (ctx.specs[j].fn == AGG_COUNT)
@@ -5658,7 +5829,7 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                                                   display, sizeof(display), 0) <= 0)
                                 continue;
                             char *kvp[1] = { display };
-                            AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0);
+                            AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0, NULL);
                             if (!b) break;
                             for (int j = 0; j < ctx.nspecs; j++) {
                                 if (ctx.specs[j].fn == AGG_COUNT)
@@ -5752,7 +5923,7 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                         continue;
                     char *kvp_h[1] = { display_h };
                     AggBucket *bkt_h = agg_find_or_create(&ctx, kvp_h, 1,
-                                                           NULL, 0);
+                                                           NULL, 0, NULL);
                     if (!bkt_h) { bm_aborted = 1; break;
                     }
 
@@ -6221,11 +6392,14 @@ sec_aborted_label:
 
         if (run_serial) {
             char prev_enc[64]; size_t prev_enc_len = 0;
+            int prev_null = 0;
             struct AggBucket *prev_bkt = NULL;
             for (int s = 0; s < n_idx_g && !aborted; s++) {
                 char idx_path[PATH_MAX];
                 build_idx_path(idx_path, sizeof(idx_path), db_root,
                                object, ctx.group_fields[0], s);
+                /* Whole-index walk: must reach the NULL tier — group-by
+                   forms a NULL bucket from [0x01] keys (§2.4.5/Task 8). */
                 BtRangeIter *it = btree_range_iter_open(
                     idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
                 if (!it) continue;
@@ -6234,40 +6408,64 @@ sec_aborted_label:
                 while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
                     if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break;
                     }
+                    /* BTRI: the primary component comes from the tiered
+                       leaf key — tier-1 forms the NULL bucket (same rule
+                       as igb_pass1_worker). */
+                    if (vlen == 0) continue;
+                    int prim_null = ((uint8_t)val[0] != 0x00);
+                    const uint8_t *prim = (const uint8_t *)val + 1;
+                    size_t prim_len = vlen - 1;
                     /* Criteria filter: skip leaf entries whose record didn't
                        match the criteria-derived KeySet. crit_ks NULL means
                        no criteria, so every entry passes. */
                     if (crit_ks && !keyset_contains(crit_ks, hash16)) continue;
                     struct AggBucket *bkt;
-                    if (n_sec == 0 && prev_bkt && vlen == prev_enc_len &&
-                        memcmp(val, prev_enc, vlen) == 0) {
+                    /* Tier-aware run compare — see igb_pass1_worker: a
+                       NULL key and a zero-valued key share zeroed payload
+                       bytes and must not fold into one bucket. */
+                    if (n_sec == 0 && prev_bkt && (int)prim_null == prev_null &&
+                        prim_len == prev_enc_len &&
+                        memcmp(prim, prev_enc, prim_len) == 0) {
                         bkt = prev_bkt;
                     } else {
                         char gbufs[MAX_FIELDS][512];
                         char *gvals[MAX_FIELDS];
+                        uint8_t gnulls[MAX_FIELDS] = {0};
                         uint8_t raw_key[AGG_INT_KEY_CAP];
                         int raw_key_len = 0;
 
+                        gnulls[0] = (uint8_t)prim_null;
+                        if (prim_null) gbufs[0][0] = '\0';
                         /* Check if we can use raw integer key */
-                        int use_raw = ctx.use_int_keys && n_sec == 0 && vlen <= AGG_INT_KEY_CAP;
+                        int use_raw = ctx.use_int_keys && n_sec == 0 && prim_len <= AGG_INT_KEY_CAP;
                         if (use_raw) {
-                            memcpy(raw_key, val, vlen);
-                            raw_key_len = (int)vlen;
-                            int n = decode_idx_to_buf(gtf, (const uint8_t *)val,
-                                                      vlen, gbufs[0], sizeof(gbufs[0]), 0);
-                            if (n <= 0) continue;
+                            int w0 = typed_field_int_width(gtf->type);
+                            if (w0 <= 0 || 1 + w0 > AGG_INT_KEY_CAP) use_raw = 0;
+                            else {
+                                raw_key[0] = gnulls[0];
+                                if (prim_null) memset(raw_key + 1, 0, (size_t)w0);
+                                else memcpy(raw_key + 1, prim, (size_t)prim_len);
+                                raw_key_len = 1 + w0;
+                            }
+                        }
+                        if (!prim_null) {
+                            /* Same empty-varchar init as igb_pass1_worker:
+                               decode_idx_to_buf returns 0 for a zero-length
+                               payload without writing the buffer. */
+                            gbufs[0][0] = '\0';
+                            int n = decode_idx_to_buf(gtf, prim,
+                                                      prim_len, gbufs[0], sizeof(gbufs[0]), 0);
+                            if (n < 0) continue;
                             gvals[0] = gbufs[0];
                         } else {
-                            int n = decode_idx_to_buf(gtf, (const uint8_t *)val,
-                                                      vlen, gbufs[0], sizeof(gbufs[0]), 0);
-                            if (n <= 0) continue;
                             gvals[0] = gbufs[0];
                         }
                         /* Compose composite key for ngroups > 1 by looking up
-                           each secondary field's value via its hash16 map.
-                           A miss means the record doesn't have that field
-                           indexed (skip-zero rule) — skip the entry to match
-                           the per-record path's "missing field" semantics. */
+                           each secondary field's tagged component via its
+                           hash16 map. A miss means the record doesn't have
+                           that field indexed (skip-zero rule) — skip the
+                           entry to match the per-record path's "missing
+                           field" semantics. */
                         int multi_skip = 0;
                         for (int g = 0; g < n_sec; g++) {
                             const char *sval; size_t slen;
@@ -6275,23 +6473,29 @@ sec_aborted_label:
                                 multi_skip = 1;
                                 break;
                             }
-                            size_t cl = slen < sizeof(gbufs[g + 1]) - 1
-                                         ? slen : sizeof(gbufs[g + 1]) - 1;
-                            memcpy(gbufs[g + 1], sval, cl);
+                            int snull = 0;
+                            const char *stext = ""; size_t stext_len = 0;
+                            hsm_parse_tagged(sval, slen, &snull, &stext, &stext_len);
+                            gnulls[g + 1] = (uint8_t)snull;
+                            size_t cl = stext_len < sizeof(gbufs[g + 1]) - 1
+                                         ? stext_len : sizeof(gbufs[g + 1]) - 1;
+                            memcpy(gbufs[g + 1], stext, cl);
                             gbufs[g + 1][cl] = '\0';
                             gvals[g + 1] = gbufs[g + 1];
                         }
                         if (multi_skip) continue;
                         bkt = (struct AggBucket *)agg_find_or_create(
-                                &ctx, gvals, ctx.ngroups, raw_key, raw_key_len);
+                                &ctx, gvals, ctx.ngroups, raw_key, raw_key_len,
+                                gnulls);
                         if (!bkt) { aborted = 1; break;
                     }
-                        if (n_sec == 0 && vlen <= sizeof(prev_enc)) {
-                            memcpy(prev_enc, val, vlen);
-                            prev_enc_len = vlen;
+                        if (n_sec == 0 && prim_len <= sizeof(prev_enc)) {
+                            memcpy(prev_enc, prim, prim_len);
+                            prev_enc_len = prim_len;
+                            prev_null = (int)prim_null;
                             prev_bkt = bkt;
                         } else {
-                            prev_bkt = NULL; prev_enc_len = 0;
+                            prev_bkt = NULL; prev_enc_len = 0; prev_null = 0;
                         }
                     }
                     AggBucket *ab = (AggBucket *)bkt;
@@ -6353,7 +6557,7 @@ igb_pass2:
                     build_idx_path(idx_path, sizeof(idx_path), db_root,
                                    object, fld, s);
                     BtRangeIter *it = btree_range_iter_open(
-                        idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
+                        idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, 0);
                     if (!it) continue;
                     const char *val; size_t vlen; const uint8_t *hash16;
                     int filled = 0;
@@ -6554,8 +6758,14 @@ igb_skip:
                     OUT("\"%s\":%s", specs[i].alias, vbuf);
                     break;
                 case AGG_AVG:
-                    fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->sum / a->count : 0.0);
-                    OUT("\"%s\":%s", specs[i].alias, vbuf);
+                    /* §2.5: avg with zero contributing values (empty table
+                       or all-NULL group) renders null, not 0. */
+                    if (a->count > 0) {
+                        fmt_double(vbuf, sizeof(vbuf), a->sum / a->count);
+                        OUT("\"%s\":%s", specs[i].alias, vbuf);
+                    } else {
+                        OUT("\"%s\":null", specs[i].alias);
+                    }
                     break;
                 case AGG_MIN:
                     if (agg_json_minmax_text(&specs[i], a, ctx.spec_tfs[i])) break;
@@ -6578,12 +6788,17 @@ igb_skip:
             if (bi > 0) OUT(",");
             OUT("{");
             int first = 1;
-            /* Group fields */
+            /* Group fields — a NULL component renders JSON null (Task 8);
+               "" and the literal "null" stay quoted strings. */
             for (int g = 0; g < ctx.ngroups; g++) {
                 if (!first) OUT(",");
-                char *gv = json_escape_const(b->group_vals[g]);
-                OUT("\"%s\":\"%s\"", ctx.group_fields[g], gv ? gv : "");
-                free(gv);
+                if (b->group_nulls && b->group_nulls[g]) {
+                    OUT("\"%s\":null", ctx.group_fields[g]);
+                } else {
+                    char *gv = json_escape_const(b->group_vals[g]);
+                    OUT("\"%s\":\"%s\"", ctx.group_fields[g], gv ? gv : "");
+                    free(gv);
+                }
                 first = 0;
             }
             /* Aggregate values */
@@ -6604,8 +6819,13 @@ igb_skip:
                         OUT("\"%s\":%s", specs[i].alias, vbuf);
                         break;
                     case AGG_AVG:
-                        fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->sum / a->count : 0.0);
-                        OUT("\"%s\":%s", specs[i].alias, vbuf);
+                        /* §2.5: all-NULL (or no contributing) values → null. */
+                        if (a->count > 0) {
+                            fmt_double(vbuf, sizeof(vbuf), a->sum / a->count);
+                            OUT("\"%s\":%s", specs[i].alias, vbuf);
+                        } else {
+                            OUT("\"%s\":null", specs[i].alias);
+                        }
                         break;
                     case AGG_MIN:
                         fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->min : 0.0);

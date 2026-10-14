@@ -34,12 +34,14 @@ typedef struct {
 static int v2_scan_wrap_cb(const uint8_t hash[16],
                             const void *key, size_t klen,
                             const void *value, size_t vlen,
-                            void *wrap_ctx) {
+                            uint8_t hdr2, void *wrap_ctx) {
     (void)value;  /* contiguous with key; cb derives via klen */
     V2ScanWrap *w = (V2ScanWrap *)wrap_ctx;
     SlotHeader hdr;
     memcpy(hdr.hash, hash, 16);
-    hdr.flag      = 1;
+    /* §2.8: generation byte rides the synthesized u16 flag's high byte;
+       consumers normalize (& 0xFF) and extract (>> 8). */
+    hdr.flag      = (uint16_t)(1 | ((uint16_t)hdr2 << 8));
     hdr.key_len   = (uint16_t)klen;
     hdr.value_len = (uint32_t)vlen;
     return w->cb(&hdr, (const uint8_t *)key, w->ctx);
@@ -100,7 +102,7 @@ int od_seg_record_cb(const uint8_t *rec, size_t vlen,
     /* Delegate to the existing v2_scan_wrap_cb which synthesises a
        SlotHeader and fires the real scan_callback. */
     int rc = v2_scan_wrap_cb(hash16, key, klen, val, (size_t)vlen,
-                             actx->wrap);
+                             rec[19], actx->wrap);
     if (rc != 0 && actx->stop_flag)
         __atomic_store_n(actx->stop_flag, 1, __ATOMIC_RELEASE);
     return rc;
@@ -161,16 +163,16 @@ typedef struct {
 static int kf_live_match_cb(const uint8_t hash16[16],
                             const void *key, size_t klen,
                             const void *value, size_t vlen,
-                            void *raw) {
+                            uint8_t hdr2, void *raw) {
     (void)hash16; (void)key; (void)klen;
     KfMatchCtx *mc = (KfMatchCtx *)raw;
     if (query_deadline_tick(mc->dl, &mc->dl_counter)) return 1;
     int matched = 0;
     if (mc->single_cc) {
-        if (match_typed(value, vlen, mc->single_cc, mc->fs) > 0)
+        if (match_typed(value, vlen, mc->single_cc, mc->fs, hdr2) > 0)
             matched = 1;
     } else if (mc->tree) {
-        if (criteria_match_tree(value, vlen, mc->tree, mc->fs))
+        if (criteria_match_tree(value, vlen, mc->tree, mc->fs, hdr2))
             matched = 1;
     }
     if (matched) mc->count++;
@@ -281,7 +283,7 @@ int scan_dispatch(const char *db_root, const char *object,
 static int v2_record_capture_cb(const uint8_t hash[16],
                                  const void *key, size_t klen,
                                  const void *value, size_t vlen,
-                                 void *ctx) {
+                                 uint8_t hdr2, void *ctx) {
     (void)hash;
     RecordRef *r = (RecordRef *)ctx;
     size_t total = klen + vlen + 1;
@@ -294,6 +296,7 @@ static int v2_record_capture_cb(const uint8_t hash[16],
     r->klen = klen;
     r->val = r->v2_buf + klen;
     r->vlen = vlen;
+    r->hdr2 = hdr2;
     return 1;  /* found; stop */
 }
 
@@ -356,14 +359,14 @@ void init_field_schema(FieldSchema *fs, const char *db_root, const char *object)
     fs->auto_key_schema_snapshot = sc;
 }
 
-/* Decode stored value to JSON. */
-char *decode_value(const char *raw, size_t raw_len, FieldSchema *fs) {
-    return typed_decode(fs->ts, (const uint8_t *)raw, raw_len);
+/* Decode stored value to JSON. hdr2 = record generation (SREC_FLAG_NULLMAP). */
+char *decode_value(const char *raw, size_t raw_len, FieldSchema *fs, uint8_t hdr2) {
+    return typed_decode(fs->ts, (const uint8_t *)raw, raw_len, hdr2);
 }
 
 /* Extract a field value from stored data as string.
    Returns malloc'd string. Caller must free. */
-char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSchema *fs) {
+char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSchema *fs, uint8_t hdr2) {
     if (fs && fs->ts) {
         /* Typed binary: handle composite fields */
         if (strchr(field, '+')) {
@@ -382,7 +385,7 @@ char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSche
             while (tok) {
                 int idx = typed_field_index(fs->ts, tok);
                 if (idx >= 0) {
-                    char *v = typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)raw_len, idx);
+                    char *v = typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)raw_len, idx, hdr2);
                     if (v) {
                         int sl = strlen(v);
                         if ((size_t)cp + (size_t)sl + 1 > cap) {
@@ -404,7 +407,7 @@ char *decode_field(const char *raw, size_t raw_len, const char *field, FieldSche
             return cat;
         }
         int idx = typed_field_index(fs->ts, field);
-        return typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)raw_len, idx);
+        return typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)raw_len, idx, hdr2);
     }
     return NULL;
 }
@@ -465,14 +468,40 @@ char *json_projected_value(char *v, const TypedField *field) {
 }
 
 char *json_projected_field(const char *raw, size_t raw_len, const char *field,
-                           FieldSchema *fs) {
-    char *v = decode_field(raw, raw_len, field, fs);
+                           FieldSchema *fs, uint8_t hdr2) {
+    errno = 0;   /* distinguish corruption (EILSEQ) from a NULL field */
+    char *v = decode_field(raw, raw_len, field, fs, hdr2);
     const TypedField *tf = NULL;
     if (fs && fs->ts && field && !strchr(field, '+')) {
         int idx = typed_field_index(fs->ts, field);
         if (idx >= 0) tf = &fs->ts->fields[idx];
     }
-    return json_projected_value(v, tf);
+    char *out = json_projected_value(v, tf);
+    if (!out && v == NULL && (hdr2 & SREC_FLAG_NULLMAP) && errno != EILSEQ) {
+        /* §2.3: a NULL field on a nullmap record renders as JSON null —
+           key present. Legacy records keep the omit-on-absent convention;
+           corrupt flagged records (EILSEQ) stay omitted/fail upstream. */
+        return strdup("null");
+    }
+    return out;
+}
+
+/* Unprojected rows-format cell for typed field idx: the JSON-quoted
+   value, or the bare literal null when the field is NULL on a nullmap
+   record (§2.3 — same rendering json_projected_field applies to the
+   projected path). Legacy absent fields and corrupt flagged records
+   (EILSEQ) keep the caller's "" cell fallback. Consumes nothing the
+   caller owns; returns a malloc'd string or NULL. */
+char *json_typed_row_cell(const TypedSchema *ts, const uint8_t *raw,
+                          int raw_len, int idx, uint8_t hdr2) {
+    if (!ts || idx < 0 || idx >= ts->nfields) return NULL;
+    errno = 0;
+    char *v = typed_get_field_str(ts, raw, raw_len, idx, hdr2);
+    char *out = json_projected_value(v, &ts->fields[idx]);
+    if (!out && v == NULL && errno != EILSEQ &&
+        (hdr2 & SREC_FLAG_NULLMAP))
+        return strdup("null");
+    return out;
 }
 
 char *json_escape_const(const char *v) {
@@ -832,16 +861,20 @@ inline int field_needs_transform(const TypedField *old_f,
 int v2_rebuild_walk_cb(const uint8_t hash16[16],
                                 const void *key, size_t klen,
                                 const void *value, size_t vlen,
-                                void *ctxp) {
+                                uint8_t hdr2, void *ctxp) {
     (void)hash16;
     V2RebuildCtx *ctx = (V2RebuildCtx *)ctxp;
     if (ctx->error) return 1;
 
     if (!ctx->slot_changed) {
         /* Layout unchanged (e.g., splits-only resplit). Re-insert the
-           record bytes verbatim. */
+           record bytes verbatim — §2.10: the generation flag travels
+           with the record, and it lives in segment byte 19, so it must
+           be re-stamped via opts, not carried by the value bytes. */
+        SlotcaskUpsertOpts vopts = {0};
+        vopts.record_hdr2 = hdr2;
         if (slotcask_insert_with_hooks(ctx->new_db, -1, key, klen, value, vlen,
-                                        NULL, NULL) != 0) {
+                                        &vopts, NULL) != 0) {
             LOG_ERROR(LOG_SUB_CONFIG,
                       "rebuild_v2: insert failed at copied record %llu (klen=%zu)",
                       (unsigned long long)(ctx->live_count + 1u), klen);
@@ -854,13 +887,35 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
 
     /* Slot layout changed (compact, add-field, edit-field, or any combo):
        recompose typed payload by mapping new field offsets ← old field
-       offsets. New fields (new_to_old == -1) get backfilled from
-       ctx->backfill[k] when default_kind is set; otherwise they stay
-       zero (matches the historical behaviour). Edited fields (size or
-       numeric scale changed) go through transform_field_value;
-       same-shape fields take the fast memcpy path. */
+       offsets. §2.10: OLD is read through its own generation view and the
+       NULL bits are remapped through new_to_old (bit indices are schema
+       indices — removal shifts them); legacy OLD converts per-field via
+       the rendering predicate legacy_field_absent, same as §2.7. New
+       fields (new_to_old == -1) get backfilled from ctx->backfill[k] when
+       default_kind is set; otherwise they stay zero and are never NULL.
+       Edited fields (size or numeric scale changed) go through
+       transform_field_value on non-NULL bytes only; a NULL stays NULL
+       through a size/scale change. The recomposed record is always
+       nullmap generation (SREC_FLAG_NULLMAP). */
+    const uint8_t *old_base = NULL, *old_bm = NULL;
+    int old_bm_bytes = 0;
+    size_t old_region = 0;
+    int old_is_nullmap = (hdr2 & SREC_FLAG_NULLMAP) != 0;
+    if (typed_record_view((const uint8_t *)value, vlen, hdr2,
+                          &old_base, &old_bm, &old_bm_bytes,
+                          &old_region) != 0) {
+        /* Malformed flagged record — fail the rebuild closed (§2.10). */
+        LOG_ERROR(LOG_SUB_CONFIG,
+                  "rebuild_v2: malformed record view (hdr2=%u vlen=%zu) — failing rebuild",
+                  hdr2, vlen);
+        ctx->error = 1;
+        return 1;
+    }
+    int new_bm_bytes = typed_nullmap_bytes(ctx->new_ts->nfields);
     uint8_t *buf = calloc(1, ctx->new_ts->total_size);
     if (!buf) { ctx->error = 1; return 1; }
+    buf[0] = (uint8_t)new_bm_bytes;
+    uint8_t *new_bm = buf + 1;
     for (int k = 0; k < ctx->new_ts->nfields; k++) {
         int oi = ctx->new_to_old[k];
         const TypedField *nf = &ctx->new_ts->fields[k];
@@ -869,7 +924,8 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
                DK_AUTO_CREATE / DK_AUTO_UPDATE stay zero by design: they're
                insert/update-time generators, not backfill stamps. The
                original record's creation time is unknown so backfilling
-               "now" would lie. Same reasoning for explicit DK_NONE. */
+               "now" would lie. Same reasoning for explicit DK_NONE.
+               New fields are never NULL (§2.10) — bit stays clear. */
             BackfillSpec *bf = ctx->backfill ? &ctx->backfill[k] : NULL;
             if (!bf || bf->kind == DK_NONE) continue;
             switch (bf->kind) {
@@ -877,7 +933,7 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
                 /* Re-use the insert-time encoder so the literal goes
                    through the same type-aware path (varchar length
                    prefix, int BE, numeric scaling, etc.). */
-                encode_field(nf, nf->default_val, buf + nf->offset);
+                encode_field(nf, nf->default_val, buf + ctx->new_ts->nullmap_prefix + nf->offset);
                 break;
             case DK_SEQ: {
                 int64_t v = atomic_fetch_add_explicit(&bf->seq_next, 1,
@@ -888,7 +944,7 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
                    rows). */
                 char numbuf[24];
                 snprintf(numbuf, sizeof(numbuf), "%lld", (long long)v);
-                encode_field(nf, numbuf, buf + nf->offset);
+                encode_field(nf, numbuf, buf + ctx->new_ts->nullmap_prefix + nf->offset);
                 break;
             }
             case DK_UUID: {
@@ -896,7 +952,7 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
                 if (gen_uuid4_raw(raw) != 0) { free(buf); ctx->error = 1; return 1; }
                 if (nf->type == FT_UUID && nf->size == 16) {
                     /* Native uuid type: store raw 16 bytes. */
-                    memcpy(buf + nf->offset, raw, 16);
+                    memcpy(buf + ctx->new_ts->nullmap_prefix + nf->offset, raw, 16);
                 } else {
                     /* varchar:36 (or wider) — render as dashed 36-char
                        string and run through encode_field so the
@@ -907,7 +963,7 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
                              raw[0], raw[1], raw[2], raw[3], raw[4], raw[5],
                              raw[6], raw[7], raw[8], raw[9], raw[10], raw[11],
                              raw[12], raw[13], raw[14], raw[15]);
-                    encode_field(nf, uuidstr, buf + nf->offset);
+                    encode_field(nf, uuidstr, buf + ctx->new_ts->nullmap_prefix + nf->offset);
                 }
                 break;
             }
@@ -925,7 +981,7 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
                 for (int b = 0; b < nbytes; b++)
                     snprintf(hexbuf + b * 2, 3, "%02x", raw[b]);
                 hexbuf[nbytes * 2] = '\0';
-                encode_field(nf, hexbuf, buf + nf->offset);
+                encode_field(nf, hexbuf, buf + ctx->new_ts->nullmap_prefix + nf->offset);
                 break;
             }
             default:
@@ -934,21 +990,63 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
             }
             continue;
         }
-        size_t off = ctx->old_ts->fields[oi].offset;
-        size_t sz  = ctx->old_ts->fields[oi].size;
-        if (off + sz > vlen) continue;  /* defensive */
         const TypedField *of = &ctx->old_ts->fields[oi];
+        /* NULL-bit remap through new_to_old (§2.10): schema indices move
+           when fields are removed; a NULL at old index oi lands on new
+           index k. */
+        if (old_is_nullmap) {
+            if (typed_field_null(old_bm, old_bm_bytes, oi)) {
+                typed_set_null(new_bm, new_bm_bytes, k);
+                continue;
+            }
+        } else if (of->offset + (size_t)of->size > old_region) {
+            /* Legacy OLD, field beyond the stored region (trailing zero
+               bytes were trimmed): the §2.7 composer materializes the
+               zero-padded bytes and runs the rendering predicate on them —
+               a trimmed skip-on-zero field becomes NULL, a trimmed
+               always-render zero (int/short/byte/numeric/bool/enum) keeps
+               the zero VALUE the legacy record rendered. Blanket-NULLing
+               the field here would change what clients see. */
+            size_t off = of->offset;
+            size_t sz  = (size_t)of->size;
+            uint8_t scratch[64];
+            uint8_t *mat = (sz <= sizeof(scratch)) ? scratch : malloc(sz);
+            if (!mat) { free(buf); ctx->error = 1; return 1; }
+            memset(mat, 0, sz);
+            size_t avail = (old_region > off) ? old_region - off : 0;
+            size_t copyn = avail < sz ? avail : sz;
+            if (copyn) memcpy(mat, old_base + off, copyn);
+            uint8_t *dst = buf + ctx->new_ts->nullmap_prefix + nf->offset;
+            if (legacy_field_absent(of, mat)) {
+                memset(dst, 0, (size_t)nf->size);
+                typed_set_null(new_bm, new_bm_bytes, k);
+            } else if (field_needs_transform(of, nf)) {
+                transform_field_value(of, nf, mat, dst);
+            } else {
+                memcpy(dst, mat, sz);
+            }
+            if (mat != scratch) free(mat);
+            continue;
+        } else if (legacy_field_absent(of, old_base + of->offset)) {
+            typed_set_null(new_bm, new_bm_bytes, k);
+            continue;
+        }
+        size_t off = of->offset;
+        size_t sz  = of->size;
+        if (off + sz > old_region) continue;  /* nullmap trimmed tail, bit clear — stays zero */
+        const uint8_t *src = old_base + off;
         if (field_needs_transform(of, nf)) {
-            transform_field_value(of, nf,
-                                   (const uint8_t *)value + off,
-                                   buf + nf->offset);
+            transform_field_value(of, nf, src,
+                                   buf + ctx->new_ts->nullmap_prefix + nf->offset);
         } else {
-            memcpy(buf + nf->offset, (const uint8_t *)value + off, sz);
+            memcpy(buf + ctx->new_ts->nullmap_prefix + nf->offset, src, sz);
         }
     }
+    SlotcaskUpsertOpts ropts = {0};
+    ropts.record_hdr2 = SREC_FLAG_NULLMAP;
     int rc = slotcask_insert_with_hooks(ctx->new_db, -1, key, klen,
                                          buf, ctx->new_ts->total_size,
-                                         NULL, NULL);
+                                         &ropts, NULL);
     free(buf);
     if (rc != 0) {
         LOG_ERROR(LOG_SUB_CONFIG,
@@ -1313,6 +1411,12 @@ int rebuild_object(const char *db_root, const char *object,
         new_ts.nfields++;
     }
     new_ts.total_size = noff;
+    /* §2.10: hand-built schemas must carry the nullmap prefix and the
+       prefix-inclusive total_size (matching load_typed_schema) — the
+       rebuild's trim/encode hooks and v2_rebuild_walk_cb run against
+       THIS schema. */
+    new_ts.nullmap_prefix = 1 + typed_nullmap_bytes(new_ts.nfields);
+    new_ts.total_size += new_ts.nullmap_prefix;
 
     Schema new_sch = old_sch;
     new_sch.splits = new_splits;
@@ -1480,14 +1584,14 @@ void print_record_json(const SlotHeader *hdr, const uint8_t *block,
         OUT("{");
         int first = 1;
         for (int i = 0; i < proj_count; i++) {
-            char *pv = json_projected_field(raw, hdr->value_len, proj_fields[i], fs);
+            char *pv = json_projected_field(raw, hdr->value_len, proj_fields[i], fs, (uint8_t)(hdr->flag >> 8));
             if (!pv) continue;
             OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[i], pv);
             first = 0; free(pv);
         }
         OUT("}}");
     } else {
-        char *val = decode_value(raw, hdr->value_len, fs);
+        char *val = decode_value(raw, hdr->value_len, fs, (uint8_t)(hdr->flag >> 8));
         OUT("%s}", val);
         free(val);
     }
@@ -1508,7 +1612,7 @@ void print_record_dict(const SlotHeader *hdr, const uint8_t *block,
         OUT("{");
         int first = 1;
         for (int i = 0; i < proj_count; i++) {
-            char *pv = json_projected_field(raw, hdr->value_len, proj_fields[i], fs);
+            char *pv = json_projected_field(raw, hdr->value_len, proj_fields[i], fs, (uint8_t)(hdr->flag >> 8));
             if (!pv) continue;
             OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[i], pv);
             first = 0;
@@ -1516,7 +1620,7 @@ void print_record_dict(const SlotHeader *hdr, const uint8_t *block,
         }
         OUT("}");
     } else {
-        char *val = decode_value(raw, hdr->value_len, fs);
+        char *val = decode_value(raw, hdr->value_len, fs, (uint8_t)(hdr->flag >> 8));
         OUT("%s", val);
         free(val);
     }
@@ -1535,16 +1639,16 @@ void print_record_row(const SlotHeader *hdr, const uint8_t *block,
     OUT("%s[\"%s\"", *printed ? "," : "", key);
     if (proj_count > 0) {
         for (int i = 0; i < proj_count; i++) {
-            char *pv = json_projected_field(raw, hdr->value_len, proj_fields[i], fs);
+            char *pv = json_projected_field(raw, hdr->value_len, proj_fields[i], fs, (uint8_t)(hdr->flag >> 8));
             OUT(",%s", pv ? pv : "\"\"");
             free(pv);
         }
     } else if (fs && fs->ts) {
         for (int i = 0; i < fs->ts->nfields; i++) {
             if (fs->ts->fields[i].removed) continue;
-            char *pv = json_projected_value(
-                typed_get_field_str(fs->ts, (const uint8_t *)raw, (int)hdr->value_len, i),
-                &fs->ts->fields[i]);
+            char *pv = json_typed_row_cell(fs->ts, (const uint8_t *)raw,
+                                           (int)hdr->value_len, i,
+                                           (uint8_t)(hdr->flag >> 8));
             OUT(",%s", pv ? pv : "\"\"");
             free(pv);
         }
@@ -1642,12 +1746,12 @@ void csv_emit_header(const char **proj_fields, int proj_count,
    untyped fallback). Terminated by \n. */
 void csv_emit_row(const char *key, const uint8_t *raw, size_t val_len,
                          const char **proj_fields, int proj_count,
-                         FieldSchema *fs, char delim) {
+                         FieldSchema *fs, char delim, uint8_t hdr2) {
     csv_emit_cell(key, delim);
     if (proj_count > 0) {
         for (int i = 0; i < proj_count; i++) {
             char d[2] = { delim, '\0' }; OUT("%s", d);
-            char *v = decode_field((const char *)raw, val_len, proj_fields[i], fs);
+            char *v = decode_field((const char *)raw, val_len, proj_fields[i], fs, hdr2);
             csv_emit_cell(v, delim);
             free(v);
         }
@@ -1655,7 +1759,7 @@ void csv_emit_row(const char *key, const uint8_t *raw, size_t val_len,
         for (int i = 0; i < fs->ts->nfields; i++) {
             if (fs->ts->fields[i].removed) continue;
             char d[2] = { delim, '\0' }; OUT("%s", d);
-            char *v = typed_get_field_str(fs->ts, raw, (int)val_len, i);
+            char *v = typed_get_field_str(fs->ts, raw, (int)val_len, i, hdr2);
             csv_emit_cell(v, delim);
             free(v);
         }
@@ -1698,7 +1802,7 @@ typedef struct {
 static int v2_fetch_cb(const uint8_t hash16[16],
                         const void *key, size_t klen,
                         const void *value, size_t vlen,
-                        void *ctxp) {
+                        uint8_t hdr2, void *ctxp) {
     (void)hash16;
     V2FetchCtx *ctx = (V2FetchCtx *)ctxp;
     ctx->scanned_so_far++;
@@ -1711,7 +1815,7 @@ static int v2_fetch_cb(const uint8_t hash16[16],
        small heap buffer. */
     SlotHeader hdr = {0};
     memcpy(hdr.hash, hash16, 16);
-    hdr.flag = 1;
+    hdr.flag = 1 | (((unsigned)hdr2 & 0xFF) << 8);
     hdr.key_len = (uint16_t)klen;
     hdr.value_len = (uint32_t)vlen;
     uint8_t stk[2048];
@@ -1726,7 +1830,7 @@ static int v2_fetch_cb(const uint8_t hash16[16],
     if (ctx->csv_delim) {
         csv_emit_row(wire_key, block + klen, (uint32_t)vlen,
                       ctx->proj_count > 0 ? ctx->proj_fields : NULL,
-                      ctx->proj_count, ctx->fs, (char)ctx->csv_delim);
+                      ctx->proj_count, ctx->fs, (char)ctx->csv_delim, hdr2);
         ctx->printed++;
     } else if (ctx->rows_fmt) {
         print_record_row(&hdr, block, ctx->proj_fields, ctx->proj_count,
@@ -1734,14 +1838,14 @@ static int v2_fetch_cb(const uint8_t hash16[16],
     } else if (ctx->dict_fmt) {
         OUT("%s\"%s\":", ctx->printed ? "," : "", wire_key);
         char *decoded = ctx->fs ? typed_decode(ctx->fs->ts,
-                                                (const uint8_t *)value, vlen) : NULL;
+                                                (const uint8_t *)value, vlen, hdr2) : NULL;
         OUT("%s", decoded ? decoded : "null");
         free(decoded);
         ctx->printed++;
     } else {
         OUT("%s{\"key\":\"%s\",\"value\":", ctx->printed ? "," : "", wire_key);
         char *decoded = ctx->fs ? typed_decode(ctx->fs->ts,
-                                                (const uint8_t *)value, vlen) : NULL;
+                                                (const uint8_t *)value, vlen, hdr2) : NULL;
         OUT("%s}", decoded ? decoded : "null");
         free(decoded);
         ctx->printed++;

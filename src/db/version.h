@@ -3,7 +3,7 @@
 
 /* Compiled-in release metadata, CalVer yyyy.mm.N — see
    docs/reference/changelog.md for the scheme. */
-#define SHARD_DB_VERSION "2026.10.1"
+#define SHARD_DB_VERSION "2026.10.2"
 #define SHARD_DB_REQUIRED_SOURCE_VERSION "2026.09.2"
 
 #define SHARD_DB_VERSION_FILE_OK       0

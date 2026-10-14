@@ -2464,7 +2464,8 @@ static void *slotcask_pool_rebuild_worker(void *raw) {
         uint32_t vlen;
         int valid = seg_scan_varlen_struct_ok(h.map, h.map_size, e->offset,
                                                (size_t)a->db->slot_size,
-                                               &rec_size, &flag, &klen, &vlen);
+                                               &rec_size, &flag, &klen, &vlen,
+                                               NULL);
         if (valid && flag == 2)
             valid = memcmp(h.map + e->offset, e->hash, sizeof(e->hash)) == 0 &&
                     seg_scan_varlen_hash_ok(h.map, e->offset, klen);
@@ -2531,6 +2532,23 @@ static int req_res_insert(ReqSlotRes *map, size_t cap, const KfInsertPlan *p) {
     memcpy(map[i].hash, p->hash, 16);
     map[i].used = 1;
     return 1;
+}
+
+static size_t req_res_count(const ReqSlotRes *map, size_t cap) {
+    size_t n = 0;
+    for (size_t i = 0; map && i < cap; i++) n += map[i].used != 0;
+    return n;
+}
+
+static int req_res_copy(ReqSlotRes *dst, size_t dst_cap,
+                        const ReqSlotRes *src, size_t src_cap) {
+    for (size_t i = 0; src && i < src_cap; i++) {
+        if (!src[i].used) continue;
+        size_t j = req_res_probe(dst, dst_cap, src[i].slot);
+        if (dst[j].used) return -1;
+        dst[j] = src[i];
+    }
+    return 0;
 }
 
 /* Non-mutating probe for a brand-new kf entry. Finds the slot a subsequent
@@ -2959,6 +2977,7 @@ typedef struct {
     uint8_t hash[16];
     uint16_t klen;
     uint32_t vlen;
+    uint8_t hdr2;       /* segment header byte 19 (generation) */
     int open;
 } MarkerRecord;
 
@@ -2986,6 +3005,7 @@ static int marker_record_read_live(const char *data_dir, uint8_t stream_id,
     memcpy(out->hash, record, sizeof(out->hash));
     out->klen = seg_rec_klen(record);
     out->vlen = seg_rec_vlen(record);
+    out->hdr2 = record[19];
     out->key = record + 24;
     out->value = out->key + out->klen;
     return 0;
@@ -3072,8 +3092,10 @@ static int kf_marker_apply_recovery_diff(const char *eff_root,
         identity->hash,
         old_record ? old_record->value : NULL,
         old_record ? old_record->vlen : 0,
+        old_record ? old_record->hdr2 : 0,
         new_record ? new_record->value : NULL,
-        new_record ? new_record->vlen : 0, err_buf, sizeof(err_buf));
+        new_record ? new_record->vlen : 0,
+        new_record ? new_record->hdr2 : 0, err_buf, sizeof(err_buf));
 }
 
 /* The kf slot named by a delete marker must still hold the exact OLD
@@ -3956,7 +3978,8 @@ static inline size_t slotcask_record_size_varlen(size_t klen, size_t vlen) {
 static inline void seg_record_emit(uint8_t *dst, int slot_size,
                                     const uint8_t hash[16],
                                     const void *key, size_t klen,
-                                    const void *value, size_t vlen) {
+                                    const void *value, size_t vlen,
+                                    uint8_t hdr2) {
     memcpy(dst, hash, 16);
     uint16_t k16 = (uint16_t)klen;
     memcpy(dst + 16, &k16, 2);
@@ -3964,7 +3987,10 @@ static inline void seg_record_emit(uint8_t *dst, int slot_size,
        relaxed ordering for the initial 0 — readers that see 0 simply skip
        the record (no acquire needed). */
     __atomic_store_n(&dst[18], 0, __ATOMIC_RELEASE);
-    dst[19] = 0;
+    /* Byte 19 carries SREC_FLAG_NULLMAP (null-bitmap generation). Written
+       before the flag release-store, so a live record always has its
+       generation byte visible. */
+    dst[19] = (uint8_t)(hdr2 & SREC_FLAG_NULLMAP);
     uint32_t v32 = (uint32_t)vlen;
     memcpy(dst + 20, &v32, 4);
     memcpy(dst + 24, key, klen);
@@ -3989,12 +4015,15 @@ static inline void seg_record_emit(uint8_t *dst, int slot_size,
 static inline void seg_record_emit_pending(uint8_t *dst, int slot_size,
                                            const uint8_t hash[16],
                                            const void *key, size_t klen,
-                                           const void *value, size_t vlen) {
+                                           const void *value, size_t vlen,
+                                           uint8_t hdr2) {
     memcpy(dst, hash, 16);
     uint16_t k16 = (uint16_t)klen;
     memcpy(dst + 16, &k16, 2);
     __atomic_store_n(&dst[18], 0, __ATOMIC_RELEASE);
-    dst[19] = 0;
+    /* Generation byte rides the staged payload; the activation flag-flip
+       publishes both together. */
+    dst[19] = (uint8_t)(hdr2 & SREC_FLAG_NULLMAP);
     uint32_t v32 = (uint32_t)vlen;
     memcpy(dst + 20, &v32, 4);
     memcpy(dst + 24, key, klen);
@@ -4056,6 +4085,13 @@ static int seg_write_flag_durable(const char *data_dir, uint8_t stream_id,
 int slotcask_get(SlotcaskDb *db,
                  const void *key, size_t klen,
                  void **val_out, size_t *vlen_out) {
+    return slotcask_get_ex(db, key, klen, val_out, vlen_out, NULL);
+}
+
+int slotcask_get_ex(SlotcaskDb *db,
+                    const void *key, size_t klen,
+                    void **val_out, size_t *vlen_out,
+                    uint8_t *out_hdr2) {
     uint8_t hash[16];
     compute_hash(key, klen, hash);
     int sid_kf = shard_for_hash(hash, db->num_shards);
@@ -4107,6 +4143,7 @@ int slotcask_get(SlotcaskDb *db,
             return -1;
         }
         if (v_stored) memcpy(vbuf, rec + 24 + klen, v_stored);
+        if (out_hdr2) *out_hdr2 = rec[19];
         segcache_release(&sh);
         kfcache_release(&kh);
         *val_out = vbuf;
@@ -4271,7 +4308,7 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
             int valid = seg_scan_varlen_struct_ok(h.map, lim, pos,
                                                    (size_t)db->slot_size,
                                                    &rec_size, &flag,
-                                                   &klen, &vlen);
+                                                   &klen, &vlen, NULL);
             if (valid && flag != 0)
                 valid = seg_scan_varlen_hash_ok(h.map, pos, klen);
 
@@ -4736,6 +4773,7 @@ typedef struct {
                               Phase 4 can repoint without re-probing */
     uint8_t *old_buf;       /* malloc'd if old_found, NULL otherwise */
     size_t   old_vlen;
+    uint8_t  old_hdr2;      /* donor record header byte 19 (generation) */
     uint8_t  old_found;
     uint8_t  needs_write;   /* 0 = early-skipped (validation, if_not_exists, lookup err) */
     uint8_t  target_stream;
@@ -5215,7 +5253,7 @@ static void bulk_phase3_stage_pending(SlotcaskDb *db,
             }
             seg_record_emit_pending(h.map + st[i].target_off, (int)rec_size,
                                     st[i].hash, r->key, r->klen,
-                                    r->value, r->vlen);
+                                    r->value, r->vlen, r->hdr2);
             SegCacheEntry *e = &g_segcache[h.slot];
             durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
         }
@@ -5360,7 +5398,7 @@ static void bulk_stage_fallback_batch(SlotcaskDb *db, SlotcaskBulkRec *recs,
                     (int)slotcask_record_size_varlen(recs[i].klen,
                                                      recs[i].vlen),
                     st[i].hash, recs[i].key, recs[i].klen, recs[i].value,
-                    recs[i].vlen);
+                    recs[i].vlen, recs[i].hdr2);
                 /* Same invariant pool_split_leftover enforces on the P
                    wave: a reused slot larger than the record must not
                    leave stale bytes past the record header, or readers
@@ -5450,6 +5488,7 @@ static int bulk_read_old_values(SlotcaskDb *db, SlotcaskBulkRec *recs,
             if (vlen) memcpy(buf, rec + 24 + r->klen, vlen);
             s->old_buf = buf;
             s->old_vlen = vlen;
+            s->old_hdr2 = rec[19];
             /* Echo back onto the public rec so a caller-supplied
                apply_window (query_bulk.c) can see OLD too -- it reads
                r->old_value directly and has no access to this file's
@@ -5460,6 +5499,7 @@ static int bulk_read_old_values(SlotcaskDb *db, SlotcaskBulkRec *recs,
                apply_window) has run. */
             r->old_value = buf;
             r->old_vlen = vlen;
+            r->old_hdr2 = rec[19];
         }
         segcache_release(&h);
         k = run_end;
@@ -5656,7 +5696,8 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
             if (recs[i].status != 0) continue;
             const void *ov = recs[i].old_value ? recs[i].old_value : st[i].old_buf;
             size_t ol = recs[i].old_value ? recs[i].old_vlen : st[i].old_vlen;
-            SlotcaskOldRecord old_rec = { (const uint8_t *)ov, ol };
+            SlotcaskOldRecord old_rec = { (const uint8_t *)ov, ol,
+                                          recs[i].old_hdr2 };
             if (uo && uo->value_compute &&
                 uo->value_compute(st[i].old_found ? &old_rec : NULL,
                                   &recs[i]) != 0) {
@@ -5742,7 +5783,7 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
             if (uo && uo->pre_commit) {
                 const void *ov = r->old_value ? r->old_value : s->old_buf;
                 size_t ol = r->old_value ? r->old_vlen : s->old_vlen;
-                SlotcaskOldRecord old_rec = { (const uint8_t *)ov, ol };
+                SlotcaskOldRecord old_rec = { (const uint8_t *)ov, ol, r->old_hdr2 };
                 if (uo->pre_commit(s->old_found ? &old_rec : NULL, r,
                                    s->old_found) != 0) {
                     r->status = -1;
@@ -5761,7 +5802,7 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
             if (dopt && dopt->pre_commit) {
                 const void *ov = r->old_value ? r->old_value : s->old_buf;
                 size_t ol = r->old_value ? r->old_vlen : s->old_vlen;
-                SlotcaskOldRecord old_rec = { (const uint8_t *)ov, ol };
+                SlotcaskOldRecord old_rec = { (const uint8_t *)ov, ol, r->old_hdr2 };
                 if (dopt->pre_commit(&old_rec, r) != 0) {
                     r->status = -2;
                     s->needs_write = 0;
@@ -6318,8 +6359,18 @@ static int bulk_apply_and_sync_kf_locked(BulkMutationTxn *txn,
     if (!plan->kf_slots) return -1;
     for (size_t i = 0; i < plan->nabandoned; i++) {
         const KfInsertPlan *ap = &plan->abandoned[i];
-        kf_write_tombstone_at_slot(kh, ap->target_slot, ap->hash);
-        plan->kf_slots[plan->nkf_slots++] = ap->target_slot;
+        /* Guard against clobbering a slot that another chain member's K
+           claimed after this window's publish: only tombstone when the
+           slot is still empty or already holds our own tombstone. A live
+           foreign entry means the reservation was consumed — the
+           probe-chain hole this write exists to prevent does not exist. */
+        SlotcaskKfEntry *t = &kh->map[ap->target_slot];
+        uint8_t tflag = __atomic_load_n(&t->flag, __ATOMIC_ACQUIRE);
+        if (tflag == 0 ||
+            (tflag == 2 && memcmp(t->hash, ap->hash, 16) == 0)) {
+            kf_write_tombstone_at_slot(kh, ap->target_slot, ap->hash);
+            plan->kf_slots[plan->nkf_slots++] = ap->target_slot;
+        }
     }
     for (size_t i = 0; i < plan->nactive; i++) {
         SlotcaskBulkRec *r = &shard->recs[plan->active[i]];
@@ -6338,6 +6389,9 @@ static int bulk_apply_and_sync_kf_locked(BulkMutationTxn *txn,
                            txn->db->data_dir) != 0) return -1;
             out_slot = s->old_kf_slot;
         } else {
+            /* Request and chain reservation maps make this physical slot
+               immutable before marker publication. Index/bitmap hooks,
+               KFM2 replay, and the keyfile all use this exact address. */
             kf_commit_planned_slot(kh, &s->kf_plan, s->target_stream,
                                    s->target_fid, s->target_off,
                                    &used_delta, &out_slot);
@@ -7725,6 +7779,38 @@ static void bulk_commit_chain_add(BulkCommitChain *chain,
                            .waiter = waiter };
 }
 
+/* Before a later chain member plans/publishes its windows, seed its
+   request reservation map with every physical slot already planned by
+   earlier members. Leave enough room for this member's own records so the
+   normal publish-time inserts cannot exhaust the map. */
+static int req_shard_seed_chain_reservations(ReqShard *dst,
+                                              const ReqSlotRes *src,
+                                              size_t src_cap) {
+    size_t src_n = req_res_count(src, src_cap);
+    if (src_n == 0) return 0;
+    size_t dst_n = req_res_count(dst->res_map, dst->res_cap);
+    if (src_n > SIZE_MAX - dst_n ||
+        src_n + dst_n > SIZE_MAX - dst->nrecs ||
+        src_n + dst_n + dst->nrecs > SIZE_MAX / 2) {
+        errno = ENOMEM;
+        return -1;
+    }
+    size_t cap = req_res_pow2((src_n + dst_n + dst->nrecs) * 2);
+    if (cap == SIZE_MAX) { errno = ENOMEM; return -1; }
+    ReqSlotRes *map = calloc(cap, sizeof(*map));
+    if (!map) return -1;
+    if (req_res_copy(map, cap, src, src_cap) != 0 ||
+        req_res_copy(map, cap, dst->res_map, dst->res_cap) != 0) {
+        free(map);
+        errno = EINVAL;
+        return -1;
+    }
+    free(dst->res_map);
+    dst->res_map = map;
+    dst->res_cap = cap;
+    return 0;
+}
+
 /* Per-member outcome fold (the pipeline's former pre-release block):
    retained windows own the terminal state (degraded flag, rc -2);
    hard-failed members report rc -1 plus their first step errno; clean
@@ -7779,15 +7865,31 @@ static int bulk_commit_chain_run(BulkCommitChain *chain) {
 
     /* 2. Publish each member's windows, then one M directory fsync for
           the chain. */
+    const ReqSlotRes *chain_res_map = NULL;
+    size_t chain_res_cap = 0;
     for (size_t m = 0; m < chain->nmembers; m++) {
         BulkChainMember *mem = &chain->members[m];
         if (mem->rs->stage_failed || mem->rs->payload_failed) continue;
+        if (req_shard_seed_chain_reservations(mem->rs, chain_res_map,
+                                               chain_res_cap) != 0) {
+            mem->rs->stage_failed = 1;
+            mem->rs->step_failed = 1;
+            if (!mem->rs->step_errno)
+                mem->rs->step_errno = errno ? errno : ENOMEM;
+            for (size_t i = 0; i < mem->in->nrecs; i++)
+                if (mem->in->recs[i].status == 0)
+                    mem->in->recs[i].status = -1;
+            rc = -1;
+            continue;
+        }
         if (slotcask_bulk_publish_shard(mem->req,
                                         chain->kf_shard_id) != 0) {
             mem->rs->step_failed = 1;
             if (!mem->rs->step_errno)
                 mem->rs->step_errno = errno ? errno : EIO;
         }
+        chain_res_map = mem->rs->res_map;
+        chain_res_cap = mem->rs->res_cap;
     }
     if (bulk_commit_chain_flush_marker_dir(chain) != 0) rc = -1;
 
@@ -7893,12 +7995,57 @@ static void bulk_gate_waiter_unpush(SlotcaskDb *db, int shard,
    them (every member publishes before any member finalizes; a merged
    pair would both evaluate conditions against the pre-A OLD — the
    lost update CI's coverage run caught). Excluded waiters stay queued
-   and serialize on the gate exactly as pre-B3b. */
+   and serialize on the gate exactly as pre-B3b.
+
+   Chain assembly additionally rejects any waiter whose key hash overlaps
+   an earlier member. Those requests serialize so each upsert evaluates
+   against committed OLD state. Disjoint members inherit a union of all
+   earlier slot reservations before publication, making their marker/index kf
+   slots immutable through commit and replay. */
 static int bulk_input_chain_admissible(const SlotcaskBulkShardInput *in) {
     if (in->kind != SLOTCASK_BULK_INPUT_UPSERT) return 0;
     const SlotcaskBulkOpts *o = &in->opts.upsert;
     return !o->if_not_exists && !o->require_existing &&
            o->value_compute == NULL && o->pre_commit == NULL;
+}
+
+typedef struct {
+    uint8_t hash[16];
+    int used;
+} BulkChainSeenKey;
+
+static size_t bulk_chain_seen_probe(const BulkChainSeenKey *set, size_t cap,
+                                    const uint8_t hash[16]) {
+    uint64_t h;
+    memcpy(&h, hash, sizeof(h));
+    size_t i = (size_t)h & (cap - 1);
+    while (set[i].used && memcmp(set[i].hash, hash, 16) != 0)
+        i = (i + 1) & (cap - 1);
+    return i;
+}
+
+static int bulk_chain_keys_conflict(const BulkChainSeenKey *set, size_t cap,
+                                    const SlotcaskBulkShardInput *in) {
+    for (size_t i = 0; i < in->nrecs; i++) {
+        uint8_t hash[16];
+        compute_hash(in->recs[i].key, in->recs[i].klen, hash);
+        size_t j = bulk_chain_seen_probe(set, cap, hash);
+        if (set[j].used) return 1;
+    }
+    return 0;
+}
+
+static void bulk_chain_keys_add(BulkChainSeenKey *set, size_t cap,
+                                const SlotcaskBulkShardInput *in) {
+    for (size_t i = 0; i < in->nrecs; i++) {
+        uint8_t hash[16];
+        compute_hash(in->recs[i].key, in->recs[i].klen, hash);
+        size_t j = bulk_chain_seen_probe(set, cap, hash);
+        if (!set[j].used) {
+            memcpy(set[j].hash, hash, 16);
+            set[j].used = 1;
+        }
+    }
 }
 
 /* Admit up to `cap` queued waiters whose input targets `shard` with
@@ -7911,25 +8058,58 @@ static int bulk_input_chain_admissible(const SlotcaskBulkShardInput *in) {
    values differ. */
 static size_t bulk_gate_waiter_take_matching(
         SlotcaskDb *db, int shard, int in_kind,
+        const SlotcaskBulkShardInput *owner,
+        size_t max_chain_records,
         BulkGateWaiter **out, size_t cap) {
+    if (!bulk_input_chain_admissible(owner)) return 0;
     BulkGateWaiterQ *q = &db->writer_gate_waiters[shard];
     size_t taken = 0, kept = 0;
     pthread_mutex_lock(&q->mu);
+
+    size_t total = owner->nrecs;
+    for (size_t i = 0; i < q->n; i++) {
+        BulkGateWaiter *w = q->slot[i];
+        if (w->in && w->in->kf_shard_id == shard &&
+            (int)w->in->kind == in_kind &&
+            bulk_input_chain_admissible(w->in)) {
+            if (w->in->nrecs > SIZE_MAX - total) {
+                total = SIZE_MAX;
+                break;
+            }
+            total += w->in->nrecs;
+        }
+    }
+    size_t set_cap = total <= SIZE_MAX / 2 ? req_res_pow2(total * 2)
+                                           : SIZE_MAX;
+    BulkChainSeenKey *seen = set_cap != SIZE_MAX
+                           ? calloc(set_cap, sizeof(*seen)) : NULL;
+    if (!seen) {
+        pthread_mutex_unlock(&q->mu);
+        return 0; /* allocation pressure degrades safely to serialization */
+    }
+    bulk_chain_keys_add(seen, set_cap, owner);
+    size_t admitted_records = owner->nrecs;
     for (size_t i = 0; i < q->n; i++) {
         BulkGateWaiter *w = q->slot[i];
         if (taken < cap && w->in && w->in->kf_shard_id == shard &&
             (int)w->in->kind == in_kind &&
-            bulk_input_chain_admissible(w->in)) {
+            bulk_input_chain_admissible(w->in) &&
+            admitted_records <= max_chain_records &&
+            w->in->nrecs <= max_chain_records - admitted_records &&
+            !bulk_chain_keys_conflict(seen, set_cap, w->in)) {
             pthread_mutex_lock(&w->mu);
             w->state = BGW_ADMITTED;
             w->in_queue = 0;
             pthread_mutex_unlock(&w->mu);
             out[taken++] = w;
+            bulk_chain_keys_add(seen, set_cap, w->in);
+            admitted_records += w->in->nrecs;
         } else {
             q->slot[kept++] = w;
         }
     }
     q->n = kept;
+    free(seen);
     pthread_mutex_unlock(&q->mu);
     return taken;
 }
@@ -8026,7 +8206,18 @@ static void slotcask_bulk_shard_pipeline(SlotcaskBulkRequest *req,
     bulk_commit_chain_init(&chain, db, s);
     SHARD_TEST_PHASE_PAUSE(SHARD_TEST_PHASE_PRE_MERGE);
     BulkGateWaiter *joiners[BULK_MERGE_MAX_JOINERS];
-    size_t njoiners = bulk_gate_waiter_take_matching(db, s, (int)in->kind,
+    size_t max_chain_records = in->nrecs;
+    if (!rs->stage_failed) {
+        SlotcaskKfHandle cap_kh;
+        if (kf_shard_acquire(&cap_kh, db, s, 0) == 0) {
+            uint64_t total = cap_kh.hdr ? cap_kh.hdr->total : 0;
+            max_chain_records = total < cap_kh.capacity
+                              ? cap_kh.capacity - (size_t)total : 0;
+            kfcache_release(&cap_kh);
+        }
+    }
+    size_t njoiners = bulk_gate_waiter_take_matching(db, s, (int)in->kind, in,
+                                                     max_chain_records,
                                                      joiners,
                                                      BULK_MERGE_MAX_JOINERS);
     bulk_commit_chain_add(&chain, req, in, rs, NULL);
@@ -8038,12 +8229,13 @@ static void slotcask_bulk_shard_pipeline(SlotcaskBulkRequest *req,
     for (size_t j = 0; j < njoiners; j++) {
         BulkGateWaiter *jd = joiners[j];
         uint64_t t0js = now_us();
-        if (slotcask_bulk_stage_shard(jd->req, s, jd->in->recs,
+        int jrc = slotcask_bulk_stage_shard(jd->req, s, jd->in->recs,
                 jd->in->nrecs,
                 jd->in->kind == SLOTCASK_BULK_INPUT_UPSERT
                     ? &jd->in->opts.upsert : NULL,
                 jd->in->kind == SLOTCASK_BULK_INPUT_DELETE
-                    ? &jd->in->opts.delete_ : NULL) != 0) {
+                    ? &jd->in->opts.delete_ : NULL);
+        if (jrc != 0) {
             ReqShard *jrs = &jd->req->shards[s];
             jrs->step_failed = 1;
             if (!jrs->step_errno) jrs->step_errno = errno ? errno : EIO;
@@ -8350,6 +8542,8 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         result->condition_not_met = 0;
         result->current_value = NULL;
         result->current_vlen = 0;
+        result->current_hdr2 = 0;
+        result->current_hdr2 = 0;
     }
     if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
 
@@ -8417,6 +8611,7 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
 
     SlotcaskBulkRec rec = {0};
     rec.key = key; rec.klen = klen; rec.value = value; rec.vlen = vlen;
+    rec.hdr2 = opts ? opts->record_hdr2 : 0;
     rec.user_ctx = &actx;
 
     SlotcaskBulkState st = {0};
@@ -8447,9 +8642,11 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
             result->was_update = rec.was_update;
             result->condition_not_met = 1;
             void *cv = NULL; size_t cvl = 0;
-            if (slotcask_get(db, key, klen, &cv, &cvl) == 0) {
+            uint8_t cv_hdr2 = 0;
+            if (slotcask_get_ex(db, key, klen, &cv, &cvl, &cv_hdr2) == 0) {
                 result->current_value = cv;
                 result->current_vlen = cvl;
+                result->current_hdr2 = cv_hdr2;
             }
         }
         return -2;
@@ -8476,6 +8673,8 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         result->condition_not_met = 0;
         result->current_value = NULL;
         result->current_vlen = 0;
+        result->current_hdr2 = 0;
+        result->current_hdr2 = 0;
     }
     if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
 
@@ -8529,6 +8728,7 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
 
     SlotcaskBulkRec rec = {0};
     rec.key = key; rec.klen = klen; rec.value = value; rec.vlen = vlen;
+    rec.hdr2 = opts ? opts->record_hdr2 : 0;
     rec.user_ctx = &actx;
 
     SlotcaskBulkState st = {0};
@@ -8559,9 +8759,11 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
             result->was_update = rec.was_update;
             result->condition_not_met = 1;
             void *cv = NULL; size_t cvl = 0;
-            if (slotcask_get(db, key, klen, &cv, &cvl) == 0) {
+            uint8_t cv_hdr2 = 0;
+            if (slotcask_get_ex(db, key, klen, &cv, &cvl, &cv_hdr2) == 0) {
                 result->current_value = cv;
                 result->current_vlen = cvl;
+                result->current_hdr2 = cv_hdr2;
             }
         }
         return -2;
@@ -8970,7 +9172,7 @@ static void kf_reval_fetch_one(KfRevalFetchArg *fa) {
                     uint16_t klen = seg_rec_klen(rec);
                     uint32_t vlen = seg_rec_vlen(rec);
                     if (fa->cb(r->hash, rec + 24, klen,
-                               rec + 24 + klen, vlen, fa->ctx) != 0)
+                               rec + 24 + klen, vlen, rec[19], fa->ctx) != 0)
                         break;
                 }
                 segcache_release(&h);
@@ -9099,6 +9301,7 @@ typedef struct {
     int pre_commit_ran;
     const uint8_t *old_ptr;
     size_t old_len;
+    uint8_t old_hdr2;
     int has_old;
 } DeleteAdapterCtx;
 
@@ -9111,6 +9314,7 @@ static int delete_adapter_pre_commit(const SlotcaskOldRecord *old,
     actx->has_old = old != NULL;
     actx->old_ptr = old ? old->value : NULL;
     actx->old_len = old ? old->vlen : 0;
+    actx->old_hdr2 = old ? old->hdr2 : 0;
     if (dopt->has_indexed_fields) return 0;   /* prepare/apply_commit handle it */
     if (dopt->pre_commit && dopt->pre_commit(old, dopt->pre_commit_ctx) != 0)
         return -1;
@@ -9127,7 +9331,7 @@ static int delete_adapter_prepare_window(SlotcaskBulkRec *recs,
     const SlotcaskDeleteOpts *dopt = actx->dopt;
     if (!dopt->prepare_commit) return 0;
     SlotcaskBulkRec *rec = &recs[active[0]];
-    SlotcaskOldRecord old_rec = { actx->old_ptr, actx->old_len };
+    SlotcaskOldRecord old_rec = { actx->old_ptr, actx->old_len, actx->old_hdr2 };
     return dopt->prepare_commit(actx->has_old ? &old_rec : NULL, rec->kf_slot,
                                 dopt->pre_commit_ctx) != 0 ? -1 : 0;
 }
@@ -9141,7 +9345,7 @@ static int delete_adapter_apply_window(SlotcaskBulkRec *recs,
     const SlotcaskDeleteOpts *dopt = actx->dopt;
     if (!dopt->apply_commit) return 0;
     SlotcaskBulkRec *rec = &recs[active[0]];
-    SlotcaskOldRecord old_rec = { actx->old_ptr, actx->old_len };
+    SlotcaskOldRecord old_rec = { actx->old_ptr, actx->old_len, actx->old_hdr2 };
     return dopt->apply_commit(actx->has_old ? &old_rec : NULL, rec->kf_slot,
                               dopt->pre_commit_ctx) != 0 ? -1 : 0;
 }
@@ -9162,6 +9366,8 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
         result->condition_not_met = 0;
         result->current_value = NULL;
         result->current_vlen = 0;
+        result->current_hdr2 = 0;
+        result->current_hdr2 = 0;
     }
     if (klen > UINT16_MAX) return -1;
     SlotcaskDeleteOpts blank = {0};
@@ -9233,9 +9439,11 @@ int slotcask_delete_with_hooks(SlotcaskDb *db,
         if (result) {
             result->condition_not_met = 1;
             void *cv = NULL; size_t cvl = 0;
-            if (slotcask_get(db, key, klen, &cv, &cvl) == 0) {
+            uint8_t cv_hdr2 = 0;
+            if (slotcask_get_ex(db, key, klen, &cv, &cvl, &cv_hdr2) == 0) {
                 result->current_value = cv;
                 result->current_vlen = cvl;
+                result->current_hdr2 = cv_hdr2;
             }
         }
         return -2;
@@ -9563,7 +9771,7 @@ static int walk_one_shard_inner(SlotcaskDb *db, int kf_shard_id,
             if (seg_rec_live_with_hash(rec, e->hash)) {
                 uint16_t klen = seg_rec_klen(rec);
                 uint32_t vlen = seg_rec_vlen(rec);
-                if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, ctx) != 0)
+                if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, rec[19], ctx) != 0)
                     stop = 1;
             }
             segcache_release(&sh);
@@ -9699,7 +9907,7 @@ done_collect:
         }
         uint16_t klen = seg_rec_klen(rec);
         uint32_t vlen = seg_rec_vlen(rec);
-        if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, ctx) != 0)
+        if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, rec[19], ctx) != 0)
             stop = 1;
     }
     if (sh.slot >= 0 || sh.fd >= 0) segcache_release(&sh);
@@ -9850,7 +10058,7 @@ static int fetch_live_addresses_grouped_locked(SlotcaskDb *db,
             uint16_t klen = seg_rec_klen(rec);
             uint32_t vlen = seg_rec_vlen(rec);
             if (cb(live[k].hash, rec + 24, klen,
-                   rec + 24 + klen, vlen, ctx) != 0) {
+                   rec + 24 + klen, vlen, rec[19], ctx) != 0) {
                 segcache_release(&h);
                 if (stop) atomic_store_explicit(stop, 1, memory_order_release);
                 return 0;
@@ -9982,7 +10190,8 @@ int slotcask_walk_one_shard_slots_locked(SlotcaskDb *db, int kf_shard_id,
         }
         const uint8_t *key_p = base + 24;
         const uint8_t *val_p = base + 24 + klen_be;
-        int crc = cb((uint32_t)s, e->hash, key_p, klen_be, val_p, vlen_be, ctx);
+        int crc = cb((uint32_t)s, e->hash, key_p, klen_be, val_p, vlen_be,
+                     base[19], ctx);
         segcache_release(&h);
         (void)vbuf; (void)vlen;
         if (crc != 0) { rc = crc; break; }
@@ -10043,7 +10252,7 @@ int slotcask_walk_one_shard_streaming(SlotcaskDb *db, int kf_shard_id,
         if (seg_rec_live_with_hash(rec, e->hash)) {
             uint16_t klen = seg_rec_klen(rec);
             uint32_t vlen = seg_rec_vlen(rec);
-            if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, ctx) != 0)
+            if (cb(e->hash, rec + 24, klen, rec + 24 + klen, vlen, rec[19], ctx) != 0)
                 stop = 1;
         }
         segcache_release(&sh);
@@ -10126,7 +10335,7 @@ static int kf_skip_emit_entry(SlotcaskDb *db, const SlotcaskKfEntry *e,
     uint32_t vlen = seg_rec_vlen(rec);
     const uint8_t *key   = rec + 24;
     const uint8_t *value = rec + 24 + klen;
-    if (c->cb(e->hash, key, klen, value, vlen, c->ctx) != 0) {
+    if (c->cb(e->hash, key, klen, value, vlen, rec[19], c->ctx) != 0) {
         c->stop = 1;
         segcache_release(&sh);
         return 1;
@@ -10189,7 +10398,7 @@ static void slotcask_lookup_scan_kf(SlotcaskDb *db, const uint8_t hash16[16],
         uint32_t vlen = seg_rec_vlen(rec);
         const uint8_t *key   = rec + 24;
         const uint8_t *value = rec + 24 + klen;
-        if (cb(e->hash, key, klen, value, vlen, ctx) != 0) stop = 1;
+        if (cb(e->hash, key, klen, value, vlen, rec[19], ctx) != 0) stop = 1;
         segcache_release(&sh);
     }
 }
@@ -10323,7 +10532,7 @@ static int seg_stat_one_varlen(SlotcaskDb *db, int stream_id, uint32_t file_id,
         uint32_t vlen;
         int ok = seg_scan_varlen_struct_ok(h.map, file_size, off,
                                             db->slot_size, &rec_size,
-                                            &flag, &klen, &vlen);
+                                            &flag, &klen, &vlen, NULL);
         if (ok && flag == 0) {
             size_t next;
             if (!seg_scan_varlen_resync(h.map, file_size, off,
@@ -10487,7 +10696,8 @@ static int varlen_compact_cb(const uint8_t *rec, size_t vlen,
         return 1;
     }
     seg_record_emit(rh.map + target_off, (int)donor_rec_size,
-                    hash16, key, (size_t)klen, value, vlen);
+                    hash16, key, (size_t)klen, value, vlen,
+                    rec[19]); /* preserve the donor record's generation */
     if (durability_msync_range(rh.map, target_off, donor_rec_size) != 0) {
         segcache_release(&rh);
         kfcache_release(&kh);
@@ -10538,7 +10748,7 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
         uint32_t vlen;
         int ok = seg_scan_varlen_struct_ok(rh.map, rmap_size, off,
                                             db->slot_size, &rec_size,
-                                            &flag, &klen, &vlen);
+                                            &flag, &klen, &vlen, NULL);
         if (!ok) {
             size_t next;
             if (!seg_scan_varlen_resync(rh.map, rmap_size, off,

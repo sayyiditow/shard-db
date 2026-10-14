@@ -186,7 +186,10 @@ static int test_vacuum_addfield_run(void) {
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"add1\",\"key\":\"k1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"name\":\"alice\"", "k1 name preserved");
     ASSERT_CONTAINS(resp, "\"age\":0", "k1 age defaults to 0");
-    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"email\"") == NULL, "k1 no email (empty varchar)");
+    /* add-field backfill is zeros with a CLEAR bit (§2.10: new fields are
+       never NULL — documents today's behavior); on the rebuilt nullmap
+       record the empty varchar renders as "" (§2.3 zero rendering). */
+    ASSERT_CONTAINS(resp, "\"email\":\"\"", "k1 email empty string (new-field backfill)");
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"add1\","
@@ -255,7 +258,8 @@ static int test_vacuum_addfield_run(void) {
     ASSERT_CONTAINS(resp, "\"a\":\"aa\"", "k1 a preserved");
     ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"b\"") == NULL, "k1 b gone");
     ASSERT_CONTAINS(resp, "\"c\":42", "k1 c preserved");
-    ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"d\"") == NULL, "k1 d empty");
+    /* added field d backfills zeros with a clear bit (§2.10) → renders "" */
+    ASSERT_CONTAINS(resp, "\"d\":\"\"", "k1 d empty string (new-field backfill)");
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"integ\","

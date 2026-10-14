@@ -907,9 +907,10 @@ static int field_vs_field_match(int cmp, enum SearchOp op) {
    `rec` points at the raw value region of the record (hdr->key_len offset
    into block). Returns 1 on match, 0 otherwise.
    For composite/unknown fields, falls back to decode_field + match_criterion. */
-int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc, FieldSchema *fs) {
+int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc, FieldSchema *fs,
+                uint8_t hdr2) {
     if (cc->composite || !cc->tf) {
-        char *attr = decode_field((const char *)rec, data_len, cc->raw->field, fs);
+        char *attr = decode_field((const char *)rec, data_len, cc->raw->field, fs, hdr2);
         int r = match_criterion(attr, cc->raw);
         free(attr);
         return r;
@@ -922,17 +923,39 @@ int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc
         cc->op == OP_LT_FIELD || cc->op == OP_GT_FIELD ||
         cc->op == OP_LTE_FIELD || cc->op == OP_GTE_FIELD) {
         if (!cc->rhs_tf) return 0;
-        const uint8_t *lhs = ((size_t)cc->tf->offset + (size_t)cc->tf->size > data_len)
-            ? g_zero_field_65537 : rec + cc->tf->offset;
-        const uint8_t *rhs = ((size_t)cc->rhs_tf->offset + (size_t)cc->rhs_tf->size > data_len)
-            ? g_zero_field_65537 : rec + cc->rhs_tf->offset;
+        const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
+        int bm_bytes = 0; size_t region = 0;
+        if (typed_record_view(rec, data_len, hdr2, &fbase, &bm,
+                              &bm_bytes, &region) != 0) return 0;
+        int lhs_idx = (int)(cc->tf - fs->ts->fields);
+        int rhs_idx = (int)(cc->rhs_tf - fs->ts->fields);
+        if ((hdr2 & SREC_FLAG_NULLMAP) &&
+            (typed_field_null(bm, bm_bytes, lhs_idx) ||
+             typed_field_null(bm, bm_bytes, rhs_idx))) return 0;
+        const uint8_t *lhs = ((size_t)cc->tf->offset + (size_t)cc->tf->size > region)
+            ? g_zero_field_65537 : fbase + cc->tf->offset;
+        const uint8_t *rhs = ((size_t)cc->rhs_tf->offset + (size_t)cc->rhs_tf->size > region)
+            ? g_zero_field_65537 : fbase + cc->rhs_tf->offset;
         int r = cmp_typed_field_pair(lhs, rhs, cc->tf);
         return field_vs_field_match(r, cc->op);
     }
 
     const TypedField *f = cc->tf;
-    const uint8_t *p = ((size_t)f->offset + (size_t)f->size > data_len)
-        ? g_zero_field_65537 : rec + f->offset;
+    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
+    int bm_bytes = 0; size_t region = 0;
+    if (typed_record_view(rec, data_len, hdr2, &fbase, &bm,
+                          &bm_bytes, &region) != 0) return 0;
+    /* NULL field: every value op false; exists/not_exists are the null
+       tests (§2.4.2 truth table). Legacy records keep their semantics. */
+    if (hdr2 & SREC_FLAG_NULLMAP) {
+        int is_null = typed_field_null(bm, bm_bytes, (int)(f - fs->ts->fields));
+        if (cc->op == OP_EXISTS)     return !is_null;
+        if (cc->op == OP_NOT_EXISTS) return is_null;
+        if (is_null) return 0;
+        /* fall through — bit clear ⇒ pure value semantics, no zero gates */
+    }
+    const uint8_t *p = ((size_t)f->offset + (size_t)f->size > region)
+        ? g_zero_field_65537 : fbase + f->offset;
 
     switch (f->type) {
     case FT_NONE:
@@ -1034,7 +1057,8 @@ int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc
         case OP_EXISTS: return v != 0;
         case OP_NOT_EXISTS: return v == 0;
         default:
-            if (v == 0) return 0; /* empty date matches nothing except NOT_EXISTS */
+            if (v == 0 && !(hdr2 & SREC_FLAG_NULLMAP))
+                return 0; /* legacy: empty date matches nothing except NOT_EXISTS */
             if (cc->op == OP_IN || cc->op == OP_NOT_IN)
                 return cmp_op_i64(v, 0, 0, cc->op, cc->in_i64, cc->in_count, cc);
             return cmp_op_i64(v, cc->i1, cc->i2, cc->op, NULL, 0, cc);
@@ -1051,7 +1075,7 @@ int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc
         case OP_EXISTS: return !(d == 0 && t == 0);
         case OP_NOT_EXISTS: return d == 0 && t == 0;
         default:
-            if (d == 0 && t == 0) return 0;
+            if (d == 0 && t == 0 && !(hdr2 & SREC_FLAG_NULLMAP)) return 0;
             return cmp_op_i64(v, q1, q2, cc->op,
                               cc->in_i64, cc->in_count, cc);
         }
@@ -1066,7 +1090,7 @@ int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc
         case OP_EXISTS: return !(d == 0 && ms == 0);
         case OP_NOT_EXISTS: return d == 0 && ms == 0;
         default:
-            if (d == 0 && ms == 0) return 0;
+            if (d == 0 && ms == 0 && !(hdr2 & SREC_FLAG_NULLMAP)) return 0;
             return cmp_op_i64(v, q1, q2, cc->op,
                               cc->in_i64, cc->in_count, cc);
         }
@@ -1075,7 +1099,10 @@ int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc
         uint32_t secs = ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
         uint32_t q1 = ((uint32_t)cc->time_val[0] << 16) | ((uint32_t)cc->time_val[1] << 8) | cc->time_val[2];
         uint32_t q2 = ((uint32_t)cc->time_val2[0] << 16) | ((uint32_t)cc->time_val2[1] << 8) | cc->time_val2[2];
-        int exists = !(secs == 0 && p[0]==0 && p[1]==0 && p[2]==0);
+        /* Absence heuristic is legacy-only: nullmap records carry the
+           authoritative bit (handled above), so midnight is a value. */
+        int exists = (hdr2 & SREC_FLAG_NULLMAP) ||
+                     !(secs == 0 && p[0]==0 && p[1]==0 && p[2]==0);
         switch (cc->op) {
         case OP_EXISTS: return exists;
         case OP_NOT_EXISTS: return !exists;
@@ -1295,7 +1322,8 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
         char parts[2][1024] = {{0}};
         int pi = 0;
         while (*ap && pi < 2) {
-            while (*ap == ' ' || *ap == ',') ap++;
+            while (*ap == ' ' || *ap == '\t' || *ap == '\r' ||
+                   *ap == '\n' || *ap == ',') ap++;
             if (*ap == ']' || !*ap) break;
             const char *start; size_t plen;
             if (*ap == '"') {
@@ -1308,6 +1336,20 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                 start = ap;
                 while (*ap && *ap != ',' && *ap != ']') ap++;
                 plen = (size_t)(ap - start);
+                /* Legal JSON allows whitespace inside arrays ([null ,20]):
+                   validate the TRIMMED member span, not the raw bytes —
+                   space/tab/CR/LF normalize off both ends, mirroring
+                   json_skip. Quoted "null" (consumed above) stays a
+                   legitimate string bound. */
+                while (plen > 0 && (start[plen - 1] == ' ' ||
+                                    start[plen - 1] == '\t' ||
+                                    start[plen - 1] == '\r' ||
+                                    start[plen - 1] == '\n'))
+                    plen--;
+                if (plen == 4 && json_span_is_null(start, 4)) {
+                    free(v); free(v_raw); free(v2);
+                    return -1;
+                }
             }
             if (plen >= sizeof(parts[0])) plen = sizeof(parts[0]) - 1;
             memcpy(parts[pi], start, plen);
@@ -1321,10 +1363,29 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
         }
     }
 
-    /* Validate value — required for all ops except exists/not_exists */
+    /* Validate value — required for all ops except exists/not_exists.
+       §2.6: reject a RAW (unquoted) JSON null operand before quote
+       stripping destroys the token kind — NULL is not a value; NULL
+       checks use exists/not_exists. Quoted "null" remains a legitimate
+       varchar/enum value. Same rule for between's value2 and for
+       IN/NOT_IN array members (checked at the split below). */
+    if (op_requires_value(c->op) && v_raw &&
+        json_span_is_null(v_raw, strlen(v_raw))) {
+        free(v); free(v_raw); free(v2);
+        return -1;
+    }
     if (op_requires_value(c->op) && (!v || v[0] == '\0')) {
         free(v); free(v_raw); free(v2);
         return -1;
+    }
+    if (c->op == OP_BETWEEN || c->op == OP_LEN_BETWEEN) {
+        char *v2_raw = json_obj_strdup_raw(&cobj, "value2");
+        int v2_null = v2_raw && json_span_is_null(v2_raw, strlen(v2_raw));
+        free(v2_raw);
+        if (v2_null) {
+            free(v); free(v_raw); free(v2);
+            return -1;
+        }
     }
 
     /* Validate value2 — between/len_between need both bounds; a missing
@@ -1377,7 +1438,8 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
             if (*ap == '[') {
                 ap++;
                 while (*ap) {
-                    while (*ap == ' ' || *ap == ',') ap++;
+                    while (*ap == ' ' || *ap == '\t' || *ap == '\r' ||
+                           *ap == '\n' || *ap == ',') ap++;
                     /* The skip-ws/comma loop can advance ap to the NUL
                        terminator if the input ends with a trailing comma
                        and no closing ']' (the upstream json_skip_value
@@ -1387,6 +1449,16 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                        read on next iteration. */
                     if (!*ap) break;
                     if (*ap == ']') break;
+                    /* §2.6: a raw null array member is rejected — NULL is
+                       not a value; quoted "null" stays a string element. */
+                    if (*ap == 'n' && ap + 4 <= v_raw + strlen(v_raw) &&
+                        json_span_is_null(ap, 4)) {
+                        for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
+                        free(c->in_values); c->in_values = NULL;
+                        c->in_count = 0; c->in_cap = 0;
+                        free(v); free(v_raw); free(v2);
+                        return -1;
+                    }
                     if (*ap == '"') {
                         ap++;
                         const char *start = ap;
@@ -1713,19 +1785,20 @@ void recompile_criteria_tree(CriteriaNode *n, const TypedSchema *ts) {
     for (int i = 0; i < n->n_children; i++) recompile_criteria_tree(n->children[i], ts);
 }
 
-int criteria_match_tree(const uint8_t *rec, size_t data_len, const CriteriaNode *n, FieldSchema *fs) {
+int criteria_match_tree(const uint8_t *rec, size_t data_len, const CriteriaNode *n, FieldSchema *fs,
+                       uint8_t hdr2) {
     if (!n) return 1;
     switch (n->kind) {
     case CNODE_LEAF:
         if (!n->compiled) return 0;
-        return match_typed(rec, data_len, n->compiled, fs);
+        return match_typed(rec, data_len, n->compiled, fs, hdr2);
     case CNODE_AND:
         for (int i = 0; i < n->n_children; i++)
-            if (!criteria_match_tree(rec, data_len, n->children[i], fs)) return 0;
+            if (!criteria_match_tree(rec, data_len, n->children[i], fs, hdr2)) return 0;
         return 1;
     case CNODE_OR:
         for (int i = 0; i < n->n_children; i++)
-            if (criteria_match_tree(rec, data_len, n->children[i], fs)) return 1;
+            if (criteria_match_tree(rec, data_len, n->children[i], fs, hdr2)) return 1;
         return 0;
     }
     return 0;
@@ -3020,6 +3093,17 @@ int build_exact_composite_key(const FieldSchema *fs, const char *composite_field
             if (op_caps(leaves[i]->op).composite_exact && strcmp(leaves[i]->field, sub) == 0) { m = leaves[i]; break; }
         if (!m) return 0;  /* sub-field not pinned by an eq leaf */
         const TypedField *tf = resolve_idx_field(fs ? fs->ts : NULL, sub);
+        /* BTRI composite keys interleave a tier byte before EVERY component
+           ([t1][v1][t2][v2], §2.4.1/§2.4.2). The exact-seek consumers
+           (chunk_walk_fanout / btree_idx_search) prefix the FIRST tier
+           themselves, so this builder emits the INTER-component bytes only:
+           [v1][0x00][v2][0x00][v3]. A missing tier makes the seek's payload
+           bytes compare against stored tier bytes and every entry falls
+           outside the range. */
+        if (total > 0) {
+            if (total + 1 >= 1024) return 0;
+            out[total++] = 0x00;
+        }
         size_t l = 0;
         encode_field_for_index(tf, m->value, strlen(m->value), out + total, &l);
         total += l;

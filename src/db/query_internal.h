@@ -135,7 +135,7 @@ int rebuild_object_v2(const char *db_root, const char *object,
 int v2_rebuild_walk_cb(const uint8_t hash16[16],
                        const void *key, size_t klen,
                        const void *value, size_t vlen,
-                       void *ctxp);
+                       uint8_t hdr2, void *ctxp);
 int update_schema_conf_splits_streams(const char *db_root, const char *object,
                                      int new_splits, int new_streams);
 int selective_reindex_dirty(const char *db_root, const char *object,
@@ -166,7 +166,7 @@ void csv_emit_header(const char **proj_fields, int proj_count,
                      FieldSchema *fs, char delim);
 void csv_emit_row(const char *key, const uint8_t *raw, size_t val_len,
                   const char **proj_fields, int proj_count,
-                  FieldSchema *fs, char delim);
+                  FieldSchema *fs, char delim, uint8_t hdr2);
 
 /* query_find.c — shard grouping (used by query.c find/count paths) */
 int cmp_by_shard(const void *a, const void *b);
@@ -420,17 +420,18 @@ int resolve_joins(JoinSpec *joins, int n, const char *db_root,
 int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
                       size_t driver_len,
                       const TypedSchema *driver_ts,
+                      uint8_t driver_hdr2,
                       char *buf, size_t bufsz);
 int lookup_remote(const JoinSpec *j, const char *db_root,
                   const char *local_key, size_t local_len,
                   RecordRef *out_rr);
 int buf_driver_values(const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs,
                       const char **driver_proj, int driver_proj_count,
-                      char *buf, size_t bufsz);
+                      uint8_t driver_hdr2, char *buf, size_t bufsz);
 int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw, size_t remote_len,
-                    char *buf, size_t bufsz);
+                    uint8_t remote_hdr2, char *buf, size_t bufsz);
 size_t build_joined_csv_row(const char *key,
-                            const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs,
+                            const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs, uint8_t driver_hdr2,
                             const char **proj_fields, int proj_count,
                             const JoinSpec *joins, int njoins,
                             const RecordRef *jrefs,

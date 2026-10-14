@@ -6,6 +6,41 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**2026.10.2 — real NULL for typed fields, BTRI index format.** Typed
+fields are now nullable: every record carries a per-record null bitmap
+(`1 + ceil(nfields/8)` bytes), explicit JSON `null` stores NULL, an
+omitted insert field with no default is NULL, and update semantics are
+explicit-null-clears / omitted-carries-forward. `get`/`find` render NULL
+as JSON `null`; value predicates never match NULL and their negations
+don't either; `exists`/`not_exists` test nullness with per-record,
+generation-correct semantics so indexed and unindexed results agree on
+mixed-generation data. Raw unquoted JSON `null` operands are rejected by
+the criteria parser (quoted `"null"` stays a string).
+
+The B+ tree index format bumps `'BTRH'` → `'BTRI'` (`BT_MAX_VAL_LEN`
+512 → 544): indexed fields store one key per record including NULLs —
+value keys `[0x00][sortable bytes]`, NULL keys the single byte
+`[0x01]` — so ranges stop below the NULL tier, ordered finds place NULL
+rows last ASC / first DESC, and keyset cursor tokens carry a per-field
+tier array that crosses the NULL boundary without repeating or skipping
+rows. The upgrade is a **startup migration**: on first start the daemon
+reindexes every indexed object through a strict durability-checked
+entry point (an unconfirmed publication fails startup; partially
+published shards retry whole), replays any pending KFM2 markers against
+the rebuilt indexes, and only then durably stamps completion and
+serves. A `'BTRH'` file also refuses per-request as defense-in-depth.
+The minimum supported source release stays **2026.09.2**.
+
+Aggregates gain SQL NULL semantics: `sum`/`avg`/`min`/`max` skip NULLs,
+`avg` of all-NULL renders `null`, `count(field)` counts non-NULL, and
+`group_by` gives NULL its own bucket rendered as bare JSON `null` —
+`NULL`, `""`, and the literal `"null"` are three distinct buckets, with
+indexed and scan paths byte-identical. Bitmap-indexed fields keep their
+documented gap: a bitmap cannot enumerate "no bit set", so NULL groups
+and exists/not_exists on bitmap-indexed fields fall back to full scans.
+See [typed-records](../concepts/typed-records.md) for the full NULL
+semantics.
+
 2026.10.1 raises the minimum supported source release to **2026.09.2**
 and removes the in-binary startup migration. A populated root must carry
 2026.09.2 clean-open evidence: such roots open as-is and are re-stamped

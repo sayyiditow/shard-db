@@ -1,6 +1,8 @@
 #include "types.h"
 #include "slotcask.h"
 
+int legacy_field_absent(const TypedField *f, const uint8_t *p);
+
 /* Hashing & shard derivation live in util.c (compute_hash_raw) and
    slotcask.c (compute_record_shard) — single source of truth across the
    engine and storage layer. */
@@ -389,14 +391,22 @@ int cmd_get(const char *db_root, const char *object,
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
     void *val = NULL; size_t vlen = 0;
-    if (slotcask_get(sdb, key, klen, &val, &vlen) != 0) {
+    uint8_t get_hdr2 = 0;
+    if (slotcask_get_ex(sdb, key, klen, &val, &vlen, &get_hdr2) != 0) {
         OUT("{\"error\":\"Not found\"}\n");
         return 1;
     }
     LOG_DEBUG(LOG_SUB_SLOTCASK, "GET %s (klen=%zu, %zu bytes)", object, klen, vlen);
     TypedSchema *ts = load_typed_schema(db_root, object);
-    typed_decode_stream(ts, (const uint8_t *)val, (uint32_t)vlen,
-                         g_out ? g_out : stdout);
+    /* Fail closed on a structurally invalid flagged record (bad bm_nbytes,
+       unknown hdr2 bits): typed_decode_stream emits nothing in that case —
+       a bare newline would masquerade as an empty record dict. */
+    if (typed_decode_stream(ts, (const uint8_t *)val, (uint32_t)vlen,
+                            g_out ? g_out : stdout, get_hdr2) != 0) {
+        OUT("{\"error\":\"corrupt record\"}\n");
+        free(val);
+        return 1;
+    }
     fputc('\n', g_out ? g_out : stdout);
     free(val);
     return 0;
@@ -417,7 +427,8 @@ int cmd_get_fields(const char *db_root, const char *object,
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
     void *val = NULL; size_t vlen = 0;
-    if (slotcask_get(sdb, key, klen, &val, &vlen) != 0) {
+    uint8_t cur_hdr2 = 0;
+    if (slotcask_get_ex(sdb, key, klen, &val, &vlen, &cur_hdr2) != 0) {
         OUT("{\"error\":\"Not found\"}\n");
         return 1;
     }
@@ -437,7 +448,7 @@ int cmd_get_fields(const char *db_root, const char *object,
     int first = 1;
     for (int fi = 0; fi < nf; fi++) {
         char *pv = json_projected_field((const char *)val, vlen, flds[fi],
-            (pfs.ts || pfs.nfields > 0) ? &pfs : NULL);
+            (pfs.ts || pfs.nfields > 0) ? &pfs : NULL, cur_hdr2);
         if (!pv) continue;
         OUT("%s\"%s\":%s", first ? "" : ",", flds[fi], pv);
         first = 0; free(pv);
@@ -453,7 +464,7 @@ int cmd_get_fields(const char *db_root, const char *object,
    value_len is the number of valid bytes in value_ptr (may be < ts->total_size
    for trim-encoded records). Returns 1 if ALL criteria match, 0 on first failure. */
 int cas_check(TypedSchema *ts, const uint8_t *value_ptr, int value_len,
-              SearchCriterion *crit, int ncrit) {
+              uint8_t hdr2, SearchCriterion *crit, int ncrit) {
     for (int i = 0; i < ncrit; i++) {
         char *val_str = NULL;
         if (strchr(crit[i].field, '+')) {
@@ -464,7 +475,7 @@ int cas_check(TypedSchema *ts, const uint8_t *value_ptr, int value_len,
             while (tok) {
                 int fi = typed_field_index(ts, tok);
                 if (fi >= 0) {
-                    char *v = typed_get_field_str(ts, value_ptr, value_len, fi);
+                    char *v = typed_get_field_str(ts, value_ptr, value_len, fi, hdr2);
                     if (v) { int sl = strlen(v); memcpy(cat + cp, v, sl); cp += sl; free(v); }
                     else { ok = 0; break; }
                 } else { ok = 0; break; }
@@ -474,7 +485,7 @@ int cas_check(TypedSchema *ts, const uint8_t *value_ptr, int value_len,
             val_str = (ok && cp > 0) ? strdup(cat) : NULL;
         } else {
             int fi = typed_field_index(ts, crit[i].field);
-            if (fi >= 0) val_str = typed_get_field_str(ts, value_ptr, value_len, fi);
+            if (fi >= 0) val_str = typed_get_field_str(ts, value_ptr, value_len, fi, hdr2);
         }
         int matched = match_criterion(val_str, &crit[i]);
         free(val_str);
@@ -539,7 +550,7 @@ static int v2_insert_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     if (c->ncrit > 0) {
         /* if_json criteria require an existing record; reject if missing. */
         if (!old) return 0;
-        if (!cas_check(c->idx_ts, old->value, (int)old->vlen, c->crit, c->ncrit)) return 0;
+        if (!cas_check(c->idx_ts, old->value, (int)old->vlen, old->hdr2, c->crit, c->ncrit)) return 0;
     }
     return 1;
 }
@@ -591,17 +602,30 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
            apply the changes via parallel_for. For 12-index workloads with
            N changed fields, this drops the index-update wall time from
            N×~1µs sequential to ~1µs parallel (limited by core count). */
-        char *old_json = typed_decode(c->idx_ts, old->value, (uint32_t)old->vlen);
         int n_args = 0;
         for (int i = 0; i < c->nfields; i++) {
             uint8_t *new_key = NULL, *old_key = NULL;
             size_t new_len = 0, old_len = 0;
-            int have_new = build_index_key_from_json(c->idx_ts, c->value_json,
-                                                     c->fields[i], &new_key, &new_len);
-            int have_old = old_json
-                ? build_index_key_from_json(c->idx_ts, old_json,
-                                            c->fields[i], &old_key, &old_len)
-                : 0;
+            int have_new = 0, have_old = 0;
+            /* §2.11: keys derive from the final encoded records (with
+               generation) — never request or rendered JSON. Btree keys are
+               tiered; bitmap/trigram payloads stay raw (NULL → no key). */
+            int btree_field = !c->idx_types || c->idx_types[i] == IT_BTREE;
+            if (btree_field) {
+                have_new = build_index_key_from_record(c->idx_ts, new_value, new_vlen,
+                                                       SREC_FLAG_NULLMAP,
+                                                       c->fields[i], &new_key, &new_len);
+                have_old = build_index_key_from_record(c->idx_ts, old->value, old->vlen,
+                                                       old->hdr2,
+                                                       c->fields[i], &old_key, &old_len);
+            } else {
+                have_new = build_index_payload_from_record(c->idx_ts, new_value, new_vlen,
+                                                           SREC_FLAG_NULLMAP,
+                                                           c->fields[i], &new_key, &new_len);
+                have_old = build_index_payload_from_record(c->idx_ts, old->value, old->vlen,
+                                                           old->hdr2,
+                                                           c->fields[i], &old_key, &old_len);
+            }
             if (have_new < 0 || have_old < 0) {
                 free(new_key); free(old_key);
                 for (int j = 0; j < n_args; j++) {
@@ -609,7 +633,6 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
                     free(c->upd_args[j].old_key);
                 }
                 c->n_upd_args = 0;
-                free(old_json);
                 snprintf(c->err_buf, sizeof(c->err_buf),
                          "index-key decode failed during insert/update: %s",
                          strerror(errno ? errno : EIO));
@@ -661,7 +684,6 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
             }
         }
         c->n_upd_args = n_args;
-        free(old_json);
     } else {
         /* Fresh insert: entirely handled by v2_insert_prepare_commit /
            v2_insert_apply_commit instead — see the doc comment above. */
@@ -704,7 +726,8 @@ static int v2_insert_prepare_commit(const uint8_t *new_value, size_t new_vlen,
         if (strchr(c->fields[i], '+')) continue;
         uint8_t *nk = NULL;
         size_t nl = 0;
-        int key_rc = build_index_key_from_json(c->idx_ts, c->value_json,
+        int key_rc = build_index_payload_from_record(c->idx_ts, new_value, new_vlen,
+                                               SREC_FLAG_NULLMAP,
                                                c->fields[i], &nk, &nl);
         if (key_rc < 0) {
             bitmap_prepare_set_free(&c->bm_prep);
@@ -828,15 +851,67 @@ static int v2_insert_apply_commit(const uint8_t *new_value, size_t new_vlen,
     const char *tg_fields[MAX_FIELDS];
     int n_tg = 0;
 
-    if (index_parallel(c->db_root, c->object, c->splits,
-                       c->value_json, c->hash, c->fields, c->nfields,
-                       c->idx_types) != 0) {
-        snprintf(c->err_buf, sizeof(c->err_buf),
-                 "btree index update failed during insert: %s",
-                 strerror(errno));
-        bitmap_prepare_set_free(&c->bm_prep);
-        v2_insert_bm_owned_free(c);
-        return -1;
+    /* §2.11: fresh-insert btree keys derive from the final encoded record
+       (with generation), never request JSON. index_parallel(value_json) is
+       retired for this path — each btree field gets a tiered BTRI key from
+       the validated record view, written via write_index_entry. */
+    {
+        const uint8_t *ins_base = NULL; const uint8_t *ins_bm = NULL;
+        int ins_bm_bytes = 0; size_t ins_region = 0;
+        if (typed_record_view(new_value, new_vlen, SREC_FLAG_NULLMAP,
+                              &ins_base, &ins_bm, &ins_bm_bytes,
+                              &ins_region) != 0) {
+            snprintf(c->err_buf, sizeof(c->err_buf),
+                     "corrupt record during btree index update");
+            bitmap_prepare_set_free(&c->bm_prep);
+            v2_insert_bm_owned_free(c);
+            return -1;
+        }
+        int idx_failed2 = 0;
+        uint8_t *owned[MAX_FIELDS]; int n_owned = 0;
+        /* Btree fields written above sync via index_sync_record_fields, one
+           durable sync per field file — the same leg the update path runs
+           (and the retired index_parallel used to run). Missing this call
+           silently drops btree durability on every fresh insert. */
+        const char *bt_fields[MAX_FIELDS];
+        enum IndexType bt_types[MAX_FIELDS];
+        int n_bt = 0;
+        for (int i = 0; i < c->nfields && !idx_failed2; i++) {
+            if (c->idx_types[i] != IT_BTREE) continue;
+            uint8_t *nk = NULL; size_t nl = 0;
+            /* §2.4.1: btree keys are TIERED ([0x00][payload] value tier,
+               [0x01].. NULL tier) — the tiered builder, never the raw
+               bitmap/trigram payload builder. NULL fields produce a tier-1
+               entry so exists/not_exists stay index-answerable. */
+            int key_rc = build_index_key_from_record(c->idx_ts, new_value, new_vlen,
+                                                     SREC_FLAG_NULLMAP,
+                                                     c->fields[i], &nk, &nl);
+            if (key_rc < 0) {
+                snprintf(c->err_buf, sizeof(c->err_buf),
+                         "btree index-key build failed during insert: %s",
+                         strerror(errno));
+                idx_failed2 = 1;
+                break;
+            }
+            if (key_rc == 0) continue;   /* no key for this field */
+            owned[n_owned++] = nk;
+            bt_fields[n_bt] = c->fields[i];
+            bt_types[n_bt] = IT_BTREE;
+            n_bt++;
+            if (write_index_entry(c->db_root, c->object, c->fields[i],
+                                  c->splits, nk, nl, c->hash) != 0)
+                idx_failed2 = 1;
+        }
+        for (int i = 0; i < n_owned; i++) free(owned[i]);
+        if (!idx_failed2 && n_bt > 0 &&
+            index_sync_record_fields(c->db_root, c->object, c->splits,
+                                     c->hash, bt_fields, bt_types, n_bt) != 0)
+            idx_failed2 = 1;
+        if (idx_failed2) {
+            bitmap_prepare_set_free(&c->bm_prep);
+            v2_insert_bm_owned_free(c);
+            return -1;
+        }
     }
 
     int idx_failed = 0;
@@ -850,9 +925,36 @@ static int v2_insert_apply_commit(const uint8_t *new_value, size_t new_vlen,
             if (strchr(c->fields[i], '+')) continue;  /* composite + trigram = rejected upstream */
             uint8_t *nk = NULL;
             size_t nl = 0;
-            int key_rc = build_index_key_from_json(c->idx_ts, c->value_json,
-                                                   c->fields[i], &nk, &nl);
+            /* Trigram keys carry NO tier byte (.tg shape is unchanged in
+               BTRI — §2.4.1): raw sortable payload from the validated
+               record view. NULL fields contribute no trigrams. */
+            const uint8_t *tg_base = NULL; const uint8_t *tg_bm = NULL;
+            int tg_bm_bytes = 0; size_t tg_region = 0;
+            int tidx = typed_field_index(c->idx_ts, c->fields[i]);
+            if (typed_record_view(new_value, new_vlen, SREC_FLAG_NULLMAP,
+                                  &tg_base, &tg_bm, &tg_bm_bytes,
+                                  &tg_region) != 0 || tidx < 0) {
+                for (int j = 0; j < n_tg; j++) free(tg_args[j].new_key);
+                snprintf(c->err_buf, sizeof(c->err_buf),
+                         "corrupt record during trigram index update");
+                bitmap_prepare_set_free(&c->bm_prep);
+                v2_insert_bm_owned_free(c);
+                return -1;
+            }
+            const TypedField *tg_f = &c->idx_ts->fields[tidx];
+            size_t tg_cap = (size_t)tg_f->size + 16;
+            nk = malloc(tg_cap);
+            nl = 0;
+            int key_rc = 0;
+            if (nk) {
+                typed_field_to_index_key(c->idx_ts, tg_base, tg_region,
+                                         tidx, (uint8_t *)nk, &nl);
+                key_rc = nl ? 1 : 0;
+            } else {
+                key_rc = -1;
+            }
             if (key_rc < 0) {
+                free(nk);
                 for (int j = 0; j < n_tg; j++) free(tg_args[j].new_key);
                 snprintf(c->err_buf, sizeof(c->err_buf),
                          "trigram index-key decode failed during insert: %s",
@@ -861,7 +963,7 @@ static int v2_insert_apply_commit(const uint8_t *new_value, size_t new_vlen,
                 v2_insert_bm_owned_free(c);
                 return -1;
             }
-            if (key_rc == 0) continue;
+            if (key_rc == 0) { free(nk); continue; }  /* NULL/empty: no trigrams */
             tg_args[n_tg].db_root  = c->db_root;
             tg_args[n_tg].object   = c->object;
             tg_args[n_tg].field    = c->fields[i];
@@ -1022,29 +1124,23 @@ static int cmd_insert_v2(const char *db_root, const char *object,
                 ts->fields[i].default_kind == DK_AUTO_CREATE) { has_ac = 1; break; }
         if (has_ac) {
             void *ac_old = NULL; size_t ac_old_vlen = 0;
-            int existed = (slotcask_get(sdb, key, klen, &ac_old, &ac_old_vlen) == 0);
+            uint8_t ac_old_hdr2 = 0;
+            int existed = (slotcask_get_ex(sdb, key, klen, &ac_old,
+                                           &ac_old_vlen, &ac_old_hdr2) == 0);
+            /* OLD generation view (validated once, shared by the loop). */
+            const uint8_t *o_base = NULL, *o_bm = NULL;
+            int o_bm_bytes = 0; size_t o_region = 0;
+            int o_view_ok = existed && ac_old &&
+                typed_record_view((const uint8_t *)ac_old, ac_old_vlen,
+                                  ac_old_hdr2, &o_base, &o_bm,
+                                  &o_bm_bytes, &o_region) == 0;
             for (int i = 0; i < ts->nfields; i++) {
                 if (ts->fields[i].removed ||
                     ts->fields[i].default_kind != DK_AUTO_CREATE) continue;
-                size_t off = (size_t)ts->fields[i].offset;
-                size_t w   = (size_t)ts->fields[i].size;
-                if (existed && ac_old && ac_old_vlen >= off + w) {
-                    memcpy(typed_buf + off, (uint8_t *)ac_old + off, w);
-                } else if (!existed) {
-                    /* Re-stamp unconditionally, even though typed_encode_defaults
-                       already stamped now() for a client-omitted field. Do NOT
-                       "optimize" this away: if the client explicitly supplied a
-                       value for this field, typed_encode_defaults wrote THAT
-                       value (seen[i]=1 skips generate_default), and this is the
-                       only place that overwrites it — removing this branch lets
-                       a client-supplied auto_create value survive a fresh
-                       insert, which the field's contract forbids. The extra
-                       clock_gettime on fresh inserts is negligible. */
-                    char tbuf[24];
-                    auto_now_str(&ts->fields[i], tbuf, sizeof(tbuf));
-                    encode_field(&ts->fields[i], tbuf, typed_buf + off);
-                }
-                /* existed but old too short (field added post-hoc): leave blank. */
+                auto_create_field_transfer(ts, typed_buf, i,
+                                           existed && ac_old ? 1 : 0, o_view_ok,
+                                           o_base, o_bm, o_bm_bytes, o_region,
+                                           ac_old_hdr2);
             }
             free(ac_old);
         }
@@ -1097,6 +1193,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         .out_kf_slot    = &ctx.kf_slot,
         .has_indexed_fields = nfields > 0,
         .out_durability_degraded = &durability_pending,
+        .record_hdr2   = SREC_FLAG_NULLMAP,  /* nullmap encoders */
     };
     SlotcaskUpsertResult result = {0};
     int rc;
@@ -1118,7 +1215,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
 
     if (rc == -2) {
         char *cur = result.current_value
-            ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen)
+            ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen, result.current_hdr2)
             : NULL;
         OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
             cur ? cur : "null");
@@ -1212,6 +1309,9 @@ typedef struct {
        compute the forward index diff (old→new) without re-reading. */
     const uint8_t    *saved_old_value;
     size_t            saved_old_vlen;
+    /* OLD record generation (segment header byte 19) — captured by the
+       check_fn alongside saved_old_value. */
+    uint8_t           old_hdr2;
 } V2UpdateCtx;
 
 /* NEW-from-OLD constructor for single partial updates. Runs inside
@@ -1221,94 +1321,194 @@ typedef struct {
    overwrite, never from a stale caller-side snapshot. Copies every
    untouched field, applies only fields present in the request, preserves
    removed fields, and stamps auto_update fields exactly once. */
-static int v2_update_new_from_old(const SlotcaskOldRecord *old,
-                                  uint8_t *out_value,
-                                  size_t out_capacity,
-                                  size_t *out_vlen,
-                                  void *ctx_ptr) {
-    V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
-    if (!old || !out_value || !out_vlen || old->vlen > out_capacity) return -1;
-    /* Stash OLD so apply_commit can compute the index diff without
-       re-reading (the two-phase hook signature doesn't carry OLD). */
-    c->saved_old_value = old->value;
-    c->saved_old_vlen  = old->vlen;
-#ifdef TEST_BUILD
-    /* Fixed-path seam: deterministic pause at the top of the under-lock
-       callback, after OLD has been received. Reports under_kf_wrlock == 1. */
-    slotcask_test_after_old(1);
-#endif
-    if ((size_t)c->idx_ts->total_size > out_capacity) return -1;
-    memcpy(out_value, old->value, old->vlen);
-    /* old->value may be a trim-compacted record shorter than
-       idx_ts->total_size (trailing default-valued fields dropped on the
-       prior write). Zero-fill the untouched tail before applying field
-       writes below so fields beyond old->vlen are defined and the caller's
-       trim pass sees the complete field region. */
-    size_t full_len = (size_t)c->idx_ts->total_size;
-    if (full_len > old->vlen)
-        memset(out_value + old->vlen, 0, full_len - old->vlen);
-    *out_vlen = full_len;
-
-    /* Build new typed buffer = copy of old, with partial fields applied. */
-    const char *field_names[MAX_FIELDS];
-    char *field_vals[MAX_FIELDS] = {0};
-    enum FieldType field_types[MAX_FIELDS];
-    for (int i = 0; i < c->idx_ts->nfields; i++) {
-        field_names[i] = c->idx_ts->fields[i].name;
-        field_types[i] = c->idx_ts->fields[i].type;
+/* Rendering predicate for legacy records: 1 if the legacy decoder would
+   SKIP this field's bytes. Used ONLY to port a legacy record into
+   nullmap form without changing what clients see — query existence uses
+   legacy_field_query_exists (query_plan.c) instead, and indexed-exists
+   verification likewise (a legacy long 0 renders absent but query-
+   exists true). */
+int legacy_field_absent(const TypedField *f, const uint8_t *p) {
+    switch (f->type) {
+    case FT_VARCHAR: {
+        int len = ((int)p[0] << 8) | p[1];
+        return len == 0;
     }
-    if (json_get_fields_unescaped(c->partial_json, field_names,
-                                  c->idx_ts->nfields, field_types,
-                                  field_vals) != 0) {
-        /* At least one field the client explicitly named had a malformed
-           JSON escape. Reject the whole update rather than silently
-           applying every other field and dropping this one — a partial
-           write here would look like success to the caller. */
-        for (int i = 0; i < c->idx_ts->nfields; i++) free(field_vals[i]);
-        snprintf(c->err_buf, sizeof(c->err_buf),
-                 "malformed JSON escape in one or more field values");
+    case FT_LONG: case FT_TIMESTAMP: {
+        int64_t v = (int64_t)(((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+                              ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+                              ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+                              ((uint64_t)p[6] << 8) | p[7]);
+        return v == 0;
+    }
+    case FT_DOUBLE: { double v; memcpy(&v, p, 8); return v == 0.0; }
+    case FT_FLOAT:  { float v;  memcpy(&v, p, 4); return v == 0.0f; }
+    case FT_DATE: {
+        int32_t v = (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                              ((uint32_t)p[2] << 8) | p[3]);
+        return v == 0;
+    }
+    case FT_DATETIME: {
+        int32_t d = (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                              ((uint32_t)p[2] << 8) | p[3]);
+        uint32_t t = ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 8) | p[6];
+        return d == 0 && t == 0;
+    }
+    case FT_DATETIMEMS: {
+        int32_t d = (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                              ((uint32_t)p[2] << 8) | p[3]);
+        uint32_t ms = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                      ((uint32_t)p[6] << 8) | p[7];
+        return d == 0 && ms == 0;
+    }
+    case FT_TIME:
+        return p[0] == 0 && p[1] == 0 && p[2] == 0;
+    case FT_UUID: {
+        int allzero = 1;
+        for (int i = 0; i < 16; i++) if (p[i]) { allzero = 0; break; }
+        return allzero;
+    }
+    case FT_IPV4:
+        return p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0;
+    case FT_IPV6: {
+        int allzero = 1;
+        for (int i = 0; i < 16; i++) if (p[i]) { allzero = 0; break; }
+        return allzero;
+    }
+    default:  /* int/short/byte/numeric/currency/bool/enum always rendered */
+        return 0;
+    }
+}
+
+void auto_create_field_transfer(const TypedSchema *ts, uint8_t *out_buf, int i,
+                                int existed, int o_view_ok,
+                                const uint8_t *o_base, const uint8_t *o_bm,
+                                int o_bm_bytes, size_t o_region,
+                                uint8_t o_hdr2) {
+    /* §2.9 auto_create preserve/stamp for ONE field, shared by the single
+       insert path and the bulk-insert value_compute so the transfer rules
+       cannot drift. Preserve transfers COMPLETE field state — bytes AND
+       nullness. NEW was already encoded (defaults or a supplied value), so
+       erase it first; a canonical NULL is all-zero bytes under a set bit. */
+    size_t off = (size_t)ts->fields[i].offset;
+    size_t w   = (size_t)ts->fields[i].size;
+    if (existed) {
+        uint8_t *dst = out_buf + ts->nullmap_prefix + off;
+        memset(dst, 0, w);
+        int preserve_null = (o_hdr2 & SREC_FLAG_NULLMAP) &&
+                            o_view_ok &&
+                            typed_field_null(o_bm, o_bm_bytes, i);
+        if (!preserve_null && o_view_ok) {
+            size_t avail = (o_region > off) ? o_region - off : 0;
+            size_t copyn = avail < w ? avail : w;
+            if (copyn) memcpy(dst, o_base + off, copyn);
+            if (!(o_hdr2 & SREC_FLAG_NULLMAP) &&
+                legacy_field_absent(&ts->fields[i], dst))
+                preserve_null = 1;
+        }
+        if (preserve_null) {
+            memset(dst, 0, w);
+            typed_set_null(out_buf + 1, ts->nullmap_prefix - 1, i);
+        } else {
+            typed_clear_null(out_buf + 1, ts->nullmap_prefix - 1, i);
+        }
+    } else {
+        /* Re-stamp unconditionally, even though typed_encode_defaults
+           already stamped now() for a client-omitted field. Do NOT
+           "optimize" this away: if the client explicitly supplied a
+           value for this field, typed_encode_defaults wrote THAT
+           value (seen[i]=1 skips generate_default), and this is the
+           only place that overwrites it — removing this branch lets
+           a client-supplied auto_create value survive a fresh
+           insert, which the field's contract forbids. The extra
+           clock_gettime on fresh inserts is negligible. */
+        char tbuf[24];
+        auto_now_str(&ts->fields[i], tbuf, sizeof(tbuf));
+        encode_field(&ts->fields[i], tbuf,
+                     out_buf + ts->nullmap_prefix + off);
+        typed_clear_null(out_buf + 1, ts->nullmap_prefix - 1, i);
+    }
+    /* existed but old too short (field added post-hoc): the
+       bounded zero fallback above carries it as NULL. */
+}
+
+int update_compose_new_from_old(const TypedSchema *ts,
+                                const SlotcaskOldRecord *old,
+                                uint8_t *out_buf,
+                                char *const *field_vals,
+                                const uint8_t *field_null) {
+    /* §2026.10.2 null plan §2.7: NEW is always written in the current
+       nullmap layout. OLD may be legacy or nullmap; the view is validated
+       before any field-region math — malformed flagged OLD fails the
+       write, never copies. */
+    const uint8_t *old_base; const uint8_t *old_bm; int old_bm_bytes;
+    size_t old_region;
+    if (!ts || !old || !out_buf ||
+        typed_record_view(old->value, (size_t)old->vlen, old->hdr2,
+                          &old_base, &old_bm, &old_bm_bytes,
+                          &old_region) != 0) {
         return -1;
     }
 
-    for (int i = 0; i < c->idx_ts->nfields; i++) {
-        if (field_vals[i]) {
-            if (!c->idx_ts->fields[i].removed) {
-                if (c->idx_ts->fields[i].type == FT_VARCHAR) {
-                    int content_max = c->idx_ts->fields[i].size - 2;
-                    size_t vlen = strlen(field_vals[i]);
-                    if ((int)vlen > content_max) {
-                        snprintf(c->err_buf, sizeof(c->err_buf),
-                            "value for field '%s' is %zu bytes; exceeds max %d for varchar",
-                            c->idx_ts->fields[i].name, vlen, content_max);
-                        free(field_vals[i]);
-                        for (int j = i + 1; j < c->idx_ts->nfields; j++)
-                            free(field_vals[j]);
-                        return -1;
-                    }
-                }
-                encode_field(&c->idx_ts->fields[i], field_vals[i],
-                             out_value + c->idx_ts->fields[i].offset);
-            }
-            free(field_vals[i]);
+    memset(out_buf, 0, (size_t)ts->total_size);
+    out_buf[0] = (uint8_t)typed_nullmap_bytes(ts->nfields);
+    uint8_t *nbm = out_buf + 1;
+    int nbm_bytes = typed_nullmap_bytes(ts->nfields);
+
+    for (int i = 0; i < ts->nfields; i++) {
+        const TypedField *f = &ts->fields[i];
+        if (f->removed) continue;
+        uint8_t *dst = out_buf + ts->nullmap_prefix + f->offset;
+
+        if (field_null && field_null[i]) {    /* explicit JSON null */
+            typed_set_null(nbm, nbm_bytes, i); /* dst stays zero — canonical */
+            continue;
+        }
+        if (field_vals && field_vals[i]) {
+            encode_field(f, field_vals[i], dst);   /* bit already clear */
+            continue;
+        }
+        /* Omitted on update → carry OLD forward, preserving rendering. */
+        if ((old->hdr2 & SREC_FLAG_NULLMAP) &&
+            typed_field_null(old_bm, old_bm_bytes, i)) {
+            typed_set_null(nbm, nbm_bytes, i); /* dst stays zero — canonical */
+            continue;
+        }
+        /* Bounded copy: out-of-bounds tail stays zero (NEW was memset);
+           src formed only when in-bounds (OLD is exactly vlen bytes and
+           may be trim-compacted or predate add-field). */
+        size_t avail = (old_region > (size_t)f->offset)
+            ? old_region - (size_t)f->offset : 0;
+        size_t copyn = avail < (size_t)f->size ? avail : (size_t)f->size;
+        if (copyn) memcpy(dst, old_base + f->offset, copyn);
+        if (!(old->hdr2 & SREC_FLAG_NULLMAP) && legacy_field_absent(f, dst)) {
+            /* legacy skip-on-zero ⇒ NULL. Zero dst even when OLD bytes
+               were nonzero-but-omitted (float/double -0.0) — NULL bytes
+               are canonically all-zero. dst is fully materialized, so the
+               predicate is safe for trimmed/short OLD records too. */
+            memset(dst, 0, (size_t)f->size);
+            typed_set_null(nbm, nbm_bytes, i);
         }
     }
+    return 0;
+}
 
+void update_stamp_auto_update_fields(const TypedSchema *ts, uint8_t *out_buf) {
     /* auto_update fields: stamp current value on every update.
        Each typed type gets its appropriate now-form:
          FT_DATE      — yyyyMMdd (8-char int32 packed)
          FT_TIMESTAMP — Unix epoch ms (int64 BE; 2026.05.6+)
          everything else — yyyyMMddHHmmss (FT_DATETIME / fallback) */
-    for (int i = 0; i < c->idx_ts->nfields; i++) {
-        if (c->idx_ts->fields[i].removed) continue;
-        if (c->idx_ts->fields[i].default_kind != DK_AUTO_UPDATE) continue;
+    for (int i = 0; i < ts->nfields; i++) {
+        if (ts->fields[i].removed) continue;
+        if (ts->fields[i].default_kind != DK_AUTO_UPDATE) continue;
 
         char tbuf[24];
-        if (c->idx_ts->fields[i].type == FT_TIMESTAMP) {
+        if (ts->fields[i].type == FT_TIMESTAMP) {
             struct timespec tsn;
             clock_gettime(CLOCK_REALTIME, &tsn);
             long long ms = (long long)tsn.tv_sec * 1000LL + tsn.tv_nsec / 1000000LL;
             snprintf(tbuf, sizeof(tbuf), "%lld", ms);
-        } else if (c->idx_ts->fields[i].type == FT_DATETIMEMS) {
+        } else if (ts->fields[i].type == FT_DATETIMEMS) {
             struct timespec tsn;
             clock_gettime(CLOCK_REALTIME, &tsn);
             time_t nowsec = tsn.tv_sec;
@@ -1322,7 +1522,7 @@ static int v2_update_new_from_old(const SlotcaskOldRecord *old,
             time_t now = time(NULL);
             struct tm tmv;
             localtime_r(&now, &tmv);
-            if (c->idx_ts->fields[i].type == FT_DATE)
+            if (ts->fields[i].type == FT_DATE)
                 snprintf(tbuf, sizeof(tbuf), "%04d%02d%02d",
                          tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
             else
@@ -1330,9 +1530,82 @@ static int v2_update_new_from_old(const SlotcaskOldRecord *old,
                          tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
                          tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
         }
-        encode_field(&c->idx_ts->fields[i], tbuf,
-                     out_value + c->idx_ts->fields[i].offset);
+        encode_field(&ts->fields[i], tbuf,
+                     out_buf + ts->nullmap_prefix + ts->fields[i].offset);
+        /* A stamp materializes a value — clear any carried-forward NULL. */
+        typed_clear_null(out_buf + 1, ts->nullmap_prefix - 1, i);
     }
+}
+
+static int v2_update_new_from_old(const SlotcaskOldRecord *old,
+                                  uint8_t *out_value,
+                                  size_t out_capacity,
+                                  size_t *out_vlen,
+                                  void *ctx_ptr) {
+    V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
+    if (!old || !out_value || !out_vlen || old->vlen > out_capacity) return -1;
+    /* Stash OLD so apply_commit can compute the index diff without
+       re-reading (the two-phase hook signature doesn't carry OLD). */
+    c->saved_old_value = old->value;
+    c->saved_old_vlen  = old->vlen;
+    c->old_hdr2        = old->hdr2;
+#ifdef TEST_BUILD
+    /* Fixed-path seam: deterministic pause at the top of the under-lock
+       callback, after OLD has been received. Reports under_kf_wrlock == 1. */
+    slotcask_test_after_old(1);
+#endif
+    if ((size_t)c->idx_ts->total_size > out_capacity) return -1;
+
+    /* Per-field null detection on the raw request spans. */
+    const char *field_names[MAX_FIELDS];
+    char *field_vals[MAX_FIELDS] = {0};
+    enum FieldType field_types[MAX_FIELDS];
+    uint8_t field_null[MAX_FIELDS] = {0};
+    for (int i = 0; i < c->idx_ts->nfields; i++) {
+        field_names[i] = c->idx_ts->fields[i].name;
+        field_types[i] = c->idx_ts->fields[i].type;
+    }
+    if (json_get_fields_null_aware(c->partial_json, field_names,
+                                   c->idx_ts->nfields, field_types,
+                                   field_vals, field_null) != 0) {
+        /* At least one field the client explicitly named had a malformed
+           JSON escape. Reject the whole update rather than silently
+           applying every other field and dropping this one — a partial
+           write here would look like success to the caller. */
+        for (int i = 0; i < c->idx_ts->nfields; i++) free(field_vals[i]);
+        snprintf(c->err_buf, sizeof(c->err_buf),
+                 "malformed JSON escape in one or more field values");
+        return -1;
+    }
+
+    /* Varchar-overflow rejection stays single-update policy: reject the
+       whole write rather than silently truncating (bulk forms keep the
+       historical encode_field truncation inside the shared composer). */
+    for (int i = 0; i < c->idx_ts->nfields; i++) {
+        TypedField *f = &c->idx_ts->fields[i];
+        if (f->removed || !field_vals[i]) continue;
+        if (f->type != FT_VARCHAR) continue;
+        int content_max = f->size - 2;
+        size_t vlen = strlen(field_vals[i]);
+        if ((int)vlen > content_max) {
+            snprintf(c->err_buf, sizeof(c->err_buf),
+                "value for field '%s' is %zu bytes; exceeds max %d for varchar",
+                f->name, vlen, content_max);
+            for (int j = 0; j < c->idx_ts->nfields; j++) free(field_vals[j]);
+            return -1;
+        }
+    }
+
+    int crc = update_compose_new_from_old(c->idx_ts, old, out_value,
+                                          field_vals, field_null);
+    for (int i = 0; i < c->idx_ts->nfields; i++) free(field_vals[i]);
+    if (crc != 0) {
+        snprintf(c->err_buf, sizeof(c->err_buf),
+                 "corrupt record header on update target");
+        return -1;
+    }
+    update_stamp_auto_update_fields(c->idx_ts, out_value);
+    *out_vlen = (size_t)c->idx_ts->total_size;   /* full nullmap record */
     return 0;
 }
 
@@ -1340,7 +1613,7 @@ static int v2_update_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
     if (!old) return 0;  /* require_existing handles this, but defensive */
     if (c->crit && c->ncrit > 0 &&
-        !cas_check(c->idx_ts, old->value, (int)old->vlen, c->crit, c->ncrit)) return 0;
+        !cas_check(c->idx_ts, old->value, (int)old->vlen, old->hdr2, c->crit, c->ncrit)) return 0;
     return 1;
 }
 
@@ -1356,8 +1629,10 @@ typedef struct {
     TypedSchema *idx_ts;
     const uint8_t *old_value;
     size_t old_vlen;
+    uint8_t old_hdr2;
     const uint8_t *new_value;
     size_t new_vlen;
+    uint8_t new_hdr2;
     char *err_buf;
     size_t err_buf_len;
 } IndexDiffApplyArgs;
@@ -1381,44 +1656,67 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
         uint8_t *old_buf = NULL, *new_buf = NULL;
 
         if (arena) {
-            int ro = a->old_value
-                ? build_index_key_from_record_into(a->idx_ts, a->old_value, a->old_vlen,
-                                                   a->idx_fields[i],
-                                                   old_slot, INDEX_KEY_MAX, &old_len)
-                : 0;
-            int rn = a->new_value
-                ? build_index_key_from_record_into(a->idx_ts, a->new_value, a->new_vlen,
-                                                   a->idx_fields[i],
-                                                   new_slot, INDEX_KEY_MAX, &new_len)
-                : 0;
+            int raw_payload = a->idx_types &&
+                              (a->idx_types[i] == IT_BITMAP || a->idx_types[i] == IT_TRIGRAM);
+            int ro = 0, rn = 0;
+            if (a->old_value)
+                ro = raw_payload
+                    ? build_index_payload_from_record_into(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
+                                                           a->idx_fields[i],
+                                                           old_slot, INDEX_KEY_MAX, &old_len)
+                    : build_index_key_from_record_into(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
+                                                       a->idx_fields[i],
+                                                       old_slot, INDEX_KEY_MAX, &old_len);
+            if (a->new_value)
+                rn = raw_payload
+                    ? build_index_payload_from_record_into(a->idx_ts, a->new_value, a->new_vlen, a->new_hdr2,
+                                                           a->idx_fields[i],
+                                                           new_slot, INDEX_KEY_MAX, &new_len)
+                    : build_index_key_from_record_into(a->idx_ts, a->new_value, a->new_vlen, a->new_hdr2,
+                                                       a->idx_fields[i],
+                                                       new_slot, INDEX_KEY_MAX, &new_len);
             have_old = (ro == 1);
             have_new = (rn == 1);
             old_buf = have_old ? old_slot : NULL;
             new_buf = have_new ? new_slot : NULL;
             if (ro == -1) {
                 have_old = a->old_value
-                    ? build_index_key_from_record(a->idx_ts, a->old_value, a->old_vlen,
-                                                  a->idx_fields[i], &old_buf, &old_len)
+                    ? (raw_payload
+                       ? build_index_payload_from_record(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
+                                                         a->idx_fields[i], &old_buf, &old_len)
+                       : build_index_key_from_record(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
+                                                     a->idx_fields[i], &old_buf, &old_len))
                     : 0;
                 if (have_old) fb_bufs[n_fb++] = old_buf;
             }
             if (rn == -1) {
                 have_new = a->new_value
-                    ? build_index_key_from_record(a->idx_ts, a->new_value, a->new_vlen,
-                                                  a->idx_fields[i], &new_buf,
-                                                  &new_len)
+                    ? (raw_payload
+                       ? build_index_payload_from_record(a->idx_ts, a->new_value, a->new_vlen, a->new_hdr2,
+                                                         a->idx_fields[i], &new_buf, &new_len)
+                       : build_index_key_from_record(a->idx_ts, a->new_value, a->new_vlen, a->new_hdr2,
+                                                     a->idx_fields[i], &new_buf,
+                                                     &new_len))
                     : 0;
                 if (have_new) fb_bufs[n_fb++] = new_buf;
             }
         } else {
+            int raw_payload = a->idx_types &&
+                              (a->idx_types[i] == IT_BITMAP || a->idx_types[i] == IT_TRIGRAM);
             if (a->old_value)
-                have_old = build_index_key_from_record(a->idx_ts, a->old_value, a->old_vlen,
-                                                       a->idx_fields[i], &old_buf, &old_len);
+                have_old = raw_payload
+                    ? build_index_payload_from_record(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
+                                                      a->idx_fields[i], &old_buf, &old_len)
+                    : build_index_key_from_record(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
+                                                  a->idx_fields[i], &old_buf, &old_len);
             if (a->new_value)
-                have_new = build_index_key_from_record(a->idx_ts,
-                                                       a->new_value, a->new_vlen,
-                                                       a->idx_fields[i],
-                                                       &new_buf, &new_len);
+                have_new = raw_payload
+                    ? build_index_payload_from_record(a->idx_ts, a->new_value, a->new_vlen, a->new_hdr2,
+                                                      a->idx_fields[i], &new_buf, &new_len)
+                    : build_index_key_from_record(a->idx_ts,
+                                                  a->new_value, a->new_vlen, a->new_hdr2,
+                                                  a->idx_fields[i],
+                                                  &new_buf, &new_len);
             if (have_old) fb_bufs[n_fb++] = old_buf;
             if (have_new) fb_bufs[n_fb++] = new_buf;
         }
@@ -1480,8 +1778,8 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
 static int storage_recovery_index_diff(const char *db_root, const char *object,
                                        int kf_shard, uint32_t kf_slot,
                                        const uint8_t *hash,
-                                       const uint8_t *old_value, size_t old_vlen,
-                                       const uint8_t *new_value, size_t new_vlen,
+                                       const uint8_t *old_value, size_t old_vlen, uint8_t old_hdr2,
+                                       const uint8_t *new_value, size_t new_vlen, uint8_t new_hdr2,
                                        char *err_buf, size_t err_buf_len) {
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
@@ -1500,8 +1798,8 @@ static int storage_recovery_index_diff(const char *db_root, const char *object,
         .nidx = nidx, .idx_fields = idx_fields, .idx_types = idx_types,
         .splits = sc.splits, .hash = hash,
         .kf_shard = kf_shard, .kf_slot = kf_slot, .idx_ts = ts,
-        .old_value = old_value, .old_vlen = old_vlen,
-        .new_value = new_value, .new_vlen = new_vlen,
+        .old_value = old_value, .old_vlen = old_vlen, .old_hdr2 = old_hdr2,
+        .new_value = new_value, .new_vlen = new_vlen, .new_hdr2 = new_hdr2,
         .err_buf = err_buf, .err_buf_len = err_buf_len,
     };
     return apply_index_diff(&args);
@@ -1538,7 +1836,9 @@ static int v2_update_apply_commit(const uint8_t *new_value, size_t new_vlen,
         .hash = c->hash, .kf_shard = c->kf_shard,
         .kf_slot = kf_slot, .idx_ts = c->idx_ts,
         .old_value = c->saved_old_value, .old_vlen = c->saved_old_vlen,
+        .old_hdr2 = c->old_hdr2,
         .new_value = new_value, .new_vlen = new_vlen,
+        .new_hdr2 = SREC_FLAG_NULLMAP,
         .err_buf = c->err_buf, .err_buf_len = sizeof(c->err_buf),
     };
     return apply_index_diff(&args);
@@ -1585,7 +1885,8 @@ static int cmd_update_v2(const char *db_root, const char *object,
        exists for the race to be lost against. */
     if (dry_run) {
         void *old_val = NULL; size_t old_vlen = 0;
-        if (slotcask_get(sdb, key, klen, &old_val, &old_vlen) != 0) {
+        uint8_t old_hdr2 = 0;
+        if (slotcask_get_ex(sdb, key, klen, &old_val, &old_vlen, &old_hdr2) != 0) {
             OUT("{\"error\":\"Not found\"}\n");
             return 1;
         }
@@ -1602,10 +1903,10 @@ static int cmd_update_v2(const char *db_root, const char *object,
                 OUT("{\"error\":\"invalid if condition\"}\n");
                 return 1;
             }
-            int pass = cas_check(ts, old_val, (int)old_vlen, crit, ncrit);
+            int pass = cas_check(ts, old_val, (int)old_vlen, old_hdr2, crit, ncrit);
             free_criteria(crit, ncrit);
             if (!pass) {
-                char *cur = typed_decode(ts, old_val, (uint32_t)old_vlen);
+                char *cur = typed_decode(ts, old_val, (uint32_t)old_vlen, old_hdr2);
                 OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
                     cur ? cur : "null");
                 free(cur); free(old_val);
@@ -1664,6 +1965,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
         .out_kf_slot      = &ctx.kf_slot,
         .has_indexed_fields = nidx > 0,
         .out_durability_degraded = &durability_pending,
+        .record_hdr2   = SREC_FLAG_NULLMAP,  /* nullmap encoders */
     };
     SlotcaskUpsertResult result = {0};
     uint64_t _commit_t0 = now_us();
@@ -1677,7 +1979,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
            result has an old value attached. */
         if (result.was_update && result.condition_not_met) {
             char *cur = result.current_value
-                ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen)
+                ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen, result.current_hdr2)
                 : NULL;
             OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
                 cur ? cur : "null");
@@ -1748,7 +2050,7 @@ static int v2_delete_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     V2DeleteCtx *c = (V2DeleteCtx *)ctx_ptr;
     if (c->ncrit > 0) {
         if (!old) return 0;
-        if (!cas_check(c->idx_ts, old->value, (int)old->vlen, c->crit, c->ncrit)) return 0;
+        if (!cas_check(c->idx_ts, old->value, (int)old->vlen, old->hdr2, c->crit, c->ncrit)) return 0;
     }
     return 1;
 }
@@ -1775,22 +2077,36 @@ static int v2_delete_apply_commit(const SlotcaskOldRecord *old,
         uint8_t *ikey = NULL;
         size_t ilen = 0;
         int have = 0;
+        /* §2.11: btree keys are tiered; bitmap/trigram payloads stay raw
+           (NULL → no key). The delete's OLD-side key must use the same
+           builder family the insert/update sides used — a tiered key fed
+           to a bitmap clear targets "[0x00]value" and leaves the real bit
+           set. */
+        int btree_field = !c->idx_types || c->idx_types[i] == IT_BTREE;
         if (arena) {
             uint8_t *slot = arena + (size_t)i * INDEX_KEY_MAX;
-            int rc = build_index_key_from_record_into(c->idx_ts, old->value, old->vlen,
+            int rc = btree_field
+                ? build_index_key_from_record_into(c->idx_ts, old->value, old->vlen, old->hdr2,
+                                                   c->idx_fields[i],
+                                                   slot, INDEX_KEY_MAX, &ilen)
+                : build_index_payload_from_record_into(c->idx_ts, old->value, old->vlen, old->hdr2,
                                                        c->idx_fields[i],
                                                        slot, INDEX_KEY_MAX, &ilen);
             if (rc == 1) { ikey = slot; have = 1; }
             else if (rc == -1) {
-                have = build_index_key_from_record(c->idx_ts, old->value, old->vlen,
-                                                   c->idx_fields[i],
-                                                   &ikey, &ilen);
+                have = btree_field
+                    ? build_index_key_from_record(c->idx_ts, old->value, old->vlen, old->hdr2,
+                                                  c->idx_fields[i], &ikey, &ilen)
+                    : build_index_payload_from_record(c->idx_ts, old->value, old->vlen, old->hdr2,
+                                                      c->idx_fields[i], &ikey, &ilen);
                 if (have) fb_bufs[n_fb++] = ikey;
             }
         } else {
-            have = build_index_key_from_record(c->idx_ts, old->value, old->vlen,
-                                               c->idx_fields[i],
-                                               &ikey, &ilen);
+            have = btree_field
+                ? build_index_key_from_record(c->idx_ts, old->value, old->vlen, old->hdr2,
+                                              c->idx_fields[i], &ikey, &ilen)
+                : build_index_payload_from_record(c->idx_ts, old->value, old->vlen, old->hdr2,
+                                                  c->idx_fields[i], &ikey, &ilen);
             if (have) fb_bufs[n_fb++] = ikey;
         }
         if (!have) continue;
@@ -1875,7 +2191,8 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     /* dry_run: read + validate, never tombstone. */
     if (dry_run) {
         void *val = NULL; size_t vlen = 0;
-        if (slotcask_get(sdb, key, klen, &val, &vlen) != 0) {
+        uint8_t cur_hdr2 = 0;
+        if (slotcask_get_ex(sdb, key, klen, &val, &vlen, &cur_hdr2) != 0) {
             OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", wire_key);
             return 0;
         }
@@ -1886,9 +2203,9 @@ static int cmd_delete_v2(const char *db_root, const char *object,
                 OUT("{\"error\":\"invalid if condition\"}\n");
                 return 1;
             }
-            int pass = cas_check(ts, val, (int)vlen, crit, ncrit);
+            int pass = cas_check(ts, val, (int)vlen, cur_hdr2, crit, ncrit);
             if (!pass) {
-                char *cur = typed_decode(ts, val, (uint32_t)vlen);
+                char *cur = typed_decode(ts, val, (uint32_t)vlen, cur_hdr2);
                 OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
                     cur ? cur : "null");
                 free(cur); free(val); free_criteria(crit, ncrit);
@@ -1958,7 +2275,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     }
     if (rc == -2 && result.condition_not_met) {
         char *cur = result.current_value
-            ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen)
+            ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen, result.current_hdr2)
             : NULL;
         OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
             cur ? cur : "null");
@@ -2421,14 +2738,14 @@ typedef struct {
 static int multi_get_fetch_cb(const uint8_t hash[16],
                                const void *key, size_t klen,
                                const void *value, size_t vlen,
-                               void *ctx_ptr) {
+                               uint8_t hdr2, void *ctx_ptr) {
     (void)key; (void)klen;
     MultiGetShardWork *sw = (MultiGetShardWork *)ctx_ptr;
     for (int ei = 0; ei < sw->count; ei++) {
         if (memcmp(sw->entries[ei].hash, hash, 16) == 0) {
             char *decoded = sw->fs ? typed_decode(sw->fs->ts,
                                                    (const uint8_t *)value,
-                                                   (uint32_t)vlen) : NULL;
+                                                   (uint32_t)vlen, hdr2) : NULL;
             sw->entries[ei].result_json = decoded ? decoded : strdup("null");
             break;
         }

@@ -39,7 +39,10 @@ static int test_trim_compact_oob_field3_run(void) {
     free(resp); resp = NULL; free(req);
     tc_request(tc, "{\"mode\":\"find\",\"dir\":\"d1\",\"object\":\"wide\",\"criteria\":[],\"fields\":[\"f2\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"k1\"", "find returns seeded key");
-    ASSERT_CONTAINS(resp, "\"f2\":\"false\"", "trimmed f2 reads as default false");
+    /* f2 was omitted at insert → NULL (§2.2 omitted + no default). The
+       trim drops its zero bytes, but the bitmap bit survives and the
+       projection renders the key as JSON null (§2.3). */
+    ASSERT_CONTAINS(resp, "\"f2\":null", "trimmed f2 reads back as null (omitted, no default)");
     free(resp); free(f1); tc_close(tc); test_env_stop(&env);
     return t_ctx->failed > 0 ? 1 : 0;
 }
@@ -81,8 +84,11 @@ static int test_trim_compact_oob_field4_run(void) {
     tc_request(tc, req, &resp);
     ASSERT_CONTAINS(resp, "\"cnt\":1", "aggregate counts trimmed record");
     /* Task 3 of the aggregate-type-correctness plan: a truncated field is
-       a MISSING group value, not a fake zero — and never OOB garbage. */
-    ASSERT_CONTAINS(resp, "\"f2\":\"\"", "group key reads trimmed f2 as missing, not a fake zero or OOB garbage");
+       a MISSING group value, not a fake zero — and never OOB garbage.
+       2026.10.2 null plan Task 8: a missing/absent group component is
+       NULL — it forms its own tagged bucket and renders JSON null
+       (distinct from "" and the literal "null"). */
+    ASSERT_CONTAINS(resp, "\"f2\":null", "group key reads trimmed f2 as NULL (own group), not a fake zero or OOB garbage");
     free(resp); free(req); free(f1); tc_close(tc); test_env_stop(&env);
     return t_ctx->failed > 0 ? 1 : 0;
 }
