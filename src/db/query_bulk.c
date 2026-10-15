@@ -3862,6 +3862,23 @@ int cmd_bulk_update(const char *db_root, const char *object,
         free_criteria_tree(tree);
         return 1;
     }
+    for (int i = 0; i < ts->nfields; i++) {
+        if (ts->fields[i].removed || !shared_field_null[i] ||
+            !ts->fields[i].not_null)
+            continue;
+        /* One explicit-null patch fans out to EVERY matched record —
+           refuse the whole request up front, before any key is
+           staged (same whole-request policy as the malformed-escape
+           rejection above). */
+        char emsg[128];
+        fmt_not_null_err(&ts->fields[i], emsg, sizeof(emsg));
+        OUT("{\"error\":\"%s\"}\n", emsg);
+        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        for (int _k = 0; _k < matched; _k++) free(ctx.keys[_k]);
+        free(ctx.keys);
+        free_criteria_tree(tree);
+        return 1;
+    }
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';  /* re-term for static analyzer; see storage.c:991 comment */
@@ -5291,6 +5308,30 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
                                        field_types, vals_buf, nulls_buf) != 0) {
             /* Each record carries its own patch, so a malformed escape skips
                only this record rather than aborting otherwise-valid peers. */
+            for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
+            skipped++;
+            free(key);
+            bulk_upd_json_if_free(&if_crit, &if_ncrit);
+            if (obj_heap) free(obj_str);
+            p = obj_end;
+            continue;
+        }
+
+        /* :not_null violation — per-record skip, mirroring the
+           malformed-escape skip above: this record's own patch is
+           rejected, peers proceed. Tombstoned fields are ignored. */
+        int nn_violation = 0;
+        for (int i = 0; i < ts->nfields; i++) {
+            if (ts->fields[i].removed || !nulls_buf[i] ||
+                !ts->fields[i].not_null)
+                continue;
+            LOG_WARN(LOG_SUB_QUERY,
+                     "bulk-update: skipped a record — not_null violation "
+                     "on field '%s'", ts->fields[i].name);
+            nn_violation = 1;
+            break;
+        }
+        if (nn_violation) {
             for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
             skipped++;
             free(key);

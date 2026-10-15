@@ -1110,6 +1110,11 @@ typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
    entries are invalid, and -1 when the kf itself cannot be read. */
 int slotcask_validate_live_refs(SlotcaskDb *db, uint64_t *out_invalid);
 
+/* Sequential, fail-closed live walk. Caller holds objlock_wrlock.
+   Returns 0 for a complete walk, 1 for callback-requested stop, -1 on
+   any unreadable or invalid live reference. Does not silently skip. */
+int slotcask_walk_live_strict(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx);
+
 /* Walk every live (flag=1) record. Parallelized across keyfile shards
    internally; cb may run on multiple threads — caller's ctx is responsible
    for its own synchronization. */

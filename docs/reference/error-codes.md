@@ -38,6 +38,14 @@ Clients should match on the `error` string, not on the full message.
 | `max_key N exceeds ceiling 1024` | `create-object` with a too-large `max_key`. | Use ≤ 1024 (UUIDs fit in 36B). |
 | `too many fields (max 256)` | Schema exceeded `MAX_FIELDS`. | Consolidate or drop unused fields. |
 
+### NOT NULL constraint (2026.10.2)
+
+| `error` | Cause | Recovery |
+|---|---|---|
+| `field '<name>' is not nullable` | A write would store NULL on a `:not_null` field: explicit JSON `null`, an omitted insert field with no default, or a malformed `uuid`/`ipv4`/`ipv6` sentinel. Whole-request error on single insert/update and criteria-form bulk update; per-record JSON bulk paths skip and count the record instead (the field name goes to the log). | Supply a real value; a `:default=` covers omission only, never an explicit null. |
+| `cannot add :not_null to field '<name>': N record(s) have NULL` | `edit-field` adding `:not_null` found N live records with that field NULL (legacy-generation records count when their next rewrite would make them NULL). | Backfill the NULLs (e.g. `bulk-update` the field), then re-run the edit. |
+| `cannot add :not_null to field '<name>': record scan failed (unreadable record?) — run vacuum-check/reindex first` | The gate's strict live-record scan failed (unreadable record, invalid live reference, or unopenable object) — fail-closed. | Run `vacuum-check` / `reindex`, repair the object, retry. |
+
 ### File storage
 
 | `error` | Cause | Recovery |

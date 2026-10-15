@@ -6,7 +6,8 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
-**2026.10.2 — real NULL for typed fields, BTRI index format.** Typed
+**2026.10.2 — real NULL for typed fields, `:not_null` constraint, BTRI
+index format.** Typed
 fields are now nullable: every record carries a per-record null bitmap
 (`1 + ceil(nfields/8)` bytes), explicit JSON `null` stores NULL, an
 omitted insert field with no default is NULL, and update semantics are
@@ -40,6 +41,55 @@ documented gap: a bitmap cannot enumerate "no bit set", so NULL groups
 and exists/not_exists on bitmap-indexed fields fall back to full scans.
 See [typed-records](../concepts/typed-records.md) for the full NULL
 semantics.
+
+Typed fields also gain the SQL `NOT NULL` constraint as a `fields.conf`
+modifier: `name:type[:...][:not_null|:nullable]`.
+On a constrained field every NULL-producing write branch is a request
+error — explicit JSON `null` (a `:default=` covers omission only, never
+an explicit null), an omitted insert field with no default, and
+malformed `uuid`/`ipv4`/`ipv6` sentinels (which would otherwise store
+NULL). Single insert/update and criteria-form bulk update reject the
+whole request with `field '<name>' is not nullable`; per-record JSON
+bulk insert/update skip and count the violating record while peers
+commit. Well-formed zeros (`0.0.0.0`, `::`, nil UUID, `0`, `""`) are
+values, not NULL, and stay legal. The constraint is strictly per field —
+a composite index has no modifier of its own; declare `:not_null` on
+each component you want mandatory (composite NULL key semantics are
+unchanged). Criteria and aggregates get no shortcut from the flag:
+`not_exists` on a `:not_null` field still scans; constant-folding is
+documented as possible future work behind a generation-aware guard.
+
+`edit-field` resolves nullability with the same carry convention as
+defaults: omission carries the old constraint forward, the explicit
+trailing token `:nullable` removes it (the directive itself is never
+persisted), default and nullability resolve independently, and the
+rewritten line is emitted canonically — exactly one default modifier
+then at most one nullability token. Adding `:not_null` to existing data
+first runs a read-only, strict, generation-aware, fail-closed scan of
+every live record: nonzero NULLs refuse the edit with a count
+(`cannot add :not_null to field '<name>': N record(s) have NULL`), and
+an unreadable record or invalid live reference refuses it too (the scan
+validates each live keyfile reference against its segment record in one
+pass and skips nothing). `create-object` and `add-field` accept
+`:not_null` freely — added fields are never NULL.
+
+Upgrade restriction: the nullability tokens are trailing-only (a token
+anywhere else, or an enum value named like a token, is an invalid field
+line on every type — `varchar`/`numeric` previously tolerated trailing
+bytes). Before any older root is reinterpreted, a read-only startup
+audit refuses roots whose pre-2026.10.2 `fields.conf` files contain
+either reserved substring on a non-comment field line — an old enum
+value or default literal spelled like the new grammar is ambiguous.
+Resolve it with the previous release's supported schema edits (change
+the default literal, or rename the enum value with explicit
+`allow_rename`, which preserves stored value positions); do not delete
+columns or hand-stamp the root. The audit never edits schema bytes; a
+clean older root opens and is stamped normally, and the audit runs
+again after recovery in case recovery restored older metadata. The
+constraint adds no on-disk format change, no index change, no reindex,
+no migration — it rides the null bitmap above, and records stay
+mixed-generation within v2 (the gate's generation-aware predicate is
+what makes that safe — no legacy-format support is added).
 
 2026.10.1 raises the minimum supported source release to **2026.09.2**
 and removes the in-binary startup migration. A populated root must carry

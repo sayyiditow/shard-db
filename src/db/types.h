@@ -195,6 +195,15 @@ typedef struct {
     enum DefaultKind default_kind;
     char default_val[256]; /* literal value, seq name, or random byte count */
 
+    /* not_null=1 rejects every write that would store NULL for this
+       field. not_null_set marks that the parsed spec stated nullability
+       EXPLICITLY (:not_null or :nullable) — edit-field uses it to tell
+       "edit omits nullability → carry the old state" apart from
+       ":nullable → remove". Zeroed by the memset at every construction
+       site, so both default to unconstrained. */
+    uint8_t not_null;
+    uint8_t not_null_set;
+
     /* FT_ENUM only — populated by load_typed_schema, freed by
        free_typed_schema. Empty/zeroed for every other type.
        `enum_values` is a heap-allocated array of strdup'd value strings;
@@ -934,7 +943,15 @@ void build_effective_root(char *out, size_t outlen, const char *dir);
 
 /* Typed field system */
 TypedSchema *load_typed_schema(const char *db_root, const char *object);
+/* Encode without defaults. Returns ts->total_size on success, -1 on
+   bad args, or -2 when a :not_null field would produce NULL (explicit
+   JSON null or an unparseable uuid/ipv4/ipv6 sentinel) — no err_buf
+   channel on this encoder. */
 int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_size);
+
+/* Canonical ":not_null" rejection text — one source so wire errors,
+   bulk skip-log lines, and the error-code docs stay identical. */
+void fmt_not_null_err(const TypedField *f, char *err_buf, size_t err_buf_size);
 int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                           int out_size, const char *db_root, const char *object,
                           char *err_buf, size_t err_buf_size);
@@ -1524,6 +1541,8 @@ int shard_db_version_check(const char *db_root,
 /* Atomic compatibility commit, called only after recovery and validation. */
 int shard_db_version_stamp(const char *db_root);
 int shard_db_version_file_read(const char *db_root, char *out, size_t out_sz);
+/* Read-only ambiguity check before interpreting pre-2026.10.2 schemas. */
+int shard_db_not_null_upgrade_audit(const char *db_root);
 int shard_db_version_file_write(const char *db_root, const char *version);
 int shard_db_recover_before_stamp(const char *db_root,
                                   int *out_markers_replayed);

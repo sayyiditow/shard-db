@@ -1344,8 +1344,39 @@ int field_default_too_long(const char *field_spec) {
     return strlen(d + 9) >= sizeof(((TypedField *)0)->default_val);
 }
 
+/* Strip default/nullability modifiers in place. Returns 1 when a default
+   modifier was stripped, 0 when none was present, -1 when the modifier
+   STRUCTURE is invalid: a :not_null / :nullable token appears anywhere
+   except as the single trailing token (duplicates included). Callers
+   must treat -1 as an unparsable spec — reject at the wire, refuse the whole schema at load. */
 int parse_default_modifier(char *type_spec_inout, TypedField *tf) {
     if (!type_spec_inout || !tf) return 0;
+    /* Trailing nullability tokens (:not_null / :nullable) strip FIRST —
+       the :default= scan below consumes to end-of-string, so a token
+       after it would be swallowed into the default literal. Grammar:
+       [:not_null|:nullable] is the LAST modifier (:removed is stripped
+       by load_typed_schema before this runs). */
+    tf->not_null = 0;
+    tf->not_null_set = 0;
+    size_t spec_len = strlen(type_spec_inout);
+    if (spec_len >= 9 &&
+        strcmp(type_spec_inout + spec_len - 9, ":not_null") == 0) {
+        type_spec_inout[spec_len - 9] = '\0';
+        tf->not_null = 1;
+        tf->not_null_set = 1;
+    } else if (spec_len >= 9 &&
+               strcmp(type_spec_inout + spec_len - 9, ":nullable") == 0) {
+        type_spec_inout[spec_len - 9] = '\0';
+        tf->not_null_set = 1;   /* explicitly unconstrained */
+    }
+    /* Structural rule: at most ONE nullability token, trailing. After
+       the strip above, ANY remaining occurrence is invalid. Exact-match
+       types would fail in parse_field_type anyway, but varchar/numeric
+       parse via atoi and tolerate trailing bytes, and an enum value list
+       can absorb a token — enforce explicitly. */
+    if (strstr(type_spec_inout, ":not_null") ||
+        strstr(type_spec_inout, ":nullable"))
+        return -1;
     char *dflt;
     if ((dflt = strstr(type_spec_inout, ":auto_update")) != NULL &&
         dflt[12] == '\0') {
@@ -1704,7 +1735,19 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
         /* Default modifiers — strip from type_spec before parse_field_type.
            Format: :auto_create, :auto_update, :default=<val>
            These are always the last colon-segment (before :removed). */
-        parse_default_modifier(type_spec, tf);
+        if (parse_default_modifier(type_spec, tf) < 0) {
+            /* Never drop a field: later offsets/bitmap positions would
+               shift. Refuse the entire schema, without caching it. */
+            LOG_ERROR(LOG_SUB_CONFIG,
+                      "invalid nullability structure in %s — schema refused",
+                      path);
+            for (int i = 0; i < ts.nfields; i++)
+                free_enum_values(&ts.fields[i]);
+            free_enum_values(tf);
+            free(line);
+            fclose(f);
+            return NULL;
+        }
 
         parse_field_type(type_spec, tf);
         free(line);
@@ -2481,12 +2524,14 @@ int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_
             int was_quoted = (el >= 2 && ev[0] == '"' && ev[el - 1] == '"');
             if (was_quoted) { ev++; el -= 2; }
             if (!was_quoted && json_span_is_null(vstart, vlen)) {
+                if (ts->fields[i].not_null) return -2;
                 /* JSON null — set the bit; bytes stay zero from the memset. */
                 typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
                 break;
             }
             if (el > 0) {
                 if (!sentinel_span_parses(ts->fields[i].type, ev, el)) {
+                    if (ts->fields[i].not_null) return -2;
                     /* Malformed uuid/ipv4/ipv6 — the historic unset
                        sentinel. Store NULL (bit set) rather than a
                        visible zero value on nullmap records. */
@@ -2944,6 +2989,14 @@ static void fmt_unknown_enum_err(const TypedField *f, const char *bad_val,
     #undef APPEND
 }
 
+/* Canonical :not_null rejection text — one source so single-request
+   errors, bulk skip-log lines, and the error-code docs stay identical.
+   err_buf may be NULL/0 (the no-channel encoder passes none). */
+void fmt_not_null_err(const TypedField *f, char *err_buf, size_t err_buf_size) {
+    if (!err_buf || err_buf_size == 0) return;
+    snprintf(err_buf, err_buf_size, "field '%s' is not nullable", f->name);
+}
+
 /* Encode with field defaults applied. db_root+object needed for seq() defaults;
    pass NULL if sequence defaults are not expected.
 
@@ -2999,6 +3052,14 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                 if (was_quoted) { ev++; el -= 2; }
                 seen[i] = 1;   /* provided — including explicit "" — suppresses defaults */
                 if (!was_quoted && json_span_is_null(vstart, vlen)) {
+                    if (ts->fields[i].not_null) {
+                        char message[320];
+                        fmt_not_null_err(&ts->fields[i], message, sizeof(message));
+                        LOG_WARN(LOG_SUB_CONFIG, "%s/%s: %s (explicit null)",
+                                 db_root ? db_root : "?", object ? object : "?", message);
+                        fmt_not_null_err(&ts->fields[i], err_buf, err_buf_size);
+                        return -2;
+                    }
                     /* JSON null — store NULL: bit set, field bytes stay
                        zero (the memset above already zeroed them). Wins
                        over :default= (seen[i] suppresses the defaults
@@ -3009,6 +3070,14 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                 }
                 if (el > 0) {
                     if (!sentinel_span_parses(ts->fields[i].type, ev, el)) {
+                        if (ts->fields[i].not_null) {
+                            char message[320];
+                            fmt_not_null_err(&ts->fields[i], message, sizeof(message));
+                            LOG_WARN(LOG_SUB_CONFIG, "%s/%s: %s (malformed sentinel)",
+                                     db_root ? db_root : "?", object ? object : "?", message);
+                            fmt_not_null_err(&ts->fields[i], err_buf, err_buf_size);
+                            return -2;
+                        }
                         /* Malformed uuid/ipv4/ipv6 — the historic unset
                            sentinel. Store NULL (bit set) rather than a
                            visible zero value on nullmap records. */
@@ -3068,6 +3137,14 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
     for (int i = 0; i < ts->nfields; i++) {
         if (ts->fields[i].removed || seen[i]) continue;
         if (ts->fields[i].default_kind == DK_NONE) {
+            if (ts->fields[i].not_null) {
+                char message[320];
+                fmt_not_null_err(&ts->fields[i], message, sizeof(message));
+                LOG_WARN(LOG_SUB_CONFIG, "%s/%s: %s (omitted, no default)",
+                         db_root ? db_root : "?", object ? object : "?", message);
+                fmt_not_null_err(&ts->fields[i], err_buf, err_buf_size);
+                return -2;
+            }
             /* Omitted, no default → NULL for nullmap records. */
             typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
             continue;
@@ -3987,7 +4064,12 @@ int cmd_add_fields(const char *db_root, const char *object,
             OUT("{\"error\":\"out of memory\"}\n");
             return 1;
         }
-        parse_default_modifier(clean_spec, &tf);
+        if (parse_default_modifier(clean_spec, &tf) < 0) {
+            free(clean_spec);
+            free_enum_values(&tf);
+            OUT("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
+            return 1;
+        }
         parse_field_type(clean_spec, &tf);
         free(clean_spec);
         if (tf.type == FT_NONE || tf.size <= 0) {
