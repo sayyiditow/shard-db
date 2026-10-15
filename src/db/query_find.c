@@ -673,7 +673,12 @@ int parse_field_line(const char *line, TypedField *out) {
        original line verbatim for the fields.conf write. */
     char *clean_spec = strdup(colon + 1);
     if (!clean_spec) return 0;
-    parse_default_modifier(clean_spec, out);
+    if (parse_default_modifier(clean_spec, out) < 0) {
+        /* Invalid modifier structure — reject the line; the caller
+           emits "Invalid field line". */
+        free(clean_spec);
+        return 0;
+    }
     parse_field_type(clean_spec, out);
     free(clean_spec);
     return out->type != FT_NONE && out->size > 0;

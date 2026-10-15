@@ -1596,6 +1596,19 @@ static int v2_update_new_from_old(const SlotcaskOldRecord *old,
         }
     }
 
+    /* An explicit JSON null on a constrained field rejects the whole
+       update before any kf write or commit marker. Carry-forward cannot
+       produce NULL here — the edit gate refuses :not_null on a field
+       that still holds NULL rows. Tombstoned fields are ignored: their
+       spec is inert, and their bytes stay reserved until vacuum. */
+    for (int i = 0; i < c->idx_ts->nfields; i++) {
+        const TypedField *f = &c->idx_ts->fields[i];
+        if (f->removed || !field_null[i] || !f->not_null) continue;
+        for (int j = 0; j < c->idx_ts->nfields; j++) free(field_vals[j]);
+        fmt_not_null_err(f, c->err_buf, sizeof(c->err_buf));
+        return -1;
+    }
+
     int crc = update_compose_new_from_old(c->idx_ts, old, out_value,
                                           field_vals, field_null);
     for (int i = 0; i < c->idx_ts->nfields; i++) free(field_vals[i]);

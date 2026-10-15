@@ -12,7 +12,13 @@ On the v2 slotcask engine these typed records are the **value payload** of each 
 
 ## Declaring fields
 
-Fields are declared in the `create-object` request as an array of strings, each `name:type[:param]`:
+Fields are declared in the `create-object` request as an array of strings, each `name:type[:param]`. The full line grammar (as stored in `fields.conf`) is:
+
+```
+name:type[:size|P,S][:default=...][:auto_create|:auto_update][:not_null|:nullable][:removed]
+```
+
+`[:not_null|:nullable]` is a **trailing** token pair — at most one, and only after any default modifier. A token anywhere else (duplicates included, e.g. `x:int:not_null:default=5`) is rejected as an invalid field line, on every type:
 
 ```json
 {
@@ -181,6 +187,58 @@ null beats the old value; an omitted field carries the old value forward;
 a legacy **absent** marker (field bytes beyond the record region) converts
 to NULL. New fields added by add-field are never NULL — existing records
 read zeros/backfill, never NULL.
+
+### NOT NULL constraint (`:not_null`, 2026.10.2)
+
+Appending `:not_null` to a field spec (or `edit-field <name>:<type>:not_null`)
+makes every NULL-producing write branch a request error for that field —
+the SQL `NOT NULL` invariant over the same per-record bitmap. The flag is
+per field (a composite index `a+n` has no modifier of its own; declare
+`:not_null` on each component you want mandatory). `describe-object`
+renders `"not_null":true` for constrained fields.
+
+Rejections — every branch that would store NULL on a constrained field:
+
+- **Explicit JSON `null`** on insert / bulk-insert (JSON) / update /
+  bulk-update (both JSON forms): error `field '<name>' is not nullable`.
+  A `:default=` does **not** rescue an explicit null — the default
+  applies to omission only (the SQL rule).
+- **Omitted insert field with no default**: same error. Declaring
+  `:not_null` without a default is legal; it makes omission an error.
+- **Malformed `uuid`/`ipv4`/`ipv6` values**: rejected. Under the null-bitmap
+  sentinel convention these would store NULL, which the constraint
+  forbids. (`bulk-update`-delimited and single update malformed sentinels
+  write a bit-clear zero, not NULL — a known non-NULL edge, unchanged.)
+- Bulk insert / bulk update per-record JSON: a violating record is
+  skipped and counted (`errors`/`skipped`) while peers commit — no
+  per-record error channel exists on those paths; the field name is
+  logged. The criteria-form bulk update refuses the whole request.
+- Criteria and aggregates get **no shortcut** from the constraint:
+  `not_exists` on a `:not_null` field still scans (it currently finds 0
+  rows; that constant-folding is deliberately not implemented).
+
+Zeros are values, not NULL: `0.0.0.0`, `::`, the nil UUID, `0`, `0.0`,
+`""`, midnight — all legal on a `:not_null` field when well-formed.
+
+Grammar restrictions: an enum value name containing the substring
+`:not_null` or `:nullable` (e.g. `enum(a,b:not_null)`) is rejected — the
+structural rule cannot distinguish it from a modifier. For upgrade
+safety, a root whose stored evidence predates 2026.10.2 refuses to open
+if any fields.conf line carries either substring (the raw audit runs
+before recovery and before the version stamp; it never edits anything).
+Resolve the ambiguity with the previous release's supported schema edits
+(change a default literal or rename the enum value with explicit
+`allow_rename`, which preserves stored value positions); do not delete
+columns or hand-stamp the root. Roots already stamped 2026.10.2 use the
+new grammar directly.
+
+Enabling the constraint on existing data: `edit-field` adding `:not_null`
+first runs a read-only, fail-closed NULL scan over the object's live
+records (legacy-generation records count as NULL exactly when the next
+rewrite would convert them to NULL). Nonzero NULLs refuse the edit with
+a count; an unreadable record or invalid live reference refuses it too.
+See [schema-mutations](../query-protocol/schema-mutations.md) for the
+edit-field rules.
 
 ## On-disk encoding
 

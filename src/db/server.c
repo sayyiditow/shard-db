@@ -3534,11 +3534,12 @@ int cmd_server(const char *db_root, int daemonize) {
         } else if (version_decision == SHARD_DB_VERSION_TOO_OLD) {
             fprintf(stderr,
                     "shard-db: refusing to start: database was last opened "
-                    "by shard-db %s; this binary requires clean-open evidence "
+                    "by shard-db %s; shard-db %s requires clean-open evidence "
                     "from %s or newer — install shard-db %s, start it once "
-                    "against this DB_ROOT, then upgrade.\n",
-                    disk_version, SHARD_DB_REQUIRED_SOURCE_VERSION,
-                    SHARD_DB_REQUIRED_SOURCE_VERSION);
+                    "against this DB_ROOT, then install shard-db %s again.\n",
+                    disk_version, SHARD_DB_VERSION,
+                    SHARD_DB_REQUIRED_SOURCE_VERSION,
+                    SHARD_DB_REQUIRED_SOURCE_VERSION, SHARD_DB_VERSION);
         } else {
             fprintf(stderr,
                     "shard-db: non-empty DB_ROOT lacks valid %s/%s "

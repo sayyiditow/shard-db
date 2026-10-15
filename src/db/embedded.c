@@ -485,6 +485,63 @@ static int startup_read_schema(const char *db_root,
     return 0;
 }
 
+int shard_db_not_null_upgrade_audit(const char *db_root) {
+    char disk_version[64] = {0};
+    int vrc = shard_db_version_file_read(db_root, disk_version,
+                                        sizeof(disk_version));
+    if (vrc == SHARD_DB_VERSION_FILE_ERROR) return -1;
+    if (vrc == SHARD_DB_VERSION_FILE_OK &&
+        shard_db_version_compare(disk_version, "2026.10.2") >= 0)
+        return 0;
+    StartupSchemaEntry *entries = NULL;
+    size_t count = 0;
+    if (startup_read_schema(db_root, &entries, &count) != 0) return -1;
+    int failed = 0;
+    for (size_t i = 0; i < count && !failed; i++) {
+        char object_dir[PATH_MAX], path[PATH_MAX];
+        int n = snprintf(object_dir, sizeof(object_dir), "%s/%s/%s",
+                         db_root, entries[i].dir, entries[i].object);
+        if (n < 0 || (size_t)n >= sizeof(object_dir)) { failed = 1; break; }
+        struct stat object_st;
+        if (stat(object_dir, &object_st) != 0) {
+            /* Same stale-entry exception as validate_before_stamp:
+               absent objects are inert; all other stat errors fail. */
+            if (errno == ENOENT) continue;
+            failed = 1;
+            break;
+        }
+        if (!S_ISDIR(object_st.st_mode)) { failed = 1; break; }
+        n = snprintf(path, sizeof(path), "%s/fields.conf", object_dir);
+        if (n < 0 || (size_t)n >= sizeof(path)) { failed = 1; break; }
+        /* A materialized object without readable fields.conf is fatal;
+           do not extend the absent-object exception to missing metadata. */
+        FILE *f = fopen(path, "r");
+        if (!f) { failed = 1; break; }
+        for (;;) {
+            int rderr = 0;
+            char *line = conf_read_line(f, MAX_FIELD_DEF, &rderr);
+            if (!line) { if (rderr) failed = 1; break; }
+            const char *q = line;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q && *q != '#' &&
+                (strstr(q, ":not_null") || strstr(q, ":nullable"))) {
+                fprintf(stderr,
+                        "shard-db: upgrade refused: ambiguous pre-2026.10.2 "
+                        "nullability spelling in %s; resolve the literal or "
+                        "enum name using the previous release's supported "
+                        "schema edits before upgrading\n", path);
+                failed = 1;
+            }
+            free(line);
+            if (failed) break;
+        }
+        if (ferror(f)) failed = 1;
+        if (fclose(f) != 0) failed = 1;
+    }
+    free(entries);
+    return failed ? -1 : 0;
+}
+
 static int startup_find_schema(const StartupSchemaEntry *entries, size_t count,
                                const char *dir, const char *object) {
     for (size_t i = 0; i < count; i++)
@@ -711,7 +768,11 @@ int shard_db_recover_before_stamp(const char *db_root,
                                   int *out_markers_replayed) {
     if (!out_markers_replayed) return -1;
     *out_markers_replayed = 0;
+    if (shard_db_not_null_upgrade_audit(db_root) != 0) return -1;
     if (rebuild_recovery(db_root) != 0) return -1;
+    /* Recovery may restore an older metadata file: re-audit before any
+       new grammar is parsed or a new version is stamped. */
+    if (shard_db_not_null_upgrade_audit(db_root) != 0) return -1;
 
     /* ── BTRI reindex migration (five-step ordering, §2.4.3) ──
        Runs after artifact recovery (rebuild_recovery above) and before
@@ -847,11 +908,13 @@ ShardDb *shard_db_open(const char *db_root) {
         } else if (version_decision == SHARD_DB_VERSION_TOO_OLD) {
             fprintf(stderr,
                     "shard_db_open: refusing to open: database was last "
-                    "opened by shard-db %s; this binary requires clean-open "
+                    "opened by shard-db %s; shard-db %s requires clean-open "
                     "evidence from %s or newer — install shard-db %s, start "
-                    "it once against this DB_ROOT, then upgrade.\n",
-                    disk_version, SHARD_DB_REQUIRED_SOURCE_VERSION,
-                    SHARD_DB_REQUIRED_SOURCE_VERSION);
+                    "it once against this DB_ROOT, then install shard-db %s "
+                    "again.\n",
+                    disk_version, SHARD_DB_VERSION,
+                    SHARD_DB_REQUIRED_SOURCE_VERSION,
+                    SHARD_DB_REQUIRED_SOURCE_VERSION, SHARD_DB_VERSION);
         } else {
             fprintf(stderr,
                     "shard_db_open: refusing to open: non-empty DB_ROOT "

@@ -214,6 +214,15 @@ static int line_has_default_modifier(const char *line) {
     return 0;
 }
 
+/* Modifier-suffix carry buffers must hold the COMPLETE suffix
+   default_modifiers_for_line extracts — ":default=" plus a wire-max
+   255-byte literal plus one trailing nullability token (a tombstoned
+   line can also still carry ":removed"). The helper refuses to
+   truncate: on overflow it writes nothing and returns 0, which callers
+   must distinguish from "no modifier present" or the field's default
+   is silently dropped from the rewritten line. */
+#define FIELD_MODS_MAX 512
+
 /* Rewrite fields.conf in place, replacing each edited line with its new
    spec. Edited lines preserve the trailing :removed marker if present
    (edit-field rejects tombstoned fields up front, so this is defensive).
@@ -287,7 +296,7 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
            from the OLD line to the new line when the user's new spec omits
            them. Lets `edit-field age:long` change the type without wiping
            an existing `:default=42`. */
-        char old_mods[256] = "";
+        char old_mods[FIELD_MODS_MAX] = "";
         default_modifiers_for_line(line, old_mods, sizeof(old_mods));
         /* A modifier that exceeds the carry buffer can't be re-emitted —
            writing the replacement without it would silently drop the
@@ -306,12 +315,90 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
             unlink(fpath_new);
             return -1;
         }
-        char new_mods[256] = "";
-        int new_has = default_modifiers_for_line(edit_lines[matched], new_mods, sizeof(new_mods));
-        if (!new_has && old_mods[0])
-            fprintf(fout, "%s%s\n", edit_lines[matched], old_mods);
+        /* Nullability + default resolve INDEPENDENTLY, then emit
+           canonically: base + exactly one default modifier + at most one
+           trailing nullability token. Appending old_mods verbatim could
+           emit two defaults or bury the token mid-line, which the schema
+           loader would drop. The old :not_null can sit standalone at
+           line end OR ride inside the old_mods suffix
+           (":default=5:not_null") — both splits trim it out of the mods
+           string first. */
+        char old_default[FIELD_MODS_MAX] = "";
+        memcpy(old_default, old_mods, sizeof(old_default));
+        int old_has_not_null = strstr(line, ":not_null") != NULL;
+        char *old_nn = strstr(old_default, ":not_null");
+        char *old_nl = strstr(old_default, ":nullable");
+        if (old_nn) *old_nn = '\0';
+        if (old_nl) *old_nl = '\0';
+
+        char new_spec[MAX_FIELD_DEF];
+        size_t slen = strlen(edit_lines[matched]);
+        memcpy(new_spec, edit_lines[matched], slen + 1);
+        char new_default[FIELD_MODS_MAX] = "";
+        default_modifiers_for_line(new_spec, new_default, sizeof(new_default));
+        if (!new_default[0] && line_has_default_modifier(new_spec)) {
+            /* The edit spec's modifier suffix outgrew the carry buffer,
+               so nothing was extracted. Emitting without it would drop
+               the requested default from the rewritten line — refuse the
+               whole rewrite instead. */
+            LOG_ERROR(LOG_SUB_CONFIG,
+                      "rewrite_fields_conf_for_edit: edit spec for [%s] "
+                      "carries a default modifier larger than %d bytes — "
+                      "refusing to rewrite (the default would be dropped)",
+                      edit_names[matched], (int)sizeof(new_default) - 1);
+            free(line);
+            fclose(fin);
+            fclose(fout);
+            unlink(fpath_new);
+            return -1;
+        }
+        int new_not_null = 0, new_nullable = 0;
+        char *nn_in_new = strstr(new_default, ":not_null");
+        char *nl_in_new = strstr(new_default, ":nullable");
+        if (nn_in_new && nl_in_new) {
+            /* Structurally invalid edit — refuse rather than emit a
+               line the schema loader would drop. */
+            LOG_ERROR(LOG_SUB_CONFIG,
+                      "rewrite_fields_conf_for_edit: edit spec for [%s] "
+                      "carries both nullability tokens — refusing",
+                      edit_names[matched]);
+            free(line);
+            fclose(fin);
+            fclose(fout);
+            unlink(fpath_new);
+            return -1;
+        }
+        if (nn_in_new) { *nn_in_new = '\0'; new_not_null = 1; }
+        if (nl_in_new) { *nl_in_new = '\0'; new_nullable = 1; }
+        if (!new_default[0]) {
+            /* No default modifier — a token would sit at new_spec's end. */
+            size_t blen = strlen(new_spec);
+            if (blen >= 9 &&
+                strcmp(new_spec + blen - 9, ":not_null") == 0) {
+                new_spec[blen - 9] = '\0';
+                new_not_null = 1;
+            } else if (blen >= 9 &&
+                       strcmp(new_spec + blen - 9, ":nullable") == 0) {
+                new_spec[blen - 9] = '\0';
+                new_nullable = 1;
+            }
+        }
+
+        /* default_modifiers_for_line COPIES; it does not strip. Split
+           the base explicitly before appending the resolved modifier. */
+        char *new_dm = strstr(new_spec, ":default=");
+        if (!new_dm) new_dm = strstr(new_spec, ":auto_create");
+        if (!new_dm) new_dm = strstr(new_spec, ":auto_update");
+        if (new_dm) *new_dm = '\0';
+
+        const char *use_default = new_default[0] ? new_default : old_default;
+        int use_not_null = new_not_null ? 1
+                         : new_nullable ? 0
+                         : old_has_not_null;
+        if (use_not_null)
+            fprintf(fout, "%s%s:not_null\n", new_spec, use_default);
         else
-            fprintf(fout, "%s\n", edit_lines[matched]);
+            fprintf(fout, "%s%s\n", new_spec, use_default);
         free(line);
     }
     fclose(fin);
@@ -406,6 +493,86 @@ int selective_reindex_dirty(const char *db_root, const char *object,
     if (devnull) fclose(devnull);
     if (rc == 0) *out_rebuilt = n_aff;
     return rc;
+}
+
+/* ==== :not_null edit gate ============================================
+   Read-only generation-aware NULL count for one field, used by
+   cmd_edit_fields before any :not_null-adding edit is applied.
+
+   Uses slotcask_walk_live_strict: each live keyfile entry is validated
+   and visited while the segment handle is held; acquisition failures
+   return failure. Callback decode failures also refuse the edit.
+   The walk is sequential; caller holds objlock_wrlock throughout. */
+typedef struct {
+    const TypedField *fld;      /* field under test                      */
+    int               field_idx;
+    uint8_t          *scratch;  /* fld->size bytes — legacy bounded copy */
+    int64_t           nulls;
+    int               broken;
+} NotNullScanCtx;
+
+static int not_null_scan_cb(const uint8_t hash16[16], const void *key,
+                            size_t klen, const void *value, size_t vlen,
+                            uint8_t hdr2, void *ud) {
+    (void)hash16; (void)key; (void)klen;
+    NotNullScanCtx *c = (NotNullScanCtx *)ud;
+    const uint8_t *base = NULL; const uint8_t *bm = NULL;
+    int bm_bytes = 0; size_t region = 0;
+    if (typed_record_view((const uint8_t *)value, vlen, hdr2,
+                          &base, &bm, &bm_bytes, &region) != 0) {
+        c->broken = 1;
+        return 1;   /* stop the walk — caller fails closed */
+    }
+    int is_null;
+    if (hdr2 & SREC_FLAG_NULLMAP) {
+        is_null = typed_field_null(bm, bm_bytes, c->field_idx);
+    } else {
+        /* Legacy: bounded zero-padded copy, exactly how
+           update_compose_new_from_old materializes dst — short or
+           trim-compacted records scan as absent (NULL), matching what
+           the next rewrite would render. */
+        size_t avail = (region > (size_t)c->fld->offset)
+            ? region - (size_t)c->fld->offset : 0;
+        size_t copyn = avail < (size_t)c->fld->size ? avail
+                                                    : (size_t)c->fld->size;
+        memset(c->scratch, 0, (size_t)c->fld->size);
+        if (copyn) memcpy(c->scratch, base + c->fld->offset, copyn);
+        is_null = legacy_field_absent(c->fld, c->scratch);
+    }
+    if (is_null) c->nulls++;
+    return 0;
+}
+
+/* Returns 0 and sets *out_nulls on a clean scan; -1 when the object
+   cannot be opened, any live reference is invalid, the walk fails, or
+   any live record failed validation (fail closed). */
+static int count_nulls_for_field(const char *db_root, const char *object,
+                                 const TypedSchema *ts, int field_idx,
+                                 int64_t *out_nulls) {
+    *out_nulls = 0;
+    if (!ts || field_idx < 0 || field_idx >= ts->nfields) return -1;
+    const TypedField *fld = &ts->fields[field_idx];
+    Schema sch = load_schema(db_root, object);
+    if (sch.splits <= 0 || sch.slot_size <= 0 || sch.streams <= 0) return -1;
+    SlotcaskSchemaInfo info = {
+        .splits = sch.splits, .slot_size = sch.slot_size,
+        .streams = sch.streams,
+    };
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) return -1;
+    uint8_t *scratch = malloc((size_t)(fld->size > 0 ? fld->size : 1));
+    if (!scratch) return -1;
+    NotNullScanCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.fld = fld;
+    ctx.field_idx = field_idx;
+    ctx.scratch = scratch;
+    int wrc = slotcask_walk_live_strict(sdb, not_null_scan_cb, &ctx);
+    free(scratch);
+    if (wrc != 0) return -1;   /* walk-level failure (defense in depth) */
+    if (ctx.broken) return -1;
+    *out_nulls = ctx.nulls;
+    return 0;
 }
 
 typedef struct {
@@ -619,6 +786,13 @@ int cmd_edit_fields(const char *db_root, const char *object,
             memcpy(new_ts.fields[i].default_val,
                    parsed[edit_for_i].default_val,
                    sizeof(new_ts.fields[i].default_val));
+            /* Nullability resolves exactly like the on-disk rewrite
+               below: an explicit token wins, omission carries the
+               old state forward. */
+            if (parsed[edit_for_i].not_null_set)
+                new_ts.fields[i].not_null = parsed[edit_for_i].not_null;
+            else
+                new_ts.fields[i].not_null = old_ts->fields[i].not_null;
         }
         new_ts.fields[i].offset = noff;
         noff += new_ts.fields[i].size;
@@ -649,6 +823,31 @@ int cmd_edit_fields(const char *db_root, const char *object,
 
     char obj_dir[PATH_MAX];
     snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
+
+    /* Every edit that ADDS :not_null must first prove the field holds
+       zero NULLs — before the dry_run report (a dry run must predict
+       the refusal), before the metadata-only fields.conf swap, and
+       before any rebuild. Strict (invalid live refs and acquisition
+       failures refuse the edit), generation-aware, fail-closed. */
+    for (int e = 0; e < n_edits; e++) {
+        int oi = edited_old_idx[e];
+        if (old_ts->fields[oi].not_null || !new_ts.fields[oi].not_null)
+            continue;   /* not an add (already constrained, or dropping) */
+        int64_t nulls = 0;
+        if (count_nulls_for_field(db_root, object, old_ts, oi, &nulls) != 0) {
+            OUT("{\"error\":\"cannot add :not_null to field '%s': record scan "
+                "failed (unreadable record?) — run vacuum-check/reindex "
+                "first\"}\n", parsed[e].name);
+            for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
+            return 1;
+        }
+        if (nulls > 0) {
+            OUT("{\"error\":\"cannot add :not_null to field '%s': %lld "
+                "record(s) have NULL\"}\n", parsed[e].name, (long long)nulls);
+            for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
+            return 1;
+        }
+    }
 
     if (!needs_rebuild) {
         if (dry_run) {
@@ -781,6 +980,16 @@ static int validate_field_type_clean(char *buf) {
     if (blen >= 8 && strcmp(buf + blen - 8, ":removed") == 0) {
         buf[blen - 8] = '\0';
     }
+    /* Strip a trailing :not_null / :nullable so the type matcher below
+       sees the bare type spec, then reject any further occurrence —
+       varchar/numeric/enum tolerate trailing bytes, so a buried token
+       would otherwise be accepted and silently unenforced. */
+    size_t nn_len = strlen(buf);
+    if (nn_len >= 9 && (strcmp(buf + nn_len - 9, ":not_null") == 0 ||
+                        strcmp(buf + nn_len - 9, ":nullable") == 0)) {
+        buf[nn_len - 9] = '\0';
+    }
+    if (strstr(buf, ":not_null") || strstr(buf, ":nullable")) return 0;
     /* Strip default modifiers: :auto_create, :auto_update, :default=... */
     char *dm;
     if ((dm = strstr(buf, ":auto_update")) != NULL && dm[12] == '\0') *dm = '\0';
@@ -1020,6 +1229,12 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
                the current grammar). */
             const char *dval = dflt + 9;
             size_t dlen = strlen(dval);
+            /* A trailing nullability token is grammar, not literal
+               content (:default=open:not_null → literal "open"). */
+            if (dlen >= 9 &&
+                (strcmp(dval + dlen - 9, ":not_null") == 0 ||
+                 strcmp(dval + dlen - 9, ":nullable") == 0))
+                dlen -= 9;
             const char *close = strchr(enum_open + 6, ')');
             if (!close) close = dval - 1;  /* defensive */
             int in_list = 0;
@@ -1673,6 +1888,8 @@ int cmd_describe_object(const char *db_root, const char *dir, const char *object
                 case DK_RANDOM:      OUT(",\"default\":\"random(%s)\"", f->default_val); break;
                 case DK_NONE:        break;
             }
+            if (f->not_null)
+                OUT(",\"not_null\":true");
             OUT("}");
             printed++;
         }

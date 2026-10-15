@@ -247,6 +247,46 @@ Pass `"dry_run":true` to run every validation step (cross-type refusal, FT_ENUM 
 - **Indexed fields**: a varchar grow that doesn't shrink content, an integer widen, or any encoding-changing edit on an indexed field rebuilds only that index (smart reindex). Queries on the indexed field continue to resolve to the same records post-edit.
 - Full object rebuild — scales with object size, not slot count. Not instantaneous on millions of records. Holds the wrlock for the duration.
 
+### NOT NULL constraints on edit-field
+
+`edit-field` resolves nullability with the same carry convention as
+defaults:
+
+- **Omission carries the constraint forward** — `edit-field age:long`
+  against `age:int:not_null` keeps `:not_null` (emitted canonically as
+  `age:long:not_null`). An edit never silently drops the constraint.
+- **Default and nullability resolve independently, emitted canonically** —
+  the rewritten line is always `base + exactly one default modifier + at
+  most one trailing nullability token`. `edit-field m:varchar:40:not_null`
+  against `m:varchar:20:default=zz` writes `m:varchar:40:default=zz:not_null`;
+  swapping the default keeps the flag; both ride along through type
+  resizes.
+- **Removal is the explicit trailing token `:nullable`** —
+  `edit-field m:varchar:40:nullable` drops the constraint and the token
+  itself is never persisted (it is a directive, not a stored modifier).
+  Removing `:not_null` is always legal — no scan. A fresh
+  create-object/add-field line may also carry `:nullable` verbatim; it
+  loads as unconstrained.
+- **Adding `:not_null` requires a zero-NULL proof.** Before the edit is
+  applied (and before `dry_run` reports — a dry run predicts the
+  refusal), the engine runs one read-only, strict, generation-aware scan
+  of the object's live records and counts NULLs in that field:
+  - `{"error":"cannot add :not_null to field 'm': 1 record(s) have NULL"}`
+    — nonzero NULLs; the schema is untouched.
+  - `{"error":"cannot add :not_null to field 'c': record scan failed
+    (unreadable record?) — run vacuum-check/reindex first"}` — the scan
+    itself failed (unreadable record, invalid live reference, unopenable
+    object). Fail-closed: the edit is refused, never applied on partial
+    evidence.
+  The scan validates every live keyfile reference against its segment
+  record in a single pass — nothing is silently skipped. Legacy-generation
+  records (pre-2026.10.2 encodings) count as NULL exactly when their next
+  rewrite would convert them to NULL. Existing NULLs are never rewritten
+  by the gate — backfill them first (e.g. `bulk-update` the field to a
+  real value), then re-run the edit.
+- `create-object` and `add-field` accept `:not_null` freely — new fields
+  are never NULL (add-field backfills/rebuilds existing records).
+
 ## rename-field
 
 Metadata-only; no data rewrite.

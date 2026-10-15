@@ -9632,6 +9632,54 @@ void slotcask_registry_shutdown(void) {
     pthread_mutex_unlock(&g_reg_lock);
 }
 
+int slotcask_walk_live_strict(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx) {
+    if (!db || !cb) return -1;
+    for (int shard = 0; shard < db->num_shards; shard++) {
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, db->data_dir, shard);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0)
+            return -1;
+        int result = 0;
+        for (size_t slot = 0; slot < kh.capacity; slot++) {
+            SlotcaskKfEntry *entry = &kh.map[slot];
+            if (__atomic_load_n(&entry->flag, __ATOMIC_ACQUIRE) != 1)
+                continue;
+            if (entry->stream_id >= db->num_streams) { result = -1; break; }
+            char seg_path[PATH_MAX];
+            seg_path_for(seg_path, db->data_dir, entry->stream_id, entry->file_id);
+            SlotcaskSegHandle sh = { .slot = -1, .fd = -1 };
+            if (segcache_acquire(&sh, seg_path, 0, 0, 0) != 0) {
+                result = -1;
+                break;
+            }
+            if (entry->offset > sh.map_size || sh.map_size - entry->offset < 24) {
+                result = -1;
+            } else {
+                const uint8_t *rec = sh.map + entry->offset;
+                uint16_t klen = seg_rec_klen(rec);
+                uint32_t vlen = seg_rec_vlen(rec);
+                size_t encoded = 24u + (size_t)klen + (size_t)vlen;
+                size_t padded = slotcask_record_size_varlen(klen, vlen);
+                if (encoded > (size_t)db->slot_size ||
+                    padded > (size_t)db->slot_size ||
+                    padded > sh.map_size - entry->offset ||
+                    !seg_rec_live_with_hash(rec, entry->hash)) {
+                    result = -1;
+                } else if (cb(entry->hash, rec + 24, klen,
+                              rec + 24 + klen, vlen, rec[19], ctx) != 0) {
+                    result = 1;
+                }
+            }
+            segcache_release(&sh);
+            if (result) break;
+        }
+        kfcache_release(&kh);
+        if (result) return result;
+    }
+    return 0;
+}
+
 int slotcask_validate_live_refs(SlotcaskDb *db, uint64_t *out_invalid) {
     if (!db || !out_invalid) return -1;
     *out_invalid = 0;

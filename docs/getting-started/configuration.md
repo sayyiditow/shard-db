@@ -150,7 +150,7 @@ Both lists live under `$DB_ROOT` so they travel with the data root.
 ## Schema — `schema.conf` and per-object `fields.conf`
 
 - `$DB_ROOT/schema.conf` — one line per object: `dir:object:splits:max_key:2:streams[:auto_key=<mode>]`. Auto-managed by `create-object` — don't edit by hand. The literal `2` is the engine-version slot, kept on disk for forward compatibility; this version refuses any other value at load (legacy v1 objects must be upgraded via 2026.05.4's `./migrate` first). `streams` is the number of seg-write streams (derived from nproc at create time, immutable for the object's life unless `vacuum` self-heals a streams-mismatch).
-- `$DB_ROOT/<dir>/<object>/fields.conf` — typed field definitions, one per line: `name:type[:size|P,S][:default=...]`. Also auto-managed (via `create-object`, `add-field`, `remove-field`, `rename-field`).
+- `$DB_ROOT/<dir>/<object>/fields.conf` — typed field definitions, one per line: `name:type[:size|P,S][:default=...][:auto_create|:auto_update][:not_null|:nullable][:removed]`. Also auto-managed (via `create-object`, `add-field`, `remove-field`, `rename-field`). The nullability tokens are **trailing** and mutually exclusive (at most one): a token anywhere else is rejected — `x:int:not_null:default=5` is an invalid field line, while `x:int:default=5:not_null` is the canonical form.
 
 See [Concepts → Typed records](../concepts/typed-records.md) for the on-disk layout and all type definitions.
 

@@ -124,7 +124,10 @@ static int test_long_field_def_run(void) {
     /* === F: :default= literals beyond TypedField.default_val's 255-byte
        capacity are rejected at every wire gate instead of being accepted
        and silently truncated (review round 3) === */
-    char big_lit[301];
+    /* 601 bytes: far over the 255-byte wire cap, and long enough that
+       its ":default=" suffix also exceeds the edit-rewrite carry buffer
+       (FIELD_MODS_MAX), which section G relies on. */
+    char big_lit[601];
     memset(big_lit, 'x', sizeof(big_lit) - 1);
     big_lit[sizeof(big_lit) - 1] = '\0';
 

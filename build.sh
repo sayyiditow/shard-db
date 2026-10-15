@@ -70,7 +70,7 @@ case "$BUILD_MODE" in
         DO_STRIP=${DO_STRIP:-1}
         ;;
     asan)
-        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-PIE -no-pie $WARN_CFLAGS"
+        MODE_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-PIE -no-pie -DBUILD_ASAN=1 $WARN_CFLAGS"
         MODE_LDFLAGS="-fsanitize=address,undefined -no-pie"
         DO_STRIP=0
         ;;
@@ -316,7 +316,14 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_null_agg_order.c \
     src/test/cases/test_null_review_fixes.c \
     src/test/cases/test_null_legacy_rebuild.c \
+    src/test/cases/test_not_null_schema.c \
+    src/test/cases/test_not_null_compat.c \
+    src/test/cases/test_not_null_edit_modifiers.c \
+    src/test/cases/test_not_null_writes.c \
+    src/test/cases/test_not_null_updates.c \
+    src/test/cases/test_not_null_edit_gate.c \
     src/test/cases/test_long_field_def.c \
+    src/test/cases/test_edit_long_default.c \
     src/test/cases/test_ipv4.c \
     src/test/cases/test_ipv6.c \
     src/test/cases/test_kf_auto_defaults.c \
