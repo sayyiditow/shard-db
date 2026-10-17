@@ -90,16 +90,19 @@ static int test_cas_tree_if_run(void) {
     free(resp); resp = NULL;
 
     /* 6. Over-deep nesting (17 levels) → invalid if condition. */
-    char deep[2048]; int off = snprintf(deep, sizeof(deep),
+    char deep[2048]; size_t off = 0;
+    int deep_ok = tu_appendf(deep, sizeof(deep), &off,
         "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"ti\","
-        "\"key\":\"k1\",\"value\":{\"amount\":4},\"if\":");
-    for (int i = 0; i < 17; i++) off += snprintf(deep + off,
-        sizeof(deep) - (size_t)off, "%s", "{\"and\":[");
-    off += snprintf(deep + off, sizeof(deep) - (size_t)off,
-        "{\"field\":\"amount\",\"op\":\"eq\",\"value\":4}");
-    for (int i = 0; i < 17; i++) off += snprintf(deep + off,
-        sizeof(deep) - (size_t)off, "%s", "]}");
-    snprintf(deep + off, sizeof(deep) - (size_t)off, "}");
+        "\"key\":\"k1\",\"value\":{\"amount\":4},\"if\":") == 0;
+    for (int i = 0; i < 17 && deep_ok; i++)
+        deep_ok = tu_appendf(deep, sizeof(deep), &off, "{\"and\":[") == 0;
+    if (deep_ok) deep_ok = tu_appendf(deep, sizeof(deep), &off,
+        "{\"field\":\"amount\",\"op\":\"eq\",\"value\":4}") == 0;
+    for (int i = 0; i < 17 && deep_ok; i++)
+        deep_ok = tu_appendf(deep, sizeof(deep), &off, "]}") == 0;
+    if (deep_ok) deep_ok = tu_appendf(deep, sizeof(deep), &off, "}") == 0;
+    ASSERT_TRUE(deep_ok, "build over-deep if tree request");
+    if (!deep_ok) { tc_close(tc); test_env_stop(&env); return 1; }
     tc_request(tc, deep, &resp);
     ASSERT_CONTAINS(resp, "\"error\":\"invalid if condition\"",
                     "depth cap inherited");

@@ -310,13 +310,16 @@ static int test_computed_update_run(void) {
            escape sequence in half, swallowing the response's closing
            quote and emitting invalid JSON. */
     {
-        char req[1024];
-        int n = snprintf(req, sizeof(req),
+        char req[1024]; size_t off = 0;
+        int req_ok = tu_appendf(req, sizeof(req), &off,
             "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"cp\","
-            "\"key\":\"c1\",\"value\":{\"mirror\":{\"$copy\":\"");
-        for (int i = 0; i < 200; i++)
-            n += snprintf(req + n, sizeof(req) - (size_t)n, "\\\"");
-        snprintf(req + n, sizeof(req) - (size_t)n, "tail\"}}}");
+            "\"key\":\"c1\",\"value\":{\"mirror\":{\"$copy\":\"") == 0;
+        for (int i = 0; i < 200 && req_ok; i++)
+            req_ok = tu_appendf(req, sizeof(req), &off, "\\\"") == 0;
+        if (req_ok) req_ok = tu_appendf(req, sizeof(req), &off,
+            "tail\"}}}") == 0;
+        ASSERT_TRUE(req_ok, "build long-name $copy request");
+        if (!req_ok) { tc_close(tc); test_env_stop(&env); return 1; }
         tc_request(tc, req, &resp);
         ASSERT_CONTAINS(resp, "is not a field",
                         "long-name message survives truncation");
@@ -334,13 +337,16 @@ static int test_computed_update_run(void) {
            record — it used to fall open and store the computed object
            as varchar text. */
     {
-        char req[4096];
-        int n = snprintf(req, sizeof(req),
+        char req[4096]; size_t off = 0;
+        int req_ok = tu_appendf(req, sizeof(req), &off,
             "{\"mode\":\"bulk-update\",\"dir\":\"default\",\"object\":\"cp\","
-            "\"records\":[{\"key\":\"c1\",\"value\":{");
-        for (int i = 0; i < 256; i++)
-            n += snprintf(req + n, sizeof(req) - (size_t)n, "\"u%d\":0,", i);
-        snprintf(req + n, sizeof(req) - (size_t)n, "\"note\":{\"$incr\":1}}}]}");
+            "\"records\":[{\"key\":\"c1\",\"value\":{") == 0;
+        for (int i = 0; i < 256 && req_ok; i++)
+            req_ok = tu_appendf(req, sizeof(req), &off, "\"u%d\":0,", i) == 0;
+        if (req_ok) req_ok = tu_appendf(req, sizeof(req), &off,
+            "\"note\":{\"$incr\":1}}}]}") == 0;
+        ASSERT_TRUE(req_ok, "build over-limit-fields bulk request");
+        if (!req_ok) { tc_close(tc); test_env_stop(&env); return 1; }
         tc_request(tc, req, &resp);
         ASSERT_CONTAINS(resp, "\"updated\":0", "unparseable-probe record skipped");
         ASSERT_CONTAINS(resp, "\"skipped\":1", "skip counted for unparseable probe");
