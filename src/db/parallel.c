@@ -140,6 +140,22 @@ int parallel_threads(void) {
      - Nested callers (already executing as a worker of either pool) →
        run the n sub-tasks serially, inline, on the calling thread. */
 static __thread int t_in_pool_worker = 0;
+/* Scoped inline-execution depth (conditional-writes F2). While > 0, BOTH
+   pools dispatch their sub-tasks inline on the calling thread regardless
+   of pool state — a thread holding a writer reservation must never
+   enqueue pool work, because pool workers may be blocked on the reserved
+   gates (deadlock). Nested parallel_for/parallel_for_io calls inside the
+   scope inherit it. Set by parallel_inline_enter/leave around the whole
+   reservation. */
+static __thread unsigned t_parallel_inline_depth;
+
+void parallel_inline_enter(void) {
+    t_parallel_inline_depth++;
+}
+void parallel_inline_leave(void) {
+    if (!t_parallel_inline_depth) abort();
+    t_parallel_inline_depth--;
+}
 /* Read lock-free at parallel_pool_init/shutdown entry, parallel_pool_size,
    and parallel_for; written under g_q_lock at parallel_pool_shutdown and
    lock-free at parallel_pool_init. _Atomic gives correct cross-thread
@@ -234,7 +250,7 @@ static void enqueue_locked(PoolTask t) {
 
 void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride) {
     if (n <= 0) return;
-    if (!g_pool_running || n == 1 || t_in_pool_worker) {
+    if (!g_pool_running || n == 1 || t_in_pool_worker || t_parallel_inline_depth) {
         /* Pool unavailable (e.g. CLI mode), single task, or the calling
            thread is already a worker of either pool (same-pool or
            cross-pool nesting). Run inline rather than enqueue: enqueuing
@@ -361,7 +377,7 @@ int parallel_io_pool_size(void) { return g_io_nthreads; }
 
 void parallel_for_io(void *(*fn)(void *), void *args, int n, size_t stride) {
     if (n <= 0) return;
-    if (!g_io_running || n == 1 || t_in_pool_worker) {
+    if (!g_io_running || n == 1 || t_in_pool_worker || t_parallel_inline_depth) {
         /* Run inline when the calling thread is already a worker of
            either pool (same-pool or cross-pool nesting). Enqueuing
            instead would let this call re-enter a shared data structure

@@ -87,7 +87,11 @@ Any query can override the global `TIMEOUT` (db.env) for itself:
 {"mode":"find", ..., "timeout_ms": 200}
 ```
 
-Applies to `find`, `count`, `aggregate`, `bulk-delete`, `bulk-update`. `0` or absent → falls back to the global. Use it to give specific callers tighter deadlines without reconfiguring the server.
+Applies to `find`, `count`, `aggregate`, `bulk-delete`, `bulk-update`, and object-scope guard evaluation on guarded writes. `0` or absent → falls back to the global. Use it to give specific callers tighter deadlines without reconfiguring the server.
+
+## Per-request return_record
+
+`insert`, `update`, and `delete` accept `"return_record": true` — the success response then carries the committed record (insert/update; defaults and computed values already applied) or the removed record (delete) as a `"record":{...}` member. Default responses are unchanged. Details: [CAS → Returning records](cas.md#returning-records-return_record).
 
 ## Modes at a glance
 
@@ -107,7 +111,7 @@ Applies to `find`, `count`, `aggregate`, `bulk-delete`, `bulk-update`. `0` or ab
 - [`bulk-insert`](bulk.md), `bulk-insert-delimited`, [`bulk-delete`](bulk.md), [`bulk-update`](bulk.md) — all with optional `dry_run`
 
 ### Conditional writes
-- [CAS](cas.md) — `if_not_exists`, `if:[...]`
+- [CAS](cas.md) — `if_not_exists`, `if:[...]` (flat or nested `{and}/{or}` trees), object-scope guards (`if_match` / `if_no_match`), computed updates (`$incr` / `$copy`), opt-in `return_record` on insert/update/delete
 
 ### Schema
 - [`create-object`](schema-mutations.md), [`add-field`](schema-mutations.md), [`remove-field`](schema-mutations.md), [`rename-field`](schema-mutations.md), [`vacuum`](schema-mutations.md), `truncate`, `recount`, `backup`

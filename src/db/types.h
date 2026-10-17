@@ -645,6 +645,13 @@ void parallel_pool_init(int nthreads);
 void parallel_pool_shutdown(void);
 int  parallel_pool_size(void);
 void parallel_for(void *(*fn)(void *), void *args, int n, size_t stride);
+/* Scoped inline dispatch (conditional-writes F2): while the depth is > 0
+   on this thread, parallel_for and parallel_for_io run all sub-tasks
+   inline on the calling thread — used while a slotcask writer reservation
+   is held so no pool work is enqueued from under the reserved gates.
+   enter/leave must pair on the same thread; no nesting limit. */
+void parallel_inline_enter(void);
+void parallel_inline_leave(void);
 
 /* I/O thread pool — persistent workers, separate queue.
    Parallelises I/O-bound work (mmap page faults, segment file reads)
@@ -1139,14 +1146,14 @@ int cmd_get_fields(const char *db_root, const char *object,
 int cmd_insert(const char *db_root, const char *object,
                const char *key, size_t klen,
                const char *value,
-               const char *if_json, int if_not_exists);
+               const char *if_json, int if_not_exists, int return_record);
 int cmd_update(const char *db_root, const char *object,
                const char *key, size_t klen,
                const char *partial_json,
-               const char *if_json, int dry_run);
+               const char *if_json, int dry_run, int return_record);
 int cmd_delete(const char *db_root, const char *object,
                const char *key, size_t klen,
-               const char *if_json, int dry_run);
+               const char *if_json, int dry_run, int return_record);
 int cmd_get_multi(const char *db_root, const char *object, const char *keys_json,
                   const char *format, const char *delimiter);
 int cmd_exists_multi(const char *db_root, const char *object, const char *keys_json,
@@ -1359,6 +1366,19 @@ void cmd_explain(const char *db_root, const char *object, const char *criteria_j
                  const char *order_by, int fetching);
 int cmd_count(const char *db_root, const char *object, const char *criteria_json);
 int cmd_count_tree(const char *db_root, const char *object, CriteriaNode *tree);
+
+/* Object-scope write guard: pass only when (require_match) at least one
+   / (require_match==0) zero OTHER live records match guard_json. The
+   caller's own record (key, normalized stored bytes; NULL for fresh auto-key
+   inserts) is excluded by comparing actual key bytes. Returns 0 with *out_pass and
+   *out_matched (0/1 witness); -1 when the scan failed or was unproven (do not
+   write); -2 for invalid guard criteria; -3 for scan timeout. Caller
+   holds objlock_rdlock and the all-shard writer reservation (Task 4). */
+int cas_guard_request(const char *db_root, const char *object,
+                      const char *guard_json,
+                      const char *key, size_t klen,
+                      int require_match,
+                      int *out_pass, size_t *out_matched);
 int cmd_exists(const char *db_root, const char *object,
                const char *key, size_t klen);
 int cmd_keys(const char *db_root, const char *object, int offset, int limit, const char *format, const char *delimiter);
@@ -1593,8 +1613,29 @@ void compile_criteria_tree(CriteriaNode *root, const TypedSchema *ts);
    NULL means "no criteria" → match-all (returns 1). */
 int criteria_match_tree(const uint8_t *rec, size_t data_len, const CriteriaNode *node, FieldSchema *fs,
                        uint8_t hdr2);
-int cas_check(TypedSchema *ts, const uint8_t *value_ptr, int value_len, uint8_t hdr2,
-              SearchCriterion *crit, int ncrit);
+/* Evaluate a COMPILED criteria tree against a typed record (CAS `if`).
+   The tree must come from cas_prepare_tree; read-only on tree and fs,
+   so one compiled tree may be shared across bulk workers. NULL tree
+   passes vacuously (historical empty-`if` semantics). value_len is the
+   number of valid bytes in value_ptr (may be < ts->total_size for
+   trim-encoded records). */
+int cas_check_tree(FieldSchema *fs, const uint8_t *value_ptr,
+                   int value_len, uint8_t hdr2, const CriteriaNode *tree);
+/* Internal conditional matcher: 1 match / 0 no match / -1 evaluation error.
+   Key CAS fails closed on -1; guard search propagates it as a proof error. */
+int cas_match_tree_checked(const uint8_t *rec, size_t len,
+                            const CriteriaNode *tree, FieldSchema *fs,
+                            uint8_t hdr2);
+
+/* Parse, field-validate, and compile an `if` / guard criteria string.
+   Returns a compiled tree the caller frees with free_criteria_tree, or
+   NULL: with err_buf EMPTY (allow_empty=1 only) the span was an empty
+   array — VACUOUS PASS; with err_buf NON-EMPTY it is invalid and
+   err_buf holds the reason (caller-owned storage — do not hold
+   pointers into this function's frames). */
+CriteriaNode *cas_prepare_tree(const char *json, TypedSchema *ts,
+                               int allow_empty,
+                               char *err_buf, size_t err_sz);
 
 
 /* config.c globals — moved to ShardDb struct (shard_db_internal.h) */

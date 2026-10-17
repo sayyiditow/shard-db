@@ -3338,8 +3338,8 @@ typedef struct {
     /* CAS: optional `if` condition re-verified per record under the wrlock.
        NULL/empty = no CAS check. Same SearchCriterion[] shape single-op
        cmd_update uses, which makes cas_check directly applicable. */
-    SearchCriterion *cas_crit;
-    int              cas_ncrit;
+    CriteriaNode *cas_tree;
+    FieldSchema *cas_fs;
     /* Results */
     int            updated;
     int            skipped;
@@ -3387,7 +3387,7 @@ typedef struct {
    patching loop:
      1. Re-verify criteria_match_tree on OLD (closes the
         scan→write race window).
-     2. Re-verify CAS (`if_json` translates to cas_crit).
+     2. Re-verify CAS (`if_json` compiles to cas_tree).
      3. Copy OLD into the worker scratch, apply value_json patches,
         apply auto_update fields.
    Returns 0 to write, -1 to skip (criteria/CAS rejection). */
@@ -3397,8 +3397,8 @@ static int v2_bulk_upd_value_compute(const SlotcaskOldRecord *old,
     BulkUpdShardWork *w = ctx->w;
     if (!old) return -1;
     if (!criteria_match_tree(old->value, old->vlen, w->tree, w->fs, old->hdr2)) return -1;
-    if (w->cas_crit && w->cas_ncrit > 0 &&
-        !cas_check(w->ts, old->value, (int)old->vlen, old->hdr2, w->cas_crit, w->cas_ncrit)) return -1;
+    if (w->cas_tree &&
+        !cas_check_tree(w->cas_fs, old->value, (int)old->vlen, old->hdr2, w->cas_tree)) return -1;
 
     /* §2.7 conversion via the shared composer: NEW is nullmap layout,
        patches land at prefix+offset, explicit nulls set bits, untouched
@@ -3786,20 +3786,38 @@ int cmd_bulk_update(const char *db_root, const char *object,
         return 1;
     }
 
-    /* Parse optional `if` once into the SearchCriterion[] shape that
-       cas_check expects. Workers share the parsed array read-only. */
-    SearchCriterion *cas_crit = NULL;
-    int cas_ncrit = 0;
-    if (if_json && if_json[0] &&
-        parse_criteria_json(if_json, &cas_crit, &cas_ncrit) != 0) {
-        OUT("{\"error\":\"invalid if condition\"}\n");
-        free_criteria_tree(tree);
-        return 1;
+    /* Parse optional `if` once into the compiled criteria tree that
+       cas_check_tree expects. Workers share the parsed array read-only. */
+    FieldSchema cas_fs;
+    init_field_schema(&cas_fs, db_root, object);
+    char cas_err[256];
+    CriteriaNode *cas_tree = NULL;
+    if (if_json && if_json[0]) {
+        cas_tree = cas_prepare_tree(if_json, cas_fs.ts, 1, cas_err, sizeof(cas_err));
+        if (!cas_tree && cas_err[0]) {
+            OUT("{\"error\":\"invalid if condition\"}\n");
+            free_criteria_tree(tree);
+            return 1;
+        }
     }
 
     /* Phase 1: Scan — collect matching keys (read-only) */
     FieldSchema fs;
     init_field_schema(&fs, db_root, object);
+    JsonObj patch;
+    if (json_parse_object(value_json, strlen(value_json), &patch) < 0) {
+        free_criteria_tree(cas_tree); free_criteria_tree(tree);
+        OUT("{\"error\":\"invalid update value\"}\n"); return 1;
+    }
+    for (int i = 0; i < fs.ts->nfields; i++) {
+        const char *v; size_t n;
+        if (!fs.ts->fields[i].removed &&
+            json_obj_get(&patch, fs.ts->fields[i].name, &v, &n) && n && *v == '{') {
+            free_criteria_tree(cas_tree); free_criteria_tree(tree);
+            OUT("{\"error\":\"computed updates are only valid on update\"}\n");
+            return 1;
+        }
+    }
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
@@ -3814,7 +3832,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
     if (dl.timed_out) {
         LOG_WARN(LOG_SUB_QUERY, "bulk-update: query deadline exceeded while matching criteria");
         OUT("{\"error\":\"query_timeout\"}\n");
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return -1;
@@ -3822,7 +3840,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
     if (ctx.budget_exceeded) {
         LOG_WARN(LOG_SUB_QUERY, "bulk-update: query buffer cap exceeded while matching criteria");
         OUT(QUERY_BUFFER_ERR);
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return -1;
@@ -3830,7 +3848,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
 
     if (dry_run) {
         OUT("{\"matched\":%d,\"updated\":0,\"skipped\":0,\"dry_run\":true}\n", matched);
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return 0;
@@ -3856,7 +3874,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
                                    shared_field_null) != 0) {
         for (int i = 0; i < ts->nfields; i++) free(shared_field_vals[i]);
         OUT("{\"error\":\"malformed JSON escape in one or more field values\"}\n");
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys);
         free_criteria_tree(tree);
@@ -3873,7 +3891,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
         char emsg[128];
         fmt_not_null_err(&ts->fields[i], emsg, sizeof(emsg));
         OUT("{\"error\":\"%s\"}\n", emsg);
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int _k = 0; _k < matched; _k++) free(ctx.keys[_k]);
         free(ctx.keys);
         free_criteria_tree(tree);
@@ -3934,8 +3952,8 @@ int cmd_bulk_update(const char *db_root, const char *object,
         workers[wi].idx_fields = (const char (*)[256])idx_fields;
         workers[wi].idx_types = idx_types;
         workers[wi].nidx = nidx;
-        workers[wi].cas_crit = cas_crit;
-        workers[wi].cas_ncrit = cas_ncrit;
+        workers[wi].cas_tree = cas_tree;
+        workers[wi].cas_fs = &cas_fs;
         workers[wi].updated = 0;
         workers[wi].skipped = 0;
     }
@@ -3986,7 +4004,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
     LOG_INFO(LOG_SUB_QUERY, "BULK-UPDATE %s matched=%d updated=%d skipped=%d", object, matched, updated, skipped);
     OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
 
-    if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+    free_criteria_tree(cas_tree);
     for (int i = 0; i < matched; i++) free(ctx.keys[i]);
     free(ctx.keys); free_criteria_tree(tree);
     return 0;
@@ -4210,6 +4228,8 @@ static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
         if (cell_len > 0) {
             int tidx = w->active_indices[ai];
             if (!w->ts->fields[tidx].removed) {
+                if (w->ts->fields[tidx].type != FT_VARCHAR && *cell_start == '{')
+                    return -1;
                 char tmpcell[256];
                 char *cellbuf = (cell_len < sizeof(tmpcell))
                     ? tmpcell : malloc(cell_len + 1);
@@ -4598,39 +4618,27 @@ typedef struct {
     char       **field_values;
     /* Optional per-record CAS, parsed before any worker is dispatched. */
     int          if_present;
-    SearchCriterion *if_crit;
-    int          if_ncrit;
+    CriteriaNode *if_tree;
 } BulkUpdJsonRec;
 
-static int bulk_upd_json_parse_if(const JsonObj *obj,
-                                  SearchCriterion **out, int *out_count) {
-    const char *raw = NULL;
-    size_t raw_len = 0;
+static int bulk_upd_json_parse_if(const JsonObj *obj, TypedSchema *ts,
+                                  CriteriaNode **out) {
+    const char *raw = NULL; size_t raw_len = 0;
     *out = NULL;
-    *out_count = 0;
     if (!json_obj_get(obj, "if", &raw, &raw_len)) return 0;
-    if (raw_len == 0) return -1;
-
+    if (!raw_len) return -1;
     char *buf = malloc(raw_len + 1);
     if (!buf) return -1;
-    memcpy(buf, raw, raw_len);
-    buf[raw_len] = '\0';
-
-    int rc = parse_criteria_json(buf, out, out_count);
+    memcpy(buf, raw, raw_len); buf[raw_len] = '\0';
+    char err[256];
+    *out = cas_prepare_tree(buf, ts, 1, err, sizeof(err));
     free(buf);
-    if (rc != 0 || *out_count <= 0) {
-        if (*out) free_criteria(*out, *out_count);
-        *out = NULL;
-        *out_count = 0;
-        return -1;
-    }
-    return 1;
+    return !*out && err[0] ? -1 : 1;
 }
 
-static void bulk_upd_json_if_free(SearchCriterion **crit, int *count) {
-    if (*crit) free_criteria(*crit, *count);
-    *crit = NULL;
-    *count = 0;
+static void bulk_upd_json_if_free(CriteriaNode **tree) {
+    free_criteria_tree(*tree);
+    *tree = NULL;
 }
 
 typedef struct {
@@ -4638,6 +4646,7 @@ typedef struct {
     const char       *object;
     const Schema     *sch;
     TypedSchema      *ts;
+    FieldSchema      *cas_fs;
     const char      (*idx_fields)[256];
     const enum IndexType *idx_types;  /* [nidx] — NULL = legacy all-btree */
     int               nidx;
@@ -4812,8 +4821,8 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
     BulkUpdJsonRec       *json_rec = ctx->rec;
     if (!old) return -1;
     if (json_rec->if_present &&
-        !cas_check(w->ts, old->value, (int)old->vlen, old->hdr2,
-                   json_rec->if_crit, json_rec->if_ncrit))
+        !cas_check_tree(w->cas_fs, old->value, (int)old->vlen, old->hdr2,
+                        json_rec->if_tree))
         return -1;
 
     uint8_t *new_buf = (uint8_t *)rec->value;
@@ -4841,6 +4850,8 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
             continue;
         }
         if (json_rec->field_values[i]) {
+            if (w->ts->fields[tidx].type != FT_VARCHAR &&
+                json_rec->field_values[i][0] == '{') return -1;
             encode_field(&w->ts->fields[tidx], json_rec->field_values[i],
                           new_buf + w->ts->nullmap_prefix +
                           w->ts->fields[tidx].offset);
@@ -5080,6 +5091,8 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         OUT("{\"error\":\"bulk-update-json requires typed fields (fields.conf)\"}\n");
         return 1;
     }
+    FieldSchema cas_fs;
+    init_field_schema(&cas_fs, db_root, object);
     Schema sch = load_schema(db_root, object);
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
@@ -5136,8 +5149,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
 
     int matched = 0, skipped = 0;
 
-    SearchCriterion *if_crit = NULL;
-    int if_ncrit = 0;
+    CriteriaNode *if_tree = NULL;
     int if_rc = 0;
 
     const char *p = json_skip(json);
@@ -5172,8 +5184,8 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         char obj_buf[8192];
         char *obj_str = NULL;
         int obj_heap = 0;
-        if_crit = NULL;
-        if_ncrit = 0;
+        if_tree = NULL;
+
         if_rc = 0;
 
         if (is_object_format) {
@@ -5258,7 +5270,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
                 break;
             }
 
-            if_rc = bulk_upd_json_parse_if(&rec, &if_crit, &if_ncrit);
+            if_rc = bulk_upd_json_parse_if(&rec, ts, &if_tree);
             if (if_rc < 0) {
                 matched++;
                 skipped++;
@@ -5266,7 +5278,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
                                             key, "invalid if condition") != 0) {
                     free(key);
                     if (obj_heap) free(obj_str);
-                    bulk_upd_json_if_free(&if_crit, &if_ncrit);
+                    bulk_upd_json_if_free(&if_tree);
                     parse_oom = 1;
                     break;
                 }
@@ -5280,7 +5292,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         if (!key || !data_str) {
             skipped++;
             free(key);
-            bulk_upd_json_if_free(&if_crit, &if_ncrit);
+            bulk_upd_json_if_free(&if_tree);
             if (obj_heap) free(obj_str);
             p = obj_end;
             continue;
@@ -5288,7 +5300,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         if ((int)klen > sch.max_key) {
             skipped++;
             free(key);
-            bulk_upd_json_if_free(&if_crit, &if_ncrit);
+            bulk_upd_json_if_free(&if_tree);
             if (obj_heap) free(obj_str);
             p = obj_end;
             continue;
@@ -5298,6 +5310,55 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
            reported as skipped below while remaining part of the matched
            input count. */
         matched++;
+
+        /* D8 boundary — a RAW (unquoted) object span is a computed op and
+           computed updates are only valid on single `update`. Detected on
+           the raw span BEFORE unquoting: after unquoting, a quoted varchar
+           like "{hello}" is indistinguishable from a raw object. The
+           per-record JSON callback encodes varchar values itself, so its
+           post-unquote check cannot catch this — reject here, as a
+           per-record skip mirroring the malformed-escape path. */
+        {
+            JsonObj data_probe;
+            int raw_object = 0;
+            /* Exact value-span length: in the array format obj_end is the
+               RECORD's end, not the value's — trailing bytes would make
+               the parse fail and silently skip the probe. */
+            int probe_parsed = json_parse_object(data_str,
+                                                 (size_t)(json_skip_value(data_str) -
+                                                          data_str),
+                                                 &data_probe) >= 0;
+            if (probe_parsed) {
+                for (int i = 0; i < ts->nfields; i++) {
+                    const char *rv; size_t rn;
+                    if (!ts->fields[i].removed &&
+                        json_obj_get(&data_probe, ts->fields[i].name,
+                                     &rv, &rn) && rn && *rv == '{') {
+                        LOG_WARN(LOG_SUB_QUERY,
+                                 "bulk-update: skipped a record — computed "
+                                 "updates are only valid on update "
+                                 "(field '%s')", ts->fields[i].name);
+                        raw_object = 1;
+                        break;
+                    }
+                }
+            }
+            /* A span the probe cannot parse (e.g. more members than
+               JSON_OBJ_MAX_FIELDS) might hide a computed op the record
+               path would store as text — the D8 boundary fails closed. */
+            if (raw_object || !probe_parsed) {
+                if (!probe_parsed)
+                    LOG_WARN(LOG_SUB_QUERY,
+                             "bulk-update: skipped a record — data span did "
+                             "not parse as an object; D8 probe fails closed");
+                skipped++;
+                free(key);
+                bulk_upd_json_if_free(&if_tree);
+                if (obj_heap) free(obj_str);
+                p = obj_end;
+                continue;
+            }
+        }
 
         /* Pull out every typed-field name from `data`. Fields not present in
            `data` come back NULL → not touched. An unquoted null span sets
@@ -5311,7 +5372,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
             skipped++;
             free(key);
-            bulk_upd_json_if_free(&if_crit, &if_ncrit);
+            bulk_upd_json_if_free(&if_tree);
             if (obj_heap) free(obj_str);
             p = obj_end;
             continue;
@@ -5335,7 +5396,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
             skipped++;
             free(key);
-            bulk_upd_json_if_free(&if_crit, &if_ncrit);
+            bulk_upd_json_if_free(&if_tree);
             if (obj_heap) free(obj_str);
             p = obj_end;
             continue;
@@ -5365,15 +5426,14 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
                         free(records[k].field_values[j]);
                     free(records[k].field_values);
                     free(records[k].field_indices);
-                    if (records[k].if_crit)
-                        free_criteria(records[k].if_crit, records[k].if_ncrit);
+                    free_criteria_tree(records[k].if_tree);
                 }
                 free(records);
                 records = NULL;
                 rec_count = 0;
                 free(key);
                 for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
-                bulk_upd_json_if_free(&if_crit, &if_ncrit);
+                bulk_upd_json_if_free(&if_tree);
                 if (obj_heap) free(obj_str);
                 parse_oom = 1;
                 break;
@@ -5387,8 +5447,8 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         r->shard_id = compute_record_shard(r->hash, sch.splits);
         r->start_slot = 0;
         r->if_present = 0;
-        r->if_crit = NULL;
-        r->if_ncrit = 0;
+        r->if_tree = NULL;
+
         /* v2 alignment — see cmd_bulk_insert for rationale. */
                     r->shard_id = compute_record_shard(r->hash, sch.splits);
         if (n_touched > 0) {
@@ -5410,9 +5470,9 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
                 for (int i = 0; i < ts->nfields; i++) free(vals_buf[i]);
                 if (obj_heap) free(obj_str);
                 obj_heap = 0;
-                bulk_upd_json_if_free(&if_crit, &if_ncrit);
-                if_crit = NULL;
-                if_ncrit = 0;
+                bulk_upd_json_if_free(&if_tree);
+                if_tree = NULL;
+
                 parse_oom = 1;
                 break;
             }
@@ -5435,10 +5495,10 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         }
         if (if_rc == 1) {
             r->if_present = 1;
-            r->if_crit = if_crit;
-            r->if_ncrit = if_ncrit;
-            if_crit = NULL;
-            if_ncrit = 0;
+            r->if_tree = if_tree;
+
+            if_tree = NULL;
+
         }
         if (obj_heap) free(obj_str);
         p = obj_end;
@@ -5452,8 +5512,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
                 free(records[i].field_values[j]);
             free(records[i].field_values);
             free(records[i].field_indices);
-            if (records[i].if_crit)
-                free_criteria(records[i].if_crit, records[i].if_ncrit);
+            free_criteria_tree(records[i].if_tree);
         }
         free(records);
         bulk_upd_json_errors_free(errors, error_count);
@@ -5481,8 +5540,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
                 free(records[i].field_values[j]);
             free(records[i].field_values);
             free(records[i].field_indices);
-            if (records[i].if_crit)
-                free_criteria(records[i].if_crit, records[i].if_ncrit);
+            free_criteria_tree(records[i].if_tree);
         }
         free(records);
         if (json_mmaped) munmap((void *)json, len);
@@ -5496,8 +5554,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
                 free(records[i].field_values[j]);
             free(records[i].field_values);
             free(records[i].field_indices);
-            if (records[i].if_crit)
-                free_criteria(records[i].if_crit, records[i].if_ncrit);
+            free_criteria_tree(records[i].if_tree);
         }
         free(records);
         bulk_upd_json_errors_free(errors, error_count);
@@ -5528,8 +5585,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             for (int j = 0; j < records[i].n_fields; j++) free(records[i].field_values[j]);
             free(records[i].field_values);
             free(records[i].field_indices);
-            if (records[i].if_crit)
-                free_criteria(records[i].if_crit, records[i].if_ncrit);
+            free_criteria_tree(records[i].if_tree);
         }
         free(records);
         bulk_upd_json_errors_free(errors, error_count);
@@ -5551,8 +5607,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             for (int j = 0; j < records[i].n_fields; j++) free(records[i].field_values[j]);
             free(records[i].field_values);
             free(records[i].field_indices);
-            if (records[i].if_crit)
-                free_criteria(records[i].if_crit, records[i].if_ncrit);
+            free_criteria_tree(records[i].if_tree);
         }
         free(records);
         bulk_upd_json_errors_free(errors, error_count);
@@ -5568,6 +5623,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             workers[wi].object = object;
             workers[wi].sch = &sch;
             workers[wi].ts = ts;
+            workers[wi].cas_fs = &cas_fs;
             workers[wi].idx_fields = idx_fields;
             workers[wi].idx_types = idx_types;
             workers[wi].nidx = nidx;
@@ -5597,8 +5653,8 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         records[i].key = NULL;
         records[i].field_values = NULL;
         records[i].field_indices = NULL;
-        records[i].if_crit = NULL;
-        records[i].if_ncrit = 0;
+        records[i].if_tree = NULL;
+
     }
     free(shard_counts);
 
@@ -5649,8 +5705,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             for (int j = 0; j < r->n_fields; j++) free(r->field_values[j]);
             free(r->field_values);
             free(r->field_indices);
-            if (r->if_crit)
-                free_criteria(r->if_crit, r->if_ncrit);
+            free_criteria_tree(r->if_tree);
         }
         free(workers[gi].recs);
     }
@@ -5693,8 +5748,8 @@ typedef struct {
     TypedSchema    *ts;
     CriteriaNode   *tree;
     FieldSchema    *fs;
-    SearchCriterion *cas_crit;
-    int             cas_ncrit;
+    CriteriaNode *cas_tree;
+    FieldSchema *cas_fs;
     char          (*idx_fields)[256];
     const enum IndexType *idx_types;  /* [nidx] — NULL = legacy all-btree */
     int             nidx;
@@ -5727,8 +5782,8 @@ static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
     BulkDelCritShardWork *w = ctx->w;
     if (!old) return -1;
     if (!criteria_match_tree(old->value, old->vlen, w->tree, w->fs, old->hdr2)) return -1;
-    if (w->cas_crit && w->cas_ncrit > 0 &&
-        !cas_check(w->ts, old->value, (int)old->vlen, old->hdr2, w->cas_crit, w->cas_ncrit)) return -1;
+    if (w->cas_tree &&
+        !cas_check_tree(w->cas_fs, old->value, (int)old->vlen, old->hdr2, w->cas_tree)) return -1;
     return 0;
 }
 
@@ -5750,9 +5805,9 @@ static int v2_bulk_del_crit_prepare_window(SlotcaskBulkRec *recs,
         if (!criteria_match_tree(r->old_value, r->old_vlen, w->tree, w->fs, r->old_hdr2)) {
             r->status = -1; continue;
         }
-        if (w->cas_crit && w->cas_ncrit > 0 &&
-            !cas_check(w->ts, r->old_value, (int)r->old_vlen,
-                       r->old_hdr2, w->cas_crit, w->cas_ncrit)) {
+        if (w->cas_tree &&
+            !cas_check_tree(w->cas_fs, r->old_value, (int)r->old_vlen,
+                            r->old_hdr2, w->cas_tree)) {
             r->status = -1; continue;
         }
     }
@@ -5893,13 +5948,17 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     }
 
     /* Optional `if` for per-record CAS, re-verified under wrlock in phase 2. */
-    SearchCriterion *cas_crit = NULL;
-    int cas_ncrit = 0;
-    if (if_json && if_json[0] &&
-        parse_criteria_json(if_json, &cas_crit, &cas_ncrit) != 0) {
-        OUT("{\"error\":\"invalid if condition\"}\n");
-        free_criteria_tree(tree);
-        return 1;
+    FieldSchema cas_fs;
+    init_field_schema(&cas_fs, db_root, object);
+    char cas_err[256];
+    CriteriaNode *cas_tree = NULL;
+    if (if_json && if_json[0]) {
+        cas_tree = cas_prepare_tree(if_json, cas_fs.ts, 1, cas_err, sizeof(cas_err));
+        if (!cas_tree && cas_err[0]) {
+            OUT("{\"error\":\"invalid if condition\"}\n");
+            free_criteria_tree(tree);
+            return 1;
+        }
     }
 
     /* Phase 1: resolve matching keys — indexed path first, full scan fallback */
@@ -5922,7 +5981,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     if (dl.timed_out) {
         LOG_WARN(LOG_SUB_QUERY, "bulk-delete: query deadline exceeded while matching criteria");
         OUT("{\"error\":\"query_timeout\"}\n");
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return -1;
@@ -5930,7 +5989,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     if (ctx.budget_exceeded) {
         LOG_WARN(LOG_SUB_QUERY, "bulk-delete: query buffer cap exceeded while matching criteria");
         OUT(QUERY_BUFFER_ERR);
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return -1;
@@ -5938,7 +5997,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
 
     if (dry_run) {
         OUT("{\"matched\":%d,\"deleted\":0,\"skipped\":0,\"dry_run\":true}\n", matched);
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return 0;
@@ -5971,7 +6030,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
                  object, matched, sdb ? 0 : matched);
         OUT("{\"matched\":%d,\"deleted\":0,\"skipped\":%d}\n",
             matched, sdb ? 0 : matched);
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return 0;
@@ -5985,7 +6044,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     if (!hashes || !shard_ids) {
         free(hashes); free(shard_ids);
         OUT("{\"error\":\"oom: bulk_delete_criteria\"}\n");
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return 1;
@@ -5999,7 +6058,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     if (!shard_counts) {
         free(hashes); free(shard_ids);
         OUT("{\"error\":\"oom: bulk_delete_criteria buckets\"}\n");
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return 1;
@@ -6015,7 +6074,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         free(workers); free(worker_shards); free(shard_to_worker);
         free(shard_counts); free(hashes); free(shard_ids);
         OUT("{\"error\":\"oom: bulk_delete_criteria workers\"}\n");
-        if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+        free_criteria_tree(cas_tree);
         for (int i = 0; i < matched; i++) free(ctx.keys[i]);
         free(ctx.keys); free_criteria_tree(tree);
         return 1;
@@ -6030,8 +6089,8 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         workers[g].ts      = ts;
         workers[g].tree    = tree;
         workers[g].fs      = &fs;
-        workers[g].cas_crit  = cas_crit;
-        workers[g].cas_ncrit = cas_ncrit;
+        workers[g].cas_tree = cas_tree;
+        workers[g].cas_fs = &cas_fs;
         workers[g].idx_fields = idx_fields;
         workers[g].idx_types  = idx_types;
         workers[g].nidx       = nidx;
@@ -6098,7 +6157,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
         OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d}\n",
             matched, deleted, skipped);
 
-    if (cas_crit) free_criteria(cas_crit, cas_ncrit);
+    free_criteria_tree(cas_tree);
     for (int i = 0; i < matched; i++) free(ctx.keys[i]);
     free(ctx.keys); free_criteria_tree(tree);
     return any_durability_degraded ? 1 : 0;

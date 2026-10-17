@@ -3047,6 +3047,12 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                 if (ts->fields[i].removed) continue;
                 if ((int)flen != ts->fields[i].name_len) continue;
                 if (memcmp(fname, ts->fields[i].name, flen) != 0) continue;
+                if (vlen && vstart[0] == '{') {
+                    if (err_buf && err_buf_size)
+                        snprintf(err_buf, err_buf_size,
+                                 "computed updates are only valid on update");
+                    return -2;
+                }
                 const char *ev = vstart; size_t el = vlen;
                 int was_quoted = (el >= 2 && ev[0] == '"' && ev[el - 1] == '"');
                 if (was_quoted) { ev++; el -= 2; }

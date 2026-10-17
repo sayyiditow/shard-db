@@ -66,8 +66,20 @@ Clients should match on the `error` string, not on the full message.
 
 | `error` | Cause | Recovery |
 |---|---|---|
-| `condition_not_met` | `if_not_exists` or `if:[...]` check failed. Response includes `"current"` with the actual record. | Inspect `current`, reconcile, retry. |
+| `condition_not_met` | `if_not_exists` or `if:[...]` check failed. Response includes `"current"` with the actual record. Guards (below) add `"guard"` and `"matched"` members. | Inspect `current`, reconcile, retry. |
 | `key already exists` | `insert` without `if_not_exists` when the key was just written by a concurrent request (rare race). | Use `if_not_exists:true` for idempotent inserts. |
+| `invalid if condition` | `if` criteria failed parsing, field validation (unknown field), depth cap, or regex compilation. | Fix the criteria (see [cas.md](../query-protocol/cas.md#if-grammar-202610--full-filter-trees)). |
+| `invalid guard criteria` | `if_match`/`if_no_match` guard is empty, unknown-field, malformed, or both guards were supplied non-null. | Fix or drop the guard (see [cas.md](../query-protocol/cas.md#object-scope-guards-if_match--if_no_match)). |
+| `guard check failed` | The guard search could not prove a verdict (index unreadable, corrupt record, scan failure). Always fail-closed — nothing was written. | Retry; investigate the object if persistent. |
+| `guards are not supported on bulk operations` | A `bulk-*` mode carried `if_match`/`if_no_match`. | Move the guard to the single-write path. |
+| `computed updates are only valid on update` | A `{"$incr":…}`/`{"$copy":…}` span appeared on `insert` or a criteria-form `bulk-update` value. | Compute after an initial insert, or use single `update`. |
+| `field '<name>' is NULL; cannot apply computed update` | `$incr` target, `$copy` target, or `$copy` source is NULL on the current record — copying never silently clears NULL. | Set the field first, or use `if` to gate on non-NULL. |
+| `field '<name>' is not finite; cannot apply computed update` | `$copy` source float/double holds NaN/Infinity — non-finite bytes never move between fields. | Repair the source value first. |
+| `field '<name>': computed update overflows <type>` | `$incr` literal or result exceeds the field's range/scale. | Smaller literal. |
+| `field '<name>': unsupported type for computed update` | `$incr`/`$copy` on a non-numeric field (only short/int/long/numeric/currency/float/double). | — |
+| `field '<name>': $copy type mismatch with '<name>'` | `$copy` source type (or numeric scale) differs from the target. | — |
+| `field '<name>': malformed computed value object` | Computed span is not a one-member `{"$incr":…}`/`{"$copy":…}` object. | Fix the span grammar. |
+| `field '<name>': bad computed literal` | `$incr` literal unparseable, empty, oversized, or has excess fractional digits. | Fix the literal. |
 
 ### Index management
 

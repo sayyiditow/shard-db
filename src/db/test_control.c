@@ -41,6 +41,11 @@ enum {
 #define TEST_HOOK_KIND_AFTER_OLD 0
 #define TEST_HOOK_KIND_COUNT_GAP 1
 #define TEST_HOOK_KIND_FIND_FLUSH_GATE 2
+#define TEST_HOOK_KIND_GUARD_CHECK 3
+/* TEST_HOOK_SET_GLOBALS phase selectors (runner-side wrappers in
+   fixtures.c duplicate these by convention). */
+#define TEST_HOOK_SET_GLOBALS_KF_SEAMS 0
+#define TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL 1
 
 typedef struct {
     uint32_t kind;   /* INSTALL..REACHED; SET_GLOBALS=6 */
@@ -150,6 +155,37 @@ static void test_control_count_gap_block(void *ctx_ptr) {
     pthread_mutex_unlock(&c->lock);
 }
 
+/* Runs on the request thread right after a passing guard check
+   (installed by INSTALL kind 3 via shard_db_test_set_guard_hook):
+   reports REACHED with phase 4 and blocks until the control thread
+   broadcasts a release (or the daemon stops). Same contract as
+   test_control_count_gap_block; the caller holds shared objlock and
+   every writer gate after a passing guard check — that is the point. */
+static void test_control_guard_block(void *ctx_ptr) {
+    TestControl *c = ctx_ptr;
+    TestHookMessage reached = { .kind = TEST_HOOK_REACHED, .phase = 4 };
+    pthread_mutex_lock(&c->lock);
+    c->waiting_for_release = 1;
+    c->release = 0;
+    pthread_cond_broadcast(&c->cond);
+    pthread_mutex_unlock(&c->lock);
+
+    if (test_control_write_full(c->fd, &reached, sizeof(reached)) != 0) {
+        pthread_mutex_lock(&c->lock);
+        c->release = 1;
+        pthread_cond_broadcast(&c->cond);
+        c->waiting_for_release = 0;
+        pthread_mutex_unlock(&c->lock);
+        return;
+    }
+
+    pthread_mutex_lock(&c->lock);
+    while (c->running && !c->release)
+        pthread_cond_wait(&c->cond, &c->lock);
+    c->waiting_for_release = 0;
+    pthread_mutex_unlock(&c->lock);
+}
+
 /* Runs on the find worker thread at the batch-fetch gate (installed by
    INSTALL kind 2 via shard_db_test_set_find_flush_gate_hook): reports
    REACHED with phase 3 and blocks until the control thread broadcasts a
@@ -201,6 +237,8 @@ static void *test_control_thread_main(void *arg) {
                 atomic_store(&g_shard_test_find_flush_gate_hit, 0);
                 shard_db_test_set_find_flush_gate_hook(
                     test_control_find_flush_gate_block, c);
+            } else if (msg.phase == TEST_HOOK_KIND_GUARD_CHECK) {
+                shard_db_test_set_guard_hook(test_control_guard_block, c);
             } else {
                 slotcask_test_set_after_old_hook(test_control_after_old, c);
             }
@@ -212,13 +250,18 @@ static void *test_control_thread_main(void *arg) {
             pthread_mutex_unlock(&c->lock);
             break;
         case TEST_HOOK_SET_GLOBALS:
-            atomic_store(&g_shard_test_kf_initial_slots, (size_t)msg.a);
-            atomic_store(&g_shard_test_kf_max_slots, (size_t)msg.b);
+            if (msg.phase == TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL) {
+                atomic_store(&g_shard_test_json_escape_fail, (int)msg.a);
+            } else {
+                atomic_store(&g_shard_test_kf_initial_slots, (size_t)msg.a);
+                atomic_store(&g_shard_test_kf_max_slots, (size_t)msg.b);
+            }
             break;
         case TEST_HOOK_CLEAR:
             slotcask_test_set_after_old_hook(NULL, NULL);
             shard_db_test_set_count_gap_hook(NULL, NULL);
             shard_db_test_set_find_flush_gate_hook(NULL, NULL);
+            shard_db_test_set_guard_hook(NULL, NULL);
             atomic_store(&g_shard_test_count_gap, 0);
             atomic_store(&g_shard_test_find_flush_gate, 0);
             pthread_mutex_lock(&c->lock);
@@ -266,6 +309,7 @@ void shard_db_test_control_stop(void) {
     slotcask_test_set_after_old_hook(NULL, NULL);
     shard_db_test_set_count_gap_hook(NULL, NULL);
     shard_db_test_set_find_flush_gate_hook(NULL, NULL);
+    shard_db_test_set_guard_hook(NULL, NULL);
     pthread_mutex_lock(&g_test_control.lock);
     g_test_control.running = 0;
     g_test_control.release = 1;

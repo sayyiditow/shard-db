@@ -142,6 +142,16 @@ int  btree_test_sync_count(void);
 void btree_search(const char *path, const char *value, size_t vlen,
                   bt_result_cb cb, void *ctx);
 
+/* Guard-only strict equality enumeration (conditional-writes F2):
+   validates every page before decode, never interprets an acquisition
+   failure or a malformed page as absence. Returns 0 when the equality
+   range was fully enumerated (cb saw every matching entry, or none),
+   -1 when the tree could not be proven complete (missing/unreadable
+   file, corrupt page, candidate cap, over-deep descent). Internal API;
+   sole caller is query.c's guard_has_other. */
+int btree_guard_eq(const char *path, const char *value, size_t vlen,
+                   bt_result_cb cb, void *ctx);
+
 /* Range scan: all entries within [min, max].
    min_exclusive/max_exclusive: if true, exclude the boundary value. */
 void btree_range(const char *path,

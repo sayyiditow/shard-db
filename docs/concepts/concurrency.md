@@ -155,6 +155,64 @@ The lock table itself is a pointer-indirected, growable open-addressed directory
 
 At teardown, entries are freed under the same no-in-flight-operations quiescence the cache shutdowns (`bt_cache_shutdown`/`slotcask_shutdown`) already require: the daemon stop path joins the request-worker pool, drains in-flight writes, and stops background threads before teardown; embedded callers must ensure every `shard_db_query()` has returned before calling `shard_db_close()`.
 
+## Guarded writes: all-shard writer reservation (2026.10)
+
+Object-scope write guards (`if_match` / `if_no_match`, see
+[cas.md](../query-protocol/cas.md#object-scope-guards-if_match--if_no_match))
+must prove an existence/absence verdict over *all* of an object's live
+records and commit the guarded mutation against that same state. They
+keep the ordinary **shared** objlock — schema/maintenance changes stay
+excluded — and additionally **reserve every existing per-shard writer
+gate** for the object:
+
+- **Acquisition.** `slotcask_write_reservation_begin` try-locks the
+  gates in ascending shard order; on contention it releases the partial
+  set before retrying (1 ms backoff). It never blocks on a later gate
+  while retaining earlier ones, so an older multi-shard transaction can
+  always finish: no pool-dependency cycle. Acquisition is not fair —
+  sustained write traffic can delay a guard. The reservation requires a
+  pinned same-instance registry handle and runs on one thread;
+  nested reservations reject.
+- **Borrowing.** While the reservation is live, the ordinary
+  `writer_gate_lock`/`writer_gate_unlock` wrappers on that thread
+  *borrow* the matching gate instead of re-locking the mutex — recovery,
+  the guard search, and the single-write commit run inside one
+  reservation without recursive locking. Other threads still take gates
+  the normal way (i.e. they wait).
+- **Scoped inline execution.** The reserving thread enters a TLS
+  inline-execution scope (`parallel_inline_enter`) for the whole
+  reservation: both the CPU and IO pools dispatch their sub-tasks inline
+  on the calling thread while the scope is active, so no work is ever
+  enqueued to pools whose workers may be blocked on the reserved gates
+  (deadlock avoidance). This affects nested `parallel_for` /
+  `parallel_for_io` calls too, and changes nothing for other threads.
+- **Recovery first.** The guarded path replays retained KFM2 commit
+  markers object-wide (`marker_recovery_sweep_object`) *after* the
+  reservation and *before* the guard search — ordinary mutations replay
+  only their touched shard, so an old retained marker on another shard
+  could otherwise invalidate an absence proof. A corrupt or unreplayable
+  marker rejects the guarded write (fail closed). Recovery may finish an
+  earlier durable write even when the guarded request itself later fails
+  its guard.
+- **Readers.** Reader paths never acquire writer gates. Reads continue
+  during a guard check — including reads of shards whose gates are
+  reserved — subject to the existing per-shard kf/index/cache rwlocks
+  (replay and the commit itself can briefly block reads of the affected
+  shards, including durability I/O already performed under kf write
+  locks). This is reader concurrency, not a lock-free read or a
+  snapshot guarantee.
+- **Release order.** Gates release in reverse acquisition order, then
+  the inline scope ends, then the shared objlock and the registry pin.
+- **No new primitives.** The reservation uses only the existing
+  per-shard writer gates, objlock, and registry pin — no new mutex, no
+  new thread. Ordinary gate instrumentation is unchanged.
+
+Cost: guarded work runs serially on its request thread while every
+competing writer on the object waits; full-scan fallbacks can be
+expensive; and reserving all gates (up to `MAX_SPLITS`) plus retained
+marker replay adds overhead. See the guard cost model in
+[cas.md](../query-protocol/cas.md#object-scope-guards-if_match--if_no_match).
+
 ## Write drain on shutdown
 
 `./shard-db stop` sets `server_running = 0` (atomic) to refuse new connections and waits up to 30 seconds for the `in_flight_writes` atomic to reach zero. This guarantees that every write that entered the server before shutdown either committed or returned an error — no half-written records.

@@ -1,5 +1,14 @@
 #include "types.h"
 #include "slotcask.h"
+#include <errno.h>
+#include <math.h>
+#ifdef TEST_BUILD
+#include "shard_test_ctl.h"
+/* Defined here (next to its only reader): forces the update-error JSON
+ * escape to fail so tests can exercise the static-fallback emission.
+ * _Atomic: control-thread writes, request-thread reads. */
+_Atomic int g_shard_test_json_escape_fail;
+#endif
 
 int legacy_field_absent(const TypedField *f, const uint8_t *p);
 
@@ -458,40 +467,16 @@ int cmd_get_fields(const char *db_root, const char *object,
     return 0;
 }
 
-/* ========== CAS (Compare-and-Swap) helper ========== */
+/* ========== CAS (Compare-and-Set) helper ========== */
 
-/* Check all criteria against the current record value (typed binary).
-   value_len is the number of valid bytes in value_ptr (may be < ts->total_size
-   for trim-encoded records). Returns 1 if ALL criteria match, 0 on first failure. */
-int cas_check(TypedSchema *ts, const uint8_t *value_ptr, int value_len,
-              uint8_t hdr2, SearchCriterion *crit, int ncrit) {
-    for (int i = 0; i < ncrit; i++) {
-        char *val_str = NULL;
-        if (strchr(crit[i].field, '+')) {
-            /* Composite field: concatenate sub-fields */
-            char fb[256]; strncpy(fb, crit[i].field, 255); fb[255] = '\0';
-            char cat[4096]; int cp = 0; int ok = 1;
-            char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-            while (tok) {
-                int fi = typed_field_index(ts, tok);
-                if (fi >= 0) {
-                    char *v = typed_get_field_str(ts, value_ptr, value_len, fi, hdr2);
-                    if (v) { int sl = strlen(v); memcpy(cat + cp, v, sl); cp += sl; free(v); }
-                    else { ok = 0; break; }
-                } else { ok = 0; break; }
-                tok = strtok_r(NULL, "+", &_tok_save);
-            }
-            cat[cp] = '\0';
-            val_str = (ok && cp > 0) ? strdup(cat) : NULL;
-        } else {
-            int fi = typed_field_index(ts, crit[i].field);
-            if (fi >= 0) val_str = typed_get_field_str(ts, value_ptr, value_len, fi, hdr2);
-        }
-        int matched = match_criterion(val_str, &crit[i]);
-        free(val_str);
-        if (!matched) return 0;
-    }
-    return 1;
+/* Evaluate a COMPILED criteria tree against a typed record. NULL tree
+   = pass. Read-only on tree and fs — one compiled tree may be shared
+   across bulk workers. value_len may be < ts->total_size for
+   trim-encoded records. */
+int cas_check_tree(FieldSchema *fs, const uint8_t *value_ptr,
+                   int value_len, uint8_t hdr2, const CriteriaNode *tree) {
+    if (!tree) return 1;
+    return cas_match_tree_checked(value_ptr, (size_t)value_len, tree, fs, hdr2) > 0;
 }
 
 /* ========== INSERT — v2 (slotcask) helper ==========
@@ -511,8 +496,8 @@ typedef struct {
     enum IndexType   *idx_types;       /* parallel to fields[], loaded once */
     const char       *value_json;
     TypedSchema      *idx_ts;
-    SearchCriterion  *crit;
-    int               ncrit;
+    CriteriaNode     *cas_tree;
+    FieldSchema      *cas_fs;
     /* Populated by slotcask BEFORE pre_commit so bitmap update_idx_fn can
        address the just-written record by (shard, slot). */
     int               kf_shard;
@@ -546,13 +531,11 @@ static void v2_insert_bm_owned_free(V2InsertCtx *c) {
 }
 
 static int v2_insert_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
-    V2InsertCtx *c = (V2InsertCtx *)ctx_ptr;
-    if (c->ncrit > 0) {
-        /* if_json criteria require an existing record; reject if missing. */
-        if (!old) return 0;
-        if (!cas_check(c->idx_ts, old->value, (int)old->vlen, old->hdr2, c->crit, c->ncrit)) return 0;
-    }
-    return 1;
+    V2InsertCtx *c = ctx_ptr;
+    if (!c->cas_tree) return 1;
+    if (!old) return 0;
+    return cas_check_tree(c->cas_fs, old->value, (int)old->vlen,
+                           old->hdr2, c->cas_tree);
 }
 
 /* UpdateIdxArg / update_idx_fn now live in index.c (declared in types.h)
@@ -1047,7 +1030,7 @@ void auto_now_str(const TypedField *f, char *buf, size_t bufsz) {
 static int cmd_insert_v2(const char *db_root, const char *object,
                          const char *key, size_t klen, const char *value,
                          const char *if_json, int if_not_exists,
-                         const Schema *sc) {
+                         int return_record, const Schema *sc) {
     TypedSchema *ts = load_typed_schema(db_root, object);
     if (!ts) {
         OUT("{\"error\":\"Object [%s] not found. Use create-object first.\"}\n", object);
@@ -1154,12 +1137,20 @@ static int cmd_insert_v2(const char *db_root, const char *object,
     enum IndexType idx_types[MAX_FIELDS];
     load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
-    SearchCriterion *crit = NULL;
-    int ncrit = 0;
-    if (if_json && parse_criteria_json(if_json, &crit, &ncrit) != 0) {
-        free(typed_buf);
-        OUT("{\"error\":\"invalid if condition\"}\n");
-        return 1;
+    FieldSchema cas_fs;
+    init_field_schema(&cas_fs, db_root, object);
+    char cas_err[256];
+    CriteriaNode *cas_tree = NULL;
+    if (if_json) {
+        cas_tree = cas_prepare_tree(if_json, cas_fs.ts, 1,
+                                    cas_err, sizeof(cas_err));
+        if (!cas_tree && cas_err[0]) {
+            LOG_WARN(LOG_SUB_SLOTCASK, "insert if rejected: %s", cas_err);
+            free(typed_buf);
+            OUT("{\"error\":\"invalid if condition\"}\n");
+            return 1;
+        }
+        /* cas_tree NULL with empty cas_err = vacuous pass ([]). */
     }
 
     V2InsertCtx ctx = {
@@ -1168,7 +1159,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         .idx_types = idx_types,
         .value_json = value,
         .idx_ts = ts,
-        .crit = crit, .ncrit = ncrit,
+        .cas_tree = cas_tree, .cas_fs = &cas_fs,
     };
     compute_hash_raw(key, klen, ctx.hash);
     int durability_pending = 0;
@@ -1221,13 +1212,13 @@ static int cmd_insert_v2(const char *db_root, const char *object,
             cur ? cur : "null");
         free(cur);
         free(result.current_value);
-        free_criteria(crit, ncrit);
+        free_criteria_tree(cas_tree);
         free(typed_buf);
         return 1;
     }
     if (rc != 0) {
         free(result.current_value);
-        free_criteria(crit, ncrit);
+        free_criteria_tree(cas_tree);
         free(typed_buf);
         if (ctx.err_buf[0]) {
             OUT("{\"error\":\"%s\"}\n", ctx.err_buf);
@@ -1239,7 +1230,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
 
     if (durability_pending) {
         free(result.current_value);
-        free_criteria(crit, ncrit);
+        free_criteria_tree(cas_tree);
         free(typed_buf);
         OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
         return 1;
@@ -1252,7 +1243,22 @@ static int cmd_insert_v2(const char *db_root, const char *object,
             result.was_update ? "UPDATE" : "INSERT", object, wire_key);
 
     free(result.current_value);
-    free_criteria(crit, ncrit);
+    free_criteria_tree(cas_tree);
+    if (return_record) {
+        /* typed_buf was mutated in place by the auto_create transfer
+           before the upsert — it IS the committed record. */
+        char *rec = typed_decode(ts, typed_buf, (uint32_t)vlen,
+                                 SREC_FLAG_NULLMAP);
+        free(typed_buf);
+        if (rec)
+            OUT("{\"status\":\"%s\",\"key\":\"%s\",\"record\":%s}\n",
+                result.was_update ? "updated" : "inserted", wire_key, rec);
+        else
+            OUT("{\"status\":\"%s\",\"key\":\"%s\"}\n",
+                result.was_update ? "updated" : "inserted", wire_key);
+        free(rec);
+        return 0;
+    }
     free(typed_buf);
     OUT("{\"status\":\"%s\",\"key\":\"%s\"}\n",
         result.was_update ? "updated" : "inserted", wire_key);
@@ -1263,10 +1269,10 @@ static int cmd_insert_v2(const char *db_root, const char *object,
 
 int cmd_insert(const char *db_root, const char *object,
                const char *key, size_t klen, const char *value,
-               const char *if_json, int if_not_exists) {
+               const char *if_json, int if_not_exists, int return_record) {
     Schema sc = load_schema(db_root, object);
     return cmd_insert_v2(db_root, object, key, klen, value, if_json,
-                         if_not_exists, &sc);
+                          if_not_exists, return_record, &sc);
 }
 
 /* ========== PARTIAL UPDATE — v2 (slotcask) helper ==========
@@ -1295,8 +1301,8 @@ typedef struct {
     /* CAS criteria — verified inside check_fn under the kf-shard wrlock
        so the check + commit are atomic against concurrent writers. NULL
        when the caller didn't pass `if`. */
-    SearchCriterion  *crit;
-    int               ncrit;
+    CriteriaNode     *cas_tree;
+    FieldSchema      *cas_fs;
     /* Populated by slotcask BEFORE pre_commit (bitmap addresses records
        by physical slot, not by hash). */
     int               kf_shard;
@@ -1312,7 +1318,21 @@ typedef struct {
     /* OLD record generation (segment header byte 19) — captured by the
        check_fn alongside saved_old_value. */
     uint8_t           old_hdr2;
+    /* F4 return_record: set from the request flag; ret_buf holds a copy
+       of the final NEW record (filled at the end of
+       v2_update_new_from_old) for the success response. Zeroed by the
+       ctx initializer. */
+    int               return_record;
+    uint8_t          *ret_buf;
 } V2UpdateCtx;
+
+/* Parsed computed-field spec for one update (conditional-writes F1).
+   op: 0 = none, 1 = $incr, 2 = $copy. */
+typedef struct {
+    int  op;
+    char literal[128];   /* $incr: literal span, quotes stripped */
+    int  src_idx;        /* $copy: sibling TypedField index */
+} V2FieldCompute;
 
 /* NEW-from-OLD constructor for single partial updates. Runs inside
    upsert_slow_path while the kf-shard write lock is held, after
@@ -1464,6 +1484,7 @@ int update_compose_new_from_old(const TypedSchema *ts,
             continue;
         }
         if (field_vals && field_vals[i]) {
+            if (f->type != FT_VARCHAR && field_vals[i][0] == '{') return -2;
             encode_field(f, field_vals[i], dst);   /* bit already clear */
             continue;
         }
@@ -1537,96 +1558,391 @@ void update_stamp_auto_update_fields(const TypedSchema *ts, uint8_t *out_buf) {
     }
 }
 
-static int v2_update_new_from_old(const SlotcaskOldRecord *old,
-                                  uint8_t *out_value,
-                                  size_t out_capacity,
-                                  size_t *out_vlen,
-                                  void *ctx_ptr) {
-    V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
-    if (!old || !out_value || !out_vlen || old->vlen > out_capacity) return -1;
-    /* Stash OLD so apply_commit can compute the index diff without
-       re-reading (the two-phase hook signature doesn't carry OLD). */
-    c->saved_old_value = old->value;
-    c->saved_old_vlen  = old->vlen;
-    c->old_hdr2        = old->hdr2;
-#ifdef TEST_BUILD
-    /* Fixed-path seam: deterministic pause at the top of the under-lock
-       callback, after OLD has been received. Reports under_kf_wrlock == 1. */
-    slotcask_test_after_old(1);
-#endif
-    if ((size_t)c->idx_ts->total_size > out_capacity) return -1;
-
-    /* Per-field null detection on the raw request spans. */
-    const char *field_names[MAX_FIELDS];
-    char *field_vals[MAX_FIELDS] = {0};
-    enum FieldType field_types[MAX_FIELDS];
-    uint8_t field_null[MAX_FIELDS] = {0};
-    for (int i = 0; i < c->idx_ts->nfields; i++) {
-        field_names[i] = c->idx_ts->fields[i].name;
-        field_types[i] = c->idx_ts->fields[i].type;
-    }
-    if (json_get_fields_null_aware(c->partial_json, field_names,
-                                   c->idx_ts->nfields, field_types,
-                                   field_vals, field_null) != 0) {
-        /* At least one field the client explicitly named had a malformed
-           JSON escape. Reject the whole update rather than silently
-           applying every other field and dropping this one — a partial
-           write here would look like success to the caller. */
-        for (int i = 0; i < c->idx_ts->nfields; i++) free(field_vals[i]);
-        snprintf(c->err_buf, sizeof(c->err_buf),
-                 "malformed JSON escape in one or more field values");
+/* Parse a raw value span that starts with '{' into a computed-field
+   spec. Exactly one of $incr / $copy must be present; any other member
+   is rejected. Returns 0 and fills *out; on failure returns -1 with a
+   whole-request error in err_buf. is_computed marks fields already
+   parsed as computed in this request — a $copy source may not name
+   one. */
+static int parse_computed_span(const TypedSchema *ts,
+                               const char *field_name, const char *span,
+                               const uint8_t *is_computed,
+                               V2FieldCompute *out,
+                               char *err_buf, size_t err_sz) {
+    JsonObj o;
+    if (json_parse_object(span, strlen(span), &o) != 1 || o.n != 1)
+        goto malformed;
+    char *incr = json_obj_strdup_raw(&o, "$incr");
+    char *copy = json_obj_strdup_raw(&o, "$copy");
+    if (incr && copy) {
+        free(incr); free(copy);
+        snprintf(err_buf, err_sz,
+                 "field '%s': computed value must hold exactly one of "
+                 "$incr / $copy", field_name);
         return -1;
     }
-
-    /* Varchar-overflow rejection stays single-update policy: reject the
-       whole write rather than silently truncating (bulk forms keep the
-       historical encode_field truncation inside the shared composer). */
-    for (int i = 0; i < c->idx_ts->nfields; i++) {
-        TypedField *f = &c->idx_ts->fields[i];
-        if (f->removed || !field_vals[i]) continue;
-        if (f->type != FT_VARCHAR) continue;
-        int content_max = f->size - 2;
-        size_t vlen = strlen(field_vals[i]);
-        if ((int)vlen > content_max) {
-            snprintf(c->err_buf, sizeof(c->err_buf),
-                "value for field '%s' is %zu bytes; exceeds max %d for varchar",
-                f->name, vlen, content_max);
-            for (int j = 0; j < c->idx_ts->nfields; j++) free(field_vals[j]);
+    if (!incr && !copy) {
+        snprintf(err_buf, err_sz,
+                 "field '%s': computed value must hold exactly one of "
+                 "$incr / $copy", field_name);
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    int fi = typed_field_index((TypedSchema *)ts, field_name);
+    if (fi < 0) { free(incr); free(copy); goto malformed; }
+    const TypedField *f = &ts->fields[fi];
+    int unsupported = f->type != FT_SHORT && f->type != FT_INT &&
+                      f->type != FT_LONG && f->type != FT_NUMERIC &&
+                      f->type != FT_FLOAT && f->type != FT_DOUBLE;
+    if (unsupported) {
+        free(incr); free(copy);
+        snprintf(err_buf, err_sz,
+                 "field '%s': unsupported type for computed update",
+                 f->name);
+        return -1;
+    }
+    if (incr) {
+        out->op = 1;
+        size_t n = strlen(incr);
+        if (n >= 2 && incr[0] == '"' && incr[n - 1] == '"') {
+            memmove(incr, incr + 1, n - 2);
+            incr[n - 2] = '\0';
+        }
+        if (!incr[0] || strlen(incr) >= sizeof(out->literal)) {
+            free(incr); free(copy);
+            snprintf(err_buf, err_sz,
+                     "field '%s': bad computed literal", f->name);
             return -1;
         }
+        memcpy(out->literal, incr, strlen(incr) + 1);
+    } else {
+        out->op = 2;
+        size_t n = strlen(copy);
+        char src[256]; char *decoded = NULL; size_t dlen = 0;
+        if (n < 2 || copy[0] != '"' || copy[n - 1] != '"' ||
+            json_unescape_cstring(copy + 1, n - 2, &decoded, &dlen) != 0 ||
+            dlen >= sizeof(src)) {
+            free(decoded); free(incr); free(copy); goto malformed;
+        }
+        memcpy(src, decoded, dlen); src[dlen] = '\0'; free(decoded);
+        int si = typed_field_index((TypedSchema *)ts, src);
+        if (si < 0) {
+            free(incr); free(copy);
+            /* src is client-controlled text — formatted RAW here; the wire
+               emission JSON-escapes err_buf once, after any truncation, so
+               an escape sequence can never be cut in half. */
+            snprintf(err_buf, err_sz,
+                     "field '%s': $copy source '%s' is not a field",
+                     f->name, src);
+            return -1;
+        }
+        if (is_computed && is_computed[si]) {
+            free(incr); free(copy);
+            snprintf(err_buf, err_sz,
+                     "field '%s': $copy source '%s' is itself computed",
+                     f->name, src);
+            return -1;
+        }
+        const TypedField *sf = &ts->fields[si];
+        if (sf->type != f->type || sf->size != f->size ||
+            (f->type == FT_NUMERIC &&
+             sf->numeric_scale != f->numeric_scale)) {
+            free(incr); free(copy);
+            snprintf(err_buf, err_sz,
+                     "field '%s': $copy type mismatch with '%s'",
+                     f->name, src);
+            return -1;
+        }
+        out->src_idx = si;
     }
+    free(incr);
+    free(copy);
+    return 0;
+malformed:
+    snprintf(err_buf, err_sz,
+             "field '%s': malformed computed value object", field_name);
+    return -1;
+}
 
-    /* An explicit JSON null on a constrained field rejects the whole
-       update before any kf write or commit marker. Carry-forward cannot
-       produce NULL here — the edit gate refuses :not_null on a field
-       that still holds NULL rows. Tombstoned fields are ignored: their
-       spec is inert, and their bytes stay reserved until vacuum. */
+/* Apply parsed computed fields to NEW (out_value), reading currents
+   from the lock-protected OLD. Called after
+   update_compose_new_from_old (computed slots carry OLD then) and
+   before auto_update stamping, inside the same kf-wrlock hold as the
+   CAS check. Results are written as final field bytes: BE int64 for
+   integer/numeric, host order for float/double (the record layout's
+   own convention). Returns 0, or -1 with err_buf set — the caller
+   aborts the whole update (nothing has been written yet). */
+static int apply_computed_fields(const TypedSchema *ts,
+                                 const SlotcaskOldRecord *old,
+                                 uint8_t *out_value,
+                                 const V2FieldCompute *comp,
+                                 char *err_buf, size_t err_sz) {
+    const uint8_t *o_base; const uint8_t *o_bm; int o_bm_bytes;
+    size_t o_region;
+    if (typed_record_view(old->value, (size_t)old->vlen, old->hdr2,
+                          &o_base, &o_bm, &o_bm_bytes, &o_region) != 0) {
+        snprintf(err_buf, err_sz, "corrupt record header on update target");
+        return -1;
+    }
+    int nbm_bytes = typed_nullmap_bytes(ts->nfields);
+    for (int i = 0; i < ts->nfields; i++) {
+        if (ts->fields[i].removed || comp[i].op == 0) continue;
+        const TypedField *f = &ts->fields[i];
+        uint8_t *dst = out_value + ts->nullmap_prefix + (size_t)f->offset;
+        const uint8_t *src = ((size_t)f->offset + (size_t)f->size > o_region)
+            ? NULL : o_base + f->offset;
+        uint8_t cur[16];
+        memset(cur, 0, sizeof(cur));
+        if (src) memcpy(cur, src, (size_t)f->size);
+        int old_is_null = (old->hdr2 & SREC_FLAG_NULLMAP)
+            ? typed_field_null(o_bm, o_bm_bytes, i)
+            : legacy_field_absent(f, cur);
+        if (comp[i].op == 2) {
+            int si = comp[i].src_idx;
+            const TypedField *sf = &ts->fields[si];
+            const uint8_t *ssrc =
+                ((size_t)sf->offset + (size_t)sf->size > o_region)
+                ? NULL : o_base + sf->offset;
+            uint8_t source_bytes[16] = {0};
+            if (ssrc) memcpy(source_bytes, ssrc, (size_t)sf->size);
+            int src_null = (old->hdr2 & SREC_FLAG_NULLMAP)
+                ? typed_field_null(o_bm, o_bm_bytes, si)
+                : legacy_field_absent(sf, source_bytes);
+            if (src_null) {
+                snprintf(err_buf, err_sz,
+                         "field '%s' is NULL; cannot apply computed update",
+                         sf->name);
+                return -1;
+            }
+            /* D4: a NULL current value rejects computed ops — $copy
+               included. Copying over NULL would silently clear NULL. */
+            if (old_is_null) {
+                snprintf(err_buf, err_sz,
+                         "field '%s' is NULL; cannot apply computed update",
+                         f->name);
+                return -1;
+            }
+            /* Non-finite source bytes would silently move NaN/Inf into
+               the target — the computed-update guarantee rejects
+               non-finite values, copying included. */
+            if (f->type == FT_FLOAT || f->type == FT_DOUBLE) {
+                double sv = 0.0;
+                if (f->type == FT_FLOAT) {
+                    float fv;
+                    memcpy(&fv, source_bytes, 4);
+                    sv = (double)fv;
+                } else {
+                    memcpy(&sv, source_bytes, 8);
+                }
+                if (!isfinite(sv)) {
+                    snprintf(err_buf, err_sz,
+                             "field '%s' is not finite; cannot apply "
+                             "computed update", sf->name);
+                    return -1;
+                }
+            }
+            memcpy(dst, source_bytes, (size_t)f->size);
+            typed_clear_null(out_value + 1, nbm_bytes, i);
+            continue;
+        }
+        /* $incr */
+        if (old_is_null) {
+            snprintf(err_buf, err_sz,
+                     "field '%s' is NULL; cannot apply computed update",
+                     f->name);
+            return -1;
+        }
+        if (f->type == FT_SHORT || f->type == FT_INT || f->type == FT_LONG) {
+            int w = f->size;
+            uint64_t raw = 0;
+            for (int b = 0; b < w; b++) raw = (raw << 8) | cur[b];
+            /* Extend the sign in unsigned space before copying bits.
+               Shifting unsigned left then right would ZERO-extend. */
+            if (w < 8 && (cur[0] & 0x80)) raw |= UINT64_MAX << (w * 8);
+            int64_t v;
+            memcpy(&v, &raw, sizeof(v));
+            errno = 0;
+            char *end = NULL;
+            long long d = strtoll(comp[i].literal, &end, 10);
+            if (end == comp[i].literal || *end || errno == ERANGE) goto badliteral;
+            int64_t r;
+            if (__builtin_add_overflow(v, (int64_t)d, &r)) goto overflow;
+            int64_t hi = (w == 2) ? INT16_MAX
+                       : (w == 4) ? INT32_MAX : INT64_MAX;
+            int64_t lo = (w == 2) ? INT16_MIN
+                       : (w == 4) ? INT32_MIN : INT64_MIN;
+            if (r < lo || r > hi) goto overflow;
+            uint64_t be = (uint64_t)r;
+            for (int b = 0; b < w; b++)
+                dst[b] = (uint8_t)(be >> (8 * (w - 1 - b)));
+            typed_clear_null(out_value + 1, nbm_bytes, i);
+        } else if (f->type == FT_NUMERIC) {
+            uint64_t raw = 0;
+            for (int b = 0; b < 8; b++) raw = (raw << 8) | cur[b];
+            int64_t v = (int64_t)raw;
+            const char *s = comp[i].literal;
+            int neg = 0;
+            if (*s == '-') { neg = 1; s++; }
+            else if (*s == '+') s++;
+            const char *dot = strchr(s, '.');
+            size_t intlen = dot ? (size_t)(dot - s) : strlen(s);
+            size_t frlen  = dot ? strlen(dot + 1) : 0;
+            if (frlen > (size_t)f->numeric_scale) goto badliteral;
+            if (!intlen && !frlen) goto badliteral;
+            uint64_t magnitude = 0;
+            for (size_t b = 0; b < intlen; b++) {
+                if (s[b] < '0' || s[b] > '9') goto badliteral;
+                if (__builtin_mul_overflow(magnitude, UINT64_C(10), &magnitude) ||
+                    __builtin_add_overflow(magnitude, (uint64_t)(s[b] - '0'),
+                                           &magnitude)) goto overflow;
+            }
+            /* Append fraction, then pad to S. Scale exactly ONCE. */
+            for (size_t b = 0; b < (size_t)f->numeric_scale; b++) {
+                uint64_t digit = 0;
+                if (b < frlen) {
+                    if (dot[1 + b] < '0' || dot[1 + b] > '9') goto badliteral;
+                    digit = (uint64_t)(dot[1 + b] - '0');
+                }
+                if (__builtin_mul_overflow(magnitude, UINT64_C(10), &magnitude) ||
+                    __builtin_add_overflow(magnitude, digit, &magnitude)) goto overflow;
+            }
+            uint64_t limit = (uint64_t)INT64_MAX + (neg ? 1u : 0u);
+            if (magnitude > limit) goto overflow;
+            int64_t scaled = neg
+                ? (magnitude == (uint64_t)INT64_MAX + 1u
+                    ? INT64_MIN : -(int64_t)magnitude)
+                : (int64_t)magnitude;
+            int64_t r;
+            if (__builtin_add_overflow(v, scaled, &r)) goto overflow;
+            uint64_t be = (uint64_t)r;
+            for (int b = 0; b < 8; b++)
+                dst[b] = (uint8_t)(be >> (8 * (7 - b)));
+            typed_clear_null(out_value + 1, nbm_bytes, i);
+        } else {   /* FT_FLOAT / FT_DOUBLE */
+            double v;
+            if (f->type == FT_FLOAT) {
+                float fv = 0.0f;
+                memcpy(&fv, cur, 4);
+                v = (double)fv;
+            } else {
+                memcpy(&v, cur, 8);
+            }
+            errno = 0;
+            char *end = NULL;
+            double d = strtod(comp[i].literal, &end);
+            if (end == comp[i].literal || *end || errno == ERANGE) goto badliteral;
+            v += d;
+            if (!isfinite(v)) goto overflow;
+            if (f->type == FT_FLOAT) {
+                float fv = (float)v;
+                if (!isfinite(fv)) goto overflow;
+                memcpy(dst, &fv, 4);
+            } else {
+                memcpy(dst, &v, 8);
+            }
+            typed_clear_null(out_value + 1, nbm_bytes, i);
+        }
+        continue;
+overflow:
+        snprintf(err_buf, err_sz,
+                 "field '%s': computed update overflows %s", f->name,
+                 f->type == FT_NUMERIC ? "numeric" : "integer");
+        return -1;
+badliteral:
+        snprintf(err_buf, err_sz, "field '%s': bad computed literal",
+                 f->name);
+        return -1;
+    }
+    return 0;
+}
+
+static int v2_update_new_from_old(const SlotcaskOldRecord *old,
+                                  uint8_t *out_value, size_t out_capacity,
+                                  size_t *out_vlen, void *ctx_ptr) {
+    V2UpdateCtx *c = ctx_ptr;
+    if (!old || !out_value || !out_vlen || old->vlen > out_capacity ||
+        (size_t)c->idx_ts->total_size > out_capacity) return -1;
+    c->saved_old_value = old->value;
+    c->saved_old_vlen = old->vlen;
+    c->old_hdr2 = old->hdr2;
+#ifdef TEST_BUILD
+    slotcask_test_after_old(1);
+#endif
+    JsonObj patch;
+    if (json_parse_object(c->partial_json, strlen(c->partial_json), &patch) < 0) {
+        snprintf(c->err_buf, sizeof(c->err_buf), "invalid update value");
+        return -1;
+    }
+    V2FieldCompute comp[MAX_FIELDS] = {0};
+    uint8_t is_computed[MAX_FIELDS] = {0};
+    for (int i = 0; i < c->idx_ts->nfields; i++) {
+        const char *v; size_t n;
+        if (!c->idx_ts->fields[i].removed &&
+            json_obj_get(&patch, c->idx_ts->fields[i].name, &v, &n) && n && *v == '{')
+            is_computed[i] = 1;
+    }
+    for (int i = 0; i < c->idx_ts->nfields; i++) {
+        if (!is_computed[i]) continue;
+        char *span = json_obj_strdup_raw(&patch, c->idx_ts->fields[i].name);
+        if (!span) { snprintf(c->err_buf, sizeof(c->err_buf), "oom"); return -1; }
+        int rc = parse_computed_span(c->idx_ts, c->idx_ts->fields[i].name,
+                                     span, is_computed, &comp[i],
+                                     c->err_buf, sizeof(c->err_buf));
+        free(span);
+        if (rc != 0) return -1;
+    }
+    const char *names[MAX_FIELDS];
+    enum FieldType types[MAX_FIELDS];
+    char *values[MAX_FIELDS] = {0}; uint8_t nulls[MAX_FIELDS] = {0};
+    for (int i = 0; i < c->idx_ts->nfields; i++) {
+        names[i] = c->idx_ts->fields[i].name;
+        types[i] = c->idx_ts->fields[i].type;
+    }
+    int parse_rc = json_get_fields_null_aware(c->partial_json, names,
+                         c->idx_ts->nfields, types, values, nulls);
+    if (parse_rc != 0) {
+        snprintf(c->err_buf, sizeof(c->err_buf), "malformed JSON escape in field values");
+        goto reject;
+    }
     for (int i = 0; i < c->idx_ts->nfields; i++) {
         const TypedField *f = &c->idx_ts->fields[i];
-        if (f->removed || !field_null[i] || !f->not_null) continue;
-        for (int j = 0; j < c->idx_ts->nfields; j++) free(field_vals[j]);
-        fmt_not_null_err(f, c->err_buf, sizeof(c->err_buf));
-        return -1;
+        if (f->removed) continue;
+        if (comp[i].op) { free(values[i]); values[i] = NULL; continue; }
+        if (f->type == FT_VARCHAR && values[i] && strlen(values[i]) > (size_t)f->size - 2) {
+            snprintf(c->err_buf, sizeof(c->err_buf),
+                     "value for field '%s' is %zu bytes; exceeds max %d for varchar",
+                     f->name, strlen(values[i]), f->size - 2);
+            goto reject;
+        }
+        if (nulls[i] && f->not_null) {
+            fmt_not_null_err(f, c->err_buf, sizeof(c->err_buf)); goto reject;
+        }
     }
-
-    int crc = update_compose_new_from_old(c->idx_ts, old, out_value,
-                                          field_vals, field_null);
-    for (int i = 0; i < c->idx_ts->nfields; i++) free(field_vals[i]);
-    if (crc != 0) {
-        snprintf(c->err_buf, sizeof(c->err_buf),
-                 "corrupt record header on update target");
-        return -1;
+    if (update_compose_new_from_old(c->idx_ts, old, out_value, values, nulls) != 0) {
+        snprintf(c->err_buf, sizeof(c->err_buf), "corrupt record header on update target");
+        goto reject;
     }
+    for (int i = 0; i < c->idx_ts->nfields; i++) { free(values[i]); values[i] = NULL; }
+    if (apply_computed_fields(c->idx_ts, old, out_value, comp,
+                              c->err_buf, sizeof(c->err_buf)) != 0) return -1;
     update_stamp_auto_update_fields(c->idx_ts, out_value);
-    *out_vlen = (size_t)c->idx_ts->total_size;   /* full nullmap record */
+    *out_vlen = (size_t)c->idx_ts->total_size;
+    if (c->return_record) {
+        c->ret_buf = malloc(*out_vlen);
+        if (c->ret_buf) memcpy(c->ret_buf, out_value, *out_vlen);
+    }
     return 0;
+reject:
+    for (int i = 0; i < c->idx_ts->nfields; i++) free(values[i]);
+    return -1;
 }
 
 static int v2_update_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
     if (!old) return 0;  /* require_existing handles this, but defensive */
-    if (c->crit && c->ncrit > 0 &&
-        !cas_check(c->idx_ts, old->value, (int)old->vlen, old->hdr2, c->crit, c->ncrit)) return 0;
+    if (c->cas_tree &&
+        !cas_check_tree(c->cas_fs, old->value, (int)old->vlen, old->hdr2,
+                        c->cas_tree)) return 0;
     return 1;
 }
 
@@ -1864,7 +2180,8 @@ static void v2_update_abort_commit(void *ctx_ptr) {
 static int cmd_update_v2(const char *db_root, const char *object,
                          const char *key, size_t klen,
                          const char *partial_json,
-                         const char *if_json, int dry_run, const Schema *sc) {
+                         const char *if_json, int dry_run,
+                         int return_record, const Schema *sc) {
     SlotcaskSchemaInfo info = {
         .splits = sc->splits, .slot_size = sc->slot_size,
         .streams = sc->streams,
@@ -1910,14 +2227,20 @@ static int cmd_update_v2(const char *db_root, const char *object,
         slotcask_test_after_old(0);
 #endif
         if (if_json) {
-            SearchCriterion *crit = NULL; int ncrit = 0;
-            if (parse_criteria_json(if_json, &crit, &ncrit) != 0) {
+            FieldSchema cas_fs;
+            init_field_schema(&cas_fs, db_root, object);
+            char cas_err[256];
+            CriteriaNode *cas_tree = cas_prepare_tree(if_json, cas_fs.ts, 1,
+                                                      cas_err, sizeof(cas_err));
+            if (!cas_tree && cas_err[0]) {
+                LOG_WARN(LOG_SUB_SLOTCASK, "update if rejected: %s", cas_err);
                 free(old_val);
                 OUT("{\"error\":\"invalid if condition\"}\n");
                 return 1;
             }
-            int pass = cas_check(ts, old_val, (int)old_vlen, old_hdr2, crit, ncrit);
-            free_criteria(crit, ncrit);
+            int pass = cas_check_tree(&cas_fs, old_val, (int)old_vlen,
+                                      old_hdr2, cas_tree);
+            free_criteria_tree(cas_tree);
             if (!pass) {
                 char *cur = typed_decode(ts, old_val, (uint32_t)old_vlen, old_hdr2);
                 OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
@@ -1934,16 +2257,24 @@ static int cmd_update_v2(const char *db_root, const char *object,
     }
 
     /* Parse `if` once before the lock-protected callback; check_fn runs
-       cas_check under the kf-shard wrlock so the verify + commit are atomic
-       against concurrent writers. Note the intentional precedence shift:
-       when both the partial field JSON and the `if` criteria are invalid,
-       this now reports "invalid if condition" first — the field parsing
-       happens inside the callback under the lock. */
-    SearchCriterion *crit = NULL;
-    int ncrit = 0;
-    if (if_json && parse_criteria_json(if_json, &crit, &ncrit) != 0) {
-        OUT("{\"error\":\"invalid if condition\"}\n");
-        return 1;
+       cas_check_tree under the kf-shard wrlock so the verify + commit are
+       atomic against concurrent writers. Note the intentional precedence
+       shift: when both the partial field JSON and the `if` criteria are
+       invalid, this now reports "invalid if condition" first — the field
+       parsing happens inside the callback under the lock. */
+    FieldSchema cas_fs;
+    init_field_schema(&cas_fs, db_root, object);
+    char cas_err[256];
+    CriteriaNode *cas_tree = NULL;
+    if (if_json) {
+        cas_tree = cas_prepare_tree(if_json, cas_fs.ts, 1,
+                                    cas_err, sizeof(cas_err));
+        if (!cas_tree && cas_err[0]) {
+            LOG_WARN(LOG_SUB_SLOTCASK, "update if rejected: %s", cas_err);
+            OUT("{\"error\":\"invalid if condition\"}\n");
+            return 1;
+        }
+        /* cas_tree NULL with empty cas_err = vacuous pass ([]). */
     }
 
     char idx_fields[MAX_FIELDS][256];
@@ -1959,7 +2290,8 @@ static int cmd_update_v2(const char *db_root, const char *object,
         .idx_types = idx_types,
         .idx_ts = ts,
         .partial_json = partial_json,
-        .crit = crit, .ncrit = ncrit,
+        .cas_tree = cas_tree, .cas_fs = &cas_fs,
+        .return_record = return_record,
     };
     compute_hash_raw(key, klen, ctx.hash);
     int durability_pending = 0;
@@ -2001,14 +2333,35 @@ static int cmd_update_v2(const char *db_root, const char *object,
             OUT("{\"error\":\"Not found\"}\n");
         }
         free(result.current_value);
-        free_criteria(crit, ncrit);
+        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free_criteria_tree(cas_tree);
         return 1;
     }
     if (rc != 0) {
         free(result.current_value);
-        free_criteria(crit, ncrit);
+        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free_criteria_tree(cas_tree);
         if (ctx.err_buf[0]) {
-            OUT("{\"error\":\"%s\"}\n", ctx.err_buf);
+            /* Escape once, after any truncation: producers format raw
+               client text into err_buf. The stack buffer holds the
+               mathematical worst case (6 escaped bytes per input byte +
+               NUL), so no allocation and no overflow is possible — on
+               any escape failure emit a static message, because raw
+               client-controlled text must never reach the wire. */
+            char esc[sizeof(ctx.err_buf) * 6 + 1];
+            int n = json_escape_into(esc, sizeof(esc),
+                                     ctx.err_buf, strlen(ctx.err_buf));
+            if (n >= 0) esc[n] = '\0';  /* helper writes no terminator */
+#ifdef TEST_BUILD
+            if (atomic_load(&g_shard_test_json_escape_fail)) n = -1;
+#endif
+            if (n >= 0) {
+                OUT("{\"error\":\"%s\"}\n", esc);
+            } else {
+                LOG_ERROR(LOG_SUB_SLOTCASK,
+                          "update error escape failed; emitting static fallback");
+                OUT("{\"error\":\"update failed\"}\n");
+            }
         } else {
             OUT("{\"error\":\"update failed\"}\n");
         }
@@ -2016,16 +2369,31 @@ static int cmd_update_v2(const char *db_root, const char *object,
     }
     if (durability_pending) {
         free(result.current_value);
-        free_criteria(crit, ncrit);
+        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free_criteria_tree(cas_tree);
         OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
         return 1;
     }
-    free_criteria(crit, ncrit);
+    free_criteria_tree(cas_tree);
 
     char wire_key[1100];
     format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
     LOG_INFO(LOG_SUB_SLOTCASK, "UPDATE %s.%s (slotcask)", object, wire_key);
     free(result.current_value);
+    if (return_record && ctx.ret_buf) {
+        char *rec = typed_decode(ts, ctx.ret_buf, (uint32_t)ts->total_size,
+                                 SREC_FLAG_NULLMAP);
+        free(ctx.ret_buf);
+        ctx.ret_buf = NULL;
+        if (rec) {
+            OUT("{\"status\":\"updated\",\"key\":\"%s\",\"record\":%s}\n",
+                wire_key, rec);
+            free(rec);
+            return 0;
+        }
+    }
+    free(ctx.ret_buf);
+    ctx.ret_buf = NULL;
     OUT("{\"status\":\"updated\",\"key\":\"%s\"}\n", wire_key);
     return 0;
 }
@@ -2033,12 +2401,11 @@ static int cmd_update_v2(const char *db_root, const char *object,
 /* ========== PARTIAL UPDATE ========== */
 
 int cmd_update(const char *db_root, const char *object,
-               const char *key, size_t klen,
-               const char *partial_json,
-               const char *if_json, int dry_run) {
+               const char *key, size_t klen, const char *partial_json,
+               const char *if_json, int dry_run, int return_record) {
     Schema sc = load_schema(db_root, object);
     return cmd_update_v2(db_root, object, key, klen, partial_json,
-                         if_json, dry_run, &sc);
+                          if_json, dry_run, return_record, &sc);
 }
 
 /* ========== DELETE — v2 (slotcask) helper ========== */
@@ -2052,18 +2419,35 @@ typedef struct {
     int               nidx;
     enum IndexType   *idx_types;
     TypedSchema      *idx_ts;
-    SearchCriterion  *crit;
-    int               ncrit;
+    CriteriaNode     *cas_tree;
+    FieldSchema      *cas_fs;
     int               kf_shard;     /* populated by slotcask before pre_commit */
     uint32_t          kf_slot;
     char              err_buf[256];
+    /* F4 return_record: ret_buf holds a copy of the removed OLD record,
+       captured by v2_delete_check_fn (slotcask_delete_with_hooks does
+       NOT populate result.current_value on success). Zeroed by the ctx
+       initializer. */
+    int               return_record;
+    uint8_t          *ret_buf;
+    size_t            ret_len;
+    uint8_t           ret_hdr2;
 } V2DeleteCtx;
 
 static int v2_delete_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     V2DeleteCtx *c = (V2DeleteCtx *)ctx_ptr;
-    if (c->ncrit > 0) {
+    if (old && c->return_record && !c->ret_buf) {
+        c->ret_buf = malloc(old->vlen);
+        if (c->ret_buf) {
+            memcpy(c->ret_buf, old->value, old->vlen);
+            c->ret_len = old->vlen;
+            c->ret_hdr2 = old->hdr2;
+        }
+    }
+    if (c->cas_tree) {
         if (!old) return 0;
-        if (!cas_check(c->idx_ts, old->value, (int)old->vlen, old->hdr2, c->crit, c->ncrit)) return 0;
+        if (!cas_check_tree(c->cas_fs, old->value, (int)old->vlen,
+                            old->hdr2, c->cas_tree)) return 0;
     }
     return 1;
 }
@@ -2169,7 +2553,7 @@ static int v2_delete_apply_commit(const SlotcaskOldRecord *old,
 static int cmd_delete_v2(const char *db_root, const char *object,
                          const char *key, size_t klen,
                          const char *if_json, int dry_run,
-                         const Schema *sc) {
+                         int return_record, const Schema *sc) {
     char wire_key[1100];
     format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
 
@@ -2210,21 +2594,27 @@ static int cmd_delete_v2(const char *db_root, const char *object,
             return 0;
         }
         if (if_json) {
-            SearchCriterion *crit = NULL; int ncrit = 0;
-            if (parse_criteria_json(if_json, &crit, &ncrit) != 0) {
+            FieldSchema cas_fs;
+            init_field_schema(&cas_fs, db_root, object);
+            char cas_err[256];
+            CriteriaNode *cas_tree = cas_prepare_tree(if_json, cas_fs.ts, 1,
+                                                      cas_err, sizeof(cas_err));
+            if (!cas_tree && cas_err[0]) {
+                LOG_WARN(LOG_SUB_SLOTCASK, "delete if rejected: %s", cas_err);
                 free(val);
                 OUT("{\"error\":\"invalid if condition\"}\n");
                 return 1;
             }
-            int pass = cas_check(ts, val, (int)vlen, cur_hdr2, crit, ncrit);
+            int pass = cas_check_tree(&cas_fs, val, (int)vlen, cur_hdr2,
+                                      cas_tree);
             if (!pass) {
                 char *cur = typed_decode(ts, val, (uint32_t)vlen, cur_hdr2);
                 OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
                     cur ? cur : "null");
-                free(cur); free(val); free_criteria(crit, ncrit);
+                free(cur); free(val); free_criteria_tree(cas_tree);
                 return 1;
             }
-            free_criteria(crit, ncrit);
+            free_criteria_tree(cas_tree);
         }
         free(val);
         OUT("{\"status\":\"would_delete\",\"key\":\"%s\"}\n", wire_key);
@@ -2238,11 +2628,19 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     enum IndexType idx_types[MAX_FIELDS];
     load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
-    SearchCriterion *crit = NULL;
-    int ncrit = 0;
-    if (if_json && parse_criteria_json(if_json, &crit, &ncrit) != 0) {
-        OUT("{\"error\":\"invalid if condition\"}\n");
-        return 1;
+    FieldSchema cas_fs;
+    init_field_schema(&cas_fs, db_root, object);
+    char cas_err[256];
+    CriteriaNode *cas_tree = NULL;
+    if (if_json) {
+        cas_tree = cas_prepare_tree(if_json, cas_fs.ts, 1,
+                                    cas_err, sizeof(cas_err));
+        if (!cas_tree && cas_err[0]) {
+            LOG_WARN(LOG_SUB_SLOTCASK, "delete if rejected: %s", cas_err);
+            OUT("{\"error\":\"invalid if condition\"}\n");
+            return 1;
+        }
+        /* cas_tree NULL with empty cas_err = vacuous pass ([]). */
     }
 
     V2DeleteCtx ctx = {
@@ -2250,7 +2648,8 @@ static int cmd_delete_v2(const char *db_root, const char *object,
         .idx_fields = idx_fields, .nidx = nidx,
         .idx_types = idx_types,
         .idx_ts = ts,
-        .crit = crit, .ncrit = ncrit,
+        .cas_tree = cas_tree, .cas_fs = &cas_fs,
+        .return_record = return_record,
     };
     compute_hash_raw(key, klen, ctx.hash);
     int durability_degraded = 0;
@@ -2260,9 +2659,10 @@ static int cmd_delete_v2(const char *db_root, const char *object,
        primitive doesn't know that and reads OLD anyway. Combined with
        skip_old_read on non-indexed paths, a plain DELETE bypasses
        read_record_value entirely. */
-    int has_cas = (crit && ncrit > 0);
+    int has_cas = (cas_tree != NULL);
     SlotcaskDeleteOpts opts = {
-        .check              = has_cas ? v2_delete_check_fn : NULL,
+        .check              = (has_cas || return_record)
+                                  ? v2_delete_check_fn : NULL,
         .check_ctx          = &ctx,
         .apply_commit       = (nidx > 0) ? v2_delete_apply_commit : NULL,
         .pre_commit_ctx     = &ctx,
@@ -2275,7 +2675,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
            non-CAS delete, opt out of read_record_value — saves a
            segcache_acquire + 100B memcpy + malloc/free per call.
            v2_delete_apply_commit handles old=NULL. */
-        .skip_old_read      = (nidx == 0),
+        .skip_old_read      = (nidx == 0 && !return_record),
     };
     SlotcaskDeleteResult result = {0};
     int rc = slotcask_delete_with_hooks(sdb, key, klen, &opts, &result);
@@ -2283,7 +2683,8 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     if (result.not_found) {
         OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", wire_key);
         free(result.current_value);
-        free_criteria(crit, ncrit);
+        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free_criteria_tree(cas_tree);
         return 0;
     }
     if (rc == -2 && result.condition_not_met) {
@@ -2292,12 +2693,15 @@ static int cmd_delete_v2(const char *db_root, const char *object,
             : NULL;
         OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
             cur ? cur : "null");
-        free(cur); free(result.current_value); free_criteria(crit, ncrit);
+        free(cur); free(result.current_value);
+        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free_criteria_tree(cas_tree);
         return 1;
     }
     if (rc != 0) {
         free(result.current_value);
-        free_criteria(crit, ncrit);
+        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free_criteria_tree(cas_tree);
         if (ctx.err_buf[0])
             OUT("{\"error\":\"%s\"}\n", ctx.err_buf);
         else
@@ -2308,11 +2712,26 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     update_counts(db_root, object, -1, 1);
     LOG_INFO(LOG_SUB_SLOTCASK, "DELETE %s.%s (slotcask)", object, wire_key);
     free(result.current_value);
-    free_criteria(crit, ncrit);
+    free_criteria_tree(cas_tree);
     if (durability_degraded) {
+        free(ctx.ret_buf);
         OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
         return 1;
     }
+    if (return_record && ctx.ret_buf) {
+        char *rec = typed_decode(ts, ctx.ret_buf, (uint32_t)ctx.ret_len,
+                                 ctx.ret_hdr2);
+        free(ctx.ret_buf);
+        ctx.ret_buf = NULL;
+        if (rec) {
+            OUT("{\"status\":\"deleted\",\"key\":\"%s\",\"record\":%s}\n",
+                wire_key, rec);
+            free(rec);
+            return 0;
+        }
+    }
+    free(ctx.ret_buf);
+    ctx.ret_buf = NULL;
     OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", wire_key);
     return 0;
 }
@@ -2321,9 +2740,10 @@ static int cmd_delete_v2(const char *db_root, const char *object,
 
 int cmd_delete(const char *db_root, const char *object,
                const char *key, size_t klen,
-               const char *if_json, int dry_run) {
+               const char *if_json, int dry_run, int return_record) {
     Schema sc = load_schema(db_root, object);
-    return cmd_delete_v2(db_root, object, key, klen, if_json, dry_run, &sc);
+    return cmd_delete_v2(db_root, object, key, klen, if_json,
+                          dry_run, return_record, &sc);
 }
 
 /* ========== MULTI-KEY GET ========== */

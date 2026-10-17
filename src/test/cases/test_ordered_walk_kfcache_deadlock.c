@@ -80,7 +80,7 @@ static void *query_thread_main(void *arg) {
     } else if (a->single_write) {
         char value[] = "{\"F\":2}";
         a->rc = cmd_insert(db_root, a->object, a->writer_key,
-                           strlen(a->writer_key), value, NULL, 0);
+                           strlen(a->writer_key), value, NULL, 0, 0);
     } else {
         char bulk[256];
         snprintf(bulk, sizeof(bulk),

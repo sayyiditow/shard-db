@@ -1534,17 +1534,57 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
        to keep that free from racing a concurrent dereference. Default to
        locked (fail-safe) rather than enumerating "modes that read": a mode
        added here later without a lock is a use-after-free, not a data race. */
+    /* Object-scope write guards (if_match / if_no_match): resolve ONCE,
+       before the lock classification, so the guard that runs is exactly
+       the guard that classified the request. Explicit JSON null =
+       absent; both present = rejected before any lock. */
+    const char *gm = NULL, *gn = NULL;
+    size_t gm_len = 0, gn_len = 0;
+    int has_gm = json_obj_get(&req, "if_match", &gm, &gm_len) &&
+                 !json_span_is_null(gm, gm_len);
+    int has_gn = json_obj_get(&req, "if_no_match", &gn, &gn_len) &&
+                 !json_span_is_null(gn, gn_len);
+    if (has_gm && has_gn) {
+        OUT("{\"error\":\"invalid guard criteria\"}\n");
+        free(mode); free(dir); free(object); return;
+    }
+    char *guard_json = NULL;
+    int guard_require_match = has_gm;
+    if (has_gm || has_gn) {
+        const char *span = has_gm ? gm : gn;
+        size_t len = has_gm ? gm_len : gn_len;
+        guard_json = malloc(len + 1);
+        if (!guard_json) {
+            OUT("{\"error\":\"guard check failed\"}\n");
+            free(mode); free(dir); free(object); return;
+        }
+        memcpy(guard_json, span, len); guard_json[len] = '\0';
+    }
+    int guard_write = strcmp(mode, "insert") == 0 ||
+                      strcmp(mode, "update") == 0 ||
+                      strcmp(mode, "delete") == 0;
+    if (guard_json && strncmp(mode, "bulk-", 5) == 0) {
+        free(guard_json);
+        OUT("{\"error\":\"guards are not supported on bulk operations\"}\n");
+        free(mode); free(dir); free(object);
+        return;
+    }
+    if (!guard_write) { free(guard_json); guard_json = NULL; }
+    SlotcaskWriteReservation guard_res = {0};
+    SlotcaskDb *guard_sdb SDB_REG_REF = NULL;
     int took_wrlock = mode_is_schema(mode);
     int took_rdlock = !took_wrlock;
     if (took_wrlock) {
         if (objlock_wrlock(db_root, object) != 0) {
             OUT("{\"error\":\"objlock_wrlock failed for %s\"}\n", mode);
+            free(guard_json);
             free(mode); free(dir); free(object);
             return;
         }
     } else if (took_rdlock) {
         if (objlock_rdlock(db_root, object) != 0) {
             OUT("{\"error\":\"objlock_rdlock failed for %s\"}\n", mode);
+            free(guard_json);
             free(mode); free(dir); free(object);
             return;
         }
@@ -1566,6 +1606,77 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                                       (long)(g_schema_wrlock_test_delay_ms % 1000) * 1000000L };
         nanosleep(&delay_ts, NULL);
         unlink(marker_path);
+    }
+
+    /* Shared object lock is held. Keep the registry pin and reservation
+       through the existing single-write branch and common tail. */
+    if (guard_json) {
+        int is_write_mode = strcmp(mode, "insert") == 0 ||
+                            strcmp(mode, "update") == 0 ||
+                            strcmp(mode, "delete") == 0;
+        if (is_write_mode) {
+            const char *key_span; size_t key_len;
+            int key_present = json_obj_get(&req, "key", &key_span, &key_len);
+            char *gkey = key_present ? json_obj_strdup(&req, "key") : NULL;
+            int gpass = 0;
+            size_t gmatched = 0;
+            /* A supplied key whose decode/allocation failed cannot become
+               a fresh-key guard or accidentally match the target itself. */
+            Schema guard_sc = load_schema(db_root, object);
+            SlotcaskSchemaInfo guard_info = {
+                .splits = guard_sc.splits, .slot_size = guard_sc.slot_size,
+                .streams = guard_sc.streams,
+            };
+            int grc = -1;
+            char *gbin = NULL; size_t gbin_len = 0;
+            const char *stored_key = gkey;
+            size_t stored_klen = gkey ? strlen(gkey) : 0;
+            int key_valid = !key_present || gkey;
+            if (key_valid && gkey && guard_sc.auto_key != AK_NONE) {
+                if (auto_key_normalize(&guard_sc, gkey, &gbin, &gbin_len)) {
+                    key_valid = 0; grc = -2;
+                } else { stored_key = gbin; stored_klen = gbin_len; }
+            }
+            if (key_valid) {
+                guard_sdb = slotcask_registry_get(db_root, object, &guard_info);
+                if (guard_sdb &&
+                    slotcask_write_reservation_begin(guard_sdb, &guard_res) == 0 &&
+                    marker_recovery_sweep_object(db_root, guard_sdb->data_dir,
+                                                 object, NULL) == 0)
+                    grc = cas_guard_request(db_root, object, guard_json,
+                                           stored_key, stored_klen,
+                                           guard_require_match,
+                                           &gpass, &gmatched);
+            }
+            free(gbin); free(gkey);
+            int reject = 1;
+            if (grc == -2)
+                OUT("{\"error\":\"invalid guard criteria\"}\n");
+            else if (grc == -3)
+                OUT("{\"error\":\"query_timeout\"}\n");
+            else if (grc == -1)
+                OUT("{\"error\":\"guard check failed\"}\n");
+            else if (!gpass)
+                OUT("{\"error\":\"condition_not_met\",\"guard\":\"%s\","
+                    "\"matched\":%zu}\n",
+                    guard_require_match ? "if_match" : "if_no_match",
+                    gmatched);
+            else
+                reject = 0;
+            free(guard_json);
+            guard_json = NULL;
+            if (reject) {
+                slotcask_write_reservation_end(&guard_res);
+                if (took_wrlock) objlock_wrunlock(db_root, object);
+                else objlock_rdunlock(db_root, object);
+                free(mode); free(dir); free(object);
+                return;
+            }
+        } else {
+            /* Guards are ignored on non-write modes (documented). */
+            free(guard_json);
+            guard_json = NULL;
+        }
     }
 
     if (strcmp(mode, "get") == 0) {
@@ -1606,6 +1717,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *value = json_obj_strdup_raw(&req, "value");
         char *if_cond = json_obj_strdup_raw(&req, "if");
         int if_not_exists = json_obj_is_true(&req, "if_not_exists");
+        int return_record = json_obj_is_true(&req, "return_record");
         if (!value) {
             OUT("{\"error\":\"Missing value\"}\n");
         } else {
@@ -1623,20 +1735,20 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                                collisions surface as condition_not_met when
                                the operator has manually inserted at/above
                                the seq watermark. */
-                            cmd_insert(db_root, object, bin, blen, value, NULL, 1);
+                            cmd_insert(db_root, object, bin, blen, value, NULL, 1, return_record);
                             free(bin);
                         }
                     }
                 } else {
                     char *bin = NULL; size_t blen = 0;
                     if (auto_key_normalize(&sc_chk, key, &bin, &blen) == 0) {
-                        cmd_insert(db_root, object, bin, blen, value, if_cond, if_not_exists);
+                        cmd_insert(db_root, object, bin, blen, value, if_cond, if_not_exists, return_record);
                         free(bin);
                     }
                 }
             } else {
                 if (key)
-                    cmd_insert(db_root, object, key, strlen(key), value, if_cond, if_not_exists);
+                    cmd_insert(db_root, object, key, strlen(key), value, if_cond, if_not_exists, return_record);
                 else
                     OUT("{\"error\":\"Missing key or value\"}\n");
             }
@@ -1647,6 +1759,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *value = json_obj_strdup_raw(&req, "value");
         char *if_cond = json_obj_strdup_raw(&req, "if");
         int dry = json_obj_is_true(&req, "dry_run");
+        int return_record = json_obj_is_true(&req, "return_record");
         if (!value) {
             OUT("{\"error\":\"Missing value\"}\n");
         } else if (!key) {
@@ -1656,11 +1769,11 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             if (sc_chk.auto_key != AK_NONE) {
                 char *bin = NULL; size_t blen = 0;
                 if (auto_key_normalize(&sc_chk, key, &bin, &blen) == 0) {
-                    cmd_update(db_root, object, bin, blen, value, if_cond, dry);
+                    cmd_update(db_root, object, bin, blen, value, if_cond, dry, return_record);
                     free(bin);
                 }
             } else {
-                cmd_update(db_root, object, key, strlen(key), value, if_cond, dry);
+                cmd_update(db_root, object, key, strlen(key), value, if_cond, dry, return_record);
             }
         }
         free(key); free(value); free(if_cond);
@@ -1668,6 +1781,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *key = json_obj_strdup(&req, "key");
         char *if_cond = json_obj_strdup_raw(&req, "if");
         int dry = json_obj_is_true(&req, "dry_run");
+        int return_record = json_obj_is_true(&req, "return_record");
         if (!key) {
             OUT("{\"error\":\"Missing key\"}\n");
         } else {
@@ -1675,11 +1789,11 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             if (sc_chk.auto_key != AK_NONE) {
                 char *bin = NULL; size_t blen = 0;
                 if (auto_key_normalize(&sc_chk, key, &bin, &blen) == 0) {
-                    cmd_delete(db_root, object, bin, blen, if_cond, dry);
+                    cmd_delete(db_root, object, bin, blen, if_cond, dry, return_record);
                     free(bin);
                 }
             } else {
-                cmd_delete(db_root, object, key, strlen(key), if_cond, dry);
+                cmd_delete(db_root, object, key, strlen(key), if_cond, dry, return_record);
             }
         }
         free(key); free(if_cond);
@@ -2155,6 +2269,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         OUT("{\"error\":\"Unknown mode: %s\"}\n", mode);
     }
 
+    slotcask_write_reservation_end(&guard_res);
     if (took_wrlock) objlock_wrunlock(db_root, object);
     else if (took_rdlock) objlock_rdunlock(db_root, object);
 
@@ -2433,9 +2548,9 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     if (strcasecmp(cmd, "get") == 0) {
         cmd_get(eff_root, object, arg1, strlen(arg1));
     } else if (strcasecmp(cmd, "insert") == 0) {
-        cmd_insert(eff_root, object, arg1, strlen(arg1), arg2, NULL, 0);
+        cmd_insert(eff_root, object, arg1, strlen(arg1), arg2, NULL, 0, 0);
     } else if (strcasecmp(cmd, "delete") == 0) {
-        cmd_delete(eff_root, object, arg1, strlen(arg1), NULL, 0);
+        cmd_delete(eff_root, object, arg1, strlen(arg1), NULL, 0, 0);
     } else if (strcasecmp(cmd, "size") == 0) {
         cmd_size(eff_root, object);
     } else if (strcasecmp(cmd, "orphaned") == 0) {
