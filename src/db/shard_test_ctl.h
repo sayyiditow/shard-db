@@ -95,6 +95,13 @@ extern _Atomic int g_shard_test_count_gap_hit;
 typedef void (*shard_db_test_count_gap_fn)(void *ctx);
 void shard_db_test_set_count_gap_hook(shard_db_test_count_gap_fn fn, void *ctx);
 void slotcask_test_count_gap_park(void);
+/* Guard-check park hook (conditional-writes F2, control-channel kind 3 /
+   REACHED phase 4): parks a guarded write AFTER its guard check passed —
+   the caller holds shared objlock and every writer gate there — so a
+   second guarded writer can be queued behind the reservation before the
+   first commits. Setter + park body live in query.c (TEST_BUILD). */
+typedef void (*shard_db_test_guard_fn)(void *ctx);
+void shard_db_test_set_guard_hook(shard_db_test_guard_fn fn, void *ctx);
 /* Find-flush gate hook (docs/plans/2026-08-27-bitmap-inline-flush-
    hazard.md Task 1): parks a streaming-find worker immediately before
    its blocking batch fetch. On the legacy collector that point sits
@@ -108,6 +115,10 @@ extern _Atomic int g_shard_test_find_flush_gate_hit;
  * TEST_BUILD). _Atomic: control-thread writes, request-thread reads. */
 extern _Atomic size_t g_shard_test_kf_initial_slots;
 extern _Atomic size_t g_shard_test_kf_max_slots;
+/* Fault injection: force the update-error JSON escape to fail so tests
+ * can exercise the static-fallback emission (defined in storage.c under
+ * TEST_BUILD, set via the control channel's SET_GLOBALS phase 1). */
+extern _Atomic int g_shard_test_json_escape_fail;
 typedef void (*shard_db_test_gate_fn)(void *ctx);
 void shard_db_test_set_find_flush_gate_hook(shard_db_test_gate_fn fn, void *ctx);
 
@@ -129,6 +140,7 @@ static inline void shard_test_ctl_reset(void) {
     atomic_store(&g_shard_test_count_gap_hit, 0);
     atomic_store(&g_shard_test_kf_initial_slots, 0);
     atomic_store(&g_shard_test_kf_max_slots, 0);
+    atomic_store(&g_shard_test_json_escape_fail, 0);
     atomic_store(&g_shard_test_gate_held_max, 0);
     atomic_store(&g_shard_test_bulk_chains, 0);
 }

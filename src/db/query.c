@@ -5537,6 +5537,316 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
                           const Schema *sch, const FieldSchema *fs,
                           SearchCriterion *leaf, QueryDeadline *dl);
 
+static int cas_tree_compiled(const CriteriaNode *n) {
+    if (n->kind == CNODE_LEAF) {
+        if (!n->compiled) return 0;
+        if (n->leaf.op == OP_REGEX || n->leaf.op == OP_NOT_REGEX)
+            return n->compiled->tf &&
+                   n->compiled->tf->type == FT_VARCHAR &&
+                   n->compiled->re_compiled;
+        return 1;
+    }
+    for (int i = 0; i < n->n_children; i++)
+        if (!cas_tree_compiled(n->children[i])) return 0;
+    return 1;
+}
+
+/* 1 match, 0 no match, -1 evaluation failure. Regex errors are never
+   converted to absence or to a successful negated predicate. */
+int cas_match_tree_checked(const uint8_t *rec, size_t len,
+                            const CriteriaNode *n, FieldSchema *fs,
+                            uint8_t hdr2) {
+    if (!n) return 1;
+    if (n->kind != CNODE_LEAF) {
+        int is_and = n->kind == CNODE_AND;
+        for (int i = 0; i < n->n_children; i++) {
+            int r = cas_match_tree_checked(rec, len, n->children[i], fs, hdr2);
+            if (r < 0) return -1;
+            if (is_and && !r) return 0;
+            if (!is_and && r) return 1;
+        }
+        return is_and ? 1 : 0;
+    }
+    const CompiledCriterion *cc = n->compiled;
+    if (!cc) return -1;
+    if (cc->op != OP_REGEX && cc->op != OP_NOT_REGEX)
+        return criteria_match_tree(rec, len, n, fs, hdr2);
+    if (!cc->tf || cc->tf->type != FT_VARCHAR || !cc->re_compiled)
+        return -1;
+    const uint8_t *base, *bm; int bm_bytes; size_t region;
+    if (typed_record_view(rec, len, hdr2, &base, &bm, &bm_bytes, &region))
+        return -1;
+    int idx = (int)(cc->tf - fs->ts->fields);
+    if ((hdr2 & SREC_FLAG_NULLMAP) && typed_field_null(bm, bm_bytes, idx))
+        return 0;
+    const uint8_t *field =
+        (size_t)cc->tf->offset + (size_t)cc->tf->size > region
+            ? g_zero_field_65537 : base + cc->tf->offset;
+    regmatch_t pm = { .rm_so = 0, .rm_eo = varchar_eff_len(field, cc->tf->size) };
+    int rc = regexec(cc->re, (const char *)field + 2, 1, &pm, REG_STARTEND);
+    if (rc != 0 && rc != REG_NOMATCH) return -1;
+    return cc->op == OP_REGEX ? rc == 0 : rc == REG_NOMATCH;
+}
+
+CriteriaNode *cas_prepare_tree(const char *json, TypedSchema *ts,
+                               int allow_empty,
+                               char *err_buf, size_t err_sz) {
+    if (err_buf && err_sz) err_buf[0] = '\0';
+    if (!json) return NULL;
+    /* Empty array = historical vacuous pass for key-scoped `if`. The
+       tree parser rejects it, so catch the exact spelling first. */
+    if (allow_empty) {
+        const char *p = json;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (*p == '[') {
+            p++;
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+            if (*p == ']') {
+                p++;
+                while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+                if (!*p) return NULL;
+            }
+        }
+    }
+    const char *perr = NULL;
+    CriteriaNode *tree = parse_criteria_tree(json, &perr);
+    if (!tree) {
+        if (err_buf && err_sz)
+            snprintf(err_buf, err_sz, "%s", perr ? perr : "parse error");
+        return NULL;
+    }
+    char verr[256];
+    if (validate_criteria_tree_fields(tree, ts, verr, sizeof(verr)) < 0) {
+        free_criteria_tree(tree);
+        if (err_buf && err_sz) snprintf(err_buf, err_sz, "%s", verr);
+        return NULL;
+    }
+    if (!allow_empty && tree->kind == CNODE_AND && tree->n_children == 0) {
+        free_criteria_tree(tree);
+        if (err_buf && err_sz) snprintf(err_buf, err_sz, "empty criteria");
+        return NULL;
+    }
+    compile_criteria_tree(tree, ts);
+    if (!cas_tree_compiled(tree)) {
+        free_criteria_tree(tree);
+        if (err_buf && err_sz) snprintf(err_buf, err_sz, "criteria compilation failed");
+        return NULL;
+    }
+    return tree;
+}
+
+typedef struct {
+    CriteriaNode *tree;
+    FieldSchema *fs;
+    const void *key;
+    size_t klen;
+    QueryDeadline dl;
+    int found, failed;
+    uint8_t hashes[64][16];
+    size_t nhashes;
+} GuardProbe;
+
+static int guard_deadline(GuardProbe *g) {
+    if (g->dl.timeout_ms &&
+        now_ms_coarse() - g->dl.t0_ms >= g->dl.timeout_ms)
+        g->dl.timed_out = 1;
+    return g->dl.timed_out;
+}
+
+static int guard_record(const uint8_t hash[16], const void *key, size_t klen,
+                         const void *value, size_t vlen, uint8_t hdr2,
+                         void *ctx) {
+    GuardProbe *g = ctx;
+    (void)hash;
+    if (guard_deadline(g)) return 1;
+    const uint8_t *base, *bm; int bm_bytes; size_t region;
+    if (typed_record_view(value, vlen, hdr2, &base, &bm, &bm_bytes, &region)) {
+        g->failed = 1; return 1;
+    }
+    if (g->key && klen == g->klen && !memcmp(key, g->key, klen)) return 0;
+    int matched = cas_match_tree_checked(value, vlen, g->tree, g->fs, hdr2);
+    if (matched < 0) { g->failed = 1; return 1; }
+    if (matched) { g->found = 1; return 1; }
+    return 0;
+}
+
+static int guard_collect_hash(const char *v, size_t n,
+                               const uint8_t *hash, void *ctx) {
+    GuardProbe *g = ctx;
+    (void)v; (void)n;
+    if (guard_deadline(g) || g->nhashes == 64) return -1;
+    memcpy(g->hashes[g->nhashes++], hash, 16);
+    return 0;
+}
+
+/* Only enumerate a single exact index key when it covers every value
+   the typed matcher could call equal. Unsupported encodings scan safely. */
+static int guard_eq_key(const CriteriaNode *n, uint8_t out[1032], size_t *len) {
+    if (!n || n->kind != CNODE_LEAF || n->leaf.op != OP_EQUAL ||
+        !n->compiled || !n->compiled->tf || strchr(n->leaf.field, '+')) return 0;
+    const CompiledCriterion *cc = n->compiled;
+    const TypedField *f = cc->tf;
+    out[0] = 0;
+    if (f->type == FT_VARCHAR) {
+        if (cc->s1_len > 1031 || cc->s1_len > (size_t)f->size - 2) return 0;
+        memcpy(out + 1, cc->s1, cc->s1_len);
+        *len = cc->s1_len + 1;
+        return 1;
+    }
+    uint64_t bits; int width;
+    switch (f->type) {
+    case FT_SHORT:
+        if (cc->i1 < INT16_MIN || cc->i1 > INT16_MAX) return 0;
+        bits = (uint16_t)cc->i1 ^ UINT16_C(0x8000); width = 2; break;
+    case FT_INT:
+        if (cc->i1 < INT32_MIN || cc->i1 > INT32_MAX) return 0;
+        bits = (uint32_t)cc->i1 ^ UINT32_C(0x80000000); width = 4; break;
+    case FT_LONG: case FT_TIMESTAMP: case FT_NUMERIC:
+        bits = (uint64_t)cc->i1 ^ (UINT64_C(1) << 63); width = 8; break;
+    case FT_BOOL: case FT_BYTE:
+        bits = cc->b1; width = 1; break;
+    case FT_FLOAT: {
+        float v = (float)cc->d1;
+        if (!isfinite(v) || v == 0.0f) return 0; /* +/- zero compare equal */
+        uint32_t raw; memcpy(&raw, &v, 4);
+        bits = raw & UINT32_C(0x80000000) ? ~raw : raw ^ UINT32_C(0x80000000);
+        width = 4; break;
+    }
+    case FT_DOUBLE: {
+        double v = cc->d1;
+        if (!isfinite(v) || v == 0.0) return 0;
+        memcpy(&bits, &v, 8);
+        bits = bits & (UINT64_C(1) << 63) ? ~bits : bits ^ (UINT64_C(1) << 63);
+        width = 8; break;
+    }
+    default: return 0;
+    }
+    for (int i = 0; i < width; i++)
+        out[1 + i] = (uint8_t)(bits >> (8 * (width - 1 - i)));
+    *len = (size_t)width + 1;
+    return 1;
+}
+
+/* A leaf under AND is a necessary condition. Never select one OR branch. */
+static CriteriaNode *guard_eq_driver(CriteriaNode *n,
+                                      const char *root, const char *object, int splits) {
+    if (n->kind == CNODE_LEAF) {
+        uint8_t key[1032]; size_t len;
+        if (guard_eq_key(n, key, &len) && len <= BT_MAX_VAL_LEN &&
+            field_index_type(root, object, n->leaf.field) == IT_BTREE &&
+            btree_idx_exists(root, object, n->leaf.field, splits)) return n;
+        return NULL;
+    }
+    if (n->kind == CNODE_AND)
+        for (int i = 0; i < n->n_children; i++) {
+            CriteriaNode *d = guard_eq_driver(n->children[i], root, object, splits);
+            if (d) return d;
+        }
+    return NULL;
+}
+
+/* Return 0 proven verdict, -1 failed, -3 timeout. A fallback scan is
+   deliberate, not absence inferred from an incomplete candidate search. */
+static int guard_has_other(const char *root, const char *object,
+                            const Schema *sc, SlotcaskDb *sdb, GuardProbe *g) {
+    CriteriaNode *d = guard_eq_driver(g->tree, root, object, sc->splits);
+    if (d) {
+        uint8_t encoded[1032]; size_t len = 0;
+        if (guard_eq_key(d, encoded, &len)) {
+            int complete = 1;
+            for (int s = 0; s < index_splits_for(sc->splits); s++) {
+                if (g->dl.timeout_ms &&
+                    now_ms_coarse() - g->dl.t0_ms >= g->dl.timeout_ms) {
+                    g->dl.timed_out = 1; return -3;
+                }
+                char path[PATH_MAX];
+                build_idx_path(path, sizeof(path), root, object, d->leaf.field, s);
+                g->nhashes = 0;
+                int rc = btree_guard_eq(path, (const char *)encoded, len,
+                                         guard_collect_hash, g);
+                if (guard_deadline(g)) return -3;
+                if (rc != 0) { complete = 0; break; }
+                /* B-tree handle was released before these record reads. */
+                for (size_t i = 0; i < g->nhashes; i++) {
+                    rc = slotcask_guard_lookup(sdb, g->hashes[i], guard_record, g);
+                    if (rc < 0 || g->failed) return -1;
+                    if (guard_deadline(g)) return -3;
+                    if (g->found) return 0;
+                }
+            }
+            if (complete) return 0;
+        }
+    }
+    int rc = slotcask_walk_live_strict(sdb, guard_record, g);
+    if (guard_deadline(g)) return -3;
+    if (rc < 0 || g->failed || (rc == 1 && !g->found)) return -1;
+    return 0;
+}
+
+#ifdef TEST_BUILD
+static pthread_mutex_t g_guard_park_lock = PTHREAD_MUTEX_INITIALIZER;
+static shard_db_test_guard_fn g_guard_park_fn = NULL;
+static void *g_guard_park_ctx = NULL;
+
+void shard_db_test_set_guard_hook(shard_db_test_guard_fn fn, void *ctx) {
+    pthread_mutex_lock(&g_guard_park_lock);
+    g_guard_park_fn = fn;
+    g_guard_park_ctx = ctx;
+    pthread_mutex_unlock(&g_guard_park_lock);
+}
+
+void shard_db_test_guard_park(void) {
+    shard_db_test_guard_fn fn;
+    void *ctx;
+    pthread_mutex_lock(&g_guard_park_lock);
+    fn = g_guard_park_fn;
+    ctx = g_guard_park_ctx;
+    g_guard_park_fn = NULL;
+    g_guard_park_ctx = NULL;
+    pthread_mutex_unlock(&g_guard_park_lock);
+    if (fn) fn(ctx);
+}
+#endif
+
+int cas_guard_request(const char *db_root, const char *object,
+                      const char *guard_json,
+                      const char *key, size_t klen,
+                      int require_match,
+                      int *out_pass, size_t *out_matched) {
+    *out_pass = 0; *out_matched = 0;
+    Schema sc = load_schema(db_root, object);
+    TypedSchema *ts = load_typed_schema(db_root, object);
+    if (!ts) return -2;
+    char err[256];
+    CriteriaNode *tree = cas_prepare_tree(guard_json, ts, 0, err, sizeof(err));
+    if (!tree) return -2;
+    /* Server supplied the exact stored key bytes, normalized while its
+       shared objlock is held. auto_key_normalize is server.c-local. */
+    const char *use_key = key; size_t use_klen = klen;
+    if (use_klen > (size_t)sc.max_key) {
+        free_criteria_tree(tree); return -2;
+    }
+    SlotcaskSchemaInfo info = {
+        .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
+    };
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
+    if (!sdb || !slotcask_write_reservation_held(sdb)) {
+        free_criteria_tree(tree); return -1;
+    }
+    FieldSchema fs; init_field_schema(&fs, db_root, object);
+    GuardProbe g = { .tree = tree, .fs = &fs, .key = use_key, .klen = use_klen,
+                    .dl = { now_ms_coarse(), resolve_timeout_ms(), 0 } };
+    int rc = guard_has_other(db_root, object, &sc, sdb, &g);
+    free_criteria_tree(tree);
+    if (rc != 0) return rc;
+    *out_matched = g.found ? 1 : 0;
+    *out_pass = require_match ? g.found : !g.found;
+#ifdef TEST_BUILD
+    shard_db_test_guard_park();
+#endif
+    return 0;
+}
+
 static int cmd_count_with_tree(const char *db_root, const char *object,
                                 CriteriaNode *tree) {
     Schema sch = load_schema(db_root, object);

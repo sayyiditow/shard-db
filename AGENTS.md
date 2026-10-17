@@ -232,7 +232,7 @@ All advanced queries: `./shard-db query '<json>'`. Wire format: newline-delimite
 | `aggregate` (count/sum/avg/min/max + group_by + having + order_by) | [aggregate.md](docs/query-protocol/aggregate.md) |
 | `find` + `join` (inner/left, by primary key or indexed field; tabular only) | [joins.md](docs/query-protocol/joins.md) |
 | `bulk-insert / bulk-delete / bulk-update` | [bulk.md](docs/query-protocol/bulk.md) |
-| `insert / update / delete` with `if` / `if_not_exists` (CAS) | [cas.md](docs/query-protocol/cas.md) |
+| `insert / update / delete` with `if` / `if_not_exists` (CAS); object-scope guards (if_match / if_no_match); computed updates ($incr/$copy); return_record | [cas.md](docs/query-protocol/cas.md) |
 | `put-file / get-file / delete-file / list-files / get-file-path` | [files.md](docs/query-protocol/files.md) |
 | `add-field / edit-field / remove-field / rename-field / vacuum / add-index / remove-index` | [schema-mutations.md](docs/query-protocol/schema-mutations.md) |
 | `add-token / remove-token / list-tokens / add-ip / remove-ip / list-ips / stats / shard-stats / vacuum-check / list-objects / describe-object` | [diagnostics.md](docs/query-protocol/diagnostics.md) |

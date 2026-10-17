@@ -141,6 +141,45 @@ silently mis-sorted once a single shard grew past 16,777,216 slots.
 Resplit cost scales with the shard's entry count (~4–5 s at ~25M
 entries) — the sizing table + sweep keep shards near the sweet spot.
 
+**Conditional writes — computed updates, object-scope guards, filter
+trees in `if`, `return_record`.** Single writes gain four features
+(no on-disk format change, no index change, no migration; all wire
+changes are additive):
+
+- **Computed updates** on single `update`: a value field may hold
+  `{"$incr": <literal>}` (checked add of a signed literal, exact scale
+  for `numeric`, overflow/ERANGE/non-finite rejected) or
+  `{"$copy": "<sibling>"}` (same type + numeric scale), evaluated from
+  the current record under the same lock hold as the CAS check — no
+  read-modify-write race. Every rejection is a whole-request error with
+  no write. Computed spans outside single `update` reject
+  (`computed updates are only valid on update`).
+- **Object-scope guards** `if_match` / `if_no_match` on single
+  insert/update/delete: the write proceeds only when at least one /
+  zero OTHER live records in the same object match the criteria (the
+  written record is excluded by exact key bytes). Failure returns
+  `condition_not_met` with `guard` and `matched` (0/1 witness).
+  Guarded writes hold the shared object lock and reserve the object's
+  existing per-shard writer gates through marker replay, the guard
+  search, and the commit — readers continue, other writers wait; every
+  guard error is fail-closed. Guards reject on bulk modes.
+- **`if` filter trees**: write conditions accept the full read grammar —
+  nested `{and}/{or}` trees (depth ≤ 16), not just flat AND arrays.
+  Behavioral changes, declared and regression-tested: comparisons are
+  typed (matching `find`, e.g. `"07"` now matches `int` 7), unknown
+  fields and invalid regex patterns reject with `invalid if condition`
+  instead of silently never-matching, and `if: []` keeps its vacuous
+  pass.
+- **`return_record`** opt-in on insert/update/delete: the success
+  response carries the committed record (defaults, auto_create/
+  auto_update and computed values applied) or the removed record
+  (delete). Without the flag all responses are byte-identical to
+  previous releases.
+
+See [cas.md](../query-protocol/cas.md) for the full semantics and
+[concurrency.md](../concepts/concurrency.md) for the writer-reservation
+cost model.
+
 ## 2026.09.2
 
 Calendar `datetime` storage widens from 6 to 7 bytes (int32 BE `yyyyMMdd` +

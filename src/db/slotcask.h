@@ -314,6 +314,19 @@ typedef struct SlotcaskDb {
     size_t                  writer_gate_waiters_inited;
 } SlotcaskDb;
 
+/* Internal, request-thread-only scope; zero-initialize before begin.
+ * Caller holds shared objlock and a registry pin through end.
+ * Begin/end must run on the same thread. No nested reservation. */
+typedef struct {
+    SlotcaskDb *db;
+    size_t acquired;
+    unsigned char *borrowed;
+} SlotcaskWriteReservation;
+int slotcask_write_reservation_begin(SlotcaskDb *db,
+                                      SlotcaskWriteReservation *r);
+void slotcask_write_reservation_end(SlotcaskWriteReservation *r);
+int slotcask_write_reservation_held(SlotcaskDb *db);
+
 /* Test-only: write a synthetic `total` (and matching `deleted`) into a kf
    shard's header. Used by resplit tests to trip the 75 % trigger without
    inserting millions of records. Must be called between slotcask_open and
@@ -1110,9 +1123,12 @@ typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
    entries are invalid, and -1 when the kf itself cannot be read. */
 int slotcask_validate_live_refs(SlotcaskDb *db, uint64_t *out_invalid);
 
-/* Sequential, fail-closed live walk. Caller holds objlock_wrlock.
-   Returns 0 for a complete walk, 1 for callback-requested stop, -1 on
-   any unreadable or invalid live reference. Does not silently skip. */
+/* Sequential, fail-closed live walk. Caller holds objlock_wrlock, or —
+   live guarded-write use (conditional-writes F2) — the object's shared
+   objlock with the same registry instance pinned and every writer gate
+   reserved. Returns 0 for a complete walk, 1 for callback-requested
+   stop, -1 on any unreadable or invalid live reference. Does not
+   silently skip. */
 int slotcask_walk_live_strict(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx);
 
 /* Walk every live (flag=1) record. Parallelized across keyfile shards
@@ -1194,6 +1210,14 @@ int64_t slotcask_count_live(SlotcaskDb *db);
  * `hash16`, invokes cb for each live entry whose hash matches. Almost
  * always 0 or 1 invocation per call (hash collisions are rare). cb returning
  * 1 stops further probing. */
+/* Guard-only strict single-hash lookup (conditional-writes F2). Unlike
+   slotcask_lookup_by_hash, never skips an unreadable live reference:
+   any validation failure is -1 (unproven), never a miss. Caller holds
+   the shared object lock and every writer gate (Task 4). Sole caller is
+   query.c's guard_has_other. */
+int slotcask_guard_lookup(SlotcaskDb *db, const uint8_t hash16[16],
+                          SlotcaskScanCb cb, void *ctx);
+
 int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
                              SlotcaskScanCb cb, void *ctx);
 int slotcask_lookup_by_hash_try(SlotcaskDb *db, const uint8_t hash16[16],

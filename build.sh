@@ -134,6 +134,10 @@ gcc $MODE_CFLAGS -o build/bin/embedded_bg_harness \
     src/test/embedded_bg_harness.c build/bin/libshard-db.a \
     -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS \
     -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o build/bin/reservation_harness \
+    src/test/reservation_harness.c build/bin/libshard-db.a \
+    -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS \
+    -lpthread -lssl -lcrypto
 echo "  -> build/bin/libshard-db.a + build/bin/shard_db.h"
 
 # shard-cli — separate ncurses TUI client. Links the same OpenSSL but no
@@ -318,6 +322,15 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_null_legacy_rebuild.c \
     src/test/cases/test_not_null_schema.c \
     src/test/cases/test_not_null_compat.c \
+    src/test/cases/test_cas_tree_if.c \
+    src/test/cases/test_return_record.c \
+    src/test/cases/test_computed_update.c \
+    src/test/cases/test_write_reservation.c \
+    src/test/cases/test_cas_guards.c \
+    src/test/cases/test_cas_guard_race.c \
+    src/test/cases/test_guard_corrupt_flag.c \
+    src/test/cases/test_guard_proof.c \
+    src/test/cases/test_guard_condition_proof.c \
     src/test/cases/test_not_null_edit_modifiers.c \
     src/test/cases/test_not_null_writes.c \
     src/test/cases/test_not_null_updates.c \

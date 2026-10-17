@@ -833,6 +833,20 @@ int test_env_ctl_set_kf_seams(TestEnv *env, size_t initial, size_t max) {
     return 0;
 }
 
+int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
+    if (!env || env->test_control_fd < 0) return -1;
+    /* phase 1 = TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL (test_control.c). */
+    TestHookMessage msg = { .kind = TEST_HOOK_SET_GLOBALS,
+                            .phase = 1, .a = (uint64_t)(fail ? 1 : 0) };
+    if (test_hook_write_full(env->test_control_fd, &msg, sizeof(msg)) != 0)
+        return -1;
+    TestHookMessage rep = {0};
+    if (test_hook_read_full(env->test_control_fd, &rep, sizeof(rep)) != 0)
+        return -1;
+    if (rep.kind != TEST_HOOK_ACK) return -1;
+    return 0;
+}
+
 int test_env_test_hook_wait(TestEnv *env, int *out_phase) {
     if (!env || env->test_control_fd < 0 || !out_phase) return -1;
     TestHookMessage rep = {0};
@@ -841,8 +855,9 @@ int test_env_test_hook_wait(TestEnv *env, int *out_phase) {
     if (rep.kind != TEST_HOOK_REACHED) return -1;
     /* phase: 0 = stale snapshot, 1 = under kf wrlock (after-old hook),
        2 = count worker parked in the pass-1 gap (probe reader held),
-       3 = find worker parked at the batch-fetch gate. */
-    if (rep.phase < 0 || rep.phase > 3) return -1;
+       3 = find worker parked at the batch-fetch gate,
+       4 = guarded write parked after its guard check. */
+    if (rep.phase < 0 || rep.phase > 4) return -1;
     *out_phase = rep.phase;
     return 0;
 }

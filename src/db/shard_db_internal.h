@@ -664,7 +664,10 @@ int clean_flag_remove(const char *data_dir);
 int kf_batch_marker_clear(const char *data_dir, int kf_shard, uint32_t batch_id);
 
 /* Startup recovery sweep. Caller must hold objlock_wrlock(data_dir's
-   eff_root, object_name) for the duration. Returns 0 if all markers found
+   eff_root, object_name) for the duration, OR — live guarded-write use —
+   the shared objlock plus a pinned same-instance registry handle and
+   every writer gate reserved (slotcask_write_reservation_begin).
+   Returns 0 if all markers found
    were replayed/cleared, -1 if any marker is corrupt or fails to replay.
    If out_replayed is non-NULL, it is incremented once per marker file found
    (regardless of replay outcome), letting the caller distinguish "the sweep

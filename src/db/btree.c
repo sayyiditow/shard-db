@@ -2214,6 +2214,106 @@ int btree_sync_path(const char *path) {
 #endif
 }
 
+/* Validate a page before the existing unchecked decode/search helpers
+   touch it. This is guard-only; ordinary B-tree readers are unchanged. */
+static uint8_t *guard_checked_page(BtFile *bt, uint32_t id) {
+    if (bt_page_size <= 0 || !id ||
+        (size_t)id >= bt->map_size / (size_t)bt_page_size) return NULL;
+    BtFileHeader *fh = (BtFileHeader *)bt->map;
+    if (id >= fh->page_count) return NULL;
+    uint8_t *page = bt_page(bt, id);
+    BtPageHeader *ph = (BtPageHeader *)page;
+    if (ph->page_type > 1 ||
+        ph->count > ((size_t)bt_page_size - sizeof(*ph)) / sizeof(uint16_t))
+        return NULL;
+    size_t slots_end = sizeof(*ph) + (size_t)ph->count * sizeof(uint16_t);
+    if (ph->data_end < slots_end || ph->data_end > (size_t)bt_page_size)
+        return NULL;
+    char prev[BT_MAX_VAL_LEN]; size_t prev_len = 0;
+    for (uint32_t i = 0; i < ph->count; i++) {
+        size_t off = bt_load_u16(page + sizeof(*ph) + i * sizeof(uint16_t));
+        if (off < ph->data_end || off > (size_t)bt_page_size - 2) return NULL;
+        uint8_t *e = page + off;
+        size_t n = entry_data_len(e);
+        if (n > (size_t)bt_page_size - off - 2) return NULL;
+        if (ph->page_type == 1) {
+            if (n < 1 + BT_HASH_SIZE) return NULL;
+            size_t prefix = leaf_entry_prefix_len(e);
+            size_t suffix = leaf_entry_suffix_len(e);
+            if ((i % BT_LEAF_RESTART_K == 0 && prefix != 0) ||
+                prefix > prev_len || prefix + suffix > BT_MAX_VAL_LEN)
+                return NULL;
+            char key[BT_MAX_VAL_LEN];
+            memcpy(key, prev, prefix);
+            memcpy(key + prefix, leaf_entry_suffix(e), suffix);
+            size_t len = prefix + suffix;
+            if (i && val_cmp(prev, prev_len, key, len) > 0) return NULL;
+            memcpy(prev, key, len); prev_len = len;
+        } else {
+            if (n < BT_HASH_SIZE + 4 ||
+                n - BT_HASH_SIZE - 4 > BT_MAX_VAL_LEN) return NULL;
+            size_t len = int_entry_vlen(e);
+            if (i && val_cmp(prev, prev_len, int_entry_value(e), len) > 0)
+                return NULL;
+            memcpy(prev, int_entry_value(e), len); prev_len = len;
+            uint32_t child = entry_child(e);
+            if (!child || child >= fh->page_count ||
+                (size_t)child >= bt->map_size / (size_t)bt_page_size)
+                return NULL;
+        }
+    }
+    if (ph->next_leaf >= fh->page_count ||
+        (ph->next_leaf &&
+         (size_t)ph->next_leaf >= bt->map_size / (size_t)bt_page_size))
+        return NULL;
+    return page;
+}
+
+/* 0 = fully enumerated equality range; -1 = unproven (including caller
+   collection cap). Never interprets an acquisition failure as absence. */
+int btree_guard_eq(const char *path, const char *value, size_t vlen,
+                   bt_result_cb cb, void *ctx) {
+    BtFile bt;
+    if (bt_acquire(&bt, path, 0) != 0) return -1;
+    int rc = -1;
+    if (bt_page_size < (int)sizeof(BtPageHeader) ||
+        bt.map_size < sizeof(BtFileHeader)) goto done;
+    BtFileHeader *fh = (BtFileHeader *)bt.map;
+    if (fh->magic != BT_MAGIC || !fh->root_page ||
+        fh->page_count > bt.map_size / (size_t)bt_page_size) goto done;
+    uint32_t id = fh->root_page;
+    size_t hops = 0;
+    uint8_t *page;
+    for (;;) {
+        if (++hops > fh->page_count) goto done;
+        page = guard_checked_page(&bt, id);
+        if (!page) goto done;
+        BtPageHeader *ph = (BtPageHeader *)page;
+        if (ph->page_type == 1) break;
+        int pos = page_bsearch(page, value, vlen);
+        id = pos ? entry_child(page_entry(page, pos - 1)) : ph->next_leaf;
+    }
+    while (id) {
+        page = guard_checked_page(&bt, id);
+        if (!page || ((BtPageHeader *)page)->page_type != 1) goto done;
+        LeafIter it; leaf_iter_init(&it, page);
+        if (leaf_iter_seek(&it, page_bsearch(page, value, vlen))) {
+            do {
+                int cmp = val_cmp(it.key_buf, it.key_len, value, vlen);
+                if (cmp > 0) { rc = 0; goto done; }
+                if (cmp == 0 && cb(it.key_buf, it.key_len, it.hash, ctx) < 0)
+                    goto done;
+            } while (leaf_iter_next(&it));
+        }
+        id = ((BtPageHeader *)page)->next_leaf;
+        if (id && ++hops > fh->page_count) goto done;
+    }
+    rc = 0;
+done:
+    bt_release(&bt);
+    return rc;
+}
+
 void btree_search(const char *path, const char *value, size_t vlen,
                   bt_result_cb cb, void *ctx) {
     BtFile bt;

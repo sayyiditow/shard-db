@@ -1003,7 +1003,83 @@ static void writer_gates_destroy(SlotcaskDb *db) {
 static __thread int t_writer_gates_held;
 #endif
 
+/* ── All-shard writer reservation (conditional-writes F2) ──
+ *
+ * A guarded single write must prove an object-scope predicate (guard) and
+ * commit its mutation against one stable view of EVERY shard. It holds the
+ * shared objlock (blocks schema/maintenance) and pins its registry handle,
+ * then reserves every existing writer gate in ascending order. Ordinary
+ * mutations go through writer_gate_lock below, which — on the reserving
+ * thread only — borrows the reservation instead of re-locking mutexes.
+ * Readers never take writer gates and continue throughout.
+ */
+static __thread SlotcaskWriteReservation *t_write_reservation;
+
+int slotcask_write_reservation_held(SlotcaskDb *db) {
+    return t_write_reservation && t_write_reservation->db == db &&
+           t_write_reservation->acquired == (size_t)db->num_shards;
+}
+
+int slotcask_write_reservation_begin(SlotcaskDb *db,
+                                      SlotcaskWriteReservation *r) {
+    if (!db || !r || r->db || r->borrowed || t_write_reservation ||
+        db->num_shards <= 0 ||
+        db->writer_gates_inited != (size_t)db->num_shards)
+        return -1;
+    unsigned char *borrowed = calloc((size_t)db->num_shards, 1);
+    if (!borrowed) return -1;
+    /* Enter BEFORE acquisition; never enqueue work while holding any
+       reserved gate, including during recovery or nested mutation. */
+    parallel_inline_enter();
+    size_t acquired = 0;
+    for (;;) {
+        int lock_rc = 0;
+        for (acquired = 0; acquired < (size_t)db->num_shards; acquired++) {
+            lock_rc = pthread_mutex_trylock(&db->writer_gates[acquired]);
+            if (lock_rc != 0) break;
+        }
+        if (acquired == (size_t)db->num_shards) break;
+        /* Never wait holding a partial reservation: an older multi-shard
+           transaction may need pool workers currently waiting on us. */
+        while (acquired) pthread_mutex_unlock(&db->writer_gates[--acquired]);
+        if (lock_rc != EBUSY) {
+            parallel_inline_leave();
+            free(borrowed);
+            return -1;
+        }
+        struct timespec retry = { .tv_sec = 0, .tv_nsec = 1000000 };
+        nanosleep(&retry, NULL);
+    }
+    r->db = db;
+    r->acquired = acquired;
+    r->borrowed = borrowed;
+    t_write_reservation = r;
+    return 0;
+}
+
+void slotcask_write_reservation_end(SlotcaskWriteReservation *r) {
+    if (!r || !r->db) return;
+    /* Contract violations must never silently unlock another thread's
+       mutex or permit a write outside its reservation. */
+    if (t_write_reservation != r) abort();
+    for (size_t i = 0; i < r->acquired; i++)
+        if (r->borrowed[i]) abort();
+    SlotcaskDb *db = r->db;
+    t_write_reservation = NULL;
+    while (r->acquired)
+        pthread_mutex_unlock(&db->writer_gates[--r->acquired]);
+    free(r->borrowed);
+    *r = (SlotcaskWriteReservation){0};
+    parallel_inline_leave();
+}
+
 static void writer_gate_lock(SlotcaskDb *db, int kf_shard) {
+    if (slotcask_write_reservation_held(db)) {
+        if (kf_shard < 0 || kf_shard >= db->num_shards ||
+            t_write_reservation->borrowed[kf_shard]) abort();
+        t_write_reservation->borrowed[kf_shard] = 1;
+        return;
+    }
 #ifdef TEST_BUILD
     if (pthread_mutex_trylock(&db->writer_gates[kf_shard]) != 0) {
         SHARD_TEST_PHASE_PAUSE(SHARD_TEST_PHASE_GATE_WAIT);
@@ -1021,6 +1097,12 @@ static void writer_gate_lock(SlotcaskDb *db, int kf_shard) {
 #endif
 }
 static void writer_gate_unlock(SlotcaskDb *db, int kf_shard) {
+    if (slotcask_write_reservation_held(db)) {
+        if (kf_shard < 0 || kf_shard >= db->num_shards ||
+            !t_write_reservation->borrowed[kf_shard]) abort();
+        t_write_reservation->borrowed[kf_shard] = 0;
+        return;
+    }
 #ifdef TEST_BUILD
     t_writer_gates_held--;
 #endif
@@ -3696,8 +3778,13 @@ static int kf_shard_marker_gate(int kf_shard, SlotcaskKfHandle *kh,
  * pre-M debris and are removed; all other marker-namespace files fail
  * closed because this release only understands KFM2 redo records.
  * Called at startup when unclean shutdown was detected, before the
- * server accepts connections. Caller must already hold the object's
- * write lock (objlock_wrlock) for the duration.
+ * server accepts connections. Locking: startup or an exclusively held
+ * objlock (objlock_wrlock) remains valid; LIVE use (conditional-writes
+ * F2 guard evaluation) is also valid with the object's SHARED objlock
+ * (objlock_rdlock) held, the same registry instance pinned, and every
+ * writer gate reserved via slotcask_write_reservation_begin — replay
+ * acquires kfcache write handles per affected shard under the
+ * reservation. Caller must hold one of those contexts for the duration.
  * Returns 0 if every marker found was replayed/cleared, -1 if any marker
  * is corrupt or fails to replay (fail-closed — operator must investigate;
  * the marker is left on disk so nothing is silently lost).
@@ -9632,6 +9719,10 @@ void slotcask_registry_shutdown(void) {
     pthread_mutex_unlock(&g_reg_lock);
 }
 
+/* Contract: caller holds objlock_wrlock, or the reserved live context
+   (shared objlock + pinned registry instance + all writer gates) — see
+   the header comment. A failed check cannot be a concurrent repoint race
+   in either context. */
 int slotcask_walk_live_strict(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx) {
     if (!db || !cb) return -1;
     for (int shard = 0; shard < db->num_shards; shard++) {
@@ -9643,8 +9734,12 @@ int slotcask_walk_live_strict(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx) {
         int result = 0;
         for (size_t slot = 0; slot < kh.capacity; slot++) {
             SlotcaskKfEntry *entry = &kh.map[slot];
-            if (__atomic_load_n(&entry->flag, __ATOMIC_ACQUIRE) != 1)
-                continue;
+            uint8_t flag = __atomic_load_n(&entry->flag, __ATOMIC_ACQUIRE);
+            if (flag == 0 || flag == 2) continue;
+            /* Any other byte is corruption, not absence — fail closed so a
+               strict walk can never prove an entry is gone (guards, the
+               :not_null audit). Valid values are only 0/1/2. */
+            if (flag != 1) { result = -1; break; }
             if (entry->stream_id >= db->num_streams) { result = -1; break; }
             char seg_path[PATH_MAX];
             seg_path_for(seg_path, db->data_dir, entry->stream_id, entry->file_id);
@@ -10449,6 +10544,47 @@ static void slotcask_lookup_scan_kf(SlotcaskDb *db, const uint8_t hash16[16],
         if (cb(e->hash, key, klen, value, vlen, rec[19], ctx) != 0) stop = 1;
         segcache_release(&sh);
     }
+}
+
+/* -1 error, 0 probe complete, 1 callback requested stop. */
+int slotcask_guard_lookup(SlotcaskDb *db, const uint8_t hash16[16],
+                          SlotcaskScanCb cb, void *ctx) {
+    int sid = shard_for_hash(hash16, db->num_shards);
+    char path[PATH_MAX]; kf_path_for(path, db->data_dir, sid);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, path, db->slots_per_shard, 0) != 0) return -1;
+    int rc = 0;
+    size_t start = kf_slot_for(hash16, kh.capacity);
+    for (size_t i = 0; i < kh.capacity; i++) {
+        SlotcaskKfEntry *e = &kh.map[(start + i) % kh.capacity];
+        uint8_t flag = __atomic_load_n(&e->flag, __ATOMIC_ACQUIRE);
+        if (!flag) break;
+        if (flag == 2) continue;
+        if (flag != 1) { rc = -1; break; }
+        if (memcmp(e->hash, hash16, 16)) continue;
+        if (e->stream_id >= db->num_streams) { rc = -1; break; }
+        char segpath[PATH_MAX];
+        seg_path_for(segpath, db->data_dir, e->stream_id, e->file_id);
+        SlotcaskSegHandle sh = { .slot = -1, .fd = -1 };
+        if (segcache_acquire(&sh, segpath, 0, 0, 0) != 0) { rc = -1; break; }
+        if (e->offset > sh.map_size || sh.map_size - e->offset < 24) rc = -1;
+        else {
+            const uint8_t *rec = sh.map + e->offset;
+            uint16_t klen = seg_rec_klen(rec);
+            uint32_t vlen = seg_rec_vlen(rec);
+            size_t padded = slotcask_record_size_varlen(klen, vlen);
+            if (24u + (size_t)klen + vlen > (size_t)db->slot_size ||
+                padded > (size_t)db->slot_size ||
+                padded > sh.map_size - e->offset ||
+                !seg_rec_live_with_hash(rec, hash16)) rc = -1;
+            else if (cb(hash16, rec + 24, klen, rec + 24 + klen,
+                         vlen, rec[19], ctx)) rc = 1;
+        }
+        segcache_release(&sh);
+        if (rc) break;
+    }
+    kfcache_release(&kh);
+    return rc;
 }
 
 int slotcask_lookup_by_hash(SlotcaskDb *db, const uint8_t hash16[16],
