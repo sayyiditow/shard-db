@@ -1,8 +1,14 @@
 # shard-db
 
-2026.08.2 removes the storage `migrate()` method. Embedded opens now require
-clean 2026.08.1 evidence for populated roots and perform no conversion or
-automatic index rebuild; run explicit maintenance operations instead.
+**Upgrading:** a populated data directory must carry clean-open evidence at
+or after shard-db `2026.09.2` — older roots are refused with an upgrade
+hint. In binding versions that means `1.0.22` or later (these embed the
+`2026.09.2` engine); if your data was last opened by an older binding,
+install `1.0.22`+ and open once before upgrading. A filesystem-empty
+directory initializes directly. The first `2026.10.2` open of an existing
+root performs a one-time, crash-safe startup migration that reindexes
+every indexed object before serving; subsequent opens skip it. Leave the
+data directory untouched while a migration open is in progress.
 
 High-performance embedded database for Node.js and Bun. Runs entirely in-process — no daemon, no TCP socket, no external dependencies.
 
@@ -75,6 +81,32 @@ const exists = JSON.parse(await db.query({
 await db.query({ mode: 'delete', dir: 'myapp', object: 'users', key: 'u1' })
 ```
 
+### Conditional writes
+
+Single writes take CAS guards and computed values:
+
+```js
+// Atomic increment — only while the balance can cover it
+const resp = JSON.parse(await db.query({
+  mode: 'update', dir: 'myapp', object: 'accounts', key: 'a1',
+  value: { balance: { $incr: -25 } },
+  if: [{ field: 'balance', op: 'gte', value: 25 }],
+  return_record: true
+}))
+// resp.record — the committed record with the computed balance applied
+
+// Uniqueness guard — insert only while NO other record has that domain
+await db.query({
+  mode: 'insert', dir: 'myapp', object: 'domains', key: 'g1',
+  value: { domain: 'd.io' },
+  if_no_match: [{ field: 'domain', op: 'eq', value: 'd.io' }]
+})
+```
+
+`$incr` is a checked add (overflow rejects the whole request) and `$copy`
+copies a same-type field; guards check *other* records atomically with
+the write and fail closed.
+
 ## Querying
 
 ### Find with criteria
@@ -90,7 +122,9 @@ const users = JSON.parse(await db.query({
 // [ { name: 'Alice', age: 30, ... }, ... ]
 ```
 
-Common operators: `eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `between`, `in`, `starts`, `contains`, `like`.
+Common operators: `eq`, `neq`, `lt`, `gt`, `lte`, `gte`, `between`, `in`, `starts`, `contains`, `like`, `exists`, `not_exists`. Criteria also accept nested `{ and: [...] }` / `{ or: [...] }` trees.
+
+Typed fields are nullable since `2026.10.2`: an explicit JSON `null` stores NULL, an omitted insert field with no `:default` reads back as `null`, and value predicates never match NULL — use `exists` / `not_exists` to test nullness.
 
 ### Count
 

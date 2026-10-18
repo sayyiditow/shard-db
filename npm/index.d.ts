@@ -58,9 +58,13 @@ declare namespace ShardDb {
   /** Callback signature for setLogHandler. type is a raw integer (1–6); use LOG_TYPES[type] to get the string name. */
   type LogHandler = (type: number, msg: string) => void
 
-  /** Arbitrary field criteria — keys are schema field names, values are
-   *  scalars (exact match) or operator objects e.g. { gt: 100 }.
-   *  Also accepts an array of { field, op, value } filter objects. */
+  /** Field criteria for reads and write guards. The implicit form is an
+   *  AND of members — keys are schema field names, values are scalars
+   *  (exact match) or operator objects e.g. { gt: 100 }. Explicit
+   *  combinators: { and: [...Criteria] } / { or: [...Criteria] } trees
+   *  (depth ≤ 16). Also accepts a flat array of { field, op, value }
+   *  filter objects. Value predicates never match NULL — use the
+   *  exists / not_exists ops to test nullness. */
   type Criteria = Record<string, unknown> | unknown[]
 
   /** Field projection — comma-separated string or array, both accepted on the wire. */
@@ -111,22 +115,57 @@ declare namespace ShardDb {
         dir: string; object: string
         /** Omit when the object has auto_key configured — the server generates one. */
         key?: string
+        /** Field values; explicit null stores NULL. An omitted field
+         *  with no :default reads back as null. */
         value: Record<string, unknown>
         /** CAS guard — fail if the key already exists. Not combinable with an omitted key. */
         if_not_exists?: boolean
         /** CAS guard — only insert/upsert if current value (if any) matches. */
-        if?: Criteria }
+        if?: Criteria
+        /** Object-scope guard — passes only while at least one OTHER
+         *  live record matches (the written record is excluded).
+         *  Single-write only; mutually exclusive with if_no_match. */
+        if_match?: Criteria
+        /** Object-scope guard — passes only while NO other live record
+         *  matches. Single-write only; mutually exclusive with if_match. */
+        if_no_match?: Criteria
+        /** Opt-in: success response gains "record" — the committed
+         *  record with defaults and auto_create/auto_update applied. */
+        return_record?: boolean }
 
     | { mode: 'update'
         dir: string; object: string; key: string
+        /** Partial update — omitted fields carry forward, explicit null
+         *  clears to NULL. A field may hold a computed op instead of a
+         *  literal: {"$incr": <literal>} (checked add — overflow rejects
+         *  the whole request) or {"$copy": "<field>"} (same-type copy). */
         value: Record<string, unknown>
         /** CAS guard — only update if current value matches. */
-        if?: Criteria }
+        if?: Criteria
+        /** Object-scope guard — passes only while at least one OTHER
+         *  live record matches (the written record is excluded).
+         *  Single-write only; mutually exclusive with if_no_match. */
+        if_match?: Criteria
+        /** Object-scope guard — passes only while NO other live record
+         *  matches. Single-write only; mutually exclusive with if_match. */
+        if_no_match?: Criteria
+        /** Opt-in: success response gains "record" — the committed
+         *  record with computed values applied. */
+        return_record?: boolean }
 
     | { mode: 'delete'
         dir: string; object: string; key: string
         /** CAS guard — only delete if current value matches. */
-        if?: Criteria }
+        if?: Criteria
+        /** Object-scope guard — passes only while at least one OTHER
+         *  live record matches (the deleted record is excluded).
+         *  Single-write only; mutually exclusive with if_no_match. */
+        if_match?: Criteria
+        /** Object-scope guard — passes only while NO other live record
+         *  matches. Single-write only; mutually exclusive with if_match. */
+        if_no_match?: Criteria
+        /** Opt-in: success response gains "record" — the removed record. */
+        return_record?: boolean }
 
     | { mode: 'not-exists'
         dir: string; object: string

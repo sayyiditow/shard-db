@@ -7,7 +7,7 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 ## Unreleased
 
 **2026.10.2 — real NULL for typed fields, `:not_null` constraint, BTRI
-index format.** Typed
+index format, conditional writes.** Typed
 fields are now nullable: every record carries a per-record null bitmap
 (`1 + ceil(nfields/8)` bytes), explicit JSON `null` stores NULL, an
 omitted insert field with no default is NULL, and update semantics are
@@ -141,8 +141,9 @@ silently mis-sorted once a single shard grew past 16,777,216 slots.
 Resplit cost scales with the shard's entry count (~4–5 s at ~25M
 entries) — the sizing table + sweep keep shards near the sweet spot.
 
-**Conditional writes — computed updates, object-scope guards, filter
-trees in `if`, `return_record`.** Single writes gain four features
+**Also in 2026.10.2 — conditional writes: computed updates,
+object-scope guards, filter trees in `if`, `return_record`.** Single
+writes gain four features
 (no on-disk format change, no index change, no migration; all wire
 changes are additive):
 
@@ -175,6 +176,12 @@ changes are additive):
   auto_update and computed values applied) or the removed record
   (delete). Without the flag all responses are byte-identical to
   previous releases.
+
+Also in this tree: the request builders of `test-cas-tree-if` and
+`test-computed-update` moved off raw `snprintf` return-value
+accumulation onto the shared clamping `tu_appendf` helper (a CodeQL
+finding — the pattern could not have overflowed in practice, but its
+safety could not be proven at the call sites).
 
 See [cas.md](../query-protocol/cas.md) for the full semantics and
 [concurrency.md](../concepts/concurrency.md) for the writer-reservation
