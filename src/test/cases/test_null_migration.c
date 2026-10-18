@@ -271,12 +271,53 @@ static int idx_mtime_sum(const char *db_root, const char *obj,
     return (n > 0) ? 0 : -1;
 }
 
-/* Raw daemon spawn: fork + exec `server` with CWD=base. Returns the raw
-   waitpid status once the child exits within timeout_ms (*exited=1), or
-   -1 if it is still alive (*exited=0 — caller owns *out_pid and kills it).
-   *out_pid is always set when the fork succeeded. */
-static int spawn_daemon_raw(const MigRoot *m, int timeout_ms, int *exited,
-                            pid_t *out_pid) {
+/* Single check: is a live `.durability-test-<phase>.active` marker
+   present under dir? `phase` may end in '*' to match any suffix
+   (e.g. "shard-published-*" — the per-kf-shard phase carries the shard
+   id). */
+static int pause_marker_present(const char *dir, const char *phase) {
+    int globbed = 0;
+    char tail[128] = "";
+    const char *star = strchr(phase, '*');
+    if (star) {
+        globbed = 1;
+        snprintf(tail, sizeof(tail), "%s", star + 1);
+    }
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    int hit = 0;
+    while ((e = readdir(d))) {
+        if (strncmp(e->d_name, ".durability-test-", 17) != 0)
+            continue;
+        const char *rest = e->d_name + 17;
+        size_t rl = strlen(rest);
+        size_t sl = strlen(".active");
+        if (rl <= sl || strcmp(rest + rl - sl, ".active") != 0)
+            continue;
+        size_t body_len = rl - sl;              /* strip .active */
+        if (globbed) {
+            size_t pl = (size_t)(star - phase);  /* body before '*' */
+            size_t tl = strlen(tail);
+            if (body_len < pl + tl) continue;
+            if (strncmp(rest, phase, pl) != 0) continue;
+            if (strcmp(rest + body_len - tl, tail) != 0) continue;
+        } else {
+            if (body_len != strlen(phase) ||
+                memcmp(rest, phase, body_len) != 0) continue;
+        }
+        hit = 1;
+        break;
+    }
+    closedir(d);
+    return hit;
+}
+
+/* Fork+exec the daemon binary with CWD=base and stdout/stderr diverted
+   to refuse.log. Returns the child pid, or 0 after a failed assert
+   (binary not found / fork failed) — callers must treat 0 as no child
+   and skip every kill/waitpid on it. */
+static pid_t fork_raw_daemon(const MigRoot *m) {
     /* Prefer the TEST_BUILD daemon — the seam knobs (fail-next-build,
        publish-fail stage, durability pauses) only exist there. Mirrors
        fixtures.c's binary resolution order. */
@@ -293,19 +334,31 @@ static int spawn_daemon_raw(const MigRoot *m, int timeout_ms, int *exited,
         }
     }
     ASSERT_TRUE(found, "locate daemon binary for raw spawn");
-    if (!found) { *exited = -1; return -1; }
+    if (!found) return 0;
 
     pid_t pid = fork();
     ASSERT_TRUE(pid >= 0, "fork raw daemon");
-    if (pid == 0) {
-        chdir(m->base);
-        char logp[400];
-        snprintf(logp, sizeof(logp), "%s/refuse.log", m->base);
-        int lfd = open(logp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (lfd >= 0) { dup2(lfd, 1); dup2(lfd, 2); close(lfd); }
-        execl(bin, bin, "server", (char *)NULL);
-        _exit(127);
-    }
+    if (pid > 0) return pid;
+    if (pid != 0) return 0;   /* fork failed; assert already recorded */
+    chdir(m->base);
+    char logp[400];
+    snprintf(logp, sizeof(logp), "%s/refuse.log", m->base);
+    int lfd = open(logp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (lfd >= 0) { dup2(lfd, 1); dup2(lfd, 2); close(lfd); }
+    execl(bin, bin, "server", (char *)NULL);
+    _exit(127);
+}
+
+/* Raw daemon spawn: fork + exec `server`, return the raw waitpid status
+   once the child exits within timeout_ms (*exited=1). If it is still
+   alive at the deadline, SIGKILL it and return -1 (*exited=0 — the
+   child is reaped here, the caller owns nothing). Refusal cases use
+   this: their daemons exit on their own, so the deadline is only a
+   backstop. */
+static int spawn_daemon_raw(const MigRoot *m, int timeout_ms, int *exited,
+                            pid_t *out_pid) {
+    pid_t pid = fork_raw_daemon(m);
+    if (pid <= 0) { *exited = -1; *out_pid = 0; return -1; }
     *out_pid = pid;
     *exited = 0;
     int status = 0;
@@ -317,6 +370,42 @@ static int spawn_daemon_raw(const MigRoot *m, int timeout_ms, int *exited,
     kill(pid, SIGKILL);
     waitpid(pid, NULL, 0);
     return -1;
+}
+
+/* Raw-spawn the daemon and SIGKILL it at the FIRST sighting of a
+   durability pause marker, with a WNOHANG liveness check riding the same
+   poll loop. Killing mid-pause keeps the marker on disk (the hook's
+   unlink never runs) and pins the interrupt point to the first shard
+   publication regardless of machine speed — a fixed kill deadline
+   instead races the migration's *second* 30s pause, and slow macOS
+   runners overshoot the deadline, letting the migration finish (stamp
+   written, all shards BTRI) before the test interrupts. Returns 0 only
+   when the marker was seen while the child was still alive;
+   *saw_marker and *alive_at_marker report which precondition failed.
+   The child is always killed and reaped before return. */
+static int spawn_kill_at_pause(const MigRoot *m, const char *marker_dir,
+                               const char *phase, int timeout_ms,
+                               int *saw_marker, int *alive_at_marker) {
+    *saw_marker = 0;
+    *alive_at_marker = 0;
+    pid_t pid = fork_raw_daemon(m);
+    if (pid <= 0) return -1;
+    int status = 0;
+    int exited = 0;
+    for (int elapsed = 0; elapsed < timeout_ms; elapsed += 50) {
+        if (waitpid(pid, &status, WNOHANG) == pid) { exited = 1; break; }
+        if (pause_marker_present(marker_dir, phase)) {
+            *saw_marker = 1;
+            *alive_at_marker = 1;
+            break;
+        }
+        usleep(50000);
+    }
+    if (!exited) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+    }
+    return *saw_marker ? 0 : -1;
 }
 
 /* Dump the raw-spawn daemon log — used when a refusal case doesn't
@@ -338,51 +427,12 @@ static int port_refuses(int port) {
     return 1;
 }
 
-/* Poll for a durability pause marker. `phase` may end in '*' to match
-   any suffix (e.g. "shard-published-*" — the per-kf-shard phase carries
-   the shard id). */
+/* Poll until a durability pause marker appears. `phase` may end in '*'
+   (see pause_marker_present). */
 static int wait_pause_marker(const char *dir, const char *phase,
                              int timeout_ms) {
-    int globbed = 0;
-    char tail[128] = "";
-    const char *star = strchr(phase, '*');
-    if (star) {
-        globbed = 1;
-        snprintf(tail, sizeof(tail), "%s", star + 1);
-    }
-    char prefix[600];
-    snprintf(prefix, sizeof(prefix), "%s/.durability-test-%.*s",
-             dir, globbed ? (int)(star - phase) : (int)strlen(phase), phase);
     for (int elapsed = 0; elapsed < timeout_ms; elapsed += 50) {
-        DIR *d = opendir(dir);
-        if (d) {
-            struct dirent *e;
-            int hit = 0;
-            while ((e = readdir(d))) {
-                if (strncmp(e->d_name, ".durability-test-", 17) != 0)
-                    continue;
-                const char *rest = e->d_name + 17;
-                size_t rl = strlen(rest);
-                size_t sl = strlen(".active");
-                if (rl <= sl || strcmp(rest + rl - sl, ".active") != 0)
-                    continue;
-                size_t body_len = rl - sl;              /* strip .active */
-                if (globbed) {
-                    size_t pl = (size_t)(star - phase);  /* body before '*' */
-                    size_t tl = strlen(tail);
-                    if (body_len < pl + tl) continue;
-                    if (strncmp(rest, phase, pl) != 0) continue;
-                    if (strcmp(rest + body_len - tl, tail) != 0) continue;
-                } else {
-                    if (body_len != strlen(phase) ||
-                        memcmp(rest, phase, body_len) != 0) continue;
-                }
-                hit = 1;
-                break;
-            }
-            closedir(d);
-            if (hit) return 0;
-        }
+        if (pause_marker_present(dir, phase)) return 0;
         usleep(50000);
     }
     return -1;
@@ -681,29 +731,23 @@ static int test_null_migration_f_crash_retry(void) {
     /* Pre-upgrade state + a pause INSIDE the migration's first shard
        publication (bt-publish-before-rename fires in bt_publish_replace).
        The migration runs before the listener opens, so spawn raw and
-       poll for the pause marker under the field's index dir. */
+       SIGKILL on the first marker sighting under the field's index dir —
+       the interrupt lands mid-first-publication at any machine speed. */
     ASSERT_TRUE(flip_idx_magic(m.db_root, "mo", "k", BTRI_MAGIC) >= 1,
                 "flip to BTRH (f)");
     stamp_remove(m.db_root);
     mig_write_env(&m, "DURABILITY_TEST_PAUSE_PHASE=bt-publish-before-rename\n"
                       "DURABILITY_TEST_PAUSE_MS=30000\n");
 
-    int exited = 0;
-    pid_t raw_pid = 0;
-    spawn_daemon_raw(&m, 60000, &exited, &raw_pid);
-    ASSERT_EQ_INT(exited, 0, "daemon alive while paused pre-publication");
+    int saw_marker = 0, alive_at_marker = 0;
     char idx_field_dir[600];
     idx_dir(idx_field_dir, sizeof(idx_field_dir), m.db_root, "mo", "k");
-    ASSERT_EQ_INT(wait_pause_marker(idx_field_dir,
-                                    "bt-publish-before-rename", 30000), 0,
-                  "publication pause reached");
-    /* SIGKILL exactly this daemon — the migration is interrupted between
-       shard publications (this one mid-first-publication). */
-    kill(raw_pid, SIGKILL);
-    {
-        int st = 0;
-        waitpid(raw_pid, &st, 0);
-    }
+    spawn_kill_at_pause(&m, idx_field_dir, "bt-publish-before-rename",
+                        60000, &saw_marker, &alive_at_marker);
+    if (!saw_marker) dump_refuse_log(&m);
+    ASSERT_EQ_INT(alive_at_marker, 1,
+                  "daemon alive while paused pre-publication");
+    ASSERT_EQ_INT(saw_marker, 1, "publication pause reached");
     sleep(1);
 
     /* Interrupted state: stamp absent. Publication was paused

@@ -1103,8 +1103,9 @@ static int test_durability_bulk_pipeline_multishard_crash(void) {
     /* Concurrent pipelines: shard 2 may have committed (or not) before
        shard 1 parked, so the visible count is 0–4; shard 1's durable
        marker is the deterministic fact. */
+    int mid = -1;
     {
-        int mid = request_count(&env, object);
+        mid = request_count(&env, object);
         ASSERT_TRUE(mid >= 0 && mid <= 4 && mid % 2 == 0,
                     "at-pause count is committed shards only "
                     "(shard 1 parked pre-finalize)");
@@ -1147,6 +1148,12 @@ static int test_durability_bulk_pipeline_multishard_crash(void) {
            commits 0 or 2 rows (under CI contention the kill can land
            before the unsynchronized shards 0/2 publish). */
         int total = request_count(&env, object);
+        if (!(total >= 2 * n_published && total <= 6 &&
+              (total - 2 * n_published) % 2 == 0))
+            TAP_DIAG("#   diag: total=%d n_published=%d mid=%d "
+                     "published=[%d%d%d]",
+                     total, n_published, mid,
+                     published[0], published[1], published[2]);
         ASSERT_TRUE(total >= 2 * n_published && total <= 6 &&
                     (total - 2 * n_published) % 2 == 0,
                     "published shards replayed exactly; unpublished shards "
@@ -1177,6 +1184,11 @@ static int test_durability_bulk_pipeline_multishard_crash(void) {
             ASSERT_TRUE(lo >= 0 && hi >= 0 && lo + hi == total,
                         "every visible row is indexed exactly once "
                         "(published markers replay with their indexes)");
+            if (!(lo >= 0 && hi >= 0 && lo + hi == total))
+                TAP_DIAG("#   diag: lo=%d hi=%d total=%d n_published=%d "
+                         "published=[%d%d%d]",
+                         lo, hi, total, n_published,
+                         published[0], published[1], published[2]);
             free(resp);
             tc_close(tc);
         }
