@@ -475,7 +475,8 @@ int update_compose_new_from_old(const struct TypedSchema *ts,
                                 const SlotcaskOldRecord *old,
                                 uint8_t *out_buf,
                                 char *const *field_vals,
-                                const uint8_t *field_null);
+                                const uint8_t *field_null,
+                                char *err, size_t errsz);
 /* auto_update stamp shared by single and bulk update: writes now() at the
    nullmap-prefixed destination and clears the field's NULL bit — a stamp
    materializes a value, so an auto_update field never carries NULL.

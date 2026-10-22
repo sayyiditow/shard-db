@@ -77,10 +77,14 @@ static void parse_datetimems(const char *s, int32_t *out_date, uint32_t *out_ms)
     *out_ms = (uint32_t)((hh * 3600 + mm * 60 + ss) * 1000 + fff);
 }
 
-/* Parse decimal string → int64 scaled by 10^scale (matches encode_field FT_NUMERIC). */
-static int64_t parse_numeric_i64(const char *s, int64_t mul) {
-    double dv = atof(s);
-    return (int64_t)(dv * mul + (dv >= 0 ? 0.5 : -0.5));
+/* Identical decimal rounding for stored values and criteria preserves
+   literal equality. Invalid or out-of-range literals retain the historic
+   zero fallback. */
+static int64_t parse_numeric_i64(const TypedField *tf, const char *s) {
+    int64_t v = 0;
+    if (!tf || !s) return 0;
+    if (conv_numeric_text(tf, s, strlen(s), &v, NULL, 0) != 0) return 0;
+    return v;
 }
 
 /* Parse UUID string (32 hex digits, with or without hyphens) → 16 bytes.
@@ -353,16 +357,16 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         cc->i2 = (int64_t)strtoll(c->value2, NULL, 10);
         break;
     case FT_NUMERIC:
-        cc->i1 = parse_numeric_i64(c->value, cc->tf->numeric_scale_mult);
-        cc->i2 = parse_numeric_i64(c->value2, cc->tf->numeric_scale_mult);
+        cc->i1 = parse_numeric_i64(cc->tf, c->value);
+        cc->i2 = parse_numeric_i64(cc->tf, c->value2);
         break;
     case FT_DOUBLE:
         cc->d1 = atof(c->value);
         cc->d2 = atof(c->value2);
         break;
     case FT_FLOAT:
-        cc->d1 = atof(c->value);
-        cc->d2 = atof(c->value2);
+        cc->d1 = (double)strtof(c->value, NULL);
+        cc->d2 = (double)strtof(c->value2, NULL);
         break;
     case FT_BOOL:
         cc->b1 = (c->value[0] == 't' || c->value[0] == 'T' || c->value[0] == '1') ? 1 : 0;
@@ -504,7 +508,7 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         case FT_NUMERIC:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
             for (int i = 0; i < c->in_count; i++)
-                cc->in_i64[i] = parse_numeric_i64(c->in_values[i], cc->tf->numeric_scale_mult);
+                cc->in_i64[i] = parse_numeric_i64(cc->tf, c->in_values[i]);
             break;
         case FT_DOUBLE:
             cc->in_f64 = malloc(sizeof(double) * c->in_count);
@@ -514,7 +518,7 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         case FT_FLOAT:
             cc->in_f64 = malloc(sizeof(double) * c->in_count);
             for (int i = 0; i < c->in_count; i++)
-                cc->in_f64[i] = atof(c->in_values[i]);
+                cc->in_f64[i] = (double)strtof(c->in_values[i], NULL);
             break;
         case FT_DATE:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
@@ -3078,7 +3082,7 @@ static int find_covering_composite(const char *db_root, const char *object,
 }
 
 /* Build the exact composite key for `composite_field` (e.g. "by+time") from
- * eq leaves, in the composite's field order. encode_field_for_index is the
+ * eq leaves, in the composite's field order. encode_field_text_for_index is the
  * same encoder typed_field_to_index_key uses at build time (config.c:1948),
  * so the key is byte-identical to the stored composite key. Returns 1 with
  * *out_len set iff EVERY sub-field is matched by an OP_EQUAL leaf. */
@@ -3105,7 +3109,7 @@ int build_exact_composite_key(const FieldSchema *fs, const char *composite_field
             out[total++] = 0x00;
         }
         size_t l = 0;
-        encode_field_for_index(tf, m->value, strlen(m->value), out + total, &l);
+        encode_field_text_for_index(tf, m->value, strlen(m->value), out + total, &l);
         total += l;
     }
     *out_len = total;

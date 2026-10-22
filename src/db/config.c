@@ -1,6 +1,9 @@
 #include "types.h"
 #include "slotcask.h"
 #include "bitmap.h"
+#include <math.h>
+#include <stdarg.h>
+#include <assert.h>
 
 /* ========== Config ========== */
 
@@ -1575,9 +1578,22 @@ void parse_field_type(const char *spec, TypedField *f) {
     }
     /* Precompute 10^scale so decode-hot paths don't recompute per record */
     if (f->type == FT_NUMERIC) {
-        int64_t mult = 1;
-        for (int i = 0; i < f->numeric_scale; i++) mult *= 10;
-        f->numeric_scale_mult = mult;
+        if (f->numeric_scale >= 0 && f->numeric_scale <= 18) {
+            int64_t mult = 1;
+            for (int i = 0; i < f->numeric_scale; i++) mult *= 10;
+            f->numeric_scale_mult = mult;
+        } else {
+            /* Legacy roots may declare S outside 0..18 (S was never
+               validated). Those objects rendered wrapped garbage before;
+               keep them loadable, but every consumer guards mult <= 0
+               (raw-integer fallback) and conv_numeric_text rejects
+               writes — never compute a wrapped multiplier again. */
+            f->numeric_scale_mult = 0;
+            LOG_WARN(LOG_SUB_CONFIG,
+                     "numeric scale %d outside representable 0..18; "
+                     "writes rejected, decoded as raw integer",
+                     f->numeric_scale);
+        }
     } else {
         f->numeric_scale_mult = 0;
     }
@@ -1821,6 +1837,416 @@ static inline void cbuf_from_span(char *buf, size_t bufsz,
 /* Length-based encoder: identical semantics to encode_field but takes an
    explicit vlen instead of requiring a null-terminated string. Used by the
    CSV path to parse directly against an mmap'd, unmodifiable buffer. */
+/* Full-input parsers preserve syntax/range errors before stored bytes
+   are changed. The void encoders retain legacy conversion semantics. */
+
+static int is_ascii_space(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static void fmt_conv_err(char *err, size_t errsz, const TypedField *f,
+                         const char *fmt, ...) {
+    if (err && errsz > 0) {
+        va_list ap;
+        va_start(ap, fmt);
+        int n = snprintf(err, errsz,
+                         "value for field '%s' is not a valid %s: ",
+                         f->name, typed_type_name(f->type));
+        if (n > 0 && (size_t)n < errsz)
+            vsnprintf(err + n, errsz - (size_t)n, fmt, ap);
+        va_end(ap);
+    }
+}
+
+/* Parse the whole span as optional-sign decimal digits (no fraction, no
+   exponent, no other bytes). Leading zeros are valid at any length and
+   do not count toward the magnitude budget — "0000000000000000000001"
+   is 1. Only significant digits are bounded (≤19), with the sign-aware
+   maximum. 0 = ok, -1 = syntax, -2 = int64 range. */
+static int parse_full_i64(const char *val, size_t vlen, int64_t *out) {
+    if (vlen == 0) return -1;
+    size_t i = 0;
+    int neg = 0;
+    if (val[0] == '+' || val[0] == '-') { neg = (val[0] == '-'); i = 1; }
+    if (i >= vlen) return -1;
+    for (size_t k = i; k < vlen; k++)
+        if (val[k] < '0' || val[k] > '9') return -1;
+    while (i + 1 < vlen && val[i] == '0') i++;   /* leading zeros */
+    size_t ndig = vlen - i;                      /* significant digits */
+    const uint64_t maxmag = neg ? 9223372036854775808ull
+                                : 9223372036854775807ull;
+    if (ndig > 19) return -2;
+    uint64_t mag = 0;
+    for (; i < vlen; i++) {
+        uint64_t d = (uint64_t)(val[i] - '0');
+        if (mag > (maxmag - d) / 10) return -2;
+        mag = mag * 10 + d;
+    }
+    /* mag <= 2^63; the negative path wraps 2^63 to its two's-complement
+       int64 bit pattern (unsigned arithmetic is defined; the cast is
+       implementation-defined and two's complement on all targets). */
+    *out = neg ? (int64_t)(0u - mag) : (int64_t)mag;
+    return 0;
+}
+
+static int conv_i16(const TypedField *f, const char *val, size_t vlen,
+                    uint8_t *out, char *err, size_t errsz) {
+    int64_t v;
+    int rc = parse_full_i64(val, vlen, &v);
+    if (rc == -1) {
+        fmt_conv_err(err, errsz, f, "expected a whole decimal number");
+        return -1;
+    }
+    if (rc == -2 || v < -32768 || v > 32767) {
+        fmt_conv_err(err, errsz, f, "out of short range (-32768..32767)");
+        return -1;
+    }
+    int16_t s = (int16_t)v;
+    out[0] = (uint8_t)(((uint16_t)s >> 8) & 0xFF);
+    out[1] = (uint8_t)s;
+    return 0;
+}
+
+static int conv_i32(const TypedField *f, const char *val, size_t vlen,
+                    uint8_t *out, char *err, size_t errsz) {
+    int64_t v;
+    int rc = parse_full_i64(val, vlen, &v);
+    if (rc == -1) {
+        fmt_conv_err(err, errsz, f, "expected a whole decimal number");
+        return -1;
+    }
+    if (rc == -2 || v < -2147483648LL || v > 2147483647LL) {
+        fmt_conv_err(err, errsz, f,
+                     "out of int range (-2147483648..2147483647)");
+        return -1;
+    }
+    int32_t s = (int32_t)v;
+    out[0] = (uint8_t)(((uint32_t)s >> 24) & 0xFF);
+    out[1] = (uint8_t)(((uint32_t)s >> 16) & 0xFF);
+    out[2] = (uint8_t)(((uint32_t)s >> 8) & 0xFF);
+    out[3] = (uint8_t)s;
+    return 0;
+}
+
+static int conv_i64(const TypedField *f, const char *val, size_t vlen,
+                    uint8_t *out, char *err, size_t errsz) {
+    int64_t v;
+    int rc = parse_full_i64(val, vlen, &v);
+    if (rc == -1) {
+        fmt_conv_err(err, errsz, f, "expected a whole decimal number");
+        return -1;
+    }
+    if (rc == -2) {
+        fmt_conv_err(err, errsz, f,
+                     "out of signed 64-bit range (-9223372036854775808.."
+                     "9223372036854775807)");
+        return -1;
+    }
+    uint64_t u = (uint64_t)v;
+    for (int b = 7; b >= 0; b--) { out[b] = (uint8_t)(u & 0xFF); u >>= 8; }
+    return 0;
+}
+
+static int conv_u8(const TypedField *f, const char *val, size_t vlen,
+                   uint8_t *out, char *err, size_t errsz) {
+    int64_t v;
+    int rc = parse_full_i64(val, vlen, &v);
+    if (rc == -1) {
+        fmt_conv_err(err, errsz, f, "expected a whole decimal number");
+        return -1;
+    }
+    if (rc == -2 || v < 0 || v > 255) {
+        fmt_conv_err(err, errsz, f, "out of byte range (0..255)");
+        return -1;
+    }
+    out[0] = (uint8_t)v;
+    return 0;
+}
+
+/* Finite binary floating parse via strtof/strtod (direct binary32 for
+   float — no double round-trip). Rejects: junk suffixes, hex float
+   syntax, non-finite spellings (inf/nan and overflow), and nonzero
+   values that underflow to zero. Representable subnormals are accepted
+   (ERANGE with a nonzero result). */
+static int conv_f64(const TypedField *f, const char *val, size_t vlen,
+                    uint8_t *out, char *err, size_t errsz) {
+    char cbuf[64];
+    if (vlen == 0 || vlen >= sizeof(cbuf)) {
+        fmt_conv_err(err, errsz, f, "empty or over-long numeric text");
+        return -1;
+    }
+    if (memchr(val, 'x', vlen) || memchr(val, 'X', vlen)) {
+        fmt_conv_err(err, errsz, f, "hex float syntax is not accepted");
+        return -1;
+    }
+    memcpy(cbuf, val, vlen);
+    cbuf[vlen] = '\0';
+    errno = 0;
+    char *end = NULL;
+    double v = strtod(cbuf, &end);
+    if (end != cbuf + vlen) {
+        fmt_conv_err(err, errsz, f, "trailing characters after number");
+        return -1;
+    }
+    if (!isfinite(v)) {
+        fmt_conv_err(err, errsz, f,
+                     "only finite values are accepted (no inf/nan)");
+        return -1;
+    }
+    if (errno == ERANGE && v == 0.0) {
+        fmt_conv_err(err, errsz, f,
+                     "nonzero value underflows to zero in double");
+        return -1;
+    }
+    memcpy(out, &v, 8);
+    return 0;
+}
+
+static int conv_f32(const TypedField *f, const char *val, size_t vlen,
+                    uint8_t *out, char *err, size_t errsz) {
+    char cbuf[64];
+    if (vlen == 0 || vlen >= sizeof(cbuf)) {
+        fmt_conv_err(err, errsz, f, "empty or over-long numeric text");
+        return -1;
+    }
+    if (memchr(val, 'x', vlen) || memchr(val, 'X', vlen)) {
+        fmt_conv_err(err, errsz, f, "hex float syntax is not accepted");
+        return -1;
+    }
+    memcpy(cbuf, val, vlen);
+    cbuf[vlen] = '\0';
+    errno = 0;
+    char *end = NULL;
+    float v = strtof(cbuf, &end);
+    if (end != cbuf + vlen) {
+        fmt_conv_err(err, errsz, f, "trailing characters after number");
+        return -1;
+    }
+    if (!isfinite((double)v)) {
+        fmt_conv_err(err, errsz, f,
+                     "only finite values are accepted (no inf/nan)");
+        return -1;
+    }
+    if (errno == ERANGE && v == 0.0f) {
+        fmt_conv_err(err, errsz, f,
+                     "nonzero value underflows to zero in float");
+        return -1;
+    }
+    memcpy(out, &v, 4);
+    return 0;
+}
+
+/* Exact decimal text -> scaled int64 (value × 10^scale), ties away from
+   zero, no double anywhere. Identical rounding for writes and criteria
+   ensures a saved value matches its own literal.
+   0 = ok, -1 = invalid syntax/unsupported field
+   scale, -2 = out of range for the field's int64 scaled storage.
+   Scale 0 is valid (mult 1). The magnitude bound is sign-aware:
+   negatives may reach 2^63 (INT64_MIN). */
+int conv_numeric_text(const TypedField *f, const char *val, size_t vlen,
+                      int64_t *out, char *err, size_t errsz) {
+    if (f->numeric_scale < 0 || f->numeric_scale > 18 ||
+        f->numeric_scale_mult <= 0) {
+        fmt_conv_err(err, errsz, f,
+                     "field has an unsupported legacy scale; the object "
+                     "needs a scale edit before writes");
+        return -1;
+    }
+    /* Write/query/index literal parity: strip one outer ASCII
+       whitespace run exactly as the write boundary does, so criterion
+       text like " 0.145" matches a value written as "0.145". */
+    while (vlen > 0 && is_ascii_space(val[0])) { val++; vlen--; }
+    while (vlen > 0 && is_ascii_space(val[vlen - 1])) vlen--;
+    size_t i = 0;
+    int neg = 0;
+    if (vlen && (val[0] == '+' || val[0] == '-')) { neg = (val[0]=='-'); i = 1; }
+    size_t int_start = i;
+    while (i < vlen && val[i] >= '0' && val[i] <= '9') i++;
+    size_t int_len = i - int_start;
+    size_t frac_len = 0;
+    if (i < vlen && val[i] == '.') {
+        i++;
+        size_t fs = i;
+        while (i < vlen && val[i] >= '0' && val[i] <= '9') i++;
+        frac_len = i - fs;
+    }
+    long expv = 0;
+    if (i < vlen && (val[i] == 'e' || val[i] == 'E')) {
+        i++;
+        int eneg = 0;
+        if (i < vlen && (val[i] == '+' || val[i] == '-')) {
+            eneg = (val[i] == '-'); i++;
+        }
+        size_t es = i;
+        while (i < vlen && val[i] >= '0' && val[i] <= '9') i++;
+        size_t el = i - es;
+        if (el == 0 || el > 6) {
+            fmt_conv_err(err, errsz, f, "exponent out of supported range");
+            return -1;
+        }
+        for (size_t k = 0; k < el; k++) expv = expv * 10 + (val[es+k]-'0');
+        if (eneg) expv = -expv;
+        if (expv > 400000 || expv < -400000) {
+            fmt_conv_err(err, errsz, f, "exponent out of supported range");
+            return -1;
+        }
+    }
+    if (i != vlen || (int_len + frac_len) == 0) {
+        fmt_conv_err(err, errsz, f, "expected a decimal number");
+        return -1;
+    }
+    if (memchr(val, 0, vlen)) {
+        fmt_conv_err(err, errsz, f, "embedded NUL byte");
+        return -1;
+    }
+    const uint64_t maxmag = neg ? 9223372036854775808ull      /* INT64_MIN */
+                                : 9223372036854775807ull;
+    const char *digits_int = val + int_start;
+    const char *digits_frac = val + int_start + int_len + 1; /* past '.' */
+    size_t total = int_len + frac_len;
+    /* All-zero digits: the value is 0 whatever the exponent says (0e19
+       is a valid zero), and leading zeros do not count toward the
+       magnitude budget (0000000000000000000001 is 1). */
+    size_t lz = 0;
+    while (lz < total && (lz < int_len ? digits_int[lz]
+                                       : digits_frac[lz - int_len]) == '0')
+        lz++;
+    if (lz == total) { *out = 0; return 0; }
+    size_t sig = total - lz;
+    /* stored = ±D × 10^te, te = scale - frac_len + exp; round the
+       dropped tail half-away-from-zero. The round-up test is safe only
+       when at least the dropped run's leading position exists in D:
+       for total < k_drop the whole value is below half of the last kept
+       place and rounds to zero (6e-100 at scale 2 → 0, not 0.01). */
+    long te = (long)f->numeric_scale - (long)frac_len + expv;
+    if (te >= 0) {
+        if (sig > 19 || te > 18) {
+            fmt_conv_err(err, errsz, f,
+                         "out of range for numeric scale %d (stored as a "
+                         "64-bit scaled integer)", f->numeric_scale);
+            return -2;
+        }
+        uint64_t mag = 0;
+        for (size_t k = 0; k < total; k++) {
+            char c = (k < int_len) ? digits_int[k] : digits_frac[k - int_len];
+            uint64_t d = (uint64_t)(c - '0');
+            if (mag > (maxmag - d) / 10) {
+                fmt_conv_err(err, errsz, f,
+                             "out of range for numeric scale %d (stored as "
+                             "a 64-bit scaled integer)", f->numeric_scale);
+                return -2;
+            }
+            mag = mag * 10 + d;
+        }
+        for (long k = 0; k < te; k++) {
+            if (mag > maxmag / 10) {
+                fmt_conv_err(err, errsz, f,
+                             "out of range for numeric scale %d",
+                             f->numeric_scale);
+                return -2;
+            }
+            mag *= 10;
+        }
+        *out = neg ? (int64_t)(0u - mag) : (int64_t)mag;
+        return 0;
+    }
+    long k_drop = -te;   /* digit positions dropped by rounding */
+    size_t q_len = (total > (size_t)k_drop) ? total - (size_t)k_drop : 0;
+    uint64_t mag = 0;
+    for (size_t k = 0; k < q_len; k++) {
+        char c = (k < int_len) ? digits_int[k] : digits_frac[k - int_len];
+        uint64_t d = (uint64_t)(c - '0');
+        if (mag > (maxmag - d) / 10) {
+            fmt_conv_err(err, errsz, f,
+                         "out of range for numeric scale %d",
+                         f->numeric_scale);
+            return -2;
+        }
+        mag = mag * 10 + d;
+    }
+    int round_up = 0;
+    if (total >= (size_t)k_drop) {
+        size_t di = total - (size_t)k_drop;   /* first dropped digit */
+        char c = (di < int_len) ? digits_int[di] : digits_frac[di - int_len];
+        round_up = (c >= '5');   /* r >= 5*10^(k-1) ⟺ 2r ≥ 10^k */
+    }
+    if (round_up) {
+        if (mag >= maxmag) {
+            fmt_conv_err(err, errsz, f,
+                         "out of range for numeric scale %d",
+                         f->numeric_scale);
+            return -2;
+        }
+        mag++;
+    }
+    *out = neg ? (int64_t)(0u - mag) : (int64_t)mag;
+    return 0;
+}
+
+static int conv_numeric(const TypedField *f, const char *val, size_t vlen,
+                        uint8_t *out, char *err, size_t errsz) {
+    int64_t v;
+    if (conv_numeric_text(f, val, vlen, &v, err, errsz) != 0) return -1;
+    uint64_t u = (uint64_t)v;
+    for (int b = 7; b >= 0; b--) { out[b] = (uint8_t)(u & 0xFF); u >>= 8; }
+    return 0;
+}
+
+int encode_field_checked(const TypedField *f, const char *val, size_t vlen,
+                         uint8_t *out, char *err, size_t errsz) {
+    if (err && errsz > 0) err[0] = '\0';
+    if (!val) vlen = 0;
+    /* Strip one outer ASCII whitespace run for the
+       scalar numeric types ONLY — varchar, enum and every other type is
+       byte-exact (trimming would rewrite stored content and could select
+       a different enum member). Embedded whitespace inside scalars is
+       rejected by the parsers. */
+    switch (f->type) {
+    case FT_SHORT: case FT_INT: case FT_LONG: case FT_TIMESTAMP:
+    case FT_BYTE: case FT_NUMERIC: case FT_DOUBLE: case FT_FLOAT:
+        while (vlen > 0 && is_ascii_space(val[0])) { val++; vlen--; }
+        while (vlen > 0 && is_ascii_space(val[vlen - 1])) vlen--;
+        break;
+    default:
+        break;
+    }
+    if (vlen == 0) {
+        /* Preserve the historic zero-filled representation for empty/NULL
+           spans. */
+        memset(out, 0, f->size);
+        return 0;
+    }
+    switch (f->type) {
+    case FT_SHORT:
+        return conv_i16(f, val, vlen, out, err, errsz);
+    case FT_INT:
+        return conv_i32(f, val, vlen, out, err, errsz);
+    case FT_LONG:
+    case FT_TIMESTAMP:
+        return conv_i64(f, val, vlen, out, err, errsz);
+    case FT_BYTE:
+        return conv_u8(f, val, vlen, out, err, errsz);
+    case FT_NUMERIC:
+        return conv_numeric(f, val, vlen, out, err, errsz);
+    case FT_DOUBLE:
+        return conv_f64(f, val, vlen, out, err, errsz);
+    case FT_FLOAT:
+        return conv_f32(f, val, vlen, out, err, errsz);
+    case FT_VARCHAR:
+        /* Reject overlength input before the legacy encoder can truncate it. */
+        if ((int)vlen > f->size - 2) {
+            fmt_conv_err(err, errsz, f,
+                         "%zu bytes exceeds max %d", vlen, f->size - 2);
+            return -1;
+        }
+        break;
+    default:
+        break;
+    }
+    encode_field_len(f, val, vlen, out);
+    return 0;
+}
+
 void encode_field_len(const TypedField *f, const char *val, size_t vlen,
                       uint8_t *out) {
     if (!val || vlen == 0) {
@@ -2055,7 +2481,7 @@ void encode_field(const TypedField *f, const char *val, uint8_t *out) {
                 positive but flip kept for consistency with other signed types)
      datetime — 4 bytes BE flipped-int32 date + 3 bytes BE seconds-of-day
      double   — 8 bytes BE with IEEE-754 total-order transform */
-void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
+void encode_field_text_for_index(const TypedField *f, const char *val, size_t vlen,
                             uint8_t *out, size_t *out_len) {
     if (!val || vlen == 0) {
         /* Empty / null input. For fixed-width fields we zero f->size bytes
@@ -2080,8 +2506,8 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
     case FT_TIMESTAMP: {
         /* Same index-key shape — top-bit-flipped BE int64 gives a memcmp
            total order over the signed range. */
-        char cbuf[32]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        int64_t v = strtoll(cbuf, NULL, 10);
+        assert(val[vlen] == '\0');
+        int64_t v = strtoll(val, NULL, 10);
         uint64_t u = (uint64_t)v ^ (1ULL << 63);
         out[0] = (u >> 56) & 0xFF; out[1] = (u >> 48) & 0xFF;
         out[2] = (u >> 40) & 0xFF; out[3] = (u >> 32) & 0xFF;
@@ -2091,8 +2517,8 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     case FT_INT: {
-        char cbuf[16]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        int32_t v = (int32_t)atoi(cbuf);
+        assert(val[vlen] == '\0');
+        int32_t v = (int32_t)strtoll(val, NULL, 10);
         uint32_t u = (uint32_t)v ^ 0x80000000u;
         out[0] = (u >> 24) & 0xFF; out[1] = (u >> 16) & 0xFF;
         out[2] = (u >> 8) & 0xFF;  out[3] = u & 0xFF;
@@ -2100,16 +2526,16 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     case FT_SHORT: {
-        char cbuf[16]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        int16_t v = (int16_t)atoi(cbuf);
+        assert(val[vlen] == '\0');
+        int16_t v = (int16_t)strtoll(val, NULL, 10);
         uint16_t u = (uint16_t)v ^ 0x8000u;
         out[0] = (u >> 8) & 0xFF; out[1] = u & 0xFF;
         *out_len = 2;
         break;
     }
     case FT_DOUBLE: {
-        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        double v = atof(cbuf);
+        assert(val[vlen] == '\0');
+        double v = strtod(val, NULL);
         uint64_t bits;
         memcpy(&bits, &v, 8);
         /* IEEE-754 total order: if sign bit set (negative), flip all bits;
@@ -2125,8 +2551,8 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     case FT_FLOAT: {
-        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        float v = (float)atof(cbuf);
+        assert(val[vlen] == '\0');
+        float v = strtof(val, NULL);
         uint32_t bits;
         memcpy(&bits, &v, 4);
         /* IEEE-754 total order: if sign bit set (negative), flip all bits;
@@ -2145,8 +2571,8 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     case FT_BYTE: {
-        char cbuf[8]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        out[0] = (uint8_t)atoi(cbuf);
+        assert(val[vlen] == '\0');
+        out[0] = (uint8_t)strtoll(val, NULL, 10);
         *out_len = 1;
         break;
     }
@@ -2262,9 +2688,13 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     case FT_NUMERIC: {
-        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        double dv = atof(cbuf);
-        int64_t v = (int64_t)(dv * f->numeric_scale_mult + (dv >= 0 ? 0.5 : -0.5));
+        /* Exact: the same conversion as the write path, so a saved
+           value is always found by its own literal. Invalid or
+           out-of-range literals evaluate to 0 — identical to the
+           scan-side criterion compiler, so indexed and scan routes
+           agree for junk input too (the historic atof behavior). */
+        int64_t v;
+        if (conv_numeric_text(f, val, vlen, &v, NULL, 0) != 0) v = 0;
         uint64_t u = (uint64_t)v ^ (1ULL << 63);
         out[0] = (u >> 56) & 0xFF; out[1] = (u >> 48) & 0xFF;
         out[2] = (u >> 40) & 0xFF; out[3] = (u >> 32) & 0xFF;
@@ -2305,7 +2735,7 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
 
 /* Direct typed-binary → index-key. Reads the field's stored bytes at
    f->offset and emits the same memcmp-sortable encoding as
-   encode_field_for_index would for equivalent text input. Skips the
+   encode_field_text_for_index would for equivalent text input. Skips the
    typed→ASCII render step on integer/date/numeric fields. */
 void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
                               size_t data_len, int field_idx,
@@ -2446,6 +2876,29 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
    0.0.0.0 / :: / nil-uuid, so the JSON encoders store NULL instead —
    the historical "unset sentinel" convention. A well-formed 0.0.0.0 /
    :: / nil uuid parses and stays a real (bit-clear) zero value. */
+static int encode_json_field_checked(const TypedField *f, const char *val,
+                                      size_t vlen, int was_quoted,
+                                      uint8_t *out, char *err, size_t errsz) {
+    if (!was_quoted || !typed_json_string_type(f->type))
+        return encode_field_checked(f, val, vlen, out, err, errsz);
+    char *decoded = NULL;
+    size_t decoded_len = 0;
+    errno = 0;
+    if (json_unescape_cstring(val, vlen, &decoded, &decoded_len) != 0) {
+        int decode_errno = errno;
+        if (err && errsz)
+            snprintf(err, errsz, decode_errno == ENOMEM
+                     ? "out of memory decoding JSON value for field '%s'"
+                     : "malformed JSON escape in value for field '%s'",
+                     f->name);
+        errno = decode_errno;
+        return -1;
+    }
+    int rc = encode_field_checked(f, decoded, decoded_len, out, err, errsz);
+    free(decoded);
+    return rc;
+}
+
 static int sentinel_span_parses(enum FieldType t, const char *val, size_t vlen) {
     switch (t) {
     case FT_IPV4: {
@@ -2476,9 +2929,11 @@ static int sentinel_span_parses(enum FieldType t, const char *val, size_t vlen) 
     }
 }
 
-int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_size) {
+int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out,
+                 int out_size, char *err_buf, size_t err_buf_size) {
     if (!ts || !ts->typed || out_size < ts->total_size) return -1;
     memset(out, 0, ts->total_size);
+    if (err_buf && err_buf_size > 0) err_buf[0] = '\0';
     /* Null bitmap head — no defaults pass here, so bits are only set by
        explicit JSON null spans below. */
     out[0] = (uint8_t)typed_nullmap_bytes(ts->nfields);
@@ -2538,24 +2993,12 @@ int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_
                     typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
                     break;
                 }
-                /* Varchar values carry JSON escapes (\" \n \\ \uXXXX
-                   etc.) — must decode before storage or round-trips
-                   come back double-escaped. Other types' values are
-                   numeric / bool / null literals that don't need it. */
-                if (ts->fields[i].type == FT_VARCHAR) {
-                    char *unesc = NULL; size_t unesc_len = 0;
-                    if (json_unescape_string(ev, el, &unesc, &unesc_len) == 0) {
-                        encode_field_len(&ts->fields[i], unesc, unesc_len,
-                                          out + ts->nullmap_prefix + ts->fields[i].offset);
-                        free(unesc);
-                    } else {
-                        encode_field_len(&ts->fields[i], ev, el,
-                                          out + ts->nullmap_prefix + ts->fields[i].offset);
-                    }
-                } else {
-                    encode_field_len(&ts->fields[i], ev, el,
-                                      out + ts->nullmap_prefix + ts->fields[i].offset);
-                }
+                /* Decode eligible JSON string fields exactly once before
+                   full-span conversion; non-JSON defaults use the literal path. */
+                if (encode_json_field_checked(&ts->fields[i], ev, el, was_quoted,
+                                              out + ts->nullmap_prefix + ts->fields[i].offset,
+                                              err_buf, err_buf_size) != 0)
+                    return -2;
             }
             break;
         }
@@ -3101,36 +3544,10 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                                               err_buf, err_buf_size);
                         return -2;
                     }
-                    /* Same JSON-unescape pass typed_encode does for
-                       varchars — keeps wire and stored bytes in sync. */
-                    if (ts->fields[i].type == FT_VARCHAR) {
-                        char *unesc = NULL; size_t unesc_len = 0;
-                        if (json_unescape_cstring(ev, el, &unesc, &unesc_len) != 0) {
-                            /* Malformed escape (including an embedded NUL)
-                               — reject rather than silently falling back
-                               to raw, still-escaped bytes. */
-                            if (err_buf && err_buf_size > 0)
-                                snprintf(err_buf, err_buf_size,
-                                    "malformed JSON escape in value for field '%s'",
-                                    ts->fields[i].name);
-                            return -2;
-                        }
-                        int content_max = ts->fields[i].size - 2;
-                        if ((int)unesc_len > content_max) {
-                            if (err_buf && err_buf_size > 0)
-                                snprintf(err_buf, err_buf_size,
-                                    "value for field '%s' is %zu bytes; exceeds max %d for varchar",
-                                    ts->fields[i].name, unesc_len, content_max);
-                            free(unesc);
-                            return -2;
-                        }
-                        encode_field_len(&ts->fields[i], unesc, unesc_len,
-                                          out + ts->nullmap_prefix + ts->fields[i].offset);
-                        free(unesc);
-                    } else {
-                        encode_field_len(&ts->fields[i], ev, el,
-                                          out + ts->nullmap_prefix + ts->fields[i].offset);
-                    }
+                    if (encode_json_field_checked(&ts->fields[i], ev, el, was_quoted,
+                                                  out + ts->nullmap_prefix + ts->fields[i].offset,
+                                                  err_buf, err_buf_size) != 0)
+                        return -2;
                     seen[i] = 1;
                 }
                 break;
@@ -3170,8 +3587,10 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                          ts->fields[i].name);
             return -2;
         }
-        encode_field(&ts->fields[i], dv,
-                     out + ts->nullmap_prefix + ts->fields[i].offset);
+        if (encode_field_checked(&ts->fields[i], dv, strlen(dv),
+                                  out + ts->nullmap_prefix + ts->fields[i].offset,
+                                  err_buf, err_buf_size) != 0)
+            return -2;
     }
     return ts->total_size;
 }
@@ -3269,7 +3688,8 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data,
             if (!render_zeros) return 0;
             return snprintf(buf, buflen, "0");
         }
-        return snprintf(buf, buflen, "%g", v);
+        /* 17 significant digits: every double round-trips exactly. */
+        return snprintf(buf, buflen, "%.17g", v);
     }
     case FT_FLOAT: {
         float v;
@@ -3278,7 +3698,9 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data,
             if (!render_zeros) return 0;
             return snprintf(buf, buflen, "0");
         }
-        return snprintf(buf, buflen, "%g", (double)v);
+        /* 9 significant digits: every float round-trips exactly, parsed
+           directly as binary32. */
+        return snprintf(buf, buflen, "%.9g", (double)v);
     }
     case FT_BOOL: {
         return snprintf(buf, buflen, "%s", data[0] ? "true" : "false");
@@ -3294,15 +3716,21 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data,
         int64_t v = (int64_t)u;   /* see FT_LONG: unsigned accumulate (UB gate) */
         if (v == 0) return snprintf(buf, buflen, "0");
         int64_t scale = f->numeric_scale_mult;
-        int64_t whole = v / scale;
-        int64_t frac = v % scale;
-        int neg = (v < 0);
-        if (frac < 0) frac = -frac;
-        if (whole < 0) whole = -whole;
+        if (scale <= 0)   /* unsupported legacy scale: raw integer fallback */
+            return snprintf(buf, buflen, "%lld", (long long)v);
+        /* Magnitude in unsigned arithmetic — negating INT64_MIN is UB
+           and rendered "--9223372036854775808" at scale 0. */
+        uint64_t m = (uint64_t)v;
+        int neg = v < 0;
+        if (neg) m = 0u - m;
+        uint64_t whole = m / (uint64_t)scale;
+        uint64_t frac = m % (uint64_t)scale;
         if (frac == 0)
-            return snprintf(buf, buflen, "%s%lld", neg ? "-" : "", (long long)whole);
-        return snprintf(buf, buflen, "%s%lld.%0*lld", neg ? "-" : "",
-                        (long long)whole, f->numeric_scale, (long long)frac);
+            return snprintf(buf, buflen, "%s%llu", neg ? "-" : "",
+                            (unsigned long long)whole);
+        return snprintf(buf, buflen, "%s%llu.%0*llu", neg ? "-" : "",
+                        (unsigned long long)whole, f->numeric_scale,
+                        (unsigned long long)frac);
     }
     case FT_DATE: {
         uint32_t u = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |

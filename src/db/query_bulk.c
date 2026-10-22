@@ -2367,9 +2367,10 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
                 if (vals[i].len == 0) continue;
                 if (ts->fields[i].type == FT_VARCHAR &&
                     (int)vals[i].len > ts->fields[i].size - 2) { row_overflow = 1; break; }
-                encode_field_len(&ts->fields[i], vals[i].ptr, vals[i].len,
-                                 payload + ts->nullmap_prefix +
-                                 ts->fields[i].offset);
+                if (encode_field_checked(&ts->fields[i], vals[i].ptr, vals[i].len,
+                                          payload + ts->nullmap_prefix +
+                                          ts->fields[i].offset,
+                                          NULL, 0) != 0) { row_overflow = 1; break; }
             }
         } else {
             for (int i = 0; i < active_count && i < nvals; i++) {
@@ -2377,9 +2378,10 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
                 if (vals[i].len == 0) continue;
                 if (ts->fields[fi].type == FT_VARCHAR &&
                     (int)vals[i].len > ts->fields[fi].size - 2) { row_overflow = 1; break; }
-                encode_field_len(&ts->fields[fi], vals[i].ptr, vals[i].len,
-                                 payload + ts->nullmap_prefix +
-                                 ts->fields[fi].offset);
+                if (encode_field_checked(&ts->fields[fi], vals[i].ptr, vals[i].len,
+                                          payload + ts->nullmap_prefix +
+                                          ts->fields[fi].offset,
+                                          NULL, 0) != 0) { row_overflow = 1; break; }
             }
         }
         if (row_overflow) {
@@ -3405,7 +3407,8 @@ static int v2_bulk_upd_value_compute(const SlotcaskOldRecord *old,
        fields carry OLD forward generation-aware. */
     uint8_t *new_buf = (uint8_t *)rec->value;
     if (update_compose_new_from_old(w->ts, old, new_buf,
-                                    ctx->field_vals, ctx->field_null) != 0)
+                                    ctx->field_vals, ctx->field_null,
+                                    NULL, 0) != 0)
         return -1;
     rec->vlen = (size_t)w->ts->total_size;
     rec->hdr2 = SREC_FLAG_NULLMAP;
@@ -4209,7 +4212,8 @@ static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
     if (!old) return -1;     /* require_existing already filtered, defence in depth */
 
     uint8_t *new_buf = (uint8_t *)rec->value;
-    if (update_compose_new_from_old(w->ts, old, new_buf, NULL, NULL) != 0)
+    if (update_compose_new_from_old(w->ts, old, new_buf, NULL, NULL,
+                                    NULL, 0) != 0)
         return -1;
     rec->vlen = (size_t)w->ts->total_size;
     rec->hdr2 = SREC_FLAG_NULLMAP;
@@ -4235,9 +4239,14 @@ static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
                     ? tmpcell : malloc(cell_len + 1);
                 memcpy(cellbuf, cell_start, cell_len);
                 cellbuf[cell_len] = '\0';
-                encode_field(&w->ts->fields[tidx], cellbuf,
-                              new_buf + w->ts->nullmap_prefix +
-                              w->ts->fields[tidx].offset);
+                if (encode_field_checked(&w->ts->fields[tidx], cellbuf,
+                                          cell_len,
+                                          new_buf + w->ts->nullmap_prefix +
+                                          w->ts->fields[tidx].offset,
+                                          NULL, 0) != 0) {
+                    if (cellbuf != tmpcell) free(cellbuf);
+                    return -1;   /* per-record skip, existing tally */
+                }
                 /* CSV cells have no null spelling, but the composer may
                    have carried a NULL bit forward from OLD — a written
                    cell materializes a value, so clear it (§2.7). */
@@ -4826,7 +4835,8 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
         return -1;
 
     uint8_t *new_buf = (uint8_t *)rec->value;
-    if (update_compose_new_from_old(w->ts, old, new_buf, NULL, NULL) != 0)
+    if (update_compose_new_from_old(w->ts, old, new_buf, NULL, NULL,
+                                    NULL, 0) != 0)
         return -1;
     rec->vlen = (size_t)w->ts->total_size;
     rec->hdr2 = SREC_FLAG_NULLMAP;
@@ -4852,9 +4862,12 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
         if (json_rec->field_values[i]) {
             if (w->ts->fields[tidx].type != FT_VARCHAR &&
                 json_rec->field_values[i][0] == '{') return -1;
-            encode_field(&w->ts->fields[tidx], json_rec->field_values[i],
-                          new_buf + w->ts->nullmap_prefix +
-                          w->ts->fields[tidx].offset);
+            if (encode_field_checked(&w->ts->fields[tidx], json_rec->field_values[i],
+                                      strlen(json_rec->field_values[i]),
+                                      new_buf + w->ts->nullmap_prefix +
+                                      w->ts->fields[tidx].offset,
+                                      NULL, 0) != 0)
+                return -1;   /* per-record skip, existing tally */
             /* A materialized value clears any bit the §2.7 composer
                carried forward from a NULL OLD — value-with-set-bit would
                render and match as NULL. */

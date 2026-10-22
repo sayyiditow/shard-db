@@ -1019,7 +1019,27 @@ static int validate_field_type_clean(char *buf) {
     if (strcmp(type, "ipv4") == 0)    return 4;
     if (strcmp(type, "ipv6") == 0)    return 16;
     if (strcmp(type, "currency") == 0) return 8;
-    if (strncmp(type, "numeric:", 8) == 0) return 8;
+    if (strncmp(type, "numeric:", 8) == 0) {
+        /* Full-input P[,S] validation. P stays informational until the
+           packed exact format lands; S must fit the int64 scaled storage:
+           0..18 (10^18 is the largest power of ten in int64; S = 0 is
+           valid). Legacy "numeric:N" without a comma keeps its
+           historical scale-2 meaning. Junk suffixes are rejected, not
+           atoi-prefixed. */
+        const char *ps = type + 8;
+        if (!(*ps >= '0' && *ps <= '9')) return 0;
+        while (*ps >= '0' && *ps <= '9') ps++;
+        if (*ps == ',') {
+            ps++;
+            if (!(*ps >= '0' && *ps <= '9')) return 0;
+            while (*ps >= '0' && *ps <= '9') ps++;
+        }
+        if (*ps != '\0') return 0;
+        const char *comma = strchr(type + 8, ',');
+        long s = comma ? strtol(comma + 1, NULL, 10) : 2;
+        if (s < 0 || s > 18) return 0;
+        return 8;
+    }
     if (strncmp(type, "enum(", 5) == 0) {
         /* Validate enum(v1,v2,...) — empty list, duplicates, missing
            close paren, and over-ceiling all → invalid (return 0).

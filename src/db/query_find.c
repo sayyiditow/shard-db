@@ -804,15 +804,16 @@ void transform_field_value(const TypedField *old_f,
     }
     case FT_FLOAT: {
         /* float → double widen. Other float edits not supported. */
-        if (new_f->type == FT_DOUBLE) {
-            uint32_t u = 0;
-            for (size_t i = 0; i < 4; i++) u = (u << 8) | src[i];
+        if (new_f->type == FT_DOUBLE && new_f->size == 8) {
+            /* Stored float bytes are native-order (written by memcpy in
+               encode_field); widen with memcpy in both directions so the
+               exact stored binary32 becomes its exact binary64. The old
+               big-endian reinterpretation destroyed every widened value
+               (for example, 3.25 became 5.34788e-318). */
             float fv;
-            memcpy(&fv, &u, 4);
+            memcpy(&fv, src, 4);
             double dv = (double)fv;
-            uint64_t u64;
-            memcpy(&u64, &dv, 8);
-            for (size_t i = 8; i-- > 0; ) { dst[i] = (uint8_t)(u64 & 0xFF); u64 >>= 8; }
+            memcpy(dst, &dv, 8);
             return;
         }
         memcpy(dst, src, old_f->size < new_f->size ? old_f->size : new_f->size);
@@ -938,7 +939,18 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
                 /* Re-use the insert-time encoder so the literal goes
                    through the same type-aware path (varchar length
                    prefix, int BE, numeric scaling, etc.). */
-                encode_field(nf, nf->default_val, buf + ctx->new_ts->nullmap_prefix + nf->offset);
+                if (encode_field_checked(nf, nf->default_val,
+                                          strlen(nf->default_val),
+                                          buf + ctx->new_ts->nullmap_prefix + nf->offset,
+                                          NULL, 0) != 0) {
+                    LOG_ERROR(LOG_SUB_CONFIG,
+                              "rebuild_v2: declared default for field [%s] "
+                              "is not a valid %s value; refusing rebuild",
+                              nf->name, typed_type_name(nf->type));
+                    free(buf);
+                    ctx->error = 1;
+                    return 1;   /* rebuild aborts; old object stays live */
+                }
                 break;
             case DK_SEQ: {
                 int64_t v = atomic_fetch_add_explicit(&bf->seq_next, 1,

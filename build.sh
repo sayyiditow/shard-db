@@ -343,6 +343,9 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_kf_uncapped_growth.c \
     src/test/cases/test_trigram_index.c \
     src/test/cases/test_config_encode.c \
+    src/test/cases/test_scalar_conversion_safety.c \
+    src/test/cases/test_scalar_routes_checked.c \
+    src/test/cases/test_scalar_csv_update.c \
     src/test/cases/test_version_gate.c \
     src/test/cases/test_datetime_evening.c \
     src/test/cases/test_error_paths.c \

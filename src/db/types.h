@@ -768,6 +768,12 @@ void free_excluded(ExcludedKeys *ex);
 void rmrf(const char *path);
 void sort_dedup_file(const char *path);
 
+static inline int typed_json_string_type(enum FieldType t) {
+    return t == FT_VARCHAR || t == FT_SHORT || t == FT_INT ||
+           t == FT_LONG || t == FT_TIMESTAMP || t == FT_BYTE ||
+           t == FT_NUMERIC || t == FT_DOUBLE || t == FT_FLOAT;
+}
+
 /* JSON helpers */
 const char *json_skip(const char *p);
 const char *json_skip_value(const char *p);
@@ -862,7 +868,8 @@ int json_get_fields_unescaped(const char *json, const char **keys, int nkeys,
 /* 1 iff the raw JSON value span is the unquoted literal null (util.c).
    Call before quote stripping — quoted "null" is a string value. */
 int json_span_is_null(const char *v, size_t len);
-/* json_get_fields + per-field unquoted-null detection + varchar unescape.
+/* json_get_fields + per-field unquoted-null detection + quoted eligible
+   string decoding (varchar and scalar numeric types).
    out_null[i] = 1 ⇔ field i's raw span was unquoted null; out[i] is then
    NULL. Same -1 contract as json_get_fields_unescaped. */
 int json_get_fields_null_aware(const char *json, const char **keys, int nkeys,
@@ -952,9 +959,10 @@ void build_effective_root(char *out, size_t outlen, const char *dir);
 TypedSchema *load_typed_schema(const char *db_root, const char *object);
 /* Encode without defaults. Returns ts->total_size on success, -1 on
    bad args, or -2 when a :not_null field would produce NULL (explicit
-   JSON null or an unparseable uuid/ipv4/ipv6 sentinel) — no err_buf
-   channel on this encoder. */
-int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_size);
+   JSON null or an unparseable uuid/ipv4/ipv6 sentinel. On -1/-2 the
+   err_buf channel carries the validation message. */
+int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out,
+                 int out_size, char *err_buf, size_t err_buf_size);
 
 /* Canonical ":not_null" rejection text — one source so wire errors,
    bulk skip-log lines, and the error-code docs stay identical. */
@@ -985,6 +993,19 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
                            int data_len, int field_idx, uint8_t hdr2);
 extern const uint8_t g_zero_field_65537[65537];
 void encode_field(const TypedField *f, const char *val, uint8_t *out);
+/* Checked conversion boundary: returns 0 on success, -1 on
+   validation failure with a field-specific message in err (if non-NULL).
+   `out` is only written on success. Outer ASCII whitespace is stripped
+   for the scalar numeric types only; varchar/enum are byte-exact. */
+int encode_field_checked(const TypedField *f, const char *val, size_t vlen,
+                         uint8_t *out, char *err, size_t errsz);
+/* Exact decimal text -> scaled int64 for the field's declared scale,
+   ties away from zero, with identical rounding for writes and criteria.
+   0 = ok, -1 = invalid,
+   -2 = out of range. */
+int conv_numeric_text(const TypedField *f, const char *val, size_t vlen,
+                      int64_t *out, char *err, size_t errsz);
+const char *typed_type_name(enum FieldType t);
 void encode_field_len(const TypedField *f, const char *val, size_t vlen, uint8_t *out);
 /* Produce the "now" string for an auto_create / auto_update timestamp field
    in the form its type expects (buf must be >= 24 bytes). Shared between
@@ -998,12 +1019,20 @@ void auto_now_str(const TypedField *f, char *buf, size_t bufsz);
    flip all bits). Varchar/byte/bool/composite are raw bytes, no flip.
    Output length returned via *out_len — callers must reserve at least
    f->size bytes (varchar: up to vlen bytes, no 2-byte length prefix). */
-void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
+/* Internal typed-text lookup encoder. FT_LONG/TIMESTAMP/INT/SHORT/BYTE/
+   DOUBLE/FLOAT require a complete C string: val[vlen] is a readable NUL.
+   Numeric uses its existing exact length-aware converter; other type
+   grammars retain their prior span semantics.
+   Varchar remains an explicit binary span; embedded NUL bytes are valid.
+   Scalar conversion is allocation-free; callers never receive a zero key
+   merely because an allocation failed. Raw/mmap scalar spans need a
+   separate checked adapter, not this text-only interface. */
+void encode_field_text_for_index(const TypedField *f, const char *val, size_t vlen,
                             uint8_t *out, size_t *out_len);
 
 /* Typed-binary → index-key encoder. Reads field bytes from a typed record
    (at the field's fixed offset) and emits the same memcmp-sortable bytes
-   that encode_field_for_index would produce for the equivalent text input.
+   that encode_field_text_for_index would produce for the equivalent text input.
    Used by index scan paths that already hold typed binary records and want
    to skip the typed→ASCII→index-bytes roundtrip. */
 void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
@@ -1032,7 +1061,7 @@ int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
 
 /* Build an index key from a JSON object for a (possibly composite) spec.
    Extracts the necessary fields from json, then encodes:
-     single-field → encode_field_for_index (binary),
+     single-field → encode_field_text_for_index (binary),
       composite    → typed binary concatenation.
    Returns 1 on success with malloc'd *out_val and *out_len set; caller
    frees. ts may be NULL (untyped object) — in that case every field is
@@ -1165,7 +1194,7 @@ char parse_csv_delim(const char *s);
 int cmd_not_exists(const char *db_root, const char *object, const char *keys_json);
 
 /* index.c */
-/* Value is raw index-key bytes (see encode_field_for_index /
+/* Value is raw index-key bytes (see encode_field_text_for_index /
    typed_field_to_index_key). Composite indexes pass the typed binary
    concatenated sub-field index keys; single-field indexes pass encoded
    bytes + their true length. vlen may be 0 (empty key sorts before all others). */

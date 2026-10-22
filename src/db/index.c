@@ -1186,31 +1186,25 @@ int index_parallel(const char *db_root, const char *object, int splits,
         }
     }
 
-    char *extracted[MAX_FIELDS * 4];
-    json_get_fields(value, unique_keys, unique_count, extracted);
+    char *extracted[MAX_FIELDS * 4] = {0};
+    enum FieldType extracted_types[MAX_FIELDS * 4];
     for (int j = 0; j < unique_count; j++) {
-        if (!extracted[j]) continue;
         int fidx = ts ? typed_field_index(ts, unique_keys[j]) : -1;
-        if (fidx < 0 || ts->fields[fidx].type != FT_VARCHAR) continue;
-        char *unesc = NULL; size_t ulen = 0;
-        errno = 0;
-        if (json_unescape_cstring(extracted[j], strlen(extracted[j]), &unesc, &ulen) != 0) {
-            /* The record encoder already validated this exact JSON before
-               pre_commit. A later failure can still be OOM; it must abort
-               the pre_commit, never silently omit this index key. */
-            int decode_errno = (errno == ENOMEM) ? ENOMEM : EINVAL;
-            for (int k = 0; k < unique_count; k++) free(extracted[k]);
-            for (int k = 0; k < unique_count; k++) {
-                int is_field = 0;
-                for (int m = 0; m < nfields; m++)
-                    if (unique_keys[k] == fields[m]) { is_field = 1; break; }
-                if (!is_field) free((char *)unique_keys[k]);
-            }
-            errno = decode_errno;
-            return -1;
+        extracted_types[j] = fidx >= 0 ? ts->fields[fidx].type : FT_COUNT;
+    }
+    errno = 0;
+    if (json_get_fields_unescaped(value, unique_keys, unique_count,
+                                  extracted_types, extracted) != 0) {
+        int decode_errno = errno == ENOMEM ? ENOMEM : EINVAL;
+        for (int k = 0; k < unique_count; k++) free(extracted[k]);
+        for (int k = 0; k < unique_count; k++) {
+            int is_field = 0;
+            for (int m = 0; m < nfields; m++)
+                if (unique_keys[k] == fields[m]) { is_field = 1; break; }
+            if (!is_field) free((char *)unique_keys[k]);
         }
-        free(extracted[j]);
-        extracted[j] = unesc;
+        errno = decode_errno;
+        return -1;
     }
 
     IndexThreadArg args[MAX_FIELDS];
@@ -1252,7 +1246,7 @@ int index_parallel(const char *db_root, const char *object, int splits,
                 if (fidx >= 0) {
                     const TypedField *f = &ts->fields[fidx];
                     size_t blen = 0;
-                    encode_field_for_index(f, txt, strlen(txt),
+                    encode_field_text_for_index(f, txt, strlen(txt),
                                             (uint8_t *)result + pos, &blen);
                     if (blen == 0) { all_present = 0; break; }
                     if (pos + (int)blen < (int)sizeof(result)) { pos += (int)blen; }
@@ -1287,7 +1281,7 @@ int index_parallel(const char *db_root, const char *object, int splits,
                     const TypedField *f = &ts->fields[fidx];
                     size_t cap = (size_t)(f->size > 8 ? f->size : 8);
                     key_buf = malloc(cap);
-                    encode_field_for_index(f, txt, strlen(txt), key_buf, &key_len);
+                    encode_field_text_for_index(f, txt, strlen(txt), key_buf, &key_len);
                     if (key_len == 0) { free(key_buf); key_buf = NULL; }
                 } else {
                     /* Unknown to typed schema (e.g. legacy untyped object) —
@@ -1635,7 +1629,7 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
             if (fi >= 0) {
                 const TypedField *f = &ts->fields[fi];
                 size_t blen = 0;
-                encode_field_for_index(f, vals[i], strlen(vals[i]),
+                encode_field_text_for_index(f, vals[i], strlen(vals[i]),
                                         (uint8_t *)cat + cp, &blen);
                 if (blen == 0) { ok = 0; break; }
                 if (cp + (int)blen < (int)sizeof(cat)) { cp += (int)blen; }
@@ -1655,22 +1649,16 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
         return 1;
     }
 
-    /* Single field — extract text, encode to index bytes. */
-    JsonObj jo;
-    json_parse_object(json, strlen(json), &jo);
+    /* Single field — extract and decode a quoted typed value once. */
     int fi = ts ? typed_field_index(ts, spec) : -1;
-    char *txt;
-    if (fi >= 0 && ts->fields[fi].type == FT_VARCHAR) {
-        const char *v; size_t vl;
-        if (!json_obj_unquoted(&jo, spec, &v, &vl)) return 0;
-        size_t ulen = 0;
-        errno = 0;
-        if (json_unescape_cstring(v, vl, &txt, &ulen) != 0) {
-            if (errno != ENOMEM) errno = EINVAL;
-            return -1;
-        }
-    } else {
-        txt = json_obj_strdup(&jo, spec);
+    enum FieldType text_type = fi >= 0 ? ts->fields[fi].type : FT_COUNT;
+    const char *text_key = spec;
+    char *txt = NULL;
+    errno = 0;
+    if (json_get_fields_unescaped(json, &text_key, 1, &text_type, &txt) != 0) {
+        free(txt);
+        if (errno != ENOMEM) errno = EINVAL;
+        return -1;
     }
     if (!txt || !txt[0]) { free(txt); return 0; }
 
@@ -1679,7 +1667,7 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
         size_t cap = (size_t)(f->size > 8 ? f->size : 8);
         uint8_t *buf = malloc(cap);
         size_t blen = 0;
-        encode_field_for_index(f, txt, strlen(txt), buf, &blen);
+        encode_field_text_for_index(f, txt, strlen(txt), buf, &blen);
         free(txt);
         if (blen == 0) { free(buf); return 0; }
         *out_val = buf;

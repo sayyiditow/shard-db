@@ -187,13 +187,13 @@ static int test_not_null_writes_run(void) {
         uint8_t out[64];
 
         tsu.fields[0].not_null = 1;
-        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":null}", out, sizeof(out)), -2,
+        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":null}", out, sizeof(out), NULL, 0), -2,
                       "typed_encode rejects null on not_null field");
-        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":5}", out, sizeof(out)),
+        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":5}", out, sizeof(out), NULL, 0),
                       tsu.total_size,
                       "typed_encode accepts value on not_null field");
         tsu.fields[0].not_null = 0;
-        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":null}", out, sizeof(out)),
+        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":null}", out, sizeof(out), NULL, 0),
                       tsu.total_size,
                       "typed_encode accepts null unconstrained");
         ASSERT_EQ_INT(typed_field_null(out + 1, tsu.nullmap_prefix - 1, 0), 1,

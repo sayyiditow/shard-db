@@ -1455,7 +1455,8 @@ int update_compose_new_from_old(const TypedSchema *ts,
                                 const SlotcaskOldRecord *old,
                                 uint8_t *out_buf,
                                 char *const *field_vals,
-                                const uint8_t *field_null) {
+                                const uint8_t *field_null,
+                                char *err, size_t errsz) {
     /* §2026.10.2 null plan §2.7: NEW is always written in the current
        nullmap layout. OLD may be legacy or nullmap; the view is validated
        before any field-region math — malformed flagged OLD fails the
@@ -1485,7 +1486,9 @@ int update_compose_new_from_old(const TypedSchema *ts,
         }
         if (field_vals && field_vals[i]) {
             if (f->type != FT_VARCHAR && field_vals[i][0] == '{') return -2;
-            encode_field(f, field_vals[i], dst);   /* bit already clear */
+            if (encode_field_checked(f, field_vals[i], strlen(field_vals[i]),
+                                     dst, err, errsz) != 0)
+                return -2;   /* field-specific message already in err */
             continue;
         }
         /* Omitted on update → carry OLD forward, preserving rendering. */
@@ -1918,7 +1921,12 @@ static int v2_update_new_from_old(const SlotcaskOldRecord *old,
             fmt_not_null_err(f, c->err_buf, sizeof(c->err_buf)); goto reject;
         }
     }
-    if (update_compose_new_from_old(c->idx_ts, old, out_value, values, nulls) != 0) {
+    int compose_rc = update_compose_new_from_old(c->idx_ts, old, out_value,
+                                                 values, nulls,
+                                                 c->err_buf, sizeof(c->err_buf));
+    if (compose_rc == -2)
+        goto reject;                     /* validation message in err_buf */
+    if (compose_rc != 0) {
         snprintf(c->err_buf, sizeof(c->err_buf), "corrupt record header on update target");
         goto reject;
     }

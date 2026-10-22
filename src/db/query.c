@@ -357,7 +357,9 @@ const TypedField *resolve_idx_field(const TypedSchema *ts, const char *field) {
 
 /* Encode a criterion value for index lookup. If tf is NULL (composite index
    or unknown field), returns the text as raw bytes. Otherwise emits
-   memcmp-sortable bytes matching what the write side stored. Output written
+   memcmp-sortable bytes matching what the write side stored. Libc-parsed
+   scalar fields require a complete NUL-terminated spelling (val[vlen] == 0);
+   raw and varchar values retain their explicit-span contract. Output written
    into caller's buf; *out_len set. */
 void encode_criterion_value(const TypedField *tf,
                                    const char *val, size_t vlen,
@@ -376,7 +378,7 @@ void encode_criterion_value(const TypedField *tf,
         *out_len = n;
         return;
     }
-    encode_field_for_index(tf, val, vlen, buf, out_len);
+    encode_field_text_for_index(tf, val, vlen, buf, out_len);
 }
 
 /* Ops where btree_dispatch falls through to the default full-leaf scan
@@ -8096,7 +8098,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                 size_t plen = 0;
                 if (!cur.part_tier[i]) {
                     if (ospec.parts[i].tf) {
-                        encode_field_for_index(ospec.parts[i].tf,
+                        encode_field_text_for_index(ospec.parts[i].tf,
                                                cur.part[i].value,
                                                cur.part[i].vlen,
                                                cur_value_buf + cur_value_len,

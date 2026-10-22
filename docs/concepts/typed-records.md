@@ -61,7 +61,7 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 | `uuid` | `id:uuid` | 16 | Raw 128-bit UUID. Parsed from `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (36 chars). Malformed input encodes 0. |
 | `ipv4` | `addr:ipv4` | 4 | Raw 4-byte IPv4 address, network byte order. Parsed from dotted-quad string (e.g. `192.168.1.1`). Malformed input encodes 0. Byte-lexicographic order matches numeric IPv4 order. |
 | `ipv6` | `addr:ipv6` | 16 | Raw 16-byte IPv6 address, network byte order. Parsed from canonical IPv6 string (e.g. `2001:db8::1`). Malformed input encodes 0. Byte-lexicographic order matches numeric IPv6 order. |
-| `numeric` | `price:numeric:P,S` | 8 | Scaled int64 BE: stored value = value × 10^S. P is total digits (informational), S is scale. |
+| `numeric` | `price:numeric:P,S` | 8 | Scaled int64 BE: stored value = value × 10^S, parsed exactly (no float), rounded half-away-from-zero to the declared scale — identically on writes and in query literals. P is informational until the packed exact format; S is validated to 0..18. Values whose scaled magnitude exceeds int64 are rejected with an explicit error. |
 | `currency` | `amount:currency` | 8 | Alias for `numeric:19,4`. |
 | `enum` | `color:enum(red,green,blue)` | 1 or 2 | Declared closed value list. Stored as the value's 0-based byte index; **1 byte** for ≤256 values, **2 bytes BE** for 257–65535. Wire format is the display string (`"red"`); the engine validates against the list on insert. Commas inside enum values aren't supported in v1. Bitmap index is opt-in (declare `color:bitmap`, or the bare field name which promotes to bitmap). Available since 2026.05.7. Value lists share the 65,535-byte field-definition cap (see [limits](../reference/limits.md)) — ≈13k four-char values. |
 
@@ -85,6 +85,31 @@ For larger blobs — images, PDFs — store them via [put-file](../query-protoco
 - **`double`** — fast, native IEEE 754. Use for rates, scores, physical measurements. Don't use for money.
 - **`numeric:P,S`** — stored as `int64 × 10^S`. Use for money, quantities with exact decimals, anything where `0.1 + 0.2` must equal `0.3`. Accepted and returned as strings: `"1500.75"`.
 - **`currency`** — shortcut for `numeric:19,4` (enough for any real-world currency value).
+
+### Scalar conversion contract (2026.10 Phase 1)
+
+Writes, updates, defaults, bulk rows and numeric query literals validate
+the entire value through one shared exact converter: whole decimal tokens
+for `short`/`int`/`long`/`timestamp`/`byte` (optional sign, no fraction
+or exponent, full range enforced — no wrapping or saturation, `INT64_MIN`
+included), finite `float`/`double` text via `strtof`/`strtod` (non-finite
+spellings, overflow, and nonzero underflow-to-zero rejected; subnormals
+accepted), and exact scaled-decimal `numeric`/`currency` as above. Outer
+ASCII whitespace is stripped once — for the scalar numeric types only;
+quoted JSON strings for those numeric types and `varchar` are JSON-decoded
+exactly once before validation, with escaped NUL rejected. Unquoted JSON
+literals and non-JSON CSV/default literals keep their literal meaning.
+`varchar` and `enum` values are byte-exact after their applicable JSON
+decoding; raw CSV varchar cells preserve their full byte span, including
+embedded NULs. Embedded whitespace, trailing
+junk and hex floats are errors. A numeric literal in a query is converted
+by the same rule as the write, so `0.145` at scale 2 finds the row stored
+from `0.145` (both mean 0.15). Invalid values fail the write with a
+field-specific error — the historic wrap/saturation/zero behaviors are
+gone. `float` output uses 9 and `double` 17 significant digits (exact
+binary round trip), so `3.14` renders as `3.1400000000000001`. Malformed
+calendar/boolean/UUID/IP input keeps its pre-2026.10 behavior until the
+Phase 7 validation layer.
 
 ## Field defaults
 

@@ -1093,12 +1093,12 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
     case FT_DOUBLE: {
         double v; memcpy(&v, p, 8);
         if (!keep_zero && v == 0) return 0;
-        return snprintf(buf, bufsz, "%g", v);
+        return snprintf(buf, bufsz, "%.17g", v);
     }
     case FT_FLOAT: {
         float v; memcpy(&v, p, 4);
         if (!keep_zero && v == 0) return 0;
-        return snprintf(buf, bufsz, "%g", (double)v);
+        return snprintf(buf, bufsz, "%.9g", (double)v);
     }
     case FT_BOOL:
         return snprintf(buf, bufsz, "%s", p[0] ? "true" : "false");
@@ -1107,16 +1107,20 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
     case FT_NUMERIC: {
         int64_t v = ld_be_i64(p);
         if (v == 0) { buf[0] = '0'; buf[1] = '\0'; return 1; }
+        if (f->numeric_scale_mult <= 0)   /* unsupported legacy scale */
+            return snprintf(buf, bufsz, "%lld", (long long)v);
         int64_t scale = f->numeric_scale_mult;
-        int64_t whole = v / scale;
-        int64_t frac = v % scale;
-        int neg = (v < 0);
-        if (frac < 0) frac = -frac;
-        if (whole < 0) whole = -whole;
+        uint64_t m = (uint64_t)v;
+        int neg = v < 0;
+        if (neg) m = 0u - m;   /* magnitude without negating INT64_MIN */
+        uint64_t whole = m / (uint64_t)scale;
+        uint64_t frac = m % (uint64_t)scale;
         if (frac == 0)
-            return snprintf(buf, bufsz, "%s%lld", neg ? "-" : "", (long long)whole);
-        return snprintf(buf, bufsz, "%s%lld.%0*lld", neg ? "-" : "",
-                        (long long)whole, f->numeric_scale, (long long)frac);
+            return snprintf(buf, bufsz, "%s%llu", neg ? "-" : "",
+                            (unsigned long long)whole);
+        return snprintf(buf, bufsz, "%s%llu.%0*llu", neg ? "-" : "",
+                        (unsigned long long)whole, f->numeric_scale,
+                        (unsigned long long)frac);
     }
     case FT_DATE: {
         int32_t v = ld_be_i32(p);
@@ -1192,7 +1196,7 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
    aggregate fast path so sum/avg/min/max can read directly from the
    btree without a per-record slot lookup.
 
-   Encoding inverses (mirrors encode_field_for_index in config.c):
+   Encoding inverses (mirrors encode_field_text_for_index in config.c):
      LONG/TIMESTAMP/INT/SHORT: BE signed-int with top bit XOR'd → undo XOR.
      DOUBLE/FLOAT: IEEE-754 total-order encoding → if top bit set (was
              positive) flip top bit; else flip all bits.
@@ -1308,7 +1312,9 @@ static AggValueStatus decode_index_key_to_double(const TypedField *f,
                      ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
                      ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
         int64_t v = (int64_t)(u ^ (1ULL << 63));
-        *out = (double)v / (double)f->numeric_scale_mult;
+        *out = (f->numeric_scale_mult > 0)
+               ? (double)v / (double)f->numeric_scale_mult
+               : (double)v;   /* unsupported legacy scale: raw integer */
         return AGG_VALUE_PRESENT;
     }
     case FT_UUID:
@@ -1383,7 +1389,7 @@ static AggValueStatus decode_index_key_to_text(const TypedField *f,
 }
 
 /* Mirror of typed_field_to_buf_raw, but reads from a btree leaf entry's
-   encoded bytes (post encode_field_for_index). Output is byte-identical
+   encoded bytes (post encode_field_text_for_index). Output is byte-identical
    to what typed_field_to_buf_raw produces from the typed-record bytes,
    so bucket keys built via the indexed group_by fast path collide with
    buckets the per-record agg_scan_cb path would create on the same
@@ -1429,7 +1435,7 @@ int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         else bits = ~bits;
         double v; memcpy(&v, &bits, 8);
         if (skip_zero && v == 0.0) return 0;
-        return snprintf(buf, bufsz, "%g", v);
+        return snprintf(buf, bufsz, "%.17g", v);
     }
     case FT_FLOAT: {
         if (plen < 4) return 0;
@@ -1439,7 +1445,7 @@ int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         else bits = ~bits;
         float v; memcpy(&v, &bits, 4);
         if (skip_zero && v == 0.0f) return 0;
-        return snprintf(buf, bufsz, "%g", (double)v);
+        return snprintf(buf, bufsz, "%.9g", (double)v);
     }
     case FT_BOOL:
         if (plen < 1) return 0;
@@ -1517,15 +1523,19 @@ int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         int64_t v = (int64_t)(u ^ (1ULL << 63));
         if (v == 0) { buf[0] = '0'; buf[1] = '\0'; return 1; }
         int64_t scale = f->numeric_scale_mult;
-        int64_t whole = v / scale;
-        int64_t frac = v % scale;
-        int neg = (v < 0);
-        if (frac < 0) frac = -frac;
-        if (whole < 0) whole = -whole;
+        if (scale <= 0)   /* unsupported legacy scale: raw integer fallback */
+            return snprintf(buf, bufsz, "%lld", (long long)v);
+        uint64_t m = (uint64_t)v;
+        int neg = v < 0;
+        if (neg) m = 0u - m;
+        uint64_t whole = m / (uint64_t)scale;
+        uint64_t frac = m % (uint64_t)scale;
         if (frac == 0)
-            return snprintf(buf, bufsz, "%s%lld", neg ? "-" : "", (long long)whole);
-        return snprintf(buf, bufsz, "%s%lld.%0*lld", neg ? "-" : "",
-                        (long long)whole, f->numeric_scale, (long long)frac);
+            return snprintf(buf, bufsz, "%s%llu", neg ? "-" : "",
+                            (unsigned long long)whole);
+        return snprintf(buf, bufsz, "%s%llu.%0*llu", neg ? "-" : "",
+                        (unsigned long long)whole, f->numeric_scale,
+                        (unsigned long long)frac);
     }
     case FT_VARCHAR: {
         /* Index stores raw varchar bytes. BTRI: an empty varchar stores
@@ -2057,7 +2067,10 @@ static AggValueStatus typed_field_to_double(const TypedField *f, const uint8_t *
     }
     case FT_NUMERIC: {
         int64_t v = ld_be_i64(p);
-        *out = (double)v / (double)f->numeric_scale_mult; return AGG_VALUE_PRESENT;
+        *out = (f->numeric_scale_mult > 0)
+               ? (double)v / (double)f->numeric_scale_mult
+               : (double)v;   /* unsupported legacy scale: raw integer */
+        return AGG_VALUE_PRESENT;
     }
     case FT_BOOL: *out = (double)(p[0] ? 1 : 0); return AGG_VALUE_PRESENT;
     case FT_BYTE: *out = (double)p[0]; return AGG_VALUE_PRESENT;

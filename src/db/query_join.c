@@ -295,7 +295,7 @@ int lookup_remote(const JoinSpec *j, const char *db_root,
         uint8_t keybuf[1032];
         size_t keylen;
         if (rem_tf && !j->local_is_composite) {
-            encode_field_for_index(rem_tf, local_key, (int)local_len, keybuf, &keylen);
+            encode_field_text_for_index(rem_tf, local_key, (int)local_len, keybuf, &keylen);
             btree_idx_search(db_root, j->object, j->remote_field, j->remote_sch.splits,
                              (const char *)keybuf, keylen, join_bt_first_cb, &hit);
         } else {

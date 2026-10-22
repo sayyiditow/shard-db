@@ -348,6 +348,8 @@ int op_prefers_trigram(enum SearchOp op);
 
 /* query.c — criterion encoding (used by query_aggregate.c) */
 void group_by_csv_to_json(const char *csv, char *out, size_t out_sz);
+/* Raw/varchar criteria are explicit spans. Libc-parsed scalar criteria
+   must be full C strings with a readable terminator at val[vlen]. */
 void encode_criterion_value(const TypedField *tf,
                             const char *val, size_t vlen,
                             uint8_t *buf, size_t *out_len);
