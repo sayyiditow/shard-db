@@ -21,7 +21,13 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   reviewed, with packed storage still inactive.
   [Execution evidence](2026-10-25-phase3a-packed-codec-evidence.md) and
   [raw-diff review](2026-10-25-phase3a-raw-diff-review.md) record completion.
-- 3B: child plan must be prepared against the reviewed 3A result.
+- 3B: consumer integration remains open. The [3B.1 shared row adapter](2026-10-25-phase3b1-typed-row-adapter-plan.md)
+  is implemented and reviewed against committed 3A (`b9cea93`), including the
+  post-execution enum fix. [Execution evidence](2026-10-25-phase3b1-typed-row-evidence.md)
+  and [raw-diff review](2026-10-25-phase3b1-raw-diff-review.md) record completion:
+  256 focused checks, 19072 full-suite assertions across 519 cases, and all 56
+  allocation injections pass. It converts no production consumers; write,
+  read/index and rebuild children remain required before 3B closure.
 - 3C: child plan must be prepared against the reviewed 3B result.
 - [Original review](2026-10-23-phase3-packed-records-plan-review.md): unchanged.
 - [Rejected draft archive](archive/2026-10-23-phase3-packed-records-rejected.md):
@@ -58,8 +64,12 @@ does not yet unblock the finance application.
 **How this serves the primary goal:** makes every reader/writer understand
 validated spans and actual sizes before any public object uses packed storage.
 
-A separate approved child must provide complete code and test hunks, not prose
-for an executor to fill in. Its required inventory includes:
+Each approved 3B child must provide complete code and test hunks, not prose
+for an executor to fill in. The completed first child supplies private shared
+adapters, explicit schema/view ownership, actual-size row preparation and bounded
+rendering. Production consumers stay legacy and unconverted. Later children
+must close the full inventory below; 3C cannot treat 3B.1 alone as completion.
+The full 3B inventory includes:
 - typed_record_view/typed field access/decode APIs and all31 current view calls:
   config,index,query,aggregate,bulk,find,join,plan,schema,storage translation units;
   repeat the search at the actual new HEAD, not these historical counts alone.

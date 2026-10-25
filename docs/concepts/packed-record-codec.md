@@ -1,9 +1,10 @@
 # Inactive packed-record codec
 
 The internal packed_record module prepares future exact numeric/varchar records.
-It has no production typed-schema adapter or public activation path. Existing
-objects, declarations and commands keep their current behavior. Do not manually
-put packed values into a public object.
+The inactive [typed-row adapter](typed-row-adapter.md) binds explicit in-memory
+schemas for later consumer integration. No loader/create-object or public
+activation path uses packed storage. Existing objects, declarations and commands
+keep their current behavior. Do not manually put packed values into a public object.
 
 The codec takes immutable schema-order cells. Fixed binary values stay in the
 directory; variable fields use an eight-byte big-endian offset/length descriptor

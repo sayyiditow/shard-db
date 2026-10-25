@@ -1,4 +1,5 @@
 #include "types.h"
+#include "typed_row.h"
 #include "slotcask.h"
 #include "bitmap.h"
 #include <math.h>
@@ -2876,7 +2877,7 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
    0.0.0.0 / :: / nil-uuid, so the JSON encoders store NULL instead —
    the historical "unset sentinel" convention. A well-formed 0.0.0.0 /
    :: / nil uuid parses and stays a real (bit-clear) zero value. */
-static int encode_json_field_checked(const TypedField *f, const char *val,
+int encode_json_field_checked(const TypedField *f, const char *val,
                                       size_t vlen, int was_quoted,
                                       uint8_t *out, char *err, size_t errsz) {
     if (!was_quoted || !typed_json_string_type(f->type))
@@ -2899,7 +2900,7 @@ static int encode_json_field_checked(const TypedField *f, const char *val,
     return rc;
 }
 
-static int sentinel_span_parses(enum FieldType t, const char *val, size_t vlen) {
+int sentinel_span_parses(enum FieldType t, const char *val, size_t vlen) {
     switch (t) {
     case FT_IPV4: {
         char ipbuf[16]; uint8_t sink[4];
@@ -3344,7 +3345,7 @@ long long seq_next_val_batch(const char *db_root, const char *object,
 
 /* Generate a default value string for a field. Returns static/malloc'd string
    in gen_buf (caller-provided, >= 256 bytes). Returns NULL if no default. */
-static const char *generate_default(const TypedField *tf, char *gen_buf, size_t bufsz,
+const char *generate_default(const TypedField *tf, char *gen_buf, size_t bufsz,
                                     const char *db_root, const char *object) {
     switch (tf->default_kind) {
     case DK_NONE:
@@ -3600,7 +3601,7 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
 /* render_zeros: set for nullmap records (the bitmap is authoritative —
    a bit-clear zero is a real value and must render). Legacy records pass
    0 and keep the skip-on-zero absence heuristics. */
-static int decode_field_to_buf(const TypedField *f, const uint8_t *data,
+int decode_field_to_buf(const TypedField *f, const uint8_t *data,
                                char *buf, int buflen, int render_zeros) {
     switch (f->type) {
     case FT_VARCHAR: {

@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "packed_record.h"
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <fcntl.h>
@@ -222,6 +223,9 @@ typedef struct TypedSchema {
                            write [u8 bm_nbytes][bits] there, field bytes after.
                            0 only before load completes — every loaded schema
                            and every hand-built TypedSchema must set it. */
+    /* By-value private codec metadata. Zero means legacy. Existing loaders
+       never bind packed layouts in Phase 3B. Schemas are immutable in use. */
+    PkrSchema packed;
 } TypedSchema;
 
 /* ===== Null bitmap record support (2026.10.2) ===== */
