@@ -66,3 +66,8 @@ failure errno even when existing scalar helpers return status/text only. Invalid
 scalar/span inputs report EINVAL, malformed OLD reports EILSEQ, and allocation
 failures report ENOMEM. Enum type binding rejects trailing declaration text and
 preserves schema bytes and ENOMEM on temporary enum-parser allocation failure.
+
+The [owning write hook](owning-write-hooks.md) supplies a transport-level
+actual-size NEW buffer lifetime for future integrations. It is optional and
+has no production caller yet. Its presence does not convert public commands,
+bulk row ownership, return_record, indexes or criteria to packed storage.

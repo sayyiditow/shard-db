@@ -8550,6 +8550,8 @@ typedef struct {
        uo->new_from_old_ctx's err_buf) apart from a soft condition_not_met
        — see slotcask_upsert_with_hooks/slotcask_insert_with_hooks. */
     int hard_error;
+    /* Only owning-constructor failures pin errno across transaction cleanup. */
+    int owned_errno;
 } UpsertAdapterCtx;
 
 /* Folds check_fn + new_from_old into the bulk value_compute slot. Fires once
@@ -8561,8 +8563,38 @@ static int upsert_adapter_value_compute(const SlotcaskOldRecord *old,
     const SlotcaskUpsertOpts *uo = actx->uo;
 
     if (uo->check && uo->check(old, uo->check_ctx) == 0) return -1;
-    if (!uo->new_from_old) return 0;
-    if (!old) return -1;               /* new_from_old requires an existing record */
+    if (!uo->new_from_old && !uo->new_from_old_alloc) return 0;
+    if (!old) return -1;               /* both constructors require OLD */
+
+    if (uo->new_from_old_alloc) {
+        uint8_t *buf = NULL;
+        size_t out_vlen = 0;
+        errno = 0;
+        int rc = uo->new_from_old_alloc(old, &buf, &out_vlen,
+                                         uo->new_from_old_alloc_ctx);
+        int cause = 0;
+        if (rc != 0) cause = errno ? errno : EINVAL;
+        else if (!buf) cause = EINVAL;
+        else if (out_vlen > UINT32_MAX ||
+                 out_vlen > SIZE_MAX - 24 - rec->klen - 7) cause = EFBIG;
+        else {
+            size_t physical = slotcask_record_size_varlen(rec->klen, out_vlen);
+            if (actx->db->slot_size < 0 ||
+                physical > (size_t)actx->db->slot_size ||
+                physical > slotcask_seg_max_bytes()) cause = EFBIG;
+        }
+        if (cause) {
+            free(buf);
+            actx->hard_error = 1;
+            actx->owned_errno = cause;
+            errno = cause;
+            return -1;
+        }
+        actx->callback_buf = buf;
+        rec->value = buf;
+        rec->vlen = out_vlen;
+        return 0;
+    }
 
     size_t out_capacity = (size_t)actx->db->slot_size - 24 - rec->klen;
     uint8_t *buf = malloc(out_capacity ? out_capacity : 1);
@@ -8662,11 +8694,15 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         result->current_hdr2 = 0;
         result->current_hdr2 = 0;
     }
+    if (opts && opts->new_from_old_alloc) {
+        value = NULL;
+        vlen = 0;
+    }
     if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
 
     /* Trim value to field boundary for compact varlen storage. */
     SlotcaskTrimFn trim_fn = atomic_load_explicit(&db->trim_fn, memory_order_acquire);
-    if (trim_fn)
+    if (trim_fn && !(opts && opts->new_from_old_alloc))
         vlen = trim_fn(value, vlen, db->trim_ctx);
     if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
 
@@ -8674,6 +8710,10 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if (!opts) opts = &blank;
     if (opts->out_durability_degraded)
         *opts->out_durability_degraded = 0;
+    if (opts->new_from_old && opts->new_from_old_alloc) {
+        errno = EINVAL;
+        return -1;
+    }
 
     /* Fail loud on a missed two-phase migration: an indexed object with a
        legacy pre_commit alongside only one half of the prepare/apply pair
@@ -8710,9 +8750,10 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
        see it — the batch-amortised skip this flag otherwise enables doesn't
        apply to a window_cap=1 transaction. */
     bopts.pre_commit_needs_old = 1;
-    bopts.value_compute = (opts->check || opts->new_from_old)
+    bopts.value_compute = (opts->check || opts->new_from_old || opts->new_from_old_alloc)
                           ? upsert_adapter_value_compute : NULL;
-    bopts.value_rewrites_payload = opts->new_from_old != NULL;
+    bopts.value_rewrites_payload = opts->new_from_old != NULL ||
+                                   opts->new_from_old_alloc != NULL;
     bopts.abort_window = upsert_adapter_abort_window;
     bopts.bulk_hook_ctx = &actx;
     bopts.has_indexed_fields = opts->has_indexed_fields;
@@ -8768,7 +8809,10 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         }
         return -2;
     }
-    if (rec.status != 0) return -1;
+    if (rec.status != 0) {
+        if (actx.owned_errno) errno = actx.owned_errno;
+        return -1;
+    }
 
     if (result) {
         result->was_update = rec.was_update;
@@ -8793,10 +8837,14 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         result->current_hdr2 = 0;
         result->current_hdr2 = 0;
     }
+    if (opts && opts->new_from_old_alloc) {
+        value = NULL;
+        vlen = 0;
+    }
     if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
 
     SlotcaskTrimFn trim_fn = atomic_load_explicit(&db->trim_fn, memory_order_acquire);
-    if (trim_fn)
+    if (trim_fn && !(opts && opts->new_from_old_alloc))
         vlen = trim_fn(value, vlen, db->trim_ctx);
     if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
 
@@ -8804,6 +8852,10 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if (!opts) opts = &blank;
     if (opts->out_durability_degraded)
         *opts->out_durability_degraded = 0;
+    if (opts->new_from_old && opts->new_from_old_alloc) {
+        errno = EINVAL;
+        return -1;
+    }
 
     /* require_existing is incompatible with INSERT-only semantics; the
        caller should route through slotcask_upsert_with_hooks for that. */
@@ -8831,9 +8883,10 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     bopts.if_not_exists = 1;
     bopts.pre_commit = upsert_adapter_pre_commit;
     bopts.pre_commit_needs_old = 1;
-    bopts.value_compute = (opts->check || opts->new_from_old)
+    bopts.value_compute = (opts->check || opts->new_from_old || opts->new_from_old_alloc)
                           ? upsert_adapter_value_compute : NULL;
-    bopts.value_rewrites_payload = opts->new_from_old != NULL;
+    bopts.value_rewrites_payload = opts->new_from_old != NULL ||
+                                   opts->new_from_old_alloc != NULL;
     bopts.abort_window = upsert_adapter_abort_window;
     bopts.bulk_hook_ctx = &actx;
     bopts.has_indexed_fields = opts->has_indexed_fields;
@@ -8885,7 +8938,10 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         }
         return -2;
     }
-    if (rec.status != 0) return -1;
+    if (rec.status != 0) {
+        if (actx.owned_errno) errno = actx.owned_errno;
+        return -1;
+    }
 
     if (result) {
         result->was_update = rec.was_update;

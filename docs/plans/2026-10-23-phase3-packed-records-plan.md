@@ -28,6 +28,13 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   256 focused checks, 19072 full-suite assertions across 519 cases, and all 56
   allocation injections pass. It converts no production consumers; write,
   read/index and rebuild children remain required before 3B closure.
+  The [3B.2 owning write callback](2026-10-25-phase3b2-owning-write-hook-plan.md)
+  is implemented and raw-diff reviewed: 153 focused checks, 19225 full-suite
+  assertions across 520 cases, and all eight ownership/OOM/limit cases pass.
+  [Execution evidence](2026-10-25-phase3b2-owning-hook-evidence.md) and
+  [executed raw-diff review](2026-10-26-phase3b2-raw-diff-review.md) record completion.
+  Production command/bulk callers remain unchanged; those conversions remain
+  required 3B children. Packed storage remains inactive.
 - 3C: child plan must be prepared against the reviewed 3B result.
 - [Original review](2026-10-23-phase3-packed-records-plan-review.md): unchanged.
 - [Rejected draft archive](archive/2026-10-23-phase3-packed-records-rejected.md):

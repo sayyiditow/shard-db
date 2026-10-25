@@ -518,6 +518,27 @@ typedef int (*slotcask_new_from_old_fn)(const SlotcaskOldRecord *old,
                                          size_t *out_vlen,
                                          void *ctx);
 
+/* Optional owning alternative to new_from_old. The callback executes once
+   against lock-protected OLD, after the existing condition gates and before
+   segment reservation. It must not perform network I/O or database reentry.
+   Slotcask initializes *out_value=NULL and *out_vlen=0. On success return 0
+   with a non-NULL malloc/free-compatible buffer, including a zero-length value.
+   On every return Slotcask owns any non-NULL *out_value: it frees rejected
+   partial output and retains accepted output until the transaction and all
+   hooks finish. Output must not alias OLD, schema storage or caller input.
+   The buffer contains final actual bytes: neither input nor output is passed
+   to trim_fn in this mode. The supplied value/vlen are ignored. Generation
+   remains opts.record_hdr2; a constructor cannot change it.
+   Nonzero return is a hard error, not condition_not_met. Set errno for a
+   specific cause; zero errno falls back to EINVAL. Invalid success output is
+   EINVAL; physical slot/uint32/segment overflow is EFBIG, checked before write.
+   Missing OLD and condition rejections do not invoke the constructor.
+   new_from_old and new_from_old_alloc are mutually exclusive.
+   This internal hook does not activate packed schemas or convert consumers. */
+typedef int (*slotcask_new_from_old_alloc_fn)(const SlotcaskOldRecord *old,
+                                             uint8_t **out_value,
+                                             size_t *out_vlen, void *ctx);
+
 /* Return 0 to commit; non-zero to abort. NULL = always commit. */
 typedef int (*slotcask_pre_commit_fn)(const SlotcaskOldRecord *old,
                                        const uint8_t *new_value, size_t new_vlen,
@@ -574,6 +595,10 @@ typedef struct {
        upsert reads under the kf-shard wrlock. NULL = existing behavior. */
     slotcask_new_from_old_fn  new_from_old;
     void                     *new_from_old_ctx;
+    /* Owning actual-sized alternative; see slotcask_new_from_old_alloc_fn.
+       Existing callers leave both fields NULL. No persisted layout change. */
+    slotcask_new_from_old_alloc_fn new_from_old_alloc;
+    void                         *new_from_old_alloc_ctx;
     slotcask_pre_commit_fn    pre_commit;
     void                     *pre_commit_ctx;
     /* Two-phase hooks — required together for a fresh indexed insert that
