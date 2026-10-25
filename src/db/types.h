@@ -226,10 +226,20 @@ typedef struct TypedSchema {
 
 /* ===== Null bitmap record support (2026.10.2) ===== */
 
-/* Segment record header byte 19 (reserved): bit 0 = value region carries
-   a field-null bitmap ([u8 bm_nbytes][bits...]) ahead of the field bytes.
-   Bits 1-7 must be zero on disk; unknown bits fail closed. */
+/* Segment record generation flags. The generic transport recognizes
+   nullmap (bit 0) and packed-with-nullmap (bits 0|1). Other bits and
+   packed-without-nullmap are invalid. Recognizing transport flags does
+   not activate packed object loading: legacy typed_record_view and the
+   schema version gate remain unchanged until their approved slices. */
 #define SREC_FLAG_NULLMAP 0x01
+#define SREC_FLAG_PACKED  0x02
+#define SREC_KNOWN_FLAGS  (SREC_FLAG_NULLMAP | SREC_FLAG_PACKED)
+
+/* Physical transport accepts legacy, nullmap, or packed+nullmap only. */
+static inline int srec_flags_valid(uint8_t flags) {
+    return flags == 0 || flags == SREC_FLAG_NULLMAP ||
+           flags == SREC_KNOWN_FLAGS;
+}
 
 static inline int typed_nullmap_bytes(int nfields) {
     return (nfields + 7) / 8;

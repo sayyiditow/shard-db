@@ -409,7 +409,7 @@ int slotcask_get(SlotcaskDb *db,
                  void **val_out, size_t *vlen_out);
 
 /* Same read, also surfacing the record's generation byte (segment header
-   byte 19: SREC_FLAG_NULLMAP or 0). out_hdr2 may be NULL. */
+   byte 19: 0, NULLMAP, or PACKED|NULLMAP). out_hdr2 may be NULL. */
 int slotcask_get_ex(SlotcaskDb *db,
                     const void *key, size_t klen,
                     void **val_out, size_t *vlen_out,
@@ -602,9 +602,10 @@ typedef struct {
        converged synchronously. The caller must return the distinct pending
        outcome; it must not report a successful mutation. */
     int                      *out_durability_degraded;
-    /* Segment header byte 19 for the NEW record (SREC_FLAG_NULLMAP when
-       the value was produced by the nullmap encoders). Zero-init = legacy
-       generation. The bulk primitive copies it to the record header. */
+    /* Segment header byte 19 for the NEW record: 0 for legacy, NULLMAP
+       for current typed encoders, NULLMAP|PACKED only for validated packed
+       payloads. The codec is inactive in public object creation; recognizing
+       transport flags does not publish or activate a packed schema. */
     uint8_t                   record_hdr2;
 } SlotcaskUpsertOpts;
 
@@ -639,7 +640,7 @@ typedef struct {
        Lifetime: caller owns the buffer; must outlive the bulk call. */
     const void *old_value;
     size_t      old_vlen;
-    /* Segment header byte 19 for the NEW record (SREC_FLAG_NULLMAP or 0)
+    /* Segment header byte 19 for the NEW record (0, NULLMAP, or PACKED|NULLMAP)
        and for a caller-provided old_value. Zero-init = legacy. */
     uint8_t     hdr2;
     uint8_t     old_hdr2;
@@ -1112,7 +1113,7 @@ void slotcask_registry_shutdown(void);
  */
 
 /* cb returns 0 to continue, 1 to stop the walk early. hdr2 = segment
-   record header byte 19 (SREC_FLAG_NULLMAP generation flag, 0 = legacy). */
+   record header byte 19 (generation flags: 0, NULLMAP, or PACKED|NULLMAP). */
 typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
                                const void *key, size_t klen,
                                const void *value, size_t vlen,

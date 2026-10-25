@@ -4074,10 +4074,9 @@ static inline void seg_record_emit(uint8_t *dst, int slot_size,
        relaxed ordering for the initial 0 — readers that see 0 simply skip
        the record (no acquire needed). */
     __atomic_store_n(&dst[18], 0, __ATOMIC_RELEASE);
-    /* Byte 19 carries SREC_FLAG_NULLMAP (null-bitmap generation). Written
-       before the flag release-store, so a live record always has its
-       generation byte visible. */
-    dst[19] = (uint8_t)(hdr2 & SREC_FLAG_NULLMAP);
+    /* Publish the known generation flags with the record payload. The
+       object/schema dispatch remains separately gated. */
+    dst[19] = hdr2;
     uint32_t v32 = (uint32_t)vlen;
     memcpy(dst + 20, &v32, 4);
     memcpy(dst + 24, key, klen);
@@ -4110,7 +4109,7 @@ static inline void seg_record_emit_pending(uint8_t *dst, int slot_size,
     __atomic_store_n(&dst[18], 0, __ATOMIC_RELEASE);
     /* Generation byte rides the staged payload; the activation flag-flip
        publishes both together. */
-    dst[19] = (uint8_t)(hdr2 & SREC_FLAG_NULLMAP);
+    dst[19] = hdr2;
     uint32_t v32 = (uint32_t)vlen;
     memcpy(dst + 20, &v32, 4);
     memcpy(dst + 24, key, klen);
@@ -5795,6 +5794,16 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
     }
 
     if (shard->kind == BULK_MUTATION_UPSERT) {
+        /* value_compute can replace NEW metadata after entry validation.
+           Reject its invalid generation before fallback payload emission. */
+        for (size_t i = begin; i < end; i++) {
+            if (recs[i].status == 0 && !srec_flags_valid(recs[i].hdr2)) {
+                recs[i].status = -1;
+                st[i].needs_write = 0;
+                errno = EINVAL;
+                goto hard_fail;
+            }
+        }
         /* Fallback staging is batched after the planning loop: these
            records could not ride the P wave (their NEW bytes depend on
            OLD), but they stage exactly like it — grouped by stream,
@@ -8378,6 +8387,15 @@ int slotcask_bulk_request_execute(SlotcaskDb *db,
             errno = EINVAL;
             return -1;
         }
+        if (inputs[i].kind == SLOTCASK_BULK_INPUT_UPSERT) {
+            for (size_t j = 0; j < inputs[i].nrecs; j++) {
+                if (!srec_flags_valid(inputs[i].recs[j].hdr2)) {
+                    free(touched);
+                    errno = EINVAL;
+                    return -1;
+                }
+            }
+        }
         inputs[i].rc = 0;
         inputs[i].error_no = 0;
         int *degraded = inputs[i].kind == SLOTCASK_BULK_INPUT_UPSERT
@@ -8470,6 +8488,18 @@ static int slotcask_bulk_mutation_transaction(BulkMutationTxn *txn) {
     if (!txn || !txn->db || !txn->shards || txn->nshards == 0) {
         errno = EINVAL;
         return -1;
+    }
+    /* Validate every generation before any shard can stage payloads. */
+    for (size_t i = 0; i < txn->nshards; i++) {
+        const BulkMutationShard *shard = &txn->shards[i];
+        if (shard->kind != BULK_MUTATION_UPSERT) continue;
+        if (!shard->recs) { errno = EINVAL; return -1; }
+        for (size_t j = 0; j < shard->nrecs; j++) {
+            if (!srec_flags_valid(shard->recs[j].hdr2)) {
+                errno = EINVAL;
+                return -1;
+            }
+        }
     }
     ids = malloc(txn->nshards * sizeof(*ids));
     if (!ids) return -1;

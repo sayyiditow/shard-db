@@ -34,8 +34,9 @@ format, and raising it again later would not be a format change.
 
 CORE-PROCESS.md requires complete production-code hunks, quoted anchors and a
 consumer inventory before implementation. The format change has not yet been
-implemented or prototyped. Consequently each production phase below has an
-explicit planning checkpoint: the planning model must supply its complete
+implemented in production. Phase 0 and the 2026-10-25 Phase 3A repair have
+planning-only scratch prototypes; they are not production execution.
+Consequently each production phase below has an explicit planning checkpoint: the planning model must supply its complete
 anchored code/test patch before that phase can be approved and executed. A
 phase's design/acceptance specification is not a substitute for that patch.
 This deliberate boundary follows CORE-PROCESS.md's rule to start with an
@@ -373,9 +374,12 @@ nullmap prefix is 33 bytes. The candidate layout therefore yields:
 The varchar bound exceeds the 128 MiB segment maximum by design: slot_size
 is a validation ceiling, not a per-record promise. Every actual record is
 individually checked against the segment maximum
-(`append_reserve_single_varlen`); a single maxed-varchar record is
-4,195,393 bytes and fits, and roughly 31 maxed varchar fields fit in one
-record before the existing segment-capacity write error applies. Both
+(`append_reserve_single_varlen`). At max_key=1024 a one-field maxed-varchar
+record has 4,194,314 value bytes and an aligned physical size of 4,195,368
+bytes. A 256-varchar schema with one max payload and all other fields NULL
+has 4,196,385 value bytes and an aligned physical size of 4,197,440 bytes.
+Both fit; roughly 31 maxed varchar fields fit in one record before the
+existing segment-capacity write error applies. Both schema maximum
 bounds stay inside the uint32 vlen/offset range and the signed-int
 `max_value` derivation.
 
@@ -384,9 +388,13 @@ headers are counted once, and actual records use actual key/value lengths,
 not these schema ceilings. Verify (a) small records still
 pack tightly at that ceiling — the size-bucketed free pool with leftover
 splitting must serve small records without stranding capacity — and (b) the
-segment maximum tolerates the worst-case slot_size, since
-append_reserve_single_varlen fails any record exceeding it; a legitimate
-maximum record must never reach that failure path.
+actual-row segment check is separate from the worst-case schema slot_size.
+The schema bound may exceed the segment cap; do not allocate that bound or
+claim that all maximum field values fit together. Check actual aligned
+header+key+value size before mutation, preserve the segment ceiling, and test
+the explicit over-capacity rejection in the owning integration plan. A row
+within the permitted actual-record bound must not fail because of its larger
+schema maximum.
 
 Phase 0 spike result (2026-10-20): every value in this table verified with
 checked sizing arithmetic and a working codec prototype — 59/59 checks at
@@ -531,6 +539,25 @@ revision naming its license, build and maintenance implications.
 
 **How this serves the primary goal:** stores small values compactly and supports
 the maximum values without changing the segment engine's commit unit.
+
+**Execution revision, 2026-10-25 (user approved):** keep packed storage
+inactive until required integrations are ready, and split this phase into
+three separately reviewed slices. [Phase 3 index](2026-10-23-phase3-packed-records-plan.md)
+tracks the rejected draft's findings and outstanding gates:
+
+- **3A:** codec, bounded composition/validated spans and raw physical-record
+  tests; no production typed-schema adapter or public activation.
+  [Approved child](2026-10-25-phase3a-packed-codec-plan.md) is implemented and
+  [reviewed](2026-10-25-phase3a-raw-diff-review.md); packed storage remains inactive.
+- **3B:** every consumer and actual-size allocation/composition adapter, with
+  legacy behavior preserved; separate complete child plan required.
+- **3C:** authoritative layout binding, checked metadata publication,
+  downgrade/crash/replay safety; separate complete child plan required.
+
+Public activation additionally requires the necessary Phase 4–6 integrations
+and explicit approval. This split changes execution order, not the acceptance
+requirements below. No migration or public packed capability is delivered by
+3A alone. The protected later certification plan remains untouched.
 
 Implement the Phase 0-reviewed layout using the exact core. Bare varchar maps
 to capacity 4 MiB (4,194,304 content bytes); explicit varchar:N retains N; numeric declarations retain

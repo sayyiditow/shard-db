@@ -27,7 +27,7 @@ static inline size_t seg_scan_varlen_size(uint16_t klen, uint32_t vlen) {
 
 /* Validate the record header at map[pos]: flag <= 2, header + rec_size
    fits within map_size, and rec_size itself <= max_slot_size. Byte 19
-   (generation) must carry only SREC_FLAG_NULLMAP — unknown bits fail
+   (generation) must be 0, NULLMAP, or PACKED|NULLMAP — other values fail
    closed. Does NOT verify the hash. max_slot_size is the owning object's
    cached SlotcaskDb.slot_size; it is deliberately not the segment file
    cap. out_hdr2 may be NULL (caller doesn't need the flag). Returns 1
@@ -45,7 +45,7 @@ static inline int seg_scan_varlen_struct_ok(const uint8_t *map, size_t map_size,
     uint8_t flag = rec[18];
     if (flag > 2) return 0;
     uint8_t hdr2 = rec[19];
-    if (hdr2 & ~SREC_FLAG_NULLMAP) return 0;
+    if (!srec_flags_valid(hdr2)) return 0;
     uint16_t klen;
     uint32_t vlen;
     memcpy(&klen, rec + 16, 2);
