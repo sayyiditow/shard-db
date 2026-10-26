@@ -68,6 +68,11 @@ instrumented assertion for small maximum-schema rows, not a new public limit.
 Packed auto-key objects and every packed secondary-index declaration currently
 fail closed before defaults or mutation. Private adapter tests exercise actual
 storage and request execution. Public schema activation, public end-to-end
-packed commands, bulk-update/delete, readers, schema rewrites and migration
-are not discharged by these fixtures. Existing public legacy tests remain
-mandatory compatibility coverage.
+packed commands, criteria/CAS updates, bulk-delete, readers, schema rewrites
+and migration are not discharged by these fixtures. Existing public legacy
+tests remain mandatory compatibility coverage.
+
+[Keyed partial bulk updates](packed-bulk-update.md) reuse this collection and
+deferred-request lifetime while requiring OLD. Their blank positional cells
+preserve OLD rather than writing insertion's empty/zero values. Packed
+conditions/criteria remain guarded until query integration is ready.

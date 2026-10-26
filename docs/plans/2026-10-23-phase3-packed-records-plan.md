@@ -47,8 +47,16 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   [Execution evidence](2026-10-26-phase3b4-packed-bulk-insert-evidence.md) and
   [raw-diff review](2026-10-26-phase3b4-raw-diff-review.md) record completion.
   Review corrected one evidence-directory reference; implementation matches
-  all approved checkpoints. Bulk-update, read/index consumers, metadata,
-  migration and activation remain open; packed schemas stay publicly inactive.
+  all approved checkpoints. Committed as `03617a8`.
+  The [3B.5 keyed bulk partial updates](2026-10-26-phase3b5-packed-bulk-update-plan.md)
+  are implemented and raw-diff reviewed: 235 focused checks, 19878 full-suite
+  assertions across 523 cases, all 112 allocation injections and 19 outcome
+  gates pass. [Execution evidence](2026-10-26-phase3b5-packed-bulk-update-evidence.md)
+  and [executed raw-diff review](2026-10-26-phase3b5-raw-diff-review.md) record
+  completion. All eight owned files match the approved checkpoints. Explicit
+  packed criteria/CAS/index guards and four legacy crash repairs are included.
+  Read/index/delete consumers, metadata, migration and activation remain open;
+  packed schemas stay publicly inactive.
   No Phase 3B closure is implied.
 - 3C: child plan must be prepared against the reviewed 3B result.
 - [Original review](2026-10-23-phase3-packed-records-plan-review.md): unchanged.

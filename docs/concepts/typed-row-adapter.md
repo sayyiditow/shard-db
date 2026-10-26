@@ -76,5 +76,7 @@ to the single-record owning hook. Neither path activates packed metadata.
 production consumers of these helpers, locked insertion/default handling and
 actual-size owning updates. [Bulk insert integration](packed-bulk-insert.md)
 adds JSON and positional insert/upsert preparation under explicit schemas.
-Bulk-update/delete and read/index consumers remain future work; packed schemas
-remain inactive in public loaders and creates.
+[Keyed bulk updates](packed-bulk-update.md) use the existing actual-size partial
+constructors and preserve omitted OLD fields. Criteria/CAS updates, bulk-delete
+and remaining read/index consumers stay future work; packed schemas remain
+inactive in public loaders and creates.

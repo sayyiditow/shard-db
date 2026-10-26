@@ -3783,6 +3783,10 @@ int cmd_bulk_update(const char *db_root, const char *object,
                     const char *criteria_json, const char *value_json,
                     const char *if_json, int limit, int dry_run) {
     Schema sch = load_schema(db_root, object);
+    TypedSchema *guard_ts=load_typed_schema(db_root,object);
+    if(guard_ts&&guard_ts->packed.nfields){
+        OUT("{\"error\":\"packed criteria updates await query integration\"}\n");return 1;
+    }
     const char *perr = NULL;
     CriteriaNode *tree = parse_criteria_tree(criteria_json, &perr);
     if (perr) {
@@ -3977,7 +3981,7 @@ int cmd_bulk_update(const char *db_root, const char *object,
             if (workers[g].prepared) np++;
         SlotcaskBulkShardInput *inputs = np ? calloc(np, sizeof(*inputs)) : NULL;
         size_t k = 0;
-        for (int g = 0; g < nshard_groups; g++)
+        if (inputs) for (int g = 0; g < nshard_groups; g++)
             if (workers[g].prepared) inputs[k++] = workers[g].input;
         if (np && !inputs) {
             for (int g = 0; g < nshard_groups; g++)
@@ -4243,6 +4247,7 @@ static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
                 char tmpcell[256];
                 char *cellbuf = (cell_len < sizeof(tmpcell))
                     ? tmpcell : malloc(cell_len + 1);
+                if (!cellbuf) return -1; /* Keep OLD intact on allocation failure. */
                 memcpy(cellbuf, cell_start, cell_len);
                 cellbuf[cell_len] = '\0';
                 if (encode_field_checked(&w->ts->fields[tidx], cellbuf,
@@ -4367,6 +4372,10 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
     if (!ts) {
         OUT("{\"error\":\"Delimited update requires typed fields (fields.conf)\"}\n");
         return 1;
+    }
+    if(ts->packed.nfields){
+        Schema packed_sc=load_schema(db_root,object);
+        return typed_bulk_update_command(db_root,object,&packed_sc,ts,NULL,data,size,1,delimiter);
     }
     if (!data || size == 0) {
         OUT("{\"error\":\"Empty input\"}\n");
@@ -4521,7 +4530,7 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
             if (workers[g].prepared) np++;
         SlotcaskBulkShardInput *inputs = np ? calloc(np, sizeof(*inputs)) : NULL;
         size_t k = 0;
-        for (int g = 0; g < nshard_groups; g++)
+        if (inputs) for (int g = 0; g < nshard_groups; g++)
             if (workers[g].prepared) inputs[k++] = workers[g].input;
         if (np && !inputs) {
             for (int g = 0; g < nshard_groups; g++)
@@ -5110,6 +5119,10 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         OUT("{\"error\":\"bulk-update-json requires typed fields (fields.conf)\"}\n");
         return 1;
     }
+    if(ts->packed.nfields){
+        Schema packed_sc=load_schema(db_root,object);
+        return typed_bulk_update_source(db_root,object,&packed_sc,ts,NULL,input,input_is_file);
+    }
     FieldSchema cas_fs;
     init_field_schema(&cas_fs, db_root, object);
     Schema sch = load_schema(db_root, object);
@@ -5689,7 +5702,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
             if (workers[g].prepared) np++;
         SlotcaskBulkShardInput *inputs = np ? calloc(np, sizeof(*inputs)) : NULL;
         size_t k = 0;
-        for (int g = 0; g < nshard_groups; g++)
+        if (inputs) for (int g = 0; g < nshard_groups; g++)
             if (workers[g].prepared) inputs[k++] = workers[g].input;
         if (np && !inputs) {
             for (int g = 0; g < nshard_groups; g++)
