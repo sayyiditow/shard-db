@@ -469,6 +469,32 @@ int typed_encode_alloc(const TypedSchema *ts,const char *json,int defaults,
     if(!rc)rc=typed_prepared_alloc(&p,out,len,err,cap);
     typed_prepared_free(&p);return rc;
 }
+/* Validate a complete JSON value before bulk record collection. */
+int typed_json_validate(const char *json){
+    if(!json)return row_error(NULL,0,EINVAL,"invalid JSON");
+    const char *p=json;
+    if(row_json_value(&p,0)||*row_json_space(p))
+        return row_error(NULL,0,EINVAL,"invalid JSON");
+    return 0;
+}
+static int prepared_insert_finish(TypedPrepared *p,const SlotcaskOldRecord *old,
+    uint8_t **out,size_t *len,char *err,size_t cap){
+    const TypedSchema *ts=p->schema;int rc=0;
+    if(old){
+        TypedRowView view;
+        if(typed_row_open(ts,old->value,old->vlen,old->hdr2,&view))
+            rc=row_error(err,cap,EILSEQ,"invalid OLD record");
+        for(int i=0;!rc&&i<ts->nfields;i++){
+            if(ts->fields[i].removed||ts->fields[i].default_kind!=DK_AUTO_CREATE)continue;
+            TypedRowSpan span;
+            if(typed_row_span(&view,(size_t)i,&span)){
+                rc=row_error(err,cap,EILSEQ,"invalid OLD field");break;}
+            rc=replace_cell(p,(size_t)i,NULL,span.data,span.len,span.is_null,err,cap);
+        }
+    }else rc=typed_prepared_stamp(p,DK_AUTO_CREATE,err,cap);
+    if(!rc)rc=typed_prepared_alloc(p,out,len,err,cap);
+    return rc;
+}
 /* Complete packed insertion against locked OLD. Ordinary defaults run once;
    auto_create is stamped only when fresh, or copied with OLD nullness.
    Public encode/default APIs retain their existing independent contract. */
@@ -481,21 +507,23 @@ int typed_insert_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     TypedPrepared p;typed_prepared_init(&p);
     int rc=prepare_json(ts,json,0,root,object,&p,NULL,err,cap);
     if(!rc)rc=prepared_defaults_mode(&p,root,object,1,err,cap);
-    if(!rc&&old){
-        TypedRowView view;
-        if(typed_row_open(ts,old->value,old->vlen,old->hdr2,&view))
-            rc=row_error(err,cap,EILSEQ,"invalid OLD record");
-        for(int i=0;!rc&&i<ts->nfields;i++){
-            if(ts->fields[i].removed||ts->fields[i].default_kind!=DK_AUTO_CREATE)continue;
-            TypedRowSpan span;
-            if(typed_row_span(&view,(size_t)i,&span)){
-                rc=row_error(err,cap,EILSEQ,"invalid OLD field");break;}
-            rc=replace_cell(&p,(size_t)i,NULL,span.data,span.len,span.is_null,err,cap);
-        }
-    }else if(!rc)rc=typed_prepared_stamp(&p,DK_AUTO_CREATE,err,cap);
-    if(!rc)rc=typed_prepared_alloc(&p,out,len,err,cap);
+    if(!rc)rc=prepared_insert_finish(&p,old,out,len,err,cap);
     typed_prepared_free(&p);return rc;
 }
+int typed_insert_inputs_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
+    const TypedInput *inputs,uint8_t **out,size_t *len,char *err,size_t cap){
+    if(!out||!len)return row_error(err,cap,EINVAL,"invalid output");
+    *out=NULL;*len=0;
+    if(!packed_schema_ok(ts)||!inputs)return row_error(err,cap,EINVAL,"invalid packed inputs");
+    TypedPrepared p;typed_prepared_init(&p);
+    int rc=typed_prepared_zero(ts,&p,err,cap);
+    for(int i=0;!rc&&i<ts->nfields;i++)
+        if(!ts->fields[i].removed&&inputs[i].supplied)
+            rc=typed_prepared_set(&p,(size_t)i,&inputs[i],err,cap);
+    if(!rc)rc=prepared_insert_finish(&p,old,out,len,err,cap);
+    typed_prepared_free(&p);return rc;
+}
+
 /* Packed scalar JSON patch. Known object/array values, including computed
    expressions, fail before composition; legacy computed semantics stay in
    storage.c until Phase 4 supplies their exact-decimal replacement. */

@@ -40,8 +40,16 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   assertions across 521 cases, decoder OOM and 33 write-failure injections pass.
   [Execution evidence](2026-10-26-phase3b3-single-write-evidence.md) and
   [raw-diff review](2026-10-26-phase3b3-raw-diff-review.md) record completion.
-  Packed storage remains inactive; bulk/read/index consumers, metadata,
-  migration and public activation remain open. No Phase 3B closure is implied.
+  Committed as `a97f9f2`; packed storage remains inactive.
+  The [3B.4 packed bulk insert/upsert](2026-10-26-phase3b4-packed-bulk-insert-plan.md)
+  is implemented and raw-diff reviewed: 178 focused checks, 19643 full-suite
+  assertions across 522 cases, all 90 allocation-failure injections pass.
+  [Execution evidence](2026-10-26-phase3b4-packed-bulk-insert-evidence.md) and
+  [raw-diff review](2026-10-26-phase3b4-raw-diff-review.md) record completion.
+  Review corrected one evidence-directory reference; implementation matches
+  all approved checkpoints. Bulk-update, read/index consumers, metadata,
+  migration and activation remain open; packed schemas stay publicly inactive.
+  No Phase 3B closure is implied.
 - 3C: child plan must be prepared against the reviewed 3B result.
 - [Original review](2026-10-23-phase3-packed-records-plan-review.md): unchanged.
 - [Rejected draft archive](archive/2026-10-23-phase3-packed-records-rejected.md):

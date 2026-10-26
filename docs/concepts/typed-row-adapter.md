@@ -67,12 +67,14 @@ scalar/span inputs report EINVAL, malformed OLD reports EILSEQ, and allocation
 failures report ENOMEM. Enum type binding rejects trailing declaration text and
 preserves schema bytes and ENOMEM on temporary enum-parser allocation failure.
 
-The [owning write hook](owning-write-hooks.md) supplies a transport-level
-actual-size NEW buffer lifetime for future integrations. It is optional and
-has no production caller yet. Its presence does not convert public commands,
-bulk row ownership, return_record, indexes or criteria to packed storage.
+The [owning write hook](owning-write-hooks.md) supplies the actual-size NEW
+buffer lifetime used by single-command integration. Bulk insertion uses its
+separate caller-owned deferred-request contract; it does not pass bulk buffers
+to the single-record owning hook. Neither path activates packed metadata.
 
 [Single-command integration](single-write-integration.md) describes the first
 production consumers of these helpers, locked insertion/default handling and
-actual-size owning updates. Bulk/read/index consumers remain future work;
-packed schemas remain inactive in public loaders and creates.
+actual-size owning updates. [Bulk insert integration](packed-bulk-insert.md)
+adds JSON and positional insert/upsert preparation under explicit schemas.
+Bulk-update/delete and read/index consumers remain future work; packed schemas
+remain inactive in public loaders and creates.

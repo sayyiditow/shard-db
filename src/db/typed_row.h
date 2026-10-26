@@ -93,6 +93,13 @@ int typed_encode_alloc(const TypedSchema *ts, const char *json, int defaults,
                          uint8_t **out, size_t *len, char *err, size_t errsz);
 /* Internal single-write collectors; output is NULL/0 on failure, owned
    malloc storage on success. No schema activation. */
+/* Validates one complete JSON value, including unknown nested fields. */
+int typed_json_validate(const char *json);
+/* Positional full replacement: no JSON defaults; preserve/stamp AUTO_CREATE
+   under the same locked OLD contract as typed_insert_alloc. inputs has nfields
+   entries. Unprovided cells are present zero/empty (removed cells stay NULL). */
+int typed_insert_inputs_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
+    const TypedInput *inputs,uint8_t **out,size_t *len,char *err,size_t cap);
 int typed_insert_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     const char *json,
     const char *root,const char *object,uint8_t **out,size_t *len,

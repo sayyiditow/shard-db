@@ -32,8 +32,10 @@ bound and current segment maximum. Overflow is EFBIG; invalid success output
 is EINVAL. Constructor errno survives cleanup. Existing condition and
 pre-commit failure policies remain unchanged.
 
-There is no production constructor caller yet. This hook does not activate
-packed schemas, change persisted formats, migrate objects, or complete single
-and bulk command conversion. Explicit-schema tests exercise real physical
-updates; public legacy tests remain the compatibility gate. Later write/read,
-index, metadata and activation plans retain their own obligations.
+Single-command insert/upsert/update now uses the constructor under the
+[write integration](single-write-integration.md). [Packed bulk insertion](packed-bulk-insert.md)
+uses a separate caller-owned value callback: its buffers survive the entire
+deferred bulk request and are freed by that adapter, not by this owning hook.
+Both integrations remain private while packed schemas are inactive. Public
+legacy tests remain the compatibility gate; later read/index, metadata,
+migration and activation plans retain their obligations.

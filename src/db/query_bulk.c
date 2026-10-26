@@ -1,4 +1,5 @@
 #include "types.h"
+#include "typed_bulk_insert.h"
 #include "slotcask.h"
 #include "query_internal.h"
 #include <dirent.h>
@@ -1104,6 +1105,7 @@ static SlotcaskBulkShardInput *bulk_ins_collect_inputs(
     size_t np = 0;
     for (int i = 0; i < nworkers; i++)
         if (workers[i].prepared) np++;
+    *ninputs = np; /* Preserve the requested count on allocation failure. */
     if (np == 0) return NULL;
     SlotcaskBulkShardInput *inputs = calloc(np, sizeof(*inputs));
     if (!inputs) return NULL;
@@ -1358,6 +1360,8 @@ static int bulk_ins_run(const char *db_root, const char *object,
                 object);
         return 1;
     }
+    if(ts->packed.nfields)
+        return typed_bulk_insert_command(db_root,object,&sc,ts,NULL,data,len,0,0,if_not_exists);
 
     /* Invariant check hoisted out of the per-record loop — ts->total_size
        and sc.max_value don't change during a bulk insert. */
@@ -2108,6 +2112,8 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     }
 
     Schema sc = load_schema(db_root, object);
+    if(ts->packed.nfields)
+        return typed_bulk_insert_command(db_root,object,&sc,ts,NULL,data,size,1,delimiter,if_not_exists);
     char idx_fields[MAX_FIELDS][256];
     int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
     /* Clamp to make the bound visible to -Walloc-size-larger-than: the
