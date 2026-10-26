@@ -1,5 +1,6 @@
 #include "types.h"
 #include "slotcask.h"
+#include "typed_row.h"
 #include <errno.h>
 #include <math.h>
 #ifdef TEST_BUILD
@@ -486,6 +487,35 @@ int cas_check_tree(FieldSchema *fs, const uint8_t *value_ptr,
  * write and kf commit (Option B). The ts pointer is borrowed from
  * load_typed_schema's cache and stays valid for the request's lifetime.
  */
+
+static char *single_write_decode(const TypedSchema *ts,const uint8_t *b,
+    size_t n,uint8_t hdr2){
+    TypedRowView view;
+    if(typed_row_open(ts,b,n,hdr2,&view))return NULL;
+    return ts->packed.nfields?typed_packed_decode(ts,b,n,hdr2,SIZE_MAX):
+        typed_decode(ts,b,(uint32_t)n,hdr2);
+}
+static int single_write_finish(const TypedSchema *ts,SlotcaskDb *db,size_t klen,
+    uint8_t *b,size_t *n,int want_record,char **record,char *err,size_t cap){
+    if(!ts->packed.nfields)*n=schema_trim_fn(b,*n,(void *)ts);
+    if(*n>UINT32_MAX||*n>SIZE_MAX-24-klen-7||
+       ((24+klen+*n+7)&~(size_t)7)>(size_t)db->slot_size||
+       ((24+klen+*n+7)&~(size_t)7)>slotcask_seg_max_bytes()){
+        snprintf(err,cap,"record exceeds slot or segment capacity");errno=EFBIG;return -1;
+    }
+    if(want_record){
+        *record=single_write_decode(ts,b,*n,typed_schema_hdr2(ts));
+        if(!*record){snprintf(err,cap,"cannot render committed record");errno=ENOMEM;return -1;}
+    }
+    return 0;
+}
+static void single_write_error(const char *message,const char *fallback){
+    char esc[512*6+1];
+    int n=message?json_escape_into(esc,sizeof(esc),message,strlen(message)):-1;
+    if(n>=0){esc[n]='\0';OUT("{\"error\":\"%s\"}\n",esc);}
+    else OUT("{\"error\":\"%s\"}\n",fallback);
+}
+
 typedef struct {
     const char       *db_root;
     const char       *object;
@@ -523,6 +553,11 @@ typedef struct {
     int               is_update;
     UpdateIdxArg      upd_args[MAX_FIELDS];
     int               n_upd_args;
+    uint8_t          *incoming; /* command-owned until constructor steals it */
+    size_t            incoming_len, key_len;
+    SlotcaskDb       *db;
+    int               return_record;
+    char             *ret_json; /* rendered before commit, command-owned */
 } V2InsertCtx;
 
 static void v2_insert_bm_owned_free(V2InsertCtx *c) {
@@ -537,6 +572,34 @@ static int v2_insert_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     return cas_check_tree(c->cas_fs, old->value, (int)old->vlen,
                            old->hdr2, c->cas_tree);
 }
+static int v2_insert_owned(const SlotcaskOldRecord *old,uint8_t **out,
+    size_t *n,void *ptr){
+    V2InsertCtx *c=ptr;TypedSchema *ts=c->idx_ts;
+    if(old){TypedRowView view;
+        if(typed_row_open(ts,old->value,old->vlen,old->hdr2,&view)){
+            snprintf(c->err_buf,sizeof(c->err_buf),"invalid OLD generation or value");errno=EILSEQ;return -1;}}
+    int has_ac=0;
+    for(int i=0;i<ts->nfields;i++)if(!ts->fields[i].removed&&
+        ts->fields[i].default_kind==DK_AUTO_CREATE){has_ac=1;break;}
+    if(ts->packed.nfields){
+        if(typed_insert_alloc(ts,old,c->value_json,c->db_root,c->object,
+            out,n,c->err_buf,sizeof(c->err_buf)))return -1;
+    }else{
+        *out=c->incoming;*n=c->incoming_len;c->incoming=NULL;
+        if(has_ac){
+            const uint8_t *base=NULL,*bm=NULL;int bmn=0;size_t region=0;
+            int ok=old&&typed_record_view(old->value,old->vlen,old->hdr2,
+                &base,&bm,&bmn,&region)==0;
+            for(int i=0;i<ts->nfields;i++)if(!ts->fields[i].removed&&
+                ts->fields[i].default_kind==DK_AUTO_CREATE)
+                auto_create_field_transfer(ts,*out,i,old!=NULL,ok,base,bm,bmn,
+                    region,old?old->hdr2:0);
+        }
+    }
+    return single_write_finish(ts,c->db,c->key_len,*out,n,c->return_record,
+        &c->ret_json,c->err_buf,sizeof(c->err_buf));
+}
+
 
 /* UpdateIdxArg / update_idx_fn now live in index.c (declared in types.h)
    so query.c can dispatch the same per-field worker for its bulk
@@ -1027,11 +1090,10 @@ void auto_now_str(const TypedField *f, char *buf, size_t bufsz) {
     }
 }
 
-static int cmd_insert_v2(const char *db_root, const char *object,
+static int cmd_insert_v2_impl(const char *db_root, const char *object,
                          const char *key, size_t klen, const char *value,
                          const char *if_json, int if_not_exists,
-                         int return_record, const Schema *sc) {
-    TypedSchema *ts = load_typed_schema(db_root, object);
+                         int return_record, const Schema *sc, TypedSchema *ts, SlotcaskDb *borrowed) {
     if (!ts) {
         OUT("{\"error\":\"Object [%s] not found. Use create-object first.\"}\n", object);
         return 1;
@@ -1042,36 +1104,24 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         return 1;
     }
 
-    uint8_t *typed_buf = malloc(ts->total_size);
-    if (!typed_buf) { OUT("{\"error\":\"oom\"}\n"); return 1; }
-    char enc_err[512] = {0};
-    int enc = typed_encode_defaults(ts, value, typed_buf, ts->total_size,
-                                    db_root, object, enc_err, sizeof(enc_err));
-    if (enc == -2) {
-        /* Strict enum (or future typed) validation rejection — actionable
-           error already in enc_err. Caller never sees a successfully-
-           encoded but semantically-corrupt record. */
-        free(typed_buf);
-        OUT("{\"error\":\"%s\"}\n", enc_err);
-        return 1;
+    /* Unsupported private packed integrations fail before defaults or writes. */
+    char guard_fields[MAX_FIELDS][256];
+    if(ts->packed.nfields&&(if_json||load_index_fields(db_root,object,guard_fields,MAX_FIELDS)>0)){
+        OUT("{\"error\":\"packed indexes and conditions await integration\"}\n");return 1;
     }
-    if (enc < 0) {
-        free(typed_buf);
-        OUT("{\"error\":\"Typed encode failed\"}\n");
-        return 1;
+    uint8_t *typed_buf=NULL;size_t vlen=0;char enc_err[512]={0};
+    if(!ts->packed.nfields&&typed_encode_alloc(ts,value,1,db_root,object,&typed_buf,&vlen,enc_err,sizeof(enc_err))){
+        single_write_error(enc_err[0]?enc_err:"Typed encode failed","Typed encode failed");return 1;
     }
-    size_t vlen = ts->total_size;
-    if ((int)vlen > sc->max_value) {
-        free(typed_buf);
-        fprintf(stderr, "Error: Value too large (%zu > %d)\n", vlen, sc->max_value);
-        return 1;
-    }
+    if(vlen>(size_t)sc->max_value){free(typed_buf);
+        OUT("{\"error\":\"value exceeds schema bound\"}\n");return 1;}
 
     SlotcaskSchemaInfo info = {
         .splits = sc->splits, .slot_size = sc->slot_size,
         .streams = sc->streams,
     };
-    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *owned SDB_REG_REF = borrowed?NULL:slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb=borrowed?borrowed:owned;
     if (!sdb) {
         free(typed_buf);
         OUT("{\"error\":\"Cannot open shard\"}\n");
@@ -1084,7 +1134,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
        here), so first-publish must be serialized and trim_fn must be
        published via release so any thread that observes it non-NULL also
        sees trim_ctx. */
-    if (!atomic_load_explicit(&sdb->trim_fn, memory_order_acquire)) {
+    if (!ts->packed.nfields && !atomic_load_explicit(&sdb->trim_fn, memory_order_acquire)) {
         pthread_mutex_lock(&sdb->trim_init_lock);
         if (!sdb->trim_fn) {
             sdb->trim_ctx = (void *)ts;
@@ -1092,41 +1142,6 @@ static int cmd_insert_v2(const char *db_root, const char *object,
                                   memory_order_release);
         }
         pthread_mutex_unlock(&sdb->trim_init_lock);
-    }
-
-    /* auto_create: stamp now() on first insert only; preserve the stored value
-       on any update / re-insert. This path is an upsert, so a re-insert of an
-       existing key would otherwise zero the create-time (typed_encode_defaults
-       leaves DK_AUTO_CREATE fields blank). We consult the prior record — but
-       only when the schema actually declares an auto_create field, so ordinary
-       objects pay nothing. */
-    {
-        int has_ac = 0;
-        for (int i = 0; i < ts->nfields; i++)
-            if (!ts->fields[i].removed &&
-                ts->fields[i].default_kind == DK_AUTO_CREATE) { has_ac = 1; break; }
-        if (has_ac) {
-            void *ac_old = NULL; size_t ac_old_vlen = 0;
-            uint8_t ac_old_hdr2 = 0;
-            int existed = (slotcask_get_ex(sdb, key, klen, &ac_old,
-                                           &ac_old_vlen, &ac_old_hdr2) == 0);
-            /* OLD generation view (validated once, shared by the loop). */
-            const uint8_t *o_base = NULL, *o_bm = NULL;
-            int o_bm_bytes = 0; size_t o_region = 0;
-            int o_view_ok = existed && ac_old &&
-                typed_record_view((const uint8_t *)ac_old, ac_old_vlen,
-                                  ac_old_hdr2, &o_base, &o_bm,
-                                  &o_bm_bytes, &o_region) == 0;
-            for (int i = 0; i < ts->nfields; i++) {
-                if (ts->fields[i].removed ||
-                    ts->fields[i].default_kind != DK_AUTO_CREATE) continue;
-                auto_create_field_transfer(ts, typed_buf, i,
-                                           existed && ac_old ? 1 : 0, o_view_ok,
-                                           o_base, o_bm, o_bm_bytes, o_region,
-                                           ac_old_hdr2);
-            }
-            free(ac_old);
-        }
     }
 
     /* Index fields + criteria (only parsed if if_json is present). */
@@ -1138,7 +1153,8 @@ static int cmd_insert_v2(const char *db_root, const char *object,
     load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
     FieldSchema cas_fs;
-    init_field_schema(&cas_fs, db_root, object);
+    memset(&cas_fs,0,sizeof(cas_fs));cas_fs.ts=ts;
+    if(!ts->packed.nfields)init_field_schema(&cas_fs, db_root, object);
     char cas_err[256];
     CriteriaNode *cas_tree = NULL;
     if (if_json) {
@@ -1159,6 +1175,8 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         .idx_types = idx_types,
         .value_json = value,
         .idx_ts = ts,
+        .incoming=typed_buf,.incoming_len=vlen,.key_len=klen,.db=sdb,
+        .return_record=return_record,
         .cas_tree = cas_tree, .cas_fs = &cas_fs,
     };
     compute_hash_raw(key, klen, ctx.hash);
@@ -1184,7 +1202,9 @@ static int cmd_insert_v2(const char *db_root, const char *object,
         .out_kf_slot    = &ctx.kf_slot,
         .has_indexed_fields = nfields > 0,
         .out_durability_degraded = &durability_pending,
-        .record_hdr2   = SREC_FLAG_NULLMAP,  /* nullmap encoders */
+        .record_hdr2   = typed_schema_hdr2(ts),
+        .new_from_old_alloc=v2_insert_owned,.new_from_old_alloc_ctx=&ctx,
+        .new_from_old_alloc_on_insert=1,
     };
     SlotcaskUpsertResult result = {0};
     int rc;
@@ -1197,31 +1217,31 @@ static int cmd_insert_v2(const char *db_root, const char *object,
     uint64_t _commit_t0 = now_us();
     if (if_not_exists && !if_json) {
         rc = slotcask_insert_with_hooks(sdb, -1, key, klen,
-                                        typed_buf, vlen, &opts, &result);
+                                        NULL, 0, &opts, &result);
     } else {
         rc = slotcask_upsert_with_hooks(sdb, -1, key, klen,
-                                        typed_buf, vlen, &opts, &result);
+                                        NULL, 0, &opts, &result);
     }
     commit_lock_hold_record(_commit_t0, db_root, object);
 
     if (rc == -2) {
         char *cur = result.current_value
-            ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen, result.current_hdr2)
+            ? single_write_decode(ts, result.current_value, result.current_vlen, result.current_hdr2)
             : NULL;
         OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
             cur ? cur : "null");
         free(cur);
         free(result.current_value);
         free_criteria_tree(cas_tree);
-        free(typed_buf);
+        free(ctx.incoming);free(ctx.ret_json);
         return 1;
     }
     if (rc != 0) {
         free(result.current_value);
         free_criteria_tree(cas_tree);
-        free(typed_buf);
+        free(ctx.incoming);free(ctx.ret_json);
         if (ctx.err_buf[0]) {
-            OUT("{\"error\":\"%s\"}\n", ctx.err_buf);
+            single_write_error(ctx.err_buf,"upsert failed");
         } else {
             OUT("{\"error\":\"upsert failed\"}\n");
         }
@@ -1231,7 +1251,7 @@ static int cmd_insert_v2(const char *db_root, const char *object,
     if (durability_pending) {
         free(result.current_value);
         free_criteria_tree(cas_tree);
-        free(typed_buf);
+        free(ctx.incoming);free(ctx.ret_json);
         OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
         return 1;
     }
@@ -1244,25 +1264,21 @@ static int cmd_insert_v2(const char *db_root, const char *object,
 
     free(result.current_value);
     free_criteria_tree(cas_tree);
-    if (return_record) {
-        /* typed_buf was mutated in place by the auto_create transfer
-           before the upsert — it IS the committed record. */
-        char *rec = typed_decode(ts, typed_buf, (uint32_t)vlen,
-                                 SREC_FLAG_NULLMAP);
-        free(typed_buf);
-        if (rec)
-            OUT("{\"status\":\"%s\",\"key\":\"%s\",\"record\":%s}\n",
-                result.was_update ? "updated" : "inserted", wire_key, rec);
-        else
-            OUT("{\"status\":\"%s\",\"key\":\"%s\"}\n",
-                result.was_update ? "updated" : "inserted", wire_key);
-        free(rec);
-        return 0;
+    free(ctx.incoming);
+    if(return_record){
+        OUT("{\"status\":\"%s\",\"key\":\"%s\",\"record\":%s}\n",
+            result.was_update?"updated":"inserted",wire_key,ctx.ret_json);
+        free(ctx.ret_json);return 0;
     }
-    free(typed_buf);
+    free(ctx.ret_json);
     OUT("{\"status\":\"%s\",\"key\":\"%s\"}\n",
-        result.was_update ? "updated" : "inserted", wire_key);
-    return 0;
+        result.was_update?"updated":"inserted",wire_key);return 0;
+}
+static int cmd_insert_v2(const char *root,const char *object,const char *key,
+    size_t klen,const char *json,const char *condition,int only_new,
+    int return_record,const Schema *sc){
+    return cmd_insert_v2_impl(root,object,key,klen,json,condition,only_new,
+        return_record,sc,load_typed_schema(root,object),NULL);
 }
 
 /* ========== INSERT (mmap + atomic flag flip) ========== */
@@ -1318,12 +1334,10 @@ typedef struct {
     /* OLD record generation (segment header byte 19) — captured by the
        check_fn alongside saved_old_value. */
     uint8_t           old_hdr2;
-    /* F4 return_record: set from the request flag; ret_buf holds a copy
-       of the final NEW record (filled at the end of
-       v2_update_new_from_old) for the success response. Zeroed by the
-       ctx initializer. */
     int               return_record;
-    uint8_t          *ret_buf;
+    char             *ret_json; /* rendered before reservation; command-owned */
+    SlotcaskDb       *db;
+    size_t            key_len;
 } V2UpdateCtx;
 
 /* Parsed computed-field spec for one update (conditional-writes F1).
@@ -1863,7 +1877,7 @@ static int v2_update_new_from_old(const SlotcaskOldRecord *old,
                                   uint8_t *out_value, size_t out_capacity,
                                   size_t *out_vlen, void *ctx_ptr) {
     V2UpdateCtx *c = ctx_ptr;
-    if (!old || !out_value || !out_vlen || old->vlen > out_capacity ||
+    if (!old || !out_value || !out_vlen ||
         (size_t)c->idx_ts->total_size > out_capacity) return -1;
     c->saved_old_value = old->value;
     c->saved_old_vlen = old->vlen;
@@ -1935,15 +1949,35 @@ static int v2_update_new_from_old(const SlotcaskOldRecord *old,
                               c->err_buf, sizeof(c->err_buf)) != 0) return -1;
     update_stamp_auto_update_fields(c->idx_ts, out_value);
     *out_vlen = (size_t)c->idx_ts->total_size;
-    if (c->return_record) {
-        c->ret_buf = malloc(*out_vlen);
-        if (c->ret_buf) memcpy(c->ret_buf, out_value, *out_vlen);
-    }
     return 0;
 reject:
     for (int i = 0; i < c->idx_ts->nfields; i++) free(values[i]);
     return -1;
 }
+static int v2_update_owned(const SlotcaskOldRecord *old,uint8_t **out,
+    size_t *n,void *ptr){
+    V2UpdateCtx *c=ptr;TypedSchema *ts=c->idx_ts;
+    if(!old){errno=EINVAL;return -1;}
+    TypedRowView view;
+    if(typed_row_open(ts,old->value,old->vlen,old->hdr2,&view)){
+        snprintf(c->err_buf,sizeof(c->err_buf),"invalid OLD generation or value");errno=EILSEQ;return -1;}
+    c->saved_old_value=old->value;c->saved_old_vlen=old->vlen;c->old_hdr2=old->hdr2;
+    int rc;
+    if(ts->packed.nfields){
+#ifdef TEST_BUILD
+        slotcask_test_after_old(1);
+#endif
+        rc=typed_update_json_alloc(ts,old,c->partial_json,out,n,c->err_buf,sizeof(c->err_buf));
+    }else{
+        *out=malloc((size_t)ts->total_size);
+        if(!*out){snprintf(c->err_buf,sizeof(c->err_buf),"oom");errno=ENOMEM;return -1;}
+        rc=v2_update_new_from_old(old,*out,(size_t)ts->total_size,n,c);
+    }
+    if(rc)return -1;
+    return single_write_finish(ts,c->db,c->key_len,*out,n,c->return_record,
+        &c->ret_json,c->err_buf,sizeof(c->err_buf));
+}
+
 
 static int v2_update_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
@@ -2185,28 +2219,32 @@ static void v2_update_abort_commit(void *ctx_ptr) {
     (void)ctx_ptr;
 }
 
-static int cmd_update_v2(const char *db_root, const char *object,
+static int cmd_update_v2_impl(const char *db_root, const char *object,
                          const char *key, size_t klen,
                          const char *partial_json,
                          const char *if_json, int dry_run,
-                         int return_record, const Schema *sc) {
+                         int return_record, const Schema *sc, TypedSchema *ts, SlotcaskDb *borrowed) {
     SlotcaskSchemaInfo info = {
         .splits = sc->splits, .slot_size = sc->slot_size,
         .streams = sc->streams,
     };
-    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *owned SDB_REG_REF = borrowed?NULL:slotcask_registry_get(db_root, object, &info);
+    SlotcaskDb *sdb=borrowed?borrowed:owned;
     if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
 
-    TypedSchema *ts = load_typed_schema(db_root, object);
     if (!ts) { OUT("{\"error\":\"Object not found\"}\n"); return 1; }
 
+    char guard_fields[MAX_FIELDS][256];
+    if(ts->packed.nfields&&(if_json||load_index_fields(db_root,object,guard_fields,MAX_FIELDS)>0)){
+        OUT("{\"error\":\"packed indexes and conditions await integration\"}\n");return 1;
+    }
     /* Wire up compact trim for VARIABLE-format typed objects. sdb is a
        registry-cached SlotcaskDb shared across all concurrent request
        threads for this object (only guarded by a shared objlock rdlock
        here), so first-publish must be serialized and trim_fn must be
        published via release so any thread that observes it non-NULL also
        sees trim_ctx. */
-    if (!atomic_load_explicit(&sdb->trim_fn, memory_order_acquire)) {
+    if (!ts->packed.nfields && !atomic_load_explicit(&sdb->trim_fn, memory_order_acquire)) {
         pthread_mutex_lock(&sdb->trim_init_lock);
         if (!sdb->trim_fn) {
             sdb->trim_ctx = (void *)ts;
@@ -2228,6 +2266,10 @@ static int cmd_update_v2(const char *db_root, const char *object,
             OUT("{\"error\":\"Not found\"}\n");
             return 1;
         }
+        TypedRowView dry_view;
+        if(typed_row_open(ts,old_val,old_vlen,old_hdr2,&dry_view)){
+            free(old_val);OUT("{\"error\":\"invalid OLD generation or value\"}\n");return 1;
+        }
 #ifdef TEST_BUILD
         /* TEST_BUILD seam retained for dry_run only: fires on dry-run
            updates in the fixed code (normal updates pause at the top of
@@ -2236,7 +2278,8 @@ static int cmd_update_v2(const char *db_root, const char *object,
 #endif
         if (if_json) {
             FieldSchema cas_fs;
-            init_field_schema(&cas_fs, db_root, object);
+            memset(&cas_fs,0,sizeof(cas_fs));cas_fs.ts=ts;
+        if(!ts->packed.nfields)init_field_schema(&cas_fs, db_root, object);
             char cas_err[256];
             CriteriaNode *cas_tree = cas_prepare_tree(if_json, cas_fs.ts, 1,
                                                       cas_err, sizeof(cas_err));
@@ -2271,7 +2314,8 @@ static int cmd_update_v2(const char *db_root, const char *object,
        invalid, this now reports "invalid if condition" first — the field
        parsing happens inside the callback under the lock. */
     FieldSchema cas_fs;
-    init_field_schema(&cas_fs, db_root, object);
+    memset(&cas_fs,0,sizeof(cas_fs));cas_fs.ts=ts;
+        if(!ts->packed.nfields)init_field_schema(&cas_fs, db_root, object);
     char cas_err[256];
     CriteriaNode *cas_tree = NULL;
     if (if_json) {
@@ -2296,7 +2340,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
         .db_root = db_root, .object = object, .splits = sc->splits,
         .idx_fields = idx_fields, .nidx = nidx,
         .idx_types = idx_types,
-        .idx_ts = ts,
+        .idx_ts = ts,.db=sdb,.key_len=klen,
         .partial_json = partial_json,
         .cas_tree = cas_tree, .cas_fs = &cas_fs,
         .return_record = return_record,
@@ -2308,8 +2352,8 @@ static int cmd_update_v2(const char *db_root, const char *object,
         .require_existing = 1,
         .check            = v2_update_check_fn,
         .check_ctx        = &ctx,
-        .new_from_old     = v2_update_new_from_old,
-        .new_from_old_ctx = &ctx,
+        .new_from_old_alloc = v2_update_owned,
+        .new_from_old_alloc_ctx = &ctx,
         .prepare_commit   = v2_update_prepare_commit,
         .apply_commit     = v2_update_apply_commit,
         .abort_commit     = v2_update_abort_commit,
@@ -2318,7 +2362,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
         .out_kf_slot      = &ctx.kf_slot,
         .has_indexed_fields = nidx > 0,
         .out_durability_degraded = &durability_pending,
-        .record_hdr2   = SREC_FLAG_NULLMAP,  /* nullmap encoders */
+        .record_hdr2   = typed_schema_hdr2(ts),
     };
     SlotcaskUpsertResult result = {0};
     uint64_t _commit_t0 = now_us();
@@ -2332,7 +2376,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
            result has an old value attached. */
         if (result.was_update && result.condition_not_met) {
             char *cur = result.current_value
-                ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen, result.current_hdr2)
+                ? single_write_decode(ts, result.current_value, result.current_vlen, result.current_hdr2)
                 : NULL;
             OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
                 cur ? cur : "null");
@@ -2341,13 +2385,13 @@ static int cmd_update_v2(const char *db_root, const char *object,
             OUT("{\"error\":\"Not found\"}\n");
         }
         free(result.current_value);
-        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free(ctx.ret_json); ctx.ret_json = NULL;
         free_criteria_tree(cas_tree);
         return 1;
     }
     if (rc != 0) {
         free(result.current_value);
-        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free(ctx.ret_json); ctx.ret_json = NULL;
         free_criteria_tree(cas_tree);
         if (ctx.err_buf[0]) {
             /* Escape once, after any truncation: producers format raw
@@ -2377,7 +2421,7 @@ static int cmd_update_v2(const char *db_root, const char *object,
     }
     if (durability_pending) {
         free(result.current_value);
-        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free(ctx.ret_json); ctx.ret_json = NULL;
         free_criteria_tree(cas_tree);
         OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
         return 1;
@@ -2388,22 +2432,18 @@ static int cmd_update_v2(const char *db_root, const char *object,
     format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
     LOG_INFO(LOG_SUB_SLOTCASK, "UPDATE %s.%s (slotcask)", object, wire_key);
     free(result.current_value);
-    if (return_record && ctx.ret_buf) {
-        char *rec = typed_decode(ts, ctx.ret_buf, (uint32_t)ts->total_size,
-                                 SREC_FLAG_NULLMAP);
-        free(ctx.ret_buf);
-        ctx.ret_buf = NULL;
-        if (rec) {
-            OUT("{\"status\":\"updated\",\"key\":\"%s\",\"record\":%s}\n",
-                wire_key, rec);
-            free(rec);
-            return 0;
-        }
+    if(return_record){
+        OUT("{\"status\":\"updated\",\"key\":\"%s\",\"record\":%s}\n",wire_key,ctx.ret_json);
+        free(ctx.ret_json);return 0;
     }
-    free(ctx.ret_buf);
-    ctx.ret_buf = NULL;
-    OUT("{\"status\":\"updated\",\"key\":\"%s\"}\n", wire_key);
-    return 0;
+    free(ctx.ret_json);
+    OUT("{\"status\":\"updated\",\"key\":\"%s\"}\n",wire_key);return 0;
+}
+static int cmd_update_v2(const char *root,const char *object,const char *key,
+    size_t klen,const char *json,const char *condition,int dry_run,
+    int return_record,const Schema *sc){
+    return cmd_update_v2_impl(root,object,key,klen,json,condition,dry_run,
+        return_record,sc,load_typed_schema(root,object),NULL);
 }
 
 /* ========== PARTIAL UPDATE ========== */
@@ -3431,3 +3471,17 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
     free(entries);
     return 0;
 }
+
+#ifdef TEST_BUILD
+#include "single_write_test.h"
+int shard_test_single_insert(const char *root,const char *object,
+    const char *key,size_t klen,const char *json,const char *condition,
+    int only_new,int return_record,const Schema *sc,TypedSchema *ts,SlotcaskDb *db) {
+    return cmd_insert_v2_impl(root,object,key,klen,json,condition,only_new,return_record,sc,ts,db);
+}
+int shard_test_single_update(const char *root,const char *object,
+    const char *key,size_t klen,const char *json,const char *condition,
+    int dry_run,int return_record,const Schema *sc,TypedSchema *ts,SlotcaskDb *db) {
+    return cmd_update_v2_impl(root,object,key,klen,json,condition,dry_run,return_record,sc,ts,db);
+}
+#endif

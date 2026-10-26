@@ -354,6 +354,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_packed_record_storage.c \
     src/test/cases/test_typed_row_adapter.c \
     src/test/cases/test_owning_write_hooks.c \
+    src/test/cases/test_single_write_integration.c \
     src/test/cases/test_version_gate.c \
     src/test/cases/test_datetime_evening.c \
     src/test/cases/test_error_paths.c \

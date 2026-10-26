@@ -532,7 +532,8 @@ typedef int (*slotcask_new_from_old_fn)(const SlotcaskOldRecord *old,
    Nonzero return is a hard error, not condition_not_met. Set errno for a
    specific cause; zero errno falls back to EINVAL. Invalid success output is
    EINVAL; physical slot/uint32/segment overflow is EFBIG, checked before write.
-   Missing OLD and condition rejections do not invoke the constructor.
+   Missing OLD does not invoke the constructor unless the explicit
+   new_from_old_alloc_on_insert option is set. Conditions always run first.
    new_from_old and new_from_old_alloc are mutually exclusive.
    This internal hook does not activate packed schemas or convert consumers. */
 typedef int (*slotcask_new_from_old_alloc_fn)(const SlotcaskOldRecord *old,
@@ -599,6 +600,10 @@ typedef struct {
        Existing callers leave both fields NULL. No persisted layout change. */
     slotcask_new_from_old_alloc_fn new_from_old_alloc;
     void                         *new_from_old_alloc_ctx;
+    /* Allow this owning callback on a fresh key with old == NULL. Built-in
+       if_not_exists/require_existing/check gates still run first. Invalid
+       without new_from_old_alloc. Zero preserves the OLD-required contract. */
+    int                           new_from_old_alloc_on_insert;
     slotcask_pre_commit_fn    pre_commit;
     void                     *pre_commit_ctx;
     /* Two-phase hooks — required together for a fresh indexed insert that

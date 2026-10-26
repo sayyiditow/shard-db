@@ -71,3 +71,8 @@ The [owning write hook](owning-write-hooks.md) supplies a transport-level
 actual-size NEW buffer lifetime for future integrations. It is optional and
 has no production caller yet. Its presence does not convert public commands,
 bulk row ownership, return_record, indexes or criteria to packed storage.
+
+[Single-command integration](single-write-integration.md) describes the first
+production consumers of these helpers, locked insertion/default handling and
+actual-size owning updates. Bulk/read/index consumers remain future work;
+packed schemas remain inactive in public loaders and creates.

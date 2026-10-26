@@ -3857,89 +3857,99 @@ int decode_field_to_buf(const TypedField *f, const uint8_t *data,
 
 char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
                    uint8_t hdr2) {
-    if (!ts || !ts->typed) return NULL;
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t field_region_len = 0;
-    int render_zeros = 0;
-    if (data_len < 0 ||
-        typed_record_view(data, (size_t)data_len, hdr2, &fbase, &bm,
-                          &bm_bytes, &field_region_len) != 0) {
-        errno = EILSEQ;   /* corrupt flagged record — error, not JSON null */
+    if (!ts || !ts->typed || ts->nfields < 1 || ts->nfields > MAX_FIELDS)
+        return NULL;
+    const uint8_t *fbase = NULL, *bm = NULL;
+    int bm_bytes = 0;
+    size_t region = 0;
+    if (data_len < 0 || typed_record_view(data, (size_t)data_len, hdr2,
+                                         &fbase, &bm, &bm_bytes, &region)) {
+        errno = EILSEQ;
         return NULL;
     }
-    render_zeros = (hdr2 & SREC_FLAG_NULLMAP) ? 1 : 0;
-    /* Size the outer record-JSON buffer based on actual field types.
-       Pre-2026.05.6 this was a flat `nfields * 300` heuristic, which
-       silently truncated mid-field on records carrying a large
-       varchar (e.g. HN comment text up to 8 KB). For each field:
-         "name":<value>, =>  name_len + 4 punctuation bytes
-       Plus the value:
-         FT_VARCHAR: worst-case 6 * (size - 2) + 2 quotes (escapes can
-                     6x-expand control chars per RFC 8259)
-         everything else: a generous 64 bytes (long literals, dates,
-                     numerics — all fit comfortably) */
-    size_t est = 4;  /* { ... } + NUL */
-    for (int i = 0; i < ts->nfields; i++) {
-        if (ts->fields[i].removed) continue;
-        est += (size_t)ts->fields[i].name_len + 4;
-        if (ts->fields[i].type == FT_VARCHAR) {
-            int cm = ts->fields[i].size > 2 ? ts->fields[i].size - 2 : 0;
-            est += (size_t)cm * 6 + 2;
-        } else {
-            est += 64;
-        }
-    }
-    char *buf = malloc(est);
-    size_t pos = 0;
-    if (est > 0) buf[pos++] = '{';
-    int first = 1;
-
+    static const uint8_t zero_field[65537];
+    int capacities[MAX_FIELDS] = {0};
+    size_t est = 4;
     for (int i = 0; i < ts->nfields; i++) {
         const TypedField *f = &ts->fields[i];
-        if (f->removed) continue;  /* tombstoned — not visible to consumers */
-
-        /* For trim-encoded records, fields past the field region are
-           zero/default. Use a static zero buffer so decode_field_to_buf
-           always has valid input. */
-        static const uint8_t zero_field[65537]; /* BSS — always zero-initialised */
-        const uint8_t *field_src = ((size_t)f->offset + (size_t)f->size <= field_region_len)
-            ? fbase + f->offset
-            : zero_field;
-
-        /* NULL bit ⇒ emit JSON null (key present), canonical-NULL bytes
-           are an encoder bug (defensive LOG at debug noise level omitted —
-           render null regardless). */
-        if (typed_field_null(bm, bm_bytes, i)) {
-            if (!first && pos + 1 < est) buf[pos++] = ',';
-            SB_APPEND(buf, pos, est, "\"%s\":null", f->name);
-            first = 0;
-            continue;
+        if (f->removed) continue;
+        if (f->offset < 0 || f->size < 1 || f->size > (int)sizeof(zero_field)) {
+            errno = EILSEQ;
+            return NULL;
         }
-
-        /* Stack buffer covers non-varchar fields (numbers / bool / dates
-           fit comfortably). Varchar may need 6 * content_max + 2 bytes
-           worst-case after JSON-escape expansion (\u00XX per byte); fall
-           back to a heap allocation for those. */
-        char vbuf_stack[512];
-        char *vbuf = vbuf_stack;
-        int vbufsz = (int)sizeof(vbuf_stack);
-        if (f->type == FT_VARCHAR) {
-            int need = 6 * (f->size > 2 ? f->size - 2 : 0) + 3;
-            if (need > vbufsz) {
-                vbuf = malloc((size_t)need);
-                if (!vbuf) { vbuf = vbuf_stack; }   /* falls back; may truncate */
-                else        { vbufsz = need; }
+        const uint8_t *src = (size_t)f->offset + (size_t)f->size <= region
+            ? fbase + f->offset : zero_field;
+        size_t need = 512;
+        if (typed_field_null(bm, bm_bytes, i)) need = 5;
+        else if (f->type == FT_VARCHAR) {
+            if (f->size < 2) { errno = EILSEQ; return NULL; }
+            size_t n = ((size_t)src[0] << 8) | src[1];
+            if (n > (size_t)f->size - 2) n = (size_t)f->size - 2;
+            need = 6 * n + 3;
+        } else if (f->type == FT_ENUM) {
+            if (f->enum_width == 2 && f->size < 2) { errno = EILSEQ; return NULL; }
+            unsigned index = f->enum_width == 2
+                ? ((unsigned)src[0] << 8) | src[1] : src[0];
+            const char *v = f->enum_values && f->n_enum_values > 0 && index < (unsigned)f->n_enum_values
+                ? f->enum_values[index] : NULL;
+            size_t n = v ? strlen(v) : 0;
+            if (n > (INT_MAX - 4u) / 6u) { errno = EOVERFLOW; return NULL; }
+            need = 6 * n + 4;
+        }
+        size_t name = strlen(f->name);
+        if (name > SIZE_MAX - need - 4 || est > SIZE_MAX - name - need - 4) {
+            errno = EOVERFLOW;
+            return NULL;
+        }
+        capacities[i] = (int)need;
+        est += name + need + 4;
+    }
+    char *buf = malloc(est);
+    if (!buf) { errno = ENOMEM; return NULL; }
+    size_t pos = 0;
+    buf[pos++] = '{';
+    int first = 1;
+    for (int i = 0; i < ts->nfields; i++) {
+        const TypedField *f = &ts->fields[i];
+        if (f->removed) continue;
+        const uint8_t *src = (size_t)f->offset + (size_t)f->size <= region
+            ? fbase + f->offset : zero_field;
+        char stack[512], *value = stack;
+        int len;
+        if (typed_field_null(bm, bm_bytes, i)) {
+            memcpy(stack, "null", 5);
+            len = 4;
+        } else {
+            int cap = capacities[i];
+            if (cap > (int)sizeof(stack)) {
+                value = malloc((size_t)cap);
+                if (!value) { free(buf); errno = ENOMEM; return NULL; }
+            }
+            len = decode_field_to_buf(f, src, value,
+                                      cap > (int)sizeof(stack) ? cap : (int)sizeof(stack),
+                                      (hdr2 & SREC_FLAG_NULLMAP) != 0);
+            if (len < 0 || len >= (cap > (int)sizeof(stack) ? cap : (int)sizeof(stack))) {
+                if (value != stack) free(value);
+                free(buf);
+                errno = EILSEQ;
+                return NULL;
             }
         }
-        int vlen = decode_field_to_buf(f, field_src, vbuf, vbufsz, render_zeros);
-        if (vlen <= 0) { if (vbuf != vbuf_stack) free(vbuf); continue; }
-
-        if (!first && pos + 1 < est) buf[pos++] = ',';
-        SB_APPEND(buf, pos, est, "\"%s\":%s", f->name, vbuf);
+        /* Preserve unflagged legacy skip-on-zero/absence semantics. */
+        if (len == 0) { if (value != stack) free(value); continue; }
+        int written = snprintf(buf + pos, est - pos, "%s\"%s\":%s",
+                               first ? "" : ",", f->name, value);
+        if (value != stack) free(value);
+        if (written < 0 || (size_t)written >= est - pos) {
+            free(buf);
+            errno = EOVERFLOW;
+            return NULL;
+        }
+        pos += (size_t)written;
         first = 0;
-        if (vbuf != vbuf_stack) free(vbuf);
     }
-    if (pos + 1 < est) buf[pos++] = '}';
+    if (pos > est - 2) { free(buf); errno = EOVERFLOW; return NULL; }
+    buf[pos++] = '}';
     buf[pos] = '\0';
     return buf;
 }

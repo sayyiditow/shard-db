@@ -8564,7 +8564,8 @@ static int upsert_adapter_value_compute(const SlotcaskOldRecord *old,
 
     if (uo->check && uo->check(old, uo->check_ctx) == 0) return -1;
     if (!uo->new_from_old && !uo->new_from_old_alloc) return 0;
-    if (!old) return -1;               /* both constructors require OLD */
+    if (!old && !(uo->new_from_old_alloc && uo->new_from_old_alloc_on_insert))
+        return -1;
 
     if (uo->new_from_old_alloc) {
         uint8_t *buf = NULL;
@@ -8710,7 +8711,8 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if (!opts) opts = &blank;
     if (opts->out_durability_degraded)
         *opts->out_durability_degraded = 0;
-    if (opts->new_from_old && opts->new_from_old_alloc) {
+    if ((opts->new_from_old && opts->new_from_old_alloc) ||
+        (opts->new_from_old_alloc_on_insert && !opts->new_from_old_alloc)) {
         errno = EINVAL;
         return -1;
     }
@@ -8852,7 +8854,8 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if (!opts) opts = &blank;
     if (opts->out_durability_degraded)
         *opts->out_durability_degraded = 0;
-    if (opts->new_from_old && opts->new_from_old_alloc) {
+    if ((opts->new_from_old && opts->new_from_old_alloc) ||
+        (opts->new_from_old_alloc_on_insert && !opts->new_from_old_alloc)) {
         errno = EINVAL;
         return -1;
     }

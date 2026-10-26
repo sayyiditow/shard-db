@@ -7,9 +7,11 @@ slot maximum. Both options together fail with EINVAL before either callback;
 old callbacks and ordinary callers retain existing behavior.
 
 The callback receives current OLD under the kf-shard write lock, after condition
-gates, once before reservation/pre-commit. Missing OLD and rejected conditions
-do not invoke it. It is not a fresh-insert default generator. It must not
-re-enter the database or perform network I/O. Nonzero return is a hard error:
+gates, once before reservation/pre-commit. Rejected conditions never invoke
+it. Missing OLD invokes it only with new_from_old_alloc_on_insert=1; otherwise
+the previous OLD-required behavior remains. The flag without an owning callback
+is EINVAL. A fresh-capable callback must handle NULL OLD explicitly. It must not
+re-enter Slotcask or perform network I/O. Nonzero return is a hard error:
 set errno for a cause; otherwise Slotcask supplies EINVAL.
 
 Slotcask initializes output pointer/length to NULL/0 and takes ownership of

@@ -91,6 +91,14 @@ int typed_prepared_alloc(const TypedPrepared *p, uint8_t **out, size_t *len,
 int typed_encode_alloc(const TypedSchema *ts, const char *json, int defaults,
                          const char *root, const char *object,
                          uint8_t **out, size_t *len, char *err, size_t errsz);
+/* Internal single-write collectors; output is NULL/0 on failure, owned
+   malloc storage on success. No schema activation. */
+int typed_insert_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
+    const char *json,
+    const char *root,const char *object,uint8_t **out,size_t *len,
+    char *err,size_t cap);
+int typed_update_json_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
+    const char *json,uint8_t **out,size_t *len,char *err,size_t cap);
 int typed_encode_packed_into(const TypedSchema *ts, const char *json, int defaults,
                               const char *root, const char *object,
                               uint8_t *out, size_t cap, size_t *used,
