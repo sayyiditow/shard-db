@@ -8,6 +8,22 @@ static int row_error(char *err, size_t cap, int code, const char *message) {
     if (err && cap) snprintf(err, cap, "%s", message);
     errno = code; return -1;
 }
+static uint32_t packed_fixed_width(const TypedField *f){
+    switch(f->type){
+    case FT_BOOL:case FT_BYTE:return 1;
+    case FT_SHORT:return 2;
+    case FT_TIME:return 3;
+    case FT_INT:case FT_FLOAT:case FT_DATE:case FT_IPV4:return 4;
+    case FT_DATETIME:return 7;
+    case FT_LONG:case FT_DOUBLE:case FT_TIMESTAMP:case FT_DATETIMEMS:return 8;
+    case FT_UUID:case FT_IPV6:return 16;
+    case FT_ENUM:
+        if(f->n_enum_values<1||f->n_enum_values>65535||!f->enum_values||
+           f->enum_width!=(f->n_enum_values<=256?1:2))return 0;
+        return (uint32_t)f->enum_width;
+    default:return 0;
+    }
+}
 static int packed_schema_ok(const TypedSchema *ts) {
     if (!ts || !ts->typed || ts->nfields < 1 || ts->nfields > MAX_FIELDS ||
         ts->packed.nfields != (uint32_t)ts->nfields ||
@@ -15,7 +31,9 @@ static int packed_schema_ok(const TypedSchema *ts) {
         ts->packed.maximum != (uint32_t)ts->total_size) return 0;
     for (int i=0;i<ts->nfields;i++) {
         const PkrField *p=&ts->packed.fields[i];const TypedField *f=&ts->fields[i];
-        if (f->name_len<1 || f->name_len>=(int)sizeof(f->name) ||
+        if ((p->kind==PKR_FIXED &&
+             (packed_fixed_width(f)==0 || packed_fixed_width(f)!=p->width)) ||
+            f->name_len<1 || f->name_len>=(int)sizeof(f->name) ||
             strnlen(f->name,sizeof(f->name))!=(size_t)f->name_len ||
             f->offset<0 || f->size<0 || (uint32_t)f->offset!=p->offset ||
             (uint32_t)f->size!=p->width ||
@@ -725,4 +743,78 @@ char *typed_packed_decode(const TypedSchema *ts,const uint8_t *value,size_t len,
     out[pos++]='}';out[pos]=0;
     if(pos+1!=need){errno=EILSEQ;goto fail;}return out;
 fail:free(out);return NULL;
+}
+/* JSON cells retain the existing projection/rows wire policy: numeric fields
+   are bare, bool and other display scalars are strings, NULL remains null. */
+static int projection_text_open(const TypedRowView *view,int index,RowText *text){
+    if(index<0){memset(text,0,sizeof(*text));dec_init(&text->decimal);
+        text->data="null";text->len=4;return 0;}
+    int rc=row_text_open(view,(size_t)index,text);if(rc)return rc;
+    if(view->schema->fields[index].type==FT_BOOL&&!view->schema->fields[index].removed){
+        TypedRowSpan span;if(typed_row_span(view,(size_t)index,&span))return -1;
+        if(!span.is_null)text->quoted=1;
+    }
+    return 0;
+}
+char *typed_packed_projected_cell(const TypedSchema *ts,const uint8_t *value,
+    size_t len,uint8_t hdr2,size_t index,size_t budget){
+    if(!packed_schema_ok(ts)||index>=(size_t)ts->nfields){errno=EINVAL;return NULL;}
+    if(budget<2){errno=ENOMEM;return NULL;}
+    TypedRowView view;if(typed_row_open(ts,value,len,hdr2,&view))return NULL;
+    RowText text;char *out=NULL;
+    int rc=projection_text_open(&view,(int)index,&text);size_t need=0,used=0;
+    if(!rc)rc=row_text_length(&text,1,&need);
+    if(rc)goto done;
+    if(need==SIZE_MAX){errno=EOVERFLOW;goto done;}
+    if(need+1>budget){errno=ENOMEM;goto done;}
+    out=malloc(need+1);if(!out){errno=ENOMEM;goto done;}
+    rc=row_text_write(&text,1,out,need+1,&used);
+    if(rc||used!=need){
+        if(!rc)errno=EILSEQ;
+        free(out);out=NULL;goto done;
+    }
+    out[used]=0;
+done:row_text_free(&text);return out;
+}
+char *typed_packed_project_json(const TypedSchema *ts,const uint8_t *value,
+    size_t len,uint8_t hdr2,const char *fields_csv,size_t budget){
+    if(!packed_schema_ok(ts)||!fields_csv){errno=EINVAL;return NULL;}
+    if(budget<3){errno=ENOMEM;return NULL;}
+    size_t length=strnlen(fields_csv,MAX_LINE);
+    if(length==MAX_LINE){errno=E2BIG;return NULL;}
+    char *copy=malloc(length+1);if(!copy){errno=ENOMEM;return NULL;}
+    memcpy(copy,fields_csv,length+1);
+    struct {char *name;int index;} selected[MAX_FIELDS];size_t count=0;
+    char *save=NULL,*token=strtok_r(copy,",",&save);char *out=NULL;
+    while(token){
+        if(count==MAX_FIELDS){errno=E2BIG;goto done;}
+        if(strchr(token,'+')){errno=ENOTSUP;goto done;}
+        selected[count].name=token;selected[count].index=typed_field_index(ts,token);
+        count++;token=strtok_r(NULL,",",&save);
+    }
+    TypedRowView view;if(typed_row_open(ts,value,len,hdr2,&view))goto done;
+    size_t need=3; /* braces and NUL; requested order/duplicates are preserved */
+    for(size_t i=0;i<count;i++){
+        size_t name=0,part=0,sep=i?2:1;RowText text;
+        if(quoted_length(selected[i].name,strlen(selected[i].name),&name))goto done;
+        int rc=projection_text_open(&view,selected[i].index,&text);
+        if(!rc)rc=row_text_length(&text,1,&part);
+        row_text_free(&text);if(rc)goto done;
+        if(name>SIZE_MAX-sep||part>SIZE_MAX-name-sep||need>SIZE_MAX-name-part-sep){errno=EOVERFLOW;goto done;}
+        need+=name+part+sep;if(need>budget){errno=ENOMEM;goto done;}
+    }
+    out=malloc(need);if(!out){errno=ENOMEM;goto done;}
+    size_t pos=0;out[pos++]='{';
+    for(size_t i=0;i<count;i++){
+        size_t used=0;if(i)out[pos++]=',';
+        if(quote_into(selected[i].name,strlen(selected[i].name),out+pos,need-pos,&used))goto fail;
+        pos+=used;out[pos++]=':';RowText text;
+        int rc=projection_text_open(&view,selected[i].index,&text);
+        if(!rc)rc=row_text_write(&text,1,out+pos,need-pos,&used);
+        row_text_free(&text);if(rc)goto fail;pos+=used;
+    }
+    out[pos++]='}';out[pos]=0;if(pos+1!=need){errno=EILSEQ;goto fail;}
+    free(copy);return out;
+fail:free(out);out=NULL;
+done:free(copy);return out;
 }

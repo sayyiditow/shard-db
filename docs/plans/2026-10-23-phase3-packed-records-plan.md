@@ -64,8 +64,20 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   completion. All nine owned files match the approved checkpoints; the two
   evidence wording corrections do not change implementation. The legacy GET
   response reserve and temporary field workspace are explicitly documented.
+  Committed as `decbee6`.
   Field/projection/CSV, read/index/delete consumers, metadata, migration and
   activation remain open; packed schemas stay publicly inactive.
+  The [3B.7 checked JSON cells and projected GET](2026-10-26-phase3b7-packed-json-projection-plan.md)
+  adds exact packed JSON cells and a complete selected-object renderer, with
+  checked projected GET allocation/output errors. Revision 2 repairs fixed
+  logical-width/enum metadata validation after blind review. It is implemented
+  and raw-diff reviewed: 218 focused checks, 20263 full-suite
+  assertions across525 cases, all31 allocation injections and122 probe gates.
+  [Execution evidence](2026-10-26-phase3b7-packed-json-projection-evidence.md)
+  and [executed review](2026-10-26-phase3b7-raw-diff-review.md) record completion.
+  All nine final hashes match; one evidence wording correction is resolved.
+  Legacy raw strings, CSV/composites, surrounding query envelopes,
+  matching/index/aggregate paths and public activation stay open.
   No Phase 3B closure is implied.
 - 3C: child plan must be prepared against the reviewed 3B result.
 - [Original review](2026-10-23-phase3-packed-records-plan-review.md): unchanged.

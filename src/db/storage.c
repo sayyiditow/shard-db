@@ -450,6 +450,22 @@ int cmd_get_fields(const char *db_root, const char *object,
 
     FieldSchema pfs;
     init_field_schema(&pfs, db_root, object);
+    if(pfs.ts&&pfs.ts->packed.nfields){
+        FILE *out=g_out?g_out:stdout;
+        if(ferror(out)){free(val);errno=EIO;return 1;}
+        char *json=typed_packed_project_json(pfs.ts,val,vlen,cur_hdr2,fields_csv,SIZE_MAX);
+        if(!json){
+            int saved=errno;
+            const char *why=saved==ENOMEM?"out of memory":saved==ENOTSUP?
+                "packed composite projections await integration":saved==E2BIG?
+                "projection exceeds limit":"corrupt record";
+            OUT("{\"error\":\"%s\"}\n",why);free(val);errno=saved;return 1;
+        }
+        size_t length=strlen(json);errno=0;size_t written=fwrite(json,1,length,out);int saved=errno;
+        free(json);free(val);
+        if(written!=length||ferror(out)){errno=saved?saved:EIO;return 1;}
+        return fputc('\n',out)==EOF?1:0;
+    }
     char proj_buf[MAX_LINE];
     strncpy(proj_buf, fields_csv, MAX_LINE - 1);
     proj_buf[MAX_LINE - 1] = '\0';

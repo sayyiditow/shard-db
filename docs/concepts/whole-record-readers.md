@@ -41,12 +41,13 @@ No new response cap or QUERY_BUFFER_MB enforcement is claimed. The configured
 query buffer cap and limits of other read routes remain later activation work.
 No benchmark or throughput claim accompanies this correctness tradeoff.
 
-This is a rendering bridge, not query integration. `typed_get_field_str`,
-projections, composite/CSV/rows/join extraction, matching, sorting, indexes and
-aggregates still have legacy assumptions and separate error/length contracts.
-A binary varchar cannot be safely passed to their strlen-based paths. A decoded
-full row does not prove the query's planner/matcher/index/emit-failure path is
-packed-ready. Existing callers that substitute null on decode failure remain
+This is a rendering bridge, not query integration. Checked
+[JSON cells and projected GET](packed-json-projection.md) now support private
+packed schemas. `typed_get_field_str`, composites/CSV, query/rows/join envelopes,
+matching, sorting, indexes and aggregates retain independent error/length and
+layout contracts. Binary varchar cannot be safely passed to their strlen-based
+paths. A decoded row/cell does not prove the planner/matcher/index/emit-failure
+path is packed-ready. Callers that substitute null on decode failure remain
 explicit follow-up work; no public packed activation is authorized here.
 
 Private C tests cover exact JSON and stream equality, NULL/empty/binary data,

@@ -2,6 +2,7 @@
 #include "slotcask.h"
 #include "io_direct.h"
 #include "query_internal.h"
+#include "typed_row.h"
 #include <dirent.h>
 #include <fnmatch.h>
 
@@ -469,6 +470,16 @@ char *json_projected_value(char *v, const TypedField *field) {
 
 char *json_projected_field(const char *raw, size_t raw_len, const char *field,
                            FieldSchema *fs, uint8_t hdr2) {
+    if(fs&&fs->ts&&fs->ts->packed.nfields){
+        errno=0;
+        if(!field){errno=EINVAL;return NULL;}
+        if(strchr(field,'+')){errno=ENOTSUP;return NULL;}
+        int index=typed_field_index(fs->ts,field);
+        if(index>=0)return typed_packed_projected_cell(fs->ts,(const uint8_t*)raw,
+            raw_len,hdr2,(size_t)index,SIZE_MAX);
+        TypedRowView view;if(typed_row_open(fs->ts,(const uint8_t*)raw,raw_len,hdr2,&view))return NULL;
+        char *out=malloc(5);if(!out){errno=ENOMEM;return NULL;}memcpy(out,"null",5);return out;
+    }
     errno = 0;   /* distinguish corruption (EILSEQ) from a NULL field */
     char *v = decode_field(raw, raw_len, field, fs, hdr2);
     const TypedField *tf = NULL;
@@ -495,6 +506,10 @@ char *json_projected_field(const char *raw, size_t raw_len, const char *field,
 char *json_typed_row_cell(const TypedSchema *ts, const uint8_t *raw,
                           int raw_len, int idx, uint8_t hdr2) {
     if (!ts || idx < 0 || idx >= ts->nfields) return NULL;
+    if(ts->packed.nfields){
+        if(raw_len<0){errno=EILSEQ;return NULL;}
+        return typed_packed_projected_cell(ts,raw,(size_t)raw_len,hdr2,(size_t)idx,SIZE_MAX);
+    }
     errno = 0;
     char *v = typed_get_field_str(ts, raw, raw_len, idx, hdr2);
     char *out = json_projected_value(v, &ts->fields[idx]);

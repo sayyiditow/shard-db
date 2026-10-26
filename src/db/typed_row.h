@@ -123,6 +123,16 @@ char *typed_packed_decode(const TypedSchema *ts, const uint8_t *value, size_t le
 char *typed_packed_field_text(const TypedSchema *ts, const uint8_t *value,
                                size_t len, uint8_t hdr2, size_t index,
                                size_t *text_len);
+/* Complete JSON cells for projection/rows, preserving their bool-as-string
+   policy. NULL/removed produces owned "null"; any error is NULL with errno.
+   Budget includes NUL. Names are not parsed by the indexed cell API.
+   Projection CSV is bounded by MAX_LINE-1/MAX_FIELDS, skips empty tokens,
+   preserves order/duplicates and whitespace, maps unknown/removed to null.
+   Packed composites containing '+' refuse ENOTSUP until integrated. */
+char *typed_packed_projected_cell(const TypedSchema *ts, const uint8_t *value,
+    size_t len, uint8_t hdr2, size_t index, size_t budget);
+char *typed_packed_project_json(const TypedSchema *ts, const uint8_t *value,
+    size_t len, uint8_t hdr2, const char *fields_csv, size_t budget);
 
 /* Existing scalar semantics, shared internally by the adapter. */
 int encode_json_field_checked(const TypedField *f, const char *text, size_t len,
