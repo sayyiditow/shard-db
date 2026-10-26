@@ -55,8 +55,17 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   and [executed raw-diff review](2026-10-26-phase3b5-raw-diff-review.md) record
   completion. All eight owned files match the approved checkpoints. Explicit
   packed criteria/CAS/index guards and four legacy crash repairs are included.
-  Read/index/delete consumers, metadata, migration and activation remain open;
-  packed schemas stay publicly inactive.
+  Committed as `35e49ab`.
+  The [3B.6 whole-record JSON readers](2026-10-26-phase3b6-whole-record-readers-plan.md)
+  are implemented and raw-diff reviewed: 167 focused checks, 20045 full-suite
+  assertions across 524 cases, all 22 allocation injections and 106 probe gates
+  pass. [Execution evidence](2026-10-26-phase3b6-whole-reader-evidence.md) and
+  [executed raw-diff review](2026-10-26-phase3b6-raw-diff-review.md) record
+  completion. All nine owned files match the approved checkpoints; the two
+  evidence wording corrections do not change implementation. The legacy GET
+  response reserve and temporary field workspace are explicitly documented.
+  Field/projection/CSV, read/index/delete consumers, metadata, migration and
+  activation remain open; packed schemas stay publicly inactive.
   No Phase 3B closure is implied.
 - 3C: child plan must be prepared against the reviewed 3B result.
 - [Original review](2026-10-23-phase3-packed-records-plan-review.md): unchanged.

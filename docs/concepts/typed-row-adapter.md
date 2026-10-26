@@ -9,9 +9,11 @@ This preparation does not activate packed storage or migrate any object.
 `typed_schema_bind_packed` accepts already parsed names/defaults and type-only
 tokens. It binds a by-value `PkrSchema` after validating the entire declaration;
 failure preserves the schema. An all-zero packed member means legacy. Bound
-packed schemas must only reach the new adapters and codec until each old
-consumer has been converted. Passing one to a legacy raw-offset API is unsafe.
-The ordinary loader does not call this binder.
+packed schemas may reach the new adapters, codec and the integrated
+[whole-record JSON readers](whole-record-readers.md). Field-string, projection
+and raw-offset consumers still require their own conversion. Passing a bound
+schema to a legacy raw-offset API is unsafe. The ordinary loader does not call
+this binder.
 
 `typed_row_open` rejects schema/record generation mismatches before returning
 borrowed field spans. Packed varchar spans contain content, not a uint16 prefix;

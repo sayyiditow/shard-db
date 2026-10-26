@@ -269,6 +269,12 @@ edit-field rules.
 
 Record payloads are encoded by `typed_encode()` (in `config.c`), which packs each field in declaration order. A reader uses `typed_decode()` — also cached per object via `g_typed_cache` — to unpack without re-reading the schema.
 
+The fixed-field description below is the currently public legacy format.
+The private [whole-record JSON reader bridge](whole-record-readers.md) also
+recognizes explicitly bound packed schemas; it does not activate their loaders,
+projection/query consumers or migration. GET validates and builds its actual
+JSON response before output, with checked allocation/write errors.
+
 No field-separator bytes, no length tags (varchar has its own uint16 length prefix, but nothing separates fields from each other). Position is everything: field `i` starts at the sum of sizes of fields `0..i-1`. This makes `typed_get_field_str(ts, raw, field_index)` a direct memcpy of a known byte range.
 
 ## Schema mutations

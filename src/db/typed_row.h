@@ -6,7 +6,8 @@
 /* Internal prepared schema/record adapters; never publish an object layout.
  * No loader/create-object calls the binder in this child. Bound packed schemas
  * may only reach these adapters/packed_record APIs until consumers are converted;
- * old typed_* and raw-offset APIs cannot interpret packed fields.
+ * typed_decode/typed_decode_stream support whole packed records; legacy
+ * field-string and raw-offset APIs still cannot interpret packed fields.
  * Schemas, enum strings and OLD bytes remain immutable while views/prepared
  * cells borrow them. Initialize prepared objects before use; free is idempotent.
  * Outputs and inputs must not alias. Owned output arguments must be valid;

@@ -408,18 +408,23 @@ int cmd_get(const char *db_root, const char *object,
     }
     LOG_DEBUG(LOG_SUB_SLOTCASK, "GET %s (klen=%zu, %zu bytes)", object, klen, vlen);
     TypedSchema *ts = load_typed_schema(db_root, object);
-    /* Fail closed on a structurally invalid flagged record (bad bm_nbytes,
-       unknown hdr2 bits): typed_decode_stream emits nothing in that case —
-       a bare newline would masquerade as an empty record dict. */
-    if (typed_decode_stream(ts, (const uint8_t *)val, (uint32_t)vlen,
-                            g_out ? g_out : stdout, get_hdr2) != 0) {
-        OUT("{\"error\":\"corrupt record\"}\n");
-        free(val);
-        return 1;
+    FILE *out = g_out ? g_out : stdout;
+    if (vlen > INT_MAX) {
+        OUT("{\"error\":\"record exceeds decode limit\"}\n");
+        free(val); errno = EOVERFLOW; return 1;
     }
-    fputc('\n', g_out ? g_out : stdout);
+    if (typed_decode_stream(ts, (const uint8_t *)val, (int)vlen,
+                            out, get_hdr2) != 0) {
+        int saved = errno;
+        /* Rendering fails before output. An I/O failure may already have
+           emitted bytes, so do not concatenate a replacement JSON error. */
+        if (!ferror(out))
+            OUT("{\"error\":\"%s\"}\n", saved == ENOMEM ? "out of memory" : "corrupt record");
+        free(val); errno = saved; return 1;
+    }
+    int rc = fputc('\n', out) == EOF ? 1 : 0;
     free(val);
-    return 0;
+    return rc;
 }
 
 /* Single-key get with a field projection. Same slotcask read path as

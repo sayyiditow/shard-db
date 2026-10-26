@@ -3857,8 +3857,13 @@ int decode_field_to_buf(const TypedField *f, const uint8_t *data,
 
 char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
                    uint8_t hdr2) {
-    if (!ts || !ts->typed || ts->nfields < 1 || ts->nfields > MAX_FIELDS)
+    if (!ts || !ts->typed || ts->nfields < 1 || ts->nfields > MAX_FIELDS) {
+        errno = EINVAL;
         return NULL;
+    }
+    if (data_len < 0) { errno = EILSEQ; return NULL; }
+    if (ts->packed.nfields)
+        return typed_packed_decode(ts, data, (size_t)data_len, hdr2, SIZE_MAX);
     const uint8_t *fbase = NULL, *bm = NULL;
     int bm_bytes = 0;
     size_t region = 0;
@@ -3956,54 +3961,21 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
 
 int typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
                         int data_len, FILE *out, uint8_t hdr2) {
-    if (!ts || !ts->typed || !out) return -1;
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t field_region_len = 0;
-    if (data_len < 0 ||
-        typed_record_view(data, (size_t)data_len, hdr2, &fbase, &bm,
-                          &bm_bytes, &field_region_len) != 0) {
-        errno = EILSEQ;   /* corrupt flagged record — fail, never emit */
+    if (!out) { errno = EINVAL; return -1; }
+    if (ferror(out)) { errno = EIO; return -1; }
+    /* Complete validation/rendering precedes output. In particular ENOMEM
+       never falls back to a smaller field buffer or drops an enum value. */
+    char *json = typed_decode(ts, data, data_len, hdr2);
+    if (!json) return -1;
+    size_t length = strlen(json);
+    errno = 0;
+    size_t written = fwrite(json, 1, length, out);
+    int saved = errno;
+    free(json);
+    if (written != length || ferror(out)) {
+        errno = saved ? saved : EIO;
         return -1;
     }
-    int render_zeros = (hdr2 & SREC_FLAG_NULLMAP) ? 1 : 0;
-    fputc('{', out);
-    int first = 1;
-    for (int i = 0; i < ts->nfields; i++) {
-        const TypedField *f = &ts->fields[i];
-        if (f->removed) continue;
-
-        static const uint8_t zero_field[65537];
-        const uint8_t *field_src = ((size_t)f->offset + (size_t)f->size <= field_region_len)
-            ? fbase + f->offset
-            : zero_field;
-
-        if (typed_field_null(bm, bm_bytes, i)) {
-            if (!first) fputc(',', out);
-            fprintf(out, "\"%s\":null", f->name);
-            first = 0;
-            continue;
-        }
-
-        char vbuf_stack[512];
-        char *vbuf = vbuf_stack;
-        int vbufsz = (int)sizeof(vbuf_stack);
-        if (f->type == FT_VARCHAR) {
-            int need = 6 * (f->size > 2 ? f->size - 2 : 0) + 3;
-            if (need > vbufsz) {
-                vbuf = malloc((size_t)need);
-                if (!vbuf) { vbuf = vbuf_stack; }
-                else        { vbufsz = need; }
-            }
-        }
-        int vlen = decode_field_to_buf(f, field_src, vbuf, vbufsz, render_zeros);
-        if (vlen <= 0) { if (vbuf != vbuf_stack) free(vbuf); continue; }
-
-        if (!first) fputc(',', out);
-        fprintf(out, "\"%s\":%s", f->name, vbuf);
-        first = 0;
-        if (vbuf != vbuf_stack) free(vbuf);
-    }
-    fputc('}', out);
     return 0;
 }
 

@@ -994,11 +994,12 @@ size_t schema_trim_fn(const void *val, size_t vlen, void *ctx);
 
 char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
                    uint8_t hdr2);
-/* Stream variant — writes the JSON object directly to `out` without
-   allocating an intermediate string. Use on the GET hot path; saves one
-   malloc + one memcpy per response vs. typed_decode + OUT("%s\n").
-   Returns 0 on success, -1 (errno=EILSEQ) on a corrupt flagged record —
-   callers must fail the request, never emit a partial object. */
+/* Checked FILE variant. Builds the complete JSON string before
+   emitting bytes, so validation/render/allocation failures leave out untouched.
+   Adds one owned whole-response buffer on the GET path; no schema-max arena.
+   Returns 0 after fwrite accepts all bytes, -1 with errno on failure. FILE I/O
+   errors may have emitted a prefix: callers must not append a replacement JSON
+   error when ferror(out) is set. Does not flush, close or own the FILE. */
 int   typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
                           int data_len, FILE *out, uint8_t hdr2);
 /* data_len is the number of valid bytes in data (may be < ts->total_size for
