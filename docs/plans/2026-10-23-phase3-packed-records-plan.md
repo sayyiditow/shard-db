@@ -88,10 +88,22 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   [Execution evidence](2026-10-26-phase3b8-packed-named-projection-evidence.md)
   and [executed review](2026-10-27-phase3b8-raw-diff-review.md) record completion;
   [plan review](2026-10-27-phase3b8-plan-review.md) records the earlier repairs.
-  Reviewed 3B.8 is included in the authorized commit for this slice.
+  Committed as `994e2eb`.
   CSV representation/error policy and raw matching/sorting/
   grouping consumers stay separate; no public binding is authorized.
   No Phase 3B closure is implied.
+  The [3B.9 checked CSV rendering](2026-10-27-phase3b9-packed-csv-rendering-plan.md)
+  is implemented and raw-diff reviewed: owned byte-aware cells, headers and
+  complete rows use visible `\u0000` with doubled literal backslashes. Strict
+  header metadata validation and indexed default field identity are included.
+  [Execution evidence](2026-10-27-phase3b9-packed-csv-evidence.md) and
+  [executed review](2026-10-27-phase3b9-raw-diff-review.md) record 144 focused
+  checks, 20603/0 full-suite assertions across 527 cases, 3035 oracle cases and
+  all 15 allocation injections. All nine final hashes match; one evidence
+  attribution typo is corrected. Reviewed 3B.9 is included in the authorized
+  commit for this slice. No production CSV emitter or public packed binding is active.
+  The [plan review](2026-10-27-phase3b9-plan-review.md) preserves the two earlier
+  repairs. Following emitter/error integration and the remaining 3B audit stay open.
 - 3C: child plan must be prepared against the reviewed 3B result.
 - [Original review](2026-10-23-phase3-packed-records-plan-review.md): unchanged.
 - [Rejected draft archive](archive/2026-10-23-phase3-packed-records-rejected.md):

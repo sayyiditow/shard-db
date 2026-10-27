@@ -85,3 +85,7 @@ adds JSON and positional insert/upsert preparation under explicit schemas.
 constructors and preserve omitted OLD fields. Criteria/CAS updates, bulk-delete
 and remaining read/index consumers stay future work; packed schemas remain
 inactive in public loaders and creates.
+
+[Checked packed CSV rendering](packed-csv-rendering.md) supplies owned exact
+cells, headers and rows with reversible visible byte escapes. These APIs remain
+private; legacy CSV writers and command error propagation are not converted.

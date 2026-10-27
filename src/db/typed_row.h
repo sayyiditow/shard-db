@@ -145,6 +145,26 @@ char *typed_packed_named_text(const TypedSchema *ts, const uint8_t *value,
 char *typed_packed_named_json(const TypedSchema *ts, const uint8_t *value,
     size_t len, uint8_t hdr2, const char *name, size_t budget);
 
+/* Checked CSV output, private until command/error integration is complete.
+   Byte layer: backslash doubles; C0 controls and DEL use \\u00xx.
+   Other bytes (including UTF-8) pass through. Parse CSV before byte unescaping.
+   No raw NUL/CR/LF enters a cell.
+   Delimiter is printable ASCII except quote/backslash, or tab. Cell output
+   has no newline; header/row include their final LF. Budget includes NUL;
+   text_len excludes NUL and resets on error. All returned buffers are owned.
+   NULL data is valid only at length zero. Missing/NULL fields are empty cells.
+   Row key is caller-formatted display bytes, not a binary storage key.
+   fields NULL/empty selects all nonremoved fields; otherwise comma parsing
+   preserves order, duplicates and whitespace, skips empty tokens and supports
+   '+' named composites, bounded by MAX_LINE-1/MAX_FIELDS. */
+char *typed_csv_cell_text(const void *data, size_t len, char delimiter,
+    size_t budget, size_t *text_len);
+char *typed_packed_csv_header(const TypedSchema *ts, const char *fields,
+    char delimiter, size_t budget, size_t *text_len);
+char *typed_packed_csv_row(const TypedSchema *ts, const uint8_t *value,
+    size_t len, uint8_t hdr2, const void *wire_key, size_t key_len,
+    const char *fields, char delimiter, size_t budget, size_t *text_len);
+
 /* Existing scalar semantics, shared internally by the adapter. */
 int encode_json_field_checked(const TypedField *f, const char *text, size_t len,
                                 int quoted, uint8_t *out, char *err, size_t errsz);

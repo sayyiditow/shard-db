@@ -62,3 +62,7 @@ named API has no production consumer. Loaders/create-object still never bind
 packed schemas; no metadata/version/migration/default-format change is made.
 Private tests and actual-source mocked command probes prove this boundary, not
 public packed network/query acceptance or concurrency safety of activation.
+
+The [checked CSV rendering layer](packed-csv-rendering.md) consumes the same
+named display semantics internally, preserving NUL through visible `\u0000`.
+Its explicit-length cell/header/row APIs have no public command callers yet.

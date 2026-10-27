@@ -919,3 +919,166 @@ char *typed_packed_project_json(const TypedSchema *ts,const uint8_t *value,
 fail:free(out);out=NULL;
 done:free(copy);return out;
 }
+
+typedef struct {
+    char *data;
+    size_t used, cap;
+} CsvSink;
+typedef struct {
+    char *copy;
+    const char *names[MAX_FIELDS];
+    int indices[MAX_FIELDS]; /* default fields retain identity; explicit names use -1 */
+    size_t count;
+} CsvSelection;
+static int csv_delim_ok(char delimiter) {
+    unsigned char d=(unsigned char)delimiter;
+    return d=='\t'||(d>=0x20 && d<=0x7e && d!='"' && d!='\\');
+}
+static int csv_put(CsvSink *sink,const char *data,size_t len) {
+    if(len>SIZE_MAX-sink->used){errno=EOVERFLOW;return -1;}
+    if(len>sink->cap-sink->used){errno=ENOMEM;return -1;}
+    if(sink->data&&len)memcpy(sink->data+sink->used,data,len);
+    sink->used+=len;return 0;
+}
+/* Literal backslash doubles; C0 controls and DEL become six-byte \\u00xx.
+   Other bytes (including UTF-8) pass through. CSV quoting is the outer layer. */
+static size_t csv_byte(unsigned char c,char out[6]) {
+    static const char hex[]="0123456789abcdef";
+    if(c=='\\'){out[0]='\\';out[1]='\\';return 2;}
+    if(c<0x20||c==0x7f){
+        memcpy(out,"\\u00",4);out[4]=hex[c>>4];out[5]=hex[c&15];return 6;
+    }
+    out[0]=(char)c;return 1;
+}
+static int csv_span(CsvSink *sink,const void *bytes,size_t len,char delimiter) {
+    const unsigned char *data=bytes;int quoted=0;
+    for(size_t i=0;i<len;i++){
+        char token[6];size_t n=csv_byte(data[i],token);
+        for(size_t j=0;j<n;j++)if(token[j]==delimiter||token[j]=='"')quoted=1;
+    }
+    if(quoted&&csv_put(sink,"\"",1))return -1;
+    for(size_t i=0;i<len;i++){
+        char token[6];size_t n=csv_byte(data[i],token);
+        for(size_t j=0;j<n;j++){
+            if(token[j]=='"'&&csv_put(sink,"\"",1))return -1;
+            if(csv_put(sink,token+j,1))return -1;
+        }
+    }
+    return quoted?csv_put(sink,"\"",1):0;
+}
+static int csv_components_ok(const char *name) {
+    size_t count=0;const char *p=name;
+    while(*p){
+        while(*p=='+')p++;
+        if(!*p)break;
+        if(++count>MAX_FIELDS){errno=E2BIG;return 0;}
+        while(*p&&*p!='+')p++;
+    }
+    return 1;
+}
+static int csv_selection_open(const TypedSchema *ts,const char *fields,
+                              CsvSelection *selection) {
+    memset(selection,0,sizeof(*selection));
+    if(!fields||!*fields){
+        for(int i=0;i<ts->nfields;i++)if(!ts->fields[i].removed){
+            selection->names[selection->count]=ts->fields[i].name;
+            selection->indices[selection->count++]=i;
+        }
+        return 0;
+    }
+    size_t n=strnlen(fields,MAX_LINE);
+    if(n==MAX_LINE){errno=E2BIG;return -1;}
+    selection->copy=malloc(n+1);
+    if(!selection->copy){errno=ENOMEM;return -1;}
+    memcpy(selection->copy,fields,n+1);char *save=NULL;
+    for(char *name=strtok_r(selection->copy,",",&save);name;
+        name=strtok_r(NULL,",",&save)){
+        if(selection->count==MAX_FIELDS){errno=E2BIG;return -1;}
+        if(!csv_components_ok(name))return -1;
+        selection->names[selection->count]=name;
+        selection->indices[selection->count++]=-1;
+    }
+    return 0;
+}
+static int csv_selected_text_open(const TypedRowView *view,const char *name,
+                                   int index,size_t budget,NamedText *text) {
+    if(index<0)return named_text_open(view,name,budget,text);
+    memset(text,0,sizeof(*text));dec_init(&text->value.decimal);
+    TypedRowSpan span;if(typed_row_span(view,(size_t)index,&span))return -1;
+    text->missing=span.is_null||view->schema->fields[index].removed;
+    return row_text_open(view,(size_t)index,&text->value);
+}
+static int csv_selected_span(CsvSink *sink,const TypedRowView *view,
+    const char *name,int index,char delimiter,size_t budget) {
+    NamedText text;int rc=csv_selected_text_open(view,name,index,budget,&text);
+    char *number=NULL;
+    if(rc)goto done;
+    if(text.missing){rc=csv_span(sink,NULL,0,delimiter);goto done;}
+    const char *data=text.value.data;size_t n=text.value.len;
+    if(n==SIZE_MAX||n+1>budget){errno=ENOMEM;rc=-1;goto done;}
+    if(text.value.numeric){
+        number=malloc(n+1);if(!number){errno=ENOMEM;rc=-1;goto done;}
+        size_t used=0;rc=row_text_write(&text.value,0,number,n+1,&used);
+        if(rc)goto done;
+        if(used!=n){errno=EILSEQ;rc=-1;goto done;}data=number;
+    }
+    rc=csv_span(sink,data,n,delimiter);
+done:free(number);named_text_free(&text);return rc;
+}
+char *typed_csv_cell_text(const void *data,size_t len,char delimiter,
+                          size_t budget,size_t *text_len) {
+    if(text_len)*text_len=0;
+    if(!text_len||(!data&&len)||!csv_delim_ok(delimiter)){errno=EINVAL;return NULL;}
+    if(!budget){errno=ENOMEM;return NULL;}
+    CsvSink measure={.cap=budget-1};
+    if(csv_span(&measure,data,len,delimiter))return NULL;
+    char *out=malloc(measure.used+1);if(!out){errno=ENOMEM;return NULL;}
+    CsvSink write={.data=out,.cap=measure.used};
+    if(csv_span(&write,data,len,delimiter)){free(out);return NULL;}
+    if(write.used!=measure.used){errno=EILSEQ;free(out);return NULL;}
+    out[write.used]=0;*text_len=write.used;return out;
+}
+static int csv_record_pass(CsvSink *sink,const CsvSelection *selection,
+                            const TypedRowView *view,const void *key,size_t key_len,
+                            char delimiter,size_t budget,int header) {
+    if(csv_span(sink,header?"key":key,header?3:key_len,delimiter))return -1;
+    for(size_t i=0;i<selection->count;i++){
+        if(csv_put(sink,&delimiter,1))return -1;
+        if(header){
+            const char *name=selection->names[i];
+            if(csv_span(sink,name,strlen(name),delimiter))return -1;
+        }else if(csv_selected_span(sink,view,selection->names[i],selection->indices[i],delimiter,budget))return -1;
+    }
+    return csv_put(sink,"\n",1);
+}
+static char *csv_record_text(const TypedSchema *ts,const uint8_t *value,
+    size_t len,uint8_t hdr2,const void *key,size_t key_len,const char *fields,
+    char delimiter,size_t budget,size_t *text_len,int header) {
+    if(text_len)*text_len=0;
+    if(!text_len||!packed_schema_ok(ts)||(!key&&key_len)||
+       !csv_delim_ok(delimiter)){errno=EINVAL;return NULL;}
+    if(!budget){errno=ENOMEM;return NULL;}
+    if(header&&pkr_schema_validate(&ts->packed)!=DEC_OK){errno=EINVAL;return NULL;}
+    TypedRowView view={0};
+    if(!header&&typed_row_open(ts,value,len,hdr2,&view))return NULL;
+    CsvSelection selection;char *out=NULL;
+    if(csv_selection_open(ts,fields,&selection))goto done;
+    CsvSink measure={.cap=budget-1};
+    if(csv_record_pass(&measure,&selection,&view,key,key_len,delimiter,budget,header))goto done;
+    out=malloc(measure.used+1);if(!out){errno=ENOMEM;goto done;}
+    CsvSink write={.data=out,.cap=measure.used};
+    if(csv_record_pass(&write,&selection,&view,key,key_len,delimiter,budget,header))goto fail;
+    if(write.used!=measure.used){errno=EILSEQ;goto fail;}
+    out[write.used]=0;*text_len=write.used;goto done;
+fail:free(out);out=NULL;
+done:free(selection.copy);return out;
+}
+char *typed_packed_csv_header(const TypedSchema *ts,const char *fields,
+    char delimiter,size_t budget,size_t *text_len) {
+    return csv_record_text(ts,NULL,0,0,NULL,0,fields,delimiter,budget,text_len,1);
+}
+char *typed_packed_csv_row(const TypedSchema *ts,const uint8_t *value,
+    size_t len,uint8_t hdr2,const void *wire_key,size_t key_len,const char *fields,
+    char delimiter,size_t budget,size_t *text_len) {
+    return csv_record_text(ts,value,len,hdr2,wire_key,key_len,fields,delimiter,budget,text_len,0);
+}

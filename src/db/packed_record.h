@@ -63,6 +63,9 @@ dec_status pkr_compose(const PkrSchema *schema, const PkrCell *cells, size_t n,
 dec_status pkr_view(const PkrSchema *schema, const uint8_t *value, size_t n,
                     uint8_t flags, PkrView *out);
 dec_status pkr_span(const PkrView *view, size_t index, PkrSpan *out);
+/* Pure structural metadata check; no allocation. Returns DEC_OK or
+ * DEC_ERR_INVALID, including for NULL. Does not inspect any record bytes. */
+dec_status pkr_schema_validate(const PkrSchema *schema);
 /* Maximum slot bound and actual-row segment gate. Both include existing
  * 24-byte header, actual key bytes, align-8 and floor 32. No cap is changed.
  * Requests/queries remain separately bounded by their existing callers. */

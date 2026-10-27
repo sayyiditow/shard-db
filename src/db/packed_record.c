@@ -126,6 +126,10 @@ static int schema_ok(const PkrSchema *s) {
            s->maximum == s->prefix + dir + payload;
 }
 
+dec_status pkr_schema_validate(const PkrSchema *schema) {
+    return schema_ok(schema)?DEC_OK:DEC_ERR_INVALID;
+}
+
 dec_status pkr_numeric_encode(const PkrField *f, const char *text, size_t n,
                               uint8_t *out, size_t cap, size_t *used,
                               char *err, size_t errsz) {
