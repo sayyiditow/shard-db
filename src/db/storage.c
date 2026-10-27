@@ -1,6 +1,7 @@
 #include "types.h"
 #include "slotcask.h"
 #include "typed_row.h"
+#include "packed_csv_command.h"
 #include <errno.h>
 #include <math.h>
 #ifdef TEST_BUILD
@@ -3290,6 +3291,18 @@ static void *multi_get_shard_worker(void *arg) {
 int cmd_get_multi(const char *db_root, const char *object, const char *keys_json,
                   const char *format, const char *delimiter) {
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
+    if (csv_delim) {
+        TypedSchema *ts=load_typed_schema(db_root,object);
+        if (ts && ts->packed.nfields) {
+            FieldSchema fs;init_field_schema(&fs,db_root,object);
+            Schema schema=load_schema(db_root,object);
+            SlotcaskSchemaInfo info={.splits=schema.splits,.slot_size=schema.slot_size,.streams=schema.streams};
+            SlotcaskDb *db SDB_REG_REF = slotcask_registry_get(db_root,object,&info);
+            PackedCsvOptions options={.delimiter=csv_delim,.buffer_budget=g_query_buffer_max_bytes,
+                .timeout_ms=resolve_timeout_ms()};
+            return packed_csv_get_multi(db,&fs,&schema,keys_json,&options,g_out?g_out:stdout);
+        }
+    }
     /* Parse keys */
     int key_count = 0, key_cap = 256;
     MultiGetEntry *entries = malloc(key_cap * sizeof(MultiGetEntry));

@@ -1246,7 +1246,7 @@ int64_t slotcask_count_live(SlotcaskDb *db);
    slotcask_lookup_by_hash, never skips an unreadable live reference:
    any validation failure is -1 (unproven), never a miss. Caller holds
    the shared object lock and every writer gate (Task 4). Sole caller is
-   query.c's guard_has_other. */
+   query.c's guard_has_other and the private packed CSV multi-read backend. */
 int slotcask_guard_lookup(SlotcaskDb *db, const uint8_t hash16[16],
                           SlotcaskScanCb cb, void *ctx);
 

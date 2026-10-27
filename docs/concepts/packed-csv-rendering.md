@@ -53,13 +53,14 @@ claimed. A 4 MiB all-NUL varchar expands to 24 MiB; a one-field row with key `k`
 needs 25,165,828 bytes including separators, LF and NUL. The >1 GiB maximum
 schema does not imply a >1 GiB rendering allocation for small selected values.
 
-No production caller uses these new APIs yet. Legacy cell/header/row writers,
-CSV find/fetch/get-multi/joins/aggregates/keys, query error propagation and
-matching/sort/group/index consumers remain unchanged. A following consumer
-integration plan must use owned complete output, carry allocation/conversion/
-I/O failure to the command result, avoid treating errors as empty cells, define
-errors after any previously accepted CSV prefix, and enforce request memory
-limits before public packed activation. Loaders/create-object remain inactive.
+The private packed [fetch and multi-get backends](packed-csv-commands.md) now
+consume these renderers and propagate construction/storage/I/O failures through
+their command entry points. They buffer complete response lines before output
+and cap retained response allocations, including line nodes. Temporary renderer
+workspaces remain outside that cap. Existing legacy cell/header/row writers and
+CSV find/joins/aggregates/keys remain unchanged. Further emitter/error integration,
+enclosing request-memory limits and import/SDK decoding remain activation gates.
+Loaders/create-object remain inactive.
 
 Default all-fields output retains physical field indices rather than parsing
 stored names as expressions. Explicit selectors still interpret '+'. Header

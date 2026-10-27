@@ -87,5 +87,7 @@ and remaining read/index consumers stay future work; packed schemas remain
 inactive in public loaders and creates.
 
 [Checked packed CSV rendering](packed-csv-rendering.md) supplies owned exact
-cells, headers and rows with reversible visible byte escapes. These APIs remain
-private; legacy CSV writers and command error propagation are not converted.
+cells, headers and rows with reversible visible byte escapes. The private
+[CSV fetch/multi-get backends](packed-csv-commands.md) connect those helpers to
+their command entry points with checked failure handling. Legacy CSV writers,
+find/join/aggregate/keys consumers and public packed activation remain separate.

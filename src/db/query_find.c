@@ -3,6 +3,7 @@
 #include "io_direct.h"
 #include "query_internal.h"
 #include "typed_row.h"
+#include "packed_csv_command.h"
 #include <dirent.h>
 #include <fnmatch.h>
 
@@ -1892,6 +1893,13 @@ static int cmd_fetch_v2(const char *db_root, const char *object,
     FieldSchema fs_fetch;
     init_field_schema(&fs_fetch, db_root, object);
     FieldSchema *fs_ptr = (fs_fetch.ts || fs_fetch.nfields > 0) ? &fs_fetch : NULL;
+    if (csv_delim && fs_fetch.ts && fs_fetch.ts->packed.nfields) {
+        SlotcaskSchemaInfo info = {.splits=sch->splits,.slot_size=sch->slot_size,.streams=sch->streams};
+        SlotcaskDb *db SDB_REG_REF = slotcask_registry_get(db_root,object,&info);
+        PackedCsvOptions options={.fields=proj_str,.delimiter=csv_delim,
+            .buffer_budget=g_query_buffer_max_bytes,.timeout_ms=resolve_timeout_ms()};
+        return packed_csv_fetch(db,&fs_fetch,offset,limit,cursor,want_total,&options,g_out?g_out:stdout);
+    }
 
     const char *proj_fields[MAX_FIELDS];
     char proj_buf[MAX_LINE];

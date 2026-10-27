@@ -100,10 +100,22 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   [executed review](2026-10-27-phase3b9-raw-diff-review.md) record 144 focused
   checks, 20603/0 full-suite assertions across 527 cases, 3035 oracle cases and
   all 15 allocation injections. All nine final hashes match; one evidence
-  attribution typo is corrected. Reviewed 3B.9 is included in the authorized
-  commit for this slice. No production CSV emitter or public packed binding is active.
+  attribution typo is corrected. Committed as `174f7d8`. No production CSV
+  emitter or public packed binding is active at that checkpoint.
   The [plan review](2026-10-27-phase3b9-plan-review.md) preserves the two earlier
   repairs. Following emitter/error integration and the remaining 3B audit stay open.
+  The [3B.10 CSV fetch/multi-get commands](2026-10-27-phase3b10-packed-csv-commands-plan.md)
+  connects two complete read entry points to checked CSV with bounded retained
+  output, fail-closed reads, explicit JSON errors and checked I/O. Collection
+  reserves writer gates and releases them before sending. It is implemented
+  and raw-diff/blind reviewed, uncommitted: 217 focused checks, 20820/0 full-suite
+  assertions across 528 cases, 388 probe gates and all 71 allocation injections.
+  [Execution evidence](2026-10-27-phase3b10-packed-csv-commands-evidence.md) and
+  [executed review](2026-10-27-phase3b10-raw-diff-review.md) record completion.
+  All ten final postimages and twenty boundaries match; one evidence attribution
+  typo is corrected. The [plan review](2026-10-27-phase3b10-plan-review.md)
+  records the earlier planning pass. Find/join/aggregate/keys/exists and other 3B consumers,
+  full request-memory/import/SDK policies and public activation remain open.
 - 3C: child plan must be prepared against the reviewed 3B result.
 - [Original review](2026-10-23-phase3-packed-records-plan-review.md): unchanged.
 - [Rejected draft archive](archive/2026-10-23-phase3-packed-records-rejected.md):
@@ -223,6 +235,34 @@ all-new-packed policy is superseded by the approved inactive policy. Interim
 numeric/index/aggregate/computed-update refusals must not break public legacy
 behavior. Metadata slot3, declaration-edit restrictions, fsync strategy,
 release bump and describe/export details must be re-derived/reviewed in 3C.
+
+## Consolidated remaining delivery schedule — 2026-10-27
+
+The user requested fewer plans and a 2026-10-28 completion target. The earlier
+8–13 additional Phase 3 estimate is superseded as an execution structure.
+Target **six remaining delivery plans for the entire roadmap after 3B.10**,
+as specified in the [parent consolidation amendment](2026-10-19-type-correctness-recovery-plan.md#execution-consolidation--2026-10-27):
+
+1. R1: remaining ordinary write/read commands, defaults/computed operations,
+   declaration surfaces and imports (remaining 3B + Phase 4).
+2. R2: exact criteria/guards, indexes, sorting, joins and cursors (remaining
+   3B + Phase 5).
+3. R3: exact aggregates, group/having, parallel merge and output (remaining
+   3B + Phase 6), with the full remaining-consumer closure census.
+4. R4: remaining calendar/bool/UUID/IP/enum/string validation (Phase 7).
+5. R5: authoritative metadata/loading/versioning, checked publication,
+   schema/rebuild/migration and forced recovery (3C + Phase 8).
+6. R6: explicit activation, finance acceptance, docs/client verification,
+   final blind review and required branch-final safety gates (Phase 9).
+
+This is a grouping target, not six already-authored executable plans or a
+verified deadline. 3B.10 remains unchanged for its executor. Internal tasks and
+checkpoints stay within each complete delivery plan; do not create another
+plan for each helper. Any later proposed split must identify the concrete
+size/architecture/testing reason first. All original requirements remain owned;
+combining plans does not declare 3B/3C complete, activate packed storage, authorize
+Git writes, or relax raw-diff review, normal tests or branch-final sanitizers.
+The protected certification plan remains separate work after this roadmap lands.
 
 ## Original review disposition
 

@@ -33,19 +33,58 @@ uint16-prefix constraint, so the ceiling is enforcement policy rather than
 format, and raising it again later would not be a format change.
 
 CORE-PROCESS.md requires complete production-code hunks, quoted anchors and a
-consumer inventory before implementation. The format change has not yet been
-implemented in production. Phase 0 and the 2026-10-25 Phase 3A repair have
-planning-only scratch prototypes; they are not production execution.
-Consequently each production phase below has an explicit planning checkpoint: the planning model must supply its complete
-anchored code/test patch before that phase can be approved and executed. A
-phase's design/acceptance specification is not a substitute for that patch.
-This deliberate boundary follows CORE-PROCESS.md's rule to start with an
-investigation task when the complete mechanism is not yet established.
+consumer inventory before implementation. The committed decimal core, packed
+codec and reviewed consumer integrations are tracked by the Phase 3 work index;
+public packed storage remains inactive. The original phase specifications below
+remain acceptance requirements, not standalone implementation authorization.
+An executable delivery plan may now combine work from several original phases
+under the consolidation amendment below. It still requires a complete anchored
+patch, human approval, test-first execution and raw-diff review.
 
 The parent plan covers every issue in the preceding audit; it does not leave
 the executor to decide semantics, silently reduce numeric limits, or broaden
 storage work into an unrelated replacement engine. Individual execution
 plans should be self-contained and executable in separate chat contexts.
+
+### Execution consolidation — 2026-10-27
+
+The user requested fewer plans and a target of finishing the roadmap by
+2026-10-28. The previous estimate of 8–13 more Phase 3 children is superseded
+as an execution structure. After the already-reviewed 3B.10 plan, target **six
+remaining delivery plans for the whole roadmap**, grouping by complete behavior
+rather than helper or translation unit. This is a planning target, not a claim
+that completion by the deadline is already demonstrated.
+
+| Delivery | Complete capability and original ownership | Required exit evidence |
+|---|---|---|
+| R1 | Remaining ordinary write/read command integration, defaults, computed updates, schema-facing declaration round trips and import/client handling (remaining 3B + Phase 4). Predicate/index and aggregate consumers belong to R2/R3; durable metadata publication belongs to R5. | One route matrix for direct/bulk/default/computed/return paths, exact plain/projection/CSV output, failure preservation and actual-size memory accounting. No separate plan per renderer/helper. |
+| R2 | Exact criteria, guards, sorting, ordered indexes, joins, cursors and their remaining packed consumers (remaining 3B + Phase 5). | Indexed/scan equivalence; invalid-input rejection; published exact key-size formula/boundaries; oversized live-key failures; order/cursor/join and output/error tests. |
+| R3 | Exact aggregates, grouping/having, parallel merge, aggregate emitters and remaining analytical consumers (remaining 3B + Phase 6). | Independent exact oracle, long/decimal precision, all execution/output paths and allocation failures; complete remaining 3B consumer census after R1–R3 with no unowned unsafe seam. |
+| R4 | All remaining calendar/bool/UUID/IP/enum/string validation (Phase 7). | Shared length-aware grammar and write/default/query route matrix; valid zero/NULL/empty distinctions; explicit compatibility notes. |
+| R5 | Authoritative metadata/loading, version gating, durable publication, rebuild/schema conversion, upgrade/migration and recovery (3C + Phase 8). | Exact identity/cache/reload tests; all layout mutations; old/new whole-object crash states; forced pending-marker replay; downgrade protection and maximum-record/request bounds. |
+| R6 | Explicit activation, finance application acceptance, documentation/clients, final blind review and branch-final safety gates (Phase 9 and remaining activation requirements). | Both numeric forms plus 4 MiB varchar through the application route matrix, migration acceptance, all tracked issues closed, fresh normal suite, required ASan+UBSan and TSan runs before an authorized push/PR. |
+
+The numeric labels Phase 3–9 continue to identify requirements; they no longer
+imply one separate plan per phase or per helper. Already-reviewed 3B.10 is not
+rewritten while the executor is using it. Later plans are authored against the
+reviewed predecessor so anchors stay valid. One delivery plan may contain
+multiple test-first tasks/checkpoints and reviewable changes; those do not
+automatically become new child plans or additional human approval stops.
+
+Keep fixes with their owning integration instead of first shipping a temporary
+private refusal and then scheduling another plan to replace it. Where an
+intermediate private seam must remain guarded until its owner lands, identify
+that owner and test the guard. Public legacy behavior and inactive packed
+storage stay intact until explicit activation approval.
+
+Do not silently expand the six-plan target into another helper-plan chain.
+If concrete source/test evidence shows a delivery is too large or has an
+independent unresolved architecture decision, explain that specific boundary
+before proposing a split. Splitting changes grouping, never scope or safety
+requirements. All original contracts, RED/GREEN regressions, full-suite gates,
+raw-diff/blind reviews and protected-plan restrictions still apply. This
+amendment approves the planning structure only, not the future production edits,
+Git writes, activation or a guarantee of deadline completion.
 
 ### Protected later work
 
@@ -438,7 +477,7 @@ obtain human approval for that child plan before its production edits.
 
 Author each later child plan just before its phase, against the reviewed
 working tree produced by its predecessors. Future child plans need not all
-exist before Phase 1 starts. Each phase still requires its own complete code
+exist before Phase 1 starts. Each consolidated delivery still requires a complete code
 plan, human approval, test-first execution and raw-diff review; parent-plan
 approval is not blanket permission to implement subsequent phases. This rule
 also covers any implementation/test changes introduced in final acceptance.
@@ -892,8 +931,11 @@ external clients have been tested.
    request exact git write authorization where required. Do not commit work.
 2. Do tasks in order, following their approved complete code patches. Every
    task starts with its failing regression or diagnostic reproduction. Prepare
-   each child code plan just before its phase; obtain human approval before
-   that phase's production edits, and review its raw diff before advancing.
+   each consolidated delivery plan just before its work; obtain human approval
+   before its production edits, and review its raw diff before advancing.
+   Multiple original phase requirements may share one approved delivery plan
+   under the 2026-10-27 consolidation; tasks/checkpoints do not need separate
+   child plans merely because they touch different consumers.
    Do not require all future child plans upfront or treat the parent as blanket
    implementation approval. Maintain the phase ledger and preserve all prior
    uncommitted work.
