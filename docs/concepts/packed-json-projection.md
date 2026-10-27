@@ -20,11 +20,12 @@ names. Empty comma tokens collapse, whitespace is significant, order and
 duplicates are preserved. Empty selectors produce {} at this direct API;
 the existing public dispatcher sends an empty fields argument to full GET.
 Unknown/removed names map to null. Oversized selectors reject with E2BIG rather
-than being silently truncated in this private helper. Any '+' token refuses
-ENOTSUP for the whole packed projection, because legacy composite concatenation
-uses strlen and cannot safely handle binary varchar. Legacy composites and
-legacy selector parsing are unchanged. Upstream JSON-to-CSV parsing still has
-its existing limits/unescaping behavior; this helper does not repair ingress.
+than being silently truncated in this private helper. Packed '+' projections now
+use [length-aware named display text](packed-named-projection.md): skip absent
+parts, concatenate exact bytes in order, then quote/escape once. This replaces
+the former private ENOTSUP restriction. Legacy raw-string composites/parsing
+remain unchanged; upstream JSON-to-CSV parsing retains its own limits/unescaping
+behavior. This helper does not repair ingress or activate packed queries.
 
 Packed-only branches in json_projected_field and json_typed_row_cell call the
 new checked cell API. Their legacy branches are unchanged. Packed cmd_get_fields

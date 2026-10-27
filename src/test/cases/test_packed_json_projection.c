@@ -59,9 +59,9 @@ static void p_basics(void){
     FieldSchema fs={.ts=ts};char *out=json_projected_field((const char*)bytes,n,"missing",&fs,PKR_FLAGS);
     ASSERT_EQ_STR(out,"null","unknown named field on flagged row");free(out);
     errno=0;out=json_projected_field((const char*)bytes,n,"f2+f0",&fs,PKR_FLAGS);
-    ASSERT_TRUE(!out&&errno==ENOTSUP,"packed composite named helper refuses");free(out);
+    ASSERT_EQ_STR(out,"\"a\\u0000b\\\"\\\\\\n1234567890123456.1234567890\"","packed composite named helper exact");free(out);
     errno=0;out=typed_packed_project_json(ts,bytes,n,PKR_FLAGS,"f4,f2+f0",SIZE_MAX);
-    ASSERT_TRUE(!out&&errno==ENOTSUP,"mixed composite request refuses entirely");free(out);
+    ASSERT_EQ_STR(out,"{\"f4\":0,\"f2+f0\":\"a\\u0000b\\\"\\\\\\n1234567890123456.1234567890\"}","mixed composite request exact");free(out);
     ts->fields[4].removed=1;p_cell(ts,bytes,n,4,"null");p_object(ts,bytes,n,"f4","{\"f4\":null}");ts->fields[4].removed=0;
     strcpy(ts->fields[4].name,"x\"\\\n");ts->fields[4].name_len=4;
     p_object(ts,bytes,n,ts->fields[4].name,"{\"x\\\"\\\\\\n\":0}");

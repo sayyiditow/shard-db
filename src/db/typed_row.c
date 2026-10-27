@@ -670,9 +670,17 @@ static int quoted_length(const char *data,size_t n,size_t *out){
 static int quote_into(const char *data,size_t n,char *out,size_t cap,size_t *used){
     size_t need=0;if(quoted_length(data,n,&need))return -1;
     if(need>cap){errno=EOVERFLOW;return -1;}
-    out[0]='"';int count=json_escape_into(out+1,need-2,data,n);
-    if(count<0||(size_t)count!=need-2){errno=EOVERFLOW;return -1;}
-    out[need-1]='"';*used=need;return 0;
+    /* json_escape_into returns int. Each 4096-byte piece expands to at most
+       24576 bytes, fitting even the minimum C INT_MAX; totals remain size_t. */
+    size_t pos=1,offset=0;out[0]='"';
+    while(offset<n){
+        size_t piece=n-offset;if(piece>4096)piece=4096;
+        int count=json_escape_into(out+pos,need-1-pos,data+offset,piece);
+        if(count<0||(size_t)count>need-1-pos){errno=EOVERFLOW;return -1;}
+        pos+=(size_t)count;offset+=piece;
+    }
+    if(pos!=need-1){errno=EOVERFLOW;return -1;}
+    out[pos++]='"';*used=pos;return 0;
 }
 static int row_text_length(const RowText *text,int json,size_t *out){
     if(json&&text->quoted)return quoted_length(text->data,text->len,out);
@@ -776,6 +784,100 @@ char *typed_packed_projected_cell(const TypedSchema *ts,const uint8_t *value,
     out[used]=0;
 done:row_text_free(&text);return out;
 }
+typedef struct {
+    RowText value;
+    char *joined;
+    int missing;
+} NamedText;
+static void named_text_free(NamedText *text){
+    free(text->joined);row_text_free(&text->value);memset(text,0,sizeof(*text));
+}
+static int named_component_index(const TypedSchema *ts,const char *name,size_t len){
+    for(int i=0;i<ts->nfields;i++)
+        if(!ts->fields[i].removed&&(size_t)ts->fields[i].name_len==len&&
+           !memcmp(ts->fields[i].name,name,len))return i;
+    return -1;
+}
+static int named_component_open(const TypedRowView *view,int index,RowText *text){
+    memset(text,0,sizeof(*text));dec_init(&text->decimal);
+    if(index<0)return 0;
+    TypedRowSpan span;if(typed_row_span(view,(size_t)index,&span))return -1;
+    if(span.is_null||view->schema->fields[index].removed)return 0;
+    return row_text_open(view,(size_t)index,text);
+}
+static int named_text_open(const TypedRowView *view,const char *name,size_t budget,
+                           NamedText *text){
+    memset(text,0,sizeof(*text));dec_init(&text->value.decimal);
+    size_t length=strnlen(name,MAX_LINE);if(length==MAX_LINE){errno=E2BIG;return -1;}
+    if(!strchr(name,'+')){
+        int index=typed_field_index(view->schema,name);TypedRowSpan span;
+        if(index<0){text->missing=1;return projection_text_open(view,-1,&text->value);}
+        if(typed_row_span(view,(size_t)index,&span))return -1;
+        text->missing=span.is_null||view->schema->fields[index].removed;
+        return projection_text_open(view,index,&text->value);
+    }
+    int indices[MAX_FIELDS];size_t count=0;const char *p=name;
+    while(*p){
+        while(*p=='+')p++;
+        if(!*p)break;
+        const char *end=strchr(p,'+');if(!end)end=p+strlen(p);
+        if(count==MAX_FIELDS){errno=E2BIG;return -1;}
+        indices[count++]=named_component_index(view->schema,p,(size_t)(end-p));p=end;
+    }
+    size_t total=0;
+    for(size_t i=0;i<count;i++){
+        RowText part;int rc=named_component_open(view,indices[i],&part);
+        size_t n=part.len;row_text_free(&part);if(rc)return -1;
+        if(n>SIZE_MAX-total){errno=EOVERFLOW;return -1;}total+=n;
+    }
+    if(!total){text->missing=1;return projection_text_open(view,-1,&text->value);}
+    if(total==SIZE_MAX){errno=EOVERFLOW;return -1;}
+    if(total+1>budget){errno=ENOMEM;return -1;}
+    text->joined=malloc(total+1);if(!text->joined){errno=ENOMEM;return -1;}
+    size_t pos=0;
+    for(size_t i=0;i<count;i++){
+        RowText part;int rc=named_component_open(view,indices[i],&part);size_t used=0;
+        if(!rc)rc=row_text_write(&part,0,text->joined+pos,total+1-pos,&used);
+        row_text_free(&part);if(rc)return -1;pos+=used;
+    }
+    if(pos!=total){errno=EILSEQ;return -1;}text->joined[pos]=0;
+    text->value.data=text->joined;text->value.len=total;text->value.quoted=1;return 0;
+}
+char *typed_packed_named_text(const TypedSchema *ts,const uint8_t *value,size_t len,
+    uint8_t hdr2,const char *name,size_t budget,size_t *text_len){
+    if(text_len)*text_len=0;
+    if(!text_len||!name||!packed_schema_ok(ts)){errno=EINVAL;return NULL;}
+    if(!budget){errno=ENOMEM;return NULL;}
+    TypedRowView view;if(typed_row_open(ts,value,len,hdr2,&view))return NULL;
+    NamedText text;char *out=NULL;
+    if(named_text_open(&view,name,budget,&text))goto done;
+    if(text.missing){errno=0;goto done;}
+    if(text.value.len==SIZE_MAX||text.value.len+1>budget){errno=ENOMEM;goto done;}
+    if(text.joined){out=text.joined;text.joined=NULL;*text_len=text.value.len;goto done;}
+    out=malloc(text.value.len+1);if(!out){errno=ENOMEM;goto done;}
+    size_t used=0;
+    int rc=row_text_write(&text.value,0,out,text.value.len+1,&used);
+    if(rc||used!=text.value.len){
+        if(!rc)errno=EILSEQ;
+        free(out);out=NULL;goto done;
+    }
+    out[used]=0;*text_len=used;
+done:named_text_free(&text);return out;
+}
+char *typed_packed_named_json(const TypedSchema *ts,const uint8_t *value,size_t len,
+    uint8_t hdr2,const char *name,size_t budget){
+    if(!name||!packed_schema_ok(ts)){errno=EINVAL;return NULL;}
+    if(budget<2){errno=ENOMEM;return NULL;}
+    TypedRowView view;if(typed_row_open(ts,value,len,hdr2,&view))return NULL;
+    NamedText text;char *out=NULL;
+    if(named_text_open(&view,name,budget,&text))goto done;
+    size_t need=0,used=0;if(row_text_length(&text.value,1,&need))goto done;
+    if(need==SIZE_MAX||need+1>budget){errno=ENOMEM;goto done;}
+    out=malloc(need+1);if(!out){errno=ENOMEM;goto done;}
+    int rc=row_text_write(&text.value,1,out,need+1,&used);
+    if(rc||used!=need){if(!rc)errno=EILSEQ;free(out);out=NULL;goto done;}out[used]=0;
+done:named_text_free(&text);return out;
+}
 char *typed_packed_project_json(const TypedSchema *ts,const uint8_t *value,
     size_t len,uint8_t hdr2,const char *fields_csv,size_t budget){
     if(!packed_schema_ok(ts)||!fields_csv){errno=EINVAL;return NULL;}
@@ -784,22 +886,21 @@ char *typed_packed_project_json(const TypedSchema *ts,const uint8_t *value,
     if(length==MAX_LINE){errno=E2BIG;return NULL;}
     char *copy=malloc(length+1);if(!copy){errno=ENOMEM;return NULL;}
     memcpy(copy,fields_csv,length+1);
-    struct {char *name;int index;} selected[MAX_FIELDS];size_t count=0;
+    struct {char *name;} selected[MAX_FIELDS];size_t count=0;
     char *save=NULL,*token=strtok_r(copy,",",&save);char *out=NULL;
     while(token){
         if(count==MAX_FIELDS){errno=E2BIG;goto done;}
-        if(strchr(token,'+')){errno=ENOTSUP;goto done;}
-        selected[count].name=token;selected[count].index=typed_field_index(ts,token);
+        selected[count].name=token;
         count++;token=strtok_r(NULL,",",&save);
     }
     TypedRowView view;if(typed_row_open(ts,value,len,hdr2,&view))goto done;
     size_t need=3; /* braces and NUL; requested order/duplicates are preserved */
     for(size_t i=0;i<count;i++){
-        size_t name=0,part=0,sep=i?2:1;RowText text;
+        size_t name=0,part=0,sep=i?2:1;NamedText text;
         if(quoted_length(selected[i].name,strlen(selected[i].name),&name))goto done;
-        int rc=projection_text_open(&view,selected[i].index,&text);
-        if(!rc)rc=row_text_length(&text,1,&part);
-        row_text_free(&text);if(rc)goto done;
+        int rc=named_text_open(&view,selected[i].name,budget,&text);
+        if(!rc)rc=row_text_length(&text.value,1,&part);
+        named_text_free(&text);if(rc)goto done;
         if(name>SIZE_MAX-sep||part>SIZE_MAX-name-sep||need>SIZE_MAX-name-part-sep){errno=EOVERFLOW;goto done;}
         need+=name+part+sep;if(need>budget){errno=ENOMEM;goto done;}
     }
@@ -808,10 +909,10 @@ char *typed_packed_project_json(const TypedSchema *ts,const uint8_t *value,
     for(size_t i=0;i<count;i++){
         size_t used=0;if(i)out[pos++]=',';
         if(quote_into(selected[i].name,strlen(selected[i].name),out+pos,need-pos,&used))goto fail;
-        pos+=used;out[pos++]=':';RowText text;
-        int rc=projection_text_open(&view,selected[i].index,&text);
-        if(!rc)rc=row_text_write(&text,1,out+pos,need-pos,&used);
-        row_text_free(&text);if(rc)goto fail;pos+=used;
+        pos+=used;out[pos++]=':';NamedText text;
+        int rc=named_text_open(&view,selected[i].name,budget,&text);
+        if(!rc)rc=row_text_write(&text.value,1,out+pos,need-pos,&used);
+        named_text_free(&text);if(rc)goto fail;pos+=used;
     }
     out[pos++]='}';out[pos]=0;if(pos+1!=need){errno=EILSEQ;goto fail;}
     free(copy);return out;

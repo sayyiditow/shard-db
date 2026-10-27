@@ -128,11 +128,22 @@ char *typed_packed_field_text(const TypedSchema *ts, const uint8_t *value,
    Budget includes NUL. Names are not parsed by the indexed cell API.
    Projection CSV is bounded by MAX_LINE-1/MAX_FIELDS, skips empty tokens,
    preserves order/duplicates and whitespace, maps unknown/removed to null.
-   Packed composites containing '+' refuse ENOTSUP until integrated. */
+   Packed composites quote the exact concatenated display bytes once. */
 char *typed_packed_projected_cell(const TypedSchema *ts, const uint8_t *value,
     size_t len, uint8_t hdr2, size_t index, size_t budget);
 char *typed_packed_project_json(const TypedSchema *ts, const uint8_t *value,
     size_t len, uint8_t hdr2, const char *fields_csv, size_t budget);
+/* Named packed display text accepts '+' components, skips unknown/NULL parts
+   and returns exact bytes plus NUL. text_len excludes NUL; it resets on error.
+   NULL/removed/unknown and an empty composite yield NULL with errno=0.
+   Scalar empty varchar yields an owned empty string. Budget includes NUL.
+   Names/components preserve whitespace; MAX_LINE-1/MAX_FIELDS are enforced.
+   The JSON counterpart keeps scalar display policy and quotes a composite
+   once, escaping its entire byte span. Errors are NULL with nonzero errno. */
+char *typed_packed_named_text(const TypedSchema *ts, const uint8_t *value,
+    size_t len, uint8_t hdr2, const char *name, size_t budget, size_t *text_len);
+char *typed_packed_named_json(const TypedSchema *ts, const uint8_t *value,
+    size_t len, uint8_t hdr2, const char *name, size_t budget);
 
 /* Existing scalar semantics, shared internally by the adapter. */
 int encode_json_field_checked(const TypedField *f, const char *text, size_t len,

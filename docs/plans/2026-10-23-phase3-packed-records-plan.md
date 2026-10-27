@@ -76,8 +76,21 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   [Execution evidence](2026-10-26-phase3b7-packed-json-projection-evidence.md)
   and [executed review](2026-10-26-phase3b7-raw-diff-review.md) record completion.
   All nine final hashes match; one evidence wording correction is resolved.
+  Committed as `cfc4970`.
   Legacy raw strings, CSV/composites, surrounding query envelopes,
   matching/index/aggregate paths and public activation stay open.
+  The [3B.8 named display text/composite JSON](2026-10-26-phase3b8-packed-named-projection-plan.md)
+  adds an explicit-length output-only resolver and replaces the temporary packed
+  JSON composite refusal. Revision 2 is implemented and raw-diff reviewed:
+  196 new focused checks, 218 prior projection checks, 20459 full-suite
+  assertions across 526 cases, all 77 allocation injections and 258 probe gates.
+  All nine final hashes match; one evidence wording correction is resolved.
+  [Execution evidence](2026-10-26-phase3b8-packed-named-projection-evidence.md)
+  and [executed review](2026-10-27-phase3b8-raw-diff-review.md) record completion;
+  [plan review](2026-10-27-phase3b8-plan-review.md) records the earlier repairs.
+  Reviewed 3B.8 is included in the authorized commit for this slice.
+  CSV representation/error policy and raw matching/sorting/
+  grouping consumers stay separate; no public binding is authorized.
   No Phase 3B closure is implied.
 - 3C: child plan must be prepared against the reviewed 3B result.
 - [Original review](2026-10-23-phase3-packed-records-plan-review.md): unchanged.

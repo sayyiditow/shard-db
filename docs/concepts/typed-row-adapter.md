@@ -12,8 +12,10 @@ failure preserves the schema. An all-zero packed member means legacy. Bound
 packed schemas may reach the new adapters, codec and the integrated
 [whole-record JSON readers](whole-record-readers.md) and checked
 [JSON projection cells/projected GET](packed-json-projection.md). Field-string,
-CSV/composite, query-envelope and raw-offset consumers still require conversion.
-Passing a bound schema to a legacy raw-offset API is unsafe. The ordinary loader
+Legacy composite/CSV, query-envelope and raw-offset consumers still require
+conversion. [Packed named/composite JSON](packed-named-projection.md) has its
+own checked length-aware output path. Passing a bound schema to a legacy
+raw-offset API is unsafe. The ordinary loader
 does not call this binder.
 
 `typed_row_open` rejects schema/record generation mismatches before returning
