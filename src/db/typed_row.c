@@ -175,6 +175,15 @@ static int row_encode_fixed(const TypedField *field,const char *text,size_t len,
     if(rc)errno=errno==ENOMEM?ENOMEM:EINVAL;
     return rc;
 }
+static size_t prepared_heap_used(const TypedPrepared *p){
+    size_t used=0;
+    for(int i=0;i<p->schema->nfields;i++)if(p->owned[i]){
+        size_t n=p->cells[i].len?p->cells[i].len:1;
+        if(n>SIZE_MAX-used)return SIZE_MAX;
+        used+=n;
+    }
+    return used;
+}
 static int replace_cell(TypedPrepared *p,size_t i,uint8_t *owner,
                           const uint8_t *data,size_t n,int is_null,
                           char *err,size_t cap){
@@ -184,6 +193,9 @@ static int replace_cell(TypedPrepared *p,size_t i,uint8_t *owner,
     if(p->bytes<prior||added>SLOTCASK_SEG_MAX_BYTES-24||
        p->bytes-prior>SLOTCASK_SEG_MAX_BYTES-24-added){
         free(owner);return row_error(err,cap,EOVERFLOW,"record exceeds segment capacity");}
+    size_t heap=prepared_heap_used(p),allocation=owner?(n?n:1):0;
+    if(heap>g_query_buffer_max_bytes||allocation>g_query_buffer_max_bytes-heap){
+        free(owner);return row_error(err,cap,ENOMEM,"query memory buffer exceeded");}
     free(p->owned[i]);p->owned[i]=owner;p->cells[i]=(PkrCell){data,n,(uint8_t)is_null};
     p->bytes=p->bytes-prior+added;return 0;
 }
@@ -202,6 +214,10 @@ int typed_prepared_set(TypedPrepared *p,size_t i,const TypedInput *in,
     }
     if(!in->data&&in->len)return row_error(err,cap,EINVAL,"invalid value span");
     const char *text=in->data?in->data:"";size_t n=in->len;char *decoded=NULL;
+    size_t heap=prepared_heap_used(p),remaining=heap<=g_query_buffer_max_bytes?g_query_buffer_max_bytes-heap:0;
+    size_t factor=pf->kind==PKR_NUMERIC?12u:2u;
+    if(remaining<1024||n>(remaining-1024)/factor)
+        return row_error(err,cap,ENOMEM,"query memory buffer exceeded");
     int string_type=f->type==FT_VARCHAR||f->type==FT_NUMERIC||
         f->type==FT_ENUM||f->type==FT_DATE||f->type==FT_DATETIME||
         f->type==FT_DATETIMEMS||f->type==FT_TIME||f->type==FT_UUID||
@@ -274,6 +290,10 @@ fail:typed_prepared_free(p);return -1;
 int typed_prepared_old(const TypedSchema *ts,const SlotcaskOldRecord *old,
                         TypedPrepared *p,char *err,size_t cap){
     if(!p||!old||!packed_schema_ok(ts))return row_error(err,cap,EINVAL,"invalid OLD");
+    size_t retained=p->schema?prepared_heap_used(p):0;
+    size_t available=retained<g_query_buffer_max_bytes?g_query_buffer_max_bytes-retained:0;
+    if(!typed_packed_render_allowance(ts,old->value,old->vlen,old->hdr2,NULL,available))
+        return row_error(err,cap,errno,"OLD validation exceeds query memory or has invalid structure");
     TypedRowView v;if(typed_row_open(ts,old->value,old->vlen,old->hdr2,&v))
         return row_error(err,cap,errno,"invalid OLD record");
     typed_prepared_free(p);p->schema=ts;p->bytes=ts->packed.prefix+ts->packed.directory;
@@ -291,18 +311,26 @@ int typed_prepared_old(const TypedSchema *ts,const SlotcaskOldRecord *old,
 fail:typed_prepared_free(p);return row_error(err,cap,EILSEQ,"invalid OLD field");
 }
 static int prepared_defaults_mode(TypedPrepared *p,const char *root,const char *object,
-                             int defer_ac,char *err,size_t cap){
+    int defer_ac,char *err,size_t cap){
     if(prepared_check(p,err,cap))return -1;
     for(int i=0;i<p->schema->nfields;i++){
-        const TypedField *f=&p->schema->fields[i];if(f->removed||p->seen[i]||(defer_ac&&f->default_kind==DK_AUTO_CREATE))continue;
-        TypedInput in={NULL,0,1,1,0};char generated[256];
+        const TypedField *f=&p->schema->fields[i];
+        if(f->removed||p->seen[i]||(defer_ac&&f->default_kind==DK_AUTO_CREATE))continue;
+        TypedInput in={NULL,0,1,1,0};char *owned=NULL;
         if(f->default_kind!=DK_NONE){
-            in.data=generate_default(f,generated,sizeof(generated),root,object);
-            if(!in.data)return row_error(err,cap,EIO,"default generator failed");
-            in.len=strlen(in.data);in.is_null=0;
+            size_t heap=prepared_heap_used(p),available=heap<g_query_buffer_max_bytes?g_query_buffer_max_bytes-heap:0;
+            /* Generator text overlaps its checked payload copy. Account the
+             * already retained owners before requesting either allocation. */
+            size_t generator_budget=available>2048?(available-2048)/2:0;
+            if(!generator_budget)return row_error(err,cap,ENOMEM,"query memory buffer exceeded");
+            owned=generate_default_owned(f,root,object,generator_budget);
+            if(!owned)return row_error(err,cap,errno,errno==ENOMEM||errno==ENOBUFS?"query memory buffer exceeded":"default generator failed");
+            in.data=owned;in.len=strlen(owned);in.is_null=0;
         }
-        if(typed_prepared_set(p,(size_t)i,&in,err,cap))return -1;
-    }return 0;
+        int rc=typed_prepared_set(p,(size_t)i,&in,err,cap);int saved=errno;
+        free(owned);if(rc){errno=saved;return -1;}
+    }
+    return 0;
 }
 int typed_prepared_defaults(TypedPrepared *p,const char *root,const char *object,
                              char *err,size_t cap){
@@ -342,6 +370,7 @@ int typed_prepared_alloc(const TypedPrepared *p,uint8_t **out,size_t *len,
     *out=NULL;*len=0;if(prepared_valid(p,err,cap))return -1;
     size_t need=0;dec_status st=pkr_measure(&p->schema->packed,p->cells,(size_t)p->schema->nfields,&need);
     if(st!=DEC_OK)return row_error(err,cap,st==DEC_ERR_NOMEM?ENOMEM:EINVAL,"record sizing failed");
+    if(prepared_heap_used(p)>g_query_buffer_max_bytes||need>g_query_buffer_max_bytes-prepared_heap_used(p))return row_error(err,cap,ENOMEM,"query memory buffer exceeded");
     uint8_t *buf=malloc(need);if(!buf)return row_error(err,cap,ENOMEM,"oom");
     size_t used=0;if(typed_prepared_compose(p,buf,need,&used,err,cap)){free(buf);return -1;}
     *out=buf;*len=used;return 0;
@@ -411,14 +440,170 @@ static int row_json_value(const char **cursor,unsigned depth){
     }
     *cursor=p;return 0;
 }
+#include <math.h>
+/* Computed operands are borrowed JSON spans; results own their payloads. */
+typedef struct {int op,source;const char *literal;size_t len;int quoted;} RowCompute;
+static int row_compute_parse(const TypedSchema *ts,size_t index,const char *json,
+    size_t n,RowCompute *c,char *err,size_t cap){
+    memset(c,0,sizeof(*c));
+    const TypedField *f=&ts->fields[index];
+    if(f->type!=FT_SHORT&&f->type!=FT_INT&&f->type!=FT_LONG&&
+       f->type!=FT_NUMERIC&&f->type!=FT_FLOAT&&f->type!=FT_DOUBLE)
+        return row_error(err,cap,EINVAL,"unsupported computed target");
+    const char *p=row_json_space(json);if(*p++!='{')goto bad;
+    p=row_json_space(p);if(*p!='"')goto bad;
+    const char *key=p+1,*end=p;if(row_json_string(&end))goto bad;
+    char *name=NULL;size_t length=0;
+    if(json_unescape_cstring(key,(size_t)(end-key-1),&name,&length))
+        return row_error(err,cap,errno==ENOMEM?ENOMEM:EINVAL,"invalid computed operator");
+    c->op=length==5&&!memcmp(name,"$incr",5)?1:
+          length==5&&!memcmp(name,"$copy",5)?2:0;
+    free(name);if(!c->op)goto bad;
+    p=row_json_space(end);if(*p++!=':')goto bad;p=row_json_space(p);
+    const char *v=p;if(row_json_value(&p,0))goto bad;
+    size_t vn=(size_t)(p-v);p=row_json_space(p);
+    if(*p++!='}'||p!=json+n)goto bad;
+    c->quoted=vn>=2&&v[0]=='"'&&v[vn-1]=='"';
+    if(c->op==1){
+        if(!vn||(!c->quoted&&(v[0]=='{'||v[0]=='['||v[0]=='n'||v[0]=='t'||v[0]=='f')))goto bad;
+        c->literal=c->quoted?v+1:v;c->len=c->quoted?vn-2:vn;return 0;
+    }
+    if(!c->quoted)goto bad;
+    char *source=NULL;size_t sn=0;
+    if(json_unescape_cstring(v+1,vn-2,&source,&sn))
+        return row_error(err,cap,errno==ENOMEM?ENOMEM:EINVAL,"invalid copy source");
+    c->source=-1;
+    for(int i=0;i<ts->nfields;i++)if(!ts->fields[i].removed&&
+       sn==(size_t)ts->fields[i].name_len&&!memcmp(source,ts->fields[i].name,sn)){c->source=i;break;}
+    free(source);if(c->source<0)goto bad;
+    const TypedField *sf=&ts->fields[c->source];
+    const PkrField *a=&ts->packed.fields[index],*b=&ts->packed.fields[c->source];
+    if(sf->type!=f->type||a->kind!=b->kind||a->width!=b->width||
+       (a->kind==PKR_NUMERIC&&(a->bare!=b->bare||a->precision!=b->precision||a->scale!=b->scale)))goto bad;
+    return 0;
+bad:return row_error(err,cap,EINVAL,"malformed or incompatible computed value");
+}
+static int row_compute_apply(TypedPrepared *p,const SlotcaskOldRecord *old,
+    const RowCompute *computes,char *err,size_t cap){
+    const TypedSchema *ts=p->schema;TypedRowView view;
+    size_t retained=prepared_heap_used(p),available=retained<g_query_buffer_max_bytes?g_query_buffer_max_bytes-retained:0;
+    if(!typed_packed_render_allowance(ts,old->value,old->vlen,old->hdr2,NULL,available))
+        return row_error(err,cap,errno,"OLD validation exceeds query memory or has invalid structure");
+    if(typed_row_open(ts,old->value,old->vlen,old->hdr2,&view))return -1;
+    for(int i=0;i<ts->nfields;i++){
+        const RowCompute *c=&computes[i];if(!c->op)continue;
+        const TypedField *f=&ts->fields[i];const PkrField *pf=&ts->packed.fields[i];
+        TypedRowSpan sp;
+        if(typed_row_span(&view,(size_t)i,&sp))return -1;
+        if(sp.is_null)return row_error(err,cap,EINVAL,"NULL computed target");
+        if(c->op==2){
+            if(computes[c->source].op)return row_error(err,cap,EINVAL,"copy source is computed");
+            if(typed_row_span(&view,(size_t)c->source,&sp))return -1;
+            if(sp.is_null)return row_error(err,cap,EINVAL,"NULL copy source");
+            if(f->type==FT_FLOAT){float v;memcpy(&v,sp.data,4);if(!isfinite(v))return row_error(err,cap,EINVAL,"nonfinite copy source");}
+            if(f->type==FT_DOUBLE){double v;memcpy(&v,sp.data,8);if(!isfinite(v))return row_error(err,cap,EINVAL,"nonfinite copy source");}
+            retained=prepared_heap_used(p);available=retained<g_query_buffer_max_bytes?g_query_buffer_max_bytes-retained:0;
+            if(sp.len>available)return row_error(err,cap,ENOMEM,"query memory buffer exceeded");
+            uint8_t *bytes=malloc(sp.len?sp.len:1);
+            if(!bytes)return row_error(err,cap,ENOMEM,"oom");
+            if(sp.len)memcpy(bytes,sp.data,sp.len);
+            if(replace_cell(p,(size_t)i,bytes,bytes,sp.len,0,err,cap))return -1;
+            p->seen[i]=1;continue;
+        }
+        retained=prepared_heap_used(p);available=retained<g_query_buffer_max_bytes?g_query_buffer_max_bytes-retained:0;
+        if(available<1024||sp.len>(available-1024)/8||c->len>(available-1024-8*sp.len)/12)
+            return row_error(err,cap,ENOMEM,"query memory buffer exceeded");
+        char *decoded=NULL;const char *literal=c->literal;size_t length=c->len;
+        if(c->quoted){
+            if(json_unescape_cstring(literal,length,&decoded,&length))
+                return row_error(err,cap,errno==ENOMEM?ENOMEM:EINVAL,"invalid increment");
+            literal=decoded;
+        }
+        int rc=-1;char text[128];
+        if(f->type==FT_FLOAT||f->type==FT_DOUBLE){
+            char *operand=malloc(length+1);
+            if(!operand){free(decoded);return row_error(err,cap,ENOMEM,"oom");}
+            memcpy(operand,literal,length);operand[length]=0;
+            char *end=NULL;errno=0;double delta=strtod(operand,&end);
+            int valid=end==operand+length&&end!=operand&&errno!=ERANGE&&isfinite(delta);
+            double current;
+            if(f->type==FT_FLOAT){float v;memcpy(&v,sp.data,4);current=v;}
+            else memcpy(&current,sp.data,8);
+            free(operand);
+            double result=current+delta;
+            if(valid&&isfinite(current)&&isfinite(result)){
+                int written;
+                if(f->type==FT_FLOAT){float v=(float)result;written=isfinite(v)?snprintf(text,sizeof(text),"%.9g",(double)v):-1;}
+                else written=snprintf(text,sizeof(text),"%.17g",result);
+                if(written>0&&(size_t)written<sizeof(text)){
+                    TypedInput in={text,(size_t)written,1,0,0};rc=typed_prepared_set(p,(size_t)i,&in,err,cap);
+                }
+            }
+            if(rc)row_error(err,cap,EINVAL,"invalid or overflowing floating increment");
+        }else{
+            dec_t current,delta,sum;dec_init(&current);dec_init(&delta);dec_init(&sum);
+            dec_status st;
+            if(pf->kind==PKR_NUMERIC)st=dec_unpack(sp.data,sp.len,&current);
+            else{
+                uint64_t bits=0;for(size_t j=0;j<sp.len;j++)bits=(bits<<8)|sp.data[j];
+                if(sp.len<8&&(sp.data[0]&128))bits|=UINT64_MAX<<(sp.len*8);
+                int64_t value;memcpy(&value,&bits,8);
+                int written=snprintf(text,sizeof(text),"%lld",(long long)value);
+                st=dec_parse(text,(size_t)written,&current,err,cap);
+            }
+            if(st==DEC_OK&&pf->kind!=PKR_NUMERIC){
+                char *integer=malloc(length+1);
+                if(!integer)st=DEC_ERR_NOMEM;
+                else{
+                    memcpy(integer,literal,length);integer[length]=0;char *end=NULL;errno=0;
+                    (void)strtoll(integer,&end,10);
+                    int valid=end!=integer&&errno!=ERANGE;
+                    while(*end==' '||*end=='\t'||*end=='\r'||*end=='\n'||*end=='\f'||*end=='\v')end++;
+                    if(*end||!valid)st=DEC_ERR_SYNTAX;
+                    free(integer);
+                }
+            }
+            if(st==DEC_OK)st=dec_parse(literal,length,&delta,err,cap);
+            if(st==DEC_OK){
+                int64_t high=current.ndigits?current.weight:delta.weight;
+                int64_t low=current.ndigits?(int64_t)current.weight-current.ndigits+1:(int64_t)delta.weight-delta.ndigits+1;
+                if(delta.ndigits){if(delta.weight>high)high=delta.weight;int64_t dlow=(int64_t)delta.weight-delta.ndigits+1;if(dlow<low)low=dlow;}
+                uint64_t span=high>=low?(uint64_t)(high-low+2)*4:4;
+                int64_t integer=(high+1)*4;if(integer<1)integer=1;
+                int64_t scale=current.dscale>delta.dscale?current.dscale:delta.dscale;
+                uint64_t rendered=(uint64_t)integer+(uint64_t)scale+4;
+                uint64_t needed=1024+16*span+16*rendered+8*(uint64_t)sp.len+12*(uint64_t)c->len;
+                if(needed>available)st=DEC_ERR_NOMEM;
+            }
+            if(st==DEC_OK)st=dec_add(&current,&delta,&sum);
+            if(st==DEC_OK){
+                size_t n=dec_text_len(&sum);char *exact=n?malloc(n):NULL;
+                if(!exact)st=DEC_ERR_NOMEM;
+                else{
+                    size_t written=0;st=dec_to_text(&sum,exact,n,&written);
+                    if(st==DEC_OK){TypedInput in={exact,written,1,0,0};rc=typed_prepared_set(p,(size_t)i,&in,err,cap);}
+                    free(exact);
+                }
+            }
+            dec_free(&sum);dec_free(&delta);dec_free(&current);
+            if(st!=DEC_OK)rc=row_error(err,cap,st==DEC_ERR_NOMEM?ENOMEM:EINVAL,"invalid or overflowing exact increment");
+        }
+        free(decoded);if(rc)return -1;
+    }
+    return 0;
+}
+
 static int prepare_json(const TypedSchema *ts,const char *json,int defaults,
-                          const char *root,const char *object,TypedPrepared *out,const SlotcaskOldRecord *old,
+                          const char *root,const char *object,TypedPrepared *out,const SlotcaskOldRecord *old,int computed,
                           char *err,size_t cap){
     if(!json)return row_error(err,cap,EINVAL,"invalid record JSON");
+    size_t request_length=strnlen(json,g_query_buffer_max_bytes);
+    if(request_length>=g_query_buffer_max_bytes/8)return row_error(err,cap,ENOMEM,"query memory buffer exceeded");
     const char *valid=json;
     if(row_json_value(&valid,0)||*row_json_space(valid))
         return row_error(err,cap,EINVAL,"invalid record JSON");
     if(old?typed_prepared_old(ts,old,out,err,cap):typed_prepared_zero(ts,out,err,cap))return -1;
+    RowCompute computes[MAX_FIELDS]={0};
     const char *p=row_json_space(json);if(*p++!='{')goto bad;
     int first=1;
     while(1){
@@ -444,7 +629,14 @@ static int prepare_json(const TypedSchema *ts,const char *json,int defaults,
             const TypedField *f=&ts->fields[i];
             if(f->removed||name_len!=(size_t)f->name_len||memcmp(f->name,name,name_len))continue;
             int quoted=n>=2&&v[0]=='"'&&v[n-1]=='"';
-            if(!quoted&&(v[0]=='{'||v[0]=='[')){free(name);goto bad;}
+            if(!quoted&&(v[0]=='{'||v[0]=='[')){
+                if(!computed||!old||v[0]!='{'){free(name);goto bad;}
+                if(row_compute_parse(ts,(size_t)i,v,n,&computes[i],err,cap)){free(name);goto fail;}
+                RowCompute one[MAX_FIELDS]={0};one[i]=computes[i];
+                if(row_compute_apply(out,old,one,err,cap)){free(name);goto fail;}
+                break;
+            }
+            computes[i]=(RowCompute){0};
             TypedInput in={quoted?v+1:v,quoted?n-2:n,1,
                 (uint8_t)(!quoted&&json_span_is_null(v,n)),(uint8_t)quoted};
             if(typed_prepared_set(out,(size_t)i,&in,err,cap)){free(name);goto fail;}
@@ -453,6 +645,9 @@ static int prepare_json(const TypedSchema *ts,const char *json,int defaults,
         free(name);first=0;
     }
     if(*row_json_space(p))goto bad;
+    if(computed)for(int i=0;i<ts->nfields;i++)if(computes[i].op==2&&computes[computes[i].source].op){
+        row_error(err,cap,EINVAL,"copy source is computed");goto fail;
+    }
     if(defaults&&typed_prepared_defaults(out,root,object,err,cap))goto fail;
     return 0;
 bad:row_error(err,cap,EINVAL,"invalid record JSON");
@@ -463,7 +658,7 @@ int typed_encode_packed_into(const TypedSchema *ts,const char *json,int defaults
                               size_t cap,size_t *used,char *err,size_t errsz){
     if(used)*used=0;
     TypedPrepared p;typed_prepared_init(&p);
-    int rc=prepare_json(ts,json,defaults,root,object,&p,NULL,err,errsz);
+    int rc=prepare_json(ts,json,defaults,root,object,&p,NULL,0,err,errsz);
     if(!rc)rc=typed_prepared_compose(&p,out,cap,used,err,errsz);
     typed_prepared_free(&p);return rc;
 }
@@ -483,7 +678,7 @@ int typed_encode_alloc(const TypedSchema *ts,const char *json,int defaults,
         *out=b;*len=(size_t)rc;return 0;
     }
     TypedPrepared p;typed_prepared_init(&p);
-    int rc=prepare_json(ts,json,defaults,root,object,&p,NULL,err,cap);
+    int rc=prepare_json(ts,json,defaults,root,object,&p,NULL,0,err,cap);
     if(!rc)rc=typed_prepared_alloc(&p,out,len,err,cap);
     typed_prepared_free(&p);return rc;
 }
@@ -523,7 +718,7 @@ int typed_insert_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     *out=NULL;*len=0;
     if(!packed_schema_ok(ts))return row_error(err,cap,EINVAL,"invalid packed schema");
     TypedPrepared p;typed_prepared_init(&p);
-    int rc=prepare_json(ts,json,0,root,object,&p,NULL,err,cap);
+    int rc=prepare_json(ts,json,0,root,object,&p,NULL,0,err,cap);
     if(!rc)rc=prepared_defaults_mode(&p,root,object,1,err,cap);
     if(!rc)rc=prepared_insert_finish(&p,old,out,len,err,cap);
     typed_prepared_free(&p);return rc;
@@ -551,7 +746,19 @@ int typed_update_json_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     *out=NULL;*len=0;
     if(!packed_schema_ok(ts)||!old)return row_error(err,cap,EINVAL,"invalid update");
     TypedPrepared p;typed_prepared_init(&p);
-    int rc=prepare_json(ts,json,0,NULL,NULL,&p,old,err,cap);
+    int rc=prepare_json(ts,json,0,NULL,NULL,&p,old,0,err,cap);
+    if(!rc)rc=typed_prepared_stamp(&p,DK_AUTO_UPDATE,err,cap);
+    if(!rc)rc=typed_prepared_alloc(&p,out,len,err,cap);
+    typed_prepared_free(&p);return rc;
+}
+
+int typed_update_computed_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
+    const char *json,uint8_t **out,size_t *len,char *err,size_t cap){
+    if(!out||!len)return row_error(err,cap,EINVAL,"invalid output");
+    *out=NULL;*len=0;
+    if(!packed_schema_ok(ts)||!old)return row_error(err,cap,EINVAL,"invalid update");
+    TypedPrepared p;typed_prepared_init(&p);
+    int rc=prepare_json(ts,json,0,NULL,NULL,&p,old,1,err,cap);
     if(!rc)rc=typed_prepared_stamp(&p,DK_AUTO_UPDATE,err,cap);
     if(!rc)rc=typed_prepared_alloc(&p,out,len,err,cap);
     typed_prepared_free(&p);return rc;
@@ -1081,4 +1288,73 @@ char *typed_packed_csv_row(const TypedSchema *ts,const uint8_t *value,
     size_t len,uint8_t hdr2,const void *wire_key,size_t key_len,const char *fields,
     char delimiter,size_t budget,size_t *text_len) {
     return csv_record_text(ts,value,len,hdr2,wire_key,key_len,fields,delimiter,budget,text_len,0);
+}
+
+/* Conservative peak heap allowance: dec_unpack digits + grown limb storage,
+ * projection selector copy, and at most one composite join beside output.
+ * Record/cache/input bytes and bounded automatic frames remain borrowed. */
+size_t typed_packed_render_allowance(const TypedSchema *ts,const uint8_t *value,
+    size_t len,uint8_t flags,const char *fields,size_t available){
+    if(!packed_schema_ok(ts)||!value||flags!=PKR_FLAGS||
+       len<(size_t)ts->packed.prefix+ts->packed.directory||
+       len>ts->packed.maximum||value[0]!=ts->packed.prefix-1){errno=EILSEQ;return 0;}
+    size_t largest=0;
+    for(int i=0;i<ts->nfields;i++)if(ts->packed.fields[i].kind==PKR_NUMERIC){
+        const PkrField *f=&ts->packed.fields[i];const uint8_t *entry=value+ts->packed.prefix+f->offset;
+        uint32_t bytes=0;for(int j=0;j<4;j++)bytes=(bytes<<8)|entry[4+j];
+        if(bytes>f->payload_max||bytes>len-ts->packed.prefix){errno=EILSEQ;return 0;}
+        if(bytes>largest)largest=bytes;
+    }
+    size_t selector=fields?strnlen(fields,MAX_LINE):0;
+    if(selector==MAX_LINE){errno=E2BIG;return 0;}
+    if(largest>(SIZE_MAX-selector-129)/8){errno=EOVERFLOW;return 0;}
+    size_t workspace=largest?8*largest+128:0;
+    if(fields)workspace+=selector+1;
+    if(available<=workspace+1){errno=ENOBUFS;return 0;}
+    /* Admission precedes pkr_view/decimal allocation; full view validation is
+     * still mandatory, never replaced by the inexpensive length scan. */
+    size_t allowance=(available-workspace)/2;
+    if(!allowance)errno=ENOBUFS;
+    return allowance;
+}
+
+static int row_selected_open(const TypedRowView *view,const CsvSelection *selection,
+    size_t index,size_t budget,NamedText *text){
+    memset(text,0,sizeof(*text));dec_init(&text->value.decimal);
+    if(selection->indices[index]>=0)
+        return projection_text_open(view,selection->indices[index],&text->value);
+    return named_text_open(view,selection->names[index],budget,text);
+}
+char *typed_packed_row_json(const TypedSchema *ts,const uint8_t *value,size_t len,
+    uint8_t flags,const void *key,size_t key_len,const char *fields,size_t budget){
+    if(!packed_schema_ok(ts)||(!key&&key_len)){errno=EINVAL;return NULL;}
+    if(budget<4){errno=ENOMEM;return NULL;}
+    CsvSelection selection;
+    if(csv_selection_open(ts,fields,&selection)){free(selection.copy);return NULL;}
+    TypedRowView view;char *out=NULL;
+    if(typed_row_open(ts,value,len,flags,&view))goto done;
+    size_t key_bytes=0,need=3;
+    if(quoted_length(key,key_len,&key_bytes))goto done;
+    if(key_bytes>SIZE_MAX-need){errno=EOVERFLOW;goto done;}
+    need+=key_bytes;if(need>budget){errno=ENOMEM;goto done;}
+    for(size_t i=0;i<selection.count;i++){
+        NamedText text;size_t part=0;int rc=row_selected_open(&view,&selection,i,budget,&text);
+        if(!rc)rc=row_text_length(&text.value,1,&part);
+        named_text_free(&text);if(rc)goto done;
+        if(part==SIZE_MAX||need>SIZE_MAX-part-1){errno=EOVERFLOW;goto done;}
+        need+=part+1;if(need>budget){errno=ENOMEM;goto done;}
+    }
+    out=malloc(need);if(!out){errno=ENOMEM;goto done;}
+    size_t pos=0,used=0;out[pos++]='[';
+    if(quote_into(key,key_len,out+pos,need-pos,&used))goto fail;
+    pos+=used;
+    for(size_t i=0;i<selection.count;i++){
+        out[pos++]=',';NamedText text;int rc=row_selected_open(&view,&selection,i,budget,&text);
+        if(!rc)rc=row_text_write(&text.value,1,out+pos,need-pos,&used);
+        named_text_free(&text);if(rc)goto fail;pos+=used;
+    }
+    out[pos++]=']';out[pos]=0;if(pos+1!=need){errno=EILSEQ;goto fail;}
+    goto done;
+fail:free(out);out=NULL;
+done:free(selection.copy);return out;
 }

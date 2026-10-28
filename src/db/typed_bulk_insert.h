@@ -20,4 +20,6 @@ int typed_bulk_update_command(const char *root,const char *object,
 int typed_bulk_update_source(const char *root,const char *object,
     const Schema *sc,const TypedSchema *ts,SlotcaskDb *borrowed,
     const char *input,int is_file);
+int typed_bulk_insert_source(const char *root,const char *object,const Schema *sc,
+    const TypedSchema *ts,const char *input,int format,char delimiter,int if_not_exists);
 #endif

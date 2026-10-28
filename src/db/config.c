@@ -1,3 +1,4 @@
+#include "schema_wire.h"
 #include "types.h"
 #include "typed_row.h"
 #include "slotcask.h"
@@ -1342,10 +1343,13 @@ void free_enum_values(TypedField *f) {
    tf->default_val on entry; on a no-modifier call it leaves them
    alone. Callers that want a guaranteed clean slate should zero those
    fields before invoking. */
-int field_default_too_long(const char *field_spec) {
-    const char *d = strstr(field_spec, ":default=");
-    if (!d) return 0;
-    return strlen(d + 9) >= sizeof(((TypedField *)0)->default_val);
+int field_default_too_long(const char *spec){
+    if(!spec)return 0;
+    const char *value=strstr(spec,":default=");if(!value)return 0;value+=9;
+    size_t n=strlen(value);
+    if(n>=8&&!strcmp(value+n-8,":removed"))n-=8;
+    if(n>=9&&(!memcmp(value+n-9,":not_null",9)||!memcmp(value+n-9,":nullable",9)))n-=9;
+    return n>=sizeof(((TypedField*)0)->default_val);
 }
 
 /* Strip default/nullability modifiers in place. Returns 1 when a default
@@ -1442,6 +1446,52 @@ int parse_default_modifier(char *type_spec_inout, TypedField *tf) {
         *dflt = '\0';
         return 1;
     }
+    return 0;
+}
+
+int parse_default_modifier_checked(char *spec,TypedField *f){
+    if(!spec||!f)return 0;
+    if(strchr(spec,'\n')||strchr(spec,'\r'))return -1;
+    f->default_invalid=0;
+    f->not_null=0;f->not_null_set=0;f->default_kind=DK_NONE;f->default_val[0]=0;
+    size_t n=strlen(spec);
+    if(n>=9&&!strcmp(spec+n-9,":not_null")){spec[n-9]=0;f->not_null=1;f->not_null_set=1;}
+    else if(n>=9&&!strcmp(spec+n-9,":nullable")){spec[n-9]=0;f->not_null_set=1;}
+    if(strstr(spec,":not_null")||strstr(spec,":nullable"))return -1;
+    char *d=strstr(spec,":default=");
+    if(d){
+        const char *value=d+9;size_t length=strlen(value);
+        if(strstr(value,":auto_create")||strstr(value,":auto_update")||strstr(value,":default="))return -1;
+        if(length>=sizeof(f->default_val))return -1;
+        if(!strncmp(value,"seq(",4)||!strncmp(value,"random(",7)){
+            int random=!strncmp(value,"random(",7);size_t prefix=random?7:4;
+            if(length<=prefix+1||value[length-1]!=')')return -1;
+            size_t arglen=length-prefix-1;
+            if(!arglen||arglen>=sizeof(f->default_val))return -1;
+            const char *arg=value+prefix;
+            if(random){
+                unsigned long count=0;
+                for(size_t i=0;i<arglen;i++){
+                    if(arg[i]<'0'||arg[i]>'9'||count>(2097152u-(unsigned)(arg[i]-'0'))/10)return -1;
+                    count=count*10+(unsigned)(arg[i]-'0');
+                }
+                if(!count||count>2097152u)return -1;
+                f->default_kind=DK_RANDOM;
+            }else{
+                if(arglen>=128)return -1;
+                for(size_t i=0;i<arglen;i++)if(arg[i]==':'||arg[i]=='+'||arg[i]=='/'||
+                    arg[i]=='('||arg[i]==')'||(unsigned char)arg[i]<=32)return -1;
+                f->default_kind=DK_SEQ;
+            }
+            memcpy(f->default_val,arg,arglen);f->default_val[arglen]=0;
+        }else if(!strcmp(value,"uuid()"))f->default_kind=DK_UUID;
+        else{f->default_kind=DK_LITERAL;memcpy(f->default_val,value,length+1);}
+        *d=0;return 1;
+    }
+    char *a=strstr(spec,":auto_create"),*u=strstr(spec,":auto_update");
+    if(a&&u)return -1;
+    d=a?a:u;
+    if(d){if(d[12])return -1;*d=0;f->default_kind=a?DK_AUTO_CREATE:DK_AUTO_UPDATE;return 1;}
     return 0;
 }
 
@@ -1752,6 +1802,11 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
         /* Default modifiers — strip from type_spec before parse_field_type.
            Format: :auto_create, :auto_update, :default=<val>
            These are always the last colon-segment (before :removed). */
+        char *default_check=strdup(type_spec);
+        if(!default_check){free(line);fclose(f);for(int i=0;i<ts.nfields;i++)free_enum_values(&ts.fields[i]);return NULL;}
+        TypedField checked_default={0};
+        tf->default_invalid=parse_default_modifier_checked(default_check,&checked_default)<0;
+        free(default_check);
         if (parse_default_modifier(type_spec, tf) < 0) {
             /* Never drop a field: later offsets/bitmap positions would
                shift. Refuse the entire schema, without caching it. */
@@ -3201,13 +3256,18 @@ int format_wire_key(const Schema *sc, const char *key, size_t klen,
 }
 
 /* Random N bytes, hex-encoded (2*N chars + NUL) */
-static void gen_random_hex(int nbytes, char *buf, size_t bufsz) {
-    if (nbytes <= 0 || (size_t)(nbytes * 2 + 1) > bufsz) { buf[0] = '\0'; return; }
-    uint8_t raw[256];
-    if (nbytes > (int)sizeof(raw)) nbytes = (int)sizeof(raw);
-    if (fill_random(raw, (size_t)nbytes) != 0) { buf[0] = '\0'; return; }
-    for (int i = 0; i < nbytes; i++)
-        snprintf(buf + i * 2, 3, "%02x", raw[i]);
+static void gen_random_hex(int nbytes,char *buf,size_t bufsz){
+    if(!buf||!bufsz)return;
+    buf[0]=0;
+    if(nbytes<=0||(size_t)nbytes>(bufsz-1)/2)return;
+    static const char hex[]="0123456789abcdef";uint8_t raw[256];size_t done=0;
+    while(done<(size_t)nbytes){
+        size_t take=(size_t)nbytes-done;if(take>sizeof(raw))take=sizeof(raw);
+        if(fill_random(raw,take)){buf[0]=0;return;}
+        for(size_t i=0;i<take;i++){buf[2*(done+i)]=hex[raw[i]>>4];buf[2*(done+i)+1]=hex[raw[i]&15];}
+        done+=take;
+    }
+    buf[2*(size_t)nbytes]=0;
 }
 
 /* Durable sequence-state write: temp file in the same directory, full
@@ -3347,6 +3407,7 @@ long long seq_next_val_batch(const char *db_root, const char *object,
    in gen_buf (caller-provided, >= 256 bytes). Returns NULL if no default. */
 const char *generate_default(const TypedField *tf, char *gen_buf, size_t bufsz,
                                     const char *db_root, const char *object) {
+    if(!tf||tf->default_invalid){errno=EINVAL;return NULL;}
     switch (tf->default_kind) {
     case DK_NONE:
         return NULL;
@@ -3380,6 +3441,27 @@ const char *generate_default(const TypedField *tf, char *gen_buf, size_t bufsz,
           return gen_buf[0] ? gen_buf : NULL; }
     }
     return NULL;
+}
+
+char *generate_default_owned(const TypedField *f,const char *root,const char *object,size_t budget){
+    if(!f||!budget||f->default_invalid){errno=EINVAL;return NULL;}
+    size_t need=256;
+    if(f->default_kind==DK_LITERAL)need=strlen(f->default_val)+1;
+    else if(f->default_kind==DK_RANDOM){
+        const char *p=f->default_val;size_t count=0;
+        if(!*p){errno=EINVAL;return NULL;}
+        for(;*p;p++){
+            if(*p<'0'||*p>'9'||count>(2097152u-(unsigned)(*p-'0'))/10){errno=EINVAL;return NULL;}
+            count=count*10+(unsigned)(*p-'0');
+        }
+        if(!count||count>2097152u){errno=EINVAL;return NULL;}need=2*count+1;
+    }
+    if(need>budget){errno=ENOBUFS;return NULL;}
+    char *out=malloc(need);if(!out){errno=ENOMEM;return NULL;}
+    const char *value=generate_default(f,out,need,root,object);
+    if(!value){free(out);errno=EIO;return NULL;}
+    if(value!=out)memcpy(out,value,strlen(value)+1);
+    return out;
 }
 
 /* Helper: render an actionable "unknown enum value" error message into
@@ -3573,9 +3655,7 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
             typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
             continue;
         }
-        char gen_buf[256];
-        const char *dv = generate_default(&ts->fields[i], gen_buf, sizeof(gen_buf),
-                                          db_root, object);
+        char *dv=generate_default_owned(&ts->fields[i],db_root,object,g_query_buffer_max_bytes);
         if (!dv) {
             /* The loop already skipped DK_NONE, so NULL here always means the
                generator failed (seq lock/filesystem error, random source
@@ -3588,10 +3668,9 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                          ts->fields[i].name);
             return -2;
         }
-        if (encode_field_checked(&ts->fields[i], dv, strlen(dv),
-                                  out + ts->nullmap_prefix + ts->fields[i].offset,
-                                  err_buf, err_buf_size) != 0)
-            return -2;
+        int rc=encode_field_checked(&ts->fields[i],dv,strlen(dv),
+            out+ts->nullmap_prefix+ts->fields[i].offset,err_buf,err_buf_size);
+        free(dv);if(rc)return -2;
     }
     return ts->total_size;
 }
@@ -3855,15 +3934,22 @@ int decode_field_to_buf(const TypedField *f, const uint8_t *data,
     }
 }
 
-char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
-                   uint8_t hdr2) {
+char *typed_decode_bounded_size(const TypedSchema *ts,const uint8_t *data,int data_len,
+    uint8_t hdr2,size_t budget,size_t *allocated) {
+    if(allocated)*allocated=0;
     if (!ts || !ts->typed || ts->nfields < 1 || ts->nfields > MAX_FIELDS) {
         errno = EINVAL;
         return NULL;
     }
     if (data_len < 0) { errno = EILSEQ; return NULL; }
     if (ts->packed.nfields)
-        return typed_packed_decode(ts, data, (size_t)data_len, hdr2, SIZE_MAX);
+        {
+        if(!data){errno=EINVAL;return NULL;}
+        size_t allowance=typed_packed_render_allowance(ts,data,(size_t)data_len,hdr2,NULL,budget);
+        char *text=allowance?typed_packed_decode(ts,data,(size_t)data_len,hdr2,allowance):NULL;
+        if(text&&allocated)*allocated=strlen(text)+1;
+        return text;
+    }
     const uint8_t *fbase = NULL, *bm = NULL;
     int bm_bytes = 0;
     size_t region = 0;
@@ -3874,7 +3960,7 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
     }
     static const uint8_t zero_field[65537];
     int capacities[MAX_FIELDS] = {0};
-    size_t est = 4;
+    size_t est=4,workspace=0;
     for (int i = 0; i < ts->nfields; i++) {
         const TypedField *f = &ts->fields[i];
         if (f->removed) continue;
@@ -3901,7 +3987,10 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
             if (n > (INT_MAX - 4u) / 6u) { errno = EOVERFLOW; return NULL; }
             need = 6 * n + 4;
         }
-        size_t name = strlen(f->name);
+        if(need>512&&need>workspace)workspace=need;
+        size_t name=strlen(f->name);
+        if(name>(SIZE_MAX-2)/6){errno=EOVERFLOW;return NULL;}
+        name=6*name+2;
         if (name > SIZE_MAX - need - 4 || est > SIZE_MAX - name - need - 4) {
             errno = EOVERFLOW;
             return NULL;
@@ -3909,6 +3998,7 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
         capacities[i] = (int)need;
         est += name + need + 4;
     }
+    if(est>budget||workspace>budget-est){errno=ENOMEM;return NULL;}
     char *buf = malloc(est);
     if (!buf) { errno = ENOMEM; return NULL; }
     size_t pos = 0;
@@ -3942,8 +4032,12 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
         }
         /* Preserve unflagged legacy skip-on-zero/absence semantics. */
         if (len == 0) { if (value != stack) free(value); continue; }
-        int written = snprintf(buf + pos, est - pos, "%s\"%s\":%s",
-                               first ? "" : ",", f->name, value);
+        if(!first)buf[pos++]=',';
+        buf[pos++]='"';
+        int escaped=json_escape_into(buf+pos,est-pos,f->name,strlen(f->name));
+        if(escaped<0){if(value!=stack)free(value);free(buf);errno=EOVERFLOW;return NULL;}
+        pos+=(size_t)escaped;buf[pos++]='"';buf[pos++]=':';
+        int written=snprintf(buf+pos,est-pos,"%s",value);
         if (value != stack) free(value);
         if (written < 0 || (size_t)written >= est - pos) {
             free(buf);
@@ -3956,7 +4050,14 @@ char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
     if (pos > est - 2) { free(buf); errno = EOVERFLOW; return NULL; }
     buf[pos++] = '}';
     buf[pos] = '\0';
+    if(allocated)*allocated=est;
     return buf;
+}
+char *typed_decode_bounded(const TypedSchema *ts,const uint8_t *data,int len,uint8_t flags,size_t budget){
+    return typed_decode_bounded_size(ts,data,len,flags,budget,NULL);
+}
+char *typed_decode(const TypedSchema *ts,const uint8_t *data,int data_len,uint8_t hdr2){
+    return typed_decode_bounded(ts,data,data_len,hdr2,g_query_buffer_max_bytes);
 }
 
 int typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
@@ -4481,17 +4582,23 @@ int cmd_add_fields(const char *db_root, const char *object,
             OUT("{\"error\":\"out of memory\"}\n");
             return 1;
         }
-        if (parse_default_modifier(clean_spec, &tf) < 0) {
+        if (parse_default_modifier_checked(clean_spec, &tf) < 0) {
             free(clean_spec);
             free_enum_values(&tf);
             OUT("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
             return 1;
         }
-        parse_field_type(clean_spec, &tf);
+        if(typed_legacy_decl_size(clean_spec)<=0){
+            free(clean_spec);OUT("{\"error\":\"Invalid field declaration\"}\n");return 1;
+        }
+        parse_field_type(clean_spec,&tf);
         free(clean_spec);
         if (tf.type == FT_NONE || tf.size <= 0) {
             OUT("{\"error\":\"Invalid type in: %s\"}\n", lines[a]);
             return 1;
+        }
+        if(typed_default_validate(&tf)){
+            free_enum_values(&tf);OUT("{\"error\":\"Invalid default in field declaration\"}\n");return 1;
         }
         /* Pre-flight: refuse random(N) with hex output that exceeds the
            field's storage. random(N) generates 2*N hex chars; for varchar

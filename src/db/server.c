@@ -1,3 +1,4 @@
+#include "schema_wire.h"
 #include "types.h"
 #include "nql.h"
 #ifndef EMBED_NO_TLS
@@ -698,7 +699,7 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
    GCC passes the cleanup the ADDRESS of the variable, so the parameter is
    a pointer to the row pointer and the heap block is *lines — free(that),
    never the variable itself. */
-static void free_spec_lines(char (**lines)[MAX_FIELD_DEF]) { free(*lines); }
+
 
 void dispatch_json_query(const char *raw_db_root, const char *json, const char *client_ip) {
     /* Concurrency cap: take a slot up-front; release on any return path
@@ -1399,6 +1400,21 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
 
     /* create-object bypasses dir validation (dir may not exist yet) */
     if (strcmp(mode, "create-object") == 0) {
+        const char *stream_value=NULL,*manifest_layout=NULL;size_t stream_len=0,manifest_len=0;
+        int marked_manifest=json_obj_get(&req,"declaration_layout",&manifest_layout,&manifest_len);
+        if(marked_manifest&&json_obj_get(&req,"streams",&stream_value,&stream_len)){
+            char expected[32];int n=snprintf(expected,sizeof(expected),"%d",slotcask_streams_for_nproc());
+            if(n<1||stream_len!=(size_t)n||memcmp(stream_value,expected,stream_len)){
+                OUT("{\"error\":\"imported stream count differs from this host; explicit geometry import awaits migration integration\"}\n");
+                free(mode);free(dir);free(object);return;
+            }
+        }
+        const char *layout_value=NULL;size_t layout_len=0;
+        if(json_obj_get(&req,"declaration_layout",&layout_value,&layout_len)&&
+           (layout_len!=8||memcmp(layout_value,"\"legacy\"",8))){
+            OUT("{\"error\":\"packed or unknown schema layout import is inactive until migration integration\"}\n");
+            free(mode);free(dir);free(object);return;
+        }
         char *fields_j = json_obj_strdup_raw(&req, "fields");
         char *indexes_j = json_obj_strdup_raw(&req, "indexes");
         char *splits_s = json_obj_strdup(&req, "splits");
@@ -2056,94 +2072,19 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         if (oldn && newn) cmd_rename_field(db_root, object, oldn, newn);
         else OUT("{\"error\":\"Missing 'old' or 'new' field name\"}\n");
         free(oldn); free(newn);
-    } else if (strcmp(mode, "add-field") == 0) {
-        /* fields is a JSON array of spec lines, e.g. ["phone:varchar:20","dob:date"] */
-        char *fields_arr = json_obj_strdup_raw(&req, "fields");
-        if (!fields_arr) { OUT("{\"error\":\"Missing 'fields' array\"}\n"); }
-        else {
-            char (*lines)[MAX_FIELD_DEF] __attribute__((cleanup(free_spec_lines))) =
-                calloc(MAX_FIELDS, MAX_FIELD_DEF);
-            if (!lines) {
-                OUT("{\"error\":\"out of memory\"}\n");
-                free(fields_arr);
-            } else {
-                int nlines = 0;
-                int too_long = 0;
-                const char *p = fields_arr;
-                while (*p && nlines < MAX_FIELDS) {
-                    while (*p == '[' || *p == ',' || *p == ' ' || *p == '\t') p++;
-                    if (*p == ']' || *p == '\0') break;
-                    if (*p == '"') {
-                        p++;
-                        const char *start = p;
-                        while (*p && *p != '"') p++;
-                        size_t l = p - start;
-                        if (l > 0 && l < MAX_FIELD_DEF) {
-                            memcpy(lines[nlines], start, l);
-                            lines[nlines][l] = '\0';
-                            nlines++;
-                        } else if (l >= MAX_FIELD_DEF) {
-                            too_long = 1;
-                        }
-                        if (*p == '"') p++;
-                    } else p++;
-                }
-                if (too_long)
-                    OUT("{\"error\":\"field definition longer than %d bytes\"}\n",
-                        MAX_FIELD_DEF - 1);
-                else if (nlines == 0) OUT("{\"error\":\"No fields in 'fields' array\"}\n");
-                else cmd_add_fields(db_root, object, lines, nlines);
-                free(fields_arr);
-            }
+    } else if (!strcmp(mode,"add-field") || !strcmp(mode,"edit-field")) {
+        char *fields_arr=json_obj_strdup_raw(&req,"fields");
+        char (*lines)[MAX_FIELD_DEF]=NULL;int nlines=0;
+        if(!fields_arr||typed_field_lines_parse(fields_arr,&lines,&nlines))
+            OUT("{\"error\":\"Invalid field line, Duplicate field or field definition longer than limit\"}\n");
+        else if(!strcmp(mode,"add-field"))cmd_add_fields(db_root,object,lines,nlines);
+        else{
+            int allow_rename=json_obj_is_true(&req,"allow_rename");
+            char *dry_s=json_obj_strdup(&req,"dry_run");
+            int dry=json_obj_is_true(&req,"dry_run")||(dry_s&&!strcmp(dry_s,"1"));
+            free(dry_s);cmd_edit_fields(db_root,object,lines,nlines,allow_rename,dry);
         }
-    } else if (strcmp(mode, "edit-field") == 0) {
-        /* fields is a JSON array of spec lines, e.g. ["name:varchar:200","age:long"] */
-        char *fields_arr = json_obj_strdup_raw(&req, "fields");
-        if (!fields_arr) { OUT("{\"error\":\"Missing 'fields' array\"}\n"); }
-        else {
-            char (*lines)[MAX_FIELD_DEF] __attribute__((cleanup(free_spec_lines))) =
-                calloc(MAX_FIELDS, MAX_FIELD_DEF);
-            if (!lines) {
-                OUT("{\"error\":\"out of memory\"}\n");
-                free(fields_arr);
-            } else {
-                int nlines = 0;
-                int too_long = 0;
-                const char *p = fields_arr;
-                while (*p && nlines < MAX_FIELDS) {
-                    while (*p == '[' || *p == ',' || *p == ' ' || *p == '\t') p++;
-                    if (*p == ']' || *p == '\0') break;
-                    if (*p == '"') {
-                        p++;
-                        const char *start = p;
-                        while (*p && *p != '"') p++;
-                        size_t l = p - start;
-                        if (l > 0 && l < MAX_FIELD_DEF) {
-                            memcpy(lines[nlines], start, l);
-                            lines[nlines][l] = '\0';
-                            nlines++;
-                        } else if (l >= MAX_FIELD_DEF) {
-                            too_long = 1;
-                        }
-                        if (*p == '"') p++;
-                    } else p++;
-                }
-                /* Optional `allow_rename` flag for FT_ENUM rename edits.
-                   Without it, any rename at an existing enum position is
-                   rejected. */
-                int allow_rename = json_obj_is_true(&req, "allow_rename");
-                char *dry_s = json_obj_strdup(&req, "dry_run");
-                int dry = json_obj_is_true(&req, "dry_run") ||
-                          (dry_s && strcmp(dry_s, "1") == 0);
-                free(dry_s);
-                if (too_long)
-                    OUT("{\"error\":\"field definition longer than %d bytes\"}\n",
-                        MAX_FIELD_DEF - 1);
-                else if (nlines == 0) OUT("{\"error\":\"No fields in 'fields' array\"}\n");
-                else cmd_edit_fields(db_root, object, lines, nlines, allow_rename, dry);
-                free(fields_arr);
-            }
-        }
+        free(lines);free(fields_arr);
     } else if (strcmp(mode, "remove-field") == 0) {
         /* fields is a JSON array of field names, e.g. ["email","age"] */
         char *fields_arr = json_obj_strdup_raw(&req, "fields");
@@ -4256,6 +4197,8 @@ static int write_all(int fd, const void *buf, size_t len) {
 /* Connect to local server, send JSON line, return accumulated response (up to first \0).
    Caller frees *out. Returns 0 on success, -1 on error. */
 static int query_collect(int port, const char *json, size_t json_len, char **out, size_t *out_len) {
+    if(!out||!out_len)return -1;
+    *out=NULL;*out_len=0;
     ClientConn cc;
     if (client_connect(port, &cc) != 0) return -1;
 
@@ -4266,7 +4209,7 @@ static int query_collect(int port, const char *json, size_t json_len, char **out
     }
 
     size_t cap = 8192, len = 0;
-    char *buf = malloc(cap);
+    char *buf = malloc(cap+1);
     if (!buf) {
         LOG_ERROR(LOG_SUB_SERVER, "query_collect: malloc(%zu) failed", cap);
         client_close(&cc); return -1;
@@ -4279,7 +4222,7 @@ static int query_collect(int port, const char *json, size_t json_len, char **out
             if (rbuf[j] == '\0') {
                 if (len + j > cap) {
                     while (cap < len + j) cap *= 2;
-                    char *nb = realloc(buf, cap);
+                    char *nb = realloc(buf, cap+1);
                     if (!nb) {
                         LOG_ERROR(LOG_SUB_SERVER, "query_collect: realloc(%zu) failed while framing response (len=%zu)", cap, len);
                         free(buf); client_close(&cc); return -1;
@@ -4289,13 +4232,14 @@ static int query_collect(int port, const char *json, size_t json_len, char **out
                 memcpy(buf + len, rbuf, j);
                 len += j;
                 client_close(&cc);
+                buf[len]=0;
                 *out = buf; *out_len = len;
                 return 0;
             }
         }
         if (len + (size_t)n > cap) {
             while (cap < len + (size_t)n) cap *= 2;
-            char *nb = realloc(buf, cap);
+            char *nb = realloc(buf, cap+1);
             if (!nb) {
                 LOG_ERROR(LOG_SUB_SERVER, "query_collect: realloc(%zu) failed while accumulating response (len=%zu)", cap, len);
                 free(buf); client_close(&cc); return -1;
@@ -4307,6 +4251,7 @@ static int query_collect(int port, const char *json, size_t json_len, char **out
     }
     client_close(&cc);
     /* EOF with no \0 sentinel — still return what we got. */
+    buf[len]=0;
     *out = buf; *out_len = len;
     return 0;
 }
@@ -4319,23 +4264,20 @@ static int query_collect(int port, const char *json, size_t json_len, char **out
 
 /* Internal: walk a top-level JSON string array, invoking cb(elem, len, ctx)
    for each element. Returns 0 on success. */
-static int walk_string_array(const char *s,
-                             void (*cb)(const char *, size_t, void *),
-                             void *ctx) {
-    const char *p = json_skip(s);
-    if (*p != '[') return -1;
-    p++;
-    while (*p) {
-        p = json_skip(p);
-        if (*p == ']') return 0;
-        if (*p == ',') { p++; continue; }
-        if (*p != '"') return -1;
-        p++;
-        const char *start = p;
-        while (*p && !(*p == '"' && p[-1] != '\\')) p++;
-        if (*p != '"') return -1;
-        cb(start, (size_t)(p - start), ctx);
-        p++;
+static int walk_string_array(const char *json,
+    void (*callback)(const char*,size_t,void*),void *ctx){
+    const char *p=json_skip(json);if(*p++!='[')return -1;p=json_skip(p);
+    if(*p==']')return *json_skip(p+1)?-1:0;
+    while(*p){
+        if(*p!='"')return -1;
+        const char *start=p+1,*end=json_raw_string_end(start);
+        if(*end!='"')return -1;
+        char *decoded=NULL;size_t length=0;
+        if(json_unescape_cstring(start,(size_t)(end-start),&decoded,&length))return -1;
+        callback(decoded,length,ctx);free(decoded);p=json_skip(end+1);
+        if(*p==']')return *json_skip(p+1)?-1:0;
+        if(*p++!=',')return -1;
+        p=json_skip(p);
     }
     return -1;
 }
@@ -4364,58 +4306,47 @@ static int walk_object_array(const char *s,
 
 /* Compose a fields.conf-style spec ("name:type[:size|P,S]") from one
    describe-object field entry — same shape create-object expects. */
-static void field_obj_to_spec(const char *obj, size_t len,
-                              char *out, size_t out_sz) {
-    JsonObj fo;
-    if (json_parse_object(obj, len, &fo) <= 0) { out[0] = '\0'; return; }
-    char name[64] = "", type[16] = "";
-    json_obj_copy(&fo, "name", name, sizeof(name));
-    json_obj_copy(&fo, "type", type, sizeof(type));
-    int size  = json_obj_int(&fo, "size",  0);
-    int scale = json_obj_int(&fo, "scale", 0);
-    if (strcmp(type, "varchar") == 0) {
-        /* describe-object reports on-disk size including the 2-byte length
-           prefix; create-object expects content size, so subtract. */
-        int n = size - 2;
-        if (n < 0) n = 0;
-        snprintf(out, out_sz, "%s:%s:%d", name, type, n);
-    } else if (strcmp(type, "numeric") == 0) {
-        snprintf(out, out_sz, "%s:%s:18,%d", name, type, scale);
-    } else {
-        snprintf(out, out_sz, "%s:%s", name, type);
-    }
+static char *field_obj_to_spec(const char *obj,size_t len){
+    JsonObj field;const char *raw=NULL;size_t n=0;
+    if(json_parse_object(obj,len,&field)<=0||!json_obj_get(&field,"spec",&raw,&n)||
+       n<2||raw[0]!='"'||raw[n-1]!='"'){errno=EINVAL;return NULL;}
+    char *spec=NULL;size_t length=0;
+    if(json_unescape_cstring(raw+1,n-2,&spec,&length))return NULL;
+    if(!length||length>=MAX_FIELD_DEF){free(spec);errno=E2BIG;return NULL;}
+    return spec;
 }
 
 typedef struct {
     FILE *out;
     int   first_object;   /* tracks whether to emit a leading comma */
     int   total;          /* objects written */
+    int   failed;
 } ExportCtx;
 
 /* Per-field cb: append a JSON-quoted spec into the in-flight fields array. */
 typedef struct {
     FILE *out;
     int   first;
+    int   failed;
 } EmitFieldsCtx;
 
-static void emit_one_field(const char *obj, size_t len, void *vctx) {
-    EmitFieldsCtx *ec = (EmitFieldsCtx *)vctx;
-    char spec[256];
-    field_obj_to_spec(obj, len, spec, sizeof(spec));
-    if (!spec[0]) return;
-    fprintf(ec->out, "%s\"%s\"", ec->first ? "" : ",", spec);
-    ec->first = 0;
+static void emit_one_field(const char *obj,size_t len,void *ptr){
+    EmitFieldsCtx *c=ptr;if(c->failed)return;
+    char *spec=field_obj_to_spec(obj,len);
+    if(!spec){c->failed=1;return;}
+    if((!c->first&&fputc(',',c->out)==EOF)||schema_wire_quote(c->out,spec,strlen(spec)))c->failed=1;
+    free(spec);c->first=0;
 }
 
-static void emit_one_index(const char *str, size_t len, void *vctx) {
-    EmitFieldsCtx *ec = (EmitFieldsCtx *)vctx;
-    fprintf(ec->out, "%s\"%.*s\"", ec->first ? "" : ",", (int)len, str);
-    ec->first = 0;
+static void emit_one_index(const char *text,size_t len,void *ptr){
+    EmitFieldsCtx *c=ptr;if(c->failed)return;
+    if((!c->first&&fputc(',',c->out)==EOF)||schema_wire_quote(c->out,text,len))c->failed=1;
+    c->first=0;
 }
 
 typedef struct {
     int  port;
-    char dir[64];
+    char dir[256];
     ExportCtx *exp;
 } DescribeCtx;
 
@@ -4423,22 +4354,23 @@ typedef struct {
    Drives one describe-object query and emits a manifest entry. */
 static void describe_one_object(const char *str, size_t len, void *vctx) {
     DescribeCtx *dc = (DescribeCtx *)vctx;
-    if (len >= 64) return;
-    char object[64];
+    if(dc->exp->failed)return;
+    if(len>=256){dc->exp->failed=1;return;}
+    char object[256];
     memcpy(object, str, len); object[len] = '\0';
 
-    char req[256];
+    char req[1024];
     int rl = snprintf(req, sizeof(req),
         "{\"mode\":\"describe-object\",\"dir\":\"%s\",\"object\":\"%s\"}",
         dc->dir, object);
-    if (rl <= 0 || rl >= (int)sizeof(req)) return;
+    if(rl<=0||rl>=(int)sizeof(req)){dc->exp->failed=1;return;}
 
     char *resp = NULL; size_t resp_len = 0;
     if (query_collect(dc->port, req, (size_t)rl, &resp, &resp_len) != 0 || !resp) {
         fprintf(stderr, "warn: describe-object %s/%s failed; skipping\n",
                 dc->dir, object);
         free(resp);
-        return;
+        dc->exp->failed=1;return;
     }
 
     JsonObj o;
@@ -4446,7 +4378,7 @@ static void describe_one_object(const char *str, size_t len, void *vctx) {
         fprintf(stderr, "warn: describe-object %s/%s returned malformed JSON\n",
                 dc->dir, object);
         free(resp);
-        return;
+        dc->exp->failed=1;return;
     }
     /* Bail if the response is an error envelope. */
     const char *errv; size_t errl;
@@ -4454,7 +4386,7 @@ static void describe_one_object(const char *str, size_t len, void *vctx) {
         fprintf(stderr, "warn: describe-object %s/%s: %.*s\n",
                 dc->dir, object, (int)errl, errv);
         free(resp);
-        return;
+        dc->exp->failed=1;return;
     }
 
     int splits  = json_obj_int(&o, "splits",  0);
@@ -4468,22 +4400,34 @@ static void describe_one_object(const char *str, size_t len, void *vctx) {
     const char *fv; size_t fl;
     if (json_obj_get(&o, "fields", &fv, &fl)) {
         char *fields_buf = malloc(fl + 1);
+        if(!fields_buf){dc->exp->failed=1;free(resp);return;}
         memcpy(fields_buf, fv, fl); fields_buf[fl] = '\0';
-        EmitFieldsCtx ec = { dc->exp->out, 1 };
-        walk_object_array(fields_buf, emit_one_field, &ec);
+        EmitFieldsCtx ec = { dc->exp->out, 1, 0 };
+        if(walk_object_array(fields_buf,emit_one_field,&ec)||ec.failed)dc->exp->failed=1;
         free(fields_buf);
     }
+    else dc->exp->failed=1;
     fprintf(dc->exp->out, "],\"indexes\":[");
 
     const char *iv; size_t il;
     if (json_obj_get(&o, "indexes", &iv, &il)) {
         char *idx_buf = malloc(il + 1);
+        if(!idx_buf){dc->exp->failed=1;free(resp);return;}
         memcpy(idx_buf, iv, il); idx_buf[il] = '\0';
-        EmitFieldsCtx ec = { dc->exp->out, 1 };
-        walk_string_array(idx_buf, emit_one_index, &ec);
+        EmitFieldsCtx ec = { dc->exp->out, 1, 0 };
+        if(walk_string_array(idx_buf,emit_one_index,&ec)||ec.failed)dc->exp->failed=1;
         free(idx_buf);
     }
-    fprintf(dc->exp->out, "]}");
+    else dc->exp->failed=1;
+    fprintf(dc->exp->out,"]");
+    const char *metadata[]={"streams","auto_key","declaration_layout"};
+    for(size_t k=0;k<sizeof(metadata)/sizeof(metadata[0]);k++){
+        const char *value=NULL;size_t n=0;
+        if(json_obj_get(&o,metadata[k],&value,&n)){
+            if(fprintf(dc->exp->out,",\"%s\":",metadata[k])<0||fwrite(value,1,n,dc->exp->out)!=n)dc->exp->failed=1;
+        }
+    }
+    if(fputc('}',dc->exp->out)==EOF)dc->exp->failed=1;
 
     dc->exp->first_object = 0;
     dc->exp->total++;
@@ -4499,87 +4443,80 @@ typedef struct {
    Lists objects under that tenant and describes each. */
 static void describe_one_tenant(const char *str, size_t len, void *vctx) {
     TenantCtx *tc = (TenantCtx *)vctx;
-    if (len >= 64) return;
+    if(tc->exp->failed)return;
+    if(len>=256){tc->exp->failed=1;return;}
     DescribeCtx dc;
     dc.port = tc->port;
     dc.exp  = tc->exp;
     memcpy(dc.dir, str, len); dc.dir[len] = '\0';
 
-    char req[128];
+    char req[512];
     int rl = snprintf(req, sizeof(req),
         "{\"mode\":\"list-objects\",\"dir\":\"%s\"}", dc.dir);
-    if (rl <= 0 || rl >= (int)sizeof(req)) return;
+    if(rl<=0||rl>=(int)sizeof(req)){tc->exp->failed=1;return;}
 
     char *resp = NULL; size_t resp_len = 0;
     if (query_collect(tc->port, req, (size_t)rl, &resp, &resp_len) != 0 || !resp) {
         fprintf(stderr, "warn: list-objects %s failed; skipping tenant\n", dc.dir);
         free(resp);
-        return;
+        tc->exp->failed=1;return;
     }
     JsonObj o;
     if (json_parse_object(resp, resp_len, &o) <= 0) {
         fprintf(stderr, "warn: list-objects %s returned malformed JSON\n", dc.dir);
         free(resp);
-        return;
+        tc->exp->failed=1;return;
     }
     const char *ov; size_t ol;
+    const char *error_value=NULL;size_t error_length=0;
+    if(json_obj_get(&o,"error",&error_value,&error_length)){
+        tc->exp->failed=1;free(resp);return;
+    }
     if (json_obj_get(&o, "objects", &ov, &ol)) {
         char *objs_buf = malloc(ol + 1);
+        if(!objs_buf){tc->exp->failed=1;free(resp);return;}
         memcpy(objs_buf, ov, ol); objs_buf[ol] = '\0';
-        walk_string_array(objs_buf, describe_one_object, &dc);
+        if(walk_string_array(objs_buf,describe_one_object,&dc))tc->exp->failed=1;
         free(objs_buf);
-    }
+    }else tc->exp->failed=1;
     free(resp);
 }
 
 /* Manifest is JSON; contains schema and index definitions only — no data,
    no tokens. out_path may be NULL or "-" to write to stdout. */
-int cmd_export_schema(int port, const char *out_path) {
-    char *resp = NULL; size_t resp_len = 0;
-    if (query_collect(port, "{\"mode\":\"db-dirs\"}", 19, &resp, &resp_len) != 0
-        || !resp) {
-        fprintf(stderr, "Error: db-dirs query failed\n");
-        free(resp);
-        return 1;
-    }
-
-    FILE *out;
-    int close_out = 0;
-    if (!out_path || !out_path[0] || strcmp(out_path, "-") == 0) {
-        out = stdout;
-    } else {
-        out = fopen(out_path, "w");
-        if (!out) {
-            fprintf(stderr, "Error: cannot open %s for writing: %s\n",
-                    out_path, strerror(errno));
-            free(resp);
-            return 1;
+int cmd_export_schema(int port,const char *path){
+    char *dirs=NULL;size_t length=0;int error=0;
+    if(query_collect(port,"{\"mode\":\"db-dirs\"}",19,&dirs,&length)||!dirs){free(dirs);return 1;}
+    FILE *stage=tmpfile();if(!stage){free(dirs);return 1;}
+    fputs("{\n  \"dirs\": [",stage);
+    EmitFieldsCtx names={stage,1,0};
+    if(walk_string_array(dirs,emit_one_index,&names)||names.failed)error=1;
+    fputs("],\n  \"objects\": [\n",stage);
+    ExportCtx export={stage,1,0,0};TenantCtx tenants={port,&export};
+    if(!error&&walk_string_array(dirs,describe_one_tenant,&tenants))error=1;
+    free(dirs);fputs("\n  ]\n}\n",stage);
+    if(export.failed||ferror(stage)||fflush(stage)||fseeko(stage,0,SEEK_SET))error=1;
+    FILE *out=stdout;char temporary[PATH_MAX]={0};int named=path&&*path&&strcmp(path,"-");
+    if(!error&&named){
+        int n=snprintf(temporary,sizeof(temporary),"%s.tmp.XXXXXX",path);
+        if(n<0||(size_t)n>=sizeof(temporary))error=1;
+        else{
+            int fd=mkstemp(temporary);
+            if(fd<0)error=1;
+            else{out=fdopen(fd,"w");if(!out){close(fd);error=1;}}
         }
-        close_out = 1;
     }
-
-    fprintf(out, "{\n  \"dirs\": [");
-    /* Re-use the same response twice: once to emit the dirs[] list, then
-       walk it again to drive list-objects + describe-object. */
-    {
-        EmitFieldsCtx ec = { out, 1 };
-        walk_string_array(resp, emit_one_index, &ec);
+    if(!error){
+        char block[8192];size_t n;
+        while((n=fread(block,1,sizeof(block),stage)))if(fwrite(block,1,n,out)!=n){error=1;break;}
+        if(ferror(stage)||ferror(out)||fflush(out))error=1;
+        if(named&&fsync(fileno(out)))error=1;
     }
-    fprintf(out, "],\n  \"objects\": [\n");
-
-    ExportCtx exp = { out, 1, 0 };
-    TenantCtx tc = { port, &exp };
-    walk_string_array(resp, describe_one_tenant, &tc);
-
-    fprintf(out, "\n  ]\n}\n");
-    if (close_out) fclose(out);
-    free(resp);
-
-    fprintf(stderr, "exported %d object%s%s%s\n",
-            exp.total, exp.total == 1 ? "" : "s",
-            close_out ? " to " : "",
-            close_out ? out_path : "");
-    return 0;
+    if(named&&out&&out!=stdout&&fclose(out))error=1;
+    if(fclose(stage))error=1;
+    if(named&&temporary[0]){if(!error){if(rename(temporary,path))error=1;}if(error)unlink(temporary);}
+    if(error){fprintf(stderr,"Error: schema export failed; no complete manifest published\n");return 1;}
+    fprintf(stderr,"exported %d object%s\n",export.total,export.total==1?"":"s");return 0;
 }
 
 typedef struct {

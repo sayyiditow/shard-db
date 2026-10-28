@@ -91,3 +91,6 @@ cells, headers and rows with reversible visible byte escapes. The private
 [CSV fetch/multi-get backends](packed-csv-commands.md) connect those helpers to
 their command entry points with checked failure handling. Legacy CSV writers,
 find/join/aggregate/keys consumers and public packed activation remain separate.
+
+Current ordinary read/write and declaration integration contracts are in
+[ordinary type integration](ordinary-type-integration.md).

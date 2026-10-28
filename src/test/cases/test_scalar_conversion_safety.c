@@ -292,19 +292,16 @@ static int test_scalar_conversion_safety_run(void) {
     ASSERT_TRUE(r && strncmp(r, "false", 5) == 0, "bad bulk row skipped");
     free(r);
 
-    /* Overflowing literal default now fails the insert (was silent
-       wrap). */
+    /* R1 validates literal defaults before publishing any schema. */
     r = req(tc, "{\"mode\":\"create-object\",\"dir\":\"conv\","
         "\"object\":\"dflt\",\"splits\":8,\"max_key\":64,"
         "\"fields\":[\"x:int:default=99999999999\"]}");
-    ASSERT_TRUE(r && strstr(r, "\"error\"") == NULL, "dflt object created "
-                "(default validation is Phase 4)");
+    ASSERT_TRUE(r && strstr(r, "\"error\"") != NULL,
+                "overflowing literal default refuses schema publication");
     free(r);
-    r = req(tc, "{\"mode\":\"insert\",\"dir\":\"conv\",\"object\":\"dflt\","
-        "\"key\":\"a\",\"value\":{}}");
-    ASSERT_TRUE(r && strstr(r, "\"error\"") != NULL &&
-                strstr(r, "x") != NULL,
-                "overflowing literal default refuses the insert");
+    r = req(tc, "{\"mode\":\"describe-object\",\"dir\":\"conv\",\"object\":\"dflt\"}");
+    ASSERT_TRUE(r && strstr(r, "\"error\"") != NULL && strstr(r,"not found") != NULL,
+                "rejected default leaves no object");
     free(r);
 
     /* Float→double widening preserves the exact stored value. */

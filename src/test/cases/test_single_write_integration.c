@@ -105,7 +105,9 @@ static void w_routes(void){
     if(out){ASSERT_CONTAINS(out,"a\\u0000b","embedded NUL byte span");free(out);}
     w_assert_reject(&f,0,"{\"f0\":\"\"}",NULL);
     w_assert_reject(&f,1,"{\"f0\":\"\"}",NULL);
-    w_assert_reject(&f,1,"{\"f3\":{\"$incr\":1}}",NULL);
+    ASSERT_EQ_INT(w_call(&f,1,"a","{\"f3\":{\"$incr\":1}}",NULL,0,1,&out),0,"packed computed update supported");
+    if(out){ASSERT_CONTAINS(out,"\"f3\":11","computed result reaches command response");free(out);}
+    w_assert_reject(&f,1,"{\"f3\":{\"$incr\":1,\"$copy\":\"f3\"}}",NULL);
     w_assert_reject(&f,1,"{\"f3\":32768000000}",NULL);
     w_assert_reject(&f,1,"{\"f1\":\"\\uZZZZ\"}",NULL);
     w_assert_reject(&f,1,"{\"f3\":1}","[]");
@@ -116,7 +118,7 @@ static void w_routes(void){
     uint64_t pos=w_pos(&f);ASSERT_EQ_INT(w_call(&f,1,"a","{}",NULL,1,0,&out),0,"dry run existing");free(out);
     ASSERT_TRUE(w_pos(&f)==pos,"dry run no append");
     char *final=w_get(&f,"a",&n);ASSERT_NOT_NULL(final,"final physical row");
-    if(final){ASSERT_CONTAINS(final,"\"f3\":10","last successful fixed field");free(final);}
+    if(final){ASSERT_CONTAINS(final,"\"f3\":11","last successful fixed field");free(final);}
     int slot=f.db.slot_size;slotcask_close(&f.db);f.opened=0;
     ASSERT_EQ_INT(slotcask_open(&f.db,f.root,1,1,slot),0,"reopen actual rows");f.opened=1;
     final=w_get(&f,"a",&n);ASSERT_NOT_NULL(final,"reopened physical row");free(final);free(before);w_close(&f);

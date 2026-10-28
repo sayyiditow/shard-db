@@ -221,4 +221,11 @@ int tui_criteria_builder(const ObjectInfo *oi,
                          CritRow *rows, int *n_io,
                          char **criteria_out);
 
+
+
+/* Shared read-only JSON span helpers: returned pointers borrow the input. */
+const char *cli_json_skip_ws(const char *text);
+const char *cli_json_skip_value(const char **text);
+const char *cli_json_find_key(const char *json,const char *key,size_t *length);
+
 #endif

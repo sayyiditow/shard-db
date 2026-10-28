@@ -11282,3 +11282,482 @@ int slotcask_compact_kf(SlotcaskDb *db) {
     }
     return 0;
 }
+
+
+/* Ordinary checked reads use exactly the existing keyfile -> segment cache
+ * read-handle order. The caller already holds the matching object read lock;
+ * no writer gate/reservation is acquired and no global snapshot is promised. */
+static int slotcask_emit_checked(SlotcaskDb *db,const SlotcaskKfEntry *entry,
+    SlotcaskScanCb callback,void *ctx){
+    if(entry->stream_id>=db->num_streams){errno=EUCLEAN;return -1;}
+    char path[PATH_MAX];seg_path_for(path,db->data_dir,entry->stream_id,entry->file_id);
+    SlotcaskSegHandle segment={.slot=-1,.fd=-1};
+    if(segcache_acquire(&segment,path,0,0,0))return -1;
+    int rc=0;
+    if(entry->offset>segment.map_size||segment.map_size-entry->offset<24){errno=EUCLEAN;rc=-1;}
+    else{
+        const uint8_t *record=segment.map+entry->offset;
+        uint16_t keylen=seg_rec_klen(record);uint32_t value_len=seg_rec_vlen(record);
+        size_t encoded=24u+(size_t)keylen+(size_t)value_len;
+        size_t padded=slotcask_record_size_varlen(keylen,value_len);
+        if(encoded>(size_t)db->slot_size||padded>(size_t)db->slot_size||
+           padded>segment.map_size-entry->offset||!seg_rec_live_with_hash(record,entry->hash)){
+            errno=EUCLEAN;rc=-1;
+        }else if(callback(entry->hash,record+24,keylen,record+24+keylen,value_len,record[19],ctx))rc=1;
+    }
+    int saved=errno;segcache_release(&segment);errno=saved;return rc;
+}
+int slotcask_walk_live_skip_checked(SlotcaskDb *db, int64_t skip_n,
+    SlotcaskScanCb callback, void *ctx) {
+    if (!db || !callback || db->num_shards < 1) { errno = EINVAL; return -1; }
+    for (int shard = 0; shard < db->num_shards; shard++) {
+        char path[PATH_MAX];
+        kf_path_for(path, db->data_dir, shard);
+        SlotcaskKfHandle keyfile;
+        if (kfcache_acquire(&keyfile, path, db->slots_per_shard, 0)) return -1;
+        int rc = 0;
+        for (size_t slot = 0; slot < keyfile.capacity; slot++) {
+            const SlotcaskKfEntry *entry = &keyfile.map[slot];
+            uint8_t flag = __atomic_load_n(&entry->flag, __ATOMIC_ACQUIRE);
+            if (!flag || flag == 2) continue;
+            if (flag != 1) { errno = EUCLEAN; rc = -1; break; }
+            if (skip_n > 0) { skip_n--; continue; }
+            rc = slotcask_emit_checked(db, entry, callback, ctx);
+            if (rc) break;
+        }
+        int saved = errno;
+        kfcache_release(&keyfile);
+        errno = saved;
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+int slotcask_walk_live_checked(SlotcaskDb *db, SlotcaskScanCb callback, void *ctx) {
+    return slotcask_walk_live_skip_checked(db, 0, callback, ctx);
+}
+int slotcask_lookup_by_hash_checked(SlotcaskDb *db,const uint8_t hash[16],
+    SlotcaskScanCb callback,void *ctx){
+    if(!db||!hash||!callback||db->num_shards<1){errno=EINVAL;return -1;}
+    int shard=shard_for_hash(hash,db->num_shards);char path[PATH_MAX];
+    kf_path_for(path,db->data_dir,shard);SlotcaskKfHandle keyfile;
+    SlotRef *ref=db->kf_slot_refs?&db->kf_slot_refs[shard]:NULL;
+    if(kfcache_acquire_direct(&keyfile,ref,path,db->slots_per_shard,db,shard))return -1;
+    int rc=0;size_t start=kf_slot_for(hash,keyfile.capacity);
+    for(size_t i=0;i<keyfile.capacity;i++){
+        const SlotcaskKfEntry *entry=&keyfile.map[(start+i)%keyfile.capacity];
+        uint8_t flag=__atomic_load_n(&entry->flag,__ATOMIC_ACQUIRE);
+        if(!flag)break;
+        if(flag==2)continue;
+        if(flag!=1){errno=EUCLEAN;rc=-1;break;}
+        if(memcmp(entry->hash,hash,16))continue;
+        rc=slotcask_emit_checked(db,entry,callback,ctx);if(rc)break;
+    }
+    int saved=errno;kfcache_release(&keyfile);errno=saved;return rc;
+}
+
+/* Checked probes distinguish a valid missing/tombstoned key from an
+ * invalid flag anywhere in the traversed probe chain. The caller owns the
+ * existing keyfile reader for the whole probe. */
+static int kf_lookup_no_verify_checked(SlotcaskKfHandle *kh,
+    const uint8_t hash[16],uint8_t *flag_out,uint8_t *stream_id_out,
+    uint16_t *file_id_out,uint32_t *offset_out,size_t *slot_out){
+    size_t start=kf_slot_for(hash,kh->capacity);
+    for(size_t i=0;i<kh->capacity;i++){
+        size_t slot=(start+i)%kh->capacity;
+        const SlotcaskKfEntry *entry=&kh->map[slot];
+        uint8_t flag=__atomic_load_n(&entry->flag,__ATOMIC_ACQUIRE);
+        if(!flag)return -1;
+        if(flag!=1&&flag!=2){errno=EUCLEAN;return -2;}
+        if(memcmp(entry->hash,hash,16))continue;
+        if(flag==2)return -1;
+        *flag_out=flag;*stream_id_out=entry->stream_id;
+        *file_id_out=entry->file_id;*offset_out=entry->offset;
+        *slot_out=slot;return 0;
+    }
+    return -1;
+}
+
+/* Checked bulk readers preserve the existing bucket/resolve/revalidation and
+ * dispatch patterns. Error status and bounds are explicit; no lock/gate or
+ * successful read-handle lifetime changes. Existing public implementations
+ * above remain byte-identical for consumers owned by later integrations. */
+int slotcask_bulk_lookup_in_kfshard_checked(SlotcaskDb *db, int kf_shard_id,
+                                      SlotcaskBulkRec *recs, size_t n) {
+    if(n==0)return 0;
+    if(!db||!recs||n>INT_MAX||kf_shard_id<0||kf_shard_id>=db->num_shards){errno=EINVAL;return -1;}
+    int failed=0;
+
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    SlotRef *kf_ref = (db->kf_slot_refs) ? &db->kf_slot_refs[kf_shard_id] : NULL;
+    if (kfcache_acquire_direct(&kh, kf_ref, kf_path,
+                                db->slots_per_shard, db, kf_shard_id) != 0) return -1;
+
+    SlotcaskBulkLookupState *st = calloc(n, sizeof(SlotcaskBulkLookupState));
+    if (!st) { kfcache_release(&kh); return -1; }
+
+    /* Phase 1: probe-only lookup under one rdlock. */
+    for (size_t i = 0; i < n; i++) {
+        SlotcaskBulkRec *r = &recs[i];
+        r->status = 0;
+        r->was_update = 0;
+        if (r->klen > UINT16_MAX) { r->status = -1; continue; }
+        compute_hash(r->key, r->klen, st[i].hash);
+        uint8_t flag = 0;
+        size_t slot;
+        int rc = kf_lookup_no_verify_checked(&kh, st[i].hash, &flag,
+                                      &st[i].sid, &st[i].fid, &st[i].off, &slot);
+        if(rc==-2){r->status=-1;failed=EUCLEAN;continue;}
+        if (rc < 0) { r->status = -2; continue; }
+        st[i].kf_found = 1;
+    }
+    /* The kf reader stays held through phase 2: the window contract
+       ("Kf read handle stays live until the segment record has been
+       checked against its hash/key and copied into caller-owned
+       memory") requires it. Released here, a window could tombstone
+       (T) and re-emit (P) this slot while phase 2 reads it under an
+       independent segcache rdlock — plain-vs-plain, zero common lock.
+       Same discipline as slotcask_get and kf_reval_fetch_one. */
+#ifdef TEST_BUILD
+    /* Regression hook (docs/plans/2026-08-28-eliminate-tsan-supp.md
+       Task B1): parks the caller after the probe phase so a test can
+       run a full window's worth of slot churn in the gap. Post-fix the
+       kf reader is still held here, so any window T step in the gap
+       blocks — which is exactly the assertion the test makes. */
+    if (atomic_load(&g_shard_test_bulk_lookup_gap) &&
+        atomic_fetch_add(&g_shard_test_bulk_lookup_gap_hit, 1) == 0) {
+        while (!atomic_load(&g_shard_test_bulk_lookup_gap_release))
+            nanosleep(&(struct timespec){0, 1000000L}, NULL);
+    }
+#endif
+
+    /* Phase 2: batched verify_stored_key — sort kf-hits by (sid, fid),
+       take segcache rdlock once per unique file, verify each record
+       under the held handle. Records that fail verify (hash collision
+       on a different stored key) get status=-2. */
+    int *vidx = malloc(n * sizeof(int));
+    if (vidx) {
+        int vcount = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (recs[i].status == 0 && st[i].kf_found) vidx[vcount++] = (int)i;
+        }
+        for (int a = 1; a < vcount; a++) {
+            int tmp = vidx[a];
+            uint8_t  ta_sid = st[tmp].sid; uint16_t ta_fid = st[tmp].fid;
+            int b = a - 1;
+            while (b >= 0) {
+                int bi = vidx[b];
+                if (st[bi].sid < ta_sid ||
+                    (st[bi].sid == ta_sid && st[bi].fid <= ta_fid)) break;
+                vidx[b + 1] = vidx[b];
+                b--;
+            }
+            vidx[b + 1] = tmp;
+        }
+        int k = 0;
+        while (k < vcount) {
+            int run_end = k + 1;
+            uint8_t  sid = st[vidx[k]].sid;
+            uint16_t fid = st[vidx[k]].fid;
+            while (run_end < vcount &&
+                   st[vidx[run_end]].sid == sid &&
+                   st[vidx[run_end]].fid == fid)
+                run_end++;
+            char path[PATH_MAX];
+            if(sid>=db->num_streams){failed=EILSEQ;for(int j=k;j<run_end;j++)recs[vidx[j]].status=-1;k=run_end;continue;}
+            seg_path_for(path, db->data_dir, sid, fid);
+            SlotcaskSegHandle h;
+            SlotRef *seg_ref = seg_ref_for(db, (int)sid, (uint32_t)fid);
+            if (segcache_acquire_direct(&h, seg_ref, path) != 0) {
+                failed=errno?errno:EIO;
+                for (int j = k; j < run_end; j++) recs[vidx[j]].status = -1;
+                k = run_end;
+                continue;
+            }
+            for (int j = k; j < run_end; j++) {
+                int i = vidx[j];
+                SlotcaskBulkRec *r = &recs[i];
+                if(st[i].sid>=db->num_streams||st[i].off>h.map_size||h.map_size-st[i].off<24){r->status=-1;failed=EILSEQ;continue;}
+                const uint8_t *rec = h.map + st[i].off;
+                size_t physical=slotcask_record_size_varlen(seg_rec_klen(rec),seg_rec_vlen(rec));
+                if(physical>(size_t)db->slot_size||physical>h.map_size-st[i].off||!seg_rec_live_with_hash(rec,st[i].hash)){
+                    r->status=-1;failed=EILSEQ;continue;
+                }
+                if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) != 1) { r->status = -2; continue; }
+                uint16_t k_stored = seg_rec_klen(rec);
+                if (k_stored != r->klen) { r->status = -2; continue; }
+                if (memcmp(rec + 24, r->key, r->klen) != 0) { r->status = -2; continue; }
+                st[i].verified = 1;
+            }
+            segcache_release(&h);
+            k = run_end;
+        }
+        free(vidx);
+    } else {
+        failed=ENOMEM;
+    }
+
+    kfcache_release(&kh);
+    free(st);
+    if(failed){errno=failed;return -1;}return 0;
+}
+static SlotcaskResolvedRec *slotcask_bulk_resolve_hashes_checked(SlotcaskDb *db,
+                                                    const uint8_t (*hashes)[16],
+                                                    size_t n,
+                                                    size_t *out_n) {
+    errno=0;
+    if (n == 0 || !out_n) { if (out_n) *out_n = 0; return NULL; }
+
+    SlotcaskResolvedRec *resolved = calloc(n, sizeof(SlotcaskResolvedRec));
+    if (!resolved) { *out_n = 0; return NULL; }
+
+    size_t resolved_n = 0;int failure=0;
+    int nshards = db->num_shards;
+
+    /* Pass 1: count hashes per KF shard */
+    size_t *per_shard_count = calloc((size_t)nshards, sizeof(size_t));
+    if (!per_shard_count) { free(resolved); *out_n = 0; return NULL; }
+
+    for (size_t i = 0; i < n; i++) {
+        int sid = shard_for_hash(hashes[i], nshards);
+        per_shard_count[sid]++;
+    }
+
+    /* Pass 2: allocate per-shard index arrays */
+    size_t **per_shard_idxs = calloc((size_t)nshards, sizeof(size_t *));
+    size_t *per_shard_pos   = calloc((size_t)nshards, sizeof(size_t));
+    if (!per_shard_idxs || !per_shard_pos) {
+        free(per_shard_count);
+        free(per_shard_idxs);
+        free(per_shard_pos);
+        free(resolved);
+        *out_n = 0;
+        return NULL;
+    }
+
+    int alloc_ok = 1;
+    for (int s = 0; s < nshards; s++) {
+        if (per_shard_count[s] > 0) {
+            per_shard_idxs[s] = malloc(per_shard_count[s] * sizeof(size_t));
+            if (!per_shard_idxs[s]) { alloc_ok = 0; break; }
+        }
+    }
+    if (!alloc_ok) {
+        for (int s = 0; s < nshards; s++) free(per_shard_idxs[s]);
+        free(per_shard_idxs);
+        free(per_shard_pos);
+        free(per_shard_count);
+        free(resolved);
+        *out_n = 0;
+        return NULL;
+    }
+
+    /* Pass 3: fill per-shard index arrays */
+    for (size_t i = 0; i < n; i++) {
+        int sid = shard_for_hash(hashes[i], nshards);
+        per_shard_idxs[sid][per_shard_pos[sid]++] = i;
+    }
+
+    /* Pass 4: for each non-empty shard, acquire KF, probe all its hashes */
+    char kf_path[PATH_MAX];
+    for (int s = 0; s < nshards; s++) {
+        size_t cnt = per_shard_count[s];
+        if (cnt == 0) continue;
+
+        kf_path_for(kf_path, db->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0){failure=errno?errno:EIO;break;}
+
+        for (size_t j = 0; j < cnt; j++) {
+            size_t hash_idx = per_shard_idxs[s][j];
+            uint8_t flag = 0;
+            uint8_t sid;
+            uint16_t fid;
+            uint32_t off;
+            size_t slot;
+            int rc = kf_lookup_no_verify_checked(&kh, hashes[hash_idx], &flag,
+                                          &sid, &fid, &off, &slot);
+            if(rc==-2){failure=EUCLEAN;break;}
+            if (rc == 0) {
+                SlotcaskResolvedRec *rr = &resolved[resolved_n++];
+                memcpy(rr->hash, hashes[hash_idx], 16);
+                rr->sid = sid;
+                rr->fid = fid;
+                rr->off = off;
+            }
+        }
+        kfcache_release(&kh);
+        if(failure)break;
+    }
+
+    /* Cleanup per-shard structures */
+    for (int s = 0; s < nshards; s++) free(per_shard_idxs[s]);
+    free(per_shard_idxs);
+    free(per_shard_pos);
+    free(per_shard_count);
+
+    if(failure){free(resolved);*out_n=0;errno=failure;return NULL;}
+    *out_n = resolved_n;
+    if (resolved_n == 0) { free(resolved); return NULL; }
+    return resolved;
+}
+typedef struct {
+    SlotcaskDb *db;SlotcaskResolvedRec *recs;size_t start,count;int kf_shard;
+    SlotcaskScanCb cb;void *ctx;int error;
+} CheckedRevalFetchArg;
+static void checked_reval_fetch_one(CheckedRevalFetchArg *fa) {
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, fa->db->data_dir, fa->kf_shard);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, fa->db->slots_per_shard, 0) != 0) {
+        fa->error=errno?errno:EIO;
+        /* Whole partition unreadable — retire every record in it. */
+        for (size_t i = 0; i < fa->count; i++)
+            fa->recs[fa->start + i].sid = 0xFF;
+        return;
+    }
+
+    for (size_t i = 0; i < fa->count; i++) {
+        SlotcaskResolvedRec *r = &fa->recs[fa->start + i];
+        uint8_t flag = 0, sid = 0;
+        uint16_t fid = 0;
+        uint32_t off = 0;
+        size_t slot = 0;
+        int rc=kf_lookup_no_verify_checked(&kh,r->hash,&flag,&sid,&fid,&off,&slot);
+        if(rc==-2){fa->error=EUCLEAN;break;}
+        if (rc != 0 || flag != 1 || sid != r->sid || fid != r->fid || off != r->off)
+            r->sid = 0xFF;  /* repointed or gone since resolve */
+    }
+    if(fa->error){kfcache_release(&kh);return;}
+
+    /* Compact survivors within the slice (disjoint per partition). */
+    size_t live_n = 0;
+    for (size_t i = 0; i < fa->count; i++) {
+        SlotcaskResolvedRec *r = &fa->recs[fa->start + i];
+        if (r->sid != 0xFF) fa->recs[fa->start + live_n++] = *r;
+    }
+
+    if (live_n > 0) {
+        qsort(&fa->recs[fa->start], live_n, sizeof(SlotcaskResolvedRec),
+              compare_sid_fid_off);
+        /* Copy every survivor's bytes under the STILL-HELD reader. */
+        size_t run_start = 0;
+        for (size_t i = 0; i < live_n; i++) {
+            int last = (i == live_n - 1);
+            if (!last &&
+                fa->recs[fa->start + i].sid ==
+                    fa->recs[fa->start + i + 1].sid &&
+                fa->recs[fa->start + i].fid ==
+                    fa->recs[fa->start + i + 1].fid)
+                continue;
+            char seg_path[PATH_MAX];
+            SlotcaskSegHandle h;
+            if(fa->recs[fa->start+run_start].sid>=fa->db->num_streams){fa->error=EILSEQ;break;}
+            seg_path_for(seg_path, fa->db->data_dir,
+                         fa->recs[fa->start + run_start].sid,
+                         fa->recs[fa->start + run_start].fid);
+            if (segcache_acquire(&h, seg_path, 0, 0, 0) == 0) {
+                for (size_t j = run_start; j <= i; j++) {
+                    const SlotcaskResolvedRec *r =
+                        &fa->recs[fa->start + j];
+                    if(r->sid>=fa->db->num_streams||r->off>h.map_size||h.map_size-r->off<24){fa->error=EILSEQ;break;}
+                    const uint8_t *rec = h.map + r->off;
+                    size_t physical=slotcask_record_size_varlen(seg_rec_klen(rec),seg_rec_vlen(rec));
+                    if(physical>(size_t)fa->db->slot_size||physical>h.map_size-r->off||!seg_rec_live_with_hash(rec,r->hash)){fa->error=EILSEQ;break;}
+                    uint16_t klen = seg_rec_klen(rec);
+                    uint32_t vlen = seg_rec_vlen(rec);
+                    if (fa->cb(r->hash, rec + 24, klen,
+                               rec + 24 + klen, vlen, rec[19], fa->ctx) != 0)
+                        break;
+                }
+                segcache_release(&h);
+            }else fa->error=errno?errno:EIO;
+            if(fa->error)break;
+            run_start = i + 1;
+        }
+    }
+
+    kfcache_release(&kh);
+}
+static void *checked_reval_fetch_worker(void *arg){checked_reval_fetch_one(arg);return NULL;}
+int slotcask_bulk_fetch_resolved_checked(SlotcaskDb *db,
+                                  SlotcaskResolvedRec *recs,
+                                  size_t n,
+                                  void *ctx,
+                                  SlotcaskScanCb cb) {
+    if (n == 0 || !cb) return 0;
+
+    /* Partition in place by KF shard: single pass with an index-keyed
+       bucket layout (avoids a comparator that needs db->num_shards). */
+    int nshards = db->num_shards;
+    size_t *part_start = calloc((size_t)nshards, sizeof(size_t));
+    size_t *part_count = calloc((size_t)nshards, sizeof(size_t));
+    if (!part_start || !part_count) {
+        free(part_start); free(part_count); return -1;
+    }
+    for (size_t i = 0; i < n; i++)
+        part_count[shard_for_hash(recs[i].hash, nshards)]++;
+    size_t acc = 0;
+    for (int s = 0; s < nshards; s++) {
+        part_start[s] = acc;
+        acc += part_count[s];
+    }
+    SlotcaskResolvedRec *sorted = malloc(n * sizeof(SlotcaskResolvedRec));
+    size_t *fill = calloc((size_t)nshards, sizeof(size_t));
+    if (!sorted || !fill) {
+        free(part_start); free(part_count); free(fill); free(sorted);
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        int s = shard_for_hash(recs[i].hash, nshards);
+        sorted[part_start[s] + fill[s]++] = recs[i];
+    }
+    free(fill);
+
+    /* Dispatch one reval+fetch pipeline per non-empty partition. */
+    int nparts = 0;
+    for (int s = 0; s < nshards; s++)
+        if (part_count[s] > 0) nparts++;
+    if (nparts > 0) {
+        CheckedRevalFetchArg *fargs = calloc((size_t)nparts, sizeof(CheckedRevalFetchArg));
+        if (!fargs) {
+            free(part_start); free(part_count); free(sorted);
+            return -1;
+        }
+        int fi = 0;
+        for (int s = 0; s < nshards; s++) {
+            if (part_count[s] == 0) continue;
+            fargs[fi].db = db;
+            fargs[fi].recs = sorted;
+            fargs[fi].start = part_start[s];
+            fargs[fi].count = part_count[s];
+            fargs[fi].kf_shard = s;
+            fargs[fi].cb = cb;
+            fargs[fi].ctx = ctx;
+            fi++;
+        }
+        if (nparts <= 3) {
+            for (int i = 0; i < nparts; i++) checked_reval_fetch_one(&fargs[i]);
+        } else {
+            parallel_for_io(checked_reval_fetch_worker, fargs, nparts,
+                            sizeof(CheckedRevalFetchArg));
+        }
+        int failure=0;for(int i=0;i<nparts;i++)if(fargs[i].error){failure=fargs[i].error;break;}
+        free(fargs);
+        if(failure){free(part_start);free(part_count);free(sorted);errno=failure;return -1;}
+    }
+    free(part_start);
+    free(part_count);
+    free(sorted);
+    return 0;
+}
+int slotcask_bulk_resolve_and_fetch_checked(SlotcaskDb *db,const uint8_t (*hashes)[16],size_t n,void *ctx,SlotcaskScanCb cb){
+    if(!db||(!hashes&&n)||!cb){errno=EINVAL;return -1;}
+    size_t count=0;errno=0;
+    SlotcaskResolvedRec *resolved=slotcask_bulk_resolve_hashes_checked(db,hashes,n,&count);
+    if(!resolved){int error=errno;return error?-1:0;}
+    int rc=slotcask_bulk_fetch_resolved_checked(db,resolved,count,ctx,cb);int error=errno;
+    free(resolved);errno=error;return rc;
+}

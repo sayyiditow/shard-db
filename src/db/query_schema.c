@@ -1,3 +1,4 @@
+#include "schema_wire.h"
 #include "types.h"
 #include "type_desc.h"
 #include "slotcask.h"
@@ -956,7 +957,6 @@ static void free_field_specs(char *(*specs)[MAX_FIELDS]) {
     for (int i = 0; i < MAX_FIELDS; i++) free((*specs)[i]);
 }
 
-static int validate_field_type_clean(char *buf);
 
 /* Validate a field type spec like "name:varchar:30" or "age:int".
    Returns the storage size (>0) on success, 0 on invalid. */
@@ -968,124 +968,15 @@ static int validate_field_type(const char *field_spec) {
        lists). _clean mutates buf in place (strips modifiers). */
     char *buf = strdup(colon + 1);
     if (!buf) return 0;
-    int rc = validate_field_type_clean(buf);
-    free(buf);
+    TypedField modifiers={0};
+    int parsed=parse_default_modifier_checked(buf,&modifiers);
+    int rc=parsed<0?0:typed_legacy_decl_size(buf);
+    if(rc){parse_field_type(buf,&modifiers);if(modifiers.type!=FT_ENUM&&typed_default_validate(&modifiers))rc=0;}
+    free_enum_values(&modifiers);free(buf);
     return rc;
 }
 
-static int validate_field_type_clean(char *buf) {
 
-    /* Strip :removed */
-    size_t blen = strlen(buf);
-    if (blen >= 8 && strcmp(buf + blen - 8, ":removed") == 0) {
-        buf[blen - 8] = '\0';
-    }
-    /* Strip a trailing :not_null / :nullable so the type matcher below
-       sees the bare type spec, then reject any further occurrence —
-       varchar/numeric/enum tolerate trailing bytes, so a buried token
-       would otherwise be accepted and silently unenforced. */
-    size_t nn_len = strlen(buf);
-    if (nn_len >= 9 && (strcmp(buf + nn_len - 9, ":not_null") == 0 ||
-                        strcmp(buf + nn_len - 9, ":nullable") == 0)) {
-        buf[nn_len - 9] = '\0';
-    }
-    if (strstr(buf, ":not_null") || strstr(buf, ":nullable")) return 0;
-    /* Strip default modifiers: :auto_create, :auto_update, :default=... */
-    char *dm;
-    if ((dm = strstr(buf, ":auto_update")) != NULL && dm[12] == '\0') *dm = '\0';
-    else if ((dm = strstr(buf, ":auto_create")) != NULL && dm[12] == '\0') *dm = '\0';
-    else if ((dm = strstr(buf, ":default=")) != NULL) *dm = '\0';
-
-    const char *type = buf;
-    if (strncmp(type, "varchar:", 8) == 0) {
-        int sz = atoi(type + 8);
-        if (sz <= 0 || sz > 65535) return 0;   /* bounded: 1..65535 content bytes */
-        return sz + 2;                          /* 2-byte length prefix */
-    }
-    if (strcmp(type, "varchar") == 0) return 0; /* bare "varchar" — require :N */
-    if (strcmp(type, "long") == 0)   return 8;
-    if (strcmp(type, "int") == 0)    return 4;
-    if (strcmp(type, "short") == 0)  return 2;
-    if (strcmp(type, "double") == 0) return 8;
-    if (strcmp(type, "float") == 0)  return 4;
-    if (strcmp(type, "bool") == 0)   return 1;
-    if (strcmp(type, "byte") == 0)   return 1;
-    if (strcmp(type, "date") == 0)   return 4;
-    if (strcmp(type, "datetime") == 0) return 7;
-    if (strcmp(type, "datetimems") == 0) return 8;
-    if (strcmp(type, "time") == 0)    return 3;
-    if (strcmp(type, "timestamp") == 0) return 8;
-    if (strcmp(type, "uuid") == 0)    return 16;
-    if (strcmp(type, "ipv4") == 0)    return 4;
-    if (strcmp(type, "ipv6") == 0)    return 16;
-    if (strcmp(type, "currency") == 0) return 8;
-    if (strncmp(type, "numeric:", 8) == 0) {
-        /* Full-input P[,S] validation. P stays informational until the
-           packed exact format lands; S must fit the int64 scaled storage:
-           0..18 (10^18 is the largest power of ten in int64; S = 0 is
-           valid). Legacy "numeric:N" without a comma keeps its
-           historical scale-2 meaning. Junk suffixes are rejected, not
-           atoi-prefixed. */
-        const char *ps = type + 8;
-        if (!(*ps >= '0' && *ps <= '9')) return 0;
-        while (*ps >= '0' && *ps <= '9') ps++;
-        if (*ps == ',') {
-            ps++;
-            if (!(*ps >= '0' && *ps <= '9')) return 0;
-            while (*ps >= '0' && *ps <= '9') ps++;
-        }
-        if (*ps != '\0') return 0;
-        const char *comma = strchr(type + 8, ',');
-        long s = comma ? strtol(comma + 1, NULL, 10) : 2;
-        if (s < 0 || s > 18) return 0;
-        return 8;
-    }
-    if (strncmp(type, "enum(", 5) == 0) {
-        /* Validate enum(v1,v2,...) — empty list, duplicates, missing
-           close paren, and over-ceiling all → invalid (return 0).
-           Returns the storage byte width: 1 for ≤256 values, 2 for
-           257..65535. create-object is cold path, simple alloc is fine. */
-        const char *open  = type + 5;
-        const char *close = strrchr(open, ')');
-        if (!close || close <= open) return 0;
-
-        /* Pass 1: count + duplicate-check via a heap-allocated value list.
-           A worst-case 65535-entry list of avg ~8B = ~640 KB peak — fine. */
-        char **vals = calloc(65536, sizeof(char *));
-        if (!vals) return 0;
-        int n = 0;
-        const char *p = open;
-        while (p < close) {
-            const char *next = memchr(p, ',', (size_t)(close - p));
-            if (!next) next = close;
-            size_t vl = (size_t)(next - p);
-            if (vl == 0) goto enum_invalid;            /* empty value */
-            if (n >= 65535)            goto enum_invalid;
-            char *v = malloc(vl + 1);
-            if (!v) goto enum_invalid;
-            memcpy(v, p, vl); v[vl] = '\0';
-            for (int i = 0; i < n; i++) {
-                if (strcmp(vals[i], v) == 0) {  /* duplicate */
-                    free(v);
-                    goto enum_invalid;
-                }
-            }
-            vals[n++] = v;
-            p = (next < close) ? next + 1 : close;
-        }
-        if (n == 0) goto enum_invalid;
-        int width = (n <= 256) ? 1 : 2;
-        for (int i = 0; i < n; i++) free(vals[i]);
-        free(vals);
-        return width;
-
-enum_invalid:
-        for (int i = 0; i < n; i++) free(vals[i]);
-        free(vals);
-        return 0;
-    }
-    return 0;
-}
 
 /* Validate + parse the auto_key spec. Returns 0 on AK_NONE, 1 on
    AK_UUID, 2 on AK_SEQ (with seq_name filled). On invalid input writes
@@ -1184,52 +1075,13 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         }
     }
 
-    /* Validate fields array — must be non-empty, every field must have a valid type */
-    const char *p = json_skip(fields_json);
-    if (*p != '[') {
-        OUT("{\"error\":\"fields must be a JSON array\"}\n");
-        return 1;
+    char *field_specs[MAX_FIELDS] __attribute__((cleanup(free_field_specs)))={0};
+    size_t parsed_fields=0;
+    if(typed_field_specs_parse(fields_json,field_specs,&parsed_fields)){
+        OUT("{\"error\":\"invalid fields array, duplicate field or field definition longer than limit\"}\n");return 1;
     }
-    p++;
-
-    /* First pass: validate all fields before creating anything. Rows are
-       heap strings (a MAX_FIELD_DEF-sized spec must fit); the cleanup
-       attribute frees every row on any of this function's early exits. */
-    char *field_specs[MAX_FIELDS] __attribute__((cleanup(free_field_specs))) = {0};
-    int nfields = 0;
-    int total_value_size = 0;
-
-    while (*p) {
-        p = json_skip(p);
-        if (*p == ']') break;
-        if (*p == ',') { p++; continue; }
-        if (*p != '"') {
-            OUT("{\"error\":\"fields array must contain strings\"}\n");
-            return 1;
-        }
-        p++;
-        const char *start = p;
-        while (*p && *p != '"') p++;
-        int flen = (int)(p - start);
-        if (*p == '"') p++;
-
-        if (nfields >= MAX_FIELDS) {
-            OUT("{\"error\":\"too many fields (max %d)\"}\n", MAX_FIELDS);
-            return 1;
-        }
-        if (flen <= 0 || flen >= MAX_FIELD_DEF) {
-            OUT("{\"error\":\"invalid field definition (empty or longer than %d bytes)\"}\n",
-                MAX_FIELD_DEF - 1);
-            return 1;
-        }
-        field_specs[nfields] = malloc((size_t)flen + 1);
-        if (!field_specs[nfields]) {
-            OUT("{\"error\":\"out of memory\"}\n");
-            return 1;
-        }
-        memcpy(field_specs[nfields], start, flen);
-        field_specs[nfields][flen] = '\0';
-
+    int nfields=0,total_value_size=0;
+    for(;nfields<(int)parsed_fields;nfields++){
         int field_size = validate_field_type(field_specs[nfields]);
         if (field_size <= 0) {
             OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, datetimems, time, timestamp, uuid, ipv4, ipv6, currency, numeric:P,S, enum(v1,v2,...)\"}\n",
@@ -1284,8 +1136,8 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
             return 1;
         }
 
-        total_value_size += field_size;
-        nfields++;
+        if(field_size>INT_MAX-total_value_size){OUT("{\"error\":\"schema size overflow\"}\n");return 1;}
+        total_value_size+=field_size;
     }
 
     if (nfields == 0) {
@@ -1370,7 +1222,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         })
 
     if (indexes_json && indexes_json[0]) {
-        p = json_skip(indexes_json);
+        const char *p=json_skip(indexes_json);
         if (*p == '[') {
             p++;
             while (*p) {
@@ -1854,10 +1706,6 @@ int cmd_list_objects(const char *db_root, const char *dir) {
     return 0;
 }
 
-static const char *field_type_str(enum FieldType t) {
-    const TypeDescriptor *d = type_desc(t);
-    return d ? d->name : "unknown";
-}
 
 /* Describe an object: schema (typed fields), indexes, splits, max_key, max_value,
    live record_count. Used by shard-cli to populate criteria builders + table
@@ -1886,56 +1734,26 @@ int cmd_describe_object(const char *db_root, const char *dir, const char *object
     Schema sch = load_schema(effective_root, object);
     TypedSchema *ts = load_typed_schema(effective_root, object);
 
-    OUT("{\"dir\":\"%s\",\"object\":\"%s\",\"splits\":%d,\"max_key\":%d,\"max_value\":%d,\"slot_size\":%d",
-        dir, object, sch.splits, sch.max_key, sch.max_value, sch.slot_size);
-
-    OUT(",\"fields\":[");
-    if (ts && ts->nfields > 0) {
-        int printed = 0;
-        for (int i = 0; i < ts->nfields; i++) {
-            const TypedField *f = &ts->fields[i];
-            if (f->removed) continue;
-            OUT("%s{\"name\":\"%s\",\"type\":\"%s\",\"size\":%d",
-                printed ? "," : "", f->name, field_type_str(f->type), f->size);
-            if (f->type == FT_NUMERIC)
-                OUT(",\"scale\":%d", f->numeric_scale);
-            switch (f->default_kind) {
-                case DK_LITERAL:     OUT(",\"default\":\"%s\"", f->default_val); break;
-                case DK_AUTO_CREATE: OUT(",\"default\":\"auto_create\""); break;
-                case DK_AUTO_UPDATE: OUT(",\"default\":\"auto_update\""); break;
-                case DK_SEQ:         OUT(",\"default\":\"seq(%s)\"", f->default_val); break;
-                case DK_UUID:        OUT(",\"default\":\"uuid()\""); break;
-                case DK_RANDOM:      OUT(",\"default\":\"random(%s)\"", f->default_val); break;
-                case DK_NONE:        break;
-            }
-            if (f->not_null)
-                OUT(",\"not_null\":true");
-            OUT("}");
-            printed++;
-        }
+    char *fields_json=typed_schema_fields_json(effective_root,object,ts,g_query_buffer_max_bytes);
+    if(!fields_json){OUT("{\"error\":\"invalid or unreadable schema declaration\"}\n");return 1;}
+    size_t used=strlen(fields_json)+1;
+    char *indexes_json=used<g_query_buffer_max_bytes?
+        typed_schema_indexes_json(effective_root,object,g_query_buffer_max_bytes-used):NULL;
+    if(!indexes_json){free(fields_json);OUT("{\"error\":\"invalid or unreadable index declaration\"}\n");return 1;}
+    OUT("{\"dir\":\"%s\",\"object\":\"%s\",\"splits\":%d,\"max_key\":%d,\"max_value\":%d,\"slot_size\":%d,\"fields\":%s",
+        dir,object,sch.splits,sch.max_key,sch.max_value,sch.slot_size,fields_json);
+    free(fields_json);
+    OUT(",\"streams\":%d,\"declaration_layout\":\"%s\"",sch.streams,
+        ts&&ts->packed.nfields?"packed":"legacy");
+    if(sch.auto_key!=AK_NONE){
+        char automatic[300];
+        if(sch.auto_key==AK_UUID)snprintf(automatic,sizeof(automatic),"uuid");
+        else snprintf(automatic,sizeof(automatic),"seq(%s)",sch.auto_key_seq_name);
+        OUT(",\"auto_key\":");
+        if(schema_wire_quote(g_out?g_out:stdout,automatic,strlen(automatic))){free(indexes_json);return 1;}
     }
-    OUT("]");
 
-    /* Index list: read $obj_root/indexes/index.conf — one declared index
-       per line. The .idx files only materialize after the first insert, so
-       scanning them would miss empty objects. */
-    OUT(",\"indexes\":[");
-    char idx_conf[PATH_MAX];
-    snprintf(idx_conf, sizeof(idx_conf), "%s/indexes/index.conf", obj_root);
-    FILE *iconf = fopen(idx_conf, "r");
-    if (iconf) {
-        char line[256];
-        int printed = 0;
-        while (fgets(line, sizeof(line), iconf)) {
-            char *end = line + strlen(line);
-            while (end > line && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ')) *--end = '\0';
-            if (line[0] == '\0' || line[0] == '#') continue;
-            OUT("%s\"%s\"", printed ? "," : "", line);
-            printed++;
-        }
-        fclose(iconf);
-    }
-    OUT("]");
+    OUT(",\"indexes\":%s",indexes_json);free(indexes_json);
 
     int rc_count = get_live_count(db_root, eff_obj);
     OUT(",\"record_count\":%d}\n", rc_count);

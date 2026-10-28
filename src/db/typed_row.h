@@ -105,6 +105,10 @@ int typed_insert_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     const char *json,
     const char *root,const char *object,uint8_t **out,size_t *len,
     char *err,size_t cap);
+/* Single-update computed operations read immutable locked OLD. Bulk retains
+ * its literal-only contract through typed_update_json_alloc. */
+int typed_update_computed_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
+    const char *json,uint8_t **out,size_t *len,char *err,size_t cap);
 int typed_update_json_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     const char *json,uint8_t **out,size_t *len,char *err,size_t cap);
 int typed_encode_packed_into(const TypedSchema *ts, const char *json, int defaults,
@@ -173,4 +177,12 @@ const char *generate_default(const TypedField *f, char *buf, size_t cap,
                               const char *root, const char *object);
 int decode_field_to_buf(const TypedField *f, const uint8_t *data,
                          char *buf, int cap, int render_zeros);
+/* Remaining heap budget shared by renderer output + transient decimal/join
+ * workspace. Zero is failure with errno; no allocation or output is performed. */
+size_t typed_packed_render_allowance(const TypedSchema *ts,const uint8_t *value,
+    size_t len,uint8_t flags,const char *fields,size_t available);
+/* Complete rows-format array with explicit key bytes and one validated view.
+ * Use render_allowance first for a command-wide output/workspace budget. */
+char *typed_packed_row_json(const TypedSchema *ts,const uint8_t *value,size_t len,
+    uint8_t flags,const void *key,size_t key_len,const char *fields,size_t budget);
 #endif

@@ -73,6 +73,9 @@ static int csv_start(CsvCommand *c,const FieldSchema *fs,
     if(!out||!fs||!fs->ts||!fs->ts->packed.nfields||!options){c->error=EINVAL;return -1;}
     c->fs=fs;c->options=options;c->started=now_ms_coarse();
     size_t budget=csv_available(c),n=0;if(!budget)return -1;
+    size_t selector=options->fields?strnlen(options->fields,MAX_LINE)+1:0;
+    if(selector>MAX_LINE||selector>=budget){c->error=ENOBUFS;return -1;}
+    budget-=selector;
     char *text=typed_packed_csv_header(fs->ts,options->fields,options->delimiter,budget,&n);
     return csv_add(c,text,n);
 }
@@ -80,6 +83,8 @@ static int csv_record(CsvCommand *c,const void *value,size_t vlen,uint8_t hdr2,
     const char *wire,size_t wire_len){
     if(csv_deadline(c))return -1;
     size_t budget=csv_available(c),n=0;if(!budget)return -1;
+    budget=typed_packed_render_allowance(c->fs->ts,value,vlen,hdr2,c->options->fields,budget);
+    if(!budget){c->error=errno?errno:ENOBUFS;return -1;}
     char *text=typed_packed_csv_row(c->fs->ts,value,vlen,hdr2,wire,wire_len,
         c->options->fields,c->options->delimiter,budget,&n);
     return csv_add(c,text,n);
@@ -88,7 +93,6 @@ static int csv_fetch_record(const uint8_t hash[16],const void *key,size_t klen,
     const void *value,size_t vlen,uint8_t hdr2,void *ptr){
     (void)hash;CsvCommand *c=ptr;
     if(csv_deadline(c))return 1;
-    if(c->skip){c->skip--;return 0;}
     if(!klen||klen>MAX_KEY_CEILING){c->error=EILSEQ;return 1;}
     char wire[MAX_KEY_CEILING+1];
     const Schema *sc=c->fs->auto_key==AK_NONE?NULL:&c->fs->auto_key_schema_snapshot;
@@ -114,10 +118,8 @@ int packed_csv_fetch(SlotcaskDb *db,const FieldSchema *fs,int offset,int limit,
     if(!db){c.error=EIO;return csv_finish(&c,out);}
     if(limit<=0||csv_offset(cursor,offset,&c.skip)){c.error=EINVAL;return csv_finish(&c,out);}
     if(want_total){c.error=ENOTSUP;return csv_finish(&c,out);}
-    c.limit=(size_t)limit;SlotcaskWriteReservation reservation={0};errno=0;
-    if(slotcask_write_reservation_begin(db,&reservation)){c.error=errno==ENOMEM?ENOMEM:EIO;return csv_finish(&c,out);}
-    int rc=slotcask_walk_live_strict(db,csv_fetch_record,&c);
-    slotcask_write_reservation_end(&reservation);
+    c.limit=(size_t)limit;
+    int rc=slotcask_walk_live_skip_checked(db,c.skip,csv_fetch_record,&c);
     if(rc<0&&!c.error)c.error=EIO;
     if(rc==1&&!c.error&&c.count!=c.limit)c.error=EIO;
     if(!c.error)csv_deadline(&c);
@@ -151,18 +153,18 @@ int packed_csv_get_multi(SlotcaskDb *db,const FieldSchema *fs,const Schema *sche
         c.error=EINVAL;return csv_finish(&c,out);
     }
     const char *p=json_skip(keys_json);if(*p++!='['){c.error=EINVAL;return csv_finish(&c,out);}
-    SlotcaskWriteReservation reservation={0};errno=0;
-    if(slotcask_write_reservation_begin(db,&reservation)){c.error=errno==ENOMEM?ENOMEM:EIO;return csv_finish(&c,out);}
-    size_t wire_max=schema->auto_key==AK_NONE?(size_t)schema->max_key:MAX_KEY_CEILING;
+        size_t wire_max=schema->auto_key==AK_NONE?(size_t)schema->max_key:MAX_KEY_CEILING;
     p=json_skip(p);
     while(*p!=']'&&!c.error){
         if(csv_deadline(&c))break;
         if(*p!='"'){c.error=EINVAL;break;}
         const char *start=++p,*end=json_raw_string_end(start);size_t raw=(size_t)(end-start);
         if(*end!='"'||raw>6u*wire_max){c.error=E2BIG;break;}
+        if(raw==SIZE_MAX||raw+1>csv_available(&c)){c.error=ENOBUFS;break;}
         char *wire=NULL;size_t wire_len=0;errno=0;
         if(json_unescape_string(start,raw,&wire,&wire_len)){c.error=errno==ENOMEM?ENOMEM:EINVAL;break;}
-        if(wire_len>wire_max){free(wire);c.error=E2BIG;break;}
+        c.bytes+=raw+1;
+        if(wire_len>wire_max){free(wire);c.bytes-=raw+1;c.error=E2BIG;break;}
         uint8_t storage[16];const uint8_t *key=(const uint8_t*)wire;size_t key_len=wire_len;
         if(schema->auto_key==AK_UUID){
             if(strlen(wire)!=wire_len||parse_uuid_string(wire,storage)){c.error=EINVAL;}
@@ -177,15 +179,14 @@ int packed_csv_get_multi(SlotcaskDb *db,const FieldSchema *fs,const Schema *sche
         if(!c.error){
             uint8_t hash[16];compute_hash_raw((const char*)key,key_len,hash);
             c.storage_key=key;c.storage_len=key_len;c.wire_key=wire;c.wire_len=wire_len;c.found=0;
-            int rc=slotcask_guard_lookup(db,hash,csv_get_record,&c);
+            int rc=slotcask_lookup_by_hash_checked(db,hash,csv_get_record,&c);
             if(rc<0&&!c.error)c.error=EIO;
             if(!c.error&&!c.found)csv_missing(&c);
         }
-        free(wire);p=json_skip(end+1);
+        free(wire);c.bytes-=raw+1;p=json_skip(end+1);
         if(*p==',')p=json_skip(p+1);
         else if(*p!=']')c.error=EINVAL;
     }
-    slotcask_write_reservation_end(&reservation);
     if(!c.error)csv_deadline(&c);
     return csv_finish(&c,out);
 }

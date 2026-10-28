@@ -1,9 +1,11 @@
+#include "schema_wire.h"
 #include "types.h"
 #include "slotcask.h"
 #include "io_direct.h"
 #include "query_internal.h"
 #include "typed_row.h"
 #include "packed_csv_command.h"
+#include "typed_read_command.h"
 #include <dirent.h>
 #include <fnmatch.h>
 
@@ -668,7 +670,8 @@ int parse_field_line(const char *line, TypedField *out) {
     const char *colon = strchr(line, ':');
     if (!colon || colon == line) return 0;
     size_t nlen = colon - line;
-    if (nlen >= 256) nlen = 255;
+    if (nlen >= sizeof(out->name)) return 0;
+    out->name_len=(int)nlen;
     memcpy(out->name, line, nlen);
     out->name[nlen] = '\0';
     /* Strip default-modifier suffix into out->default_kind/default_val so
@@ -681,15 +684,16 @@ int parse_field_line(const char *line, TypedField *out) {
        original line verbatim for the fields.conf write. */
     char *clean_spec = strdup(colon + 1);
     if (!clean_spec) return 0;
-    if (parse_default_modifier(clean_spec, out) < 0) {
+    if (parse_default_modifier_checked(clean_spec, out) < 0) {
         /* Invalid modifier structure — reject the line; the caller
            emits "Invalid field line". */
         free(clean_spec);
         return 0;
     }
-    parse_field_type(clean_spec, out);
+    if(typed_legacy_decl_size(clean_spec)<=0){free(clean_spec);return 0;}
+    parse_field_type(clean_spec,out);
     free(clean_spec);
-    return out->type != FT_NONE && out->size > 0;
+    return out->type != FT_NONE && out->size > 0 && !typed_default_validate(out);
 }
 
 /* === v2 (slotcask) rebuild path ===
@@ -1497,89 +1501,23 @@ int is_number(const char *s) {
 
 int cmd_exists(const char *db_root, const char *object,
                const char *key, size_t klen) {
-    Schema sc = load_schema(db_root, object);
-
-    SlotcaskSchemaInfo info = {
-        .splits = sc.splits, .slot_size = sc.slot_size,
-        .streams = sc.streams,
-    };
-    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) { OUT("false\n"); return 1; }
-    int rc = slotcask_exists(sdb, key, klen);
-    OUT("%s\n", rc == 1 ? "true" : "false");
-    return rc == 1 ? 0 : 1;
+    return typed_read_exists(db_root,object,key,klen);
 }
 
 
 
 /* ========== KEYS ========== */
 
-typedef struct {
-    int offset; int limit; int count; int printed;
-    char csv_delim;   /* 0 = JSON mode; else CSV (delim-less, single column) */
-    pthread_mutex_t lock;  /* serializes the emit section across parallel shards */
-} KeysCtx;
 
-int keys_cb(const SlotHeader *hdr, const uint8_t *block,
-                    void *ctx) {
-    KeysCtx *kc = (KeysCtx *)ctx;
 
-    /* Copy the key bytes to a thread-local buffer outside the lock. */
-    char kbuf[1024];
-    size_t kl = hdr->key_len < sizeof(kbuf) - 1 ? hdr->key_len : sizeof(kbuf) - 1;
-    memcpy(kbuf, block, kl); kbuf[kl] = '\0';
-
-    pthread_mutex_lock(&kc->lock);
-    if (kc->limit > 0 && kc->printed >= kc->limit) {
-        pthread_mutex_unlock(&kc->lock);
-        return 1;
-    }
-    kc->count++;
-    if (kc->count <= kc->offset) {
-        pthread_mutex_unlock(&kc->lock);
-        return 0;
-    }
-    if (kc->csv_delim) {
-        csv_emit_cell(kbuf, kc->csv_delim);
-        OUT("\n");
-    } else {
-        OUT("%s\"%s\"", kc->printed ? "," : "", kbuf);
-    }
-    kc->printed++;
-    pthread_mutex_unlock(&kc->lock);
-    return 0;
-}
 
 int cmd_keys(const char *db_root, const char *object, int offset, int limit,
              const char *format, const char *delimiter) {
-    if (limit <= 0) limit = g_global_limit;
-    char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
-    Schema sch = load_schema(db_root, object);
-    char data_dir[PATH_MAX];
-    snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
-    KeysCtx ctx = { offset, limit, 0, 0, csv_delim, PTHREAD_MUTEX_INITIALIZER };
-    if (csv_delim) OUT("key\n");  /* header */
-    else OUT("[");
-    /* For v2 with a small caller-set limit, route through the streaming
-       per-shard walker — Pass-1 ref-buffering wastes time collecting refs
-       a limit-bound caller never reads. The threshold (1000) is well below
-       typical full-scan workloads but covers the common KEYS first N case
-       and admin previews. */
-    int use_streaming = (limit > 0 && limit <= 1000);
-    if (use_streaming) {
-        SlotcaskSchemaInfo info = {
-            .splits = sch.splits, .slot_size = sch.slot_size,
-            .streams = sch.streams,
-        };
-        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
-        if (sdb) scan_shards_v2_streaming(sdb, keys_cb, &ctx);
-        else     scan_dispatch(db_root, object, &sch, data_dir, keys_cb, &ctx);
-    } else {
-        scan_dispatch(db_root, object, &sch, data_dir, keys_cb, &ctx);
-    }
-    pthread_mutex_destroy(&ctx.lock);
-    if (!csv_delim) OUT("]\n");
-    return 0;
+    TypedReadOptions options={.kind=TYPED_READ_KEYS,.format=format,
+        .delimiter=(format&&!strcmp(format,"csv"))?parse_csv_delim(delimiter):0,
+        .offset=offset,.limit=limit>0?limit:g_global_limit,.budget=g_query_buffer_max_bytes,
+        .timeout_ms=resolve_timeout_ms()};
+    return typed_read_route(db_root,object,&options);
 }
 
 /* ========== FETCH (paginated scan with optional field projection) ========== */
@@ -1811,162 +1749,19 @@ char parse_csv_delim(const char *s) {
  * deterministic given an unchanged dataset. Concurrent inserts can shift
  * the slot a record lives in but the per-kf-shard scan itself is
  * deterministic for read-only iteration. */
-typedef struct {
-    int     csv_delim;
-    int     rows_fmt;
-    int     dict_fmt;
-    int     to_skip;            /* records still to skip (cursor + offset combined) */
-    int     limit;
-    int     printed;            /* emitted so far (this call) */
-    int     scanned_so_far;     /* live records observed (skipped + emitted) */
-    const char **proj_fields;
-    int     proj_count;
-    FieldSchema *fs;
-} V2FetchCtx;
 
-static int v2_fetch_cb(const uint8_t hash16[16],
-                        const void *key, size_t klen,
-                        const void *value, size_t vlen,
-                        uint8_t hdr2, void *ctxp) {
-    (void)hash16;
-    V2FetchCtx *ctx = (V2FetchCtx *)ctxp;
-    ctx->scanned_so_far++;
-    if (ctx->to_skip > 0) { ctx->to_skip--; return 0; }
-    if (ctx->printed >= ctx->limit) return 1;
 
-    /* Reuse the existing v1 emit helpers — they take a SlotHeader + block
-       pointer where block = key bytes followed by value bytes. Synthesize a
-       SlotHeader for v2 (flag=1, klen, vlen) and compose the block in a
-       small heap buffer. */
-    SlotHeader hdr = {0};
-    memcpy(hdr.hash, hash16, 16);
-    hdr.flag = 1 | (((unsigned)hdr2 & 0xFF) << 8);
-    hdr.key_len = (uint16_t)klen;
-    hdr.value_len = (uint32_t)vlen;
-    uint8_t stk[2048];
-    uint8_t *block = (klen + vlen + 1 < sizeof(stk)) ? stk : malloc(klen + vlen);
-    if (!block) return 1;
-    memcpy(block, key, klen);
-    memcpy(block + klen, value, vlen);
-
-    char wire_key[1100];
-    render_wire_key(ctx->fs, block, hdr.key_len, wire_key);
-
-    if (ctx->csv_delim) {
-        csv_emit_row(wire_key, block + klen, (uint32_t)vlen,
-                      ctx->proj_count > 0 ? ctx->proj_fields : NULL,
-                      ctx->proj_count, ctx->fs, (char)ctx->csv_delim, hdr2);
-        ctx->printed++;
-    } else if (ctx->rows_fmt) {
-        print_record_row(&hdr, block, ctx->proj_fields, ctx->proj_count,
-                          &ctx->printed, ctx->fs);
-    } else if (ctx->dict_fmt) {
-        OUT("%s\"%s\":", ctx->printed ? "," : "", wire_key);
-        char *decoded = ctx->fs ? typed_decode(ctx->fs->ts,
-                                                (const uint8_t *)value, vlen, hdr2) : NULL;
-        OUT("%s", decoded ? decoded : "null");
-        free(decoded);
-        ctx->printed++;
-    } else {
-        OUT("%s{\"key\":\"%s\",\"value\":", ctx->printed ? "," : "", wire_key);
-        char *decoded = ctx->fs ? typed_decode(ctx->fs->ts,
-                                                (const uint8_t *)value, vlen, hdr2) : NULL;
-        OUT("%s}", decoded ? decoded : "null");
-        free(decoded);
-        ctx->printed++;
-    }
-
-    if (block != stk) free(block);
-    return 0;
-}
 
 static int cmd_fetch_v2(const char *db_root, const char *object,
                          int offset, int limit, const char *proj_str,
                          const char *cursor, const char *format,
                          const char *delimiter, const Schema *sch,
                          int want_total) {
-    int rows_fmt = (format && strcmp(format, "rows") == 0);
-    int dict_fmt = (format && strcmp(format, "dict") == 0);
-    char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
-    if (limit <= 0) limit = g_global_limit;
-
-    FieldSchema fs_fetch;
-    init_field_schema(&fs_fetch, db_root, object);
-    FieldSchema *fs_ptr = (fs_fetch.ts || fs_fetch.nfields > 0) ? &fs_fetch : NULL;
-    if (csv_delim && fs_fetch.ts && fs_fetch.ts->packed.nfields) {
-        SlotcaskSchemaInfo info = {.splits=sch->splits,.slot_size=sch->slot_size,.streams=sch->streams};
-        SlotcaskDb *db SDB_REG_REF = slotcask_registry_get(db_root,object,&info);
-        PackedCsvOptions options={.fields=proj_str,.delimiter=csv_delim,
-            .buffer_budget=g_query_buffer_max_bytes,.timeout_ms=resolve_timeout_ms()};
-        return packed_csv_fetch(db,&fs_fetch,offset,limit,cursor,want_total,&options,g_out?g_out:stdout);
-    }
-
-    const char *proj_fields[MAX_FIELDS];
-    char proj_buf[MAX_LINE];
-    int proj_count = 0;
-    if (proj_str && proj_str[0]) {
-        snprintf(proj_buf, sizeof(proj_buf), "%s", proj_str);
-        char *_tok_save = NULL; char *tok = strtok_r(proj_buf, ",", &_tok_save);
-        while (tok && proj_count < MAX_FIELDS) {
-            proj_fields[proj_count++] = tok;
-            tok = strtok_r(NULL, ",", &_tok_save);
-        }
-    }
-
-    int cursor_n = 0;
-    if (cursor && cursor[0]) cursor_n = atoi(cursor);
-
-    SlotcaskSchemaInfo info = {
-        .splits = sch->splits, .slot_size = sch->slot_size,
-        .streams = sch->streams,
-    };
-    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
-
-    if (csv_delim) {
-        if (want_total) {
-            OUT("{\"error\":\"\\\"total\\\" with format=csv is not supported\"}\n");
-            return -1;
-        }
-        csv_emit_header(proj_count > 0 ? proj_fields : NULL, proj_count, fs_ptr, csv_delim);
-    } else if (rows_fmt)
-        emit_rows_columns(proj_fields, proj_count, fs_ptr);
-    else if (dict_fmt)
-        OUT(want_total ? "{\"rows\":{" : "{\"results\":{");
-    else
-        OUT(want_total ? "{\"rows\":[" : "{\"results\":[");
-
-    V2FetchCtx fctx = {0};
-    fctx.csv_delim = csv_delim;
-    fctx.rows_fmt = rows_fmt;
-    fctx.dict_fmt = dict_fmt;
-    fctx.to_skip = 0;        /* skip handled by walk_live_skip below */
-    fctx.limit = limit;
-    fctx.proj_fields = proj_fields;
-    fctx.proj_count = proj_count;
-    fctx.fs = fs_ptr;
-    int64_t skip_n = (int64_t)cursor_n + (offset > 0 ? offset : 0);
-    /* slotcask_walk_live_skip cheaply skips past the first N live
-       records (no segcache touch) before invoking the callback —
-       offset=5000 went from ~5ms (per-record segcache_acquire even on
-       skip) to <1ms. */
-    if (sdb) slotcask_walk_live_skip(sdb, skip_n, v2_fetch_cb, &fctx);
-
-    if (csv_delim || rows_fmt) {
-        /* No JSON wrapper. CSV / rows formats stream as-is. */
-    } else if (want_total) {
-        /* total mode: emit {"rows":[...],"total":null} — cursor is omitted */
-        const char *close = dict_fmt ? "}" : "]";
-        OUT("%s,\"total\":null}\n", close);
-    } else {
-        const char *close = dict_fmt ? "}" : "]";
-        if (fctx.printed >= limit) {
-            int next_cur = cursor_n + fctx.printed;
-            OUT("%s,\"cursor\":\"%d\"}\n", close, next_cur);
-        } else {
-            OUT("%s,\"cursor\":null}\n", close);
-        }
-    }
-    return 0;
+    TypedReadOptions options={.kind=TYPED_READ_FETCH,.fields=proj_str,.format=format,
+        .delimiter=(format&&!strcmp(format,"csv"))?parse_csv_delim(delimiter):0,
+        .cursor=cursor,.offset=offset,.limit=limit>0?limit:g_global_limit,.want_total=want_total,
+        .budget=g_query_buffer_max_bytes,.timeout_ms=resolve_timeout_ms()};
+    return typed_read_route(db_root,object,&options);
 }
 
 /* Cursor-based fetch — scans from cursor position, returns next cursor.

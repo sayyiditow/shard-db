@@ -2015,6 +2015,12 @@ static int bulk_ins_run(const char *db_root, const char *object,
 
 int cmd_bulk_insert(const char *db_root, const char *object, const char *input,
                     int if_not_exists) {
+    TypedSchema *packed=load_typed_schema(db_root,object);
+    if(packed&&packed->packed.nfields){
+        Schema schema=load_schema(db_root,object);
+        return typed_bulk_insert_source(db_root,object,&schema,packed,input,0,0,if_not_exists);
+    }
+
     size_t len;
     char *json;
     int json_mmaped = 0;
@@ -2776,6 +2782,12 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
 int cmd_bulk_insert_delimited(const char *db_root, const char *object,
                                const char *filepath, char delimiter,
                                int if_not_exists) {
+    TypedSchema *packed=load_typed_schema(db_root,object);
+    if(packed&&packed->packed.nfields){
+        Schema schema=load_schema(db_root,object);
+        return typed_bulk_insert_source(db_root,object,&schema,packed,filepath,1,delimiter,if_not_exists);
+    }
+
     if (!filepath) { OUT("{\"error\":\"file is required\"}\n"); return 1; }
 
     int ifd = open(filepath, O_RDONLY);

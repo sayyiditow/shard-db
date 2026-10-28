@@ -204,6 +204,7 @@ typedef struct {
        site, so both default to unconstrained. */
     uint8_t not_null;
     uint8_t not_null_set;
+    uint8_t default_invalid; /* legacy declaration readable; unsafe default generation refused */
 
     /* FT_ENUM only — populated by load_typed_schema, freed by
        free_typed_schema. Empty/zeroed for every other type.
@@ -958,6 +959,13 @@ void free_enum_values(TypedField *f);
    max_len bytes or longer. Deliberately not getline(): no feature-macro
    regime questions on macOS. */
 char *conf_read_line(FILE *fp, size_t max_len, int *err);
+char *typed_decode_bounded_size(const TypedSchema *ts,const uint8_t *data,int len,
+    uint8_t hdr2,size_t budget,size_t *allocated);
+char *typed_decode_bounded(const TypedSchema *ts,const uint8_t *data,int len,
+    uint8_t hdr2,size_t budget);
+int parse_default_modifier(char *type_spec_inout,TypedField *tf);
+int parse_default_modifier_checked(char *type_spec_inout,TypedField *tf);
+char *generate_default_owned(const TypedField *tf,const char *root,const char *object,size_t budget);
 
 /* True when the spec's ":default=" tail exceeds TypedField.default_val's
    255-byte capacity. parse_default_modifier would silently truncate such

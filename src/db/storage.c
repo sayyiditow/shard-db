@@ -2,6 +2,7 @@
 #include "slotcask.h"
 #include "typed_row.h"
 #include "packed_csv_command.h"
+#include "typed_read_command.h"
 #include <errno.h>
 #include <math.h>
 #ifdef TEST_BUILD
@@ -391,41 +392,7 @@ int is_number(const char *s);
 
 int cmd_get(const char *db_root, const char *object,
             const char *key, size_t klen) {
-    Schema sc = load_schema(db_root, object);
-
-    /* Route through slotcask. Wire response shape (bare value dict for
-       single-key get, per 2026.05.1) is preserved. */
-    SlotcaskSchemaInfo info = {
-        .splits = sc.splits, .slot_size = sc.slot_size,
-        .streams = sc.streams,
-    };
-    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
-    void *val = NULL; size_t vlen = 0;
-    uint8_t get_hdr2 = 0;
-    if (slotcask_get_ex(sdb, key, klen, &val, &vlen, &get_hdr2) != 0) {
-        OUT("{\"error\":\"Not found\"}\n");
-        return 1;
-    }
-    LOG_DEBUG(LOG_SUB_SLOTCASK, "GET %s (klen=%zu, %zu bytes)", object, klen, vlen);
-    TypedSchema *ts = load_typed_schema(db_root, object);
-    FILE *out = g_out ? g_out : stdout;
-    if (vlen > INT_MAX) {
-        OUT("{\"error\":\"record exceeds decode limit\"}\n");
-        free(val); errno = EOVERFLOW; return 1;
-    }
-    if (typed_decode_stream(ts, (const uint8_t *)val, (int)vlen,
-                            out, get_hdr2) != 0) {
-        int saved = errno;
-        /* Rendering fails before output. An I/O failure may already have
-           emitted bytes, so do not concatenate a replacement JSON error. */
-        if (!ferror(out))
-            OUT("{\"error\":\"%s\"}\n", saved == ENOMEM ? "out of memory" : "corrupt record");
-        free(val); errno = saved; return 1;
-    }
-    int rc = fputc('\n', out) == EOF ? 1 : 0;
-    free(val);
-    return rc;
+    return typed_read_single_route(db_root,object,key,klen,NULL);
 }
 
 /* Single-key get with a field projection. Same slotcask read path as
@@ -435,59 +402,7 @@ int cmd_get(const char *db_root, const char *object,
    same as decode_field elsewhere). */
 int cmd_get_fields(const char *db_root, const char *object,
                     const char *key, size_t klen, const char *fields_csv) {
-    Schema sc = load_schema(db_root, object);
-    SlotcaskSchemaInfo info = {
-        .splits = sc.splits, .slot_size = sc.slot_size,
-        .streams = sc.streams,
-    };
-    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
-    if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
-    void *val = NULL; size_t vlen = 0;
-    uint8_t cur_hdr2 = 0;
-    if (slotcask_get_ex(sdb, key, klen, &val, &vlen, &cur_hdr2) != 0) {
-        OUT("{\"error\":\"Not found\"}\n");
-        return 1;
-    }
-
-    FieldSchema pfs;
-    init_field_schema(&pfs, db_root, object);
-    if(pfs.ts&&pfs.ts->packed.nfields){
-        FILE *out=g_out?g_out:stdout;
-        if(ferror(out)){free(val);errno=EIO;return 1;}
-        char *json=typed_packed_project_json(pfs.ts,val,vlen,cur_hdr2,fields_csv,SIZE_MAX);
-        if(!json){
-            int saved=errno;
-            const char *why=saved==ENOMEM?"out of memory":saved==ENOTSUP?
-                "packed composite projections await integration":saved==E2BIG?
-                "projection exceeds limit":"corrupt record";
-            OUT("{\"error\":\"%s\"}\n",why);free(val);errno=saved;return 1;
-        }
-        size_t length=strlen(json);errno=0;size_t written=fwrite(json,1,length,out);int saved=errno;
-        free(json);free(val);
-        if(written!=length||ferror(out)){errno=saved?saved:EIO;return 1;}
-        return fputc('\n',out)==EOF?1:0;
-    }
-    char proj_buf[MAX_LINE];
-    strncpy(proj_buf, fields_csv, MAX_LINE - 1);
-    proj_buf[MAX_LINE - 1] = '\0';
-    const char *flds[MAX_FIELDS];
-    int nf = 0;
-    char *_tok_save = NULL;
-    char *tok = strtok_r(proj_buf, ",", &_tok_save);
-    while (tok && nf < MAX_FIELDS) { flds[nf++] = tok; tok = strtok_r(NULL, ",", &_tok_save); }
-
-    OUT("{");
-    int first = 1;
-    for (int fi = 0; fi < nf; fi++) {
-        char *pv = json_projected_field((const char *)val, vlen, flds[fi],
-            (pfs.ts || pfs.nfields > 0) ? &pfs : NULL, cur_hdr2);
-        if (!pv) continue;
-        OUT("%s\"%s\":%s", first ? "" : ",", flds[fi], pv);
-        first = 0; free(pv);
-    }
-    OUT("}\n");
-    free(val);
-    return 0;
+    return typed_read_single_route(db_root,object,key,klen,fields_csv);
 }
 
 /* ========== CAS (Compare-and-Set) helper ========== */
@@ -510,12 +425,9 @@ int cas_check_tree(FieldSchema *fs, const uint8_t *value_ptr,
  * load_typed_schema's cache and stays valid for the request's lifetime.
  */
 
-static char *single_write_decode(const TypedSchema *ts,const uint8_t *b,
-    size_t n,uint8_t hdr2){
-    TypedRowView view;
-    if(typed_row_open(ts,b,n,hdr2,&view))return NULL;
-    return ts->packed.nfields?typed_packed_decode(ts,b,n,hdr2,SIZE_MAX):
-        typed_decode(ts,b,(uint32_t)n,hdr2);
+static char *single_write_decode(const TypedSchema *ts,const uint8_t *b,size_t n,uint8_t hdr2){
+    if(n>INT_MAX||n>=g_query_buffer_max_bytes){errno=ENOMEM;return NULL;}
+    return typed_decode_bounded(ts,b,(int)n,hdr2,g_query_buffer_max_bytes-n);
 }
 static int single_write_finish(const TypedSchema *ts,SlotcaskDb *db,size_t klen,
     uint8_t *b,size_t *n,int want_record,char **record,char *err,size_t cap){
@@ -1366,9 +1278,14 @@ typedef struct {
    op: 0 = none, 1 = $incr, 2 = $copy. */
 typedef struct {
     int  op;
-    char literal[128];   /* $incr: literal span, quotes stripped */
+    char *literal;      /* owned exact $incr text, JSON-decoded once */
     int  src_idx;        /* $copy: sibling TypedField index */
 } V2FieldCompute;
+typedef struct {V2FieldCompute fields[MAX_FIELDS];} V2ComputeSet;
+static void v2_compute_free(V2ComputeSet *set){
+    for(int i=0;i<MAX_FIELDS;i++)free(set->fields[i].literal);
+}
+
 
 /* NEW-from-OLD constructor for single partial updates. Runs inside
    upsert_slow_path while the kf-shard write lock is held, after
@@ -1644,16 +1561,19 @@ static int parse_computed_span(const TypedSchema *ts,
         out->op = 1;
         size_t n = strlen(incr);
         if (n >= 2 && incr[0] == '"' && incr[n - 1] == '"') {
-            memmove(incr, incr + 1, n - 2);
-            incr[n - 2] = '\0';
+            char *decoded=NULL;size_t decoded_len=0;
+            if(json_unescape_cstring(incr+1,n-2,&decoded,&decoded_len)){
+                free(incr);free(copy);return -1;
+            }
+            free(incr);incr=decoded;
         }
-        if (!incr[0] || strlen(incr) >= sizeof(out->literal)) {
+        if(!incr[0]||strlen(incr)>=g_query_buffer_max_bytes) {
             free(incr); free(copy);
             snprintf(err_buf, err_sz,
                      "field '%s': bad computed literal", f->name);
             return -1;
         }
-        memcpy(out->literal, incr, strlen(incr) + 1);
+        out->literal=incr;incr=NULL;
     } else {
         out->op = 2;
         size_t n = strlen(copy);
@@ -1711,6 +1631,38 @@ malformed:
    integer/numeric, host order for float/double (the record layout's
    own convention). Returns 0, or -1 with err_buf set — the caller
    aborts the whole update (nothing has been written yet). */
+static int legacy_numeric_increment(const TypedField *f,const uint8_t *old,
+    const char *literal,uint8_t *out,char *err,size_t cap){
+    if(f->numeric_scale<0||f->numeric_scale>18||f->numeric_scale_mult<=0){errno=EINVAL;return -1;}
+    char current[96];int n=decode_field_to_buf(f,old,current,sizeof(current),1);
+    if(n<1||(size_t)n>=sizeof(current)){errno=EILSEQ;return -1;}
+    dec_t a,b,sum,rounded;dec_init(&a);dec_init(&b);dec_init(&sum);dec_init(&rounded);
+    dec_status st=dec_parse(current,(size_t)n,&a,err,cap);
+    if(st==DEC_OK)st=dec_parse(literal,strlen(literal),&b,err,cap);
+    if(st==DEC_OK)st=dec_add(&a,&b,&sum);
+    /* Legacy P is informational. Only its actual int64/scale interpretation
+     * constrains assignment; migration audits the declared P separately. */
+    if(st==DEC_OK)st=dec_apply_precision(&sum,DEC_MAX_PRECISION,f->numeric_scale,&rounded,err,cap);
+    int rc=-1;
+    if(st==DEC_OK){
+        size_t bytes=dec_text_len(&rounded);
+        char *text=bytes&&bytes<=g_query_buffer_max_bytes?malloc(bytes):NULL;
+        if(!text)st=DEC_ERR_NOMEM;
+        else{
+            size_t used=0;st=dec_to_text(&rounded,text,bytes,&used);
+            int64_t value;
+            if(st==DEC_OK&&!conv_numeric_text(f,text,used,&value,err,cap)){
+                uint64_t bits=(uint64_t)value;
+                for(int i=7;i>=0;i--){out[i]=(uint8_t)bits;bits>>=8;}rc=0;
+            }
+            free(text);
+        }
+    }
+    dec_free(&rounded);dec_free(&sum);dec_free(&b);dec_free(&a);
+    if(st!=DEC_OK){errno=st==DEC_ERR_NOMEM?ENOMEM:EINVAL;}
+    return rc;
+}
+
 static int apply_computed_fields(const TypedSchema *ts,
                                  const SlotcaskOldRecord *old,
                                  uint8_t *out_value,
@@ -1815,48 +1767,9 @@ static int apply_computed_fields(const TypedSchema *ts,
             for (int b = 0; b < w; b++)
                 dst[b] = (uint8_t)(be >> (8 * (w - 1 - b)));
             typed_clear_null(out_value + 1, nbm_bytes, i);
-        } else if (f->type == FT_NUMERIC) {
-            uint64_t raw = 0;
-            for (int b = 0; b < 8; b++) raw = (raw << 8) | cur[b];
-            int64_t v = (int64_t)raw;
-            const char *s = comp[i].literal;
-            int neg = 0;
-            if (*s == '-') { neg = 1; s++; }
-            else if (*s == '+') s++;
-            const char *dot = strchr(s, '.');
-            size_t intlen = dot ? (size_t)(dot - s) : strlen(s);
-            size_t frlen  = dot ? strlen(dot + 1) : 0;
-            if (frlen > (size_t)f->numeric_scale) goto badliteral;
-            if (!intlen && !frlen) goto badliteral;
-            uint64_t magnitude = 0;
-            for (size_t b = 0; b < intlen; b++) {
-                if (s[b] < '0' || s[b] > '9') goto badliteral;
-                if (__builtin_mul_overflow(magnitude, UINT64_C(10), &magnitude) ||
-                    __builtin_add_overflow(magnitude, (uint64_t)(s[b] - '0'),
-                                           &magnitude)) goto overflow;
-            }
-            /* Append fraction, then pad to S. Scale exactly ONCE. */
-            for (size_t b = 0; b < (size_t)f->numeric_scale; b++) {
-                uint64_t digit = 0;
-                if (b < frlen) {
-                    if (dot[1 + b] < '0' || dot[1 + b] > '9') goto badliteral;
-                    digit = (uint64_t)(dot[1 + b] - '0');
-                }
-                if (__builtin_mul_overflow(magnitude, UINT64_C(10), &magnitude) ||
-                    __builtin_add_overflow(magnitude, digit, &magnitude)) goto overflow;
-            }
-            uint64_t limit = (uint64_t)INT64_MAX + (neg ? 1u : 0u);
-            if (magnitude > limit) goto overflow;
-            int64_t scaled = neg
-                ? (magnitude == (uint64_t)INT64_MAX + 1u
-                    ? INT64_MIN : -(int64_t)magnitude)
-                : (int64_t)magnitude;
-            int64_t r;
-            if (__builtin_add_overflow(v, scaled, &r)) goto overflow;
-            uint64_t be = (uint64_t)r;
-            for (int b = 0; b < 8; b++)
-                dst[b] = (uint8_t)(be >> (8 * (7 - b)));
-            typed_clear_null(out_value + 1, nbm_bytes, i);
+        } else if(f->type==FT_NUMERIC){
+            if(legacy_numeric_increment(f,cur,comp[i].literal,dst,err_buf,err_sz))return -1;
+            typed_clear_null(out_value+1,nbm_bytes,i);
         } else {   /* FT_FLOAT / FT_DOUBLE */
             double v;
             if (f->type == FT_FLOAT) {
@@ -1912,7 +1825,8 @@ static int v2_update_new_from_old(const SlotcaskOldRecord *old,
         snprintf(c->err_buf, sizeof(c->err_buf), "invalid update value");
         return -1;
     }
-    V2FieldCompute comp[MAX_FIELDS] = {0};
+    V2ComputeSet set __attribute__((cleanup(v2_compute_free)))={0};
+    V2FieldCompute *comp=set.fields;
     uint8_t is_computed[MAX_FIELDS] = {0};
     for (int i = 0; i < c->idx_ts->nfields; i++) {
         const char *v; size_t n;
@@ -1989,8 +1903,12 @@ static int v2_update_owned(const SlotcaskOldRecord *old,uint8_t **out,
 #ifdef TEST_BUILD
         slotcask_test_after_old(1);
 #endif
-        rc=typed_update_json_alloc(ts,old,c->partial_json,out,n,c->err_buf,sizeof(c->err_buf));
+        rc=typed_update_computed_alloc(ts,old,c->partial_json,out,n,c->err_buf,sizeof(c->err_buf));
     }else{
+        size_t budget=g_query_buffer_max_bytes;
+        size_t source=strnlen(c->partial_json,budget);
+        if(source==budget||(size_t)ts->total_size>budget||
+            source>(budget-(size_t)ts->total_size)/4){errno=ENOMEM;return -1;}
         *out=malloc((size_t)ts->total_size);
         if(!*out){snprintf(c->err_buf,sizeof(c->err_buf),"oom");errno=ENOMEM;return -1;}
         rc=v2_update_new_from_old(old,*out,(size_t)ts->total_size,n,c);
@@ -2820,690 +2738,27 @@ int cmd_delete(const char *db_root, const char *object,
 
 /* ========== Parallel multi-key EXISTS ========== */
 
-typedef struct {
-    char *key;          /* storage form: binary for auto_key, string otherwise */
-    size_t klen;        /* binary length (was strlen(key) before auto-key) */
-    char *wire_key;     /* wire-form string for response output */
-    uint8_t hash[16];
-    int shard_id;
-    int start_slot;
-    int orig_idx;
-    int found;
-} MultiExistsEntry;
-
-typedef struct {
-    const char *db_root;
-    const char *object;
-    const Schema *sch;
-    MultiExistsEntry *entries;
-    int count;
-} MultiExistsShardWork;
-
-/* Parse one wire-form key from a JSON array element into its storage
-   form, computing hash + kf-shard id along the way. Shared by every
-   multi-key path (bulk_exists, bulk_get). Auto-key UUID/seq forms get
-   parsed to binary; otherwise the storage form is verbatim bytes.
-   On malformed auto-key forms returns 0 — caller treats the row as a
-   miss (found=0 / result_json=NULL) so clients see the same "missing"
-   shape as a non-existent key. Returns 1 on success.
-   Heap allocations land in *out_wire_key and *out_storage_key — caller
-   owns both. */
-static int parse_multi_key(const char *src, size_t klen, const Schema *sc,
-                            char  **out_wire_key,
-                            uint8_t **out_storage_key, size_t *out_storage_klen,
-                            uint8_t out_hash[16], int *out_shard_id) {
-    char *wire = malloc(klen + 1);
-    if (!wire) {
-        LOG_ERROR(LOG_SUB_SLOTCASK, "parse_multi_key: malloc(%zu) failed for wire key buffer", klen + 1);
-        return -1;
-    }
-    memcpy(wire, src, klen);
-    wire[klen] = '\0';
-    *out_wire_key = wire;
-
-    uint8_t *skey = NULL;
-    size_t   slen = 0;
-    if (sc->auto_key == AK_UUID) {
-        uint8_t bin[16];
-        if (parse_uuid_string(wire, bin) == 0) {
-            skey = malloc(16);
-            if (skey) { memcpy(skey, bin, 16); slen = 16; }
-        }
-    } else if (sc->auto_key == AK_SEQ) {
-        int64_t v;
-        if (parse_seq_key(wire, &v) == 0) {
-            skey = malloc(8);
-            if (skey) {
-                for (int b = 7; b >= 0; b--) { skey[b] = (uint8_t)(v & 0xFF); v >>= 8; }
-                slen = 8;
-            }
-        }
-    } else {
-        skey = malloc(klen + 1);
-        if (skey) { memcpy(skey, src, klen); skey[klen] = '\0'; slen = klen; }
-    }
-    *out_storage_key = skey;
-    *out_storage_klen = slen;
-    if (skey) {
-        compute_hash_raw((const char *)skey, slen, out_hash);
-        *out_shard_id = compute_record_shard(out_hash, sc->splits);
-    } else {
-        /* Malformed auto-key wire form → never matches; keep shard
-           deterministic so bucket-sort works. */
-        memset(out_hash, 0, 16);
-        *out_shard_id = 0;
-    }
-    return 1;
-}
-
-static void *multi_exists_shard_worker(void *arg) {
-    MultiExistsShardWork *sw = (MultiExistsShardWork *)arg;
-    if (sw->count == 0) return NULL;
-
-    /* bulk_lookup_in_kfshard amortises kfcache_acquire + segcache_acquire
-       across the worker's records. The dispatcher already aligned
-       shard_id with compute_record_shard so all entries here hash to the
-       same kf shard. */
-    SlotcaskSchemaInfo info = {
-        .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
-        .streams = sw->sch->streams,
-    };
-    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(sw->db_root, sw->object, &info);
-    if (!sdb) {
-        LOG_ERROR(LOG_SUB_SLOTCASK, "multi_exists_shard_worker %s/%s: slotcask_registry_get failed, %d keys reported as not-found", sw->db_root, sw->object, sw->count);
-        return NULL;
-    }
-
-    SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
-    if (!batch) {
-        LOG_ERROR(LOG_SUB_SLOTCASK, "multi_exists_shard_worker %s/%s: calloc(%d) failed for batch, keys reported as not-found", sw->db_root, sw->object, sw->count);
-        return NULL;
-    }
-    for (int ei = 0; ei < sw->count; ei++) {
-        MultiExistsEntry *e = &sw->entries[ei];
-        batch[ei].key       = e->key;
-        batch[ei].klen      = e->klen;
-        batch[ei].value     = NULL;
-        batch[ei].vlen      = 0;
-        batch[ei].user_ctx  = NULL;
-        batch[ei].old_value = NULL;
-        batch[ei].old_vlen  = 0;
-        batch[ei].status    = 0;
-        batch[ei].was_update = 0;
-    }
-    int kf_shard_id = sw->entries[0].shard_id;  /* aligned by dispatcher */
-    slotcask_bulk_lookup_in_kfshard(sdb, kf_shard_id, batch, (size_t)sw->count);
-    for (int ei = 0; ei < sw->count; ei++) {
-        sw->entries[ei].found = (batch[ei].status == 0) ? 1 : 0;
-    }
-    free(batch);
-    return NULL;
-}
-
-/* Bucket-sort entries by shard_id, dispatch multi_exists_shard_worker
-   in parallel across shards, copy `.found` results back into `entries`
-   in original order. Shared by cmd_exists_multi, cmd_not_exists, and
-   cmd_get_multi — they each parse their key list into `entries[]` then
-   call this; afterwards they format their type-specific response from
-   the populated `entries[].found`.
-
-   Replaces the O(n²) insertion sort that previously dominated BULK
-   EXISTS / BULK GET: at 10K keys × ~128 shards the sort was ~50M
-   swaps before parallel_for even started. The bucket-sort is a
-   single pass over entries plus one pass to fan out into per-shard
-   buckets. */
-static void multi_bucket_dispatch(MultiExistsEntry *entries, int key_count,
-                                  const Schema *sc,
-                                  const char *db_root, const char *object) {
-    for (int i = 0; i < key_count; i++) entries[i].orig_idx = i;
-    int *shard_counts    = calloc(sc->splits, sizeof(int));
-    int *shard_to_worker = malloc(sc->splits * sizeof(int));
-    for (int i = 0; i < key_count; i++) shard_counts[entries[i].shard_id]++;
-    int nshard = 0;
-    for (int s = 0; s < sc->splits; s++) if (shard_counts[s] > 0) nshard++;
-
-    MultiExistsShardWork *workers = calloc(nshard, sizeof(MultiExistsShardWork));
-    {
-        int g = 0;
-        for (int s = 0; s < sc->splits; s++) {
-            if (shard_counts[s] > 0) {
-                workers[g].db_root = db_root;
-                workers[g].object  = object;
-                workers[g].sch     = sc;
-                workers[g].count   = 0;
-                workers[g].entries = malloc(shard_counts[s] * sizeof(MultiExistsEntry));
-                shard_to_worker[s] = g;
-                g++;
-            } else {
-                shard_to_worker[s] = -1;
-            }
-        }
-    }
-    for (int i = 0; i < key_count; i++) {
-        int w = shard_to_worker[entries[i].shard_id];
-        workers[w].entries[workers[w].count++] = entries[i];
-    }
-
-    parallel_for_io(multi_exists_shard_worker, workers, nshard, sizeof(MultiExistsShardWork));
-
-    /* Copy results back via orig_idx (no sorted[] indirection). */
-    for (int g = 0; g < nshard; g++)
-        for (int i = 0; i < workers[g].count; i++)
-            entries[workers[g].entries[i].orig_idx].found = workers[g].entries[i].found;
-
-    for (int g = 0; g < nshard; g++) free(workers[g].entries);
-    free(workers);
-    free(shard_counts);
-    free(shard_to_worker);
-}
-
-/* mode=exists with keys[], returns {"k1":true,"k2":false,...} */
 int cmd_exists_multi(const char *db_root, const char *object, const char *keys_json,
                      const char *format, const char *delimiter) {
-    char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
-    int key_count = 0, key_cap = 256;
-    MultiExistsEntry *entries = malloc(key_cap * sizeof(MultiExistsEntry));
-    Schema sc = load_schema(db_root, object);
-
-    const char *p = json_skip(keys_json);
-    if (*p == '[') p++;
-    while (*p) {
-        p = json_skip(p);
-        if (*p == ']') break;
-        if (*p == ',') { p++; continue; }
-        if (*p == '"') {
-            p++;
-            const char *start = p;
-            while (*p && *p != '"') p++;
-            size_t klen = p - start;
-            if (*p == '"') p++;
-            if (key_count >= key_cap) {
-                key_cap *= 2;
-                MultiExistsEntry *t = xrealloc_or_free(entries, key_cap * sizeof(*t));
-                if (!t) {
-                    /* xrealloc_or_free freed the old buffer; per-key
-                       strings inside it are leaked (no double-free,
-                       since the array holding their pointers is gone)
-                       — acceptable on OOM. Coverity CID 1693843: the
-                       previous "entries=NULL; break" left key_count>0
-                       and the loop below would deref NULL. */
-                    OUT("{\"error\":\"oom: bulk_exists keys\"}\n");
-                    return 1;
-                }
-                entries = t;
-            }
-            MultiExistsEntry *e = &entries[key_count++];
-            parse_multi_key(start, klen, &sc,
-                             &e->wire_key,
-                             (uint8_t **)&e->key, &e->klen,
-                             e->hash, &e->shard_id);
-            e->start_slot = 0;
-            e->found = 0;
-        } else p++;
-    }
-
-    if (key_count == 0) { free(entries); OUT("{}\n"); return 0; }
-
-    multi_bucket_dispatch(entries, key_count, &sc, db_root, object);
-
-    /* Output in original order — build the response in a single buffer
-       and OUT it once. Was 10K fprintf() calls in a loop, each taking
-       the per-FILE stdio lock + parsing the format string (~15+ ms for
-       10K keys at 1-2 µs/call). One snprintf-into-buffer + one OUT is
-       hundreds of µs. */
-    if (csv_delim) {
-        OUT("key%cexists\n", csv_delim);
-        size_t cap = (size_t)key_count * 64 + 64;
-        char *buf = malloc(cap);
-        size_t pos = 0;
-        if (buf) for (int i = 0; i < key_count; i++) {
-            const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
-            size_t klen = strlen(out_key);
-            if (pos + klen + 16 > cap) {
-                cap = (pos + klen + 16) * 2;
-                char *t = realloc(buf, cap);
-                if (!t) { free(buf); buf = NULL; break; }
-                buf = t;
-            }
-            /* Coverity: re-assert the post-grow invariant in subtractive
-               form (no addition-overflow path). The pre-grow above already
-               guarantees this — the check is dead code on the happy path
-               and the compiler DCEs it — but Coverity's flow analysis
-               loses the size-aliasing through the realloc→t→buf chain
-               and flags the memcpy below as OVERRUN. CID 1693857/1693869. */
-            if (cap < pos || cap - pos < klen) { free(buf); buf = NULL; break; }
-            /* csv_emit_cell quotes if needed; do it via the existing helper but
-               into our buffer via snprintf — replicate the no-quote-needed shape
-               here to avoid re-implementing the quote logic. */
-            /* CID 1693857/1693869 - bounds checked above, triage */
-            memcpy(buf + pos, out_key, klen); pos += klen;
-            /* Use SB_APPEND for bounded write — pre-grow above guarantees
-               room, but the macro silences the CodeQL "potentially
-               overflowing snprintf" finding by clamping to cap-1. */
-            SB_APPEND(buf, pos, cap, "%c%s\n",
-                       csv_delim, entries[i].found ? "true" : "false");
-        }
-        if (buf) {
-            fwrite(buf, 1, pos, g_out ? g_out : stdout);
-            free(buf);
-        }
-    } else {
-        size_t cap = (size_t)key_count * 32 + 32;
-        char *buf = malloc(cap);
-        size_t pos = 0;
-        if (buf) {
-            buf[pos++] = '{';
-            for (int i = 0; i < key_count; i++) {
-                const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
-                size_t klen = strlen(out_key);
-                if (pos + klen + 16 > cap) {
-                    cap = (pos + klen + 16) * 2;
-                    char *t = realloc(buf, cap);
-                    if (!t) { free(buf); buf = NULL; break; }
-                    buf = t;
-                }
-                /* Coverity: subtractive re-assertion of the post-grow
-                   invariant — see the equivalent comment in the CSV branch
-                   above for rationale. Tautological on the happy path. */
-                if (cap < pos || cap - pos < klen + 16) { free(buf); buf = NULL; break; }
-                if (i) buf[pos++] = ',';
-                buf[pos++] = '"';
-                memcpy(buf + pos, out_key, klen); pos += klen;
-                buf[pos++] = '"'; buf[pos++] = ':';
-                if (entries[i].found) {
-                    memcpy(buf + pos, "true", 4); pos += 4;
-                } else {
-                    memcpy(buf + pos, "false", 5); pos += 5;
-                }
-            }
-        }
-        if (buf) {
-            buf[pos++] = '}'; buf[pos++] = '\n';
-            fwrite(buf, 1, pos, g_out ? g_out : stdout);
-            free(buf);
-        } else {
-            OUT("{}\n");
-        }
-    }
-
-    /* (workers + per-worker entries freed inside multi_bucket_dispatch.) */
-    for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
-    free(entries);
-    return 0;
+    TypedReadOptions options={.kind=TYPED_READ_EXISTS_MULTI,.keys=keys_json,
+        .format=format,.delimiter=(format&&!strcmp(format,"csv"))?parse_csv_delim(delimiter):0,
+        .budget=g_query_buffer_max_bytes,.timeout_ms=resolve_timeout_ms()};
+    return typed_read_route(db_root,object,&options);
 }
 
-/* mode=not-exists with keys[], returns keys that don't exist */
 int cmd_not_exists(const char *db_root, const char *object, const char *keys_json) {
-    int key_count = 0, key_cap = 256;
-    MultiExistsEntry *entries = malloc(key_cap * sizeof(MultiExistsEntry));
-    Schema sc = load_schema(db_root, object);
-
-    const char *p = json_skip(keys_json);
-    if (*p == '[') p++;
-    while (*p) {
-        p = json_skip(p);
-        if (*p == ']') break;
-        if (*p == ',') { p++; continue; }
-        if (*p == '"') {
-            p++;
-            const char *start = p;
-            while (*p && *p != '"') p++;
-            size_t klen = p - start;
-            if (*p == '"') p++;
-            if (key_count >= key_cap) {
-                key_cap *= 2;
-                MultiExistsEntry *t = xrealloc_or_free(entries, key_cap * sizeof(*t));
-                if (!t) {
-                    /* See cmd_exists_multi above for rationale (Coverity
-                       CID 1693844). */
-                    OUT("{\"error\":\"oom: bulk_get keys\"}\n");
-                    return 1;
-                }
-                entries = t;
-            }
-            MultiExistsEntry *e = &entries[key_count++];
-            parse_multi_key(start, klen, &sc,
-                             &e->wire_key,
-                             (uint8_t **)&e->key, &e->klen,
-                             e->hash, &e->shard_id);
-            e->start_slot = 0;
-            e->found = 0;
-        } else p++;
-    }
-
-    if (key_count == 0) { free(entries); OUT("[]\n"); return 0; }
-
-    multi_bucket_dispatch(entries, key_count, &sc, db_root, object);
-
-    /* Build output in one buffer; one fwrite. */
-    size_t cap = (size_t)key_count * 32 + 16;
-    char *buf = malloc(cap);
-    if (buf) {
-        size_t pos = 0;
-        buf[pos++] = '[';
-        int first = 1;
-        for (int i = 0; i < key_count; i++) {
-            if (entries[i].found) continue;
-            const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
-            size_t klen = strlen(out_key);
-            if (pos + klen + 8 > cap) {
-                cap = (pos + klen + 8) * 2;
-                char *t = realloc(buf, cap);
-                if (!t) { free(buf); buf = NULL; break; }
-                buf = t;
-            }
-            /* Coverity: subtractive re-assertion of the post-grow invariant. CID 1693871 */
-            if (cap < pos || cap - pos < klen + 8) { free(buf); buf = NULL; break; }
-            if (!first) buf[pos++] = ',';
-            buf[pos++] = '"';
-            /* CID 1693871 - bounds checked above, triage */
-            memcpy(buf + pos, out_key, klen); pos += klen;
-            buf[pos++] = '"';
-            first = 0;
-        }
-        if (buf) {
-            buf[pos++] = ']'; buf[pos++] = '\n';
-            fwrite(buf, 1, pos, g_out ? g_out : stdout);
-            free(buf);
-        }
-    }
-    if (!buf) OUT("[]\n");
-
-    /* (workers + per-worker entries freed inside multi_bucket_dispatch.) */
-    for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
-    free(entries);
-    return 0;
-}
-
-/* ========== Parallel multi-key GET ========== */
-
-typedef struct {
-    char *key;          /* storage form: binary for auto_key, string otherwise */
-    size_t klen;        /* binary length (was strlen(key) before auto-key) */
-    char *wire_key;     /* wire-form string for response output (NULL → use key) */
-    uint8_t hash[16];
-    int shard_id;
-    int start_slot;
-    int orig_idx;
-    char *result_json; /* NULL if not found */
-} MultiGetEntry;
-
-typedef struct {
-    const char *db_root;
-    const char *object;
-    const Schema *sch;
-    MultiGetEntry *entries;
-    int count;
-    FieldSchema *fs;
-} MultiGetShardWork;
-
-/* Callback for multi-get: decodes value inline into entry's result_json. */
-static int multi_get_fetch_cb(const uint8_t hash[16],
-                               const void *key, size_t klen,
-                               const void *value, size_t vlen,
-                               uint8_t hdr2, void *ctx_ptr) {
-    (void)key; (void)klen;
-    MultiGetShardWork *sw = (MultiGetShardWork *)ctx_ptr;
-    for (int ei = 0; ei < sw->count; ei++) {
-        if (memcmp(sw->entries[ei].hash, hash, 16) == 0) {
-            char *decoded = sw->fs ? typed_decode(sw->fs->ts,
-                                                   (const uint8_t *)value,
-                                                   (uint32_t)vlen, hdr2) : NULL;
-            sw->entries[ei].result_json = decoded ? decoded : strdup("null");
-            break;
-        }
-    }
-    return 0;
-}
-
-static void *multi_get_shard_worker(void *arg) {
-    MultiGetShardWork *sw = (MultiGetShardWork *)arg;
-    if (sw->count == 0) return NULL;
-
-    SlotcaskSchemaInfo info = {
-        .splits = sw->sch->splits, .slot_size = sw->sch->slot_size,
-        .streams = sw->sch->streams,
-    };
-    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(sw->db_root, sw->object, &info);
-    if (!sdb) {
-        LOG_ERROR(LOG_SUB_SLOTCASK, "multi_get_shard_worker %s/%s: slotcask_registry_get failed, %d keys reported as missing", sw->db_root, sw->object, sw->count);
-        return NULL;
-    }
-
-    /* Extract pre-computed hashes from entries */
-    uint8_t (*hashes)[16] = malloc((size_t)sw->count * sizeof(*hashes));
-    if (!hashes) {
-        LOG_ERROR(LOG_SUB_SLOTCASK, "multi_get_shard_worker %s/%s: malloc(%d * 16) failed for hashes array", sw->db_root, sw->object, sw->count);
-        return NULL;
-    }
-    for (int ei = 0; ei < sw->count; ei++)
-        memcpy(hashes[ei], sw->entries[ei].hash, 16);
-
-    /* Batch resolve+fetch — two-phase model resolves KF shards internally
-       and parallelizes segment reads. Callback decodes each found record. */
-    slotcask_bulk_resolve_and_fetch(sdb, hashes, (size_t)sw->count,
-                                     sw, multi_get_fetch_cb);
-
-    free(hashes);
-    return NULL;
+    TypedReadOptions options={.kind=TYPED_READ_NOT_EXISTS,.keys=keys_json,
+        .format=NULL,.delimiter=0,
+        .budget=g_query_buffer_max_bytes,.timeout_ms=resolve_timeout_ms()};
+    return typed_read_route(db_root,object,&options);
 }
 
 int cmd_get_multi(const char *db_root, const char *object, const char *keys_json,
                   const char *format, const char *delimiter) {
-    char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
-    if (csv_delim) {
-        TypedSchema *ts=load_typed_schema(db_root,object);
-        if (ts && ts->packed.nfields) {
-            FieldSchema fs;init_field_schema(&fs,db_root,object);
-            Schema schema=load_schema(db_root,object);
-            SlotcaskSchemaInfo info={.splits=schema.splits,.slot_size=schema.slot_size,.streams=schema.streams};
-            SlotcaskDb *db SDB_REG_REF = slotcask_registry_get(db_root,object,&info);
-            PackedCsvOptions options={.delimiter=csv_delim,.buffer_budget=g_query_buffer_max_bytes,
-                .timeout_ms=resolve_timeout_ms()};
-            return packed_csv_get_multi(db,&fs,&schema,keys_json,&options,g_out?g_out:stdout);
-        }
-    }
-    /* Parse keys */
-    int key_count = 0, key_cap = 256;
-    MultiGetEntry *entries = malloc(key_cap * sizeof(MultiGetEntry));
-    Schema sc = load_schema(db_root, object);
-
-    const char *p = json_skip(keys_json);
-    if (*p == '[') p++;
-    while (*p) {
-        p = json_skip(p);
-        if (*p == ']') break;
-        if (*p == ',') { p++; continue; }
-        if (*p == '"') {
-            p++;
-            const char *start = p;
-            while (*p && !(*p == '"' && *(p-1) != '\\')) p++;
-            size_t klen = p - start;
-            if (*p == '"') p++;
-            if (key_count >= key_cap) {
-                key_cap *= 2;
-                /* Plain realloc (not xrealloc_or_free): on failure we still
-                   need the old `entries` array intact to free each already-
-                   parsed entry's key/wire_key before dropping the array
-                   itself (CID 1696478). Resetting key_count to 0 here also
-                   makes the `key_count == 0` early-return below fire
-                   correctly instead of falling through to a NULL entries[]
-                   dereference. */
-                MultiGetEntry *t = realloc(entries, key_cap * sizeof(*t));
-                if (!t) {
-                    for (int j = 0; j < key_count; j++) {
-                        free(entries[j].key);
-                        free(entries[j].wire_key);
-                    }
-                    free(entries);
-                    entries = NULL;
-                    key_count = 0;
-                    break;
-                }
-                entries = t;
-            }
-            MultiGetEntry *e = &entries[key_count++];
-            /* Wire form for response output; storage form (binary for
-               auto_key=uuid/seq, verbatim otherwise); hash + kf-shard
-               bucket — see parse_multi_key. */
-            parse_multi_key(start, klen, &sc,
-                             &e->wire_key,
-                             (uint8_t **)&e->key, &e->klen,
-                             e->hash, &e->shard_id);
-            e->start_slot = 0;
-            e->result_json = NULL;
-        } else p++;
-    }
-
-    if (key_count == 0) { free(entries); OUT("{}\n"); return 0; }
-
-    /* Bucket-sort by shard_id — same fix as cmd_exists_multi above. */
-    for (int i = 0; i < key_count; i++) entries[i].orig_idx = i;
-    int *shard_counts = calloc(sc.splits, sizeof(int));
-    int *shard_to_worker = malloc(sc.splits * sizeof(int));
-    for (int i = 0; i < key_count; i++) shard_counts[entries[i].shard_id]++;
-    int nshard = 0;
-    for (int s = 0; s < sc.splits; s++) if (shard_counts[s] > 0) nshard++;
-
-    FieldSchema fs; init_field_schema(&fs, db_root, object);
-    MultiGetShardWork *workers = calloc(nshard, sizeof(MultiGetShardWork));
-    {
-        int g = 0;
-        for (int s = 0; s < sc.splits; s++) {
-            if (shard_counts[s] > 0) {
-                workers[g].db_root = db_root;
-                workers[g].object = object;
-                workers[g].sch = &sc;
-                workers[g].fs = (fs.ts || fs.nfields > 0) ? &fs : NULL;
-                workers[g].count = 0;
-                workers[g].entries = malloc(shard_counts[s] * sizeof(MultiGetEntry));
-                shard_to_worker[s] = g;
-                g++;
-            } else {
-                shard_to_worker[s] = -1;
-            }
-        }
-    }
-    for (int i = 0; i < key_count; i++) {
-        int w = shard_to_worker[entries[i].shard_id];
-        workers[w].entries[workers[w].count++] = entries[i];
-    }
-
-    /* Parallel fetch */
-    parallel_for_io(multi_get_shard_worker, workers, nshard, sizeof(MultiGetShardWork));
-
-    /* Copy results back to entries[] via orig_idx. */
-    for (int g = 0; g < nshard; g++)
-        for (int i = 0; i < workers[g].count; i++)
-            entries[workers[g].entries[i].orig_idx].result_json = workers[g].entries[i].result_json;
-    free(shard_counts); free(shard_to_worker);
-
-    /* Output in original key order */
-    if (csv_delim) {
-        /* Header: key + schema fields (no projection on get-multi). */
-        OUT("key");
-        if (fs.ts) {
-            for (int i = 0; i < fs.ts->nfields; i++) {
-                if (fs.ts->fields[i].removed) continue;
-                char d[2] = { csv_delim, '\0' }; OUT("%s", d);
-                csv_emit_cell(fs.ts->fields[i].name, csv_delim);
-            }
-        }
-        OUT("\n");
-        for (int i = 0; i < key_count; i++) {
-            if (!entries[i].result_json) continue;
-            const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
-            csv_emit_cell(out_key, csv_delim);
-            JsonObj value_obj;
-            int have_value = json_parse_object(entries[i].result_json,
-                                               strlen(entries[i].result_json),
-                                               &value_obj) >= 0;
-            if (fs.ts) {
-                for (int fi = 0; fi < fs.ts->nfields; fi++) {
-                    if (fs.ts->fields[fi].removed) continue;
-                    char d[2] = { csv_delim, '\0' }; OUT("%s", d);
-                    char *pv = !have_value ? NULL :
-                        (fs.ts->fields[fi].type == FT_VARCHAR
-                         ? json_obj_strdup_unescaped(&value_obj, fs.ts->fields[fi].name, NULL)
-                         : json_obj_strdup(&value_obj, fs.ts->fields[fi].name));
-                    csv_emit_cell(pv, csv_delim);
-                    free(pv);
-                }
-            }
-            OUT("\n");
-            free(entries[i].result_json);
-        }
-    } else {
-        /* Build the response in one buffer + one fwrite. Was 10K+
-           fprintf calls in a loop (each takes the per-FILE stdio lock
-           + parses the format string), the dominant cost in BULK GET
-           on top of the bucket-sort fix. */
-        size_t cap = (size_t)key_count * 256 + 64;
-        char *buf = malloc(cap);
-        if (buf) {
-            size_t pos = 0;
-            buf[pos++] = '{';
-            int first = 1;
-            for (int i = 0; i < key_count; i++) {
-                const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
-                size_t klen = strlen(out_key);
-                size_t vlen = entries[i].result_json ? strlen(entries[i].result_json) : 4;
-                if (pos + klen + vlen + 16 > cap) {
-                    cap = (pos + klen + vlen + 16) * 2;
-                    char *t = realloc(buf, cap);
-                    if (!t) { free(buf); buf = NULL; break; }
-                    buf = t;
-                }
-                /* Coverity: subtractive re-assertion of the post-grow invariant. CID 1693870 */
-                if (cap < pos || cap - pos < klen + vlen + 16) { free(buf); buf = NULL; break; }
-                if (!first) buf[pos++] = ',';
-                first = 0;
-                buf[pos++] = '"';
-                /* CID 1693870 - bounds checked above, triage */
-                memcpy(buf + pos, out_key, klen); pos += klen;
-                buf[pos++] = '"'; buf[pos++] = ':';
-                if (entries[i].result_json) {
-                    /* CID 1693872 - bounds checked above, triage */
-                    memcpy(buf + pos, entries[i].result_json, vlen); pos += vlen;
-                    free(entries[i].result_json);
-                } else {
-                    memcpy(buf + pos, "null", 4); pos += 4;
-                }
-            }
-            if (buf) {
-                buf[pos++] = '}'; buf[pos++] = '\n';
-                fwrite(buf, 1, pos, g_out ? g_out : stdout);
-                free(buf);
-            }
-        }
-        if (!buf) {
-            /* OOM fallback — old per-record path. */
-            OUT("{");
-            int first = 1;
-            for (int i = 0; i < key_count; i++) {
-                if (!first) OUT(",");
-                first = 0;
-                const char *out_key = entries[i].wire_key ? entries[i].wire_key : entries[i].key;
-                if (entries[i].result_json) {
-                    OUT("\"%s\":%s", out_key, entries[i].result_json);
-                    free(entries[i].result_json);
-                } else {
-                    OUT("\"%s\":null", out_key);
-                }
-            }
-            OUT("}\n");
-        }
-    }
-
-    /* cmd_get_multi has its own MultiGetEntry/MultiGetShardWork types
-       (extra `fs` FieldSchema field, different result type) so it can't
-       share the multi_bucket_dispatch helper used by exists/not_exists;
-       clean up workers explicitly. */
-    for (int g = 0; g < nshard; g++) free(workers[g].entries);
-    free(workers);
-    for (int i = 0; i < key_count; i++) { free(entries[i].key); free(entries[i].wire_key); }
-    free(entries);
-    return 0;
+    TypedReadOptions options={.kind=TYPED_READ_GET_MULTI,.keys=keys_json,.format=format,
+        .delimiter=(format&&!strcmp(format,"csv"))?parse_csv_delim(delimiter):0,
+        .budget=g_query_buffer_max_bytes,.timeout_ms=resolve_timeout_ms()};
+    return typed_read_route(db_root,object,&options);
 }
 
 #ifdef TEST_BUILD

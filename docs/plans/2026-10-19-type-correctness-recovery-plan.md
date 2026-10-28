@@ -71,6 +71,14 @@ reviewed predecessor so anchors stay valid. One delivery plan may contain
 multiple test-first tasks/checkpoints and reviewable changes; those do not
 automatically become new child plans or additional human approval stops.
 
+R1 completion (2026-10-28): revision 3 and the user-approved pagination amendment
+are implemented and independently reviewed. The final fresh normal suite passes
+21,095 assertions across 530 cases; all compatibility probes pass. R1 removes
+the CSV writer reservation and restores keyfile-only skipping without changing
+existing reader locks. See the [execution ledger](2026-10-28-r1-execution-evidence.md)
+and [amendment evidence](2026-10-28-r1-fetch-skip-evidence.md). R2 is next; public
+packed activation and the remaining R2–R6 acceptance requirements stay open.
+
 Keep fixes with their owning integration instead of first shipping a temporary
 private refusal and then scheduling another plan to replace it. Where an
 intermediate private seam must remain guarded until its owner lands, identify
@@ -85,6 +93,23 @@ requirements. All original contracts, RED/GREEN regressions, full-suite gates,
 raw-diff/blind reviews and protected-plan restrictions still apply. This
 amendment approves the planning structure only, not the future production edits,
 Git writes, activation or a guarantee of deadline completion.
+
+### Concurrency constraint — user clarification, 2026-10-27
+
+This roadmap fixes type/value handling, not engine concurrency. Preserve existing
+lock acquisitions, lock order, shard scheduling and ordinary read/write blocking
+semantics across previous and remaining deliveries. Do not add writer reservations,
+new locks or stronger multi-row snapshot semantics to ordinary readers. Necessary
+value construction and validation stay inside the existing transaction boundaries.
+
+The post-3B.10 audit identified one private, inactive exception: its packed CSV
+backend reserves all shard writer gates while collecting output. R1 explicitly
+removes that reservation and adds status/bounds checks using existing cache read
+handles. Its original slotcask.c implementation must remain an exact byte prefix;
+appended checked readers add no writer gate, reservation or lock primitive.
+Do not treat a prior private implementation as permission to broaden blocking.
+Any genuinely necessary concurrency change needs a concrete separate justification
+and explicit human approval; it is not silently folded into a type fix.
 
 ### Protected later work
 

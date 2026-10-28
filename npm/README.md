@@ -255,3 +255,20 @@ LOG_LEVEL=3          # 1=ERROR 2=WARN 3=INFO 4=DEBUG
 - [GitHub](https://github.com/sayyiditow/shard-db)
 - [Full documentation](https://github.com/sayyiditow/shard-db/tree/main/docs)
 - [Changelog](https://github.com/sayyiditow/shard-db/blob/main/CHANGELOG.md)
+
+### Exact decimal and CSV values
+
+`query()` preserves response text. For finance fields, send numeric literals as
+strings (for example `"1234567890123456.1234567890"`) and use a lossless JSON
+parser that preserves number tokens when reading. JavaScript `Number` and
+`JSON.parse` cannot preserve arbitrary decimal precision. Existing `JSON.parse`
+examples above use bounded integers and are not a finance-decimal recipe.
+
+Ordinary fetch/multi-get/keys/existence CSV cells escape literal backslash as `\\` and control bytes as `\u00xx`.
+After normal CSV quote/delimiter decoding, `ShardDb.decodeCsvCellBytes(cell)`
+returns the original bytes. A literal six-character `\u0000` and an actual NUL
+remain distinct. Pass a `Uint8Array` from a byte-preserving transport for
+non-UTF-8 content; the native `query()` string route is UTF-8 text. CSV still
+conflates SQL NULL with an empty cell, so use JSON for typed record interchange.
+The escape layer is not an instruction to feed rendered CSV directly into the
+existing positional bulk-import grammar.

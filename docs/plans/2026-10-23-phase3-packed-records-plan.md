@@ -108,7 +108,7 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   connects two complete read entry points to checked CSV with bounded retained
   output, fail-closed reads, explicit JSON errors and checked I/O. Collection
   reserves writer gates and releases them before sending. It is implemented
-  and raw-diff/blind reviewed, uncommitted: 217 focused checks, 20820/0 full-suite
+  and raw-diff/blind reviewed, committed as `0ef1a0b`: 217 focused checks, 20820/0 full-suite
   assertions across 528 cases, 388 probe gates and all 71 allocation injections.
   [Execution evidence](2026-10-27-phase3b10-packed-csv-commands-evidence.md) and
   [executed review](2026-10-27-phase3b10-raw-diff-review.md) record completion.
@@ -116,6 +116,19 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   typo is corrected. The [plan review](2026-10-27-phase3b10-plan-review.md)
   records the earlier planning pass. Find/join/aggregate/keys/exists and other 3B consumers,
   full request-memory/import/SDK policies and public activation remain open.
+- R1: the [consolidated ordinary integration plan](2026-10-27-r1-write-read-integration-plan.md)
+  revision 3 is implemented and raw-diff/blind reviewed against `0ef1a0b`.
+  [Execution evidence](2026-10-28-r1-execution-evidence.md) records exact frozen
+  replay, 69/36 RED, 109/0 GREEN, 20931/0 across 529 cases and all 126
+  allocation-failure checks. The later user-approved
+  [pagination amendment](2026-10-28-r1-fetch-skip-amendment.md) restores
+  keyfile-only offset skipping while preserving checked returned records.
+  [Amendment evidence](2026-10-28-r1-fetch-skip-evidence.md) records genuine
+  116/48 RED, 164/0 GREEN, the final 21095/0 full suite across 530 cases,
+  compatibility probes and independent review with no remaining findings.
+  R1 removes 3B.10's private all-shard CSV reservation and preserves existing
+  ordinary per-shard/cache locking. Packed storage remains publicly inactive.
+  R2 is the next consolidated delivery; R1 does not close Phase 3B.
 - 3C: child plan must be prepared against the reviewed 3B result.
 - [Original review](2026-10-23-phase3-packed-records-plan-review.md): unchanged.
 - [Rejected draft archive](archive/2026-10-23-phase3-packed-records-rejected.md):

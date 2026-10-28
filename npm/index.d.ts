@@ -1,6 +1,9 @@
 export = ShardDb
 
 declare class ShardDb {
+  /** Decode one CSV-unquoted byte-escaped cell. NULL and empty remain indistinguishable. */
+  static decodeCsvCellBytes(cell: string | Uint8Array): Uint8Array
+
   /** Open a shard-db data directory for in-process use. */
   constructor(dbRoot: string)
 
@@ -8,7 +11,9 @@ declare class ShardDb {
    * Execute a query asynchronously.
    * Accepts a typed QueryBody object (recommended — enables autocomplete)
    * or a raw JSON string (backward compatible).
-   * Returns a Promise that resolves to the JSON response string. Parse with JSON.parse().
+   * Returns the raw response string (CSV when requested). JSON.parse converts
+   * unquoted decimals to binary64 and can lose precision; retain number lexemes
+   * with an application-selected lossless JSON parser for finance values.
    * Multiple concurrent queries are safe — shard-db's worker pool handles parallelism.
    */
   query(body: ShardDb.QueryBody): Promise<string>
@@ -90,11 +95,14 @@ declare namespace ShardDb {
 
   /** One record in bulk-insert/bulk-update array form. */
   interface BulkRecord {
-    key: string
+    /** Omit only for bulk inserts into an auto-key object. */
+    key?: string
     value: Record<string, unknown>
     /** Per-record CAS guard (bulk-update array form only). */
     if?: Criteria
   }
+
+  interface BulkUpdateRecord extends BulkRecord { key: string }
 
   type QueryBody =
     // ── CRUD ──────────────────────────────────────────────────────────────
@@ -203,7 +211,7 @@ declare namespace ShardDb {
         criteria?: Criteria
         value?: Record<string, unknown>
         /** Per-key partial update — dict or array form. Mutually exclusive with criteria/value. */
-        records?: Record<string, Record<string, unknown>> | BulkRecord[]
+        records?: Record<string, Record<string, unknown>> | BulkUpdateRecord[]
         file?: string
         limit?: number
         dry_run?: boolean }
@@ -238,7 +246,10 @@ declare namespace ShardDb {
         dir: string; object: string
         offset?: number; limit?: number
         fields?: Fields
-        format?: 'dict' }
+        format?: 'rows' | 'dict' | 'csv'
+        delimiter?: string
+        cursor?: string | null
+        total?: boolean }
 
     | { mode: 'count'
         dir: string; object: string

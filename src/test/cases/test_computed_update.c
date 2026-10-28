@@ -146,7 +146,7 @@ static int test_computed_update_run(void) {
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"cp\","
         "\"key\":\"c1\",\"value\":{\"price\":{\"$incr\":\"0.005\"}}}", &resp);
-    ASSERT_CONTAINS(resp, "\"error\"", "sub-scale literal rejected");
+    ASSERT_CONTAINS(resp, "\"status\":\"updated\"", "exact increment rounded once on assignment");
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"cp\","
         "\"key\":\"c1\",\"value\":{\"balance\":{\"$copy\":\"price\"}}}", &resp);

@@ -1162,6 +1162,19 @@ int slotcask_validate_live_refs(SlotcaskDb *db, uint64_t *out_invalid);
    stop, -1 on any unreadable or invalid live reference. Does not
    silently skip. */
 int slotcask_walk_live_strict(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx);
+/* Checked ordinary-reader counterparts. Use the existing per-shard cache read
+ * handles (no writer gate/reservation, no new lock/order/global snapshot).
+ * Caller pins matching registry/schema and holds the object read lock.
+ * Callbacks borrow the current record while KF/segment handles remain live;
+ * validate/render bounded owned output only, never perform client I/O or
+ * nested storage/pool work. Returns 0 complete/miss, 1 callback stop, -1 invalid
+ * or unreadable reference. Cache handles are released on every return path. */
+int slotcask_walk_live_checked(SlotcaskDb *db,SlotcaskScanCb cb,void *ctx);
+/* Skip live keyfile entries before accessing segments; validate emitted records. */
+int slotcask_walk_live_skip_checked(SlotcaskDb *db, int64_t skip_n,
+    SlotcaskScanCb cb, void *ctx);
+int slotcask_lookup_by_hash_checked(SlotcaskDb *db,const uint8_t hash[16],SlotcaskScanCb cb,void *ctx);
+
 
 /* Walk every live (flag=1) record. Parallelized across keyfile shards
    internally; cb may run on multiple threads — caller's ctx is responsible
@@ -1298,3 +1311,8 @@ size_t kf_slot_for(const uint8_t hash[16], size_t cap);
 void kf_path_for(char out[PATH_MAX], const char *data_dir, int shard_id);
 
 #endif
+
+/* Checked bulk counterparts keep existing shard/segment batching and pool
+ * dispatch, with explicit allocation/unreadable-reference failure status. */
+int slotcask_bulk_lookup_in_kfshard_checked(SlotcaskDb*,int,SlotcaskBulkRec*,size_t);
+int slotcask_bulk_resolve_and_fetch_checked(SlotcaskDb*,const uint8_t (*)[16],size_t,void*,SlotcaskScanCb);
