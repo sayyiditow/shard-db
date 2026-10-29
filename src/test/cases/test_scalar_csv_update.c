@@ -74,7 +74,12 @@ static int test_scalar_csv_update_run(void) {
     resp = csv_request(tc, query);
     ASSERT_TRUE(resp && strstr(resp, "\"matched\":3") != NULL, "all rows matched");
     ASSERT_TRUE(resp && strstr(resp, "\"updated\":2") != NULL, "only valid rows updated");
-    ASSERT_TRUE(resp && strstr(resp, "\"skipped\":1") != NULL, "malformed scalar row skipped");
+    ASSERT_TRUE(resp && strstr(resp, "\"skipped\":0") != NULL,
+                "malformed scalar is an error, not a condition skip");
+    ASSERT_TRUE(resp && strstr(resp, "\"errors\":[") != NULL,
+                "malformed scalar has an explicit row error");
+    ASSERT_TRUE(resp && strstr(resp, "\"key\":\"bad\"") != NULL,
+                "row error identifies malformed scalar key");
     free(resp);
 
     resp = csv_request(tc,

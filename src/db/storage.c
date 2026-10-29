@@ -1,3 +1,4 @@
+#include "typed_index.h"
 #include "types.h"
 #include "slotcask.h"
 #include "typed_row.h"
@@ -503,8 +504,9 @@ static int v2_insert_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     V2InsertCtx *c = ctx_ptr;
     if (!c->cas_tree) return 1;
     if (!old) return 0;
-    return cas_check_tree(c->cas_fs, old->value, (int)old->vlen,
-                           old->hdr2, c->cas_tree);
+    int matched=cas_match_tree_checked(old->value,old->vlen,c->cas_tree,c->cas_fs,old->hdr2);
+    if(matched<0)snprintf(c->err_buf,sizeof(c->err_buf),"invalid typed condition: %s",strerror(errno));
+    return matched>0;
 }
 static int v2_insert_owned(const SlotcaskOldRecord *old,uint8_t **out,
     size_t *n,void *ptr){
@@ -529,6 +531,10 @@ static int v2_insert_owned(const SlotcaskOldRecord *old,uint8_t **out,
                 auto_create_field_transfer(ts,*out,i,old!=NULL,ok,base,bm,bmn,
                     region,old?old->hdr2:0);
         }
+    }
+    if(typed_index_validate_new(ts,*out,*n,typed_schema_hdr2(ts),
+        c->fields,c->idx_types,c->nfields)){
+        snprintf(c->err_buf,sizeof(c->err_buf),"invalid NEW index key: %s",strerror(errno));return -1;
     }
     return single_write_finish(ts,c->db,c->key_len,*out,n,c->return_record,
         &c->ret_json,c->err_buf,sizeof(c->err_buf));
@@ -593,14 +599,14 @@ static int v2_insert_pre_commit(const SlotcaskOldRecord *old,
             int btree_field = !c->idx_types || c->idx_types[i] == IT_BTREE;
             if (btree_field) {
                 have_new = build_index_key_from_record(c->idx_ts, new_value, new_vlen,
-                                                       SREC_FLAG_NULLMAP,
+                                                       typed_schema_hdr2(c->idx_ts),
                                                        c->fields[i], &new_key, &new_len);
-                have_old = build_index_key_from_record(c->idx_ts, old->value, old->vlen,
+                have_old = typed_index_old_record_key(c->idx_ts, old->value, old->vlen,
                                                        old->hdr2,
                                                        c->fields[i], &old_key, &old_len);
             } else {
                 have_new = build_index_payload_from_record(c->idx_ts, new_value, new_vlen,
-                                                           SREC_FLAG_NULLMAP,
+                                                           typed_schema_hdr2(c->idx_ts),
                                                            c->fields[i], &new_key, &new_len);
                 have_old = build_index_payload_from_record(c->idx_ts, old->value, old->vlen,
                                                            old->hdr2,
@@ -707,7 +713,7 @@ static int v2_insert_prepare_commit(const uint8_t *new_value, size_t new_vlen,
         uint8_t *nk = NULL;
         size_t nl = 0;
         int key_rc = build_index_payload_from_record(c->idx_ts, new_value, new_vlen,
-                                               SREC_FLAG_NULLMAP,
+                                               typed_schema_hdr2(c->idx_ts),
                                                c->fields[i], &nk, &nl);
         if (key_rc < 0) {
             bitmap_prepare_set_free(&c->bm_prep);
@@ -836,17 +842,6 @@ static int v2_insert_apply_commit(const uint8_t *new_value, size_t new_vlen,
        retired for this path — each btree field gets a tiered BTRI key from
        the validated record view, written via write_index_entry. */
     {
-        const uint8_t *ins_base = NULL; const uint8_t *ins_bm = NULL;
-        int ins_bm_bytes = 0; size_t ins_region = 0;
-        if (typed_record_view(new_value, new_vlen, SREC_FLAG_NULLMAP,
-                              &ins_base, &ins_bm, &ins_bm_bytes,
-                              &ins_region) != 0) {
-            snprintf(c->err_buf, sizeof(c->err_buf),
-                     "corrupt record during btree index update");
-            bitmap_prepare_set_free(&c->bm_prep);
-            v2_insert_bm_owned_free(c);
-            return -1;
-        }
         int idx_failed2 = 0;
         uint8_t *owned[MAX_FIELDS]; int n_owned = 0;
         /* Btree fields written above sync via index_sync_record_fields, one
@@ -864,7 +859,7 @@ static int v2_insert_apply_commit(const uint8_t *new_value, size_t new_vlen,
                bitmap/trigram payload builder. NULL fields produce a tier-1
                entry so exists/not_exists stay index-answerable. */
             int key_rc = build_index_key_from_record(c->idx_ts, new_value, new_vlen,
-                                                     SREC_FLAG_NULLMAP,
+                                                     typed_schema_hdr2(c->idx_ts),
                                                      c->fields[i], &nk, &nl);
             if (key_rc < 0) {
                 snprintf(c->err_buf, sizeof(c->err_buf),
@@ -908,31 +903,9 @@ static int v2_insert_apply_commit(const uint8_t *new_value, size_t new_vlen,
             /* Trigram keys carry NO tier byte (.tg shape is unchanged in
                BTRI — §2.4.1): raw sortable payload from the validated
                record view. NULL fields contribute no trigrams. */
-            const uint8_t *tg_base = NULL; const uint8_t *tg_bm = NULL;
-            int tg_bm_bytes = 0; size_t tg_region = 0;
-            int tidx = typed_field_index(c->idx_ts, c->fields[i]);
-            if (typed_record_view(new_value, new_vlen, SREC_FLAG_NULLMAP,
-                                  &tg_base, &tg_bm, &tg_bm_bytes,
-                                  &tg_region) != 0 || tidx < 0) {
-                for (int j = 0; j < n_tg; j++) free(tg_args[j].new_key);
-                snprintf(c->err_buf, sizeof(c->err_buf),
-                         "corrupt record during trigram index update");
-                bitmap_prepare_set_free(&c->bm_prep);
-                v2_insert_bm_owned_free(c);
-                return -1;
-            }
-            const TypedField *tg_f = &c->idx_ts->fields[tidx];
-            size_t tg_cap = (size_t)tg_f->size + 16;
-            nk = malloc(tg_cap);
-            nl = 0;
-            int key_rc = 0;
-            if (nk) {
-                typed_field_to_index_key(c->idx_ts, tg_base, tg_region,
-                                         tidx, (uint8_t *)nk, &nl);
-                key_rc = nl ? 1 : 0;
-            } else {
-                key_rc = -1;
-            }
+            int key_rc = build_index_payload_from_record(c->idx_ts,
+                new_value,new_vlen,typed_schema_hdr2(c->idx_ts),
+                c->fields[i],&nk,&nl);
             if (key_rc < 0) {
                 free(nk);
                 for (int j = 0; j < n_tg; j++) free(tg_args[j].new_key);
@@ -1038,11 +1011,6 @@ static int cmd_insert_v2_impl(const char *db_root, const char *object,
         return 1;
     }
 
-    /* Unsupported private packed integrations fail before defaults or writes. */
-    char guard_fields[MAX_FIELDS][256];
-    if(ts->packed.nfields&&(if_json||load_index_fields(db_root,object,guard_fields,MAX_FIELDS)>0)){
-        OUT("{\"error\":\"packed indexes and conditions await integration\"}\n");return 1;
-    }
     uint8_t *typed_buf=NULL;size_t vlen=0;char enc_err[512]={0};
     if(!ts->packed.nfields&&typed_encode_alloc(ts,value,1,db_root,object,&typed_buf,&vlen,enc_err,sizeof(enc_err))){
         single_write_error(enc_err[0]?enc_err:"Typed encode failed","Typed encode failed");return 1;
@@ -1158,6 +1126,7 @@ static int cmd_insert_v2_impl(const char *db_root, const char *object,
     }
     commit_lock_hold_record(_commit_t0, db_root, object);
 
+    if (rc == -2 && ctx.err_buf[0]) rc=-1;
     if (rc == -2) {
         char *cur = result.current_value
             ? single_write_decode(ts, result.current_value, result.current_vlen, result.current_hdr2)
@@ -1914,18 +1883,22 @@ static int v2_update_owned(const SlotcaskOldRecord *old,uint8_t **out,
         rc=v2_update_new_from_old(old,*out,(size_t)ts->total_size,n,c);
     }
     if(rc)return -1;
+    if(typed_index_validate_new(ts,*out,*n,typed_schema_hdr2(ts),
+        c->idx_fields,c->idx_types,c->nidx)){
+        snprintf(c->err_buf,sizeof(c->err_buf),"invalid NEW index key: %s",strerror(errno));return -1;
+    }
     return single_write_finish(ts,c->db,c->key_len,*out,n,c->return_record,
         &c->ret_json,c->err_buf,sizeof(c->err_buf));
 }
 
 
 static int v2_update_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
-    V2UpdateCtx *c = (V2UpdateCtx *)ctx_ptr;
-    if (!old) return 0;  /* require_existing handles this, but defensive */
-    if (c->cas_tree &&
-        !cas_check_tree(c->cas_fs, old->value, (int)old->vlen, old->hdr2,
-                        c->cas_tree)) return 0;
-    return 1;
+    V2UpdateCtx *c=ctx_ptr;if(!old)return 0;
+    if(!c->cas_tree)return 1;
+    int matched=cas_match_tree_checked(old->value,old->vlen,c->cas_tree,c->cas_fs,old->hdr2);
+    if(matched<0)snprintf(c->err_buf,sizeof(c->err_buf),"invalid typed condition: %s",strerror(errno));
+    return matched>0;
+
 }
 
 typedef struct {
@@ -1975,7 +1948,7 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
                     ? build_index_payload_from_record_into(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
                                                            a->idx_fields[i],
                                                            old_slot, INDEX_KEY_MAX, &old_len)
-                    : build_index_key_from_record_into(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
+                    : typed_index_old_record_key_into(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
                                                        a->idx_fields[i],
                                                        old_slot, INDEX_KEY_MAX, &old_len);
             if (a->new_value)
@@ -1995,10 +1968,10 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
                     ? (raw_payload
                        ? build_index_payload_from_record(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
                                                          a->idx_fields[i], &old_buf, &old_len)
-                       : build_index_key_from_record(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
+                       : typed_index_old_record_key(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
                                                      a->idx_fields[i], &old_buf, &old_len))
                     : 0;
-                if (have_old) fb_bufs[n_fb++] = old_buf;
+                if (have_old == 1) fb_bufs[n_fb++] = old_buf;
             }
             if (rn == -1) {
                 have_new = a->new_value
@@ -2009,7 +1982,7 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
                                                      a->idx_fields[i], &new_buf,
                                                      &new_len))
                     : 0;
-                if (have_new) fb_bufs[n_fb++] = new_buf;
+                if (have_new == 1) fb_bufs[n_fb++] = new_buf;
             }
         } else {
             int raw_payload = a->idx_types &&
@@ -2018,7 +1991,7 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
                 have_old = raw_payload
                     ? build_index_payload_from_record(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
                                                       a->idx_fields[i], &old_buf, &old_len)
-                    : build_index_key_from_record(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
+                    : typed_index_old_record_key(a->idx_ts, a->old_value, a->old_vlen, a->old_hdr2,
                                                   a->idx_fields[i], &old_buf, &old_len);
             if (a->new_value)
                 have_new = raw_payload
@@ -2028,10 +2001,14 @@ static int apply_index_diff(const IndexDiffApplyArgs *a) {
                                                   a->new_value, a->new_vlen, a->new_hdr2,
                                                   a->idx_fields[i],
                                                   &new_buf, &new_len);
-            if (have_old) fb_bufs[n_fb++] = old_buf;
-            if (have_new) fb_bufs[n_fb++] = new_buf;
+            if (have_old == 1) fb_bufs[n_fb++] = old_buf;
+            if (have_new == 1) fb_bufs[n_fb++] = new_buf;
         }
 
+        if(have_old<0||have_new<0){
+            for(int k=0;k<n_fb;k++)free(fb_bufs[k]);
+            free(arena);return -1;
+        }
         int changed = 0;
         if (have_new && !have_old) changed = 1;
         else if (!have_new && have_old) changed = 1;
@@ -2149,7 +2126,7 @@ static int v2_update_apply_commit(const uint8_t *new_value, size_t new_vlen,
         .old_value = c->saved_old_value, .old_vlen = c->saved_old_vlen,
         .old_hdr2 = c->old_hdr2,
         .new_value = new_value, .new_vlen = new_vlen,
-        .new_hdr2 = SREC_FLAG_NULLMAP,
+        .new_hdr2 = typed_schema_hdr2(c->idx_ts),
         .err_buf = c->err_buf, .err_buf_len = sizeof(c->err_buf),
     };
     return apply_index_diff(&args);
@@ -2174,10 +2151,6 @@ static int cmd_update_v2_impl(const char *db_root, const char *object,
 
     if (!ts) { OUT("{\"error\":\"Object not found\"}\n"); return 1; }
 
-    char guard_fields[MAX_FIELDS][256];
-    if(ts->packed.nfields&&(if_json||load_index_fields(db_root,object,guard_fields,MAX_FIELDS)>0)){
-        OUT("{\"error\":\"packed indexes and conditions await integration\"}\n");return 1;
-    }
     /* Wire up compact trim for VARIABLE-format typed objects. sdb is a
        registry-cached SlotcaskDb shared across all concurrent request
        threads for this object (only guarded by a shared objlock rdlock
@@ -2229,11 +2202,16 @@ static int cmd_update_v2_impl(const char *db_root, const char *object,
                 OUT("{\"error\":\"invalid if condition\"}\n");
                 return 1;
             }
-            int pass = cas_check_tree(&cas_fs, old_val, (int)old_vlen,
-                                      old_hdr2, cas_tree);
+            int pass = cas_match_tree_checked(old_val, old_vlen, cas_tree,
+                                               &cas_fs, old_hdr2);
             free_criteria_tree(cas_tree);
+            if (pass < 0) {
+                free(old_val);
+                OUT("{\"error\":\"invalid typed condition\"}\n");
+                return 1;
+            }
             if (!pass) {
-                char *cur = typed_decode(ts, old_val, (uint32_t)old_vlen, old_hdr2);
+                char *cur = single_write_decode(ts, old_val, old_vlen, old_hdr2);
                 OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
                     cur ? cur : "null");
                 free(cur); free(old_val);
@@ -2310,6 +2288,7 @@ static int cmd_update_v2_impl(const char *db_root, const char *object,
                                         NULL, 0, &opts, &result);
     commit_lock_hold_record(_commit_t0, db_root, object);
 
+    if(rc==-2&&ctx.err_buf[0])rc=-1;
     if (rc == -2) {
         /* Either require_existing fired (record vanished) or check_fn
            rejected (criteria didn't match). Disambiguate by whether the
@@ -2434,8 +2413,9 @@ static int v2_delete_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     }
     if (c->cas_tree) {
         if (!old) return 0;
-        if (!cas_check_tree(c->cas_fs, old->value, (int)old->vlen,
-                            old->hdr2, c->cas_tree)) return 0;
+        int matched=cas_match_tree_checked(old->value,old->vlen,c->cas_tree,c->cas_fs,old->hdr2);
+        if(matched<0)snprintf(c->err_buf,sizeof(c->err_buf),"invalid typed condition: %s",strerror(errno));
+        if(matched<=0)return 0;
     }
     return 1;
 }
@@ -2471,7 +2451,7 @@ static int v2_delete_apply_commit(const SlotcaskOldRecord *old,
         if (arena) {
             uint8_t *slot = arena + (size_t)i * INDEX_KEY_MAX;
             int rc = btree_field
-                ? build_index_key_from_record_into(c->idx_ts, old->value, old->vlen, old->hdr2,
+                ? typed_index_old_record_key_into(c->idx_ts, old->value, old->vlen, old->hdr2,
                                                    c->idx_fields[i],
                                                    slot, INDEX_KEY_MAX, &ilen)
                 : build_index_payload_from_record_into(c->idx_ts, old->value, old->vlen, old->hdr2,
@@ -2480,20 +2460,21 @@ static int v2_delete_apply_commit(const SlotcaskOldRecord *old,
             if (rc == 1) { ikey = slot; have = 1; }
             else if (rc == -1) {
                 have = btree_field
-                    ? build_index_key_from_record(c->idx_ts, old->value, old->vlen, old->hdr2,
+                    ? typed_index_old_record_key(c->idx_ts, old->value, old->vlen, old->hdr2,
                                                   c->idx_fields[i], &ikey, &ilen)
                     : build_index_payload_from_record(c->idx_ts, old->value, old->vlen, old->hdr2,
                                                       c->idx_fields[i], &ikey, &ilen);
-                if (have) fb_bufs[n_fb++] = ikey;
+                if (have == 1) fb_bufs[n_fb++] = ikey;
             }
         } else {
             have = btree_field
-                ? build_index_key_from_record(c->idx_ts, old->value, old->vlen, old->hdr2,
+                ? typed_index_old_record_key(c->idx_ts, old->value, old->vlen, old->hdr2,
                                               c->idx_fields[i], &ikey, &ilen)
                 : build_index_payload_from_record(c->idx_ts, old->value, old->vlen, old->hdr2,
                                                   c->idx_fields[i], &ikey, &ilen);
-            if (have) fb_bufs[n_fb++] = ikey;
+            if (have == 1) fb_bufs[n_fb++] = ikey;
         }
+        if(have<0){for(int k=0;k<n_fb;k++)free(fb_bufs[k]);free(arena);return -1;}
         if (!have) continue;
         args[n_args].db_root = c->db_root;
         args[n_args].object  = c->object;
@@ -2593,8 +2574,13 @@ static int cmd_delete_v2(const char *db_root, const char *object,
                 OUT("{\"error\":\"invalid if condition\"}\n");
                 return 1;
             }
-            int pass = cas_check_tree(&cas_fs, val, (int)vlen, cur_hdr2,
-                                      cas_tree);
+            int pass = cas_match_tree_checked(val, vlen, cas_tree,
+                                               &cas_fs, cur_hdr2);
+            if (pass < 0) {
+                free(val); free_criteria_tree(cas_tree);
+                OUT("{\"error\":\"invalid typed condition\"}\n");
+                return 1;
+            }
             if (!pass) {
                 char *cur = typed_decode(ts, val, (uint32_t)vlen, cur_hdr2);
                 OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
@@ -2675,6 +2661,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
         free_criteria_tree(cas_tree);
         return 0;
     }
+    if(rc==-2&&ctx.err_buf[0])rc=-1;
     if (rc == -2 && result.condition_not_met) {
         char *cur = result.current_value
             ? typed_decode(ts, result.current_value, (uint32_t)result.current_vlen, result.current_hdr2)

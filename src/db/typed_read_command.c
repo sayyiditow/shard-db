@@ -1,4 +1,5 @@
 #include "typed_read_command.h"
+#include "query_internal.h"
 #include "packed_csv_command.h"
 #include <errno.h>
 #include <stdatomic.h>
@@ -640,4 +641,171 @@ int typed_read_exists(const char *root,const char *object,const void *key,size_t
     const char *text=c.found?"true\n":"false\n";size_t n=strlen(text);
     if(fwrite(text,1,n,out)!=n||fflush(out)||ferror(out)){errno=EIO;return -1;}
     return c.found?0:1;
+}
+
+/* Query rows borrow cache bytes only during construction. The existing caller
+ * owns serialization; no lock, I/O pipeline or response buffering is added. */
+static int query_cell(ReadCommand *c,const uint8_t *raw,size_t len,uint8_t flags,
+                      const char *name,int native_json){
+    int index=typed_field_index(c->fs->ts,name);
+    if(!c->fs->ts->packed.nfields){
+        if(read_legacy_open(c,raw,len,flags))return -1;
+        if(!native_json)return read_legacy_cell(c,name,index);
+        const char *p=NULL;size_t n=0;
+        read_legacy_span(c,name,strlen(name),&p,&n);
+        if(n==SIZE_MAX||n+1>read_available(c)){c->error=ENOBUFS;return -1;}
+        char *copy=malloc(n+1);if(!copy){c->error=ENOMEM;return -1;}
+        memcpy(copy,p,n);copy[n]=0;return read_owned(c,copy,n);
+    }
+    size_t budget=typed_packed_render_allowance(c->fs->ts,raw,len,flags,name,read_available(c));
+    if(!budget){c->error=errno?errno:ENOBUFS;return -1;}
+    char *cell=typed_packed_named_json(c->fs->ts,raw,len,flags,name,budget);
+    if(!cell){c->error=errno?errno:EILSEQ;return -1;}
+    size_t n=strlen(cell);
+    /* Join tables retain native JSON booleans; projected query cells retain
+       their existing quoted-boolean representation. */
+    if(native_json&&index>=0&&c->fs->ts->fields[index].type==FT_BOOL&&
+       n>=2&&cell[0]=='"'&&cell[n-1]=='"'){
+        memmove(cell,cell+1,n-2);cell[n-2]=0;
+        return read_owned_size(c,cell,n-2,n+1);
+    }
+    return read_owned(c,cell,n);
+}
+
+static int query_csv_cell(ReadCommand *c,const uint8_t *raw,size_t len,uint8_t flags,
+                          const char *name){
+    char *text=NULL;size_t n=0;int null=0;
+    if(c->fs->ts->packed.nfields){
+        size_t budget=typed_packed_render_allowance(c->fs->ts,raw,len,flags,name,read_available(c));
+        if(!budget){c->error=errno?errno:ENOBUFS;return -1;}
+        errno=0;text=typed_packed_named_text(c->fs->ts,raw,len,flags,name,budget,&n);
+        if(!text&&errno){c->error=errno;return -1;}null=!text;
+    }else{
+        if(read_legacy_open(c,raw,len,flags))return -1;
+        text=read_legacy_text(c,name,typed_field_index(c->fs->ts,name),&n,&null);
+        if(c->error){free(text);return -1;}
+    }
+    if(null){free(text);return 0;}
+    if(n==SIZE_MAX||n+1>read_available(c)){free(text);c->error=ENOBUFS;return -1;}
+    c->retained+=n+1;size_t used=0;
+    char *cell=typed_csv_cell_text(text,n,c->options->delimiter,read_available(c),&used);
+    c->retained-=n+1;free(text);return read_owned(c,cell,used);
+}
+
+static int query_columns(ReadCommand *c,const uint8_t *raw,size_t len,uint8_t flags,
+                         const char **names,int count,int csv,int native_json){
+    if(!c->fs||!c->fs->ts||count<0||count>MAX_FIELDS){c->error=EINVAL;return -1;}
+    char separator[2]={csv?c->options->delimiter:',',0};
+    int total=count?count:c->fs->ts->nfields;
+    for(int i=0;i<total;i++){
+        if(!count&&c->fs->ts->fields[i].removed)continue;
+        const char *name=count?names[i]:c->fs->ts->fields[i].name;
+        if(read_literal(c,separator))return -1;
+        if(!raw){if(!csv&&read_literal(c,"null"))return -1;continue;}
+        if(!csv&&!native_json&&!c->fs->ts->packed.nfields&&!(flags&SREC_FLAG_NULLMAP)){
+            if(read_legacy_open(c,raw,len,flags))return -1;
+            int index=typed_field_index(c->fs->ts,name);
+            if(!strchr(name,'+')&&(index<0||!c->legacy_values[index])){
+                if(read_literal(c,"\"\""))return -1;
+                continue;
+            }
+        }
+        if(csv?query_csv_cell(c,raw,len,flags,name):query_cell(c,raw,len,flags,name,native_json))return -1;
+    }
+    return 0;
+}
+
+/* Return owned complete logical field text for joins, with NULL distinct from
+   errors. Account legacy decode and packed render workspace before allocation. */
+int typed_query_named_text(const TypedSchema *ts,const uint8_t *raw,size_t len,
+                           uint8_t flags,const char *name,size_t budget,
+                           char **out,size_t *outlen){
+    if(out)*out=NULL;
+    if(outlen)*outlen=0;
+    if(!ts||!name||!out||!outlen){errno=EINVAL;return -1;}
+    if(ts->packed.nfields){
+        size_t allowance=typed_packed_render_allowance(ts,raw,len,flags,name,budget);
+        if(!allowance)return -1;
+        errno=0;*out=typed_packed_named_text(ts,raw,len,flags,name,allowance,outlen);
+        return *out?1:errno?-1:0;
+    }
+    FieldSchema fs={.ts=(TypedSchema*)ts};TypedReadOptions options={.budget=budget};
+    ReadCommand c={.fs=&fs,.options=&options};int null=0;
+    if(!read_legacy_open(&c,raw,len,flags))
+        *out=read_legacy_text(&c,name,typed_field_index(ts,name),outlen,&null);
+    int error=c.error;read_free(&c);
+    if(error){free(*out);*out=NULL;*outlen=0;errno=error;return -1;}
+    errno=0;return null?0:1;
+}
+
+int typed_query_emit_row(FILE *out,const char *wire,size_t wirelen,
+    const uint8_t *raw,size_t len,uint8_t flags,FieldSchema *fs,
+    const char **proj,int nproj,int rows,int dict,char csv,int comma,
+    const JoinSpec *joins,int njoins,const RecordRef *jrefs,size_t budget){
+    if(!out||!wire||!fs||!fs->ts||nproj<0||nproj>MAX_FIELDS||njoins<0||
+       (nproj&&!proj)||(njoins&&(!joins||!jrefs))){errno=EINVAL;return -1;}
+    for(int i=0;i<njoins;i++)if(joins[i].proj_count<0||joins[i].proj_count>MAX_FIELDS){errno=EINVAL;return -1;}
+    TypedReadOptions options={.budget=budget,.delimiter=csv};
+    ReadCommand c={.fs=fs,.options=&options};int rc=0;
+    if(comma&&!csv)rc=read_literal(&c,",");
+    if(!rc&&csv)rc=read_csv_key(&c,wire,wirelen);
+    else if(!rc&&(rows||njoins))rc=read_literal(&c,"[")||read_quote(&c,wire,wirelen);
+    else if(!rc){
+        if(!dict)rc=read_literal(&c,"{\"key\":");
+        if(!rc)rc=read_quote(&c,wire,wirelen)||read_literal(&c,dict?":":",\"value\":");
+    }
+    if(!rc&&(csv||rows||njoins))rc=query_columns(&c,raw,len,flags,proj,nproj,csv!=0,njoins>0);
+    else if(!rc&&nproj){
+        rc=read_literal(&c,"{");int emitted=0;
+        if(!fs->ts->packed.nfields&&!rc)rc=read_legacy_open(&c,raw,len,flags);
+        for(int i=0;!rc&&i<nproj;i++){
+            int idx=typed_field_index(fs->ts,proj[i]);
+            /* Preserve omission for absent legacy unflagged fields. */
+            if(!fs->ts->packed.nfields&&!(flags&SREC_FLAG_NULLMAP)&&!strchr(proj[i],'+')&&
+               (idx<0||!c.legacy_values[idx]))continue;
+            if(emitted++)rc=read_literal(&c,",");
+            if(!rc)rc=read_quote(&c,proj[i],strlen(proj[i]))||read_literal(&c,":")||
+                      query_cell(&c,raw,len,flags,proj[i],0);
+        }
+        if(!rc)rc=read_literal(&c,"}");
+    }else if(!rc)rc=read_value(&c,raw,len,flags,NULL,-1);
+    for(int i=0;!rc&&i<njoins;i++){
+        read_legacy_close(&c);c.fs=&joins[i].remote_fs;
+        char separator[2]={csv?csv:',',0};
+        if(joins[i].include_remote_key)
+            rc=read_literal(&c,separator)||(!csv&&read_literal(&c,"null"));
+        const char *names[MAX_FIELDS];
+        for(int k=0;k<joins[i].proj_count;k++)names[k]=joins[i].proj_fields[k];
+        if(!rc)rc=query_columns(&c,jrefs[i].val,jrefs[i].vlen,jrefs[i].hdr2,
+                               names,joins[i].proj_count,csv!=0,1);
+    }
+    if(!rc)rc=read_literal(&c,csv?"\n":rows||njoins?"]":dict?"":"}");
+    if(rc||c.error){int code=c.error?c.error:errno?errno:EILSEQ;read_free(&c);errno=code;return -1;}
+    for(ReadPart *p=c.head;p;p=p->next){
+        if(fwrite(p->data,1,p->len,out)!=p->len||ferror(out)){
+            read_free(&c);errno=EIO;return -1;
+        }
+    }
+    read_free(&c);return 0;
+}
+
+/* Compatibility utility for existing bounded-buffer callers. Failure returns
+   -1 with an empty destination, never a truncated syntactically valid row. */
+int typed_query_columns_into(const uint8_t *raw,size_t len,uint8_t flags,
+    FieldSchema *fs,const char **names,int count,char *out,size_t cap){
+    if(out&&cap)out[0]=0;
+    if(!out||!cap||!fs||!fs->ts){errno=EINVAL;return -1;}
+    TypedReadOptions options={.budget=g_query_buffer_max_bytes};
+    ReadCommand c={.fs=fs,.options=&options};
+    if(query_columns(&c,raw,len,flags,names,count,0,1)){
+        int error=c.error?c.error:errno;read_free(&c);errno=error?error:EILSEQ;return -1;
+    }
+    size_t total=0;
+    for(ReadPart *p=c.head;p;p=p->next){
+        if(p->len>cap-1-total){read_free(&c);errno=ENOBUFS;return -1;}
+        total+=p->len;
+    }
+    if(total>INT_MAX){read_free(&c);errno=EOVERFLOW;return -1;}
+    size_t at=0;for(ReadPart *p=c.head;p;p=p->next){memcpy(out+at,p->data,p->len);at+=p->len;}
+    out[at]=0;read_free(&c);return (int)at;
 }

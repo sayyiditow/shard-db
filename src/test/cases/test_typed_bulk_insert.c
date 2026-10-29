@@ -120,7 +120,9 @@ static void b_guards(void){
     snprintf(path,sizeof(path),"%s/obj/indexes",f.root);ASSERT_EQ_INT(mkdir(path,0700),0,"private indexes directory");
     snprintf(path,sizeof(path),"%s/obj/indexes/index.conf",f.root);FILE *fp=fopen(path,"w");ASSERT_NOT_NULL(fp,"private manifest");
     if(fp){ASSERT_TRUE(fputs("f0\n",fp)>=0,"manifest content");ASSERT_EQ_INT(fclose(fp),0,"manifest close");}
-    invalidate_idx_cache(f.root,"obj");b_reject(&f,"{\"a\":{}}");remove(path);invalidate_idx_cache(f.root,"obj");
+    invalidate_idx_cache(f.root,"obj");
+    ASSERT_EQ_INT(b_json(&f,"{\"a\":{}}",0,&out),0,"packed indexed upsert supported");free(out);
+    remove(path);invalidate_idx_cache(f.root,"obj");
     f.ts->fields[1].not_null=1;b_reject(&f,"{\"a\":{\"f1\":null}}");f.ts->fields[1].not_null=0;
     SlotcaskUpsertOpts o={.record_hdr2=SREC_FLAG_NULLMAP};const uint8_t legacy[]={1,0};
     ASSERT_EQ_INT(slotcask_upsert_with_hooks(&f.db,-1,"legacy",6,legacy,sizeof(legacy),&o,NULL),0,"legacy generation seed");
@@ -159,3 +161,74 @@ static void b_maximum(void){
 }
 static int test_typed_bulk_insert_run(void){b_routes();b_delimited();b_guards();b_maximum();return t_ctx->failed?1:0;}
 TEST_REGISTER("test-typed-bulk-insert",test_typed_bulk_insert_run)
+
+static int bi_count(const char *v,size_t n,const uint8_t *h,void *p){
+    (void)v;(void)n;(void)h;(*(int*)p)++;return 0;
+}
+static void bi_index(BFixture *f){
+    char path[256];const char *parts[]={"obj","obj/indexes","obj/indexes/f1"};
+    for(int i=0;i<3;i++){snprintf(path,sizeof(path),"%s/%s",f->root,parts[i]);ASSERT_TRUE(mkdir(path,0700)==0||errno==EEXIST,"private index path");}
+    snprintf(path,sizeof(path),"%s/obj/indexes/index.conf",f->root);
+    FILE *fp=fopen(path,"w");ASSERT_NOT_NULL(fp,"private index declaration");
+    if(fp){fputs("f1\n",fp);fclose(fp);}invalidate_idx_cache(f->root,"obj");
+}
+static int bi_hits(BFixture *f,const char *value){
+    size_t n=strlen(value);int count=0;
+    btree_idx_search(f->root,"obj","f1",f->sc.splits,value,n,bi_count,&count);return count;
+}
+static int test_typed_bulk_index_admission_run(void){
+    BFixture f;if(b_open(&f,0)){b_close(&f);return 1;}
+    char physical[256];snprintf(physical,sizeof(physical),"%s/obj",f.root);
+    ASSERT_EQ_INT(mkdir(physical,0700),0,"physical object directory");
+    slotcask_close(&f.db);f.opened=0;
+    ASSERT_EQ_INT(slotcask_open(&f.db,physical,f.sc.splits,1,f.sc.slot_size),0,"open real physical shape");f.opened=1;
+    bi_index(&f);
+    char big[545],ok[544],json[4096],*out=NULL;memset(big,'x',544);big[544]=0;memset(ok,'x',543);ok[543]=0;
+    snprintf(json,sizeof(json),"{\"a\":{\"f1\":\"%s\"}}",ok);
+    ASSERT_EQ_INT(b_json(&f,json,0,&out),0,"544 byte ordered key admitted");free(out);
+    ASSERT_EQ_INT(bi_hits(&f,ok),1,"boundary key indexed");
+    snprintf(json,sizeof(json),"{\"a\":{\"f1\":\"%s\"}}",big);b_reject(&f,json);
+    ASSERT_EQ_INT(bi_hits(&f,ok),1,"rejected NEW keeps OLD index");
+    snprintf(json,sizeof(json),"{\"bad\":{\"f1\":\"%s\"},\"good\":{\"f1\":\"small\"}}",big);
+    ASSERT_EQ_INT(b_json(&f,json,0,&out),1,"mixed valid and oversized rows");
+    if(out){ASSERT_CONTAINS(out,"\"inserted\":1","mixed good committed");ASSERT_CONTAINS(out,"\"errors\":1","oversized is error");ASSERT_CONTAINS(out,"\"skipped\":0","oversized never skip");free(out);}
+    size_t n=0;char *value=b_get(&f,"bad",&n);ASSERT_TRUE(!value,"oversized fresh key absent");free(value);
+    ASSERT_EQ_INT(bi_hits(&f,"small"),1,"mixed good indexed");
+    size_t used=0;FILE *fp=open_memstream(&out,&used);FILE *save=g_out;g_out=fp;
+    snprintf(json,sizeof(json),"{\"a\":{\"f1\":\"%s\"}}",big);
+    uint64_t pos=b_pos(&f);ASSERT_EQ_INT(typed_bulk_update_command(f.root,"obj",&f.sc,f.ts,&f.db,json,strlen(json),0,0),1,"packed update oversize rejects");
+    g_out=save;fclose(fp);if(out){ASSERT_CONTAINS(out,"\"skipped\":0","packed update error not skipped");ASSERT_CONTAINS(out,"\"errors\":[","packed update reason");free(out);}
+    ASSERT_TRUE(b_pos(&f)==pos,"packed update rejection before append");ASSERT_EQ_INT(bi_hits(&f,ok),1,"packed update OLD index intact");
+#ifdef TYPED_BULK_INDEX_BRIDGE_API
+    /* A local budget proves exact bridge/window lifetimes without mutable
+       test-wide configuration or an engine fault-injection switch. */
+    TypedBulkMemory memory={.limit=SIZE_MAX};atomic_init(&memory.used,0);
+    uint8_t *encoded=NULL;size_t encoded_len=0;
+    ASSERT_EQ_INT(typed_insert_alloc(f.ts,NULL,"{\"f1\":\"budget\"}",f.root,"obj",
+        &encoded,&encoded_len,NULL,0),0,"encode budget fixture");
+    SlotcaskBulkRec record={.key="budget",.klen=6,.value=encoded,.vlen=encoded_len,.hdr2=PKR_FLAGS};
+    SlotcaskBulkShardInput input={.recs=&record,.nrecs=1,.kf_shard_id=0};
+    char fields[1][256]={"f1"};enum IndexType types[1]={IT_BTREE};
+    void *bridge=typed_bulk_index_bridge_create(f.root,"obj",&f.sc,f.ts,fields,types,1,&input,&memory);
+    ASSERT_NOT_NULL(bridge,"local-budget bridge");
+    if(bridge){
+        size_t baseline=atomic_load(&memory.used),active=0;void *window=NULL;
+        memory.limit=baseline+64;
+        ASSERT_EQ_INT(input.opts.upsert.prepare_window(&record,&active,1,
+            input.opts.upsert.bulk_hook_ctx,&window),-1,"window budget failure before allocation");
+        ASSERT_TRUE(window==NULL,"failed preparation yields no window owner");
+        ASSERT_TRUE(atomic_load(&memory.used)==baseline,"failed prepare restores actual budget");
+        memory.limit=SIZE_MAX;
+        ASSERT_EQ_INT(input.opts.upsert.prepare_window(&record,&active,1,
+            input.opts.upsert.bulk_hook_ctx,&window),0,"prepare within actual budget");
+        ASSERT_TRUE(atomic_load(&memory.used)>baseline,"live window charged");
+        input.opts.upsert.abort_window(input.opts.upsert.bulk_hook_ctx,window);
+        ASSERT_TRUE(atomic_load(&memory.used)==baseline,"abort releases every actual window allocation");
+        typed_bulk_index_bridge_free(bridge);
+        ASSERT_TRUE(atomic_load(&memory.used)==0,"bridge release restores local budget");
+    }
+    free(encoded);
+#endif
+    b_close(&f);return t_ctx->failed?1:0;
+}
+TEST_REGISTER("test-typed-bulk-index-admission",test_typed_bulk_index_admission_run)

@@ -1,3 +1,4 @@
+#include "typed_index.h"
 #include <stdatomic.h>
 #include "typed_bulk_insert.h"
 #include <errno.h>
@@ -8,7 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-typedef struct {size_t limit;_Atomic size_t used;} BulkMemory;
+typedef TypedBulkMemory BulkMemory;
 static int bulk_take(BulkMemory *m,size_t n){
     size_t used=atomic_load(&m->used);
     do{
@@ -17,6 +18,9 @@ static int bulk_take(BulkMemory *m,size_t n){
     return 0;
 }
 static void bulk_release(BulkMemory *m,size_t n){atomic_fetch_sub(&m->used,n);}
+
+int typed_bulk_index_memory_take(void *memory,size_t n){return memory?bulk_take(memory,n):0;}
+void typed_bulk_index_memory_release(void *memory,size_t n){if(memory)bulk_release(memory,n);}
 
 typedef struct {
     char *key,*json;
@@ -29,6 +33,7 @@ typedef struct {
     const TypedSchema *ts;
     const Schema *sc;
     const char *root,*object;
+    const char (*indexes)[256];const enum IndexType *index_types;int nidx;
 } BulkRow;
 typedef struct {char *key;size_t len;} BulkKey;
 typedef struct {
@@ -236,6 +241,11 @@ static int bulk_value(const SlotcaskOldRecord *old,SlotcaskBulkRec *rec){
         physical>(size_t)r->sc->slot_size){
         r->error=rc?(errno?errno:EINVAL):E2BIG;free(r->owned);r->owned=NULL;bulk_release(r->memory,r->charged);r->charged=0;return -1;
     }
+    if(typed_index_validate_new(r->ts,r->owned,len,PKR_FLAGS,
+        r->indexes,r->index_types,r->nidx)){
+        r->error=errno?errno:EINVAL;free(r->owned);r->owned=NULL;
+        bulk_release(r->memory,r->charged);r->charged=0;return -1;
+    }
     if(len>r->charged){r->error=EOVERFLOW;free(r->owned);r->owned=NULL;bulk_release(r->memory,r->charged);r->charged=0;return -1;}
     bulk_release(r->memory,r->charged-len);r->charged=len;
     rec->value=r->owned;rec->vlen=len;rec->hdr2=PKR_FLAGS;return 0;
@@ -356,10 +366,11 @@ static int typed_bulk_command(const char *root,const char *object,
         (borrowed&&(borrowed->num_shards!=sc->splits||borrowed->slot_size!=sc->slot_size))){
         errno=EINVAL;OUT("{\"error\":\"invalid packed bulk input\"}\n");return 1;
     }
-    char indexes[MAX_FIELDS][256];
-    if(load_index_fields(root,object,indexes,MAX_FIELDS)>0){
-        errno=ENOTSUP;OUT("{\"error\":\"packed bulk indexes await R2 integration\"}\n");return 1;
-    }
+    char indexes[MAX_FIELDS][256];enum IndexType index_types[MAX_FIELDS];
+    int nidx=load_index_fields(root,object,indexes,MAX_FIELDS);
+    if(nidx<0){OUT("{\"error\":\"cannot load indexes\"}\n");return 1;}
+    load_index_types(root,object,index_types,MAX_FIELDS);
+    SlotcaskDb *owned SDB_REG_REF=NULL;
     BulkRows b={.update=update};b.memory.limit=g_query_buffer_max_bytes;
     atomic_init(&b.memory.used,0);char *json=NULL;
     QueryDeadline dl={now_ms_coarse(),resolve_timeout_ms(),0};
@@ -393,6 +404,7 @@ static int typed_bulk_command(const char *root,const char *object,
     if(!recs||!cells||!inputs){free(recs);free(cells);free(inputs);errno=ENOMEM;goto fail;}
     for(size_t i=0,g=0;i<b.count;i++){
         BulkRow *r=&b.rows[i];r->ts=ts;r->sc=sc;r->root=root;r->object=object;
+        r->indexes=(const char (*)[256])indexes;r->index_types=index_types;r->nidx=nidx;
         cells[i]=(BulkCell){r,delimiter,update};
         recs[i]=(SlotcaskBulkRec){.key=r->key,.klen=r->klen,.hdr2=PKR_FLAGS,.user_ctx=&cells[i],.status=-1};
         if(!i||r->shard!=b.rows[i-1].shard){
@@ -405,19 +417,35 @@ static int typed_bulk_command(const char *root,const char *object,
         inputs[g].nrecs++;
     }
     SlotcaskSchemaInfo info={.splits=sc->splits,.slot_size=sc->slot_size,.streams=sc->streams};
-    SlotcaskDb *owned SDB_REG_REF=borrowed?NULL:slotcask_registry_get(root,object,&info);
+    owned=borrowed?NULL:slotcask_registry_get(root,object,&info);
     SlotcaskDb *db=borrowed?borrowed:owned;
     if(!db){free(inputs);free(cells);free(recs);goto fail;}
+    size_t bridge_array_bytes=nidx?groups*sizeof(void*):0;
+    if(bridge_array_bytes&&bulk_take(&b.memory,bridge_array_bytes)){
+        free(inputs);free(cells);free(recs);goto fail;
+    }
+    void **bridges=nidx?calloc(groups,sizeof(*bridges)):NULL;
+    if(nidx&&!bridges){free(inputs);free(cells);free(recs);goto fail;}
+    if(nidx)for(size_t g=0;g<groups;g++){
+        if(!(bridges[g]=typed_bulk_index_bridge_create(
+            root,object,sc,ts,(const char (*)[256])indexes,index_types,nidx,&inputs[g],&b.memory))){
+            for(size_t k=0;k<g;k++)typed_bulk_index_bridge_free(bridges[k]);
+            free(bridges);bulk_release(&b.memory,bridge_array_bytes);free(inputs);free(cells);free(recs);goto fail;
+        }
+    }
     rc=slotcask_bulk_request_execute(db,inputs,groups);
+    if(nidx)for(size_t g=0;g<groups;g++)typed_bulk_index_bridge_free(bridges[g]);
+    free(bridges);if(bridge_array_bytes)bulk_release(&b.memory,bridge_array_bytes);
+
     size_t inserted=0,skipped=b.skipped,errors=b.errors,updated=0;int pending=0;
     for(size_t g=0;g<groups;g++){
         if(inputs[g].rc==-2)pending=1;
         for(size_t i=0;i<inputs[g].nrecs;i++){
             SlotcaskBulkRec *r=&inputs[g].recs[i];BulkCell *c=r->user_ctx;
-            if(c->row->error){errors++;if(update)skipped++;}
+            if(c->row->error){errors++;}
             else if(r->status==-2)skipped++;
             else if(r->status||(!update&&inputs[g].rc)){
-                errors++;if(update){skipped++;c->row->error=EIO;}
+                errors++;if(update){c->row->error=EIO;}
             }else if(update)updated++;
             else if(!r->was_update)inserted++;
         }

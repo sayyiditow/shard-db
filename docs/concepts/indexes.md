@@ -30,6 +30,21 @@ shard-db ships three index types:
 
 ## When to add an index
 
+Ordered keys are admitted by their actual encoded length, up to 544 bytes
+including each component's NULL tier. A standalone varchar fits at 543 content
+bytes. A write validates every affected NEW ordered key before staging its
+segment record; a key that does not fit is an error, rather than a successful
+record silently omitted from the index. An index build encountering such a
+live value fails before publishing that shard. The previous complete shard
+remains available, under the publication and durability rules above.
+
+Legacy index bytes retain their existing interpretation. Private packed numeric
+keys use exact canonical decimal ordering, independent of display scale. Public
+packed loading and migration remain inactive until authoritative layout metadata
+and rebuild eligibility are implemented. Ordinary legacy varchar-leading
+composite indexes remain creatable and filterable; fixed-width non-final
+components are an additional cursor eligibility rule, not a creation rule.
+
 Add an index when:
 - You run `find` / `count` / `aggregate` filtered by that field, and
 - The object is big enough that a full scan is noticeably slow (tens of thousands of records and up), or
@@ -114,8 +129,8 @@ Safe to call on a non-existent index — returns `{"status":"not_indexed",...}` 
 Given a `criteria` array, the planner picks one of five paths:
 
 - **`PRIMARY_LEAF`** — single indexed AND leaf drives the candidate set; remaining criteria are post-filtered on the records via `match_typed()` (zero-malloc byte compares).
-- **`PRIMARY_INTERSECT`** — pure AND of 2+ indexed leaves on rangeable operators (eq, lt, gt, lte, gte, between, in, starts_with). Walks each leaf's btree into a lock-free hash KeySet, intersects the sets, and skips per-record fetch entirely for `count` and AND-only `aggregate`. Capped at `MAX_INTERSECT_LEAVES = 8` indexed leaves — past that the planner falls back to `PRIMARY_LEAF`.
-- **`PRIMARY_KEYSET`** — pure OR (every child indexed) unions candidate hashes into a KeySet; pure-OR `count` returns `|KeySet|` directly.
+- **`PRIMARY_INTERSECT`** — pure AND of 2+ indexed leaves on rangeable operators (eq, lt, gt, lte, gte, between, in, starts_with). Walks each leaf's btree into a lock-free hash KeySet and intersects the candidate sets. Filtered `count` verifies candidates against live records. Capped at `MAX_INTERSECT_LEAVES = 8` indexed leaves — past that the planner falls back to `PRIMARY_LEAF`.
+- **`PRIMARY_KEYSET`** — pure OR (every child indexed) unions candidate hashes into a KeySet; filtered `count` verifies those candidates against live records.
 - **Hybrid AND+OR** — indexed AND leaf as primary, OR sub-tree as per-record post-filter.
 - **`PRIMARY_NONE`** — no indexable leaf; parallel scan across every kf shard. Each worker probes its shard's slot array, follows live slots into the segcache, runs `match_typed()` on the payload.
 

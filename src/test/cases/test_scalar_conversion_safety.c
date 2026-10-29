@@ -1,5 +1,5 @@
 /* Public routes must reject unsafe scalar conversions, preserve
-   criterion/write parity, and round-trip stored floating values. */
+   exact mathematical predicates, and round-trip stored floating values. */
 #include "test_runner.h"
 #include "test_assert.h"
 #include "test_client.h"
@@ -14,6 +14,66 @@ static char *req(TestClient *tc, const char *json) {
     return resp;
 }
 
+/* Each object has exactly four non-NULL values plus one NULL. No query
+   can borrow a rounded write operand or use NULL as a negated match. */
+static void exact_threshold_count(TestClient *tc, const char *object,
+                                  const char *criterion, int expected) {
+    char query[2048];
+    snprintf(query, sizeof(query),
+        "{\"mode\":\"count\",\"dir\":\"conv\",\"object\":\"%s\",\"criteria\":%s}",
+        object, criterion);
+    char *r = req(tc, query);
+    ASSERT_NOT_NULL(r, "exact threshold count response");
+    if (r) {
+        char *end = NULL;
+        long n = strtol(r, &end, 10);
+        ASSERT_TRUE(end != r && (*end == '\0' || *end == '\n'),
+                    "exact threshold returns a count rather than an error");
+        ASSERT_EQ_INT(n, expected, "exact threshold expected mathematical set");
+    }
+    free(r);
+}
+static void exact_threshold_matrix(TestClient *tc) {
+    const char *objects[] = {"exact_scan", "exact_btree"};
+    const char *ops[] = {"eq", "neq", "lt", "lte", "gt", "gte"};
+    const int positive[] = {0,4,3,3,1,1};
+    const int negative[] = {0,4,1,1,3,3};
+    for (int route = 0; route < 2; route++) {
+        char query[2048];
+        snprintf(query, sizeof(query),
+            "{\"mode\":\"create-object\",\"dir\":\"conv\",\"object\":\"%s\","
+            "\"splits\":8,\"max_key\":16,\"fields\":[\"n:numeric:12,2\"]%s}",
+            objects[route], route ? ",\"indexes\":[\"n\"]" : "");
+        char *r = req(tc, query);
+        ASSERT_TRUE(r && strstr(r,"\"error\"")==NULL,"create exact threshold route");free(r);
+        snprintf(query, sizeof(query),
+            "{\"mode\":\"bulk-insert\",\"dir\":\"conv\",\"object\":\"%s\","
+            "\"records\":{\"a\":{\"n\":\"-0.15\"},\"b\":{\"n\":\"-0.14\"},"
+            "\"c\":{\"n\":\"0.14\"},\"d\":{\"n\":\"0.15\"},\"null\":{\"n\":null}}}",
+            objects[route]);
+        r=req(tc,query);ASSERT_TRUE(r&&strstr(r,"\"inserted\":5"),"seed exact threshold route");free(r);
+        for (int i = 0; i < 6; i++) {
+            char criterion[512];
+            snprintf(criterion,sizeof(criterion),
+                "{\"field\":\"n\",\"op\":\"%s\",\"value\":\"0.145\"}",ops[i]);
+            exact_threshold_count(tc,objects[route],criterion,positive[i]);
+            snprintf(criterion,sizeof(criterion),
+                "{\"field\":\"n\",\"op\":\"%s\",\"value\":\"-0.145\"}",ops[i]);
+            exact_threshold_count(tc,objects[route],criterion,negative[i]);
+        }
+        exact_threshold_count(tc,objects[route],
+            "{\"field\":\"n\",\"op\":\"eq\",\"value\":\"-0.15\"}",1);
+        exact_threshold_count(tc,objects[route],
+            "{\"field\":\"n\",\"op\":\"eq\",\"value\":\"0.15\"}",1);
+        exact_threshold_count(tc,objects[route],
+            "{\"field\":\"n\",\"op\":\"between\",\"value\":\"-0.145\",\"value2\":\"0.145\"}",2);
+        exact_threshold_count(tc,objects[route],
+            "{\"field\":\"n\",\"op\":\"in\",\"value\":[\"0.145\",\"0.15\",\"-0.145\"]}",1);
+        exact_threshold_count(tc,objects[route],
+            "{\"field\":\"n\",\"op\":\"not_in\",\"value\":[\"0.145\",\"0.15\",\"-0.145\"]}",3);
+    }
+}
+
 static int test_scalar_conversion_safety_run(void) {
     TestEnv env = {0};
     if (test_env_start(&env) != 0) return 1;
@@ -23,6 +83,7 @@ static int test_scalar_conversion_safety_run(void) {
     if (!tc) { test_env_stop(&env); return 1; }
 
     char *r = req(tc, "{\"mode\":\"add-dir\",\"dir\":\"conv\"}"); free(r);
+    exact_threshold_matrix(tc);
     r = req(tc, "{\"mode\":\"create-object\",\"dir\":\"conv\","
         "\"object\":\"t\",\"splits\":8,\"max_key\":64,\"fields\":["
         "\"s:short\",\"i:int\",\"l:long\",\"b:byte\",\"n:numeric:26,10\","
@@ -114,10 +175,9 @@ static int test_scalar_conversion_safety_run(void) {
     ASSERT_TRUE(r && strncmp(r, "1", 1) == 0, "scale-0 INT64_MIN eq finds");
     free(r);
 
-    /* Numeric rounding + write/query parity: 0.145 at scale 2 stores
-       0.15 (ties away from zero — the old double path stored 14); both
-       the rounded and the original literal must find the row. 6e-100
-       rounds to 0.00, not 0.01. */
+    /* Assignment rounds to the column scale; a predicate retains its exact
+       mathematical threshold. 0.145 stores 0.15, but is not equal to 0.15.
+       6e-100 rounds to 0.00 on assignment, not 0.01. */
     r = req(tc, "{\"mode\":\"insert\",\"dir\":\"conv\",\"object\":\"t\","
         "\"key\":\"rnd\",\"value\":{\"r\":\"0.145\"}}");
     ASSERT_TRUE(r && strstr(r, "\"error\"") == NULL, "rounding insert ok");
@@ -129,11 +189,12 @@ static int test_scalar_conversion_safety_run(void) {
     free(r);
     r = req(tc, "{\"mode\":\"count\",\"dir\":\"conv\",\"object\":\"t\","
         "\"criteria\":[{\"field\":\"r\",\"op\":\"eq\",\"value\":\"0.145\"}]}");
-    ASSERT_TRUE(r && strncmp(r, "1", 1) == 0, "eq 0.145 finds (parity)");
+    ASSERT_TRUE(r && strncmp(r, "0", 1) == 0,
+                "stored 0.15 does not equal exact threshold 0.145");
     free(r);
     r = req(tc, "{\"mode\":\"count\",\"dir\":\"conv\",\"object\":\"t\","
         "\"criteria\":[{\"field\":\"r\",\"op\":\"eq\",\"value\":\"0.15\"}]}");
-    ASSERT_TRUE(r && strncmp(r, "1", 1) == 0, "eq 0.15 finds (parity)");
+    ASSERT_TRUE(r && strncmp(r, "1", 1) == 0, "eq 0.15 finds stored exact value");
     free(r);
     r = req(tc, "{\"mode\":\"insert\",\"dir\":\"conv\",\"object\":\"t\","
         "\"key\":\"tiny\",\"value\":{\"r\":\"6e-100\"}}");

@@ -1012,10 +1012,17 @@ static int named_component_open(const TypedRowView *view,int index,RowText *text
     if(span.is_null||view->schema->fields[index].removed)return 0;
     return row_text_open(view,(size_t)index,text);
 }
+/* Explicit bounded scan, semantically identical to strnlen(s,MAX_LINE): spelled
+   out so inlined callers with smaller buffer objects (for example the
+   SearchCriterion.field[256] at the match_typed_checked named-text site) are
+   not flagged by -Wstringop-overread for the caller-independent bound. */
+static size_t bounded_line_length(const char *s){
+    size_t n=0;while(n<MAX_LINE&&s[n])n++;return n;
+}
 static int named_text_open(const TypedRowView *view,const char *name,size_t budget,
                            NamedText *text){
     memset(text,0,sizeof(*text));dec_init(&text->value.decimal);
-    size_t length=strnlen(name,MAX_LINE);if(length==MAX_LINE){errno=E2BIG;return -1;}
+    size_t length=bounded_line_length(name);if(length==MAX_LINE){errno=E2BIG;return -1;}
     if(!strchr(name,'+')){
         int index=typed_field_index(view->schema,name);TypedRowSpan span;
         if(index<0){text->missing=1;return projection_text_open(view,-1,&text->value);}
@@ -1089,7 +1096,7 @@ char *typed_packed_project_json(const TypedSchema *ts,const uint8_t *value,
     size_t len,uint8_t hdr2,const char *fields_csv,size_t budget){
     if(!packed_schema_ok(ts)||!fields_csv){errno=EINVAL;return NULL;}
     if(budget<3){errno=ENOMEM;return NULL;}
-    size_t length=strnlen(fields_csv,MAX_LINE);
+    size_t length=bounded_line_length(fields_csv);
     if(length==MAX_LINE){errno=E2BIG;return NULL;}
     char *copy=malloc(length+1);if(!copy){errno=ENOMEM;return NULL;}
     memcpy(copy,fields_csv,length+1);
@@ -1193,7 +1200,7 @@ static int csv_selection_open(const TypedSchema *ts,const char *fields,
         }
         return 0;
     }
-    size_t n=strnlen(fields,MAX_LINE);
+    size_t n=bounded_line_length(fields);
     if(n==MAX_LINE){errno=E2BIG;return -1;}
     selection->copy=malloc(n+1);
     if(!selection->copy){errno=ENOMEM;return -1;}
@@ -1305,7 +1312,7 @@ size_t typed_packed_render_allowance(const TypedSchema *ts,const uint8_t *value,
         if(bytes>f->payload_max||bytes>len-ts->packed.prefix){errno=EILSEQ;return 0;}
         if(bytes>largest)largest=bytes;
     }
-    size_t selector=fields?strnlen(fields,MAX_LINE):0;
+    size_t selector=fields?bounded_line_length(fields):0;
     if(selector==MAX_LINE){errno=E2BIG;return 0;}
     if(largest>(SIZE_MAX-selector-129)/8){errno=EOVERFLOW;return 0;}
     size_t workspace=largest?8*largest+128:0;

@@ -76,8 +76,15 @@ are implemented and independently reviewed. The final fresh normal suite passes
 21,095 assertions across 530 cases; all compatibility probes pass. R1 removes
 the CSV writer reservation and restores keyfile-only skipping without changing
 existing reader locks. See the [execution ledger](2026-10-28-r1-execution-evidence.md)
-and [amendment evidence](2026-10-28-r1-fetch-skip-evidence.md). R2 is next; public
-packed activation and the remaining R2–R6 acceptance requirements stay open.
+and [amendment evidence](2026-10-28-r1-fetch-skip-evidence.md).
+
+R2 completion (2026-10-29): exact filtering/index/order/join integration and
+review repairs are implemented and independently reviewed. The final normal
+suite passes 21,719 assertions across 537 cases with no failures. The
+[executed R2 plan](2026-10-28-r2-exact-query-index-plan.md) records contracts,
+regression evidence and confirmed packed aggregate defects owned by R3.
+R3 is next; public packed activation and R3–R6 acceptance remain open. The
+human owns sanitizer runs before the final authorized push/PR.
 
 Keep fixes with their owning integration instead of first shipping a temporary
 private refusal and then scheduling another plan to replace it. Where an

@@ -75,6 +75,7 @@ typedef struct {
     size_t buffer_bytes;
     _Atomic int budget_exceeded;
     pthread_mutex_t lock;
+    int predicate_error;
 } BulkCriteriaCtx;
 
 /* ========== Joins ========== */
@@ -186,7 +187,7 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
 /* query_find.c — O_DIRECT scan helpers (used by query.c find/count paths) */
 int od_seg_record_cb(const uint8_t *rec, size_t vlen,
                      const uint8_t hash16[16], void *raw_ctx);
-void scan_shards_v2_o_direct_match(SlotcaskDb *db,
+int scan_shards_v2_o_direct_match_checked(SlotcaskDb *db,
                                    FieldSchema *fs,
                                    const CompiledCriterion *single_cc,
                                    const CriteriaNode *tree,
@@ -332,6 +333,7 @@ typedef struct {
     QueryDeadline *deadline;
     int dl_counter;
     pthread_mutex_t lock;
+    int predicate_error;
 } AdvSearchCtx;
 
 /* query.c — callback functions (used by query_aggregate.c) */
@@ -350,6 +352,9 @@ int op_prefers_trigram(enum SearchOp op);
 void group_by_csv_to_json(const char *csv, char *out, size_t out_sz);
 /* Raw/varchar criteria are explicit spans. Libc-parsed scalar criteria
    must be full C strings with a readable terminator at val[vlen]. */
+int encode_criterion_value_checked(const TypedSchema*,const TypedField*,const char*,size_t,uint8_t*,size_t,size_t*);
+int btree_dispatch_schema_checked(const TypedSchema*,const char*,const char*,const char*,int,SearchCriterion*,const TypedField*,bt_result_cb,void*);
+int btree_dispatch_checked(const char*,const char*,const char*,int,SearchCriterion*,const TypedField*,bt_result_cb,void*);
 void encode_criterion_value(const TypedField *tf,
                             const char *val, size_t vlen,
                             uint8_t *buf, size_t *out_len);
@@ -374,7 +379,9 @@ int bitmap_emit_for_shard(const char *db_root, const char *object,
                           bt_result_cb cb, void *ctx, SlotcaskDb *sdb);
 
 /* query.c — criteria tree operations (used by query_aggregate.c) */
-void recompile_criteria_tree(CriteriaNode *n, const TypedSchema *ts);
+int recompile_criteria_tree(CriteriaNode *n, const TypedSchema *ts);
+int pick_index_for_leaf_schema(const TypedSchema*,const char*,const char*,const SearchCriterion*);
+int search_criterion_indexable(const TypedSchema*,const SearchCriterion*);
 int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
                     const char *object, char *out_idx_path, size_t out_sz);
 int find_intersect_leaves(CriteriaNode *root,
@@ -414,31 +421,21 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
 int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
                       char *buf, size_t bufsz, int skip_zero);
 
+/* query.c — sound tier-0 candidate pre-filter shared by every btree
+   candidate callback (collect_hash_cb, stream_keyset_cb, idx_count_cb,
+   stream_primary_check/filter). 1 = admit to per-record verification,
+   0 = positively rejected on an exactly-decoded mismatch. */
+int idx_candidate_admits(const TypedField *tf, const char *payload,
+                         size_t plen, const SearchCriterion *c);
+
 /* query_join.c — join helpers (used by query.c find paths) */
 int parse_joins_json(const char *json, JoinSpec **out, int *count);
 void free_joins(JoinSpec *arr, int n);
 int resolve_joins(JoinSpec *joins, int n, const char *db_root,
                   const char *driver_object, FieldSchema *driver_fs);
-int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
-                      size_t driver_len,
-                      const TypedSchema *driver_ts,
-                      uint8_t driver_hdr2,
-                      char *buf, size_t bufsz);
-int lookup_remote(const JoinSpec *j, const char *db_root,
-                  const char *local_key, size_t local_len,
-                  RecordRef *out_rr);
 int buf_driver_values(const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs,
                       const char **driver_proj, int driver_proj_count,
                       uint8_t driver_hdr2, char *buf, size_t bufsz);
-int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw, size_t remote_len,
-                    uint8_t remote_hdr2, char *buf, size_t bufsz);
-size_t build_joined_csv_row(const char *key,
-                            const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs, uint8_t driver_hdr2,
-                            const char **proj_fields, int proj_count,
-                            const JoinSpec *joins, int njoins,
-                            const RecordRef *jrefs,
-                            char csv_delim,
-                            char *buf, size_t bufsz);
 void emit_joined_csv_header(const char *driver_object,
                             FieldSchema *driver_fs,
                             const JoinSpec *joins, int njoins,
@@ -489,4 +486,14 @@ typedef struct {
 void order_walk_bounds(CriteriaNode *tree, FieldSchema *fs,
                        const char *order_by, OrderWalkBounds *b);
 
+/* Render one complete bounded row before writing it; 0/-1 with errno. */
+int typed_query_emit_row(FILE *out,const char *wire,size_t wire_len,
+    const uint8_t *raw,size_t len,uint8_t flags,FieldSchema *fs,
+    const char **fields,int nfields,int rows,int dict,char delimiter,int comma,
+    const JoinSpec *joins,int njoins,const RecordRef *refs,size_t budget);
+
+int typed_query_named_text(const TypedSchema *,const uint8_t *,size_t,uint8_t,const char *,size_t,char **,size_t *);
+int typed_query_columns_into(const uint8_t *,size_t,uint8_t,FieldSchema *,const char **,int,char *,size_t);
+int resolve_join_record(const JoinSpec *,const char *,const TypedSchema *,const uint8_t *,size_t,uint8_t,size_t,RecordRef *);
+int order_walk_bounds_checked(CriteriaNode *,FieldSchema *,const char *,OrderWalkBounds *);
 #endif

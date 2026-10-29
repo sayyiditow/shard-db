@@ -128,7 +128,17 @@ the split does not approve the new code, all old D1–D9 decisions, or activatio
   compatibility probes and independent review with no remaining findings.
   R1 removes 3B.10's private all-shard CSV reservation and preserves existing
   ordinary per-shard/cache locking. Packed storage remains publicly inactive.
-  R2 is the next consolidated delivery; R1 does not close Phase 3B.
+  R1 does not close Phase 3B.
+- R2: [executed plan and acceptance record](2026-10-28-r2-exact-query-index-plan.md)
+  is implemented and independently reviewed against R1 commit `bbb6248`.
+  Exact predicates and pre-staging oversized-key rejection in both layouts
+  retain the user-confirmed contract. Review repairs cover allocation/worker
+  errors, zero-valued index candidates, bitmap count verification and buffered
+  pagination. Final normal build is warning-free; fresh full suite is
+  21,719 passed / 0 failed across 537 cases. Public packed activation remains
+  inactive. R3 is next and owns the confirmed packed aggregate min/max and
+  indexed grouping decode defects recorded in the R2 handoff. Sanitizer runs
+  remain human-owned before the final authorized push/PR.
 - 3C: child plan must be prepared against the reviewed 3B result.
 - [Original review](2026-10-23-phase3-packed-records-plan-review.md): unchanged.
 - [Rejected draft archive](archive/2026-10-23-phase3-packed-records-rejected.md):

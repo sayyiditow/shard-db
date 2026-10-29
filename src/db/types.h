@@ -386,6 +386,8 @@ typedef struct {
     enum SearchOp op;
     char value[1024];
     char value2[1024];
+    char *owned_value, *owned_value2;
+    size_t owned_value_len, owned_value2_len;
     char **in_values;
     int in_count;
     int in_cap;
@@ -401,6 +403,15 @@ typedef struct {
     int64_t len_target2;   /* second bound for OP_LEN_BETWEEN */
 } SearchCriterion;
 
+const char *search_criterion_value(const SearchCriterion *c);
+const char *search_criterion_value2(const SearchCriterion *c);
+size_t search_criterion_value_len(const SearchCriterion *c);
+size_t search_criterion_value2_len(const SearchCriterion *c);
+int search_criterion_set(SearchCriterion *c, int second, const char *s, size_t n);
+void search_criterion_clear(SearchCriterion *c);
+int search_criterion_clone(SearchCriterion *dst, const SearchCriterion *src);
+void search_criterion_move(SearchCriterion *dst, SearchCriterion *src);
+
 /* Like-kind for OP_LIKE / OP_ILIKE — determined at compile-criteria time
    from the pattern shape (no wildcards → LK_EXACT, trailing % → LK_PREFIX,
    leading+trailing % → LK_CONTAINS).  Replaces a runtime string search. */
@@ -410,6 +421,10 @@ typedef enum LikeKind { LK_EXACT, LK_PREFIX, LK_CONTAINS } LikeKind;
    match_typed() in the scan hot path.  Fully visible so io_direct.c's
    batch matchers can pre-digest field type + op without opaque accessors. */
 typedef struct CompiledCriterion {
+    const TypedSchema *schema;
+    size_t workspace_budget; /* immutable remainder after collection prepare */
+    dec_t numeric1, numeric2;
+    dec_t *in_numeric;
     const TypedField *tf;       /* resolved; NULL iff composite or unknown */
     const TypedField *rhs_tf;   /* RHS for field-vs-field ops; NULL otherwise */
     enum SearchOp op;
@@ -474,6 +489,7 @@ typedef struct CriteriaNode {
     CompiledCriterion *compiled;     /* populated by compile_criteria_tree() */
     struct CriteriaNode **children;  /* valid iff kind == CNODE_AND || CNODE_OR */
     int n_children;
+    int children_cap; /* retained allocation may exceed n_children after coalescing */
 } CriteriaNode;
 
 #define MAX_CRITERIA_DEPTH 16
@@ -1659,6 +1675,10 @@ void free_criteria_tree(CriteriaNode *root);
 /* Pre-compile every leaf in the tree against the schema so match_typed() has
    zero-malloc-per-record cost during scans. Safe to call multiple times — leaves
    already compiled are skipped. */
+int compile_one_checked(CompiledCriterion*, const SearchCriterion*, const TypedSchema*, char*, size_t);
+int compile_criteria_tree_checked(CriteriaNode*, const TypedSchema*, char*, size_t);
+int match_typed_checked(const uint8_t*, size_t, const CompiledCriterion*, FieldSchema*, uint8_t, int*);
+int criteria_match_tree_checked(const uint8_t*, size_t, const CriteriaNode*, FieldSchema*, uint8_t, int*);
 void compile_criteria_tree(CriteriaNode *root, const TypedSchema *ts);
 
 /* Recursive match: AND short-circuits on first false, OR on first true. Passing

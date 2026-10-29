@@ -38,7 +38,7 @@ Memory admission covers retained payload owners, OLD numeric validation,
 generated text plus its copied payload, and aligned decimal/result workspace
 before allocation. Allocation failures preserve their resource-error identity.  Migration audits
 that metadata separately. Bulk updates retain their existing literal-only contract;
-criteria/per-row guards remain owned by R2. Packed bulk input rejects repeated
+R2 integrates criteria/per-row guards through the existing protected callbacks. Packed bulk input rejects repeated
 normalized storage keys before request submission, preserving its approved private
 policy; the older public legacy bulk duplicate policy is unchanged. Auto-key bulk
 inserts return generated keys in input order. Generator/sequence gaps after a
@@ -74,3 +74,41 @@ finance applications must preserve number tokens rather than passing arbitrary
 precision decimals through JavaScript Number/JSON.parse. The optional pure-JS
 cell decoder accepts bytes from a byte-preserving transport. The native query
 string route remains UTF-8 text; it is not a new binary transport API.
+
+## Query predicates, keys and streamed rows
+
+Query operands retain their complete bytes. Numeric filters compare exact
+decimal values, including operands outside a legacy column's assignment scale;
+they are not rounded to the column merely to construct an index bound. A valid
+bound that cannot be represented by that legacy index uses exact record
+filtering. For example, a scale-2 assignment of `0.145` stores `0.15`;
+`eq 0.145` does not match it, while `eq 0.15` does. Malformed predicates fail before planning, including count shortcuts
+that would otherwise avoid record access. Runtime matcher failures travel
+separately from a false match. Write checks retain the engine's boolean callback
+contract; command-owned error reasons distinguish type failures from conditions
+that simply did not match.
+
+Index hits are candidates for filtered counts and unordered indexed finds.
+Bitmap postfilters may reject a candidate, but surviving records still undergo
+the complete criteria check. Buffered finds apply offset and limit after that
+check, exclusions and joins; they do not stop collecting at offset plus limit.
+The query-memory cap still bounds candidate collection, with the existing scan
+fallback when the buffered path exceeds its budget.
+
+Find retains its existing streaming behavior. Each returned row is rendered
+completely into bounded owned fragments while its input bytes are borrowed,
+then written in the existing emit critical section. Joined output and sort keys
+use actual lengths, with no 1024-byte value or 16384-byte joined-row truncation.
+Sort ownership follows the existing heaps, swaps and compaction. Byte counters
+account for new owners and candidate capacities; they add no lock, reservation,
+worker task or stronger snapshot guarantee. A late failure stops the response
+without emitting a successful closing envelope or appending a replacement JSON
+document after accepted bytes. Clients must treat an incomplete response as a
+failure. Row construction failure emits none of that row's fragments.
+
+All affected NEW ordered index keys are validated before segment staging,
+including literal bulk input and OLD-derived constructors. Failed construction
+counts as an error rather than the engine's condition-skip status. Existing
+window batching, writer gates, durable markers and forward replay remain
+authoritative. Packed bulk index adapters reuse the existing per-field/per-shard
+window callbacks; they do not replace them with serial per-record index writes.

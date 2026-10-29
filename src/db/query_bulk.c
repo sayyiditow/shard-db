@@ -1,3 +1,4 @@
+#include "typed_index.h"
 #include "types.h"
 #include "typed_bulk_insert.h"
 #include "slotcask.h"
@@ -16,6 +17,17 @@ static int g_bulk_upd_test_fail_alloc;
 
 void bulk_upd_json_test_set_fail_alloc(int fail_n) {
     g_bulk_upd_test_fail_alloc = fail_n;
+}
+#endif
+
+#ifdef TEST_BUILD
+/* Deterministic injection for the v2 bulk-insert bitmap/trigram staging
+   allocation (same precedent as g_bulk_upd_test_fail_alloc): armed N
+   fails the Nth staging allocation; 0 = never. */
+static int g_bulk_ins_payload_test_fail_alloc;
+
+void bulk_ins_payload_test_set_fail_alloc(int fail_n) {
+    g_bulk_ins_payload_test_fail_alloc = fail_n;
 }
 #endif
 
@@ -62,6 +74,7 @@ typedef struct {
     size_t   new_count;
     int      out_error;
     int      out_errno;
+    void *memory; /* packed bridge only */
 } IdxFieldArg;
 
 static void *idx_build_field_worker(void *arg) {
@@ -71,6 +84,10 @@ static void *idx_build_field_worker(void *arg) {
     if (fa->new_count == 0) return NULL;
     int idx_n = index_splits_for(fa->splits);
 
+    size_t allocation_bytes=(size_t)idx_n*3*sizeof(size_t)+fa->new_count*sizeof(BtEntry);
+    if(typed_bulk_index_memory_take(fa->memory,allocation_bytes)){
+        fa->out_error=-1;fa->out_errno=ENOMEM;return NULL;
+    }
     /* Bucket-sort new_entries by idx_shard. */
     size_t *counts  = calloc((size_t)idx_n, sizeof(size_t));
     size_t *offsets = calloc((size_t)idx_n, sizeof(size_t));
@@ -80,6 +97,7 @@ static void *idx_build_field_worker(void *arg) {
         free(counts); free(offsets); free(parted);
         fa->out_error = -1;
         fa->out_errno = ENOMEM;
+        typed_bulk_index_memory_release(fa->memory,allocation_bytes);
         return NULL;
     }
     for (size_t i = 0; i < fa->new_count; i++)
@@ -92,6 +110,7 @@ static void *idx_build_field_worker(void *arg) {
         free(counts); free(offsets); free(parted);
         fa->out_error = -1;
         fa->out_errno = ENOMEM;
+        typed_bulk_index_memory_release(fa->memory,allocation_bytes);
         return NULL;
     }
     for (size_t i = 0; i < fa->new_count; i++) {
@@ -125,6 +144,7 @@ static void *idx_build_field_worker(void *arg) {
     free(parted);
     free(counts);
     free(offsets);
+    typed_bulk_index_memory_release(fa->memory,allocation_bytes);
     return NULL;
 }
 
@@ -366,6 +386,7 @@ typedef struct {
     int             *kf_offsets;
     int             *kf_cursors;
     uint8_t         *old_arena;
+    void *index_memory; /* packed bridge only: existing BulkMemory owner */
 } BulkInsShardWork;
 
 /* Build the shard→worker mapping used by every parallel bulk path
@@ -428,6 +449,9 @@ typedef struct {
        after the pre_commit returns. */
     uint8_t          *old_arena;
     size_t            old_arena_slot;
+    void *original_user;
+    int (*original_compute)(const SlotcaskOldRecord *, SlotcaskBulkRec *);
+    int error;
 } V2BulkInsCtx;
 
 /* value_compute hook: corrects :auto_create fields before the segment
@@ -448,6 +472,11 @@ typedef struct {
      - key is a genuine fresh insert (old == NULL): re-stamp now()
        unconditionally, even though phase 1 may already have stamped it,
        to overwrite any client-supplied override, matching cmd_insert_v2. */
+static int bulk_insert_has_auto_create(const TypedSchema *ts){
+    for(int i=0;i<ts->nfields;i++)if(!ts->fields[i].removed&&
+        ts->fields[i].default_kind==DK_AUTO_CREATE)return 1;
+    return 0;
+}
 static int v2_bulk_ins_ac_value_compute(const SlotcaskOldRecord *old,
                                          SlotcaskBulkRec *rec) {
     V2BulkInsCtx *ctx = (V2BulkInsCtx *)rec->user_ctx;
@@ -468,6 +497,10 @@ static int v2_bulk_ins_ac_value_compute(const SlotcaskOldRecord *old,
         auto_create_field_transfer(ts, buf, i, existed, o_view_ok,
                                    o_base, o_bm, o_bm_bytes, o_region,
                                    old ? old->hdr2 : 0);
+    }
+    if(typed_index_validate_new(ts,buf,rec->vlen,rec->hdr2,
+        ctx->sw->idx_fields,ctx->sw->idx_types,ctx->sw->nidx)){
+        ctx->error=errno?errno:EINVAL;return -1;
     }
     return 0;
 }
@@ -494,7 +527,61 @@ typedef struct {
     size_t               *idx_pair_counts;
     size_t               *idx_pair_caps;
     int                   nidx;
+    void *memory;
+    size_t bitmap_charge;
 } BulkInsWindowState;
+
+/* Packed windows charge actual allocation requests through the adapter's
+ * existing atomic BulkMemory. Legacy windows keep their prior allocation policy. */
+typedef union {max_align_t align;size_t size;} BwAllocationHeader;
+static void *bw_alloc(BulkInsWindowState *ws,size_t n){
+    if(!ws->memory)return malloc(n);
+    if(n>SIZE_MAX-sizeof(BwAllocationHeader)){errno=ENOMEM;return NULL;}
+    size_t charge=n+sizeof(BwAllocationHeader);
+    if(typed_bulk_index_memory_take(ws->memory,charge))return NULL;
+    BwAllocationHeader *h=malloc(charge);
+    if(!h){typed_bulk_index_memory_release(ws->memory,charge);return NULL;}
+    h->size=n;return h+1;
+}
+static void bw_dealloc(BulkInsWindowState *ws,void *ptr){
+    if(!ptr)return;
+    if(!ws->memory){free(ptr);return;}
+    BwAllocationHeader *h=(BwAllocationHeader*)ptr-1;
+    typed_bulk_index_memory_release(ws->memory,h->size+sizeof(*h));free(h);
+}
+static void *bw_calloc(BulkInsWindowState *ws,size_t count,size_t size){
+    if(size&&count>SIZE_MAX/size){errno=ENOMEM;return NULL;}
+    size_t n=count*size;void *p=bw_alloc(ws,n);if(p)memset(p,0,n);return p;
+}
+static void *bw_realloc(BulkInsWindowState *ws,void *ptr,size_t n){
+    if(!ws->memory)return realloc(ptr,n);
+    void *p=bw_alloc(ws,n);if(!p)return NULL;
+    if(ptr){size_t old=((BwAllocationHeader*)ptr-1)->size;memcpy(p,ptr,old<n?old:n);bw_dealloc(ws,ptr);}
+    return p;
+}
+static int bw_record_key(BulkInsWindowState *ws,const TypedSchema *ts,
+    const uint8_t *value,size_t n,uint8_t flags,const char *field,int payload,
+    int old,uint8_t **out,size_t *len){
+    *out=NULL;*len=0;
+    int rc=payload?typed_index_record_payload_into(ts,value,n,flags,field,NULL,0,len):
+        old?typed_index_old_record_key_into(ts,value,n,flags,field,NULL,0,len):
+        typed_index_record_key_into(ts,value,n,flags,field,NULL,0,len);
+    if(rc!=1)return rc;
+    size_t need=*len;uint8_t *p=bw_alloc(ws,need?need:1);if(!p){*len=0;return -1;}
+    rc=payload?typed_index_record_payload_into(ts,value,n,flags,field,p,need,len):
+        typed_index_record_key_into(ts,value,n,flags,field,p,need,len);
+    if(rc!=1){bw_dealloc(ws,p);*len=0;return rc;}
+    *out=p;return 1;
+}
+
+typedef struct {
+    void *memory;uint8_t *buffers[MAX_FIELDS];size_t lengths[MAX_FIELDS];
+    int have[MAX_FIELDS],owned[MAX_FIELDS];
+} BwOldKeys;
+static void bw_old_keys_free(BwOldKeys *keys){
+    BulkInsWindowState temporary={.memory=keys->memory};
+    for(int i=0;i<MAX_FIELDS;i++)if(keys->owned[i]==1)bw_dealloc(&temporary,keys->buffers[i]);
+}
 
 /* The worker-ctx variants of the staging helpers, re-keyed onto the
    per-window state. */
@@ -502,7 +589,7 @@ static int bw_track_buf(BulkInsWindowState *ws, void *buf) {
     if (!buf) return 0;
     if (ws->bw_nbufs >= ws->bw_bufs_cap) {
         size_t ncap = ws->bw_bufs_cap ? ws->bw_bufs_cap * 2 : 32;
-        void **t = realloc(ws->bw_bufs, ncap * sizeof(void *));
+        void **t = bw_realloc(ws,ws->bw_bufs, ncap * sizeof(void *));
         if (!t) return -1;
         ws->bw_bufs = t;
         ws->bw_bufs_cap = ncap;
@@ -512,8 +599,8 @@ static int bw_track_buf(BulkInsWindowState *ws, void *buf) {
 }
 
 static void bw_free_bufs(BulkInsWindowState *ws) {
-    for (size_t i = 0; i < ws->bw_nbufs; i++) free(ws->bw_bufs[i]);
-    free(ws->bw_bufs);
+    for (size_t i = 0; i < ws->bw_nbufs; i++) bw_dealloc(ws,ws->bw_bufs[i]);
+    bw_dealloc(ws,ws->bw_bufs);
     ws->bw_bufs = NULL;
     ws->bw_nbufs = 0;
     ws->bw_bufs_cap = 0;
@@ -522,20 +609,20 @@ static void bw_free_bufs(BulkInsWindowState *ws) {
 static uint8_t *bw_stage_old_key(BulkInsWindowState *ws, uint8_t *buf,
                                   size_t len, int owned, int *err) {
     if (owned) {
-        if (bw_track_buf(ws, buf) != 0) { free(buf); *err = -1; return NULL; }
+        if (bw_track_buf(ws, buf) != 0) { bw_dealloc(ws,buf); *err = -1; return NULL; }
         return buf;
     }
-    uint8_t *copy = malloc(len);
+    uint8_t *copy = bw_alloc(ws,len);
     if (!copy) { *err = -1; return NULL; }
     memcpy(copy, buf, len);
-    if (bw_track_buf(ws, copy) != 0) { free(copy); *err = -1; return NULL; }
+    if (bw_track_buf(ws, copy) != 0) { bw_dealloc(ws,copy); *err = -1; return NULL; }
     return copy;
 }
 
 static int tg_track_op(BulkInsWindowState *ws, const UpdateIdxArg *a) {
     if (ws->tg_nops >= ws->tg_cap) {
         size_t ncap = ws->tg_cap ? ws->tg_cap * 2 : 32;
-        UpdateIdxArg *t = realloc(ws->tg_ops, ncap * sizeof(UpdateIdxArg));
+        UpdateIdxArg *t = bw_realloc(ws,ws->tg_ops, ncap * sizeof(UpdateIdxArg));
         if (!t) return -1;
         ws->tg_ops = t;
         ws->tg_cap = ncap;
@@ -547,7 +634,7 @@ static int tg_track_op(BulkInsWindowState *ws, const UpdateIdxArg *a) {
 static int bt_track_del_op(BulkInsWindowState *ws, const BtDeleteOp *op) {
     if (ws->bt_del_nops >= ws->bt_del_cap) {
         size_t ncap = ws->bt_del_cap ? ws->bt_del_cap * 2 : 32;
-        BtDeleteOp *t = realloc(ws->bt_del_ops, ncap * sizeof(BtDeleteOp));
+        BtDeleteOp *t = bw_realloc(ws,ws->bt_del_ops, ncap * sizeof(BtDeleteOp));
         if (!t) return -1;
         ws->bt_del_ops = t;
         ws->bt_del_cap = ncap;
@@ -567,18 +654,19 @@ static void v2_bulk_ins_window_release_state(void *ctx, void *window_state) {
     if (!ws) return;
     bitmap_prepare_window_free(&ws->bw_window);
     bw_free_bufs(ws);
-    free(ws->tg_ops); ws->tg_ops = NULL; ws->tg_nops = ws->tg_cap = 0;
-    free(ws->bt_del_ops); ws->bt_del_ops = NULL; ws->bt_del_nops = ws->bt_del_cap = 0;
+    bw_dealloc(ws,ws->tg_ops); ws->tg_ops = NULL; ws->tg_nops = ws->tg_cap = 0;
+    bw_dealloc(ws,ws->bt_del_ops); ws->bt_del_ops = NULL; ws->bt_del_nops = ws->bt_del_cap = 0;
     if (ws->idx_pairs) {
         for (int fi = 0; fi < ws->nidx; fi++) {
-            for (size_t k = 0; k < ws->idx_pair_counts[fi]; k++)
-                free((void *)ws->idx_pairs[fi][k].value);
-            free(ws->idx_pairs[fi]);
+            for (size_t k = 0; ws->idx_pair_counts && k < ws->idx_pair_counts[fi]; k++)
+                bw_dealloc(ws,(void *)ws->idx_pairs[fi][k].value);
+            bw_dealloc(ws,ws->idx_pairs[fi]);
         }
-        free(ws->idx_pairs);
+        bw_dealloc(ws,ws->idx_pairs);
     }
-    free(ws->idx_pair_counts);
-    free(ws->idx_pair_caps);
+    bw_dealloc(ws,ws->idx_pair_counts);
+    bw_dealloc(ws,ws->idx_pair_caps);
+    typed_bulk_index_memory_release(ws->memory,ws->bitmap_charge+sizeof(*ws));
     free(ws);
 }
 
@@ -616,25 +704,33 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
     *out_window_state = NULL;
     if (sw->nidx == 0 || nactive == 0) return 0;
 
+    if(typed_bulk_index_memory_take(sw->index_memory,sizeof(BulkInsWindowState)))return -1;
     BulkInsWindowState *ws = calloc(1, sizeof(*ws));
-    if (!ws) return -1;
+    if (!ws){typed_bulk_index_memory_release(sw->index_memory,sizeof(*ws));return -1;}
+    ws->memory=sw->index_memory;
     ws->nidx = sw->nidx;
-    ws->idx_pairs = calloc((size_t)sw->nidx, sizeof(BtEntry *));
-    ws->idx_pair_counts = calloc((size_t)sw->nidx, sizeof(size_t));
-    ws->idx_pair_caps = calloc((size_t)sw->nidx, sizeof(size_t));
+    ws->idx_pairs = bw_calloc(ws,(size_t)sw->nidx, sizeof(BtEntry *));
+    ws->idx_pair_counts = bw_calloc(ws,(size_t)sw->nidx, sizeof(size_t));
+    ws->idx_pair_caps = bw_calloc(ws,(size_t)sw->nidx, sizeof(size_t));
     if (!ws->idx_pairs || !ws->idx_pair_counts || !ws->idx_pair_caps) {
         v2_bulk_ins_window_release_state(sw, ws);
         return -1;
     }
     for (int fi = 0; fi < sw->nidx; fi++) {
         ws->idx_pair_caps[fi] = 64;
-        ws->idx_pairs[fi] = malloc(ws->idx_pair_caps[fi] * sizeof(BtEntry));
+        ws->idx_pairs[fi] = bw_alloc(ws,ws->idx_pair_caps[fi] * sizeof(BtEntry));
         if (!ws->idx_pairs[fi]) {
             v2_bulk_ins_window_release_state(sw, ws);
             return -1;
         }
     }
 
+    size_t bitmap_bytes=(size_t)sw->nidx*sizeof(BitmapWindowEntry)+
+        nactive*(size_t)sw->nidx*sizeof(BitmapWindowOp);
+    if(typed_bulk_index_memory_take(ws->memory,bitmap_bytes)){
+        v2_bulk_ins_window_release_state(sw,ws);return -1;
+    }
+    ws->bitmap_charge=bitmap_bytes;
     if (bitmap_prepare_window_init(&ws->bw_window, (size_t)sw->nidx,
                                     nactive * (size_t)sw->nidx) != 0) {
         v2_bulk_ins_window_release_state(sw, ws);
@@ -663,14 +759,10 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
             old = &old_rec;
         }
 
-        uint8_t *old_idx_bufs[MAX_FIELDS];
-        size_t   old_idx_lens[MAX_FIELDS];
-        int      old_idx_have[MAX_FIELDS];
-        int      old_idx_owned[MAX_FIELDS];
-        memset(old_idx_bufs, 0, sizeof(old_idx_bufs));
-        memset(old_idx_lens, 0, sizeof(old_idx_lens));
-        memset(old_idx_have, 0, sizeof(old_idx_have));
-        memset(old_idx_owned, 0, sizeof(old_idx_owned));
+        BwOldKeys old_keys __attribute__((cleanup(bw_old_keys_free)))={.memory=ws->memory};
+        uint8_t **old_idx_bufs=old_keys.buffers;
+        size_t *old_idx_lens=old_keys.lengths;
+        int *old_idx_have=old_keys.have,*old_idx_owned=old_keys.owned;
         if (is_update && old) {
             for (int fi = 0; fi < sw->nidx; fi++) {
                 /* Old-key encoding must match the new-key encoding for
@@ -681,23 +773,29 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                 enum IndexType old_ity =
                     sw->idx_types ? sw->idx_types[fi] : IT_BTREE;
                 int rc;
+                if(ws->memory){
+                    old_idx_have[fi]=bw_record_key(ws,sw->ts,old->value,old->vlen,
+                        old->hdr2,sw->idx_fields[fi],old_ity!=IT_BTREE,1,
+                        &old_idx_bufs[fi],&old_idx_lens[fi]);
+                    old_idx_owned[fi]=old_idx_have[fi];continue;
+                }
                 if (old_ity == IT_BTREE) {
                     if (rctx->old_arena) {
                         uint8_t *slot = rctx->old_arena + (size_t)fi * rctx->old_arena_slot;
-                        rc = build_index_key_from_record_into(
+                        rc = typed_index_old_record_key_into(
                             sw->ts, old->value, old->vlen, old->hdr2, sw->idx_fields[fi],
                             slot, rctx->old_arena_slot, &old_idx_lens[fi]);
                         if (rc == 1) {
                             old_idx_bufs[fi] = slot;
                             old_idx_have[fi] = 1;
                         } else if (rc == -1) {
-                            old_idx_have[fi] = build_index_key_from_record(
+                            old_idx_have[fi] = typed_index_old_record_key(
                                 sw->ts, old->value, old->vlen, old->hdr2, sw->idx_fields[fi],
                                 &old_idx_bufs[fi], &old_idx_lens[fi]);
                             old_idx_owned[fi] = old_idx_have[fi];
                         }
                     } else {
-                        old_idx_have[fi] = build_index_key_from_record(
+                        old_idx_have[fi] = typed_index_old_record_key(
                             sw->ts, old->value, old->vlen, old->hdr2, sw->idx_fields[fi],
                             &old_idx_bufs[fi], &old_idx_lens[fi]);
                         old_idx_owned[fi] = old_idx_have[fi];
@@ -725,6 +823,10 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
             }
         }
 
+        for(int fi=0;fi<sw->nidx;fi++)if(old_idx_have[fi]<0){
+            v2_bulk_ins_window_release_state(sw,ws);return -1;
+        }
+
         const uint8_t *new_value = (const uint8_t *)rec->value;
         int record_rejected = 0;
         size_t tg_start = ws->tg_nops;
@@ -744,35 +846,15 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                the [tier][payload] layout, and NULL fields. Capacity is
                checked inside; ENOBUFS is an error, never a missing key. */
             if (itype == IT_BTREE) {
-                size_t cap = 1;
-                if (sw->idx_is_composite[fi]) {
-                    for (int si = 0; si < sw->idx_field_counts[fi]; si++) {
-                        int tidx = sw->idx_field_indices[fi][si];
-                        if (tidx < 0) { cap = 0; break; }
-                        cap += 1 + (size_t)sw->ts->fields[tidx].size;
-                    }
-                } else {
-                    int tidx = sw->idx_field_indices[fi][0];
-                    cap = (tidx >= 0) ? 1 + (size_t)sw->ts->fields[tidx].size : 0;
-                }
-                if (cap) {
-                    key_buf = malloc(cap);
-                    int rc = key_buf
-                        ? build_index_key_from_record_into(
-                              sw->ts, new_value, rec->vlen, rec->hdr2,
-                              sw->idx_fields[fi], key_buf, cap, &key_len)
-                        : -1;
-                    if (rc != 1) { free(key_buf); key_buf = NULL;
-                        if (rc == -1 && key_len == 0) {
-                            /* capacity/corruption — fail the window */
-                            LOG_ERROR(LOG_SUB_INDEX,
-                                      "INDEX_KEY_BUILD_FAILED shard=%d field=%s",
-                                      sw->shard_id, sw->idx_fields[fi]);
-                            v2_bulk_ins_window_release_state(sw, ws);
-                            return -1;
-                        }
-                    }
-                }
+                int rc=ws->memory?bw_record_key(ws,sw->ts,new_value,rec->vlen,
+                    rec->hdr2,sw->idx_fields[fi],0,0,&key_buf,&key_len):
+                    build_index_key_from_record(sw->ts,new_value,rec->vlen,
+                    rec->hdr2,sw->idx_fields[fi],&key_buf,&key_len);
+                if(rc<0){v2_bulk_ins_window_release_state(sw,ws);return -1;}
+            } else if(ws->memory){
+                int rc=bw_record_key(ws,sw->ts,new_value,rec->vlen,rec->hdr2,
+                    sw->idx_fields[fi],1,0,&key_buf,&key_len);
+                if(rc<0){v2_bulk_ins_window_release_state(sw,ws);return -1;}
             } else {
                 /* Bitmap/trigram payloads keep the raw untiered layout.
                    build_index_payload_from_record_into resolves the
@@ -781,25 +863,40 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                    for nullmap records. NULL fields produce no key. */
                 size_t cap = BT_MAX_VAL_LEN;
                 key_buf = malloc(cap);
-                int rc = key_buf
-                    ? build_index_payload_from_record_into(
-                          sw->ts, new_value, rec->vlen, rec->hdr2,
-                          sw->idx_fields[fi], key_buf, cap, &key_len)
-                    : -1;
+#ifdef TEST_BUILD
+                if (g_bulk_ins_payload_test_fail_alloc > 0 &&
+                    --g_bulk_ins_payload_test_fail_alloc == 0) {
+                    free(key_buf);
+                    key_buf = NULL;
+                    errno = ENOMEM;
+                }
+#endif
+                if (!key_buf) {
+                    /* Staging allocation failure: abort preparation, never
+                       treat the missing buffer as an absent key. */
+                    v2_bulk_ins_window_release_state(sw,ws);return -1;
+                }
+                int rc = build_index_payload_from_record_into(
+                    sw->ts, new_value, rec->vlen, rec->hdr2,
+                    sw->idx_fields[fi], key_buf, cap, &key_len);
                 if (rc == -1) {
                     /* Payload beyond the staging cap (a trigram varchar
                        past ~542 content bytes): the key exists — rebuild
                        through the allocating wrapper, never skip it (a
                        skipped NEW key drops the index update silently,
-                       §2.11). */
-                    free(key_buf); key_buf = NULL; key_len = 0;
-                    if (build_index_payload_from_record(
-                            sw->ts, new_value, rec->vlen, rec->hdr2,
-                            sw->idx_fields[fi], &key_buf, &key_len) != 1) {
-                        key_buf = NULL; key_len = 0;
+                       §2.11). A wrapper allocation or decoding failure
+                       also aborts preparation. */
+                    bw_dealloc(ws,key_buf); key_buf = NULL; key_len = 0;
+                    int prc = build_index_payload_from_record(
+                        sw->ts, new_value, rec->vlen, rec->hdr2,
+                        sw->idx_fields[fi], &key_buf, &key_len);
+                    if (prc < 0) {
+                        v2_bulk_ins_window_release_state(sw,ws);return -1;
                     }
+                    if (prc == 0) { key_buf = NULL; key_len = 0; }
                 } else if (rc != 1) {
-                    free(key_buf); key_buf = NULL; key_len = 0;
+                    /* 0 = NULL/empty field: a legitimately absent key. */
+                    bw_dealloc(ws,key_buf); key_buf = NULL; key_len = 0;
                 }
             }
 
@@ -817,8 +914,9 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                         ? bw_stage_old_key(ws, old_idx_bufs[fi], old_idx_lens[fi],
                                           old_idx_owned[fi], &err)
                         : NULL;
+                    if(old_idx_owned[fi]==1)old_idx_owned[fi]=0;
                     if (err) {
-                        free(key_buf);
+                        bw_dealloc(ws,key_buf);
                         v2_bulk_ins_window_release_state(sw, ws);
                         return -1;
                     }
@@ -834,13 +932,13 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                                            (field, idx shard) after apply */
                     int tracked = !have_new || (bw_track_buf(ws, key_buf) == 0);
                     if (!tracked || tg_track_op(ws, &ta) != 0) {
-                        if (!tracked) free(key_buf);
+                        if (!tracked) bw_dealloc(ws,key_buf);
                         v2_bulk_ins_window_release_state(sw, ws);
                         return -1;
                     }
                 } else {
-                    free(key_buf);
-                    if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
+                    bw_dealloc(ws,key_buf);
+                    if (old_idx_have[fi] && old_idx_owned[fi]){bw_dealloc(ws,old_idx_bufs[fi]);old_idx_owned[fi]=0;}
                 }
                 continue;
             }
@@ -852,8 +950,9 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                         ? bw_stage_old_key(ws, old_idx_bufs[fi], old_idx_lens[fi],
                                           old_idx_owned[fi], &err)
                         : NULL;
+                    if(old_idx_owned[fi]==1)old_idx_owned[fi]=0;
                     if (err) {
-                        free(key_buf);
+                        bw_dealloc(ws,key_buf);
                         v2_bulk_ins_window_release_state(sw, ws);
                         return -1;
                     }
@@ -867,25 +966,54 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                     ba.hash = r->hash; ba.type = IT_BITMAP;
                     ba.kf_shard = rec->kf_shard; ba.kf_slot = rec->kf_slot;
                     char errf[128];
+                    size_t old_pending_cap=0,pending_reserved=0;
+                    if(ws->memory){
+                        for(size_t k=0;k<ws->bw_window.n_entries;k++){
+                            BitmapWindowEntry *e=&ws->bw_window.entries[k];
+                            if(e->kf_shard==ba.kf_shard&&!strcmp(e->field,ba.field)){
+                                if(e->npending==e->pending_cap)old_pending_cap=e->pending_cap;
+                                else old_pending_cap=SIZE_MAX;
+                                break;
+                            }
+                        }
+                        if(have_new&&old_pending_cap!=SIZE_MAX){
+                            pending_reserved=(old_pending_cap?2*old_pending_cap:8)*sizeof(BitmapPendingValue);
+                            if(typed_bulk_index_memory_take(ws->memory,pending_reserved)){
+                                bw_dealloc(ws,key_buf);v2_bulk_ins_window_release_state(sw,ws);return -1;
+                            }
+                        }
+                    }
                     int rc = bitmap_prepare_window_add(&ws->bw_window, &ba,
                                                         errf, sizeof(errf));
+                    if(pending_reserved){
+                        size_t newcap=old_pending_cap;
+                        for(size_t k=0;k<ws->bw_window.n_entries;k++){
+                            BitmapWindowEntry *e=&ws->bw_window.entries[k];
+                            if(e->kf_shard==ba.kf_shard&&!strcmp(e->field,ba.field)){newcap=e->pending_cap;break;}
+                        }
+                        if(newcap>old_pending_cap){
+                            size_t oldbytes=old_pending_cap*sizeof(BitmapPendingValue);
+                            typed_bulk_index_memory_release(ws->memory,oldbytes);
+                            ws->bitmap_charge+=newcap*sizeof(BitmapPendingValue)-oldbytes;
+                        }else typed_bulk_index_memory_release(ws->memory,pending_reserved);
+                    }
                     if (rc == 0) {
                         if (have_new && bw_track_buf(ws, key_buf) != 0) {
-                            free(key_buf);
+                            bw_dealloc(ws,key_buf);
                             v2_bulk_ins_window_release_state(sw, ws);
                             return -1;
                         }
                     } else if (rc == 1) {
-                        free(key_buf);
+                        bw_dealloc(ws,key_buf);
                         record_rejected = 1;
                     } else {
-                        free(key_buf);
+                        bw_dealloc(ws,key_buf);
                         v2_bulk_ins_window_release_state(sw, ws);
                         return -1;
                     }
                 } else {
-                    free(key_buf);
-                    if (old_idx_have[fi] && old_idx_owned[fi]) free(old_idx_bufs[fi]);
+                    bw_dealloc(ws,key_buf);
+                    if (old_idx_have[fi] && old_idx_owned[fi]){bw_dealloc(ws,old_idx_bufs[fi]);old_idx_owned[fi]=0;}
                 }
                 if (record_rejected) break;
                 continue;
@@ -898,8 +1026,9 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                 int err = 0;
                 uint8_t *staged_old = bw_stage_old_key(ws, old_idx_bufs[fi], old_idx_lens[fi],
                                                        old_idx_owned[fi], &err);
+                if(old_idx_owned[fi]==1)old_idx_owned[fi]=0;
                 if (err) {
-                    free(key_buf);
+                    bw_dealloc(ws,key_buf);
                     v2_bulk_ins_window_release_state(sw, ws);
                     return -1;
                 }
@@ -909,31 +1038,31 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                 bdop.klen = old_idx_lens[fi];
                 memcpy(bdop.hash, r->hash, 16);
                 if (bt_track_del_op(ws, &bdop) != 0) {
-                    free(key_buf);
+                    bw_dealloc(ws,key_buf);
                     v2_bulk_ins_window_release_state(sw, ws);
                     return -1;
                 }
             } else if (old_idx_have[fi] && old_idx_owned[fi]) {
-                free(old_idx_bufs[fi]);
+                bw_dealloc(ws,old_idx_bufs[fi]); old_idx_owned[fi]=0;
             }
 
-            if (unchanged) { free(key_buf); continue; }
+            if (unchanged) { bw_dealloc(ws,key_buf); continue; }
 
             if (have_new) {
                 if (ws->idx_pair_counts[fi] >= ws->idx_pair_caps[fi]) {
                     size_t new_cap = ws->idx_pair_caps[fi] ? ws->idx_pair_caps[fi] * 2 : 64;
                     /* Keep the existing entries live on OOM so the common
                        window-release path can free every already allocated
-                       key.  xrealloc_or_free() releases only the outer
+                       key.  xrealloc_or_bw_dealloc(ws,) releases only the outer
                        array, leaking those per-entry values. */
-                    BtEntry *t = realloc(ws->idx_pairs[fi], new_cap * sizeof(BtEntry));
+                    BtEntry *t = bw_realloc(ws,ws->idx_pairs[fi], new_cap * sizeof(BtEntry));
                     if (!t) {
                         /* Abort the whole pre-marker window rather than
                            silently committing records with a missing B-tree
                            entry for this field. */
                         LOG_ERROR(LOG_SUB_INDEX, "INDEX_OOM shard=%d field=%s (aborting bulk window)",
                                 sw->shard_id, sw->idx_fields[fi]);
-                        free(key_buf);
+                        bw_dealloc(ws,key_buf);
                         v2_bulk_ins_window_release_state(sw, ws);
                         return -1;
                     }
@@ -945,7 +1074,7 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
                 bp->vlen  = key_len;
                 memcpy(bp->hash, r->hash, 16);
             } else {
-                free(key_buf);
+                bw_dealloc(ws,key_buf);
             }
         }
 
@@ -956,7 +1085,7 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
             ws->bt_del_nops = bt_del_start;
             for (int fi = 0; fi < sw->nidx; fi++) {
                 for (size_t k = idx_pair_start[fi]; k < ws->idx_pair_counts[fi]; k++)
-                    free((void *)ws->idx_pairs[fi][k].value);
+                    bw_dealloc(ws,(void *)ws->idx_pairs[fi][k].value);
                 ws->idx_pair_counts[fi] = idx_pair_start[fi];
             }
             bitmap_prepare_window_rollback(&ws->bw_window, &bm_cp);
@@ -1034,6 +1163,7 @@ static int v2_bulk_ins_apply_window(SlotcaskBulkRec *recs, const size_t *active,
         fa.db_root = sw->db_root; fa.object = sw->object;
         fa.field = sw->idx_fields[fi]; fa.splits = sw->sch->splits;
         fa.new_entries = ws->idx_pairs[fi]; fa.new_count = count;
+        fa.memory=sw->index_memory;
         idx_build_field_worker(&fa);
         if (fa.out_error) rc = -1;
         for (size_t pi = 0; pi < count; pi++)
@@ -1093,6 +1223,60 @@ static void v2_bulk_ins_commit_done(void *ctx, void *window_state) {
    wiring reads honestly. */
 static void v2_bulk_ins_release_window(void *ctx, void *window_state) {
     v2_bulk_ins_window_release_state(ctx, window_state);
+}
+
+typedef struct {
+    BulkInsShardWork sw;
+    V2BulkInsCtx *contexts;
+    BulkInsRecord *records;
+    SlotcaskBulkRec *batch;
+    size_t count;
+} TypedBulkIndexBridge;
+size_t typed_bulk_index_bridge_bytes(size_t count){
+    size_t unit=sizeof(V2BulkInsCtx)+sizeof(BulkInsRecord);
+    return count>(SIZE_MAX-sizeof(TypedBulkIndexBridge))/unit?SIZE_MAX:
+        sizeof(TypedBulkIndexBridge)+count*unit;
+}
+static int typed_bulk_index_compute(const SlotcaskOldRecord *old,SlotcaskBulkRec *rec){
+    V2BulkInsCtx *c=rec->user_ctx;
+    rec->user_ctx=c->original_user;
+    int rc=c->original_compute(old,rec);
+    rec->user_ctx=c;
+    return rc;
+}
+void *typed_bulk_index_bridge_create(const char *root,const char *object,
+    const Schema *sc,const TypedSchema *ts,const char fields[][256],
+    const enum IndexType *types,int nidx,SlotcaskBulkShardInput *input,void *memory){
+    size_t charge=typed_bulk_index_bridge_bytes(input->nrecs);
+    if(typed_bulk_index_memory_take(memory,charge))return NULL;
+    TypedBulkIndexBridge *b=calloc(1,sizeof(*b));
+    if(!b){typed_bulk_index_memory_release(memory,charge);return NULL;}
+    b->count=input->nrecs;b->batch=input->recs;
+    b->contexts=calloc(b->count,sizeof(*b->contexts));
+    b->records=calloc(b->count,sizeof(*b->records));
+    if(!b->contexts||!b->records){free(b->contexts);free(b->records);free(b);typed_bulk_index_memory_release(memory,charge);return NULL;}
+    b->sw=(BulkInsShardWork){.db_root=root,.object=object,.sch=sc,.ts=ts,
+        .shard_id=input->kf_shard_id,.nidx=nidx,.idx_fields=fields,.idx_types=types,.index_memory=memory};
+    for(size_t i=0;i<b->count;i++){
+        compute_hash_raw(input->recs[i].key,input->recs[i].klen,b->records[i].hash);
+        b->contexts[i]=(V2BulkInsCtx){.sw=&b->sw,.rec=&b->records[i],
+            .original_user=input->recs[i].user_ctx,
+            .original_compute=input->opts.upsert.value_compute};
+        input->recs[i].user_ctx=&b->contexts[i];
+    }
+    SlotcaskBulkOpts *o=&input->opts.upsert;
+    o->value_compute=typed_bulk_index_compute;
+    o->prepare_window=v2_bulk_ins_prepare_window;o->apply_window=v2_bulk_ins_apply_window;
+    o->commit_done=v2_bulk_ins_commit_done;o->abort_window=v2_bulk_ins_abort_window;
+    o->release_window=v2_bulk_ins_release_window;o->bulk_hook_ctx=&b->sw;
+    o->pre_commit_needs_old=1;o->has_indexed_fields=1;
+    return b;
+}
+void typed_bulk_index_bridge_free(void *ptr){
+    TypedBulkIndexBridge *b=ptr;if(!b)return;
+    for(size_t i=0;i<b->count;i++)b->batch[i].user_ctx=b->contexts[i].original_user;
+    typed_bulk_index_memory_release(b->sw.index_memory,typed_bulk_index_bridge_bytes(b->count));
+    free(b->contexts);free(b->records);free(b);
 }
 
 /* Command-thread compaction: gather every prepared worker's input into
@@ -1160,7 +1344,7 @@ static void *bulk_insert_shard_worker_v2(BulkInsShardWork *sw) {
        the lock acquisition across all records in that shard. */
     int splits = sw->sch->splits;
     SlotcaskBulkRec *batch = calloc(sw->count, sizeof(SlotcaskBulkRec));
-    V2BulkInsCtx    *ctxs  = malloc(sw->count * sizeof(V2BulkInsCtx));
+    V2BulkInsCtx *ctxs = calloc((size_t)sw->count,sizeof(*ctxs));
     int *kf_shards = malloc(sw->count * sizeof(int));
     int *counts    = calloc(splits, sizeof(int));
     int *offsets   = malloc(splits * sizeof(int));
@@ -1302,6 +1486,8 @@ static void bulk_ins_finish_request(BulkInsShardWork *sw) {
     for (size_t i = 0; i < sw->count; i++) {
         if (batch[i].status == 0) {
             if (!batch[i].was_update) sw->inserted++;
+        } else if (((V2BulkInsCtx *)batch[i].user_ctx)->error) {
+            sw->errors++;
         } else if (batch[i].status == -2) {
             sw->skipped++;
         } else {
@@ -1605,7 +1791,9 @@ static int bulk_ins_run(const char *db_root, const char *object,
                 int _enc = typed_encode_defaults(ts, data_ptr, payload,
                                                   ts->total_size,
                                                   db_root, object, NULL, 0);
-                if (_enc == -2) {
+                if (_enc < 0 || (!bulk_insert_has_auto_create(ts)&&
+                    typed_index_validate_new(ts,payload,ts->total_size,SREC_FLAG_NULLMAP,
+                        (const char (*)[256])idx_fields,idx_types,nfields))) {
                     errors++;
                     if (obj_heap) free(obj_str);
                     free(wire_for_record);
@@ -2396,6 +2584,9 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
                                           NULL, 0) != 0) { row_overflow = 1; break; }
             }
         }
+        if (!row_overflow&&!bulk_insert_has_auto_create(ts)&&
+            typed_index_validate_new(ts,payload,ts->total_size,SREC_FLAG_NULLMAP,
+                (const char (*)[256])idx_fields,idx_types,nidx))row_overflow=1;
         if (row_overflow) {
             /* Skip this row rather than storing a truncated value. Count it
                like every other per-row reject in this loop so the client's
@@ -2931,9 +3122,10 @@ static int v2_bulk_del_apply_window(SlotcaskBulkRec *recs,
             int have = raw_payload
                 ? build_index_payload_from_record(sw->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                                   sw->idx_fields[fi], &buf, &blen)
-                : build_index_key_from_record(sw->ts, r->old_value, r->old_vlen, r->old_hdr2,
+                : typed_index_old_record_key(sw->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                               sw->idx_fields[fi],
                                               &buf, &blen);
+            if(have<0){idx_failed=1;free(buf);continue;}
             if (!have)
                 continue;
             UpdateIdxArg a2 = make_index_diff_arg(sw->db_root, sw->object,
@@ -3288,7 +3480,10 @@ static int bulk_criteria_scan_cb(const SlotHeader *hdr, const uint8_t *block, vo
 
     const uint8_t *raw = block + hdr->key_len;
 
-    if (!criteria_match_tree(raw, hdr->value_len, bc->tree, bc->fs, (uint8_t)(hdr->flag >> 8))) return 0;
+    int matched=0;
+    if(criteria_match_tree_checked(raw,hdr->value_len,bc->tree,bc->fs,(uint8_t)(hdr->flag>>8),&matched)){
+        int error=errno?errno:EILSEQ;pthread_mutex_lock(&bc->lock);bc->predicate_error=error;pthread_mutex_unlock(&bc->lock);return 1;}
+    if(!matched)return 0;
 
     /* Match — grow array and append under internal mutex. criteria_match_tree
        above runs lock-free; only the shared-state mutation is serialized. */
@@ -3330,6 +3525,17 @@ static int bulk_criteria_scan_cb(const SlotHeader *hdr, const uint8_t *block, vo
     return 0;
 }
 
+static void bulk_mutation_error_emit(const char *key,size_t len,int reason,int *started){
+    OUT("%s",*started?",":",\"errors\":[");*started=1;
+    char *escaped=json_escape_const(key?key:"");
+    const char *message=reason==E2BIG?"NEW ordered index key exceeds 544 bytes":
+        reason==ENOMEM?"out of memory":reason==EILSEQ?"invalid typed record":
+        "bulk mutation failed";
+    (void)len;
+    OUT("{\"key\":\"%s\",\"error\":\"%s\"}",escaped?escaped:"",message);
+    free(escaped);
+}
+
 /* Per-record state for bulk-update's Phase 2 shard-grouped workers. */
 typedef struct {
     const char *key;
@@ -3337,6 +3543,7 @@ typedef struct {
     uint8_t     hash[16];
     int         start_slot;
     int         shard_id;
+    int mutation_error;
 } BulkUpdRec;
 
 typedef struct {
@@ -3400,6 +3607,7 @@ typedef struct {
     uint8_t          *old_arena;
     uint8_t          *new_arena;
     size_t            arena_slot;
+    int error;
 } V2BulkUpdCtx;
 
 /* value_compute: rolls together the per-record steps that the old
@@ -3416,9 +3624,16 @@ static int v2_bulk_upd_value_compute(const SlotcaskOldRecord *old,
     V2BulkUpdCtx *ctx = (V2BulkUpdCtx *)rec->user_ctx;
     BulkUpdShardWork *w = ctx->w;
     if (!old) return -1;
-    if (!criteria_match_tree(old->value, old->vlen, w->tree, w->fs, old->hdr2)) return -1;
-    if (w->cas_tree &&
-        !cas_check_tree(w->cas_fs, old->value, (int)old->vlen, old->hdr2, w->cas_tree)) return -1;
+    int matched=cas_match_tree_checked(old->value,old->vlen,w->tree,w->fs,old->hdr2);
+    if(matched<0){
+        ctx->error=errno?errno:EILSEQ;return -1;
+    }
+    if(!matched)return -1;
+    if(w->cas_tree){
+        int rc=cas_match_tree_checked(old->value,old->vlen,w->cas_tree,w->cas_fs,old->hdr2);
+        if(rc<0){ctx->error=errno?errno:EILSEQ;return -1;}
+        if(!rc)return -1;
+    }
 
     /* §2.7 conversion via the shared composer: NEW is nullmap layout,
        patches land at prefix+offset, explicit nulls set bits, untouched
@@ -3427,10 +3642,12 @@ static int v2_bulk_upd_value_compute(const SlotcaskOldRecord *old,
     if (update_compose_new_from_old(w->ts, old, new_buf,
                                     ctx->field_vals, ctx->field_null,
                                     NULL, 0) != 0)
-        return -1;
+        {ctx->error=errno?errno:EINVAL;return -1;}
     rec->vlen = (size_t)w->ts->total_size;
     rec->hdr2 = SREC_FLAG_NULLMAP;
     update_stamp_auto_update_fields(w->ts, new_buf);
+    if(typed_index_validate_new(w->ts,new_buf,rec->vlen,rec->hdr2,
+        w->idx_fields,w->idx_types,w->nidx)){ctx->error=errno?errno:EINVAL;return -1;}
     return 0;
 }
 
@@ -3469,7 +3686,7 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
                 ? build_index_payload_from_record_into(w->ts, old->value, old->vlen, old->hdr2,
                                                        w->idx_fields[fi],
                                                        slot, ctx->arena_slot, &old_len)
-                : build_index_key_from_record_into(w->ts, old->value, old->vlen, old->hdr2,
+                : typed_index_old_record_key_into(w->ts, old->value, old->vlen, old->hdr2,
                                                    w->idx_fields[fi],
                                                    slot, ctx->arena_slot, &old_len);
             if (rc == 1) { old_buf = slot; have_old = 1; }
@@ -3477,19 +3694,19 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
                 have_old = raw_payload
                     ? build_index_payload_from_record(w->ts, old->value, old->vlen, old->hdr2,
                                                       w->idx_fields[fi], &old_buf, &old_len)
-                    : build_index_key_from_record(w->ts, old->value, old->vlen, old->hdr2,
+                    : typed_index_old_record_key(w->ts, old->value, old->vlen, old->hdr2,
                                                   w->idx_fields[fi],
                                                   &old_buf, &old_len);
-                if (have_old) fb_bufs[n_fb++] = old_buf;
+                if (have_old == 1) fb_bufs[n_fb++] = old_buf;
             }
         } else {
             have_old = raw_payload
                 ? build_index_payload_from_record(w->ts, old->value, old->vlen, old->hdr2,
                                                   w->idx_fields[fi], &old_buf, &old_len)
-                : build_index_key_from_record(w->ts, old->value, old->vlen, old->hdr2,
+                : typed_index_old_record_key(w->ts, old->value, old->vlen, old->hdr2,
                                               w->idx_fields[fi],
                                               &old_buf, &old_len);
-            if (have_old) fb_bufs[n_fb++] = old_buf;
+            if (have_old == 1) fb_bufs[n_fb++] = old_buf;
         }
 
         if (ctx->new_arena) {
@@ -3509,7 +3726,7 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
                     : build_index_key_from_record(w->ts, new_value, rec->vlen, rec->hdr2,
                                                   w->idx_fields[fi],
                                                   &new_buf, &new_len);
-                if (have_new) fb_bufs[n_fb++] = new_buf;
+                if (have_new == 1) fb_bufs[n_fb++] = new_buf;
             }
         } else {
             have_new = raw_payload
@@ -3518,9 +3735,13 @@ static int v2_bulk_upd_pre_commit_bulk(const SlotcaskOldRecord *old,
                 : build_index_key_from_record(w->ts, new_value, rec->vlen, rec->hdr2,
                                               w->idx_fields[fi],
                                               &new_buf, &new_len);
-            if (have_new) fb_bufs[n_fb++] = new_buf;
+            if (have_new == 1) fb_bufs[n_fb++] = new_buf;
         }
 
+        if(have_old<0||have_new<0){
+            for(int k=0;k<n_fb;k++)free(fb_bufs[k]);
+            return -1;
+        }
         int changed = 0;
         if (have_new && !have_old) changed = 1;
         else if (!have_new && have_old) changed = 1;
@@ -3597,7 +3818,7 @@ static int v2_bulk_upd_apply_window(SlotcaskBulkRec *recs,
                     ? build_index_payload_from_record_into(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                                            w->idx_fields[fi],
                                                            slot, uctx->arena_slot, &old_len)
-                    : build_index_key_from_record_into(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
+                    : typed_index_old_record_key_into(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                                        w->idx_fields[fi],
                                                        slot, uctx->arena_slot, &old_len);
                 if (rc == 1) { old_buf = slot; have_old = 1; }
@@ -3605,19 +3826,19 @@ static int v2_bulk_upd_apply_window(SlotcaskBulkRec *recs,
                     have_old = raw_payload
                         ? build_index_payload_from_record(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                                           w->idx_fields[fi], &old_buf, &old_len)
-                        : build_index_key_from_record(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
+                        : typed_index_old_record_key(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                                       w->idx_fields[fi],
                                                       &old_buf, &old_len);
-                    if (have_old) fb_bufs[n_fb++] = old_buf;
+                    if (have_old == 1) fb_bufs[n_fb++] = old_buf;
                 }
             } else {
                 have_old = raw_payload
                     ? build_index_payload_from_record(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                                       w->idx_fields[fi], &old_buf, &old_len)
-                    : build_index_key_from_record(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
+                    : typed_index_old_record_key(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                                   w->idx_fields[fi],
                                                   &old_buf, &old_len);
-                if (have_old) fb_bufs[n_fb++] = old_buf;
+                if (have_old == 1) fb_bufs[n_fb++] = old_buf;
             }
 
             if (uctx->new_arena) {
@@ -3637,7 +3858,7 @@ static int v2_bulk_upd_apply_window(SlotcaskBulkRec *recs,
                         : build_index_key_from_record(w->ts, r->value, r->vlen, r->hdr2,
                                                       w->idx_fields[fi],
                                                       &new_buf_p, &new_len);
-                    if (have_new) fb_bufs[n_fb++] = new_buf_p;
+                    if (have_new == 1) fb_bufs[n_fb++] = new_buf_p;
                 }
             } else {
                 have_new = raw_payload
@@ -3646,9 +3867,14 @@ static int v2_bulk_upd_apply_window(SlotcaskBulkRec *recs,
                     : build_index_key_from_record(w->ts, r->value, r->vlen, r->hdr2,
                                                   w->idx_fields[fi],
                                                   &new_buf_p, &new_len);
-                if (have_new) fb_bufs[n_fb++] = new_buf_p;
+                if (have_new == 1) fb_bufs[n_fb++] = new_buf_p;
             }
 
+            if(have_old<0||have_new<0){
+                idx_failed=1;
+                for(int k=0;k<n_fb;k++)free(fb_bufs[k]);
+                n_fb=0;break;
+            }
             int changed = 0;
             if (have_new && !have_old) changed = 1;
             else if (!have_new && have_old) changed = 1;
@@ -3687,7 +3913,8 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "bulk_upd_shard_worker_v2: slotcask_registry_get failed for %s/%s", w->db_root, w->object);
-        w->skipped += w->count; return NULL;
+        for(int k=0;k<w->count;k++)w->recs[k].mutation_error=errno?errno:ENOMEM;
+        return NULL;
     }
 
     /* cmd_bulk_update decoded this shared patch exactly once before any
@@ -3696,12 +3923,12 @@ static void *bulk_upd_shard_worker_v2(BulkUpdShardWork *w) {
     const uint8_t *field_null = w->field_null;
 
     SlotcaskBulkRec *batch   = calloc(w->count, sizeof(SlotcaskBulkRec));
-    V2BulkUpdCtx    *ctxs    = malloc(w->count * sizeof(V2BulkUpdCtx));
+    V2BulkUpdCtx    *ctxs    = calloc((size_t)w->count,sizeof(V2BulkUpdCtx));
     uint8_t         *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
         LOG_ERROR(LOG_SUB_QUERY, "bulk_upd_shard_worker_v2: alloc failed, skipping %d updates", w->count);
         free(batch); free(ctxs); free(scratch);
-        w->skipped += w->count;
+        for(int k=0;k<w->count;k++)w->recs[k].mutation_error=errno?errno:ENOMEM;
         return NULL;
     }
     /* Two per-worker arenas (OLD + NEW index keys) shared across every
@@ -3772,8 +3999,14 @@ static void bulk_upd_finish_request(BulkUpdShardWork *w) {
             if (batch[k].status == 0) batch[k].status = -1;
     }
     for (int ki = 0; ki < w->count; ki++) {
+        w->recs[ki].mutation_error=0;
         if (batch[ki].status == 0) w->updated++;
-        else w->skipped++;
+        else {
+            int reason=((V2BulkUpdCtx *)batch[ki].user_ctx)->error;
+            if(!reason&&batch[ki].status!=-2)reason=EIO;
+            if(reason)w->recs[ki].mutation_error=reason;
+            else w->skipped++;
+        }
     }
     free(w->batch); free(w->ctxs); free(w->scratch);
     free(w->old_arena); free(w->new_arena);
@@ -3846,13 +4079,19 @@ int cmd_bulk_update(const char *db_root, const char *object,
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
-    compile_criteria_tree(tree, fs.ts);
+    if(compile_criteria_tree_checked(tree,fs.ts,NULL,0)){free_criteria_tree(cas_tree);free_criteria_tree(tree);OUT("{\"error\":\"invalid criteria value\"}\n");return -1;}
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
     BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0,
-                            PTHREAD_MUTEX_INITIALIZER };
+                            PTHREAD_MUTEX_INITIALIZER, 0 };
     scan_dispatch(db_root, object, &sch, data_dir, bulk_criteria_scan_cb, &ctx);
     pthread_mutex_destroy(&ctx.lock);
     int matched = ctx.count;
+    if(ctx.predicate_error){
+        int error=ctx.predicate_error;free_criteria_tree(cas_tree);
+        for(int i=0;i<matched;i++){free(ctx.keys[i]);}
+        free(ctx.keys);free_criteria_tree(tree);
+        OUT("{\"error\":\"invalid typed record\"}\n");errno=error;return -1;
+    }
 
     if (dl.timed_out) {
         LOG_WARN(LOG_SUB_QUERY, "bulk-update: query deadline exceeded while matching criteria");
@@ -4018,21 +4257,26 @@ int cmd_bulk_update(const char *db_root, const char *object,
             bulk_upd_finish_request(&workers[g]);
     }
 
+    for(int g=0;g<nshard_groups;g++){updated+=workers[g].updated;skipped+=workers[g].skipped;}
+    OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d",matched,updated,skipped);
+    int mutation_errors=0;
     for (int wi = 0; wi < nshard_groups; wi++) {
-        updated += workers[wi].updated;
-        skipped += workers[wi].skipped;
+        for(int k=0;k<workers[wi].count;k++)if(workers[wi].recs[k].mutation_error)
+            bulk_mutation_error_emit(workers[wi].recs[k].key,workers[wi].recs[k].klen,
+                workers[wi].recs[k].mutation_error,&mutation_errors);
         free(workers[wi].recs);
     }
     free(workers);
     for (int i = 0; i < ts->nfields; i++) free(shared_field_vals[i]);
 
     LOG_INFO(LOG_SUB_QUERY, "BULK-UPDATE %s matched=%d updated=%d skipped=%d", object, matched, updated, skipped);
-    OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
+    if(mutation_errors)OUT("]");
+    OUT("}\n");
 
     free_criteria_tree(cas_tree);
     for (int i = 0; i < matched; i++) free(ctx.keys[i]);
     free(ctx.keys); free_criteria_tree(tree);
-    return 0;
+    return mutation_errors?1:0;
 }
 
 /* ========== BULK UPDATE (DELIMITED TEXT FILE) ========== */
@@ -4052,6 +4296,7 @@ typedef struct {
     int         shard_id;
     const char *line_end;      /* points into mmap'd CSV; valid until munmap */
     const char *body_start;    /* span after key_end + delimiter */
+    int mutation_error;
 } BulkUpdDelimRec;
 
 typedef struct {
@@ -4090,6 +4335,7 @@ typedef struct {
 typedef struct {
     BulkUpdDelimShardWork *w;
     BulkUpdDelimRec       *rec;
+    int error;
 } V2BulkUpdDelimCtx;
 
 /* Bulk-shaped pre_commit hook. ctx via rec->user_ctx; new value via
@@ -4116,7 +4362,7 @@ static int v2_bulk_upd_delim_pre_commit_bulk(const SlotcaskOldRecord *old,
         int have_old = raw_payload
             ? build_index_payload_from_record(w->ts, old->value, old->vlen, old->hdr2,
                                               w->idx_fields[fi], &old_buf, &old_len)
-            : build_index_key_from_record(w->ts, old->value, old->vlen, old->hdr2,
+            : typed_index_old_record_key(w->ts, old->value, old->vlen, old->hdr2,
                                           w->idx_fields[fi],
                                           &old_buf, &old_len);
         int have_new = raw_payload
@@ -4125,6 +4371,7 @@ static int v2_bulk_upd_delim_pre_commit_bulk(const SlotcaskOldRecord *old,
             : build_index_key_from_record(w->ts, new_value, rec->vlen, rec->hdr2,
                                           w->idx_fields[fi],
                                           &new_buf, &new_len);
+        if(have_old<0||have_new<0){free(old_buf);free(new_buf);return -1;}
         int changed = 0;
         if (have_new && !have_old) changed = 1;
         else if (!have_new && have_old) changed = 1;
@@ -4189,7 +4436,7 @@ static int v2_bulk_upd_delim_apply_window(SlotcaskBulkRec *recs,
             int have_old = raw_payload
                 ? build_index_payload_from_record(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                                   w->idx_fields[fi], &old_buf, &old_len)
-                : build_index_key_from_record(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
+                : typed_index_old_record_key(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                               w->idx_fields[fi],
                                               &old_buf, &old_len);
             int have_new = raw_payload
@@ -4198,6 +4445,7 @@ static int v2_bulk_upd_delim_apply_window(SlotcaskBulkRec *recs,
                 : build_index_key_from_record(w->ts, r->value, r->vlen, r->hdr2,
                                               w->idx_fields[fi],
                                               &new_buf, &new_len);
+            if(have_old<0||have_new<0){free(old_buf);free(new_buf);idx_failed=1;continue;}
             int changed = 0;
             if (have_new && !have_old) changed = 1;
             else if (!have_new && have_old) changed = 1;
@@ -4236,7 +4484,7 @@ static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
     uint8_t *new_buf = (uint8_t *)rec->value;
     if (update_compose_new_from_old(w->ts, old, new_buf, NULL, NULL,
                                     NULL, 0) != 0)
-        return -1;
+        {ctx->error=errno?errno:EINVAL;return -1;}
     rec->vlen = (size_t)w->ts->total_size;
     rec->hdr2 = SREC_FLAG_NULLMAP;
 
@@ -4255,11 +4503,11 @@ static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
             int tidx = w->active_indices[ai];
             if (!w->ts->fields[tidx].removed) {
                 if (w->ts->fields[tidx].type != FT_VARCHAR && *cell_start == '{')
-                    return -1;
+                    {ctx->error=errno?errno:EINVAL;return -1;}
                 char tmpcell[256];
                 char *cellbuf = (cell_len < sizeof(tmpcell))
                     ? tmpcell : malloc(cell_len + 1);
-                if (!cellbuf) return -1; /* Keep OLD intact on allocation failure. */
+                if (!cellbuf) {ctx->error=errno?errno:EINVAL;return -1;} /* Keep OLD intact on allocation failure. */
                 memcpy(cellbuf, cell_start, cell_len);
                 cellbuf[cell_len] = '\0';
                 if (encode_field_checked(&w->ts->fields[tidx], cellbuf,
@@ -4268,7 +4516,7 @@ static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
                                           w->ts->fields[tidx].offset,
                                           NULL, 0) != 0) {
                     if (cellbuf != tmpcell) free(cellbuf);
-                    return -1;   /* per-record skip, existing tally */
+                    {ctx->error=errno?errno:EINVAL;return -1;}   /* per-record skip, existing tally */
                 }
                 /* CSV cells have no null spelling, but the composer may
                    have carried a NULL bit forward from OLD — a written
@@ -4281,6 +4529,8 @@ static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
     }
 
     update_stamp_auto_update_fields(w->ts, new_buf);
+    if(typed_index_validate_new(w->ts,new_buf,rec->vlen,rec->hdr2,
+        w->idx_fields,w->idx_types,w->nidx)){ctx->error=errno?errno:EINVAL;return -1;}
     return 0;
 }
 
@@ -4292,18 +4542,19 @@ static void *bulk_upd_delim_shard_worker_v2(BulkUpdDelimShardWork *w) {
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "bulk_upd_delim_shard_worker_v2: slotcask_registry_get failed for %s/%s", w->db_root, w->object);
-        w->skipped += w->count; return NULL;
+        for(int k=0;k<w->count;k++)w->recs[k].mutation_error=errno?errno:ENOMEM;
+        return NULL;
     }
 
     /* Build batch + scratch slab. value_compute will write into the
        slab; rec->value points at this worker's slot up front. */
     SlotcaskBulkRec   *batch   = calloc(w->count, sizeof(SlotcaskBulkRec));
-    V2BulkUpdDelimCtx *ctxs    = malloc(w->count * sizeof(V2BulkUpdDelimCtx));
+    V2BulkUpdDelimCtx *ctxs    = calloc((size_t)w->count,sizeof(V2BulkUpdDelimCtx));
     uint8_t           *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
         LOG_ERROR(LOG_SUB_QUERY, "bulk_upd_delim_shard_worker_v2: alloc failed, skipping %d updates", w->count);
         free(batch); free(ctxs); free(scratch);
-        w->skipped += w->count;
+        for(int k=0;k<w->count;k++)w->recs[k].mutation_error=errno?errno:ENOMEM;
         return NULL;
     }
     for (int ki = 0; ki < w->count; ki++) {
@@ -4360,8 +4611,14 @@ static void bulk_upd_delim_finish_request(BulkUpdDelimShardWork *w) {
             if (batch[k].status == 0) batch[k].status = -1;
     }
     for (int ki = 0; ki < w->count; ki++) {
+        w->recs[ki].mutation_error=0;
         if (batch[ki].status == 0) w->updated++;
-        else w->skipped++;
+        else {
+            int reason=((V2BulkUpdDelimCtx *)batch[ki].user_ctx)->error;
+            if(!reason&&batch[ki].status!=-2)reason=EIO;
+            if(reason)w->recs[ki].mutation_error=reason;
+            else w->skipped++;
+        }
     }
     free(w->batch); free(w->ctxs); free(w->scratch);
     w->batch = NULL; w->ctxs = NULL; w->scratch = NULL;
@@ -4568,9 +4825,13 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
     }
 
     int updated = 0;
+    for(int g=0;g<nshard_groups;g++){updated+=workers[g].updated;skipped+=workers[g].skipped;}
+    OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d",matched,updated,skipped);
+    int mutation_errors=0;
     for (int wi = 0; wi < nshard_groups; wi++) {
-        updated += workers[wi].updated;
-        skipped += workers[wi].skipped;
+        for(int k=0;k<workers[wi].count;k++)if(workers[wi].recs[k].mutation_error)
+            bulk_mutation_error_emit(workers[wi].recs[k].key,workers[wi].recs[k].klen,
+                workers[wi].recs[k].mutation_error,&mutation_errors);
         for (int i = 0; i < workers[wi].count; i++) free(workers[wi].recs[i].key);
         free(workers[wi].recs);
     }
@@ -4581,8 +4842,9 @@ static int bulk_upd_delim_run(const char *db_root, const char *object,
 
     LOG_INFO(LOG_SUB_QUERY, "BULK-UPDATE-DELIM %s matched=%d updated=%d skipped=%d",
             object, matched, updated, skipped);
-    OUT("{\"matched\":%d,\"updated\":%d,\"skipped\":%d}\n", matched, updated, skipped);
-    return 0;
+    if(mutation_errors)OUT("]");
+    OUT("}\n");
+    return mutation_errors?1:0;
 }
 
 int cmd_bulk_update_delimited(const char *db_root, const char *object,
@@ -4655,6 +4917,7 @@ typedef struct {
     /* Optional per-record CAS, parsed before any worker is dispatched. */
     int          if_present;
     CriteriaNode *if_tree;
+    int mutation_error;
 } BulkUpdJsonRec;
 
 static int bulk_upd_json_parse_if(const JsonObj *obj, TypedSchema *ts,
@@ -4718,6 +4981,7 @@ typedef struct {
 typedef struct {
     BulkUpdJsonShardWork *w;
     BulkUpdJsonRec       *rec;
+    int error;
 } V2BulkUpdJsonCtx;
 
 /* Bulk-shaped pre_commit; new value via rec->value (set by value_compute). */
@@ -4743,7 +5007,7 @@ static int v2_bulk_upd_json_pre_commit_bulk(const SlotcaskOldRecord *old,
         int have_old = raw_payload
             ? build_index_payload_from_record(w->ts, old->value, old->vlen, old->hdr2,
                                               w->idx_fields[fi], &old_buf, &old_len)
-            : build_index_key_from_record(w->ts, old->value, old->vlen, old->hdr2,
+            : typed_index_old_record_key(w->ts, old->value, old->vlen, old->hdr2,
                                           w->idx_fields[fi],
                                           &old_buf, &old_len);
         int have_new = raw_payload
@@ -4752,6 +5016,7 @@ static int v2_bulk_upd_json_pre_commit_bulk(const SlotcaskOldRecord *old,
             : build_index_key_from_record(w->ts, new_value, rec->vlen, rec->hdr2,
                                           w->idx_fields[fi],
                                           &new_buf, &new_len);
+        if(have_old<0||have_new<0){free(old_buf);free(new_buf);return -1;}
         int changed = 0;
         if (have_new && !have_old) changed = 1;
         else if (!have_new && have_old) changed = 1;
@@ -4813,7 +5078,7 @@ static int v2_bulk_upd_json_apply_window(SlotcaskBulkRec *recs,
             int have_old = raw_payload
                 ? build_index_payload_from_record(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                                   w->idx_fields[fi], &old_buf, &old_len)
-                : build_index_key_from_record(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
+                : typed_index_old_record_key(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                               w->idx_fields[fi],
                                               &old_buf, &old_len);
             int have_new = raw_payload
@@ -4822,6 +5087,7 @@ static int v2_bulk_upd_json_apply_window(SlotcaskBulkRec *recs,
                 : build_index_key_from_record(w->ts, r->value, r->vlen, r->hdr2,
                                               w->idx_fields[fi],
                                               &new_buf, &new_len);
+            if(have_old<0||have_new<0){free(old_buf);free(new_buf);idx_failed=1;continue;}
             int changed = 0;
             if (have_new && !have_old) changed = 1;
             else if (!have_new && have_old) changed = 1;
@@ -4856,15 +5122,16 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
     BulkUpdJsonShardWork *w = ctx->w;
     BulkUpdJsonRec       *json_rec = ctx->rec;
     if (!old) return -1;
-    if (json_rec->if_present &&
-        !cas_check_tree(w->cas_fs, old->value, (int)old->vlen, old->hdr2,
-                        json_rec->if_tree))
-        return -1;
+    if(json_rec->if_present){
+        int rc=cas_match_tree_checked(old->value,old->vlen,json_rec->if_tree,w->cas_fs,old->hdr2);
+        if(rc<0){ctx->error=errno?errno:EILSEQ;return -1;}
+        if(!rc)return -1;
+    }
 
     uint8_t *new_buf = (uint8_t *)rec->value;
     if (update_compose_new_from_old(w->ts, old, new_buf, NULL, NULL,
                                     NULL, 0) != 0)
-        return -1;
+        {ctx->error=errno?errno:EINVAL;return -1;}
     rec->vlen = (size_t)w->ts->total_size;
     rec->hdr2 = SREC_FLAG_NULLMAP;
 
@@ -4888,13 +5155,13 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
         }
         if (json_rec->field_values[i]) {
             if (w->ts->fields[tidx].type != FT_VARCHAR &&
-                json_rec->field_values[i][0] == '{') return -1;
+                json_rec->field_values[i][0] == '{') {ctx->error=errno?errno:EINVAL;return -1;}
             if (encode_field_checked(&w->ts->fields[tidx], json_rec->field_values[i],
                                       strlen(json_rec->field_values[i]),
                                       new_buf + w->ts->nullmap_prefix +
                                       w->ts->fields[tidx].offset,
                                       NULL, 0) != 0)
-                return -1;   /* per-record skip, existing tally */
+                {ctx->error=errno?errno:EINVAL;return -1;}   /* per-record skip, existing tally */
             /* A materialized value clears any bit the §2.7 composer
                carried forward from a NULL OLD — value-with-set-bit would
                render and match as NULL. */
@@ -4902,6 +5169,8 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
         }
     }
     update_stamp_auto_update_fields(w->ts, new_buf);
+    if(typed_index_validate_new(w->ts,new_buf,rec->vlen,rec->hdr2,
+        w->idx_fields,w->idx_types,w->nidx)){ctx->error=errno?errno:EINVAL;return -1;}
     return 0;
 }
 
@@ -4921,16 +5190,17 @@ static void *bulk_upd_json_shard_worker_v2(BulkUpdJsonShardWork *w) {
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(w->db_root, w->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "bulk_upd_json_shard_worker_v2: slotcask_registry_get failed for %s/%s", w->db_root, w->object);
-        w->skipped += w->count; return NULL;
+        for(int k=0;k<w->count;k++)w->recs[k].mutation_error=errno?errno:ENOMEM;
+        return NULL;
     }
 
     SlotcaskBulkRec  *batch   = calloc(w->count, sizeof(SlotcaskBulkRec));
-    V2BulkUpdJsonCtx *ctxs    = malloc(w->count * sizeof(V2BulkUpdJsonCtx));
+    V2BulkUpdJsonCtx *ctxs    = calloc((size_t)w->count,sizeof(V2BulkUpdJsonCtx));
     uint8_t          *scratch = malloc((size_t)w->count * (size_t)w->ts->total_size);
     if (!batch || !ctxs || !scratch) {
         LOG_ERROR(LOG_SUB_QUERY, "bulk_upd_json_shard_worker_v2: alloc failed, skipping %d updates", w->count);
         free(batch); free(ctxs); free(scratch);
-        w->skipped += w->count;
+        for(int k=0;k<w->count;k++)w->recs[k].mutation_error=errno?errno:ENOMEM;
         return NULL;
     }
     for (int ki = 0; ki < w->count; ki++) {
@@ -4987,8 +5257,14 @@ static void bulk_upd_json_finish_request(BulkUpdJsonShardWork *w) {
             if (batch[k].status == 0) batch[k].status = -1;
     }
     for (int ki = 0; ki < w->count; ki++) {
+        w->recs[ki].mutation_error=0;
         if (batch[ki].status == 0) w->updated++;
-        else w->skipped++;
+        else {
+            int reason=((V2BulkUpdJsonCtx *)batch[ki].user_ctx)->error;
+            if(!reason&&batch[ki].status!=-2)reason=EIO;
+            if(reason)w->recs[ki].mutation_error=reason;
+            else w->skipped++;
+        }
     }
     free(w->batch); free(w->ctxs); free(w->scratch);
     w->batch = NULL; w->ctxs = NULL; w->scratch = NULL;
@@ -5745,6 +6021,8 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         skipped += workers[gi].skipped;
         for (int i = 0; i < workers[gi].count; i++) {
             BulkUpdJsonRec *r = &workers[gi].recs[i];
+            if(r->mutation_error)bulk_upd_json_error_add(&errors,&error_count,&error_capacity,
+                r->key,r->mutation_error==E2BIG?"NEW ordered index key exceeds 544 bytes":"bulk mutation failed");
             free(r->key);
             for (int j = 0; j < r->n_fields; j++) free(r->field_values[j]);
             free(r->field_values);
@@ -5804,6 +6082,7 @@ typedef struct {
     /* result */
     int             deleted;
     int             skipped;
+    int             errors;
     int             durability_degraded;
     /* Deferred-request input + worker-owned scratch. */
     SlotcaskBulkShardInput input;
@@ -5815,20 +6094,32 @@ typedef struct {
 typedef struct {
     BulkDelCritShardWork *w;
     int                    ki;
+    int                    error;
 } V2BulkDelCritCtx;
 
 /* Legacy per-record hook for criteria-based bulk delete (no indexes).
    Only does criteria + CAS check; index drops are handled by the
    windowed apply_window path when nidx > 0. */
-static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
-                                             SlotcaskBulkRec *rec) {
-    V2BulkDelCritCtx *ctx = (V2BulkDelCritCtx *)rec->user_ctx;
-    BulkDelCritShardWork *w = ctx->w;
-    if (!old) return -1;
-    if (!criteria_match_tree(old->value, old->vlen, w->tree, w->fs, old->hdr2)) return -1;
-    if (w->cas_tree &&
-        !cas_check_tree(w->cas_fs, old->value, (int)old->vlen, old->hdr2, w->cas_tree)) return -1;
+static int bulk_del_crit_check(V2BulkDelCritCtx *ctx,const uint8_t *value,
+    size_t len,uint8_t flags){
+    BulkDelCritShardWork *w=ctx->w;int matched=0;
+    if(criteria_match_tree_checked(value,len,w->tree,w->fs,flags,&matched)){
+        ctx->error=errno?errno:EILSEQ;return -1;
+    }
+    if(!matched)return -1;
+    if(w->cas_tree){
+        int result=cas_match_tree_checked(value,len,w->cas_tree,w->cas_fs,flags);
+        if(result<0)ctx->error=errno?errno:EILSEQ;
+        if(result<=0)return -1;
+    }
     return 0;
+}
+
+static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
+    SlotcaskBulkRec *rec){
+    V2BulkDelCritCtx *ctx=rec->user_ctx;
+    if(!old)return -1;
+    return bulk_del_crit_check(ctx,old->value,old->vlen,old->hdr2);
 }
 
 /* Batch prepare_window for criteria-based indexed bulk deletes: fires once
@@ -5837,23 +6128,14 @@ static int v2_bulk_del_crit_pre_commit_bulk(const SlotcaskOldRecord *old,
    (some records survived) or -1 (all rejected — the primitive will skip
    the marker for this window). */
 static int v2_bulk_del_crit_prepare_window(SlotcaskBulkRec *recs,
-                                            const size_t *active, size_t nactive,
-                                            void *ctx, void **out_window_state) {
-    BulkDelCritShardWork *w = (BulkDelCritShardWork *)ctx;
-    *out_window_state = NULL;
-    for (size_t a = 0; a < nactive; a++) {
-        size_t j = active[a];
-        SlotcaskBulkRec *r = &recs[j];
-        if (r->status != 0) continue;
-        if (!r->old_value) { r->status = -1; continue; }
-        if (!criteria_match_tree(r->old_value, r->old_vlen, w->tree, w->fs, r->old_hdr2)) {
-            r->status = -1; continue;
-        }
-        if (w->cas_tree &&
-            !cas_check_tree(w->cas_fs, r->old_value, (int)r->old_vlen,
-                            r->old_hdr2, w->cas_tree)) {
-            r->status = -1; continue;
-        }
+    const size_t *active,size_t nactive,void *ctx,void **out_window_state){
+    (void)ctx;*out_window_state=NULL;
+    for(size_t a=0;a<nactive;a++){
+        SlotcaskBulkRec *r=&recs[active[a]];
+        if(r->status!=0)continue;
+        if(!r->old_value){r->status=-1;continue;}
+        if(bulk_del_crit_check(r->user_ctx,r->old_value,r->old_vlen,r->old_hdr2))
+            r->status=-1;
     }
     return 0;
 }
@@ -5887,8 +6169,9 @@ static int v2_bulk_del_crit_apply_window(SlotcaskBulkRec *recs,
             int have = raw_payload
                 ? build_index_payload_from_record(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                                   w->idx_fields[fi], &buf, &blen)
-                : build_index_key_from_record(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
+                : typed_index_old_record_key(w->ts, r->old_value, r->old_vlen, r->old_hdr2,
                                               w->idx_fields[fi], &buf, &blen);
+            if(have<0){idx_failed=1;free(buf);continue;}
             if (!have)
                 continue;
             UpdateIdxArg a2 = make_index_diff_arg(w->db_root, w->object,
@@ -5912,7 +6195,7 @@ static void *bulk_del_crit_shard_worker(void *arg) {
     int kf_shard_id = compute_record_shard(w->hashes[0], w->sch->splits);
 
     SlotcaskBulkRec  *batch = calloc((size_t)w->count, sizeof(SlotcaskBulkRec));
-    V2BulkDelCritCtx *ctxs  = malloc((size_t)w->count * sizeof(V2BulkDelCritCtx));
+    V2BulkDelCritCtx *ctxs = calloc((size_t)w->count,sizeof(*ctxs));
     if (!batch || !ctxs) {
         LOG_ERROR(LOG_SUB_QUERY, "bulk_del_crit_shard_worker: alloc failed, skipping %d deletes", w->count);
         free(batch); free(ctxs);
@@ -5968,7 +6251,9 @@ static void bulk_del_crit_finish_request(BulkDelCritShardWork *w) {
             if (batch[i].status == 0) batch[i].status = -1;
     }
     for (int i = 0; i < w->count; i++) {
-        if (batch[i].status == 0) w->deleted++;
+        V2BulkDelCritCtx *contexts=w->ctxs;
+        if(contexts[i].error)w->errors++;
+        else if(batch[i].status==0)w->deleted++;
         else w->skipped++;
     }
     free(w->batch); free(w->ctxs);
@@ -6011,16 +6296,22 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
-    compile_criteria_tree(tree, fs.ts);
+    if(compile_criteria_tree_checked(tree,fs.ts,NULL,0)){free_criteria_tree(cas_tree);free_criteria_tree(tree);OUT("{\"error\":\"invalid criteria value\"}\n");return -1;}
     QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
     BulkCriteriaCtx ctx = { tree, &fs, NULL, 0, 0, limit, &dl, 0, 0, 0,
-                            PTHREAD_MUTEX_INITIALIZER };
+                            PTHREAD_MUTEX_INITIALIZER, 0 };
     if (!bulk_delete_phase1_indexed(db_root, object, &sch, &fs,
                                      tree, limit, &dl, &ctx)) {
         scan_dispatch(db_root, object, &sch, data_dir, bulk_criteria_scan_cb, &ctx);
     }
     pthread_mutex_destroy(&ctx.lock);
     int matched = ctx.count;
+    if(ctx.predicate_error){
+        int error=ctx.predicate_error;free_criteria_tree(cas_tree);
+        for(int i=0;i<matched;i++){free(ctx.keys[i]);}
+        free(ctx.keys);free_criteria_tree(tree);
+        OUT("{\"error\":\"invalid typed record\"}\n");errno=error;return -1;
+    }
 
     if (dl.timed_out) {
         LOG_WARN(LOG_SUB_QUERY, "bulk-delete: query deadline exceeded while matching criteria");
@@ -6049,7 +6340,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
 
     /* Phase 2: Write — for each key, acquire wrlock, re-verify, tombstone */
     TypedSchema *ts = load_typed_schema(db_root, object);
-    int deleted = 0, skipped = 0;
+    int deleted = 0, skipped = 0, errors = 0;
     int any_durability_degraded = 0;
 
     /* v2 fast path: bucket matched keys by kf shard, then fan out one
@@ -6182,6 +6473,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     for (int g = 0; g < nshard_groups; g++) {
         deleted += workers[g].deleted;
         skipped += workers[g].skipped;
+        errors += workers[g].errors;
         any_durability_degraded |= workers[g].durability_degraded;
         free(workers[g].keys);
         free(workers[g].hashes);
@@ -6197,6 +6489,9 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
              object, matched, deleted, skipped);
     if (any_durability_degraded)
         OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
+    else if(errors)
+        OUT("{\"error\":\"typed condition evaluation failed\",\"matched\":%d,\"deleted\":%d,\"skipped\":%d,\"errors\":%d}\n",
+            matched,deleted,skipped,errors);
     else
         OUT("{\"matched\":%d,\"deleted\":%d,\"skipped\":%d}\n",
             matched, deleted, skipped);
@@ -6204,7 +6499,7 @@ int cmd_bulk_delete_criteria(const char *db_root, const char *object,
     free_criteria_tree(cas_tree);
     for (int i = 0; i < matched; i++) free(ctx.keys[i]);
     free(ctx.keys); free_criteria_tree(tree);
-    return any_durability_degraded ? 1 : 0;
+    return any_durability_degraded || errors ? 1 : 0;
 }
 
 /* ========== VACUUM ========== */

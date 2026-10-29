@@ -55,6 +55,17 @@ File content is the same JSON (either shape — one big object or one big array,
 
 `bulk-insert` is a **true upsert**: if a key already exists, its record is overwritten and any stale index entries pointing at the old value are dropped before the new entry is written. Pass `"if_not_exists": true` to make it idempotent (existing keys are skipped, response includes `"skipped":N`).
 
+An ordered index key must fit the B+ tree's 544-byte encoded-key limit,
+including NULL tiers and every composite component. A standalone varchar
+therefore permits at most 543 content bytes in an ordered index. Insert and
+update validate all affected NEW keys before segment staging. An oversized key
+counts as a failed row; an existing row, its indexes and counts stay unchanged.
+This applies to legacy objects too. Historical oversized values that could not
+have an index entry can still be deleted or updated to an admissible value.
+Unindexed values and bitmap/trigram payloads do not inherit this ordered-key
+limit. Existing durable commit-intent recovery still applies to failures after
+staging; this validation does not add whole-request rollback.
+
 ### Response
 
 ```json

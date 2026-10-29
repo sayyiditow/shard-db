@@ -108,14 +108,14 @@ esac
 #        shrinks the binary by eliminating dead code visible only across files).
 # strip: remove symbol/debug tables from the shipped binary (~25K cut). Skipped
 #        for sanitizer/debug builds — symbols are needed for readable stack traces.
-gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/durability.c src/db/durability_epoch.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/decnum.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c src/db/type_desc.c src/db/nql.c src/db/embedded.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/durability.c src/db/durability_epoch.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/decnum.c src/db/decimal_order.c src/db/typed_index.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c src/db/type_desc.c src/db/nql.c src/db/embedded.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db
 
 # libshard-db.a — embedded mode static library (all daemon sources except main.c)
 LIB_SRCS="src/db/util.c src/db/durability.c src/db/durability_epoch.c src/db/parallel.c src/db/storage.c src/db/index.c \
           src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c \
           src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c \
-          src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/config.c src/db/decnum.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c src/db/type_desc.c \
+          src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/config.c src/db/decnum.c src/db/decimal_order.c src/db/typed_index.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c src/db/type_desc.c \
           src/db/nql.c src/db/embedded.c"
 LIB_OBJS=""
 mkdir -p build/bin build/obj
@@ -158,7 +158,7 @@ gcc $MODE_CFLAGS -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c s
 # TCP cases reach the deterministic seam; the production shard-db binary and
 # its flags are never built from TEST_BUILD.
 gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test-server \
-    src/db/util.c src/db/durability.c src/db/durability_epoch.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/decnum.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c src/db/type_desc.c src/db/nql.c src/db/embedded.c src/db/test_control.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+    src/db/util.c src/db/durability.c src/db/durability_epoch.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/decnum.c src/db/decimal_order.c src/db/typed_index.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c src/db/type_desc.c src/db/nql.c src/db/embedded.c src/db/test_control.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-test-server
 
 # shard-db-test — TAP-style C test runner. Links daemon's JSON helpers
@@ -167,7 +167,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test-server \
 # under src/test/cases/ get listed here.
 gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/shard-db-test.c \
-    src/db/decnum.c \
+    src/db/decnum.c src/db/decimal_order.c src/db/typed_index.c \
     src/db/packed_record.c \
     src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c \
     src/test/test_client.c \
@@ -195,6 +195,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_list_files.c \
     src/test/cases/test_bulk_update_json.c \
     src/test/cases/test_bulk_update_json_oom.c \
+    src/test/cases/test_alloc_error_propagation.c \
+    src/test/cases/test_indexed_zero_exists.c \
     src/test/cases/test_bulk_update_delimited.c \
     src/test/cases/test_remove_field.c \
     src/test/cases/test_length_ops.c \
@@ -362,7 +364,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_packed_named_projection.c \
     src/test/cases/test_packed_csv.c \
     src/test/cases/test_packed_csv_commands.c \
-    src/test/cases/test_r1_routes.c \
+    src/test/cases/test_r1_routes.c src/test/cases/test_r2_predicate_verification.c \
     src/test/cases/test_version_gate.c \
     src/test/cases/test_datetime_evening.c \
     src/test/cases/test_error_paths.c \
@@ -538,7 +540,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/db/query_bulk.c \
     src/db/query_find.c \
     src/db/server.c \
-    src/db/config.c src/db/decnum.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c \
+    src/db/config.c src/db/decnum.c src/db/decimal_order.c src/db/typed_index.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c \
     src/db/type_desc.c \
     src/db/embedded.c \
     src/db/nql.c \

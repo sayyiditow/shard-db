@@ -36,10 +36,10 @@ static int u_open(UFixture *f,int maximum){
     if(!maximum){ts->fields[3].default_kind=DK_LITERAL;strcpy(ts->fields[3].default_val,"7");
         ts->fields[4].default_kind=DK_AUTO_CREATE;ts->fields[5].default_kind=DK_AUTO_UPDATE;}
     size_t slot=0;ASSERT_EQ_INT(pkr_slot_bound(&ts->packed,32,&slot),DEC_OK,"schema bound");
-    f->sc=(Schema){.splits=4,.streams=1,.slot_size=(int)slot,.max_key=32,.max_value=ts->total_size};
+    f->sc=(Schema){.splits=4,.streams=2,.slot_size=(int)slot,.max_key=32,.max_value=ts->total_size};
     strcpy(f->root,"/tmp/shard-packed-bulk-XXXXXX");
     if(!mkdtemp(f->root)){f->root[0]=0;return -1;}
-    slotcask_init(64,64);rc=slotcask_open(&f->db,f->root,4,1,(int)slot);
+    slotcask_init(64,64);rc=slotcask_open(&f->db,f->root,4,f->sc.streams,(int)slot);
     f->opened=!rc;ASSERT_EQ_INT(rc,0,"open multi-shard private object");return rc;
 }
 static int u_call(UFixture *f,const char *data,size_t n,int delim,char separator,char **out){
@@ -67,17 +67,35 @@ static char *u_get(UFixture *f,const char *key,size_t *n){
     ASSERT_EQ_INT(hdr,PKR_FLAGS,"physical generation is packed");
     char *s=typed_packed_decode(f->ts,bytes,*n,hdr,16*1024*1024);free(bytes);return s;
 }
-static uint64_t u_pos(UFixture *f){
-    SlotcaskStream *s=&f->db.streams[0];pthread_mutex_lock(&s->rotation_lock);
-    uint64_t p=((uint64_t)s->active_file_id<<32)|s->reserve_off;pthread_mutex_unlock(&s->rotation_lock);return p;
+static uint64_t u_pos_key(UFixture *f,const char *key){
+    uint8_t hash[16];compute_hash_raw(key,strlen(key),hash);
+    SlotcaskStream *stream=&f->db.streams[hash[15]%f->db.num_streams];
+    pthread_mutex_lock(&stream->rotation_lock);
+    uint64_t p=((uint64_t)stream->active_file_id<<32)|stream->reserve_off;
+    pthread_mutex_unlock(&stream->rotation_lock);return p;
+}
+static uint64_t u_pos(UFixture *f){return u_pos_key(f,"a");}
+static int u_hit(const char *v,size_t n,const uint8_t *h,void *p){
+    (void)v;(void)n;(void)h;(*(int*)p)++;return 0;
+}
+static int u_hits(UFixture *f,const char *value){
+    int n=0;btree_idx_search(f->root,"obj","f1",f->sc.splits,
+        value,strlen(value),u_hit,&n);return n;
 }
 static void u_reject_input(UFixture *f,const char *data,int delim,char sep){
     size_t n=0,m=0;char *before=u_get(f,"a",&n),*out=NULL;uint64_t pos=u_pos(f),t=0,d=0,t2=0,d2=0;
+    void *raw_before=NULL,*raw_after=NULL;size_t raw_n=0,raw_m=0;uint8_t hdr_before=0,hdr_after=0;
+    ASSERT_EQ_INT(slotcask_get_ex(&f->db,"a",1,&raw_before,&raw_n,&hdr_before),0,"capture raw OLD");
     ASSERT_EQ_INT(slotcask_sum_kf_totals(&f->db,&t,&d),0,"count before rejection");
     ASSERT_EQ_INT(u_call(f,data,strlen(data),delim,sep,&out),1,"bad batch/row rejected");
     ASSERT_NOT_NULL(out,"error response exists");if(out){ASSERT_CONTAINS(out,"error","error response");free(out);}
     char *after=u_get(f,"a",&m);ASSERT_EQ_INT(n,m,"OLD actual size unchanged");
     if(before&&after)ASSERT_EQ_STR(after,before,"OLD exact value unchanged");
+    ASSERT_EQ_INT(slotcask_get_ex(&f->db,"a",1,&raw_after,&raw_m,&hdr_after),0,"capture raw OLD after rejection");
+    ASSERT_TRUE(raw_n==raw_m&&hdr_before==hdr_after,"OLD physical size and generation unchanged");
+    if(raw_before&&raw_after&&raw_n==raw_m)
+        ASSERT_TRUE(memcmp(raw_before,raw_after,raw_n)==0,"OLD physical bytes unchanged");
+    free(raw_before);free(raw_after);
     ASSERT_TRUE(u_pos(f)==pos,"no segment reservation on rejected input");
     ASSERT_EQ_INT(slotcask_sum_kf_totals(&f->db,&t2,&d2),0,"count after rejection");
     ASSERT_TRUE(t==t2&&d==d2,"rejected counts unchanged");free(before);free(after);
@@ -97,8 +115,15 @@ static void u_routes(void){
     ASSERT_EQ_INT(u_json(&f,"[{\"key\":\"a\",\"value\":{\"f1\":null,\"f0\":\"1.25\"}},{\"key\":\"b\",\"value\":{\"f1\":\"a\\u0000b\"}}]",&out),0,"array exact NULL and binary string patches");free(out);
     s=u_get(&f,"a",&n);ASSERT_NOT_NULL(s,"NULL physical row");if(s){ASSERT_CONTAINS(s,"\"f1\":null","explicit NULL");ASSERT_CONTAINS(s,"1.2500000000","exact typmod output");free(s);}
     s=u_get(&f,"b",&n);ASSERT_NOT_NULL(s,"binary physical row");if(s){ASSERT_CONTAINS(s,"a\\u0000b","decoded embedded NUL");free(s);}
+    void *invalid_before=NULL,*invalid_after=NULL;size_t invalid_n=0,invalid_m=0;uint8_t invalid_h=0,invalid_h2=0;
+    ASSERT_EQ_INT(slotcask_get_ex(&f.db,"a",1,&invalid_before,&invalid_n,&invalid_h),0,"capture invalid peer OLD");
     ASSERT_EQ_INT(u_json(&f,"{\"a\":{\"f0\":\"\"},\"b\":{\"f3\":22}}",&out),1,"mixed invalid row and valid peer");
-    if(out){ASSERT_CONTAINS(out,"\"matched\":2","bad scalar remains matched");ASSERT_CONTAINS(out,"\"updated\":1","good peer commits");ASSERT_CONTAINS(out,"\"skipped\":1","bad row skipped");ASSERT_CONTAINS(out,"\"errors\":[","bad row distinguished from missing");ASSERT_CONTAINS(out,"\"key\":\"a\"","error identifies row");free(out);}
+    if(out){ASSERT_CONTAINS(out,"\"matched\":2","bad scalar remains matched");ASSERT_CONTAINS(out,"\"updated\":1","good peer commits");ASSERT_CONTAINS(out,"\"skipped\":0","invalid scalar is an error, not a skip");ASSERT_CONTAINS(out,"\"errors\":[","bad row distinguished from missing");ASSERT_CONTAINS(out,"\"key\":\"a\"","error identifies row");free(out);}
+    ASSERT_EQ_INT(slotcask_get_ex(&f.db,"a",1,&invalid_after,&invalid_m,&invalid_h2),0,"capture invalid peer after request");
+    ASSERT_TRUE(invalid_n==invalid_m&&invalid_h==invalid_h2,"invalid peer physical shape unchanged");
+    if(invalid_before&&invalid_after&&invalid_n==invalid_m)
+        ASSERT_TRUE(memcmp(invalid_before,invalid_after,invalid_n)==0,"invalid peer OLD bytes unchanged while valid peer commits");
+    free(invalid_before);free(invalid_after);
     u_reject(&f,"{\"a\":{\"f1\":\"duplicate patch\"},\"\\u0061\":{\"f3\":999}}");
     u_reject(&f,"{\"a\":{\"f3\":2147483648}}");
     u_reject(&f,"{\"a\":{\"f3\":{\"$incr\":1}}}");
@@ -107,7 +132,7 @@ static void u_routes(void){
     u_reject(&f,"{\"a\":{\"f1\":\"ok\"},\"b\":{\"f1\":\"\\uZZZZ\"}}");
     f.ts->fields[1].not_null=1;u_reject(&f,"{\"a\":{\"f1\":null}}");f.ts->fields[1].not_null=0;
     ASSERT_EQ_INT(slotcask_sum_kf_totals(&f.db,&t2,&d2),0,"counts after updates");ASSERT_TRUE(total==t2&&deleted==d2,"updates never insert/delete");
-    int slot=f.db.slot_size;slotcask_close(&f.db);f.opened=0;ASSERT_EQ_INT(slotcask_open(&f.db,f.root,4,1,slot),0,"reopen updated rows");f.opened=1;
+    int slot=f.db.slot_size;slotcask_close(&f.db);f.opened=0;ASSERT_EQ_INT(slotcask_open(&f.db,f.root,4,f.sc.streams,slot),0,"reopen updated rows");f.opened=1;
     s=u_get(&f,"b",&n);ASSERT_NOT_NULL(s,"reopened updated row");if(s){ASSERT_CONTAINS(s,"\"f3\":22","valid peer durable");free(s);}u_close(&f);
 }
 static void u_delimited(void){
@@ -138,10 +163,29 @@ static void u_files_guards(void){
     f.sc.auto_key=AK_UUID;u_reject(&f,"{\"a\":{}}");f.sc.auto_key=AK_NONE;
     snprintf(path,sizeof(path),"%s/obj",f.root);ASSERT_EQ_INT(mkdir(path,0700),0,"private metadata dir");
     snprintf(path,sizeof(path),"%s/obj/indexes",f.root);ASSERT_EQ_INT(mkdir(path,0700),0,"private index dir");
-    snprintf(path,sizeof(path),"%s/obj/indexes/index.conf",f.root);fp=fopen(path,"w");ASSERT_NOT_NULL(fp,"manifest");if(fp){fputs("f0\n",fp);fclose(fp);}
-    invalidate_idx_cache(f.root,"obj");u_reject(&f,"{\"a\":{}}");remove(path);invalidate_idx_cache(f.root,"obj");
+    char index_path[256];snprintf(index_path,sizeof(index_path),"%s/obj/indexes/f1",f.root);
+    ASSERT_EQ_INT(mkdir(index_path,0700),0,"private ordered field directory");
+    snprintf(path,sizeof(path),"%s/obj/indexes/index.conf",f.root);fp=fopen(path,"w");ASSERT_NOT_NULL(fp,"manifest");if(fp){fputs("f1\n",fp);fclose(fp);}
+    invalidate_idx_cache(f.root,"obj");
+    uint64_t total=0,deleted=0,after_total=0,after_deleted=0;
+    ASSERT_EQ_INT(slotcask_sum_kf_totals(&f.db,&total,&deleted),0,"count before indexed update");
+    ASSERT_EQ_INT(u_json(&f,"{\"a\":{\"f1\":\"indexed-old\"}}",&out),0,"first indexed packed update is supported");free(out);
+    ASSERT_EQ_INT(u_hits(&f,"indexed-old"),1,"first ordered value is indexed before replacement");
+    ASSERT_EQ_INT(u_json(&f,"{\"a\":{\"f1\":\"indexed\"}}",&out),0,"indexed packed update is supported");
+    if(out){ASSERT_CONTAINS(out,"\"updated\":1","one indexed row updated");free(out);}
+    s=u_get(&f,"a",&n);ASSERT_NOT_NULL(s,"indexed update readable");
+    if(s){ASSERT_CONTAINS(s,"\"f1\":\"indexed\"","indexed update stored exact NEW");free(s);}
+    ASSERT_EQ_INT(u_hits(&f,"indexed"),1,"NEW ordered entry is present");
+    ASSERT_EQ_INT(u_hits(&f,"indexed-old"),0,"previously indexed OLD entry is removed");
+    ASSERT_EQ_INT(slotcask_sum_kf_totals(&f.db,&after_total,&after_deleted),0,"count after indexed update");
+    ASSERT_TRUE(total==after_total&&deleted==after_deleted,"indexed update preserves counts");
+    char too_big[545],bad_json[640];memset(too_big,'x',544);too_big[544]=0;
+    snprintf(bad_json,sizeof(bad_json),"{\"a\":{\"f1\":\"%s\"}}",too_big);
+    u_reject(&f,bad_json);
+    ASSERT_EQ_INT(u_hits(&f,"indexed"),1,"oversized NEW rejection retains OLD index");
+    remove(path);invalidate_idx_cache(f.root,"obj");
     SlotcaskUpsertOpts o={.record_hdr2=SREC_FLAG_NULLMAP};const uint8_t bytes[]={1,0};ASSERT_EQ_INT(slotcask_upsert_with_hooks(&f.db,-1,"legacy",6,bytes,sizeof(bytes),&o,NULL),0,"legacy OLD seed");
-    pos=u_pos(&f);ASSERT_EQ_INT(u_json(&f,"{\"legacy\":{}}",&out),1,"legacy OLD refuses packed patch");free(out);ASSERT_TRUE(u_pos(&f)==pos,"generation rejection no append");u_close(&f);
+    pos=u_pos_key(&f,"legacy");ASSERT_EQ_INT(u_json(&f,"{\"legacy\":{}}",&out),1,"legacy OLD refuses packed patch");free(out);ASSERT_TRUE(u_pos_key(&f,"legacy")==pos,"generation rejection no append");u_close(&f);
 }
 static void u_maximum(void){
     UFixture f;if(u_open(&f,1)){u_close(&f);return;}char *out=NULL;size_t n=0;

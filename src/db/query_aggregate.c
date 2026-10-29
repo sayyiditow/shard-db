@@ -115,6 +115,7 @@ static void keyset_emit_agg(const char *db_root, const char *object,
     free(hashes);
 }
 
+static void agg_note_predicate_error(void*,int);
 static void keyset_agg_from_or(const char *db_root, const char *object,
                                const Schema *sch, void *agg_ctx,
                                CriteriaNode *or_node, QueryDeadline *dl,
@@ -122,7 +123,7 @@ static void keyset_agg_from_or(const char *db_root, const char *object,
     /* Aggregate needs the full union — no short-circuit (target_count=0). */
     KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl,
                                  out_budget_exceeded, 0);
-    if (!ks) return;
+    if (!ks){if(errno)agg_note_predicate_error(agg_ctx,errno);return;}
     if (dl->timed_out) { keyset_free(ks); return; }
     keyset_emit_agg(db_root, object, sch, ks, agg_ctx, dl);
     keyset_free(ks);
@@ -144,7 +145,7 @@ static int keyset_agg_from_intersect(const char *db_root, const char *object,
                                           (SearchCriterion **)fp->source_leaves,
                                           fp->n_source, dl,
                                           &small_primary);
-    if (!ks) return 0;
+    if (!ks){if(errno)agg_note_predicate_error(agg_ctx,errno);return 0;}
 
     if (small_primary || fp->n_postfilter > 0) {
         /* Restore tree so agg_scan_cb post-filters via criteria_match_tree.
@@ -1049,6 +1050,7 @@ typedef struct {
        plain size_t. budget_exceeded flips per-ctx once the cap is hit. */
     _Atomic size_t *shared_buffer_bytes;
     int budget_exceeded;
+    int predicate_error;
     /* Slab arena for AggBucket + group_key + group_vals + accums. All
        per-bucket allocations live here so teardown is O(slabs) not
        O(buckets) and bucket creation skips ~5 malloc/strdup calls. Per-
@@ -1059,6 +1061,7 @@ typedef struct {
     /* Integer group key optimization: 1 if all group fields are integer types */
     int use_int_keys;
 } AggCtx;
+static void agg_note_predicate_error(void *ctx,int error){((AggCtx*)ctx)->predicate_error=error;}
 
 /* Write a typed field's string form into a caller-provided buffer (no malloc).
    Returns the length written. Returns 0 for "empty" fields (0-value LONG/INT/SHORT/
@@ -1805,6 +1808,7 @@ typedef struct {
     double           *best;
     int              *found;
     pthread_mutex_t   mu;
+    int predicate_error;
 } WfcBatchCtx;
 
 typedef struct {
@@ -1825,6 +1829,7 @@ typedef struct {
     int     found;
     int     budget_exceeded;
     int     dl_counter;
+    int predicate_error;
 } WfcArg;
 
 static int wfc_batch_cb(const uint8_t hash16[16],
@@ -1833,7 +1838,10 @@ static int wfc_batch_cb(const uint8_t hash16[16],
                          uint8_t hdr2, void *ctx) {
     (void)hash16; (void)key; (void)klen;
     WfcBatchCtx *bc = (WfcBatchCtx *)ctx;
-    if (!criteria_match_tree(value, vlen, bc->tree, bc->fs, hdr2)) return 0;
+    int matched=0;
+    if(criteria_match_tree_checked(value,vlen,bc->tree,bc->fs,hdr2,&matched)){
+        pthread_mutex_lock(&bc->mu);bc->predicate_error=errno?errno:EILSEQ;pthread_mutex_unlock(&bc->mu);return 1;}
+    if(!matched)return 0;
     /* NULL skips min/max (§2.5) — the bitmap bit decides on nullmap
        records; legacy records keep the decode-time absence contract. */
     if (hdr2 & SREC_FLAG_NULLMAP) {
@@ -1871,6 +1879,7 @@ static void flush_wfc_batch(SlotcaskDb *sdb, WfcArg *w,
             release_record_ref(&rr);
         }
     }
+    if(bc->predicate_error)w->predicate_error=bc->predicate_error;
 }
 
 static void *wfc_worker(void *arg) {
@@ -1980,7 +1989,7 @@ static void *wfc_worker(void *arg) {
             flush_wfc_batch(sdb, w, batch, bn, &bc);
             bn = 0;
         }
-        if (w->found || w->budget_exceeded || exhausted || dl_stop) break;
+        if (w->predicate_error || w->found || w->budget_exceeded || exhausted || dl_stop) break;
     }
 
     return NULL;
@@ -2390,7 +2399,10 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
     const uint8_t *raw = block + hdr->key_len;
 
     /* Check full criteria tree (AND/OR) */
-    if (!criteria_match_tree(raw, hdr->value_len, ctx->tree, ctx->fs, (uint8_t)(hdr->flag >> 8))) return 0;
+    int matched=0;
+    if(criteria_match_tree_checked(raw,hdr->value_len,ctx->tree,ctx->fs,(uint8_t)(hdr->flag>>8),&matched)){
+        ctx->predicate_error=errno?errno:EILSEQ;return 1;}
+    if(!matched)return 0;
 
     /* Extract group_by values into stack buffers (no malloc). gbuf[i][0]
        is forced to NUL up front because typed_field_to_buf_raw can return
@@ -2829,8 +2841,8 @@ static AggResult agg_bucket_value(const AggCtx *ctx, AggBucket *bkt,
 static int agg_text_matches(const AggResult *r, const SearchCriterion *c) {
     if (!r->present) return c->op == OP_NOT_EXISTS;
     const char *v = r->text; size_t vl = r->text_len;
-    size_t ql = strlen(c->value);
-    int cmp = agg_text_cmp(v, vl, c->value, ql);
+    size_t ql = strlen(search_criterion_value(c));
+    int cmp = agg_text_cmp(v, vl, search_criterion_value(c), ql);
     switch (c->op) {
     case OP_EQUAL: return cmp == 0;
     case OP_NOT_EQUAL: return cmp != 0;
@@ -2839,8 +2851,8 @@ static int agg_text_matches(const AggResult *r, const SearchCriterion *c) {
     case OP_LESS_EQ: return cmp <= 0;
     case OP_GREATER_EQ: return cmp >= 0;
     case OP_BETWEEN: {
-        int lo = agg_text_cmp(v, vl, c->value, strlen(c->value));
-        int hi = agg_text_cmp(v, vl, c->value2, strlen(c->value2));
+        int lo = agg_text_cmp(v, vl, search_criterion_value(c), strlen(search_criterion_value(c)));
+        int hi = agg_text_cmp(v, vl, search_criterion_value2(c), strlen(search_criterion_value2(c)));
         return (c->min_exclusive ? lo > 0 : lo >= 0) &&
                (c->max_exclusive ? hi < 0 : hi <= 0);
     }
@@ -2942,6 +2954,7 @@ static void agg_ctx_free_local(AggCtx *ctx);
    group_vals strings into dst->arena, then the caller (or
    agg_ctx_free_local on src) frees src->arena en masse. */
 static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
+    if(src->predicate_error)dst->predicate_error=src->predicate_error;
     int nvals = src->ngroups > 0 ? src->ngroups : 1;
     if (!src->ht) { src->total_buckets = 0; return; }
     for (size_t i = 0; i < src->ht_cap; i++) {
@@ -3308,6 +3321,8 @@ static int agg_minmax_same_field_btree(
         const char *alias, const TypedField *agg_tf, int splits,
         int is_max, const SearchCriterion *crit,
         const char *format, const char *delimiter, int want_total) {
+    const TypedSchema *literal_schema=load_typed_schema(db_root,object);
+    if(!search_criterion_indexable(load_typed_schema(db_root,object),crit))return 0;
     int rangeable = (crit->op == OP_EQUAL ||
                      crit->op == OP_GREATER ||
                      crit->op == OP_GREATER_EQ ||
@@ -3323,29 +3338,29 @@ static int agg_minmax_same_field_btree(
     const char *max_v = AGG_VALUE_TIER_CEIL; size_t max_l = 1; int max_x = 1;
     switch (crit->op) {
     case OP_EQUAL:
-        encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+        if(encode_criterion_value_checked(literal_schema,agg_tf,search_criterion_value(crit),strlen(search_criterion_value(crit)),buf1,sizeof(buf1),&len1)<0){return -1;}
         min_v = (const char *)buf1; min_l = len1;
         max_v = (const char *)buf1; max_l = len1;
         break;
     case OP_GREATER:
-        encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+        if(encode_criterion_value_checked(literal_schema,agg_tf,search_criterion_value(crit),strlen(search_criterion_value(crit)),buf1,sizeof(buf1),&len1)<0){return -1;}
         min_v = (const char *)buf1; min_l = len1; min_x = 1;
         break;
     case OP_GREATER_EQ:
-        encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+        if(encode_criterion_value_checked(literal_schema,agg_tf,search_criterion_value(crit),strlen(search_criterion_value(crit)),buf1,sizeof(buf1),&len1)<0){return -1;}
         min_v = (const char *)buf1; min_l = len1;
         break;
     case OP_LESS:
-        encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+        if(encode_criterion_value_checked(literal_schema,agg_tf,search_criterion_value(crit),strlen(search_criterion_value(crit)),buf1,sizeof(buf1),&len1)<0){return -1;}
         max_v = (const char *)buf1; max_l = len1; max_x = 1;
         break;
     case OP_LESS_EQ:
-        encode_criterion_value(agg_tf, crit->value, strlen(crit->value), buf1, &len1);
+        if(encode_criterion_value_checked(literal_schema,agg_tf,search_criterion_value(crit),strlen(search_criterion_value(crit)),buf1,sizeof(buf1),&len1)<0){return -1;}
         max_v = (const char *)buf1; max_l = len1;
         break;
     case OP_BETWEEN:
-        encode_criterion_value(agg_tf, crit->value,  strlen(crit->value),  buf1, &len1);
-        encode_criterion_value(agg_tf, crit->value2, strlen(crit->value2), buf2, &len2);
+        if(encode_criterion_value_checked(literal_schema,agg_tf,search_criterion_value(crit),strlen(search_criterion_value(crit)),buf1,sizeof(buf1),&len1)<0){return -1;}
+        if(encode_criterion_value_checked(literal_schema,agg_tf,search_criterion_value2(crit),strlen(search_criterion_value2(crit)),buf2,sizeof(buf2),&len2)<0){return -1;}
         min_v = (const char *)buf1; min_l = len1; min_x = crit->min_exclusive;
         max_v = (const char *)buf2; max_l = len2; max_x = crit->max_exclusive;
         break;
@@ -3453,10 +3468,10 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
             cc.check_primary = check_primary;
             cc.deadline = ctx->deadline;
             cc.tf = resolve_idx_field(ctx->fs->ts, pc->field);
-            btree_dispatch(db_root, object, pc->field, sch->splits,
+            if(btree_dispatch_checked(db_root, object, pc->field, sch->splits,
                            pc,
                            resolve_idx_field(ctx->fs->ts, pc->field),
-                           collect_hash_cb, &cc);
+                           collect_hash_cb, &cc)<0){ctx->predicate_error=errno?errno:EILSEQ;}
             if (cc.budget_exceeded) ctx->budget_exceeded = 1;
             else parallel_indexed_agg(ctx, db_root, object, sch, cc.entries, (int)cc.count);
             collect_ctx_destroy(&cc);
@@ -3484,7 +3499,7 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
     }
 
     if (ctx->deadline->timed_out) return -1;
-    if (ctx->budget_exceeded) return -1;
+    if (ctx->budget_exceeded || ctx->predicate_error) return -1;
     return 0;
 }
 
@@ -4267,6 +4282,8 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
            an aggregate alias or a group_by field, not just a typed field. */
     }
 
+    if(compile_criteria_tree_checked(tree,fs.ts,NULL,0)){OUT("{\"error\":\"invalid criteria value\"}\n");return -1;}
+
     /* Fast path: count-only with no criteria and no group_by → metadata.
        Skip fields whose presence semantics require inspecting the value. */
     int no_group = (!group_by_json || group_by_json[0] == '\0' || strcmp(group_by_json, "[]") == 0);
@@ -4610,7 +4627,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         }
     }
 
-    compile_criteria_tree(tree, fs.ts);
+
 
     /* Streaming top-N dispatch: eligible_for_topn_stream + agg_run_topn_stream.
      * Build a CSV form of group_by_json for the eligibility check. */
@@ -4806,10 +4823,12 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
             const TypedField *agg_tf = &fs.ts->fields[sf_agg_fi];
             SearchCriterion *crit = &sf_leaf_node->leaf;
-            if (agg_minmax_same_field_btree(
+            int minmax_status0=agg_minmax_same_field_btree(
                     db_root, object, specs[0].field, specs[0].alias,
                     agg_tf, sch.splits,
-                    specs[0].fn == AGG_MAX, crit, format, delimiter, want_total)) {
+                    specs[0].fn == AGG_MAX, crit, format, delimiter, want_total);
+            if(minmax_status0<0)return -1;
+            if(minmax_status0) {
                 return 0;
             }
         }
@@ -4852,10 +4871,12 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 parallel_for(wfc_worker, wargs, n_idx, sizeof(WfcArg));
 
                 int any_indefinite = 0;
+                int predicate_error=0;
                 double best = 0.0;
                 int have = 0;
                 for (int s = 0; s < n_idx; s++) {
                     if (wargs[s].budget_exceeded) any_indefinite = 1;
+                    if(wargs[s].predicate_error)predicate_error=wargs[s].predicate_error;
                     if (wargs[s].found) {
                         if (!have) { best = wargs[s].best; have = 1; }
                         else if (desc) { if (wargs[s].best > best) best = wargs[s].best; }
@@ -4863,6 +4884,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     }
                 }
                 free(wargs);
+                if(predicate_error){OUT("{\"error\":\"invalid typed record\"}\n");errno=predicate_error;return -1;}
                 if (dl.timed_out) {
                     LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query deadline exceeded (single-shard fast path)");
                     OUT("{\"error\":\"query_timeout\"}\n");
@@ -4921,10 +4943,12 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             /* Same-field shortcut: when crit->field == specs[0].field, the
                criterion's btree IS the agg field's btree. No KeySet needed —
                see agg_minmax_same_field_btree for the full walk. */
-            if (agg_minmax_same_field_btree(
+            int minmax_status1=agg_minmax_same_field_btree(
                     db_root, object, specs[0].field, specs[0].alias,
                     agg_tf, sch.splits,
-                    specs[0].fn == AGG_MAX, crit, format, delimiter, want_total)) {
+                    specs[0].fn == AGG_MAX, crit, format, delimiter, want_total);
+            if(minmax_status1<0)return -1;
+            if(minmax_status1) {
                 return 0;
             }
 
@@ -4943,8 +4967,8 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     .deadline = &dl, .dl_counter = 0, .full = 0,
                     .tf = crit_tf,
                 };
-                btree_dispatch(db_root, object, crit->field, sch.splits,
-                               crit, crit_tf, stream_keyset_cb, &sk);
+                if(btree_dispatch_checked(db_root, object, crit->field, sch.splits,
+                               crit, crit_tf, stream_keyset_cb, &sk)<0){keyset_free(ks);OUT("{\"error\":\"invalid index criterion\"}\n");return -1;}
 
                 if (!atomic_load_explicit(&sk.full, memory_order_relaxed) &&
                     !dl.timed_out && keyset_size(ks) > 0) {
@@ -5786,8 +5810,7 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                     const TypedField *ctf = resolve_idx_field(fs.ts, sc->field);
                     if (!ctf) { can_slot = 0; break;
                     }
-                    encode_criterion_value(ctf, sc->value, strlen(sc->value),
-                                           cvals[ci], &cvlens[ci]);
+                    if(encode_criterion_value_checked(fs.ts,ctf,search_criterion_value(sc),strlen(search_criterion_value(sc)),cvals[ci],sizeof(cvals[ci]),&cvlens[ci])<0){can_slot=0;break;}
                     if (cvlens[ci] == 0) { can_slot = 0; break;
                     }
                 }
@@ -6631,6 +6654,8 @@ igb_skip:
         if (dl.timed_out) {
             LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query deadline exceeded");
             OUT("{\"error\":\"query_timeout\"}\n");
+        } else if(ctx.predicate_error){
+            OUT("{\"error\":\"invalid typed record\"}\n");
         } else if (ctx.budget_exceeded) {
             LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query buffer cap exceeded");
             OUT(QUERY_BUFFER_ERR);
@@ -6639,6 +6664,7 @@ igb_skip:
         return -1;
     }
 
+    if(ctx.predicate_error){int error=ctx.predicate_error;agg_free(&ctx);OUT("{\"error\":\"invalid typed record\"}\n");errno=error;return -1;}
     /* Collect buckets */
     int nbuckets = 0;
     AggBucket **buckets = agg_collect(&ctx, &nbuckets);

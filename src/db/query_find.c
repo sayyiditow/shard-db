@@ -58,7 +58,7 @@ static int v2_scan_wrap_cb(const uint8_t hash[16],
 
 /* Forward declarations — defined below after the O_DIRECT helper block. */
 void scan_shards_v2_o_direct(SlotcaskDb *db, scan_callback cb, void *ctx);
-void scan_shards_v2_o_direct_match(SlotcaskDb *db,
+int scan_shards_v2_o_direct_match_checked(SlotcaskDb *db,
                                     FieldSchema *fs,
                                     const CompiledCriterion *single_cc,
                                     const CriteriaNode *tree,
@@ -162,6 +162,7 @@ typedef struct {
     QueryDeadline           *dl;
     int                      dl_counter;
     int64_t                  count;
+    int predicate_error;
 } KfMatchCtx;
 
 static int kf_live_match_cb(const uint8_t hash16[16],
@@ -171,14 +172,10 @@ static int kf_live_match_cb(const uint8_t hash16[16],
     (void)hash16; (void)key; (void)klen;
     KfMatchCtx *mc = (KfMatchCtx *)raw;
     if (query_deadline_tick(mc->dl, &mc->dl_counter)) return 1;
-    int matched = 0;
-    if (mc->single_cc) {
-        if (match_typed(value, vlen, mc->single_cc, mc->fs, hdr2) > 0)
-            matched = 1;
-    } else if (mc->tree) {
-        if (criteria_match_tree(value, vlen, mc->tree, mc->fs, hdr2))
-            matched = 1;
-    }
+    int matched=0;
+    int rc=mc->single_cc?match_typed_checked(value,vlen,mc->single_cc,mc->fs,hdr2,&matched):
+        criteria_match_tree_checked(value,vlen,mc->tree,mc->fs,hdr2,&matched);
+    if(rc){mc->predicate_error=errno?errno:EILSEQ;return 1;}
     if (matched) mc->count++;
     return 0;
 }
@@ -193,6 +190,7 @@ typedef struct {
     const CriteriaNode      *tree;
     QueryDeadline          *dl;
     int64_t                *out_count;
+    int predicate_error;
 } KfMatchShardArg;
 
 static void *kf_match_shard_worker(void *raw) {
@@ -205,6 +203,7 @@ static void *kf_match_shard_worker(void *raw) {
     };
     slotcask_scan_live_kf_one(arg->db, arg->kf_shard_id,
                               kf_live_match_cb, &mc, arg->stop_flag);
+    arg->predicate_error=mc.predicate_error;
     if (mc.count > 0)
         __atomic_add_fetch(arg->out_count, mc.count, __ATOMIC_RELAXED);
     return NULL;
@@ -212,14 +211,14 @@ static void *kf_match_shard_worker(void *raw) {
 
 /* Kf-driven inline-match count: one worker per Kf shard, matches the
    criteria against validated values, sums per-shard counts. */
-void scan_shards_v2_o_direct_match(SlotcaskDb *db,
+int scan_shards_v2_o_direct_match_checked(SlotcaskDb *db,
                                     FieldSchema *fs,
                                     const CompiledCriterion *single_cc,
                                     const CriteriaNode *tree,
                                     QueryDeadline *dl,
                                     int64_t *out_count)
 {
-    if (!db || db->num_shards <= 0) return;
+    if(!db||db->num_shards<=0||!out_count){errno=EINVAL;return -1;}
     *out_count = 0;
 
     int stop_flag = 0;
@@ -233,9 +232,10 @@ void scan_shards_v2_o_direct_match(SlotcaskDb *db,
                 .dl = dl, .dl_counter = 0, .count = 0,
             };
             slotcask_scan_live_kf_one(db, s, kf_live_match_cb, &mc, &stop_flag);
+            if(mc.predicate_error){*out_count=0;errno=mc.predicate_error;return -1;}
             *out_count += mc.count;
         }
-        return;
+        return 0;
     }
     for (int s = 0; s < db->num_shards; s++) {
         args[s].db = db;
@@ -250,7 +250,10 @@ void scan_shards_v2_o_direct_match(SlotcaskDb *db,
     }
     parallel_for_io(kf_match_shard_worker, args, db->num_shards,
                     sizeof(*args));
+    int error=0;for(int i=0;i<db->num_shards;i++)if(args[i].predicate_error)error=args[i].predicate_error;
     free(args);
+    if(error){*out_count=0;errno=error;return -1;}
+    return 0;
 }
 
 /* Dispatch helper: callers that have a Schema in scope use this to pick

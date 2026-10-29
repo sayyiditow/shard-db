@@ -110,7 +110,20 @@ static void w_routes(void){
     w_assert_reject(&f,1,"{\"f3\":{\"$incr\":1,\"$copy\":\"f3\"}}",NULL);
     w_assert_reject(&f,1,"{\"f3\":32768000000}",NULL);
     w_assert_reject(&f,1,"{\"f1\":\"\\uZZZZ\"}",NULL);
-    w_assert_reject(&f,1,"{\"f3\":1}","[]");
+    ASSERT_EQ_INT(w_call(&f,1,"a","{\"f3\":11}","[]",0,1,&out),0,
+                  "empty key-scoped condition retains vacuous pass");free(out);
+    ASSERT_EQ_INT(w_call(&f,1,"a","{\"f3\":11}",
+        "{\"field\":\"f0\",\"op\":\"eq\",\"value\":\"2.0000000000\"}",0,1,&out),0,
+        "packed exact condition matches mathematical value");free(out);
+    w_assert_reject(&f,1,"{\"f3\":1}",
+        "{\"field\":\"f0\",\"op\":\"eq\",\"value\":\"2.0000000001\"}");
+    w_assert_reject(&f,1,"{\"f3\":1}",
+        "{\"field\":\"f0\",\"op\":\"eq\",\"value\":\"invalid\"}");
+    uint64_t condition_pos=w_pos(&f);
+    ASSERT_EQ_INT(w_call(&f,1,"a","{}",
+        "{\"field\":\"f0\",\"op\":\"eq\",\"value\":\"2\"}",1,0,&out),0,
+        "packed dry run evaluates exact condition");free(out);
+    ASSERT_TRUE(w_pos(&f)==condition_pos,"condition dry run never appends");
     f.ts->fields[1].not_null=1;w_assert_reject(&f,1,"{\"f1\":null}",NULL);f.ts->fields[1].not_null=0;
     ASSERT_EQ_INT(w_call(&f,0,"a","{}",NULL,1,0,&out),1,"strict insert duplicate rejected");
     if(out){ASSERT_CONTAINS(out,"condition_not_met","duplicate response");free(out);}
@@ -129,6 +142,14 @@ static void w_mismatch(void){
     uint64_t p=w_pos(&f);char *out=NULL;
     ASSERT_EQ_INT(w_call(&f,1,"a","{}",NULL,0,1,&out),1,"packed update rejects legacy OLD");free(out);
     ASSERT_EQ_INT(w_call(&f,0,"a","{}",NULL,0,1,&out),1,"packed upsert rejects legacy OLD");free(out);
+    ASSERT_EQ_INT(w_call(&f,1,"a","{}","{\"field\":\"f0\",\"op\":\"eq\",\"value\":1}",0,1,&out),1,"checked OLD condition error rejects update");
+    if(out){ASSERT_CONTAINS(out,"invalid typed condition","condition evaluation failure is explicit");
+        ASSERT_TRUE(strstr(out,"condition_not_met")==NULL,"evaluation failure is not an ordinary condition miss");free(out);}
+    ASSERT_EQ_INT(w_call(&f,1,"a","{}",
+        "{\"field\":\"f0\",\"op\":\"eq\",\"value\":1}",1,0,&out),1,
+        "dry run rejects mismatched OLD generation");
+    if(out){ASSERT_CONTAINS(out,"invalid OLD generation or value","dry run reports invalid OLD");
+        ASSERT_TRUE(strstr(out,"condition_not_met")==NULL,"dry run error is not no-match");free(out);}
     ASSERT_TRUE(w_pos(&f)==p,"generation failures before append");w_close(&f);
 }
 static void w_maximum(void){
@@ -165,7 +186,9 @@ static void w_defaults_guards(void){
     snprintf(path,sizeof(path),"%s/obj/indexes",f.root);ASSERT_EQ_INT(mkdir(path,0700),0,"private index directory");
     snprintf(path,sizeof(path),"%s/obj/indexes/index.conf",f.root);FILE *fp=fopen(path,"w");ASSERT_NOT_NULL(fp,"private index manifest");
     if(fp){ASSERT_TRUE(fputs("f0\n",fp)>=0,"index manifest write");ASSERT_EQ_INT(fclose(fp),0,"index manifest close");}
-    invalidate_idx_cache(f.root,"obj");w_assert_reject(&f,0,"{}",NULL);w_assert_reject(&f,1,"{}",NULL);
+    invalidate_idx_cache(f.root,"obj");
+    ASSERT_EQ_INT(w_call(&f,0,"a","{}",NULL,0,1,&out),0,"packed indexed upsert supported");free(out);
+    ASSERT_EQ_INT(w_call(&f,1,"a","{}",NULL,0,1,&out),0,"packed indexed update supported");free(out);
     ASSERT_EQ_INT(remove(path),0,"remove private index declaration");invalidate_idx_cache(f.root,"obj");
     void *bytes=NULL;uint8_t hdr=0;
     ASSERT_EQ_INT(slotcask_get_ex(&f.db,"a",1,&bytes,&n,&hdr),0,"packed seed for reverse mismatch");
@@ -247,7 +270,49 @@ static void w_legacy_render(void){
     w_close(&f);
 }
 
+static void w_conditions(void){
+    WFixture f;if(w_open(&f,0)){w_close(&f);return;}char *out=NULL;size_t n=0;
+    const char *same="{\"field\":\"f0\",\"op\":\"eq\",\"value\":\"12345678901234561234567890e-10\"}";
+    const char *different="{\"field\":\"f0\",\"op\":\"eq\",\"value\":\"1234567890123456.1234567891\"}";
+    ASSERT_EQ_INT(w_call(&f,0,"a","{\"f0\":\"1234567890123456.1234567890\",\"f3\":1}",NULL,0,1,&out),0,
+        "exact condition seed");free(out);
+    w_assert_reject(&f,0,"{\"f3\":2}",different);
+    w_assert_reject(&f,1,"{\"f3\":2}",different);
+    w_assert_reject(&f,0,"{\"f3\":2}","{\"field\":\"f0\",\"op\":\"eq\",\"value\":\"invalid\"}");
+    ASSERT_EQ_INT(w_call(&f,0,"a","{\"f0\":\"1234567890123456.1234567890\",\"f3\":44}",same,0,1,&out),0,
+        "packed conditional upsert uses exact OLD");free(out);
+    ASSERT_EQ_INT(w_call(&f,1,"a","{\"f3\":45}",same,0,1,&out),0,
+        "packed conditional update uses equivalent-scale exact OLD");free(out);
+    uint64_t pos=w_pos(&f);
+    ASSERT_EQ_INT(w_call(&f,1,"a","{}",different,1,0,&out),1,"packed dry-run exact no-match");
+    if(out){ASSERT_CONTAINS(out,"condition_not_met","dry-run distinguishes no-match");
+        ASSERT_CONTAINS(out,"1234567890123456.1234567890","dry-run returns exact packed current value");free(out);}
+    ASSERT_TRUE(w_pos(&f)==pos,"packed no-match dry-run does not append");
+    char *value=w_get(&f,"a",&n);ASSERT_NOT_NULL(value,"condition result readable");
+    if(value){ASSERT_CONTAINS(value,"\"f3\":45","only successful conditional updates applied");free(value);}
+    w_close(&f);
+}
 static int test_single_write_integration_run(void){
-    w_legacy_render();w_transport();w_routes();w_mismatch();w_maximum();w_defaults_guards();w_large();w_concurrent();return t_ctx->failed?1:0;
+    w_legacy_render();w_transport();w_routes();w_conditions();w_mismatch();w_maximum();w_defaults_guards();w_large();w_concurrent();return t_ctx->failed?1:0;
 }
 TEST_REGISTER("test-single-write-integration",test_single_write_integration_run)
+
+static int test_single_index_admission_run(void){
+    WFixture f;if(w_open(&f,0)){w_close(&f);return 1;}char *out=NULL,path[256];
+    char big[545],ok[544],json[2048];memset(big,'q',544);big[544]=0;memset(ok,'q',543);ok[543]=0;
+    /* Seed historical oversized OLD before adding a declaration. */
+    snprintf(json,sizeof(json),"{\"f1\":\"%s\"}",big);
+    ASSERT_EQ_INT(w_call(&f,0,"historical",json,NULL,0,0,&out),0,"historical oversize fixture");free(out);
+    const char *parts[]={"obj","obj/indexes","obj/indexes/f1"};
+    for(int i=0;i<3;i++){snprintf(path,sizeof(path),"%s/%s",f.root,parts[i]);mkdir(path,0700);}
+    snprintf(path,sizeof(path),"%s/obj/indexes/index.conf",f.root);FILE *fp=fopen(path,"w");ASSERT_NOT_NULL(fp,"index declaration");if(fp){fputs("f1\n",fp);fclose(fp);}invalidate_idx_cache(f.root,"obj");
+    snprintf(json,sizeof(json),"{\"f1\":\"%s\"}",ok);
+    ASSERT_EQ_INT(w_call(&f,0,"a",json,NULL,0,1,&out),0,"packed single boundary accepted");free(out);
+    snprintf(json,sizeof(json),"{\"f1\":\"%s\"}",big);w_assert_reject(&f,0,json,NULL);w_assert_reject(&f,1,json,NULL);
+    ASSERT_EQ_INT(w_call(&f,1,"historical","{\"f1\":\"small\"}",NULL,0,1,&out),0,"OLD oversized may update to small");free(out);
+    f.ts->fields[1].default_kind=DK_AUTO_CREATE;
+    snprintf(json,sizeof(json),"{\"f1\":\"%s\"}",big);
+    ASSERT_EQ_INT(w_call(&f,0,"a",json,NULL,0,1,&out),0,"ignored oversized AC literal validated after OLD copy");free(out);
+    w_close(&f);return t_ctx->failed?1:0;
+}
+TEST_REGISTER("test-single-index-admission",test_single_index_admission_run)

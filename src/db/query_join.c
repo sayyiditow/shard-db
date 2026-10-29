@@ -5,6 +5,7 @@
 #include "trigram.h"
 #include "io_direct.h"
 #include "query_internal.h"
+#include "typed_index.h"
 #include <math.h>
 #include <dirent.h>
 #include <stdarg.h>
@@ -195,65 +196,10 @@ int resolve_joins(JoinSpec *joins, int n, const char *db_root,
    Handles composite (a+b → concat values). Returns written length (0 = empty).
    A NULL local field also returns 0: NULL joins nothing, and probing the
    zero-encoded bytes would falsely match a remote zero-valued key. */
-int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
-                             size_t driver_len, const TypedSchema *driver_ts,
-                             uint8_t driver_hdr2,
-                             char *buf, size_t bufsz) {
-    /* Field bytes sit nullmap_prefix into the record for nullmap
-       generations — resolve the field-region base once (§2.7). */
-    const uint8_t *fbase = driver_raw;
-    const uint8_t *bm = NULL; int bm_bytes = 0;
-    size_t region = driver_len;
-    if (driver_hdr2) {
-        if (typed_record_view(driver_raw, driver_len, driver_hdr2,
-                              &fbase, &bm, &bm_bytes, &region) != 0)
-            return 0;
-    }
-    if (j->local_is_composite) {
-        char fb[256]; strncpy(fb, j->local_field, 255); fb[255] = '\0';
-        int pos = 0;
-        char *save = NULL;
-        char *tok = strtok_r(fb, "+", &save);
-        while (tok) {
-            int idx = driver_ts ? typed_field_index(driver_ts, tok) : -1;
-            if (idx < 0) { tok = strtok_r(NULL, "+", &save); continue; }
-            /* Any NULL component nulls the whole composite (SQL equality) —
-               a zero-filled probe would match a remote zero key. */
-            if (driver_hdr2 && typed_field_null(bm, bm_bytes, idx)) return 0;
-            /* BTRI composite keys interleave a tier byte before EVERY
-               component ([t1][v1][t2][v2], §2.4.1). The remote probe seek
-               prefixes only the FIRST tier (shard_walk_worker), so this
-               builder emits the inter-component bytes between payload
-               parts — a missing tier makes the payload byte compare
-               against the stored tier byte and every probe misses. */
-            if (pos > 0 && pos + 1 < (int)bufsz) buf[pos++] = '\x00';
-            size_t blen = 0;
-            typed_field_to_index_key(driver_ts, fbase, region, idx,
-                                      (uint8_t *)buf + pos, &blen);
-            if (blen == 0) { tok = strtok_r(NULL, "+", &save); continue; }
-            if (pos + (int)blen < (int)bufsz) { pos += (int)blen; }
-            else break;
-            tok = strtok_r(NULL, "+", &save);
-        }
-        return pos;
-    }
-    if (j->local_tf) {
-        const TypedField *tf = j->local_tf;
-        if (driver_hdr2 && driver_ts &&
-            typed_field_null(bm, bm_bytes,
-                             (int)(tf - driver_ts->fields)))
-            return 0;
-        const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > region)
-            ? g_zero_field_65537
-            : fbase + tf->offset;
-        return typed_field_to_buf_raw(tf, fp,
-                                      buf, bufsz, 0);
-    }
-    return 0;
-}
+
 
 /* Forward decl — definition lives near btree_dispatch below. */
-const TypedField *resolve_idx_field(const TypedSchema *ts, const char *field);
+
 
 
 
@@ -275,318 +221,147 @@ static int join_bt_first_cb(const char *val, size_t vlen, const uint8_t *hash16,
     return -1;  /* stop after first match */
 }
 
+typedef struct {
+    uint8_t (*hashes)[16];size_t cap;
+    _Atomic size_t count;
+} JoinCandidates;
+typedef struct {size_t field,offset,length;} JoinComponent;
+static int join_candidate_cb(const char *value,size_t length,const uint8_t *hash,void *arg){
+    (void)value;(void)length;JoinCandidates *c=arg;
+    size_t at=atomic_fetch_add_explicit(&c->count,1,memory_order_relaxed);
+    if(c->hashes&&at<c->cap)memcpy(c->hashes[at],hash,16);
+    return 0;
+}
+/* Legacy variable composite bytes can collide across component boundaries.
+   The shared codec stays unchanged. Validate components after all index
+   callbacks have returned, never fetching while a Btree lock is held. */
+static int join_candidate_components(const JoinSpec *j,const char *root,
+    const uint8_t *key,size_t keylen,const JoinComponent *parts,size_t count,
+    size_t budget,RecordRef *out){
+    JoinCandidates candidates={0};
+    btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
+                     (const char*)key+1,keylen-1,join_candidate_cb,&candidates);
+    size_t capacity=atomic_load_explicit(&candidates.count,memory_order_relaxed);
+    if(!capacity)return 0;
+    if(capacity>budget/sizeof(*candidates.hashes)){errno=ENOBUFS;return -1;}
+    candidates.hashes=malloc(capacity*sizeof(*candidates.hashes));
+    if(!candidates.hashes)return -1;
+    candidates.cap=capacity;atomic_store_explicit(&candidates.count,0,memory_order_relaxed);
+    btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
+                     (const char*)key+1,keylen-1,join_candidate_cb,&candidates);
+    size_t actual=atomic_load_explicit(&candidates.count,memory_order_relaxed);
+    if(actual>capacity){free(candidates.hashes);errno=ENOBUFS;return -1;}
+    int found=0;
+    for(size_t i=0;i<actual;i++){
+        if(read_record_ref(root,j->object,&j->remote_sch,candidates.hashes[i],out))continue;
+        int equal=1;
+        for(size_t p=0;p<count;p++){
+            size_t n=0;
+            int rc=typed_index_field_key_into(j->remote_fs.ts,parts[p].field,
+                out->val,out->vlen,out->hdr2,NULL,0,&n);
+            if(rc<0){found=-1;equal=0;break;}
+            if(!rc||n!=parts[p].length){equal=0;break;}
+            uint8_t component[544];size_t written=0;
+            rc=typed_index_field_key_into(j->remote_fs.ts,parts[p].field,
+                out->val,out->vlen,out->hdr2,component,sizeof(component),&written);
+            if(rc<0){found=-1;equal=0;break;}
+            if(rc!=1||written!=n||memcmp(component,key+parts[p].offset,n)){equal=0;break;}
+        }
+        if(equal){found=1;break;}
+        int error=errno;release_record_ref(out);memset(out,0,sizeof(*out));errno=error;
+        if(found<0)break;
+    }
+    int error=errno;free(candidates.hashes);errno=error;return found;
+}
+
 /* Look up the remote record for one join. Returns 1 if found, 0 otherwise.
    On success, *out_rr is populated; caller must release_record_ref(out_rr).
    Storage-version-agnostic: read_record_ref dispatches v1/v2 internally. */
-int lookup_remote(const JoinSpec *j, const char *db_root,
-                         const char *local_key, size_t local_len,
-                         RecordRef *out_rr) {
-    memset(out_rr, 0, sizeof(*out_rr));
-    if (local_len == 0) return 0;
-
-    uint8_t hash[16];
-    if (j->remote_is_key) {
-        compute_hash_raw(local_key, local_len, hash);
-    } else {
-        JoinBtHit hit = {{0}, 0};
-        /* Encode local_key as an index key for the REMOTE field's type —
-           that's how the remote .idx stores its values. */
-        const TypedField *rem_tf = resolve_idx_field(j->remote_fs.ts, j->remote_field);
-        uint8_t keybuf[1032];
-        size_t keylen;
-        if (rem_tf && !j->local_is_composite) {
-            encode_field_text_for_index(rem_tf, local_key, (int)local_len, keybuf, &keylen);
-            btree_idx_search(db_root, j->object, j->remote_field, j->remote_sch.splits,
-                             (const char *)keybuf, keylen, join_bt_first_cb, &hit);
-        } else {
-            /* Composite remote field or untyped — raw passthrough. */
-            btree_idx_search(db_root, j->object, j->remote_field, j->remote_sch.splits,
-                             local_key, local_len, join_bt_first_cb, &hit);
+/* Resolve one join from complete logical values, not a fixed-size display
+   buffer or bytes encoded for the driver's potentially different layout. */
+int resolve_join_record(const JoinSpec *j,const char *root,
+    const TypedSchema *driver_ts,const uint8_t *raw,size_t len,uint8_t flags,
+    size_t budget,RecordRef *out){
+    if(!j||!driver_ts||!out){errno=EINVAL;return -1;}
+    memset(out,0,sizeof(*out));
+    if(j->remote_is_key){
+        char *text=NULL;size_t n=0;
+        int rc=typed_query_named_text(driver_ts,raw,len,flags,j->local_field,budget,&text,&n);
+        if(rc<=0)return rc;
+        const uint8_t *key=(const uint8_t*)text;size_t keylen=n;uint8_t binary[16];
+        if(j->remote_sch.auto_key==AK_UUID){
+            if(n!=36||parse_uuid_string(text,binary)){free(text);return 0;}
+            key=binary;keylen=16;
+        }else if(j->remote_sch.auto_key==AK_SEQ){
+            int64_t number=0;
+            if(memchr(text,0,n)||parse_seq_key(text,&number)){free(text);return 0;}
+            for(size_t i=0;i<8;i++)binary[i]=(uint8_t)((uint64_t)number>>(56-8*i));
+            key=binary;keylen=8;
         }
-        if (!atomic_load_explicit(&hit.found, memory_order_acquire)) return 0;
-        memcpy(hash, hit.hash, 16);
+        if(keylen>(size_t)j->remote_sch.max_key){free(text);return 0;}
+        uint8_t hash[16];compute_hash_raw((const char*)key,keylen,hash);
+        int found=read_record_ref(root,j->object,&j->remote_sch,hash,out)==0;
+        if(found&&(out->klen!=keylen||memcmp(out->key,key,keylen))){release_record_ref(out);found=0;}
+        free(text);return found;
     }
-
-    if (read_record_ref(db_root, j->object, &j->remote_sch, hash, out_rr) != 0)
-        return 0;
-
-    /* For primary-key joins, guard against 16-byte hash collisions by
-       verifying the stored key bytes match. The indexed-field path already
-       verified equality via the btree. */
-    if (j->remote_is_key) {
-        if (out_rr->klen != local_len ||
-            memcmp(out_rr->key, local_key, local_len) != 0) {
-            release_record_ref(out_rr);
-            return 0;
+    if(!j->remote_fs.ts){errno=EINVAL;return -1;}
+    TypedRowView view;
+    if(typed_row_open(driver_ts,raw,len,flags,&view))return -1;
+    char local[256],remote[256];
+    memcpy(local,j->local_field,sizeof(local));local[255]=0;
+    memcpy(remote,j->remote_field,sizeof(remote));remote[255]=0;
+    char *ls=NULL,*rs=NULL,*l=strtok_r(local,"+",&ls),*r=strtok_r(remote,"+",&rs);
+    uint8_t key[544];size_t used=0,count=0;int ambiguous=0;
+    JoinComponent parts[MAX_FIELDS];
+    while(l&&r){
+        int li=typed_field_index(driver_ts,l),ri=typed_field_index(j->remote_fs.ts,r);
+        if(li<0||ri<0)return 0;
+        TypedRowSpan span;if(typed_row_span(&view,(size_t)li,&span))return -1;
+        if(span.is_null)return 0;
+        char *text=NULL;size_t n=0;
+        int rc=typed_query_named_text(driver_ts,raw,len,flags,l,budget,&text,&n);
+        if(rc<=0)return rc;
+        size_t width=0;
+        rc=typed_index_text_key_into(j->remote_fs.ts,(size_t)ri,text,n,NULL,0,&width);
+        if(rc<=0){int error=errno;free(text);if(!rc||error==EDOM)return 0;errno=error;return -1;}
+        char *next_l=strtok_r(NULL,"+",&ls),*next_r=strtok_r(NULL,"+",&rs);
+        int escape=next_r&&j->remote_fs.ts->packed.nfields&&
+                   j->remote_fs.ts->fields[ri].type==FT_VARCHAR;
+        size_t extra=escape?2:0;
+        if(escape)for(size_t i=0;i<n;i++)extra+=text[i]==0;
+        /* No admitted remote key can match a larger complete probe. */
+        if(used>=sizeof(key)||width>sizeof(key)-used-1||
+           extra>sizeof(key)-used-1-width){free(text);return 0;}
+        if(count==MAX_FIELDS){free(text);errno=EINVAL;return -1;}
+        parts[count++]=(JoinComponent){(size_t)ri,used,width+1};
+        if(next_r&&!j->remote_fs.ts->packed.nfields&&j->remote_fs.ts->fields[ri].type==FT_VARCHAR)ambiguous=1;
+        key[used++]=0;
+        if(escape){
+            for(size_t i=0;i<n;i++){key[used++]=(uint8_t)text[i];if(!text[i])key[used++]=255;}
+            key[used++]=0;key[used++]=0;
+        }else{
+            size_t written=0;
+            rc=typed_index_text_key_into(j->remote_fs.ts,(size_t)ri,text,n,
+                                          key+used,sizeof(key)-used,&written);
+            if(rc!=1||written!=width){int error=errno;free(text);errno=error?error:EILSEQ;return -1;}
+            used+=written;
         }
+        free(text);l=next_l;r=next_r;
     }
-    return 1;
+    if(l||r||!used)return 0;
+    if(ambiguous)return join_candidate_components(j,root,key,used,parts,count,budget,out);
+    JoinBtHit hit={{0},0};
+    btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
+                     (const char*)key+1,used-1,join_bt_first_cb,&hit);
+    if(!atomic_load_explicit(&hit.found,memory_order_acquire))return 0;
+    return read_record_ref(root,j->object,&j->remote_sch,hit.hash,out)==0;
 }
 
-/* snprintf() reports the length it *would* write even when the
-   destination is too small to hold it. Accumulating that raw return
-   value into a running buffer offset (`pos += snprintf(buf+pos,
-   bufsz-pos, ...)`) lets a single truncation permanently desync pos
-   from the buffer: the next call in the chain computes `buf + pos`
-   past the end of the buffer, and `bufsz - pos` (size_t - int, with
-   pos > bufsz) wraps around to a huge unsigned size — both feed an
-   out-of-bounds write to the following snprintf. This wrapper clamps
-   to what was actually written / would fit, so pos can never exceed
-   bufsz - 1 (CID 1696463, CID 1696458). */
-static int snprintf_bounded(char *buf, size_t bufsz, const char *fmt, ...) {
-    if (bufsz == 0) return 0;
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, bufsz, fmt, ap);
-    va_end(ap);
-    if (n < 0) return 0;
-    return (n >= (int)bufsz) ? (int)bufsz - 1 : n;
-}
 
-/* Write one field value as a JSON token (number/"string"/null) into buf.
-   Returns bytes written; always < bufsz, so accumulating this into a
-   running offset can never overrun the caller's buffer (see
-   snprintf_bounded above). Safe for worker threads. */
-static int buf_field_value(const TypedField *tf, const uint8_t *field_ptr,
-                           char *buf, size_t bufsz) {
-    if (!tf) return snprintf_bounded(buf, bufsz, "null");
-    char tmp[512];
-    int n;
-    switch (tf->type) {
-    case FT_VARCHAR: {
-        int len = varchar_eff_len(field_ptr, tf->size);
-        if (len == 0) return snprintf_bounded(buf, bufsz, "\"\"");
-        /* Escape per RFC 8259 — varchar content is opaque bytes,
-           may contain " \ or control chars. Caller sizes buf for
-           up to 6 * len + 2 worst case. NUL-terminate so callers
-           that pass the buffer to printf-%s read a bounded string.
-           Returns 0 (not -1) when it doesn't fit, so a caller doing
-           pos += buf_field_value(...) never has pos move backwards. */
-        if (bufsz < 4) return 0;
-        buf[0] = '"';
-        int esc = json_escape_into(buf + 1, bufsz - 3,
-                                    (const char *)(field_ptr + 2),
-                                    (size_t)len);
-        if (esc < 0) return 0;
-        buf[1 + esc] = '"';
-        buf[2 + esc] = '\0';
-        return 2 + esc;
-    }
-    case FT_DATE:
-    case FT_DATETIME:
-    case FT_DATETIMEMS:
-    case FT_IPV4:
-    case FT_IPV6:
-    case FT_ENUM:
-        /* Enum's display string is a JSON string (quoted, escaped).
-           DATE/DATETIME are also strings on the wire. */
-        n = typed_field_to_buf_raw(tf, field_ptr, tmp, sizeof(tmp), 0);
-        if (n <= 0) return snprintf_bounded(buf, bufsz, "null");
-        return snprintf_bounded(buf, bufsz, "\"%s\"", tmp);
-    default:
-        n = typed_field_to_buf_raw(tf, field_ptr, tmp, sizeof(tmp), 0);
-        if (n <= 0) return snprintf_bounded(buf, bufsz, "null");
-        return snprintf_bounded(buf, bufsz, "%s", tmp);
-    }
-}
 
-/* Write one join's contribution (,val,val,...) to buf. remote_raw NULL → nulls.
-   remote_hdr2 is the remote record's generation flag — field offsets are
-   field-region-relative, so the view slide must run before any field read.
-   Returns bytes written; always < bufsz (see snprintf_bounded above). */
-int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw, size_t remote_len,
-                    uint8_t remote_hdr2, char *buf, size_t bufsz) {
-    int pos = 0;
-    if (j->include_remote_key) {
-        /* v1: emit null — local field gives the value; extend later if needed */
-        pos += snprintf_bounded(buf + pos, bufsz - pos, ",null");
-    }
-    /* Validated field-region view (§2.1) — resolved once, shared by the
-       loop. A structurally invalid remote record renders nulls (the
-       fetch path fails the request separately for corruption). */
-    const uint8_t *rbase = NULL; const uint8_t *rbm = NULL;
-    int rbm_bytes = 0; size_t rregion = 0;
-    int view_ok = remote_raw &&
-        typed_record_view(remote_raw, remote_len, remote_hdr2,
-                          &rbase, &rbm, &rbm_bytes, &rregion) == 0;
-    for (int k = 0; k < j->proj_count; k++) {
-        if (pos >= (int)bufsz - 1) break;
-        pos += snprintf_bounded(buf + pos, bufsz - pos, ",");
-        if (!remote_raw || !view_ok || !j->proj_tfs[k]) {
-            pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
-            continue;
-        }
-        const TypedField *tf = j->proj_tfs[k];
-        int tidx = j->remote_fs.ts ? (int)(tf - j->remote_fs.ts->fields) : -1;
-        if (tidx >= 0 && typed_field_null(rbm, rbm_bytes, tidx)) {
-            pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
-            continue;
-        }
-        const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > rregion)
-            ? g_zero_field_65537
-            : rbase + tf->offset;
-        pos += buf_field_value(tf, fp,
-                               buf + pos, bufsz - pos);
-    }
-    return pos;
-}
-
-/* Write driver-side row values (,val,val,...) after the key.
-   driver_hdr2 is the driver record's generation flag — the view slide must
-   run before any field read (field offsets are field-region-relative).
-   Returns bytes written; always < bufsz (see snprintf_bounded above). */
-int buf_driver_values(const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs,
-                             const char **driver_proj, int driver_proj_count,
-                             uint8_t driver_hdr2, char *buf, size_t bufsz) {
-    int pos = 0;
-    /* Validated field-region view (§2.1), resolved once. */
-    const uint8_t *dbase = NULL; const uint8_t *dbm = NULL;
-    int dbm_bytes = 0; size_t dregion = 0;
-    int dview_ok = driver_raw && driver_fs && driver_fs->ts &&
-        typed_record_view(driver_raw, driver_len, driver_hdr2,
-                          &dbase, &dbm, &dbm_bytes, &dregion) == 0;
-    if (driver_proj_count > 0) {
-        for (int i = 0; i < driver_proj_count; i++) {
-            if (pos >= (int)bufsz - 1) break;
-            pos += snprintf_bounded(buf + pos, bufsz - pos, ",");
-            if (dview_ok) {
-                int idx = typed_field_index(driver_fs->ts, driver_proj[i]);
-                if (idx >= 0) {
-                    const TypedField *tf = &driver_fs->ts->fields[idx];
-                    if (typed_field_null(dbm, dbm_bytes, idx)) {
-                        pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
-                        continue;
-                    }
-                    const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > dregion)
-                        ? g_zero_field_65537
-                        : dbase + tf->offset;
-                    pos += buf_field_value(tf, fp,
-                                           buf + pos, bufsz - pos);
-                    continue;
-                }
-            }
-            pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
-        }
-    } else if (dview_ok) {
-        for (int i = 0; i < driver_fs->ts->nfields; i++) {
-            if (driver_fs->ts->fields[i].removed) continue;
-            if (pos >= (int)bufsz - 1) break;
-            pos += snprintf_bounded(buf + pos, bufsz - pos, ",");
-            const TypedField *tf = &driver_fs->ts->fields[i];
-            if (typed_field_null(dbm, dbm_bytes, i)) {
-                pos += snprintf_bounded(buf + pos, bufsz - pos, "null");
-                continue;
-            }
-            const uint8_t *fp = ((size_t)tf->offset + (size_t)tf->size > dregion)
-                ? g_zero_field_65537
-                : dbase + tf->offset;
-            pos += buf_field_value(tf, fp,
-                                   buf + pos, bufsz - pos);
-        }
-    }
-    return pos;
-}
-
-/* CSV-cell quoting to a buffer (mirrors csv_emit_cell but doesn't OUT —
-   safe for worker threads). Returns chars written (excluding NUL). */
-static size_t csv_cell_to_buf(const char *val, char delim, char *out, size_t out_sz) {
-    if (!out_sz) return 0;
-    if (!val || !val[0]) { out[0] = '\0'; return 0; }
-    size_t len = strlen(val);
-    int needs_quote = 0;
-    for (size_t i = 0; i < len; i++) {
-        char c = val[i];
-        if (c == delim || c == '"' || c == '\n' || c == '\r') { needs_quote = 1; break; }
-    }
-    size_t pos = 0;
-    if (!needs_quote) {
-        for (size_t i = 0; i < len && pos < out_sz - 1; i++) out[pos++] = val[i];
-    } else {
-        if (pos < out_sz - 1) out[pos++] = '"';
-        for (size_t i = 0; i < len && pos < out_sz - 1; i++) {
-            char c = val[i];
-            if (c == '\n' || c == '\r') c = ' ';
-            if (c == '"') {
-                if (pos + 1 < out_sz - 1) { out[pos++] = '"'; out[pos++] = '"'; }
-                else break;
-            } else out[pos++] = c;
-        }
-        if (pos < out_sz - 1) out[pos++] = '"';
-    }
-    out[pos] = '\0';
-    return pos;
-}
-
-/* Build one joined-query CSV row "<key><d>v1<d>v2<d>j1.a<d>...\n" into buf.
-   Joins with no remote match emit empty cells. Returns chars written. */
-size_t build_joined_csv_row(const char *key,
-                                   const uint8_t *driver_raw, size_t driver_len,
-                                   FieldSchema *driver_fs, uint8_t driver_hdr2,
-                                   const char **proj_fields, int proj_count,
-                                   const JoinSpec *joins, int njoins,
-                                   const RecordRef *jrefs,
-                                   char csv_delim,
-                                   char *buf, size_t bufsz) {
-    size_t pos = 0;
-    pos += csv_cell_to_buf(key, csv_delim, buf + pos, bufsz - pos);
-    char tmp[1024];
-
-    /* Driver fields */
-    if (proj_count > 0 && driver_fs && driver_fs->ts) {
-        for (int i = 0; i < proj_count; i++) {
-            if (pos < bufsz - 1) buf[pos++] = csv_delim;
-            int idx = typed_field_index(driver_fs->ts, proj_fields[i]);
-            char *v = (idx >= 0)
-                ? typed_get_field_str(driver_fs->ts, driver_raw, (int)driver_len, idx, driver_hdr2)
-                : NULL;
-            (void)tmp;
-            pos += csv_cell_to_buf(v, csv_delim, buf + pos, bufsz - pos);
-            free(v);
-        }
-    } else if (driver_fs && driver_fs->ts) {
-        for (int i = 0; i < driver_fs->ts->nfields; i++) {
-            if (driver_fs->ts->fields[i].removed) continue;
-            if (pos < bufsz - 1) buf[pos++] = csv_delim;
-            char *v = typed_get_field_str(driver_fs->ts, driver_raw, (int)driver_len, i, driver_hdr2);
-            pos += csv_cell_to_buf(v, csv_delim, buf + pos, bufsz - pos);
-            free(v);
-        }
-    }
-
-    /* Joined fields — one column per (join.proj_field), prefixed with as_name in the header. */
-    for (int i = 0; i < njoins; i++) {
-        const JoinSpec *j = &joins[i];
-        const uint8_t *rraw = jrefs ? jrefs[i].val : NULL;
-        size_t rlen = jrefs ? jrefs[i].vlen : 0;
-        uint8_t rhdr2 = jrefs ? jrefs[i].hdr2 : 0;
-        /* Validated field-region view (§2.1) — resolved once per join. */
-        const uint8_t *rbase = NULL; const uint8_t *rbm = NULL;
-        int rbm_bytes = 0; size_t rregion = 0;
-        int rview_ok = rraw &&
-            typed_record_view(rraw, rlen, rhdr2,
-                              &rbase, &rbm, &rbm_bytes, &rregion) == 0;
-        if (j->include_remote_key) {
-            if (pos < bufsz - 1) buf[pos++] = csv_delim;
-            /* Empty cell — local field carries the value (matches JSON's null). */
-        }
-        for (int k = 0; k < j->proj_count; k++) {
-            if (pos < bufsz - 1) buf[pos++] = csv_delim;
-            if (!rraw || !rview_ok || !j->proj_tfs[k]) continue;
-            const TypedField *rtf = j->proj_tfs[k];
-            int rtidx = j->remote_fs.ts ? (int)(rtf - j->remote_fs.ts->fields) : -1;
-            if (rtidx >= 0 && typed_field_null(rbm, rbm_bytes, rtidx)) continue;
-            const uint8_t *rfp = ((size_t)rtf->offset + (size_t)rtf->size > rregion)
-                ? g_zero_field_65537
-                : rbase + rtf->offset;
-            int n = typed_field_to_buf_raw(rtf, rfp,
-                                           tmp, sizeof(tmp), 0);
-            if (n > 0) pos += csv_cell_to_buf(tmp, csv_delim, buf + pos, bufsz - pos);
-        }
-    }
-
-    if (pos < bufsz - 1) buf[pos++] = '\n';
-    buf[pos] = '\0';
-    return pos;
+/* Retained bounded-buffer compatibility entry for the regression rig. */
+int buf_driver_values(const uint8_t *raw,size_t len,FieldSchema *fs,const char **names,int count,uint8_t flags,char *out,size_t cap){
+    return typed_query_columns_into(raw,len,flags,fs,names,count,out,cap);
 }
 
 /* Emit the CSV header line for a joined query (driver + joins, prefixed columns). */
@@ -640,172 +415,57 @@ void emit_joined_columns(const char *driver_object,
     OUT("],\"rows\":[");
 }
 
-int adv_search_cb(const SlotHeader *hdr, const uint8_t *block,
-                          void *ctx) {
-    AdvSearchCtx *sc = (AdvSearchCtx *)ctx;
-    /* Best-effort pre-checks (no lock). The emit section below re-checks
-       limit under the lock to ensure we never over-emit.
-       coverity[lock_evasion] coverity[missing_lock] — `_Atomic int printed`
-       gives torn-read-free visibility; staleness costs at most one wasted
-       record-fetch before the locked re-check at line 5731 catches it. */
-    if (sc->limit > 0 && sc->printed >= sc->limit) return 1;
-    if (query_deadline_tick(sc->deadline, &sc->dl_counter)) return 1;
-
-    /* Render key per the object's auto_key mode so the wire-form
-       comparison + emit work for binary keys (AK_UUID/SEQ). Heap-alloc
-       to preserve the existing free() lifecycle in this function. */
-    char *key = malloc(1100);
-    if (!key) return 1;
-    {
-        const Schema *sc_p = (sc->fs && sc->fs->auto_key != AK_NONE)
-                              ? &sc->fs->auto_key_schema_snapshot : NULL;
-        format_wire_key(sc_p, (const char *)block, hdr->key_len, key, 1100);
+int adv_search_cb(const SlotHeader *hdr,const uint8_t *block,void *ctx){
+    AdvSearchCtx *sc=ctx;
+    if(sc->limit>0&&sc->printed>=sc->limit)return 1;
+    if(query_deadline_tick(sc->deadline,&sc->dl_counter))return 1;
+    char key[1100];
+    const Schema *schema=sc->fs&&sc->fs->auto_key!=AK_NONE?&sc->fs->auto_key_schema_snapshot:NULL;
+    if(format_wire_key(schema,(const char*)block,hdr->key_len,key,sizeof(key))<0){
+        pthread_mutex_lock(&sc->lock);sc->predicate_error=EILSEQ;pthread_mutex_unlock(&sc->lock);return 1;
     }
-
-    /* Check excluded keys first */
-    if (is_excluded(&sc->excluded, key)) { free(key); return 0; }
-
-    const char *raw = (const char *)block + hdr->key_len;
-
-    /* Criteria match + join resolution are thread-local reads, lock-free. */
-    uint8_t rec_hdr2 = (uint8_t)(hdr->flag >> 8);
-    int match = sc->fast_cc
-        ? match_typed((const uint8_t *)raw, hdr->value_len, sc->fast_cc, sc->fs, rec_hdr2)
-        : criteria_match_tree((const uint8_t *)raw, hdr->value_len, sc->tree, sc->fs, rec_hdr2);
-
-    if (match) {
-        RecordRef     *join_refs = NULL;
-        const uint8_t **join_raws = NULL;  /* parallel array of value ptrs for emit helpers */
-        int dropped = 0;
-        if (sc->njoins > 0) {
-            join_refs = calloc(sc->njoins, sizeof(RecordRef));
-            join_raws = calloc(sc->njoins, sizeof(const uint8_t *));
-            for (int i = 0; i < sc->njoins; i++) {
-                char lk[1024];
-                int llen = extract_local_key(&sc->joins[i], (const uint8_t *)raw,
-                                             (size_t)hdr->value_len,
-                                             sc->fs ? sc->fs->ts : NULL,
-                                             rec_hdr2, lk, sizeof(lk));
-                int found = 0;
-                if (llen > 0) {
-                    found = lookup_remote(&sc->joins[i], sc->db_root, lk, (size_t)llen,
-                                          &join_refs[i]);
-                    if (found) join_raws[i] = join_refs[i].val;
-                }
-                if (!found && sc->joins[i].type == JOIN_INNER) { dropped = 1; break; }
-            }
+    if(is_excluded(&sc->excluded,key))return 0;
+    const uint8_t *raw=block+hdr->key_len;uint8_t flags=(uint8_t)(hdr->flag>>8);
+    int matched=0;
+    int rc=sc->fast_cc?match_typed_checked(raw,hdr->value_len,sc->fast_cc,sc->fs,flags,&matched):
+        criteria_match_tree_checked(raw,hdr->value_len,sc->tree,sc->fs,flags,&matched);
+    if(rc){int error=errno?errno:EILSEQ;pthread_mutex_lock(&sc->lock);
+        sc->predicate_error=error;pthread_mutex_unlock(&sc->lock);return 1;}
+    if(!matched)return 0;
+    RecordRef *refs=NULL;int dropped=0,error=0;
+    if(sc->njoins){
+        size_t bytes=(size_t)sc->njoins*sizeof(*refs);
+        if(bytes>g_query_buffer_max_bytes){error=ENOBUFS;goto done;}
+        refs=calloc((size_t)sc->njoins,sizeof(*refs));
+        if(!refs){error=ENOMEM;goto done;}
+        for(int i=0;i<sc->njoins;i++){
+            int found=resolve_join_record(&sc->joins[i],sc->db_root,sc->fs->ts,
+                                          raw,hdr->value_len,flags,
+                                          g_query_buffer_max_bytes-bytes,&refs[i]);
+            if(found<0){error=errno?errno:EILSEQ;goto done;}
+            if(!found&&sc->joins[i].type==JOIN_INNER){dropped=1;break;}
         }
-
-        if (!dropped) {
-            /* Emit section — must serialize: OUT() bytes, sc->printed / sc->count
-               updates, and the "printed>0 ? comma" decision all depend on a
-               consistent view of shared state. */
-            pthread_mutex_lock(&sc->lock);
-            if (sc->limit > 0 && sc->printed >= sc->limit) {
-                pthread_mutex_unlock(&sc->lock);
-                if (sc->njoins > 0) {
-                    for (int i = 0; i < sc->njoins; i++) release_record_ref(&join_refs[i]);
-                    free(join_refs); free(join_raws);
-                }
-                free(key);
-                return 1;
-            }
+    }
+    if(!dropped){
+        /* Keep the existing emit critical section and limit recheck. */
+        pthread_mutex_lock(&sc->lock);
+        if(sc->limit<=0||sc->printed<sc->limit){
             sc->count++;
-            if (sc->count > sc->offset) {
-                if (sc->njoins > 0 && sc->csv_delim) {
-                    /* CSV joined row: <key><delim>v1<delim>...<delim>j1.a<delim>...\n */
-                    char row[16384];
-                    size_t n = build_joined_csv_row(
-                        key, (const uint8_t *)raw, (size_t)hdr->value_len, sc->fs,
-                        (uint8_t)(hdr->flag >> 8),
-                        sc->proj_count > 0 ? sc->proj_fields : NULL, sc->proj_count,
-                        sc->joins, sc->njoins, join_refs, sc->csv_delim,
-                        row, sizeof(row));
-                    OUT("%.*s", (int)n, row);
-                } else if (sc->njoins > 0) {
-                    /* Tabular JSON row: [driver.key, driver fields..., join1 fields..., ...] */
-                    char row[16384];
-                    int pos = snprintf_bounded(row, sizeof(row), "%s[\"%s\"",
-                                       sc->printed ? "," : "", key);
-                    pos += buf_driver_values((const uint8_t *)raw, (size_t)hdr->value_len, sc->fs,
-                                             sc->proj_count > 0 ? sc->proj_fields : NULL,
-                                             sc->proj_count, (uint8_t)(hdr->flag >> 8),
-                                             row + pos, sizeof(row) - pos);
-                    for (int i = 0; i < sc->njoins && pos < (int)sizeof(row) - 2; i++)
-                        pos += buf_join_values(&sc->joins[i], join_raws[i], join_refs[i].vlen,
-                                               join_refs[i].hdr2,
-                                               row + pos, sizeof(row) - pos);
-                    snprintf_bounded(row + pos, sizeof(row) - pos, "]");
-                    OUT("%s", row);
-                } else if (sc->csv_delim) {
-                    csv_emit_row(key, (const uint8_t *)raw, hdr->value_len,
-                                 sc->proj_count > 0 ? sc->proj_fields : NULL,
-                                 sc->proj_count, sc->fs, sc->csv_delim, (uint8_t)(hdr->flag >> 8));
-                } else if (sc->rows_fmt) {
-                    OUT("%s[\"%s\"", sc->printed ? "," : "", key);
-                    if (sc->proj_count > 0) {
-                        for (int i = 0; i < sc->proj_count; i++) {
-                            char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs, (uint8_t)(hdr->flag >> 8));
-                            OUT(",%s", pv ? pv : "\"\"");
-                            free(pv);
-                        }
-                    } else if (sc->fs && sc->fs->ts) {
-                        for (int i = 0; i < sc->fs->ts->nfields; i++) {
-                            if (sc->fs->ts->fields[i].removed) continue;
-                            char *pv = json_typed_row_cell(sc->fs->ts,
-                                                           (const uint8_t *)raw,
-                                                           (int)hdr->value_len, i,
-                                                           (uint8_t)(hdr->flag >> 8));
-                            OUT(",%s", pv ? pv : "\"\"");
-                            free(pv);
-                        }
-                    }
-                    OUT("]");
-                } else if (sc->dict_fmt) {
-                    OUT("%s\"%s\":", sc->printed ? "," : "", key);
-                    if (sc->proj_count > 0) {
-                        OUT("{");
-                        int first = 1;
-                        for (int i = 0; i < sc->proj_count; i++) {
-                            char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs, (uint8_t)(hdr->flag >> 8));
-                            if (!pv) continue;
-                            OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[i], pv);
-                            first = 0;
-                            free(pv);
-                        }
-                        OUT("}");
-                    } else {
-                        char *val = decode_value(raw, hdr->value_len, sc->fs, (uint8_t)(hdr->flag >> 8));
-                        OUT("%s", val);
-                        free(val);
-                    }
-                } else if (sc->proj_count > 0) {
-                    OUT("%s{\"key\":\"%s\",\"value\":{", sc->printed ? "," : "", key);
-                    int first = 1;
-                    for (int i = 0; i < sc->proj_count; i++) {
-                        char *pv = json_projected_field(raw, hdr->value_len, sc->proj_fields[i], sc->fs, (uint8_t)(hdr->flag >> 8));
-                        if (!pv) continue;
-                        OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[i], pv);
-                        first = 0;
-                        free(pv);
-                    }
-                    OUT("}}");
-                } else {
-                    char *val = decode_value(raw, hdr->value_len, sc->fs, (uint8_t)(hdr->flag >> 8));
-                    OUT("%s{\"key\":\"%s\",\"value\":%s}", sc->printed ? "," : "", key, val);
-                    free(val);
-                }
-                sc->printed++;
+            if(sc->count>sc->offset){
+                size_t charge=(size_t)sc->njoins*sizeof(*refs);
+                if(typed_query_emit_row(g_out?g_out:stdout,key,strlen(key),raw,hdr->value_len,
+                    flags,sc->fs,sc->proj_fields,sc->proj_count,sc->rows_fmt,sc->dict_fmt,
+                    sc->csv_delim,sc->printed>0,sc->joins,sc->njoins,refs,
+                    g_query_buffer_max_bytes-charge))error=errno?errno:EILSEQ;
+                else sc->printed++;
             }
-            pthread_mutex_unlock(&sc->lock);
         }
-
-        if (sc->njoins > 0) {
-            for (int i = 0; i < sc->njoins; i++) release_record_ref(&join_refs[i]);
-            free(join_refs);
-            free(join_raws);
-        }
+        if(error)sc->predicate_error=error;
+        pthread_mutex_unlock(&sc->lock);
     }
-    free(key);
-    return 0;
+done:
+    if(refs){for(int i=0;i<sc->njoins;i++)release_record_ref(&refs[i]);free(refs);}
+    if(error){pthread_mutex_lock(&sc->lock);sc->predicate_error=error;
+        pthread_mutex_unlock(&sc->lock);return 1;}
+    return sc->limit>0&&sc->printed>=sc->limit;
 }
