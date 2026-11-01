@@ -14,6 +14,8 @@ declare class ShardDb {
    * Returns the raw response string (CSV when requested). JSON.parse converts
    * unquoted decimals to binary64 and can lose precision; retain number lexemes
    * with an application-selected lossless JSON parser for finance values.
+   * Aggregate integer/decimal results also require preserved number lexemes;
+   * see "Exact decimal and CSV values" in the README.
    * Multiple concurrent queries are safe — shard-db's worker pool handles parallelism.
    */
   query(body: ShardDb.QueryBody): Promise<string>

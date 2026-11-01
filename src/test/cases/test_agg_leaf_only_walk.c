@@ -92,7 +92,7 @@ static int test_agg_leaf_only_walk_run(void) {
     tc_request(tc,
         "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"agg_t\","
         "\"aggregates\":[{\"fn\":\"avg\",\"field\":\"age\",\"alias\":\"a\"}]}", &resp);
-    ASSERT_TRUE(agg_value_eq(resp, "a", "500.5"), "avg age = 500.5");
+    ASSERT_TRUE(agg_value_eq(resp, "a", "500.5000000000000000"), "avg age = 500.5");
     free(resp); resp = NULL;
 
     tc_request(tc,

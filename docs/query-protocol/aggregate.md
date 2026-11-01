@@ -66,8 +66,8 @@ Response is a JSON object with `plan`, `order`, `total_cheap`, `table_rows`, `so
 | Function | Needs `field` | Notes |
 |---|---|---|
 | `count` | optional | Without `field`, counts all records. With a concrete field, counts present values; the per-type unset markers (empty varchar, all-zero calendar values, midnight time `00:00:00`, all-zero uuid) are excluded. Numeric zero is a real value and counts. Composite field expressions are rejected. |
-| `sum` | yes | Supports `int`, `long`, `short`, `float`, `double`, `numeric`, `bool`, `byte`, and `timestamp`; result is a JSON number. |
-| `avg` | yes | Same supported types as `sum`; returns `sum / count` as a JSON number. |
+| `sum` | yes | Supports `int`, `long`, `short`, `float`, `double`, `numeric`, `bool`, `byte`, and `timestamp`; integer/decimal results are exact JSON numbers — integer sums stay exact beyond 2⁵³ and decimals keep declared/display scale; float/double retain binary floating-point semantics. |
+| `avg` | yes | Same supported types as `sum`; integer/decimal averages use the PostgreSQL 18 exact result-scale policy (16 significant digits, ties away from zero) and render as an exact JSON number; float averages stay binary floating. No contributing value renders `null` (JSON) on every route, or the CSV cell `0`. |
 | `min` | yes | Numeric types, varchar, and calendar types. Varchar/calendar results are lexicographic text. |
 | `max` | yes | Numeric types, varchar, and calendar types. Varchar/calendar results are lexicographic text. |
 
@@ -129,6 +129,45 @@ identical buckets. Full semantics:
   {"status":"pending","n":2000,"total":450000}
 ]
 ```
+
+### Numeric exactness
+
+- Integer-class and decimal aggregates are computed exactly (no binary
+  floating point); a `sum` of `long` values may exceed 2⁵³ and still prints
+  every digit. Clients must keep the number lexeme intact (a `JSON.parse`
+  loses digits above 2⁵³ — see the npm notes).
+- Decimal results keep scale: bounded `numeric(P,S)` results render at the
+  declared scale (`0.3000`, not `0.3`). An empty group's `sum` is zero at
+  that declared scale; an empty group's `min`/`max` render `null`, as `avg`
+  always has. (Bare-numeric grouping — canonical shortest labels where `1.0`
+  and `1.00` are one group labelled `1` — exists only on packed schemas,
+  which have no production caller yet; it is not reachable on public
+  objects.)
+- `group_by` labels, `order_by` and `having` on numeric fields are exact and
+  numeric (not lexicographic); `timestamp` groups render epoch-millis labels.
+- A group value longer than 511 bytes, a composite key longer than 4096
+  bytes, or a NUL inside either is an explicit error, never a truncated key:
+  `{"error":"group_by value exceeds aggregate key limit (511 bytes per value, 4096 bytes per composite key) or contains NUL"}`.
+- An invalid numeric literal in `having` is a validation error, checked
+  before the operator is validated (so `regex` on a numeric having reports
+  this, not an operator-support error):
+  `{"error":"invalid numeric value 'abc' for having on 's'"}`. Float-class
+  results validate the literal with the same `strtod` rule that evaluates
+  it; integer/decimal results use the canonical number grammar (no
+  surrounding whitespace). A literal like `1e400` is a valid exact decimal
+  but is rejected on a float result as non-finite.
+- `QUERY_BUFFER_MB` covers retained number strings and escaped aggregate
+  text/group values. Exhausting the cap on any route — indexed, streaming,
+  top-N or scan — returns one query-buffer error and no success body
+  (allocation failures likewise never emit a partial success); reduce
+  groups/limit or increase the configured cap. The one documented exception
+  is the bitmap-dictionary deferred collector, which returns its partial
+  result deadline-style.
+- `find`/`count` pre-filters decode `timestamp` index keys to their
+  epoch-millis text and compare with the raw query literal, so non-canonical
+  integer literals (`001254980454000`, `+1254980454000`) still match; all
+  epoch-millisecond values sit below 2⁵³, keeping the range pre-filter's
+  floating-point comparisons exact.
 
 ## `having`
 

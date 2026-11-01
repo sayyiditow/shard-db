@@ -6,6 +6,43 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+Aggregates now preserve exact integer and decimal arithmetic through scans,
+indexes, parallel merging, grouping, `having`, ordering, and JSON/CSV
+output. Integer sums retain every digit beyond int64 and 2⁵³; decimal
+results retain declared/display scale, and integer/decimal averages follow
+the PostgreSQL 18 result-scale policy (`select_div_scale`: 16 significant
+digits, both operands' display scales as floors, ties rounded away from
+zero), so an integer `avg` renders 16 fractional digits (`1010.0000000000000000`).
+`float`/`double` aggregates print shortest round-trip lexemes (up to 17
+digits, e.g. `0.30000000000000004`) instead of the old `%.6f`-trimmed form.
+Clients that depend on the previous trimmed decimal output must preserve
+the new number lexemes. Timestamp group labels use epoch milliseconds,
+and numeric group fields compare numerically in `order_by` and `having`.
+An average with no contributing values returns JSON `null` on every route;
+an empty group's `min`/`max` now also render `null`, while its `sum` renders
+zero at the declared scale; CSV retains its historical `0` cells. Oversized
+or NUL-containing group keys (511 bytes per value, 4096 bytes per composite
+key) and invalid numeric `having` literals now return explicit errors — the
+literal check runs before the operator check, so `regex` on a numeric
+having reports the invalid literal. Index `find`/`count` pre-filters decode
+`timestamp` keys to epoch-millis text; non-canonical integer literals still
+match, and all epoch-ms values sit below 2⁵³ so range pre-filters stay
+exact. Packed decimal indexed aggregates agree with scans, varchar extrema
+retain their full values, and finite floating-point `count`/`min`/`max`
+remain available when an unused sum would overflow. Query memory limits
+cover retained rendered number strings and escaped text; exhausting the cap
+or hitting an allocation failure on any route returns one error and no
+success body — except the bitmap-dictionary deferred collector, which keeps
+its documented deadline-style partial result.
+
+Fixed: `group_by` over a non-integer key (varchar, double, decimal, composite)
+with more than 256 distinct groups returned the same group several times
+with split counts (totals stayed right). The bucket table's resize, the
+parallel-merge scatter, and the partition splice hashed the NUL-tagged group
+key with a NUL-terminated hash, while lookups hashed it by length, so
+buckets were unreachable after the first table doubling. All sites now use
+one bucket hash shared with the lookup path.
+
 **2026.10.2 — real NULL for typed fields, `:not_null` constraint, BTRI
 index format, conditional writes.** Typed
 fields are now nullable: every record carries a per-record null bitmap

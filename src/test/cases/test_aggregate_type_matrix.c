@@ -278,7 +278,7 @@ static int test_aggregate_type_matrix_run(void) {
         "\"mx\":1789000003000", "timestamp max is an unquoted number");
     agg_has(tc,
         AGG_BASE ",\"aggregates\":[{\"fn\":\"avg\",\"field\":\"ts\",\"alias\":\"a\"}]}",
-        "\"a\":1490833334666.666748", "timestamp avg divides by 6 (ts:0 present)");
+        "\"a\":1490833334666.6667", "timestamp avg divides by 6 (ts:0 present)");
 
     /* ===== calendar min/max: exact canonical quoted strings ===== */
     agg_has(tc,
@@ -500,7 +500,7 @@ static int test_aggregate_type_matrix_run(void) {
     agg_has(tc,
         AGG_BASE ",\"criteria\":[{\"field\":\"l\",\"op\":\"gte\",\"value\":\"10000\"}],"
                  "\"aggregates\":[{\"fn\":\"min\",\"field\":\"i\",\"alias\":\"mn\"}]}",
-        "\"mn\":0", "empty numeric min keeps legacy 0");
+        "\"mn\":null", "empty numeric min renders null (Task 8)");
     /* CSV: alias header then an empty cell */
     {
         char *resp2 = NULL;
@@ -540,7 +540,7 @@ static int test_aggregate_type_matrix_run(void) {
     agg_has(tc,
         AGG_BASE ",\"aggregates\":[{\"fn\":\"sum\",\"field\":\"i\",\"alias\":\"s\"}],"
                  "\"having\":[{\"field\":\"s\",\"op\":\"regex\",\"value\":\"1.*\"}]}",
-        "aggregate having unsupported for field type number",
+        "invalid numeric value '1.*' for having on 's'",
         "regex op rejected on numeric having");
 
     /* ===== NQL entry point ===== */

@@ -6,10 +6,15 @@
 #include "trigram.h"
 #include "io_direct.h"
 #include "query_internal.h"
+#include "agg_exact.h"
+#include "decimal_order.h"
+#include "typed_row.h"
 #include <math.h>
+#include <sys/stat.h>
 #include <dirent.h>
-/* Forward decl — defined below. */
+/* Forward decls — defined below. */
 static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ctx);
+static void agg_note_error(void*,int);
 
 /* Run the aggregate pipeline over records keyed by an OR index-union KeySet.
    Tree-match is performed by agg_scan_cb itself (it checks ctx->tree), so
@@ -49,6 +54,9 @@ static int keyset_emit_agg_cb(const uint8_t hash[16],
         agg_scan_cb(&hdr, block, ctx->agg_ctx);
         pthread_mutex_unlock(&ctx->lock);
         if (block != stk) free(block);
+    } else {
+        agg_note_error(ctx->agg_ctx, ENOMEM);   /* never a silent skip */
+        return 1;
     }
     return 0;
 }
@@ -86,6 +94,10 @@ static void keyset_emit_agg(const char *db_root, const char *object,
                 memcpy(block + rr.klen, rr.val, rr.vlen);
                 agg_scan_cb(&hdr, block, agg_ctx);
                 if (block != stk) free(block);
+            } else {
+                agg_note_error(agg_ctx, ENOMEM);
+                release_record_ref(&rr);
+                break;
             }
             release_record_ref(&rr);
         }
@@ -111,6 +123,8 @@ static void keyset_emit_agg(const char *db_root, const char *object,
         pthread_mutex_init(&cb_ctx.lock, NULL);
         slotcask_bulk_resolve_and_fetch(sdb, hashes, n, &cb_ctx, keyset_emit_agg_cb);
         pthread_mutex_destroy(&cb_ctx.lock);
+    } else {
+        agg_note_error(agg_ctx, EIO);   /* registry miss: records unverifiable */
     }
     free(hashes);
 }
@@ -162,8 +176,6 @@ static int keyset_agg_from_intersect(const char *db_root, const char *object,
 
 /* ========== AGGREGATE ========== */
 
-enum AggFn { AGG_COUNT, AGG_SUM, AGG_AVG, AGG_MIN, AGG_MAX };
-
 typedef struct {
     enum AggFn fn;
     char field[256];
@@ -171,10 +183,8 @@ typedef struct {
 } AggSpec;
 
 typedef struct {
-    double sum;
-    double min;
-    double max;
-    int64_t count;
+    int64_t count;          /* COUNT result / contributing-value count */
+    AggNum  num;            /* sum/min/max (agg_exact) */
     char *text_min;
     size_t text_min_len;
     char *text_max;
@@ -196,8 +206,8 @@ typedef enum {
 typedef struct {
     AggResultKind kind;
     int present;
-    double number;
-    const char *text;
+    AggValue val;           /* AGG_RESULT_NUMBER */
+    const char *text;       /* AGG_RESULT_TEXT */
     size_t text_len;
 } AggResult;
 
@@ -207,6 +217,15 @@ typedef struct {
    aggregates at validation. */
 static int agg_type_is_text(enum FieldType t) {
     return t == FT_VARCHAR || t == FT_DATE || t == FT_DATETIME || t == FT_DATETIMEMS;
+}
+
+/* 1 when this field's index key carries its full exact value for value
+   shortcuts (D1): false only for bare packed numeric, whose ordered key has
+   no display scale. Callers fall through to the record-fed route. */
+static int agg_index_exact_field(const TypedSchema *ts, const TypedField *tf) {
+    AggNumSpec ns;
+    return agg_num_spec_for(ts, (size_t)(tf - ts->fields), &ns) &&
+           agg_index_exact(&ns);
 }
 
 /* count(field) presence doctrine: these types carry an encoded unset
@@ -246,33 +265,7 @@ static int agg_field_is_unset(const TypedField *f, const uint8_t *p) {
     }
 }
 
-/* Shared field-span resolver for the record-fed aggregate callbacks:
-   returns the field bytes pointer and sets *avail to how many field
-   bytes the record actually carries. A truncated field degrades to
-   *avail < field size, so every converter's available<size check
-   classifies it MISSING — never a fabricated zero. */
-/* Field pointer within a typed record. Generation-aware (2026.10.2 null
-   plan): nullmap records slide to the field-region base; the bitmap is
-   surfaced via *out_null so accumulators can skip NULLs (§2.5). */
-static const uint8_t *agg_field_ptr(const uint8_t *rec, size_t rec_len,
-                                    const TypedField *tf, size_t *avail,
-                                    uint8_t hdr2, int *out_null) {
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t region = 0;
-    *out_null = 0;
-    if (typed_record_view(rec, rec_len, hdr2, &fbase, &bm,
-                          &bm_bytes, &region) != 0) {
-        *avail = 0;
-        return g_zero_field_65537;
-    }
-    /* NULL determination needs the schema index — call sites that have it
-       test typed_field_null(bm, bm_bytes, idx) directly (Task 8). */
-    (void)bm; (void)bm_bytes;
-    *avail = ((size_t)tf->offset < region)
-        ? region - (size_t)tf->offset : 0;
-    return (*avail >= (size_t)tf->size)
-        ? fbase + tf->offset : g_zero_field_65537;
-}
+
 
 /* Inline raw-key cap for the integer group_by fast path. Sized to fit
    common all-integer multi-field group_bys: 4×long, 8×int, or any mix
@@ -302,6 +295,10 @@ typedef struct AggArenaSlab {
     struct AggArenaSlab *next;
     size_t used;
     size_t cap;
+    /* Header padded to 32 bytes so the first carve after (s+1) keeps the
+       16-byte alignment malloc handed out: AggNum holds __int128, so
+       AggAccum arrays carved here must be 16-byte aligned. */
+    void   *_align_pad;
     /* buf[] follows the header in the same allocation */
 } AggArenaSlab;
 
@@ -320,7 +317,10 @@ typedef struct {
 #define MAX_AGG_SPECS 32
 
 static void *agg_arena_alloc(AggArena *a, size_t bytes) {
-    bytes = (bytes + 7u) & ~(size_t)7;
+    /* 16-byte granularity: exact AggNum states carry __int128 (alignof 16),
+       and vectorized struct assignment into arena storage faults on
+       under-aligned movaps. */
+    bytes = (bytes + 15u) & ~(size_t)15;
     if (a->head && a->head->used + bytes <= a->head->cap) {
         char *base = (char *)(a->head + 1);
         void *p = base + a->head->used;
@@ -619,18 +619,56 @@ TOPN_ELIG_VIS int eligible_for_topn_stream(
     return 1;
 }
 
-/* Forward declarations for helpers defined later in this file that the
- * streaming top-N executor needs. */
-static AggValueStatus decode_index_key_to_double(const TypedField *f,
-                                        const uint8_t *key, size_t klen,
-                                        double *out);
-static void fmt_double(char *buf, size_t sz, double v);
 
 /* §2.4.2 tier clamp: an open-ended upper bound for a VALUE walk (min/max,
  * sum/top-N-over-values) stops before the first [0x01]-prefixed (NULL-tier)
  * key — length 1, exclusive. Never padded: NULL varchar is exactly [0x01],
  * and the length tie-break sorts it below [0x01,0x00]. */
 static const char AGG_VALUE_TIER_CEIL[1] = { 0x01 };
+/* Output cells own every allocation needed after the first success byte. */
+typedef struct {
+    char *lex, *escaped;
+    int is_null, is_text;
+    _Atomic size_t *budget;
+    size_t limit, charged;
+} AggCell;
+static int agg_report_error(int);
+static void agg_cells_bind(AggCell *, size_t, _Atomic size_t *, size_t);
+static AggCell *agg_cells_alloc(size_t, _Atomic size_t *, size_t);
+static void agg_cells_free(AggCell *, int);
+static void agg_cells_dispose(AggCell *, size_t);
+static int agg_cell_count(AggCell *, int64_t);
+static int agg_cell_text(AggCell *, const char *, size_t, int);
+static void agg_cell_emit_json(const AggCell *);
+
+/* Group label from an index payload (tier byte already stripped; B+ tree leaf
+   payloads and bitmap dictionary values share the decimal_order form for
+   packed numeric). Packed numeric decodes with the D2 scale rule; everything
+   else keeps the legacy renderer. Returns length >= 0, -1 on error (errno;
+   E2BIG when the label would not fit - never truncated). `base` supplies the
+   QUERY_BUFFER accounting (NULL = unmetered). */
+static int agg_index_label_f(const TypedField *f, const AggNumSpec *ns,
+                             int is_num, const AggEnv *base, const uint8_t *p,
+                             size_t plen, char *buf, size_t cap) {
+    buf[0] = '\0';
+    if (is_num && ns->cls == AGC_DEC) {
+        AggEnv env;
+        agg_env_init(&env, base ? base->bytes : NULL, base ? base->limit : 0);
+        int n = agg_dec_label(ns, p, plen, 1, buf, cap, &env);
+        int e = errno;
+        agg_env_free(&env);
+        errno = e == ENAMETOOLONG ? E2BIG : e;
+        return n;
+    }
+    if (f->type == FT_VARCHAR) {
+        if (plen >= cap || (plen && memchr(p, 0, plen))) { errno = E2BIG; return -1; }
+        if (plen) memcpy(buf, p, plen);
+        buf[plen] = '\0';
+        return (int)plen;
+    }
+    int n = decode_idx_to_buf(f, p, plen, buf, cap, 0);
+    return n < 0 ? -1 : n;
+}
 
 /* ========== Streaming top-N aggregate executor (Phase 1) ==========
  *
@@ -666,6 +704,10 @@ typedef struct {
     QueryDeadline    *dl;
     int               dl_counter;
     const TypedField *gb_tf;   /* for future sum/min/max on the group field */
+    AggNumSpec gb_spec;        /* exact classification of the group field */
+    int gb_numeric;            /* exact numeric group-label classification */
+    int offer_failed;          /* heap insert dropped a group (malloc) */
+    int walk_failed;           /* walk callback aborted (scratch malloc) */
 } TopNWalkCtx;
 
 static double topn_metric_from_state(const TopNWalkCtx *c) {
@@ -684,11 +726,20 @@ static double topn_metric_from_state(const TopNWalkCtx *c) {
 static void topn_finalize_run(TopNWalkCtx *c) {
     if (!c->current_key) return;
     double metric = topn_metric_from_state(c);
-    topn_heap_offer(c->heap, metric,
-                    c->current_key, c->current_key_len,
-                    c->current_count, c->current_sum,
-                    c->current_min_set ? c->current_min : 0.0,
-                    c->current_max_set ? c->current_max : 0.0);
+    TopNHeap *h = (TopNHeap *)c->heap;
+    int was_full = h && h->size >= h->cap;
+    int beats = was_full && topn_metric_beats(h, metric, h->entries[1].metric);
+    if (!topn_heap_offer(c->heap, metric,
+                         c->current_key, c->current_key_len,
+                         c->current_count, c->current_sum,
+                         c->current_min_set ? c->current_min : 0.0,
+                         c->current_max_set ? c->current_max : 0.0) &&
+        (!was_full || beats)) {
+        /* offer returned 0 without a full-heap decline: the group's key
+           allocation failed and the group was dropped. Flag it — the walk
+           stops and the whole aggregate reports one error (Task 6). */
+        c->offer_failed = 1;
+    }
     free(c->current_key);
     c->current_key     = NULL;
     c->current_key_len = 0;
@@ -712,8 +763,8 @@ static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
        single [0x01] key (length 1) is the NULL group's identity; the
        tiered key stays intact through the heap: the varchar emit strips
        the tier for the label (and renders null for the NULL group), and
-       the numeric emit's decode_index_key_to_double re-strips internally
-       (MISSING for the NULL key — accumulators then skip it). */
+       the numeric emit's exact label helper re-strips internally
+       (the NULL key renders null). */
     if (enc_val_len == 0) return 0;
 
     if (c->prefilter) {
@@ -729,6 +780,7 @@ static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
     } else if (c->current_key_len != enc_val_len ||
                memcmp(c->current_key, enc_val, enc_val_len) != 0) {
         topn_finalize_run(c);
+        if (c->offer_failed) return -1;
         new_group = 1;
     }
 
@@ -736,6 +788,7 @@ static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
         c->current_key = malloc(enc_val_len + 1);
         if (!c->current_key) {
             LOG_ERROR(LOG_SUB_QUERY, "topn_walk_cb: malloc %zu bytes failed", enc_val_len + 1);
+            c->walk_failed = 1;
             return -1;
         }
         memcpy(c->current_key, enc_val, enc_val_len);
@@ -754,11 +807,10 @@ static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
      * update sum/min/max for specs that aggregate the group_by field
      * itself. Varchar group_by → numeric specs would be a no-op
      * anyway; skip decode to avoid false positives. */
-    if (c->gb_tf && c->gb_tf->type != FT_VARCHAR) {
+    if (c->gb_numeric && c->gb_spec.cls == AGC_FLT) {
         double v;
-        if (decode_index_key_to_double(c->gb_tf,
-                                        (const uint8_t *)enc_val, enc_val_len,
-                                        &v) == AGG_VALUE_PRESENT) {
+        if (agg_key_double(&c->gb_spec, (const uint8_t *)enc_val, enc_val_len,
+                           &v) == 1) {
             c->current_sum += v;
             if (!c->current_min_set || v < c->current_min) {
                 c->current_min = v;
@@ -798,6 +850,11 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
         }
     }
     if (order_spec_idx < 0) return -1;
+
+    /* The stream has only one row-count state, not per-field present counts.
+       All value/presence-dependent specs use the exact hash executor (D7). */
+    for (int i = 0; i < nspecs; i++)
+        if (specs[i].fn != AGG_COUNT || specs[i].field[0]) return -2;
 
     void *heap = topn_heap_new(limit, order_desc);
     if (!heap) return -1;
@@ -891,10 +948,15 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
     ctx.prefilter      = prefilter;
     ctx.prefilter_inverted = prefilter_inverted;
     ctx.dl             = dl;
-    ctx.gb_tf          = resolve_idx_field(fs->ts, group_by_field);
+    ctx.gb_tf = resolve_idx_field(fs->ts, group_by_field);
+    ctx.gb_numeric = ctx.gb_tf && ctx.gb_tf->type != FT_BOOL &&
+        agg_num_spec_for(fs->ts, (size_t)(ctx.gb_tf - fs->ts->fields), &ctx.gb_spec);
 
     /* Open upper bound: the ordered walk must reach the NULL tier so a
        NULL group_by forms its own (tagged) group (§2.4.5/Task 8). */
+    /* btree_idx_walk_ordered is void; callback aborts surface through
+       dl->timed_out (deadline), walk_failed (scratch malloc) and
+       offer_failed (dropped group). */
     btree_idx_walk_ordered(db_root, object, group_by_field, sch->splits,
                             NULL, 0, 0,
                             NULL, 0, 0,
@@ -909,6 +971,15 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
         LOG_WARN(LOG_SUB_QUERY, "top-N group-by aggregate: query deadline exceeded");
         topn_heap_destroy(heap);
         return -1;
+    }
+    if (ctx.walk_failed || ctx.offer_failed) {
+        /* The ordered walk or a group insert failed mid-stream: the heap
+           holds a partial top-N. One explicit error, never a partial
+           success body (Task 6). */
+        LOG_WARN(LOG_SUB_QUERY, "top-N group-by aggregate: walk/heap failure, reporting buffer error");
+        topn_heap_destroy(heap);
+        agg_report_error(ENOBUFS);
+        return -3;
     }
 
     int n_out = topn_heap_size(heap);
@@ -929,94 +1000,61 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
     int n = topn_heap_drain(heap, metrics, gkeys, gklens, counts, sums, mins, maxs);
     topn_heap_destroy(heap);
 
-    /* Determine if the group_by field's btree stores raw bytes (varchar)
-     * or encoded numeric bytes. For varchar, gkeys[i] is the raw string.
-     * For numeric types, decode via decode_index_key_to_double + format. */
-    int gb_is_varchar = ctx.gb_tf && ctx.gb_tf->type == FT_VARCHAR;
-
+    /* heap was destroyed immediately after drain. Only drained arrays and
+       rendered cells remain owned here; never destroy heap a second time. */
+    size_t live = ((size_t)n_out + 1) *
+        (4 * sizeof(double) + sizeof(int64_t) + sizeof(char *) + sizeof(size_t));
+    for (int i = 0; i < n; i++) live += gklens[i] + 1;
+    _Atomic size_t render_bytes = live;
+    AggCell *cellv = agg_cells_alloc((size_t)n * (size_t)nspecs,
+                                     &render_bytes, g_query_buffer_max_bytes);
+    int rerr = cellv ? 0 : (errno ? errno : ENOMEM);
+    AggCell *labels = rerr ? NULL : agg_cells_alloc((size_t)n,
+                                     &render_bytes, g_query_buffer_max_bytes);
+    if (!rerr && !labels) rerr = errno ? errno : ENOMEM;
+    for (int i = 0; i < n && !rerr; i++) {
+        const uint8_t *raw = (const uint8_t *)gkeys[i];
+        size_t raw_len = gklens[i];
+        /* Fixed-width NULL keys may have padding after their tier byte. */
+        if (raw_len && raw[0] == 0x01) {
+            if (agg_cell_text(&labels[i], NULL, 0, 0)) rerr = errno;
+        } else if (!raw_len || raw[0] != 0x00 || !ctx.gb_tf) {
+            rerr = EILSEQ;
+        } else {
+            char label[512];
+            int len = agg_index_label_f(ctx.gb_tf, &ctx.gb_spec, ctx.gb_numeric,
+                                        NULL, raw + 1, raw_len - 1,
+                                        label, sizeof label);
+            if (len < 0) rerr = errno ? errno : EILSEQ;
+            else if (agg_cell_text(&labels[i], label, (size_t)len, 1)) rerr = errno;
+        }
+        for (int j = 0; j < nspecs && !rerr; j++)
+            if (agg_cell_count(&cellv[(size_t)i * nspecs + j], counts[i]))
+                rerr = errno ? errno : ENOMEM;
+    }
+    if (rerr) {
+        agg_cells_dispose(labels, (size_t)n);
+        agg_cells_dispose(cellv, (size_t)n * nspecs);
+        for (int i = 0; i < n; i++) free(gkeys[i]);
+        free(metrics); free(gkeys); free(gklens);
+        free(counts); free(sums); free(mins); free(maxs);
+        agg_report_error(rerr);
+        return -3; /* one complete error response already emitted */
+    }
     OUT(want_total ? "{\"rows\":[" : "[");
     for (int i = 0; i < n; i++) {
-        if (i > 0) OUT(",");
-        OUT("{");
-
-        /* Emit the group_by field value. */
-        char val_buf[1032];
-        int  vl = 0;
-        if (gb_is_varchar) {
-            /* Index stores [tier][raw string content] for varchar — strip
-               the tier byte for the label (numeric keys take the other
-               branch, whose decode strips the tier itself). The NULL
-               group's key is the bare [0x01] tier byte: render null. */
-            const char *raw = gkeys[i];
-            size_t raw_len = gklens[i];
-            if (raw_len == 1 && (uint8_t)raw[0] == 0x01) {
-                OUT("\"%s\":null", group_by_field);
-                goto emit_aggs_i;
-            }
-            if (raw_len > 0 && (uint8_t)raw[0] == 0x00) { raw++; raw_len--; }
-            vl = (int)raw_len;
-            if (vl > (int)(sizeof(val_buf) - 1)) vl = (int)(sizeof(val_buf) - 1);
-            memcpy(val_buf, raw, (size_t)vl);
-            val_buf[vl] = '\0';
-            char *esc = json_escape_const(val_buf);
-            OUT("\"%s\":\"%s\"", group_by_field, esc ? esc : "");
-            free(esc);
-        } else if (ctx.gb_tf) {
-            /* Numeric index key — decode to double and format as quoted
-             * string to match the existing IGB/scan-path output shape
-             * where group_vals are always emitted as JSON strings. */
-            double dv = 0.0;
-            if (decode_index_key_to_double(ctx.gb_tf, (const uint8_t *)gkeys[i],
-                                            gklens[i], &dv) == AGG_VALUE_PRESENT) {
-                char dbuf[64];
-                fmt_double(dbuf, sizeof(dbuf), dv);
-                OUT("\"%s\":\"%s\"", group_by_field, dbuf);
-            } else {
-                OUT("\"%s\":null", group_by_field);
-            }
-        } else {
-            /* Unknown type — emit raw bytes as string (safe for ASCII). */
-            vl = (int)gklens[i];
-            if (vl > (int)(sizeof(val_buf) - 1)) vl = (int)(sizeof(val_buf) - 1);
-            memcpy(val_buf, gkeys[i], (size_t)vl);
-            val_buf[vl] = '\0';
-            char *esc = json_escape_const(val_buf);
-            OUT("\"%s\":\"%s\"", group_by_field, esc ? esc : "");
-            free(esc);
-        }
-
-        emit_aggs_i:
-        /* Emit aggregate values. */
-        for (int s = 0; s < nspecs; s++) {
-            char vbuf[64];
-            switch (specs[s].fn) {
-                case AGG_COUNT:
-                    OUT(",\"%s\":%lld", specs[s].alias, (long long)counts[i]);
-                    break;
-                case AGG_SUM:
-                    fmt_double(vbuf, sizeof(vbuf), sums[i]);
-                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
-                    break;
-                case AGG_MIN:
-                    fmt_double(vbuf, sizeof(vbuf), mins[i]);
-                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
-                    break;
-                case AGG_MAX:
-                    fmt_double(vbuf, sizeof(vbuf), maxs[i]);
-                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
-                    break;
-                case AGG_AVG: {
-                    double v = counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0;
-                    fmt_double(vbuf, sizeof(vbuf), v);
-                    OUT(",\"%s\":%s", specs[s].alias, vbuf);
-                    break;
-                }
-            }
+        if (i) OUT(",");
+        OUT("{\"%s\":", group_by_field);
+        agg_cell_emit_json(&labels[i]);
+        for (int j = 0; j < nspecs; j++) {
+            OUT(",\"%s\":", specs[j].alias);
+            agg_cell_emit_json(&cellv[(size_t)i * nspecs + j]);
         }
         OUT("}");
         free(gkeys[i]);
     }
-    OUT(want_total ? "],\"total\":null}\n" : "]\n");
+    agg_cells_dispose(labels, (size_t)n);
+    agg_cells_dispose(cellv, (size_t)n * nspecs);    OUT(want_total ? "],\"total\":null}\n" : "]\n");
 
     free(metrics); free(gkeys); free(gklens);
     free(counts); free(sums); free(mins); free(maxs);
@@ -1060,8 +1098,132 @@ typedef struct {
     AggArena arena;
     /* Integer group key optimization: 1 if all group fields are integer types */
     int use_int_keys;
+    /* Exact aggregate state (agg_exact): scratch + QUERY_BUFFER accounting,
+       the first exact-state/render/key failure (errno), and the numeric
+       classification of every aggregate and group field. */
+    AggEnv     env;
+    int        agg_error;
+    AggNumSpec spec_nums[MAX_AGG_SPECS];
+    uint8_t    spec_is_num[MAX_AGG_SPECS];
+    AggNumSpec group_nums[MAX_FIELDS];
+    uint8_t    group_is_num[MAX_FIELDS];   /* numeric-class group field (D5; bool is text) */
 } AggCtx;
 static void agg_note_predicate_error(void *ctx,int error){((AggCtx*)ctx)->predicate_error=error;}
+static void agg_note_error(void *ctx,int error){((AggCtx*)ctx)->agg_error=error;}
+
+/* Ctx-level wrapper: label of group component `gi` from an index payload. */
+static int agg_index_label(const AggCtx *ctx, int gi, const uint8_t *p,
+                           size_t plen, char *buf, size_t cap) {
+    return agg_index_label_f(ctx->group_tfs[gi], &ctx->group_nums[gi],
+                             ctx->group_is_num[gi], &ctx->env, p, plen, buf, cap);
+}
+
+/* ---- typed-row access for the record-fed routes ---------------------- */
+
+/* One validated view per record (legacy, nullmap or packed). A legacy view
+   failure degrades exactly as before — every field reads as missing — but a
+   packed schema never degrades silently: the failure is recorded. */
+typedef struct { TypedRowView v; int ok; } AggRow;
+
+static int typed_field_int_width(int ft);
+static int typed_field_to_raw(const TypedField *f, const uint8_t *p,
+                              uint8_t *buf, size_t bufsz);
+static int agg_row_label(AggCtx *ctx, const AggRow *r, int gi, char *buf,
+                         size_t cap, uint8_t *is_null);
+static int agg_span_text(const AggCtx *ctx, const TypedField *f,
+                         const TypedRowSpan *s, char *buf, size_t cap,
+                         const char **text, size_t *len);
+
+static int agg_row_open(AggCtx *ctx, const uint8_t *raw, size_t len,
+                        uint8_t hdr2, AggRow *r) {
+    memset(r, 0, sizeof *r);
+    if (typed_row_open(ctx->fs->ts, raw, len, hdr2, &r->v) == 0) {
+        r->ok = 1;
+        return 0;
+    }
+    if (ctx->fs->ts && ctx->fs->ts->packed.nfields) {
+        ctx->agg_error = errno ? errno : EILSEQ;
+        return -1;
+    }
+    return 0;
+}
+
+/* 1 when the field span is readable (it may still be NULL / incomplete). */
+static int agg_row_span(const AggRow *r, size_t idx, TypedRowSpan *s) {
+    memset(s, 0, sizeof *s);
+    return r->ok && typed_row_span(&r->v, idx, s) == 0;
+}
+
+static int agg_row_unset(const AggCtx *ctx, const TypedField *f,
+                         const TypedRowSpan *s) {
+    if (f->type == FT_VARCHAR && ctx->fs->ts->packed.nfields) return s->len == 0;
+    if (!s->complete) return 1;
+    return agg_field_is_unset(f, s->data);
+}
+
+/* Group label of component `gi`: length >= 0 (buf NUL-terminated), -1 with
+   ctx->agg_error set. *is_null reports a NULL component. Over-long values and
+   embedded NULs are an explicit error (E2BIG, decision D6), never a truncated
+   key. Packed numeric uses the D2 scale rule; every other field keeps the
+   historical typed_field_to_buf_raw rendering. */
+static int agg_row_label(AggCtx *ctx, const AggRow *r, int gi, char *buf,
+                         size_t cap, uint8_t *is_null) {
+    buf[0] = '\0';
+    *is_null = 0;
+    const TypedField *f = ctx->group_tfs[gi];
+    TypedRowSpan s;
+    if (!agg_row_span(r, (size_t)ctx->group_idx[gi], &s)) return 0;
+    if (s.is_null) { *is_null = 1; return 0; }
+    if (f->type == FT_VARCHAR) {
+        const uint8_t *c; size_t n;
+        if (ctx->fs->ts->packed.nfields) { c = s.data; n = s.len; }
+        else {
+            if (!s.complete) return 0;
+            int len = varchar_eff_len(s.data, f->size);
+            c = s.data + 2;
+            n = len > 0 ? (size_t)len : 0;
+        }
+        if (n >= cap || (n && memchr(c, 0, n))) { ctx->agg_error = E2BIG; return -1; }
+        if (n) memcpy(buf, c, n);
+        buf[n] = '\0';
+        return (int)n;
+    }
+    if (!s.complete) return 0;
+    if (ctx->group_is_num[gi] && ctx->group_nums[gi].cls == AGC_DEC) {
+        int n = agg_dec_label(&ctx->group_nums[gi], s.data, s.len, 0, buf, cap,
+                              &ctx->env);
+        if (n < 0) { ctx->agg_error = errno == ENAMETOOLONG ? E2BIG : errno; return -1; }
+        return n;
+    }
+    typed_field_to_buf_raw(f, s.data, buf, cap, 1);
+    return (int)strlen(buf);
+}
+
+/* Raw fixed-width key for the all-integer group fast path (same bytes as
+   before: tag byte + natural width, NULL = zeroed width). */
+static int agg_row_raw_key(const AggCtx *ctx, const AggRow *r,
+                           const uint8_t *gnulls, uint8_t *raw_key) {
+    int kp = 0;
+    for (int i = 0; i < ctx->ngroups && kp < AGG_INT_KEY_CAP; i++) {
+        const TypedField *gtf = ctx->group_tfs[i];
+        if (!gtf) continue;
+        if (kp + 1 >= AGG_INT_KEY_CAP) break;
+        raw_key[kp++] = gnulls[i] ? 1 : 0;
+        int w = typed_field_int_width(gtf->type);
+        if (gnulls[i]) {
+            if (w <= 0 || kp + w > AGG_INT_KEY_CAP) break;
+            memset(raw_key + kp, 0, (size_t)w);
+            kp += w;
+            continue;
+        }
+        TypedRowSpan s;
+        if (!agg_row_span(r, (size_t)ctx->group_idx[i], &s) || !s.complete) break;
+        int len = typed_field_to_raw(gtf, s.data, raw_key + kp,
+                                     (size_t)(AGG_INT_KEY_CAP - kp));
+        if (len > 0) kp += len;
+    }
+    return kp;
+}
 
 /* Write a typed field's string form into a caller-provided buffer (no malloc).
    Returns the length written. Returns 0 for "empty" fields (0-value LONG/INT/SHORT/
@@ -1107,6 +1269,11 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
         return snprintf(buf, bufsz, "%s", p[0] ? "true" : "false");
     case FT_BYTE:
         return snprintf(buf, bufsz, "%u", p[0]);
+    case FT_TIMESTAMP: {
+        int64_t v = ld_be_i64(p);
+        if (!keep_zero && v == 0) return 0;
+        return snprintf(buf, bufsz, "%lld", (long long)v);
+    }
     case FT_NUMERIC: {
         int64_t v = ld_be_i64(p);
         if (v == 0) { buf[0] = '0'; buf[1] = '\0'; return 1; }
@@ -1190,148 +1357,6 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
     }
     default:
         return 0;
-    }
-}
-
-/* Decode a btree index leaf entry's encoded bytes back to the original
-   numeric value, matching what typed_field_to_double would emit if given
-   the typed-record bytes for the same field. Used by the indexed-walk
-   aggregate fast path so sum/avg/min/max can read directly from the
-   btree without a per-record slot lookup.
-
-   Encoding inverses (mirrors encode_field_text_for_index in config.c):
-     LONG/TIMESTAMP/INT/SHORT: BE signed-int with top bit XOR'd → undo XOR.
-     DOUBLE/FLOAT: IEEE-754 total-order encoding → if top bit set (was
-             positive) flip top bit; else flip all bits.
-     NUMERIC: BE int64 top-bit-flipped, divided by 10^scale.
-     BOOL/BYTE: single byte stored directly.
-
-   Status semantics (AggValueStatus):
-     AGG_VALUE_PRESENT for a decoded numeric value — including zero,
-     which is a real value (the old decode-time zero skip is gone).
-     AGG_VALUE_MISSING when the leaf bytes are shorter than the type's
-     encoded width, or when a calendar field decodes to its all-zero
-     unset marker.
-     AGG_VALUE_UNSUPPORTED for types that never aggregate numerically
-     (calendar/binary/varchar — calendar min/max uses
-     decode_index_key_to_text instead, varchar compares raw bytes). */
-static AggValueStatus decode_index_key_to_double(const TypedField *f,
-                                      const uint8_t *p, size_t plen,
-                                      double *out) {
-    /* BTRI leaf entries are [tier][payload]: strip the tier, and skip
-       NULL-tier entries (numeric accumulators skip NULLs). Foreign tier
-       bytes fail closed as MISSING. Payload decode follows. */
-    if (!p || plen == 0 || p[0] != 0x00) return AGG_VALUE_MISSING;
-    p++; plen--;
-    switch (f->type) {
-    case FT_LONG: {
-        if (plen < 8) return AGG_VALUE_MISSING;
-        uint64_t u = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
-                     ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
-                     ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
-                     ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
-        int64_t v = (int64_t)(u ^ (1ULL << 63));
-        *out = (double)v; return AGG_VALUE_PRESENT;
-    }
-    case FT_TIMESTAMP: {
-        if (plen < 8) return AGG_VALUE_MISSING;
-        uint64_t u = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
-                     ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
-                     ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
-                     ((uint64_t)p[6] << 8)  | (uint64_t)p[7];
-        *out = (double)(int64_t)(u ^ (1ULL << 63)); return AGG_VALUE_PRESENT;
-    }
-    case FT_INT: {
-        if (plen < 4) return AGG_VALUE_MISSING;
-        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                     ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
-        int32_t v = (int32_t)(u ^ 0x80000000u);
-        *out = (double)v; return AGG_VALUE_PRESENT;
-    }
-    case FT_SHORT: {
-        if (plen < 2) return AGG_VALUE_MISSING;
-        uint16_t u = ((uint16_t)p[0] << 8) | (uint16_t)p[1];
-        int16_t v = (int16_t)(u ^ 0x8000u);
-        *out = (double)v; return AGG_VALUE_PRESENT;
-    }
-    case FT_DOUBLE: {
-        if (plen < 8) return AGG_VALUE_MISSING;
-        uint64_t bits = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
-                        ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
-                        ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
-                        ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
-        if (bits & (1ULL << 63)) bits ^= (1ULL << 63);
-        else bits = ~bits;
-        double v; memcpy(&v, &bits, 8);
-        *out = v; return AGG_VALUE_PRESENT;
-    }
-    case FT_FLOAT: {
-        if (plen < 4) return AGG_VALUE_MISSING;
-        uint32_t bits = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                        ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-        if (bits & 0x80000000u) bits ^= 0x80000000u;
-        else bits = ~bits;
-        float v; memcpy(&v, &bits, 4);
-        *out = (double)v; return AGG_VALUE_PRESENT;
-    }
-    case FT_BOOL:
-        if (plen < 1) return AGG_VALUE_MISSING;
-        *out = (double)(p[0] ? 1 : 0); return AGG_VALUE_PRESENT;
-    case FT_BYTE:
-        if (plen < 1) return AGG_VALUE_MISSING;
-        *out = (double)p[0]; return AGG_VALUE_PRESENT;
-    case FT_DATE: {
-        if (plen < 4) return AGG_VALUE_MISSING;
-        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                     ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
-        int32_t v = (int32_t)(u ^ 0x80000000u);
-        if (v == 0) return AGG_VALUE_MISSING;
-        return AGG_VALUE_UNSUPPORTED;
-    }
-    case FT_DATETIME: {
-        if (plen < 6) return AGG_VALUE_MISSING;
-        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                     ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
-        int32_t d = (int32_t)(u ^ 0x80000000u);
-        uint32_t t = ld_be_u24(p + 4);
-        if (d == 0 && t == 0) return AGG_VALUE_MISSING;
-        return AGG_VALUE_UNSUPPORTED;
-    }
-    case FT_DATETIMEMS: {
-        if (plen < 8) return AGG_VALUE_MISSING;
-        uint32_t u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                     ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
-        int32_t d = (int32_t)(u ^ 0x80000000u);
-        uint32_t ms = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                      ((uint32_t)p[6] << 8)  |  (uint32_t)p[7];
-        if (d == 0 && ms == 0) return AGG_VALUE_MISSING;
-        return AGG_VALUE_UNSUPPORTED;
-    }
-    case FT_TIME: return AGG_VALUE_UNSUPPORTED;
-    case FT_NUMERIC: {
-        if (plen < 8) return AGG_VALUE_MISSING;
-        uint64_t u = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
-                     ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
-                     ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
-                     ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
-        int64_t v = (int64_t)(u ^ (1ULL << 63));
-        *out = (f->numeric_scale_mult > 0)
-               ? (double)v / (double)f->numeric_scale_mult
-               : (double)v;   /* unsupported legacy scale: raw integer */
-        return AGG_VALUE_PRESENT;
-    }
-    case FT_UUID:
-        /* UUIDs aren't summable */
-        return AGG_VALUE_UNSUPPORTED;
-    case FT_IPV4:
-        /* IPv4 addresses aren't summable. */
-        return AGG_VALUE_UNSUPPORTED;
-    case FT_IPV6:
-        /* IPv6 addresses aren't summable. */
-        return AGG_VALUE_UNSUPPORTED;
-    case FT_VARCHAR:
-    case FT_ENUM:
-    default: return AGG_VALUE_UNSUPPORTED;
     }
 }
 
@@ -1494,6 +1519,16 @@ int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
         if (skip_zero && secs == 0 && p[0]==0 && p[1]==0 && p[2]==0) return 0;
         int hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
         return snprintf(buf, bufsz, "%02d:%02d:%02d", hh, mm, ss);
+    }
+    case FT_TIMESTAMP: {
+        if (plen < 8) return 0;
+        uint64_t u = ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+                     ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+                     ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+                     ((uint64_t)p[6] << 8)  |  (uint64_t)p[7];
+        int64_t v = (int64_t)(u ^ (1ULL << 63));
+        if (skip_zero && v == 0) return 0;
+        return snprintf(buf, bufsz, "%lld", (long long)v);
     }
     case FT_UUID: {
         /* Index stores raw 16 bytes - decode to canonical form */
@@ -1795,9 +1830,6 @@ static int hsm_get(const HashStrMap *m, const uint8_t hash[16],
    the caller falls through to the keyset/intersect path which guarantees
    completeness regardless of selectivity. */
 
-/* Forward declaration for wfc_batch_cb */
-static AggValueStatus typed_field_to_double(const TypedField *f, const uint8_t *p,
-                                            size_t available, double *out);
 
 typedef struct {
     CriteriaNode     *tree;
@@ -1805,10 +1837,13 @@ typedef struct {
     const TypedField *agg_tf;
     int               agg_tf_idx;  /* schema index of agg_tf — bitmap NULL test */
     int               desc;     /* 0 = MIN (ASC walk), 1 = MAX (DESC) */
-    double           *best;
+    const AggNumSpec *spec;
+    AggNum           *num;
+    AggEnv           *env;
     int              *found;
     pthread_mutex_t   mu;
     int predicate_error;
+    int err;
 } WfcBatchCtx;
 
 typedef struct {
@@ -1825,7 +1860,9 @@ typedef struct {
     int               budget;     /* max walks per shard before bailout */
 
     /* Per-shard outputs */
-    double  best;
+    const AggNumSpec *spec;
+    AggNum  num;
+    AggEnv  env;
     int     found;
     int     budget_exceeded;
     int     dl_counter;
@@ -1842,27 +1879,19 @@ static int wfc_batch_cb(const uint8_t hash16[16],
     if(criteria_match_tree_checked(value,vlen,bc->tree,bc->fs,hdr2,&matched)){
         pthread_mutex_lock(&bc->mu);bc->predicate_error=errno?errno:EILSEQ;pthread_mutex_unlock(&bc->mu);return 1;}
     if(!matched)return 0;
-    /* NULL skips min/max (§2.5) — the bitmap bit decides on nullmap
-       records; legacy records keep the decode-time absence contract. */
-    if (hdr2 & SREC_FLAG_NULLMAP) {
-        const uint8_t *val = (const uint8_t *)value;
-        const uint8_t *nb = typed_bitmap_of(val, hdr2);
-        if (nb && typed_field_null(nb, val[0], bc->agg_tf_idx)) return 0;
+    TypedRowView view;
+    if (typed_row_open(bc->fs->ts, (const uint8_t *)value, vlen, hdr2, &view)) {
+        pthread_mutex_lock(&bc->mu);
+        bc->predicate_error = errno ? errno : EILSEQ;
+        pthread_mutex_unlock(&bc->mu);
+        return 1;
     }
-    size_t agg_avail;
-    const uint8_t *agg_p = agg_field_ptr(value, vlen, bc->agg_tf, &agg_avail, hdr2, &(int){0});
-    double v;
-    if (typed_field_to_double(bc->agg_tf, agg_p, agg_avail, &v) != AGG_VALUE_PRESENT)
-        return 0;
     pthread_mutex_lock(&bc->mu);
-    if (!*bc->found ||
-        (!bc->desc && v < *bc->best) ||
-        ( bc->desc && v > *bc->best)) {
-        *bc->best  = v;
-        *bc->found = 1;
-    }
+    int r = agg_num_offer_row(bc->spec, &view, bc->num, bc->env);
+    if (r < 0) bc->err = errno ? errno : EILSEQ;
+    else if (r == 1) *bc->found = 1;
     pthread_mutex_unlock(&bc->mu);
-    return 0;
+    return r < 0;
 }
 
 static void flush_wfc_batch(SlotcaskDb *sdb, WfcArg *w,
@@ -1913,13 +1942,17 @@ static void *wfc_worker(void *arg) {
 #define WFC_BATCH 64
     uint8_t batch[WFC_BATCH][16];
     int bn = 0;
+    agg_env_init(&w->env, NULL, 0);
+    memset(&w->num, 0, sizeof w->num);
     WfcBatchCtx bc = {
         .tree   = w->tree,
         .fs     = w->fs,
         .agg_tf = w->agg_tf,
         .agg_tf_idx = (int)(w->agg_tf - w->fs->ts->fields),
         .desc   = w->desc,
-        .best   = &w->best,
+        .spec   = w->spec,
+        .num    = &w->num,
+        .env    = &w->env,
         .found  = &w->found,
         .mu     = PTHREAD_MUTEX_INITIALIZER,
     };
@@ -1969,10 +2002,9 @@ static void *wfc_worker(void *arg) {
                     continue;
             }
 
-            double v;
-            if (decode_index_key_to_double(w->agg_tf,
-                                            (const uint8_t *)val,
-                                            vlen, &v) != AGG_VALUE_PRESENT) continue;
+            /* Presence of a non-NULL tier entry; the value comes from the
+               fetched record in wfc_batch_cb. */
+            if (vlen == 0 || (uint8_t)val[0] != 0x00) continue;
 
             last_len = vlen > BT_MAX_VAL_LEN ? BT_MAX_VAL_LEN : vlen;
             memcpy(last_val, val, last_len);
@@ -1989,6 +2021,7 @@ static void *wfc_worker(void *arg) {
             flush_wfc_batch(sdb, w, batch, bn, &bc);
             bn = 0;
         }
+        if (bc.err) w->predicate_error = bc.err;
         if (w->predicate_error || w->found || w->budget_exceeded || exhausted || dl_stop) break;
     }
 
@@ -1999,108 +2032,7 @@ static void *wfc_worker(void *arg) {
    worker walks one idx shard's btree, filters entries by the candidate
    KeySet, decodes the value, and accumulates into per-spec local arrays.
    The orchestrator merges across shards after parallel_for returns. */
-typedef struct {
-    const char       *db_root;
-    const char       *object;
-    const char       *fld;
-    int               shard_id;
-    const TypedField *tf;
-    KeySet           *crit_ks;
-    const int        *sibs;       /* spec indices sharing this field */
-    int               nsibs;
-    QueryDeadline    *deadline;
-    int               dl_counter;
-    /* outputs (one slot per agg spec — only sibs[] entries are touched) */
-    int64_t          *counts;     /* MAX_AGG_SPECS-wide */
-    double           *sums;
-    double           *mins;
-    double           *maxs;
-    int              *present;
-} AwcShardArg;
 
-static void *awc_shard_worker(void *raw) {
-    AwcShardArg *a = (AwcShardArg *)raw;
-    char idx_path[PATH_MAX];
-    build_idx_path(idx_path, sizeof(idx_path),
-                   a->db_root, a->object, a->fld, a->shard_id);
-    BtRangeIter *it = btree_range_iter_open(
-        idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, 0);
-    if (!it) {
-        LOG_ERROR(LOG_SUB_QUERY, "awc_shard_worker: btree_range_iter_open %s failed", idx_path);
-        return NULL;
-    }
-    const char *val; size_t vlen; const uint8_t *hash16;
-    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-        if (query_deadline_tick(a->deadline, &a->dl_counter)) break;
-        if (!keyset_contains(a->crit_ks, hash16)) continue;
-        double v;
-        if (decode_index_key_to_double(a->tf, (const uint8_t *)val,
-                                        vlen, &v) != AGG_VALUE_PRESENT) continue;
-        for (int k = 0; k < a->nsibs; k++) {
-            int idx = a->sibs[k];
-            a->counts[idx]++;
-            a->sums[idx] += v;
-            if (v < a->mins[idx]) a->mins[idx] = v;
-            if (v > a->maxs[idx]) a->maxs[idx] = v;
-            a->present[idx] = 1;
-        }
-    }
-    btree_range_iter_close(it);
-    return NULL;
-}
-
-/* Extract a typed field as a double for numeric aggregate operations. */
-static AggValueStatus typed_field_to_double(const TypedField *f, const uint8_t *p,
-                                            size_t available, double *out) {
-    if (!f || !p || available < (size_t)f->size) return AGG_VALUE_MISSING;
-    switch (f->type) {
-    case FT_LONG: {
-        int64_t v = ld_be_i64(p);
-        *out = (double)v; return AGG_VALUE_PRESENT;
-    }
-    case FT_INT: {
-        int32_t v = ld_be_i32(p);
-        *out = (double)v; return AGG_VALUE_PRESENT;
-    }
-    case FT_SHORT: {
-        int16_t v = ld_be_i16(p);
-        *out = (double)v; return AGG_VALUE_PRESENT;
-    }
-    case FT_DOUBLE: {
-        double v; memcpy(&v, p, 8);
-        *out = v; return AGG_VALUE_PRESENT;
-    }
-    case FT_FLOAT: {
-        float v; memcpy(&v, p, 4);
-        *out = (double)v; return AGG_VALUE_PRESENT;
-    }
-    case FT_NUMERIC: {
-        int64_t v = ld_be_i64(p);
-        *out = (f->numeric_scale_mult > 0)
-               ? (double)v / (double)f->numeric_scale_mult
-               : (double)v;   /* unsupported legacy scale: raw integer */
-        return AGG_VALUE_PRESENT;
-    }
-    case FT_BOOL: *out = (double)(p[0] ? 1 : 0); return AGG_VALUE_PRESENT;
-    case FT_BYTE: *out = (double)p[0]; return AGG_VALUE_PRESENT;
-    case FT_TIMESTAMP:
-        *out = (double)ld_be_i64(p); return AGG_VALUE_PRESENT;
-    case FT_DATE: {
-        return AGG_VALUE_UNSUPPORTED;
-    }
-    case FT_DATETIME: {
-        return AGG_VALUE_UNSUPPORTED;
-    }
-    case FT_DATETIMEMS:
-    case FT_TIME:
-    case FT_UUID:
-    case FT_ENUM:
-    case FT_IPV4:
-    case FT_IPV6:
-    case FT_VARCHAR:
-    default: return AGG_VALUE_UNSUPPORTED;
-    }
-}
 
 /* Text projection for text min/max. The per-type unset-marker doctrine is
    generation-independent (matching count(field)): an empty varchar, an
@@ -2154,6 +2086,28 @@ static AggValueStatus typed_field_to_text(const TypedField *f, const uint8_t *p,
     if (out_len) *out_len = (size_t)n;
     return AGG_VALUE_PRESENT;
 }
+/* Borrow full varchar bytes until agg_text_offer copies them into its arena.
+   Only bounded calendar representations use the supplied scratch buffer. */
+static int agg_span_text(const AggCtx *ctx, const TypedField *f,
+                         const TypedRowSpan *s, char *buf, size_t cap,
+                         const char **text, size_t *len) {
+    if (f->type == FT_VARCHAR) {
+        if (ctx->fs->ts->packed.nfields) {
+            *text = (const char *)s->data;
+            *len = s->len;
+        } else {
+            if (!s->complete) return 0;
+            int n = varchar_eff_len(s->data, f->size);
+            *text = (const char *)s->data + 2;
+            *len = n > 0 ? (size_t)n : 0;
+        }
+        return *len > 0;
+    }
+    if (!s->complete) return 0;
+    *text = buf;
+    return typed_field_to_text(f, s->data, s->len, buf, cap, len, 0) ==
+           AGG_VALUE_PRESENT;
+}
 
 static void agg_text_offer(AggCtx *ctx, AggAccum *a, enum AggFn fn,
                            const char *text, size_t len) {
@@ -2171,11 +2125,269 @@ static void agg_text_offer(AggCtx *ctx, AggAccum *a, enum AggFn fn,
     }
     a->text_present = 1;
 }
+/* One error response for every route (no success-shaped partial output). */
+static int agg_report_error(int err) {
+    switch (err) {
+    case ENOBUFS:  OUT(QUERY_BUFFER_ERR); break;
+    case ENOMEM:   OUT("{\"error\":\"out of memory\"}\n"); break;
+    case ERANGE:   OUT("{\"error\":\"aggregate result out of range\"}\n"); break;
+    case E2BIG:    OUT("{\"error\":\"group_by value exceeds aggregate key limit (511 bytes per value, 4096 bytes per composite key) or contains NUL\"}\n"); break;
+    case ETIMEDOUT: OUT("{\"error\":\"query_timeout\"}\n"); break;
+    case EIO:      OUT("{\"error\":\"aggregate storage access failed\"}\n"); break;
+    default:       OUT("{\"error\":\"invalid typed record\"}\n"); break;
+    }
+    errno = err ? err : EILSEQ;
+    return -1;
+}
 
-static uint32_t agg_hash(const char *s) {
-    uint32_t h = 5381;
-    while (*s) h = h * 33 + (uint8_t)*s++;
-    return h;
+typedef struct {
+    const char *db_root, *object, *field;
+    int shard_id;
+    const AggNumSpec *spec;
+    const KeySet *ks;               /* optional membership filter */
+    int first_only, desc;           /* min/max: stop at first PRESENT entry per shard */
+    const char *lo; size_t lo_len; int lo_excl;
+    const char *hi; size_t hi_len; int hi_excl;
+    QueryDeadline *dl; int dl_counter;
+    _Atomic size_t *budget; size_t limit;
+    AggNum num; int64_t count; int err; int timed_out;   /* outputs */
+} AggWalkArg;
+
+static void *agg_walk_worker(void *raw) {
+    AggWalkArg *a = (AggWalkArg *)raw;
+    AggEnv env;
+    agg_env_init(&env, a->budget, a->limit);
+    char path[PATH_MAX];
+    build_idx_path(path, sizeof(path), a->db_root, a->object, a->field, a->shard_id);
+    /* Untouched index shards are created lazily; ENOENT is an empty shard.
+       An existing shard whose iterator cannot open still fails closed. */
+    struct stat st;
+    if (stat(path, &st) < 0) {
+        if (errno != ENOENT) a->err = EIO;
+        agg_env_free(&env);
+        return NULL;
+    }
+    BtRangeIter *it = btree_range_iter_open(
+        path, a->lo ? a->lo : "", a->lo ? a->lo_len : 0, a->lo ? a->lo_excl : 0,
+        a->hi ? a->hi : AGG_VALUE_TIER_CEIL, a->hi ? a->hi_len : 1,
+        a->hi ? a->hi_excl : 1, a->desc);
+    if (!it) {
+        /* The shard exists: an open failure must not become an empty total. */
+        LOG_ERROR(LOG_SUB_QUERY, "agg_walk_worker: btree_range_iter_open %s failed", path);
+        a->err = EIO;
+        agg_env_free(&env);
+        return NULL;
+    }
+    const char *val; size_t vlen; const uint8_t *hash16;
+    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
+        if (query_deadline_tick(a->dl, &a->dl_counter)) { a->timed_out = 1; break; }
+        if (a->ks && !keyset_contains(a->ks, hash16)) continue;
+        int r = agg_num_offer_key(a->spec, (const uint8_t *)val, vlen, &a->num, &env);
+        if (r < 0) { a->err = errno ? errno : EILSEQ; break; }
+        if (r == 0) continue;
+        a->count++;
+        if (a->first_only) break;
+    }
+    btree_range_iter_close(it);
+    agg_env_free(&env);
+    return NULL;
+}
+
+/* Walk every idx shard of `proto->field` in parallel and merge into *out /
+   *count. 0 ok, -1 error (errno), 1 deadline. */
+static int agg_walk_field(const AggWalkArg *proto, int n_idx, AggNum *out,
+                          int64_t *count) {
+    AggWalkArg *args = calloc((size_t)n_idx, sizeof *args);
+    if (!args) { errno = ENOMEM; return -1; }
+    for (int s = 0; s < n_idx; s++) { args[s] = *proto; args[s].shard_id = s; }
+    parallel_for_io(agg_walk_worker, args, n_idx, sizeof *args);
+    AggEnv env;
+    agg_env_init(&env, proto->budget, proto->limit);
+    int rc = 0, err = 0, timed = 0;
+    for (int s = 0; s < n_idx; s++) {
+        if (args[s].timed_out) timed = 1;
+        if (args[s].err && !err) err = args[s].err;
+    }
+    for (int s = 0; s < n_idx; s++) {
+        if (!err && agg_num_merge(out, &args[s].num, proto->spec->cls, &env))
+            err = errno ? errno : EILSEQ;
+        *count += args[s].count;
+        agg_num_release(&args[s].num, proto->spec->cls, &env);
+    }
+    agg_env_free(&env);
+    free(args);
+    if (err) { errno = err; rc = -1; }
+    else if (timed) rc = 1;
+    return rc;
+}
+
+/* Output accounting covers arrays, full decimal lexemes and escaped text.
+   Integer/float cells reserve a conservative bounded allocation; decimals
+   reserve dec_text_len exactly before allocating the potentially huge text. */
+#ifdef TEST_BUILD
+static _Thread_local int agg_fail_cells_alloc, agg_fail_escape_alloc;
+void agg_test_fail_cells_alloc(int enabled) { agg_fail_cells_alloc = enabled; }
+void agg_test_fail_escape_alloc(int n) { agg_fail_escape_alloc = n; }
+#endif
+static int agg_render_charge(_Atomic size_t *bytes, size_t limit, size_t n) {
+    if (!bytes || !n) return 0;
+    size_t old = atomic_load_explicit(bytes, memory_order_relaxed);
+    do {
+        if (n > limit || old > limit - n) { errno = ENOBUFS; return -1; }
+    } while (!atomic_compare_exchange_weak_explicit(bytes, &old, old + n,
+                 memory_order_relaxed, memory_order_relaxed));
+    return 0;
+}
+static void agg_render_uncharge(_Atomic size_t *bytes, size_t n) {
+    if (bytes && n) atomic_fetch_sub_explicit(bytes, n, memory_order_relaxed);
+}
+static void agg_cells_bind(AggCell *c, size_t n, _Atomic size_t *bytes, size_t limit) {
+    for (size_t i = 0; i < n; i++) { c[i].budget = bytes; c[i].limit = limit; }
+}
+static AggCell *agg_cells_alloc(size_t n, _Atomic size_t *bytes, size_t limit) {
+    size_t count = n ? n : 1;
+    if (count > SIZE_MAX / sizeof(AggCell)) { errno = ENOBUFS; return NULL; }
+    size_t need = count * sizeof(AggCell);
+    if (agg_render_charge(bytes, limit, need)) return NULL;
+#ifdef TEST_BUILD
+    if (agg_fail_cells_alloc) {
+        agg_render_uncharge(bytes, need); errno = ENOMEM; return NULL;
+    }
+#endif
+    AggCell *c = calloc(count, sizeof *c);
+    if (!c) { agg_render_uncharge(bytes, need); errno = ENOMEM; return NULL; }
+    agg_cells_bind(c, count, bytes, limit);
+    return c;
+}
+static int agg_cell_reserve(AggCell *c, size_t n) {
+    if (agg_render_charge(c->budget, c->limit, n)) return -1;
+    c->charged += n;
+    return 0;
+}
+static void agg_cells_free(AggCell *c, int n) {
+    if (!c) return;
+    for (int i = 0; i < n; i++) {
+        free(c[i].lex); free(c[i].escaped);
+        agg_render_uncharge(c[i].budget, c[i].charged);
+        c[i].lex = c[i].escaped = NULL; c[i].charged = 0;
+    }
+}
+static void agg_cells_dispose(AggCell *c, size_t n) {
+    if (!c) return;
+    _Atomic size_t *bytes = c[0].budget;
+    agg_cells_free(c, (int)n);
+    agg_render_uncharge(bytes, (n ? n : 1) * sizeof(AggCell));
+    free(c);
+}
+static int agg_cell_count(AggCell *c, int64_t n) {
+    char tmp[32];
+    int len = snprintf(tmp, sizeof tmp, "%lld", (long long)n);
+    if (agg_cell_reserve(c, (size_t)len + 1)) return -1;
+    c->lex = strdup(tmp);
+    if (!c->lex) { errno = ENOMEM; return -1; }
+    return 0;
+}
+static int agg_cell_text(AggCell *c, const char *text, size_t len, int present) {
+    c->is_text = 1; c->is_null = !present;
+    if (!present) return 0;
+    if (agg_cell_reserve(c, len + 1)) return -1;
+    c->lex = malloc(len + 1);
+    if (!c->lex) { errno = ENOMEM; return -1; }
+    memcpy(c->lex, text, len); c->lex[len] = 0;
+    size_t need = 1;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)text[i];
+        size_t add = (ch == '"' || ch == '\\' || ch == '\b' || ch == '\f' ||
+                      ch == '\n' || ch == '\r' || ch == '\t') ? 2 : ch < 0x20 ? 6 : 1;
+        if (need > SIZE_MAX - add) { errno = ENOBUFS; return -1; }
+        need += add;
+    }
+    if (agg_cell_reserve(c, need)) return -1;
+#ifdef TEST_BUILD
+    if (agg_fail_escape_alloc > 0 && --agg_fail_escape_alloc == 0) {
+        errno = ENOMEM; return -1;
+    }
+#endif
+    c->escaped = malloc(need);
+    if (!c->escaped) { errno = ENOMEM; return -1; }
+    int n = json_escape_into(c->escaped, need - 1, text, len);
+    if (n < 0) { errno = EILSEQ; return -1; }
+    c->escaped[n] = 0;
+    return 0;
+}
+static int agg_cell_from_num(const AggNumSpec *sp, const AggNum *num,
+                             enum AggFn fn, int64_t count, AggCell *c) {
+    if (count <= 0) {
+        /* avg/min/max of no values have no answer: JSON null (CSV keeps its
+           historical "0" cell). sum of no values is exactly zero at the
+           column's declared/display scale (Task 8). */
+        if (fn != AGG_SUM) { c->is_null = 1; return 0; }
+        AggValue z;
+        agg_value_init(&z);
+        if (sp->cls == AGC_DEC) {
+            dec_init(&z.own);
+            z.own.dscale = sp->dscale;
+            z.cls = AGC_DEC;
+            z.dv = &z.own;
+        } else {
+            z.cls = sp->cls;
+            z.i = 0;
+            z.scale = sp->scale;
+        }
+        z.present = 1;
+        size_t need = z.cls == AGC_DEC ? dec_text_len(z.dv) : 128 + (size_t)(z.scale > 0 ? z.scale : 0);
+        if (agg_cell_reserve(c, need)) return -1;
+        c->lex = agg_value_render(&z);
+        int ze = errno;
+        agg_value_release(&z);
+        if (!c->lex) { errno = ze ? ze : ENOMEM; return -1; }
+        return 0;
+    }
+    AggValue v;
+    if (agg_num_value(num, sp, fn, count, &v)) return -1;
+    size_t need = v.cls == AGC_DEC ? dec_text_len(v.dv)
+                                 : 128 + (v.scale > 0 ? (size_t)v.scale : 0);
+    if (agg_cell_reserve(c, need)) { agg_value_release(&v); return -1; }
+    c->lex = agg_value_render(&v);
+    int e = errno;
+    agg_value_release(&v);
+    if (!c->lex) { errno = e ? e : ENOMEM; return -1; }
+    return 0;
+}
+static void agg_cell_emit_json(const AggCell *c) {
+    if (c->is_null) OUT("null");
+    else if (c->is_text) OUT("\"%s\"", c->escaped);
+    else OUT("%s", c->lex ? c->lex : "0");
+}
+static void agg_cell_emit_csv(const AggCell *c, char delim) {
+    csv_emit_cell(c->is_null ? (c->is_text ? "" : "0") : (c->lex ? c->lex : ""), delim);
+}
+static void agg_emit_delim(char d) { char s[2] = { d, '\0' }; OUT("%s", s); }
+/* Scalar (no group_by) response: JSON object, rows+total wrapper, or CSV
+   header+row. All values are already rendered, so nothing can fail here. */
+static void agg_emit_scalar_cells(const AggSpec *specs, int nspecs,
+                                  const AggCell *cells, char csv_delim,
+                                  int want_total) {
+    if (csv_delim) {
+        for (int i = 0; i < nspecs; i++) {
+            if (i > 0) agg_emit_delim(csv_delim);
+            csv_emit_cell(specs[i].alias, csv_delim);
+        }
+        OUT("\n");
+        for (int i = 0; i < nspecs; i++) {
+            if (i > 0) agg_emit_delim(csv_delim);
+            agg_cell_emit_csv(&cells[i], csv_delim);
+        }
+        OUT("\n");
+        return;
+    }
+    OUT(want_total ? "{\"rows\":{" : "{");
+    for (int i = 0; i < nspecs; i++) {
+        if (i > 0) OUT(",");
+        OUT("\"%s\":", specs[i].alias);
+        agg_cell_emit_json(&cells[i]);
+    }
+    OUT(want_total ? "},\"total\":1}\n" : "}\n");
 }
 
 /* djb2 over an explicit length — the tagged group key holds embedded
@@ -2195,6 +2407,16 @@ static uint32_t agg_hash_int(const void *key, size_t len) {
         h = h * 0x9E3779B9 + p[i];
     }
     return (uint32_t)(h ^ (h >> 32));
+}
+
+/* Table slot hash of an existing bucket. It must be the exact function
+   agg_find_or_create probes with: raw-int buckets hash their raw bytes;
+   everything else hashes the tagged key over its recorded length (the
+   leading 0x00 NULL tag makes a strlen-based hash see an empty string). */
+static uint32_t agg_bucket_hash(const AggCtx *ctx, const AggBucket *b) {
+    if (ctx->use_int_keys && b->raw_key_len > 0)
+        return agg_hash_int(b->raw_key, (size_t)b->raw_key_len);
+    return agg_hash_len(b->group_key, (size_t)b->group_key_len);
 }
 
 /* Compare raw integer keys (memcmp but returns bool). */
@@ -2254,9 +2476,7 @@ static int agg_ht_resize(AggCtx *ctx) {
         AggBucket *b = ctx->ht[i];
         while (b) {
             AggBucket *next = b->next;
-            uint32_t h = (ctx->use_int_keys && b->raw_key_len > 0)
-                ? agg_hash_int(b->raw_key, (size_t)b->raw_key_len) & (uint32_t)new_mask
-                : agg_hash(b->group_key) & (uint32_t)new_mask;
+            uint32_t h = agg_bucket_hash(ctx, b) & (uint32_t)new_mask;
             b->next = new_ht[h];
             new_ht[h] = b;
             b = next;
@@ -2286,7 +2506,10 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals,
         if (i > 0) key[kp++] = '\x1F';
         int is_null = nulls ? (nulls[i] ? 1 : 0) : 0;
         uint32_t bl = is_null ? 0 : (uint32_t)strlen(vals[i]);
-        if (kp + 5 + (int)bl >= (int)sizeof(key) - 1) break;
+        if (kp + 5 + (int)bl >= (int)sizeof(key) - 1) {
+            ctx->agg_error = E2BIG;   /* never truncate a group key (D6) */
+            return NULL;
+        }
         key[kp++] = (char)(is_null ? 1 : 0);
         key[kp++] = (char)(bl >> 24);
         key[kp++] = (char)(bl >> 16);
@@ -2373,10 +2596,6 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals,
                                  (size_t)ctx->nspecs * sizeof(AggAccum));
     if (!b->accums) { ctx->budget_exceeded = 1; return NULL; }
     memset(b->accums, 0, (size_t)ctx->nspecs * sizeof(AggAccum));
-    for (int i = 0; i < ctx->nspecs; i++) {
-        b->accums[i].min = 1e308;
-        b->accums[i].max = -1e308;
-    }
     b->next = ctx->ht[h];
     ctx->ht[h] = b;
     ctx->total_buckets++;
@@ -2394,210 +2613,97 @@ static AggBucket *agg_find_or_create(AggCtx *ctx, char **vals, int nvals,
 
 static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ctx) {
     AggCtx *ctx = (AggCtx *)raw_ctx;
-    if (ctx->budget_exceeded) return 1;
+    if (ctx->budget_exceeded || ctx->agg_error) return 1;
     if (query_deadline_tick(ctx->deadline, &ctx->dl_counter)) return 1;
     const uint8_t *raw = block + hdr->key_len;
+    const uint8_t hdr2 = (uint8_t)(hdr->flag >> 8);
 
-    /* Check full criteria tree (AND/OR) */
-    int matched=0;
-    if(criteria_match_tree_checked(raw,hdr->value_len,ctx->tree,ctx->fs,(uint8_t)(hdr->flag>>8),&matched)){
-        ctx->predicate_error=errno?errno:EILSEQ;return 1;}
-    if(!matched)return 0;
+    int matched = 0;
+    if (criteria_match_tree_checked(raw, hdr->value_len, ctx->tree, ctx->fs, hdr2, &matched)) {
+        ctx->predicate_error = errno ? errno : EILSEQ;
+        return 1;
+    }
+    if (!matched) return 0;
 
-    /* Extract group_by values into stack buffers (no malloc). gbuf[i][0]
-       is forced to NUL up front because typed_field_to_buf_raw can return
-       without writing (e.g. v=0 on int/long/etc.) — leaving stale bytes
-       from a prior record in this thread's stack frame, which would then
-       leak into the string-path group_key and merge unrelated rows. */
+    AggRow row;
+    if (agg_row_open(ctx, raw, hdr->value_len, hdr2, &row)) return 1;
+
+    /* Group components into stack buffers (no malloc). gbuf[i][0] is NUL up
+       front so an empty/absent component never leaks a prior record's bytes. */
     char gbuf[MAX_FIELDS][512];
     char *gvals[MAX_FIELDS];
     uint8_t gnulls[MAX_FIELDS] = {0};
-    /* One validated view up front: the bitmap decides group NULL-ness
-       (Task 8: a NULL group_by field forms its own tagged bucket). */
-    const uint8_t *vbm0 = NULL;
-    int vbm0_bytes = 0;
-    uint8_t v_hdr0 = (uint8_t)(hdr->flag >> 8);
-    if (v_hdr0 & SREC_FLAG_NULLMAP) {
-        const uint8_t *vbase0 = NULL; size_t vregion0 = 0;
-        (void)typed_record_view(raw, hdr->value_len, v_hdr0, &vbase0, &vbm0,
-                                &vbm0_bytes, &vregion0);
-    }
     for (int i = 0; i < ctx->ngroups; i++) {
         gbuf[i][0] = '\0';
         if (ctx->group_tfs[i]) {
-            const TypedField *gtf = ctx->group_tfs[i];
-            gnulls[i] = (v_hdr0 & SREC_FLAG_NULLMAP) &&
-                        ctx->group_idx[i] >= 0 &&
-                        typed_field_null(vbm0, vbm0_bytes, ctx->group_idx[i]);
-            if (gnulls[i]) {
-                /* NULL component: tagged key [01][len 0], text "" for
-                   output; decoding the zero field would fabricate a
-                   value (§2.4.5). */
-                gvals[i] = gbuf[i];
-                continue;
-            }
-            size_t avail;
-            /* agg_field_ptr resolves the field-region base (nullmap records
-               slide by the bitmap prefix) and returns the zero field on a
-               short record — avail < size is the truncated case. */
-            const uint8_t *gp = agg_field_ptr(raw, hdr->value_len, gtf,
-                                              &avail, (uint8_t)(hdr->flag >> 8),
-                                              &(int){0});
-            if (avail < (size_t)gtf->size) {
-                /* truncated field — missing group value, not a fake zero */
-            } else {
-                typed_field_to_buf_raw(gtf, gp,
-                                       gbuf[i], sizeof(gbuf[i]), 1);
-            }
+            if (agg_row_label(ctx, &row, i, gbuf[i], sizeof gbuf[i], &gnulls[i]) < 0)
+                return 1;
+        } else if (ctx->fs->ts && ctx->fs->ts->packed.nfields) {
+            size_t tl = 0;
+            errno = 0;
+            char *s = typed_packed_named_text(ctx->fs->ts, raw, hdr->value_len,
+                                              hdr2, ctx->group_fields[i],
+                                              sizeof gbuf[i], &tl);
+            if (!s && errno) { ctx->agg_error = errno == ENOBUFS ? E2BIG : errno; return 1; }
+            if (s) { memcpy(gbuf[i], s, tl); gbuf[i][tl] = '\0'; free(s); }
         } else {
-            /* Composite/unknown — fallback to decode_field */
             char *s = decode_field((const char *)raw, hdr->value_len,
-                                   ctx->group_fields[i], ctx->fs,
-                                   (uint8_t)(hdr->flag >> 8));
+                                   ctx->group_fields[i], ctx->fs, hdr2);
             if (s) {
                 size_t sl = strlen(s);
-                if (sl >= sizeof(gbuf[i])) sl = sizeof(gbuf[i]) - 1;
+                if (sl >= sizeof gbuf[i]) { free(s); ctx->agg_error = E2BIG; return 1; }
                 memcpy(gbuf[i], s, sl); gbuf[i][sl] = '\0';
                 free(s);
-            } else {
-                gbuf[i][0] = '\0';
             }
         }
         gvals[i] = gbuf[i];
     }
 
-    /* Extract raw bytes for integer group keys (fast hash path). use_int_keys
-       is only set at agg setup when the sum of field widths fits the inline
-       cap, so the loop is guaranteed to consume every group field — no
-       silent truncation. typed_field_to_raw emits the full natural width
-       for each field (including for v=0) so byte-equal ⇔ tuple-equal.
-       agg_field_ptr resolves the field-region base (nullmap records slide
-       by the bitmap prefix) — never index raw by gtf->offset. */
     uint8_t raw_key[AGG_INT_KEY_CAP];
     int raw_key_len = 0;
-    if (ctx->use_int_keys) {
-        int kp = 0;
-        for (int i = 0; i < ctx->ngroups && kp < AGG_INT_KEY_CAP; i++) {
-            if (ctx->group_tfs[i]) {
-                const TypedField *gtf = ctx->group_tfs[i];
-                /* Task 8 tag byte keeps NULL tuples distinct from
-                   zero-valued ones in the fast integer path. */
-                if (kp + 1 >= AGG_INT_KEY_CAP) break;
-                raw_key[kp++] = gnulls[i] ? 1 : 0;
-                if (gnulls[i]) {
-                    int w = typed_field_int_width(gtf->type);
-                    if (w <= 0 || kp + w > AGG_INT_KEY_CAP) break;
-                    memset(raw_key + kp, 0, (size_t)w);
-                    kp += w;
-                    continue;
-                }
-                size_t avail;
-                const uint8_t *gp = agg_field_ptr(raw, hdr->value_len, gtf,
-                                                  &avail, (uint8_t)(hdr->flag >> 8),
-                                                  &(int){0});
-                if (avail < (size_t)gtf->size)
-                    break;  /* truncated here — every later field is too */
-                int len = typed_field_to_raw(gtf, gp, raw_key + kp,
-                                             (size_t)(AGG_INT_KEY_CAP - kp));
-                if (len > 0) kp += len;
-            }
-        }
-        raw_key_len = kp;
-    }
+    if (ctx->use_int_keys) raw_key_len = agg_row_raw_key(ctx, &row, gnulls, raw_key);
 
-    /* Find or create bucket + accumulate. Every parallel path now gives
-       each worker its own cloned AggCtx (fresh hash table + arena), so
-       hashtable insert and accumulator updates are worker-local — no
-       mutex needed. */
     AggBucket *bkt;
     if (ctx->ngroups > 0) {
-        bkt = agg_find_or_create(ctx, gvals, ctx->ngroups, raw_key, raw_key_len,
-                                 gnulls);
+        bkt = agg_find_or_create(ctx, gvals, ctx->ngroups, raw_key, raw_key_len, gnulls);
     } else {
         char *empty = "";
         bkt = agg_find_or_create(ctx, &empty, 1, NULL, 0, NULL);
     }
-    if (!bkt) return 1;  /* budget exceeded — stop scan */
-
-    /* One validated view per record; on nullmap records the bitmap decides
-       NULL for every accumulator (§2.5: NULLs skip sum/avg/min/max;
-       count(field) counts non-NULL). Legacy records keep the zero
-       heuristics untouched. A view failure leaves vbm NULL — the row then
-       behaves legacy (agg_field_ptr's zero-field fallback already covers
-       the short-record case). */
-    const uint8_t *vbm = NULL;
-    int vbm_bytes = 0;
-    uint8_t v_hdr2 = (uint8_t)(hdr->flag >> 8);
-    if (v_hdr2 & SREC_FLAG_NULLMAP) {
-        const uint8_t *vbase = NULL; size_t vregion = 0;
-        (void)typed_record_view(raw, hdr->value_len, v_hdr2, &vbase, &vbm,
-                                &vbm_bytes, &vregion);
-    }
+    if (!bkt) return 1;
 
     for (int i = 0; i < ctx->nspecs; i++) {
         AggAccum *a = &bkt->accums[i];
+        const TypedField *stf = ctx->spec_tfs[i];
         if (ctx->specs[i].fn == AGG_COUNT) {
-            /* count(*) (no field) counts every record. count(field) counts
-               records whose stored value is not the type's encoded unset
-               marker — empty varchar, all-zero calendar, midnight time,
-               all-zero uuid (agg_count_inspects_presence). Fixed-width
-               numeric fields always carry a value, so they count every
-               record, zeros included. Nullmap records: the bitmap bit is
-               the truth — a bit-clear zero counts, a NULL doesn't. */
-            if (ctx->specs[i].field[0] && ctx->spec_tfs[i]) {
-                const TypedField *cvtf = ctx->spec_tfs[i];
-                /* NULL never counts on nullmap records — the bitmap is
-                   the truth for every type (§2.5). */
-                if (vbm &&
-                    typed_field_null(vbm, vbm_bytes,
-                                     (int)(cvtf - ctx->fs->ts->fields)))
+            /* count(*) counts every record; count(field) skips NULL and, for
+               the presence-doctrine types, the encoded unset marker. */
+            if (ctx->specs[i].field[0] && stf) {
+                TypedRowSpan s;
+                int have = agg_row_span(&row, (size_t)(stf - ctx->fs->ts->fields), &s);
+                if (have && s.is_null) continue;
+                if (agg_count_inspects_presence(stf->type) &&
+                    (!have || agg_row_unset(ctx, stf, &s)))
                     continue;
-                if (agg_count_inspects_presence(cvtf->type)) {
-                    /* The per-type present-value doctrine (empty varchar,
-                       unset calendar, midnight, nil uuid) is
-                       generation-independent — a bit-clear empty string
-                       is still an unset marker. */
-                    size_t avail;
-                    const uint8_t *cvp = agg_field_ptr(raw, hdr->value_len,
-                                                       cvtf, &avail, v_hdr2, &(int){0});
-                    if (avail < (size_t)cvtf->size ||
-                        agg_field_is_unset(cvtf, cvp))
-                        continue;
-                }
             }
             a->count++;
             continue;
         }
-
-        double v;
-        int present = 0;
-        if (ctx->spec_tfs[i]) {
-            const TypedField *stf = ctx->spec_tfs[i];
-            size_t avail;
-            const uint8_t *sp = agg_field_ptr(raw, hdr->value_len, stf, &avail, v_hdr2, &(int){0});
-            if (vbm &&
-                typed_field_null(vbm, vbm_bytes,
-                                 (int)(stf - ctx->fs->ts->fields)))
-                continue;   /* NULL skips sum/avg/min/max (§2.5) */
-            if ((ctx->specs[i].fn == AGG_MIN || ctx->specs[i].fn == AGG_MAX) &&
-                agg_type_is_text(stf->type)) {
-                char text[1024]; size_t text_len = 0;
-                if (typed_field_to_text(stf, sp, avail, text, sizeof(text),
-                                        &text_len, v_hdr2) == AGG_VALUE_PRESENT)
-                    agg_text_offer(ctx, a, ctx->specs[i].fn, text, text_len);
-                continue;
-            }
-            present = typed_field_to_double(stf, sp, avail, &v) == AGG_VALUE_PRESENT;
-        } else {
-            /* Composite aggregate fields are rejected during validation. */
-            present = 0;
+        if (!stf) continue;
+        size_t sidx = (size_t)(stf - ctx->fs->ts->fields);
+        if ((ctx->specs[i].fn == AGG_MIN || ctx->specs[i].fn == AGG_MAX) &&
+            agg_type_is_text(stf->type)) {
+            TypedRowSpan s;
+            char scratch[64]; const char *text = NULL; size_t text_len = 0;
+            if (agg_row_span(&row, sidx, &s) && !s.is_null &&
+                agg_span_text(ctx, stf, &s, scratch, sizeof scratch, &text, &text_len))
+                agg_text_offer(ctx, a, ctx->specs[i].fn, text, text_len);
+            continue;
         }
-        if (present) {
-            a->count++;
-            a->sum += v;
-            if (v < a->min) a->min = v;
-            if (v > a->max) a->max = v;
-        }
+        if (!ctx->spec_is_num[i] || !row.ok) continue;
+        int r = agg_num_offer_row(&ctx->spec_nums[i], &row.v, &a->num, &ctx->env);
+        if (r < 0) { ctx->agg_error = errno ? errno : EILSEQ; return 1; }
+        if (r == 1) a->count++;
     }
     return 0;
 }
@@ -2743,11 +2849,12 @@ static int agg_validate_spec(const AggSpec *spec, const TypedSchema *ts,
 static int agg_having_leaf_ok(const AggCtx *ctx, const SearchCriterion *c,
                               char *err, size_t errsz) {
     int kind = -1;   /* -1 unresolved, 0 numeric, 1 text */
+    int flt = 0;     /* numeric result compares through strtod (AGC_FLT) */
     const char *tname = "unknown";
     for (int g = 0; g < ctx->ngroups; g++) {
         if (strcmp(ctx->group_fields[g], c->field) == 0) {
             if (ctx->group_tfs[g]) {
-                kind = agg_type_is_text(ctx->group_tfs[g]->type) ? 1 : 0;
+                kind = ctx->group_is_num[g] ? 0 : 1;
                 tname = agg_field_type_name(ctx->group_tfs[g]->type);
             }
             break;
@@ -2758,12 +2865,15 @@ static int agg_having_leaf_ok(const AggCtx *ctx, const SearchCriterion *c,
         if (ctx->specs[i].fn == AGG_COUNT || ctx->specs[i].fn == AGG_SUM ||
             ctx->specs[i].fn == AGG_AVG) {
             kind = 0; tname = "number";
+            flt = ctx->spec_is_num[i] && ctx->spec_nums[i].cls == AGC_FLT;
             break;
         }
         /* min/max kind follows the aggregated field's type. */
         if (ctx->spec_tfs[i]) {
             kind = agg_type_is_text(ctx->spec_tfs[i]->type) ? 1 : 0;
             tname = agg_field_type_name(ctx->spec_tfs[i]->type);
+            flt = kind == 0 && ctx->spec_is_num[i] &&
+                  ctx->spec_nums[i].cls == AGC_FLT;
         }
         break;
     }
@@ -2772,6 +2882,42 @@ static int agg_having_leaf_ok(const AggCtx *ctx, const SearchCriterion *c,
                  "unknown field '%s' in having (no matching field, alias, or group_by)",
                  c->field);
         return -1;
+    }
+    if (kind == 0 && c->op != OP_EXISTS && c->op != OP_NOT_EXISTS) {
+        int n = (c->op == OP_IN || c->op == OP_NOT_IN) ? c->in_count
+                : (c->op == OP_BETWEEN ? 2 : 1);
+        for (int i = 0; i < n; i++) {
+            const char *lit = (c->op == OP_IN || c->op == OP_NOT_IN)
+                                  ? c->in_values[i]
+                                  : (i == 0 ? search_criterion_value(c)
+                                            : search_criterion_value2(c));
+            int bad;
+            if (flt) {
+                /* Float-class results evaluate through strtod
+                   (agg_value_cmp_text): validate with the same rule so the
+                   accepted literal set matches on both sides. */
+                char *end;
+                double dv = strtod(lit, &end);
+                bad = end == lit || *end != '\0' || !isfinite(dv);
+            } else {
+                /* dec_parse tolerates surrounding whitespace; the
+                   canonical number grammar does not — reject it here so
+                   validation and evaluation agree. */
+                size_t ll = strlen(lit);
+                bad = ll == 0 ||
+                      dec_parse(lit, ll, &(dec_t){0}, NULL, 0) != DEC_OK;
+                if (!bad) {
+                    char c0 = lit[0], cl = lit[ll - 1];
+                    bad = c0 == ' ' || c0 == '\t' || c0 == '\r' || c0 == '\n' ||
+                          cl == ' ' || cl == '\t' || cl == '\r' || cl == '\n';
+                }
+            }
+            if (bad) {
+                snprintf(err, errsz, "invalid numeric value '%.64s' for having on '%s'",
+                         lit, c->field);
+                return -1;
+            }
+        }
     }
     switch (c->op) {
     case OP_EQUAL: case OP_NOT_EQUAL:
@@ -2804,38 +2950,65 @@ static int agg_having_tree_ok(const AggCtx *ctx, const CriteriaNode *n,
     return 0;
 }
 
-static AggResult agg_bucket_value(const AggCtx *ctx, AggBucket *bkt,
-                                  const char *name) {
-    AggResult missing = { AGG_RESULT_NUMBER, 0, 0.0, NULL, 0 };
+static const dec_t AGG_ZERO_DEC = {0};
+
+/* Zero value for a numeric result with no contributors (sorting keeps the
+   historical "absent compares as 0"). */
+static void agg_value_zero_fill(AggValue *v) {
+    v->present = 1;
+    if (v->cls == AGC_DEC && !v->dv) v->dv = &AGG_ZERO_DEC;
+}
+
+static void agg_result_release(AggResult *r) { agg_value_release(&r->val); }
+
+/* 0 ok / -1 errno. The result may borrow the bucket's decimals: it must not
+   outlive the bucket and must be released with agg_result_release. */
+static int agg_bucket_value(const AggCtx *ctx, AggBucket *bkt, const char *name,
+                            AggResult *out) {
+    memset(out, 0, sizeof *out);
+    out->kind = AGG_RESULT_NUMBER;
+    agg_value_init(&out->val);
     for (int g = 0; g < ctx->ngroups; g++) {
-        if (strcmp(ctx->group_fields[g], name) == 0) {
-            const char *v = bkt->group_vals[g];
-            if (ctx->group_tfs[g] && agg_type_is_text(ctx->group_tfs[g]->type))
-                return (AggResult){ AGG_RESULT_TEXT, v[0] != '\0', 0.0, v, strlen(v) };
-            return (AggResult){ AGG_RESULT_NUMBER, v[0] != '\0', atof(v), NULL, 0 };
+        if (strcmp(ctx->group_fields[g], name) != 0) continue;
+        const char *v = bkt->group_vals[g];
+        if (!ctx->group_is_num[g]) {
+            out->kind = AGG_RESULT_TEXT;
+            out->present = v[0] != '\0';
+            out->text = v;
+            out->text_len = strlen(v);
+            return 0;
         }
+        return agg_value_from_label(&ctx->group_nums[g], v, &out->val) ? -1
+               : ((out->present = out->val.present), 0);
     }
     for (int i = 0; i < ctx->nspecs; i++) {
-        if (strcmp(ctx->specs[i].alias, name) == 0) {
-            const AggSpec *spec = &ctx->specs[i];
-            AggAccum *a = &bkt->accums[i];
-            if (spec->fn == AGG_COUNT)
-                return (AggResult){ AGG_RESULT_NUMBER, 1, (double)a->count, NULL, 0 };
-            if (spec->fn == AGG_SUM)
-                return (AggResult){ AGG_RESULT_NUMBER, 1, a->sum, NULL, 0 };
-            if (spec->fn == AGG_AVG)
-                return (AggResult){ AGG_RESULT_NUMBER, a->count > 0,
-                                    a->count > 0 ? a->sum / a->count : 0.0,
-                                    NULL, 0 };
-            if (ctx->spec_tfs[i] && agg_type_is_text(ctx->spec_tfs[i]->type))
-                return (AggResult){ AGG_RESULT_TEXT, a->text_present, 0.0,
-                                    spec->fn == AGG_MIN ? a->text_min : a->text_max,
-                                    spec->fn == AGG_MIN ? a->text_min_len : a->text_max_len };
-            return (AggResult){ AGG_RESULT_NUMBER, a->count > 0,
-                                spec->fn == AGG_MIN ? a->min : a->max, NULL, 0 };
+        if (strcmp(ctx->specs[i].alias, name) != 0) continue;
+        const AggSpec *spec = &ctx->specs[i];
+        AggAccum *a = &bkt->accums[i];
+        if (spec->fn == AGG_COUNT) {
+            agg_value_from_count(&out->val, a->count);
+            out->present = 1;
+            return 0;
         }
+        if (ctx->spec_tfs[i] && agg_type_is_text(ctx->spec_tfs[i]->type)) {
+            out->kind = AGG_RESULT_TEXT;
+            out->present = a->text_present;
+            out->text = spec->fn == AGG_MIN ? a->text_min : a->text_max;
+            out->text_len = spec->fn == AGG_MIN ? a->text_min_len : a->text_max_len;
+            return 0;
+        }
+        if (!ctx->spec_is_num[i]) return 0;
+        if (agg_num_value(&a->num, &ctx->spec_nums[i], spec->fn, a->count, &out->val))
+            return -1;
+        out->present = spec->fn == AGG_SUM ? 1 : a->count > 0;
+        /* AVG of an integer class is always a decimal value; resetting the
+           class for an empty group would leave an INT-tagged value with no
+           integer payload next to DEC-tagged siblings. */
+        if (!out->val.present && spec->fn != AGG_AVG)
+            out->val.cls = ctx->spec_nums[i].cls;
+        return 0;
     }
-    return missing;
+    return 0;
 }
 
 static int agg_text_matches(const AggResult *r, const SearchCriterion *c) {
@@ -2869,20 +3042,64 @@ static int agg_text_matches(const AggResult *r, const SearchCriterion *c) {
     }
 }
 
+/* 1 match / 0 no match / -1 error (errno). Numeric comparisons are exact:
+   decimals by dec_cmp, integers as 128-bit, floats as doubles. */
 static int agg_result_matches(const AggResult *r, const SearchCriterion *c) {
     if (r->kind == AGG_RESULT_TEXT) return agg_text_matches(r, c);
     if (!r->present) return c->op == OP_NOT_EXISTS;
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%.6f", r->number);
-    return match_criterion(buf, c);
+    int cmp = 0;
+    switch (c->op) {
+    case OP_EXISTS: return 1;
+    case OP_NOT_EXISTS: return 0;
+    case OP_EQUAL: case OP_NOT_EQUAL: case OP_LESS: case OP_GREATER:
+    case OP_LESS_EQ: case OP_GREATER_EQ:
+        if (agg_value_cmp_text(&r->val, search_criterion_value(c), &cmp)) return -1;
+        switch (c->op) {
+        case OP_EQUAL: return cmp == 0;
+        case OP_NOT_EQUAL: return cmp != 0;
+        case OP_LESS: return cmp < 0;
+        case OP_GREATER: return cmp > 0;
+        case OP_LESS_EQ: return cmp <= 0;
+        default: return cmp >= 0;
+        }
+    case OP_BETWEEN: {
+        int lo, hi;
+        if (agg_value_cmp_text(&r->val, search_criterion_value(c), &lo) ||
+            agg_value_cmp_text(&r->val, search_criterion_value2(c), &hi))
+            return -1;
+        return (c->min_exclusive ? lo > 0 : lo >= 0) &&
+               (c->max_exclusive ? hi < 0 : hi <= 0);
+    }
+    case OP_IN: case OP_NOT_IN: {
+        int found = 0;
+        for (int i = 0; i < c->in_count && !found; i++) {
+            if (agg_value_cmp_text(&r->val, c->in_values[i], &cmp)) return -1;
+            found = cmp == 0;
+        }
+        return c->op == OP_IN ? found : !found;
+    }
+    default: return 0;
+    }
+}
+
+/* One leaf against one bucket: 1/0, or -1 with errno set. */
+static int agg_having_leaf_match(const AggCtx *ctx, AggBucket *bkt,
+                                 const SearchCriterion *leaf) {
+    AggResult val;
+    if (agg_bucket_value(ctx, bkt, leaf->field, &val)) return -1;
+    int m = agg_result_matches(&val, leaf);
+    int e = errno;
+    agg_result_release(&val);
+    if (m < 0) errno = e;
+    return m;
 }
 
 /* Check having criteria against a bucket */
 static int agg_having_match(const AggCtx *ctx, AggBucket *bkt,
                             SearchCriterion *having, int nhaving) {
     for (int i = 0; i < nhaving; i++) {
-        AggResult val = agg_bucket_value(ctx, bkt, having[i].field);
-        if (!agg_result_matches(&val, &having[i])) return 0;
+        int m = agg_having_leaf_match(ctx, bkt, &having[i]);
+        if (m <= 0) return m;
     }
     return 1;
 }
@@ -2891,27 +3108,25 @@ static int agg_having_match(const AggCtx *ctx, AggBucket *bkt,
    Mirrors criteria_match_tree() but evaluates against aggregate bucket
    values instead of raw record bytes. */
 static int agg_having_match_tree(const AggCtx *ctx, AggBucket *bkt,
-                                  const CriteriaNode *n) {
+                                 const CriteriaNode *n) {
     if (!n) return 1;
     switch (n->kind) {
-    case CNODE_LEAF: {
-        AggResult val = agg_bucket_value(ctx, bkt, n->leaf.field);
-        return agg_result_matches(&val, &n->leaf);
-    }
+    case CNODE_LEAF: return agg_having_leaf_match(ctx, bkt, &n->leaf);
     case CNODE_AND:
-        for (int i = 0; i < n->n_children; i++)
-            if (!agg_having_match_tree(ctx, bkt, n->children[i]))
-                return 0;
+        for (int i = 0; i < n->n_children; i++) {
+            int m = agg_having_match_tree(ctx, bkt, n->children[i]);
+            if (m <= 0) return m;
+        }
         return 1;
     case CNODE_OR:
-        for (int i = 0; i < n->n_children; i++)
-            if (agg_having_match_tree(ctx, bkt, n->children[i]))
-                return 1;
+        for (int i = 0; i < n->n_children; i++) {
+            int m = agg_having_match_tree(ctx, bkt, n->children[i]);
+            if (m != 0) return m;
+        }
         return 0;
     }
     return 0;
 }
-
 /* Collect all buckets into a flat array */
 static AggBucket **agg_collect(AggCtx *ctx, int *out_count) {
     AggBucket **arr = malloc((size_t)ctx->total_buckets * sizeof(AggBucket *));
@@ -2941,6 +3156,12 @@ static void agg_ctx_clone_shared(AggCtx *dst, const AggCtx *src) {
     memcpy(dst->spec_tfs, src->spec_tfs, sizeof(src->spec_tfs));
     dst->deadline = src->deadline;
     dst->use_int_keys = src->use_int_keys;
+    memcpy(dst->spec_nums, src->spec_nums, sizeof(src->spec_nums));
+    memcpy(dst->spec_is_num, src->spec_is_num, sizeof(src->spec_is_num));
+    memcpy(dst->group_nums, src->group_nums, sizeof(src->group_nums));
+    memcpy(dst->group_is_num, src->group_is_num, sizeof(src->group_is_num));
+    memcpy(dst->group_idx, src->group_idx, sizeof(src->group_idx));
+    agg_env_init(&dst->env, src->shared_buffer_bytes, src->env.limit);
     /* dl_counter stays 0 (per-worker local) */
 }
 
@@ -2949,12 +3170,26 @@ static void agg_ctx_clone_shared(AggCtx *dst, const AggCtx *src) {
    need this to release per-worker arenas after merging into main. */
 static void agg_ctx_free_local(AggCtx *ctx);
 
+/* Release every bucket's exact states (heap-backed for packed numeric).
+   Idempotent: released states are the zero state. Callers must not walk a
+   chain whose buckets were spliced elsewhere (see the partition splice). */
+static void agg_ctx_release_nums(AggCtx *ctx) {
+    if (!ctx->ht) return;
+    for (size_t i = 0; i < ctx->ht_cap; i++)
+        for (AggBucket *b = ctx->ht[i]; b; b = b->next)
+            for (int k = 0; k < ctx->nspecs; k++)
+                if (ctx->spec_is_num[k])
+                    agg_num_release(&b->accums[k].num, ctx->spec_nums[k].cls,
+                                    &ctx->env);
+}
+
 /* Merge src's hash table into dst. Buckets in src live in src->arena
    so we don't free them individually — agg_find_or_create copies the
    group_vals strings into dst->arena, then the caller (or
    agg_ctx_free_local on src) frees src->arena en masse. */
 static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
     if(src->predicate_error)dst->predicate_error=src->predicate_error;
+    if (src->agg_error && !dst->agg_error) dst->agg_error = src->agg_error;
     int nvals = src->ngroups > 0 ? src->ngroups : 1;
     if (!src->ht) { src->total_buckets = 0; return; }
     for (size_t i = 0; i < src->ht_cap; i++) {
@@ -2965,12 +3200,13 @@ static void agg_ctx_merge(AggCtx *dst, AggCtx *src) {
             if (!dbkt) continue;  /* dst budget exhausted — caller checks flag */
             for (int k = 0; k < src->nspecs; k++) {
                 AggAccum *sa = &b->accums[k], *da = &dbkt->accums[k];
-                da->sum += sa->sum;
-                da->count += sa->count;
-                if (sa->count > 0) {
-                    if (sa->min < da->min) da->min = sa->min;
-                    if (sa->max > da->max) da->max = sa->max;
+                if (src->spec_is_num[k] &&
+                    agg_num_merge(&da->num, &sa->num, src->spec_nums[k].cls, &dst->env)) {
+                    if (!dst->agg_error) dst->agg_error = errno ? errno : EILSEQ;
                 }
+                da->count += sa->count;
+                if (src->spec_is_num[k])
+                    agg_num_release(&sa->num, src->spec_nums[k].cls, &src->env);
                 if (sa->text_present) {
                     if (sa->text_min)
                         agg_text_offer(dst, da, AGG_MIN, sa->text_min, sa->text_min_len);
@@ -3030,7 +3266,7 @@ static void parallel_agg_scan_shards_o_direct(AggCtx *main_ctx,
     FILE *parent_out = g_out;
 
     AggKfShardArg *args = calloc((size_t)sdb->num_shards, sizeof(*args));
-    if (!args) return;
+    if (!args) { main_ctx->agg_error = ENOMEM; return; }
     for (int s = 0; s < sdb->num_shards; s++) {
         args[s].sdb = sdb;
         args[s].kf_shard_id = s;
@@ -3088,6 +3324,9 @@ static int agg_batch_cb(const uint8_t hash[16],
         agg_scan_cb(&hdr, block, &sa->local);
         pthread_mutex_unlock(&sa->lock);
         if (block != stk) free(block);
+    } else {
+        sa->local.agg_error = ENOMEM;   /* never a silent skip */
+        return 1;
     }
     return 0;
 }
@@ -3104,6 +3343,7 @@ static void *shard_agg_worker(void *arg) {
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(sa->db_root, sa->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "shard_agg_worker: slotcask_registry_get failed for %s/%s", sa->db_root, sa->object);
+        sa->local.agg_error = EIO;
         return NULL;
     }
 
@@ -3111,6 +3351,7 @@ static void *shard_agg_worker(void *arg) {
     uint8_t (*hashes)[16] = malloc((size_t)sa->entry_count * sizeof(*hashes));
     if (!hashes) {
         LOG_ERROR(LOG_SUB_QUERY, "shard_agg_worker: malloc %d hashes failed", sa->entry_count);
+        sa->local.agg_error = ENOMEM;
         return NULL;
     }
     for (int ei = 0; ei < sa->entry_count; ei++)
@@ -3137,6 +3378,7 @@ static void parallel_indexed_agg(AggCtx *main_ctx, const char *db_root,
     int nshard_groups = shard_group_batch(batch, batch_count, group_starts, group_sizes, 1024);
 
     ShardAggCtx *workers = calloc(nshard_groups, sizeof(ShardAggCtx));
+    if (!workers) { main_ctx->agg_error = ENOMEM; return; }
     for (int g = 0; g < nshard_groups; g++) {
         workers[g].db_root = db_root;
         workers[g].object = object;
@@ -3161,47 +3403,102 @@ static void parallel_indexed_agg(AggCtx *main_ctx, const char *db_root,
     free(workers);
 }
 
-/* Sort context for qsort */
-static AggSpec *g_sort_specs;
-static int g_sort_nspecs;
-static char g_sort_field[256];
-static int g_sort_desc;
-static int g_sort_ngroups;
-static char (*g_sort_group_fields)[256];
-static const AggCtx *g_sort_ctx;
+/* Exact sort keys are materialised once per bucket (so the comparator never
+   allocates) and the permutation is sorted through pointers (AggValue may
+   borrow its own storage and must not be moved by qsort). */
+typedef struct {
+    AggBucket *b;
+    AggResult  r;        /* aggregate alias, or numeric group label */
+    int        use_label;/* text group field: compare group_vals with strcmp */
+    int        desc;     /* sort direction, per row (no shared state) */
+} AggSortRow;
 
-static int agg_sort_cmp(const void *a, const void *b) {
-    AggBucket *ba = *(AggBucket **)a;
-    AggBucket *bb = *(AggBucket **)b;
-
-    /* Check if order_by is a group_by field */
-    int ga = -1, gb = -1;
-    for (int i = 0; i < g_sort_ngroups; i++) {
-        if (strcmp(g_sort_group_fields[i], g_sort_field) == 0) {
-            ga = gb = i; break;
-        }
-    }
-    if (ga >= 0) {
-        /* Group values keep their stored string form: lexicographic
-           byte order for text and integer renderings alike. */
-        int cmp = strcmp(ba->group_vals[ga], bb->group_vals[gb]);
-        return g_sort_desc ? -cmp : cmp;
-    }
-
-    /* Otherwise it's an aggregate alias */
-    AggResult va = agg_bucket_value(g_sort_ctx, ba, g_sort_field);
-    AggResult vb = agg_bucket_value(g_sort_ctx, bb, g_sort_field);
+static int agg_sort_row_cmp(const void *pa, const void *pb) {
+    const AggSortRow *x = *(const AggSortRow *const *)pa;
+    const AggSortRow *y = *(const AggSortRow *const *)pb;
     int cmp;
-    if (va.kind == AGG_RESULT_TEXT || vb.kind == AGG_RESULT_TEXT)
-        cmp = agg_text_cmp(va.present ? va.text : "", va.present ? va.text_len : 0,
-                           vb.present ? vb.text : "", vb.present ? vb.text_len : 0);
-    else if (va.number < vb.number) cmp = -1;
-    else if (va.number > vb.number) cmp = 1;
-    else cmp = 0;
-    return g_sort_desc ? -cmp : cmp;
+    if (x->use_label) {
+        cmp = strcmp(x->r.text, y->r.text);
+    } else if (x->r.kind == AGG_RESULT_TEXT || y->r.kind == AGG_RESULT_TEXT) {
+        cmp = agg_text_cmp(x->r.present ? x->r.text : "", x->r.present ? x->r.text_len : 0,
+                           y->r.present ? y->r.text : "", y->r.present ? y->r.text_len : 0);
+    } else {
+        cmp = agg_value_cmp(&x->r.val, &y->r.val);
+    }
+    return x->desc ? -cmp : cmp;
 }
 
+static int agg_sort_buckets(const AggCtx *ctx, AggBucket **buckets, int n,
+                            const char *order_by, int order_desc) {
+    if (n < 2) return 0;
+    AggSortRow *rows = calloc((size_t)n, sizeof *rows);
+    AggSortRow **ptrs = malloc((size_t)n * sizeof *ptrs);
+    if (!rows || !ptrs) { free(rows); free(ptrs); errno = ENOMEM; return -1; }
+    int rc = 0;
+    for (int i = 0; i < n && !rc; i++) {
+        rows[i].b = buckets[i];
+        rows[i].desc = order_desc;
+        ptrs[i] = &rows[i];
+        int is_group = -1;
+        for (int g = 0; g < ctx->ngroups; g++)
+            if (strcmp(ctx->group_fields[g], order_by) == 0) { is_group = g; break; }
+        if (is_group >= 0 && !ctx->group_is_num[is_group]) {
+            rows[i].use_label = 1;
+            rows[i].r.kind = AGG_RESULT_TEXT;
+            rows[i].r.text = buckets[i]->group_vals[is_group];
+            continue;
+        }
+        if (agg_bucket_value(ctx, buckets[i], order_by, &rows[i].r)) { rc = -1; break; }
+        if (rows[i].r.kind == AGG_RESULT_NUMBER && !rows[i].r.val.present)
+            agg_value_zero_fill(&rows[i].r.val);
+    }
+    if (!rc) {
+        qsort(ptrs, (size_t)n, sizeof *ptrs, agg_sort_row_cmp);
+        for (int i = 0; i < n; i++) buckets[i] = ptrs[i]->b;
+    }
+    int e = errno;
+    for (int i = 0; i < n; i++) agg_result_release(&rows[i].r);
+    free(rows); free(ptrs);
+    if (rc) errno = e;
+    return rc;
+}
+#ifdef TEST_BUILD
+/* Structural check for the per-row sort direction: sort one array ascending
+   and one descending through the real comparator back to back, with no
+   direction state set in between (a shared static would make the second
+   sort reuse the first call's direction). */
+int agg_test_sort_dirs(void) {
+    AggSortRow a[3], b[3];
+    AggSortRow *pa[3], *pb[3];
+    for (int i = 0; i < 3; i++) {
+        memset(&a[i], 0, sizeof a[i]);
+        memset(&b[i], 0, sizeof b[i]);
+        agg_value_init(&a[i].r.val);
+        agg_value_init(&b[i].r.val);
+        a[i].r.kind = b[i].r.kind = AGG_RESULT_NUMBER;
+        a[i].r.present = b[i].r.present = 1;
+        a[i].r.val.cls = b[i].r.val.cls = AGC_INT;
+        a[i].r.val.present = b[i].r.val.present = 1;
+        a[i].r.val.i = b[i].r.val.i = i;   /* b starts ascending like a */
+        a[i].desc = 0;
+        b[i].desc = 1;
+        pa[i] = &a[i];
+        pb[i] = &b[i];
+    }
+    qsort(pa, 3, sizeof *pa, agg_sort_row_cmp);
+    qsort(pb, 3, sizeof *pb, agg_sort_row_cmp);
+    for (int i = 0; i < 3; i++) {
+        if (pa[i]->r.val.i != i) return -1;          /* asc array stayed asc */
+        if (pb[i]->r.val.i != 2 - i) return -1;      /* desc array inverted */
+    }
+    return 0;
+}
+#endif
 static void agg_free(AggCtx *ctx) {
+    /* Exact decimal states are heap-backed (decnum buffers) — release them
+       before the arena disappears; then the per-query env scratch. */
+    agg_ctx_release_nums(ctx);
+    agg_env_free(&ctx->env);
     /* Arena owns every per-bucket allocation — one bulk free vs
        O(buckets × 5) malloc-companion frees in the pre-arena path. */
     agg_arena_free(&ctx->arena);
@@ -3214,71 +3511,33 @@ static void agg_free(AggCtx *ctx) {
     ctx->specs = NULL;
 }
 
-/* Format a double, removing trailing zeros */
-static void fmt_double(char *buf, size_t sz, double v) {
-    snprintf(buf, sz, "%.6f", v);
-    /* Trim trailing zeros after decimal point */
-    char *dot = strchr(buf, '.');
-    if (dot) {
-        char *end = buf + strlen(buf) - 1;
-        while (end > dot && *end == '0') *end-- = '\0';
-        if (end == dot) *end = '\0';
-    }
-}
+
 
 /* Kind-aware emitters for min/max specs whose field is a text type
    (varchar/calendar). Textual results emit the arena-held canonical
    string — quoted JSON or a raw CSV cell — or JSON null / an empty CSV
    cell when no value was seen. Each returns 1 when it produced the
    output (textual spec) so the caller skips the numeric path, 0 when
-   the spec is numeric and must render through fmt_double. */
-static int agg_csv_minmax_text(const AggSpec *spec, const AggAccum *a,
-                               const TypedField *tf, char csv_delim) {
-    if ((spec->fn != AGG_MIN && spec->fn != AGG_MAX) ||
-        !tf || !agg_type_is_text(tf->type))
-        return 0;
-    const char *tv = spec->fn == AGG_MIN ? a->text_min : a->text_max;
-    csv_emit_cell(a->text_present && tv ? tv : "", csv_delim);
-    return 1;
-}
-
-static int agg_json_minmax_text(const AggSpec *spec, const AggAccum *a,
-                                const TypedField *tf) {
-    if ((spec->fn != AGG_MIN && spec->fn != AGG_MAX) ||
-        !tf || !agg_type_is_text(tf->type))
-        return 0;
-    if (a->text_present) {
-        const char *tv = spec->fn == AGG_MIN ? a->text_min : a->text_max;
-        char *esc = json_escape_const(tv ? tv : "");
-        OUT("\"%s\":\"%s\"", spec->alias, esc ? esc : "");
-        free(esc);
-    } else {
-        OUT("\"%s\":null", spec->alias);
-    }
-    return 1;
-}
-
+   the spec is numeric and must render through the exact cell renderer. */
 static int agg_minmax_text_indexed(const char *db_root, const char *object,
                                    const Schema *sch, const AggSpec *spec,
                                    const TypedField *tf, const char *format,
                                    const char *delimiter, int want_total) {
-    int desc = spec->fn == AGG_MAX;
-    char best[1024]; size_t best_len = 0; int have = 0;
-    int nidx = index_splits_for(sch->splits);
-    for (int s = 0; s < nidx; s++) {
-        char path[PATH_MAX];
-        build_idx_path(path, sizeof(path), db_root, object, spec->field, s);
+    int desc = spec->fn == AGG_MAX, have = 0, error = 0;
+    char best[1024]; size_t best_len = 0;
+    for (int sh = 0; sh < index_splits_for(sch->splits) && !error; sh++) {
+        char path[PATH_MAX]; struct stat st;
+        build_idx_path(path, sizeof path, db_root, object, spec->field, sh);
+        if (stat(path, &st) < 0) { if (errno != ENOENT) error = EIO; continue; }
         BtRangeIter *it = btree_range_iter_open(path, "", 0, 0,
-                                                AGG_VALUE_TIER_CEIL, 1, 1, desc);
-        if (!it) continue;
-        const char *val; size_t vlen; const uint8_t *hash16;
-        while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-            (void)hash16;
+                                               AGG_VALUE_TIER_CEIL, 1, 1, desc);
+        if (!it) { error = EIO; break; }
+        const char *value; size_t vlen; const uint8_t *hash;
+        while (btree_range_iter_next(it, &value, &vlen, &hash) == 1) {
             char text[1024]; size_t len = 0;
-            if (vlen >= sizeof(text)) continue;
-            if (decode_index_key_to_text(tf, (const uint8_t *)val, vlen,
-                                         text, &len) != AGG_VALUE_PRESENT)
-                continue;
+            if (vlen >= sizeof text) { error = E2BIG; break; }
+            if (decode_index_key_to_text(tf, (const uint8_t *)value, vlen,
+                                         text, &len) != AGG_VALUE_PRESENT) continue;
             if (!have || (desc ? agg_text_cmp(text, len, best, best_len) > 0
                               : agg_text_cmp(text, len, best, best_len) < 0)) {
                 memcpy(best, text, len + 1); best_len = len; have = 1;
@@ -3287,42 +3546,23 @@ static int agg_minmax_text_indexed(const char *db_root, const char *object,
         }
         btree_range_iter_close(it);
     }
-    char delim = format && strcmp(format, "csv") == 0 ? parse_csv_delim(delimiter) : 0;
-    if (delim) {
-        csv_emit_cell(spec->alias, delim); OUT("\n");
-        csv_emit_cell(have ? best : "", delim); OUT("\n");
-    } else if (have) {
-        char *esc = json_escape_const(best);
-        if (want_total) OUT("{\"rows\":{\"%s\":\"%s\"},\"total\":1}\n", spec->alias, esc ? esc : "");
-        else OUT("{\"%s\":\"%s\"}\n", spec->alias, esc ? esc : "");
-        free(esc);
-    } else if (want_total) {
-        OUT("{\"rows\":{\"%s\":null},\"total\":1}\n", spec->alias);
-    } else {
-        OUT("{\"%s\":null}\n", spec->alias);
-    }
+    _Atomic size_t bytes = 0;
+    AggCell cell = {0}; agg_cells_bind(&cell, 1, &bytes, g_query_buffer_max_bytes);
+    if (!error && agg_cell_text(&cell, best, have ? best_len : 0, have)) error = errno;
+    if (error) { agg_cells_free(&cell, 1); return agg_report_error(error); }
+    char delim = format && !strcmp(format, "csv") ? parse_csv_delim(delimiter) : 0;
+    agg_emit_scalar_cells(spec, 1, &cell, delim, want_total);
+    agg_cells_free(&cell, 1);
     return 1;
 }
-
-/* Same-field MIN/MAX fast path: when the agg field == the (single,
-   rangeable) criterion field, we can walk the agg field's btree in
-   MIN/MAX direction inside the criterion's bounds and take the first
-   leaf entry per shard. No KeySet, no record fetch — answer comes
-   straight from the index key.
-   Two planner branches arrived at the same code (CPD flagged this as
-   a 77-line dup). Centralised here.
-
-   Returns 1 if the criterion shape qualified (caller treats it as
-   "answered, return 0"). Returns 0 if not (caller falls through to a
-   later plan). Encodes bounds into the caller-supplied buf1/buf2 stack
-   buffers since the btree iter holds spans into them across the loop. */
 static int agg_minmax_same_field_btree(
         const char *db_root, const char *object, const char *field,
-        const char *alias, const TypedField *agg_tf, int splits,
+        const char *alias, const TypedField *agg_tf, const TypedSchema *ts,
+        int splits,
         int is_max, const SearchCriterion *crit,
         const char *format, const char *delimiter, int want_total) {
-    const TypedSchema *literal_schema=load_typed_schema(db_root,object);
-    if(!search_criterion_indexable(load_typed_schema(db_root,object),crit))return 0;
+    const TypedSchema *literal_schema = ts;
+    if (!search_criterion_indexable(ts, crit)) return 0;
     int rangeable = (crit->op == OP_EQUAL ||
                      crit->op == OP_GREATER ||
                      crit->op == OP_GREATER_EQ ||
@@ -3367,45 +3607,51 @@ static int agg_minmax_same_field_btree(
     default: break;
     }
 
-    int n_idx = index_splits_for(splits);
-    int desc = is_max ? 1 : 0;
-    double best = 0.0;
-    int have = 0;
-    for (int s = 0; s < n_idx; s++) {
-        char idx_path[PATH_MAX];
-        build_idx_path(idx_path, sizeof(idx_path), db_root, object, field, s);
-        BtRangeIter *it = btree_range_iter_open(
-            idx_path, min_v, min_l, min_x,
-            max_v, max_l, max_x, desc);
-        if (!it) continue;
-        const char *val; size_t vlen; const uint8_t *hash16;
-        while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-            double v;
-            if (decode_index_key_to_double(agg_tf,
-                                            (const uint8_t *)val, vlen, &v) == AGG_VALUE_PRESENT) {
-                if (!have)        { best = v; have = 1; }
-                else if (desc)    { if (v > best) best = v; }
-                else              { if (v < best) best = v; }
-                break;
-            }
-        }
-        btree_range_iter_close(it);
+    /* Checked literals are untiered payloads; iterator bounds include tier 0.
+       Leave the default tier-1 ceiling untouched. The tier shift moves the
+       payload up one byte: a full-capacity literal has no headroom, so the
+       shortcut declines and the general record-fed path answers instead
+       (defensive — encode_criterion_value_checked currently caps below
+       capacity). */
+    if (len1 >= sizeof buf1 || len2 >= sizeof buf2) return 0;
+    if (min_v == (const char *)buf1 || max_v == (const char *)buf1) {
+        memmove(buf1 + 1, buf1, len1); buf1[0] = 0x00;
+        if (min_v == (const char *)buf1) min_l++;
+        if (max_v == (const char *)buf1) max_l++;
     }
-
-    char vbuf[64];
-    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
+    if (max_v == (const char *)buf2) {
+        memmove(buf2 + 1, buf2, len2); buf2[0] = 0x00; max_l++;
+    }
+    if (crit->op == OP_EQUAL || crit->op == OP_LESS_EQ) max_x = 0;
+    AggNumSpec ns;
+    if (!agg_num_spec_for(ts, (size_t)(agg_tf - ts->fields), &ns) ||
+        !agg_index_exact(&ns))
+        return 0;                     /* record-fed route decides (D1) */
+    QueryDeadline wdl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
+    _Atomic size_t wbytes = 0;
+    atomic_init(&wbytes, 0);
+    AggWalkArg proto = { .db_root = db_root, .object = object, .field = field,
+        .spec = &ns, .dl = &wdl, .budget = &wbytes,
+        .limit = g_query_buffer_max_bytes, .first_only = 1, .desc = is_max,
+        .lo = min_v, .lo_len = min_l, .lo_excl = min_x,
+        .hi = max_v, .hi_len = max_l, .hi_excl = max_x };
+    AggNum num; memset(&num, 0, sizeof num);
+    int64_t cnt = 0;
+    int rc = agg_walk_field(&proto, index_splits_for(splits), &num, &cnt);
+    AggCell cell; memset(&cell, 0, sizeof cell);
+    agg_cells_bind(&cell, 1, &wbytes, g_query_buffer_max_bytes);
+    AggSpec one = { .fn = is_max ? AGG_MAX : AGG_MIN };
+    snprintf(one.alias, sizeof one.alias, "%s", alias);
+    int err = rc < 0 ? (errno ? errno : EILSEQ) : (rc > 0 || wdl.timed_out) ? ETIMEDOUT : 0;
+    if (!err && agg_cell_from_num(&ns, &num, one.fn, cnt, &cell)) err = errno;
+    AggEnv env; agg_env_init(&env, &wbytes, g_query_buffer_max_bytes);
+    agg_num_release(&num, ns.cls, &env);
+    agg_env_free(&env);
+    if (err) { agg_cells_free(&cell, 1); return agg_report_error(err); }
     char csv_delim_local = (format && strcmp(format, "csv") == 0)
                              ? parse_csv_delim(delimiter) : 0;
-    if (csv_delim_local) {
-        csv_emit_cell(alias, csv_delim_local);
-        OUT("\n");
-        csv_emit_cell(vbuf, csv_delim_local);
-        OUT("\n");
-    } else if (want_total) {
-        OUT("{\"rows\":{\"%s\":%s},\"total\":1}\n", alias, vbuf);
-    } else {
-        OUT("{\"%s\":%s}\n", alias, vbuf);
-    }
+    agg_emit_scalar_cells(&one, 1, &cell, csv_delim_local, want_total);
+    agg_cells_free(&cell, 1);
     return 1;
 }
 
@@ -3468,10 +3714,11 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
             cc.check_primary = check_primary;
             cc.deadline = ctx->deadline;
             cc.tf = resolve_idx_field(ctx->fs->ts, pc->field);
-            if(btree_dispatch_checked(db_root, object, pc->field, sch->splits,
-                           pc,
-                           resolve_idx_field(ctx->fs->ts, pc->field),
-                           collect_hash_cb, &cc)<0){ctx->predicate_error=errno?errno:EILSEQ;}
+            if (btree_dispatch_schema_checked(ctx->fs->ts, db_root, object,
+                    pc->field, sch->splits, pc,
+                    resolve_idx_field(ctx->fs->ts, pc->field),
+                    collect_hash_cb, &cc) < 0)
+                ctx->predicate_error = errno ? errno : EILSEQ;
             if (cc.budget_exceeded) ctx->budget_exceeded = 1;
             else parallel_indexed_agg(ctx, db_root, object, sch, cc.entries, (int)cc.count);
             collect_ctx_destroy(&cc);
@@ -3496,10 +3743,11 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
         };
         SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
         if (sdb) parallel_agg_scan_shards_o_direct(ctx, sdb);
+        else ctx->agg_error = EIO;   /* no scan possible: error, not empty */
     }
 
     if (ctx->deadline->timed_out) return -1;
-    if (ctx->budget_exceeded || ctx->predicate_error) return -1;
+    if (ctx->budget_exceeded || ctx->predicate_error || ctx->agg_error) return -1;
     return 0;
 }
 
@@ -3509,6 +3757,8 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
 static void agg_ctx_free_local(AggCtx *ctx) {
     /* Same arena teardown as agg_free, but without freeing the shared
        resources (specs, mutex) — those are owned by the cloning origin. */
+    agg_ctx_release_nums(ctx);
+    agg_env_free(&ctx->env);
     agg_arena_free(&ctx->arena);
     free(ctx->ht);
     ctx->ht = NULL;
@@ -3538,6 +3788,9 @@ typedef struct {
     int              aborted;
     int              dl_counter;
     QueryDeadline   *dl;
+    const AggCtx    *actx;           /* owning ctx for exact labels (D2) */
+    int              gi;             /* group component index + 1 */
+    int              err;            /* first label failure (errno) */
 } SecMapBuildWorker;
 
 static void *sec_map_build_worker(void *arg) {
@@ -3572,9 +3825,9 @@ static void *sec_map_build_worker(void *arg) {
         uint32_t bl = 0;
         if (!is_null) {
             char dbuf[512];
-            int dlen = decode_idx_to_buf(w->gtf_s, (const uint8_t *)val + 1,
-                                          vlen - 1, dbuf, sizeof(dbuf), 0);
-            if (dlen < 0) continue;
+            int dlen = agg_index_label(w->actx, w->gi, (const uint8_t *)val + 1,
+                                        vlen - 1, dbuf, sizeof(dbuf));
+            if (dlen < 0) { w->err = errno ? errno : EILSEQ; w->aborted = 1; break; }
             bl = (uint32_t)dlen;
             memcpy(centry + 5, dbuf, (size_t)dlen);
         }
@@ -3691,9 +3944,9 @@ static void *igb_pass1_worker(void *arg) {
                    Initialize the label first or the bucket key reads
                    uninitialized stack (§2.4.5). */
                 gbufs[0][0] = '\0';
-                int n = decode_idx_to_buf(w->gtf, prim,
-                                           prim_len, gbufs[0], sizeof(gbufs[0]), 0);
-                if (n < 0) continue;
+                int n = agg_index_label(&w->local, 0, prim, prim_len,
+                                        gbufs[0], sizeof(gbufs[0]));
+                if (n < 0) { w->local.agg_error = errno ? errno : EILSEQ; w->aborted = 1; break; }
                 gvals[0] = gbufs[0];
             } else {
                 gvals[0] = gbufs[0];
@@ -3784,7 +4037,7 @@ static void *scatter_worker(void *arg) {
     if (!s->src->ht) return NULL;
     for (size_t i = 0; i < s->src->ht_cap; i++) {
         for (AggBucket *b = s->src->ht[i]; b; b = b->next) {
-            uint32_t h = agg_hash(b->group_key);
+            uint32_t h = agg_bucket_hash(s->src, b);
             int p = (int)(h % (uint32_t)s->npart);
             if (bktarr_push(&s->queues[p], b) != 0) {
                 s->alloc_failed = 1;
@@ -3820,12 +4073,17 @@ static void *part_merge_worker(void *arg) {
             if (!mb) { p->aborted = 1; return NULL; }
             for (int k = 0; k < p->local.nspecs; k++) {
                 AggAccum *sa = &src->accums[k], *da = &mb->accums[k];
-                da->sum += sa->sum;
-                da->count += sa->count;
-                if (sa->count > 0) {
-                    if (sa->min < da->min) da->min = sa->min;
-                    if (sa->max > da->max) da->max = sa->max;
+                if (p->local.spec_is_num[k] &&
+                    agg_num_merge(&da->num, &sa->num, p->local.spec_nums[k].cls,
+                                  &p->local.env)) {
+                    p->local.agg_error = errno ? errno : EILSEQ;
+                    p->aborted = 1;
+                    return NULL;
                 }
+                da->count += sa->count;
+                if (p->local.spec_is_num[k])
+                    agg_num_release(&sa->num, p->local.spec_nums[k].cls,
+                                    &p->local.env);
                 if (sa->text_present) {
                     if (sa->text_min)
                         agg_text_offer(&p->local, da, AGG_MIN,
@@ -3843,93 +4101,6 @@ static void *part_merge_worker(void *arg) {
     return NULL;
 }
 
-/* Per-shard accumulator + worker for the single-spec SUM/AVG/MIN/MAX
-   fast path inside cmd_aggregate. Each shard's btree leaf walk is
-   independent, so parallel_for_io fans them out — at 25M records the
-   sequential walk took 9-15 s cold (idx shards × ~30 MB sequential
-   reads serialised); parallel cuts that close to single-shard cost. */
-typedef struct {
-    const char       *db_root, *object, *field;
-    int               shard_id;
-    const TypedField *tf;
-    enum AggFn        fn;
-    int               min_or_max, desc;
-    /* Outputs. */
-    double  accum;
-    int64_t count;
-    int     have;
-} AggSingleArg;
-
-/* Per-entry callback for the SUM/AVG fast walk. Decodes the leaf key
-   bytes to a double via the indexed-numeric inverse, then accumulates
-   into the worker's local sum + count. Returns 0 to keep iterating. */
-typedef struct {
-    const TypedField *tf;
-    double            sum;
-    int64_t           count;
-} AggLeafSumCtx;
-
-static int agg_leaf_sum_cb(const char *val, size_t vlen, void *raw) {
-    AggLeafSumCtx *c = (AggLeafSumCtx *)raw;
-    double v;
-    if (decode_index_key_to_double(c->tf, (const uint8_t *)val, vlen, &v) == AGG_VALUE_PRESENT) {
-        c->sum += v;
-        c->count++;
-    }
-    return 0;
-}
-
-static void *agg_single_shard_worker(void *raw) {
-    AggSingleArg *a = (AggSingleArg *)raw;
-    a->accum = 0; a->count = 0; a->have = 0;
-
-    char idx_path[PATH_MAX];
-    build_idx_path(idx_path, sizeof(idx_path), a->db_root, a->object,
-                    a->field, a->shard_id);
-
-    /* SUM/AVG walk every leaf entry — take the bound-free, hash-free
-       fast path that bypasses BtRangeIter's per-entry overhead. */
-    if (a->fn == AGG_SUM || a->fn == AGG_AVG) {
-        AggLeafSumCtx c = { a->tf, 0.0, 0 };
-        btree_walk_all_values(idx_path, agg_leaf_sum_cb, &c);
-        if (c.count > 0) {
-            a->accum = c.sum;
-            a->count = c.count;
-            a->have  = 1;
-        }
-        return NULL;
-    }
-
-    /* MIN/MAX read one leaf entry per shard (ASC for MIN, DESC for MAX)
-       so iter's break-after-first is already optimal — keep the iter
-       path here to reuse its DESC handling via v3 last_leaf_page. */
-    BtRangeIter *it = btree_range_iter_open(
-        idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, a->desc);
-    if (!it) {
-        LOG_ERROR(LOG_SUB_QUERY, "agg_single_shard_worker: btree_range_iter_open failed");
-        return NULL;
-    }
-
-    const char *val; size_t vlen; const uint8_t *hash16;
-    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-        double v;
-        if (decode_index_key_to_double(a->tf, (const uint8_t *)val, vlen, &v) != AGG_VALUE_PRESENT)
-            continue;
-        if (!a->have) { a->accum = v; a->have = 1; a->count = 1; }
-        else {
-            switch (a->fn) {
-                case AGG_MIN: if (v < a->accum) a->accum = v; a->count++; break;
-                case AGG_MAX: if (v > a->accum) a->accum = v; a->count++; break;
-                default: break;
-            }
-        }
-        break;
-                      /* one leaf entry suffices per shard for min/max */
-    }
-    btree_range_iter_close(it);
-    return NULL;
-}
-
 /* Per-emit staging slot for the varchar-streaming fast path. Holds
    tentative aggregate state for one distinct group key; only committed
    into ctx.ht once every emit's lookups have succeeded (or we abort
@@ -3937,11 +4108,7 @@ static void *agg_single_shard_worker(void *raw) {
 typedef struct {
     char    key[BT_MAX_VAL_LEN + 1];
     size_t  klen;
-    int64_t total_count;                  /* AGG_COUNT total for this key */
-    double  spec_sum[MAX_AGG_SPECS];      /* AGG_SUM / AGG_AVG running sum */
-    double  spec_min[MAX_AGG_SPECS];      /* AGG_MIN running min */
-    double  spec_max[MAX_AGG_SPECS];      /* AGG_MAX running max */
-    int64_t spec_count[MAX_AGG_SPECS];    /* live-value count per spec */
+    int64_t total_count;
 } VSStaged;
 
 /* One deferred lookup: a hash16 plus the staged[] index its record feeds. */
@@ -3956,6 +4123,12 @@ typedef struct {
     const TypedField     **spec_tfs;
     const int             *spec_tidx;      /* schema index per spec (NULL-bit test) */
     int                    nspecs;
+    const TypedSchema     *ts;             /* for typed_row_open */
+    AggNum                *nums;           /* [slot * nspecs + i] exact states */
+    int64_t               *counts;         /* contributing values per slot/spec */
+    const AggNumSpec      *spec_nums;      /* per-spec exact classification */
+    AggEnv                *env;            /* owning ctx env (QUERY_BUFFER accounting) */
+    int                    err;            /* first offer failure (errno) */
     const VSPendPair      *pairs;          /* sorted by hash16 */
     size_t                 n;
     /* Partition workers deliver concurrently; staged accums are shared
@@ -3991,45 +4164,23 @@ static int vs_lookup_cb(const uint8_t hash16[16],
     int p = vs_pair_find(c, hash16);
     if (p < 0) return 0;
     pthread_mutex_lock(&c->mu);
-    VSStaged *cur = &c->staged[c->pairs[p].slot];
     const uint8_t *rec = (const uint8_t *)value;
-    /* Bitmap view for the NULL-bit test — resolved once per record. */
-    const uint8_t *vbase = NULL, *vbm = NULL;
-    int vbm_bytes = 0; size_t vregion = 0;
-    int view_ok = typed_record_view(rec, vlen, hdr2, &vbase, &vbm,
-                                    &vbm_bytes, &vregion) == 0;
-    (void)vbase; (void)vregion;
+    TypedRowView view;
+    int vok = typed_row_open(c->ts, rec, vlen, hdr2, &view) == 0;
     for (int i = 0; i < c->nspecs; i++) {
         enum AggFn fn = c->specs[i].fn;
-        if (fn == AGG_COUNT) continue;
-        const TypedField *tf = c->spec_tfs[i];
-        if (!tf) continue;
+        if (fn == AGG_COUNT || !c->spec_tfs[i] || !vok) continue;
         /* NULL spec value skips the accumulator (§2.5: sum/avg/min/max
            skip NULLs; avg's denominator counts non-NULL only). */
-        if (c->spec_tidx && c->spec_tidx[i] >= 0 && view_ok &&
-            typed_field_null(vbm, vbm_bytes, c->spec_tidx[i])) continue;
-        size_t avail;
-        const uint8_t *fp = agg_field_ptr(rec, vlen, tf, &avail, hdr2, &(int){0});
-        double v;
-        if (typed_field_to_double(tf, fp, avail, &v) != AGG_VALUE_PRESENT) continue;
-        switch (fn) {
-        case AGG_SUM:
-        case AGG_AVG:
-            cur->spec_sum[i] += v;
-            cur->spec_count[i]++;
-            break;
-        case AGG_MIN:
-            if (cur->spec_count[i] == 0 || v < cur->spec_min[i])
-                cur->spec_min[i] = v;
-            cur->spec_count[i]++;
-            break;
-        case AGG_MAX:
-            if (cur->spec_count[i] == 0 || v > cur->spec_max[i])
-                cur->spec_max[i] = v;
-            cur->spec_count[i]++;
-            break;
-        default: break;
+        if (c->spec_tidx && c->spec_tidx[i] >= 0) {
+            TypedRowSpan sp;
+            if (typed_row_span(&view, (size_t)c->spec_tidx[i], &sp) == 0 &&
+                sp.is_null) continue;
         }
+        size_t k = (size_t)c->pairs[p].slot * (size_t)c->nspecs + (size_t)i;
+        int r = agg_num_offer_row(&c->spec_nums[i], &view, &c->nums[k], c->env);
+        if (r < 0) { c->err = errno ? errno : EILSEQ; break; }
+        if (r == 1) c->counts[k]++;
     }
     /* Batched attribution is exact via the pair map; a non-zero return
        would abort the enclosing bulk-fetch run and drop the rest of the
@@ -4124,58 +4275,45 @@ static void vs_flush_pending(SlotcaskDb *sdb,
    Two cmd_aggregate planner branches need this exact loop+emit logic
    (single-leaf KeySet path and AND-intersect KeySet path) — extracted
    to avoid the 45-line duplication CPD flagged. */
-static void emit_min_max_via_keyset(const char *db_root, const char *object,
+static int emit_min_max_via_keyset(const char *db_root, const char *object,
                                     const Schema *sch,
                                     const AggSpec *spec,
                                     const TypedField *agg_tf,
+                                    const TypedSchema *ts,
                                     KeySet *ks,
                                     const char *format,
                                     const char *delimiter,
                                     int want_total) {
-    int n_idx = index_splits_for(sch->splits);
-    int desc  = (spec->fn == AGG_MAX) ? 1 : 0;
-    double best = 0.0;
-    int have = 0;
-    for (int s = 0; s < n_idx; s++) {
-        char idx_path[PATH_MAX];
-        build_idx_path(idx_path, sizeof(idx_path), db_root,
-                       object, spec->field, s);
-        BtRangeIter *it = btree_range_iter_open(
-            idx_path, "", 0, 0,
-            AGG_VALUE_TIER_CEIL, 1, 1, desc);
-        if (!it) continue;
-        const char *val; size_t vlen; const uint8_t *hash16;
-        while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-            if (!keyset_contains(ks, hash16)) continue;
-            double v;
-            if (decode_index_key_to_double(agg_tf,
-                                           (const uint8_t *)val,
-                                           vlen, &v) == AGG_VALUE_PRESENT) {
-                if (!have) { best = v; have = 1; }
-                else if (desc) { if (v > best) best = v; }
-                else           { if (v < best) best = v; }
-                break;
-                    /* per-shard min/max found */
-            }
-        }
-        btree_range_iter_close(it);
+    AggNumSpec ns;
+    if (!agg_num_spec_for(ts, (size_t)(agg_tf - ts->fields), &ns) ||
+        !agg_index_exact(&ns)) {
+        keyset_free(ks);
+        return 0;                     /* record-fed route decides (D1) */
     }
+    QueryDeadline wdl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
+    _Atomic size_t wbytes = 0;
+    atomic_init(&wbytes, 0);
+    AggWalkArg proto = { .db_root = db_root, .object = object,
+        .field = spec->field, .spec = &ns, .ks = ks, .dl = &wdl,
+        .budget = &wbytes, .limit = g_query_buffer_max_bytes,
+        .first_only = 1, .desc = spec->fn == AGG_MAX };
+    AggNum num; memset(&num, 0, sizeof num);
+    int64_t cnt = 0;
+    int rc = agg_walk_field(&proto, index_splits_for(sch->splits), &num, &cnt);
     keyset_free(ks);
-
-    char vbuf[64];
-    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
+    AggCell cell; memset(&cell, 0, sizeof cell);
+    agg_cells_bind(&cell, 1, &wbytes, g_query_buffer_max_bytes);
+    int err = rc < 0 ? (errno ? errno : EILSEQ) : (rc > 0 || wdl.timed_out) ? ETIMEDOUT : 0;
+    if (!err && agg_cell_from_num(&ns, &num, spec->fn, cnt, &cell)) err = errno;
+    AggEnv env; agg_env_init(&env, &wbytes, g_query_buffer_max_bytes);
+    agg_num_release(&num, ns.cls, &env);
+    agg_env_free(&env);
+    if (err) { agg_cells_free(&cell, 1); return agg_report_error(err); }
     char csv_delim_local = (format && strcmp(format, "csv") == 0)
                              ? parse_csv_delim(delimiter) : 0;
-    if (csv_delim_local) {
-        csv_emit_cell(spec->alias, csv_delim_local);
-        OUT("\n");
-        csv_emit_cell(vbuf, csv_delim_local);
-        OUT("\n");
-    } else if (want_total) {
-        OUT("{\"rows\":{\"%s\":%s},\"total\":1}\n", spec->alias, vbuf);
-    } else {
-        OUT("{\"%s\":%s}\n", spec->alias, vbuf);
-    }
+    agg_emit_scalar_cells(spec, 1, &cell, csv_delim_local, want_total);
+    agg_cells_free(&cell, 1);
+    return 1;
 }
 
 /* Bitmap emit → hbk adapter.
@@ -4255,12 +4393,17 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                             const char *having_json,
                             CriteriaNode *having_tree,   /* NEW — priority over having_json */
                             const char *order_by, int order_desc, int limit,
-                            const char *format, const char *delimiter, int want_total) {
+                            const char *format, const char *delimiter, int want_total,
+                            const Schema *sch_in, const FieldSchema *fs_in) {
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
 
-    Schema sch = load_schema(db_root, object);
+    Schema sch;
     FieldSchema fs;
-    init_field_schema(&fs, db_root, object);
+    if (sch_in && fs_in) { sch = *sch_in; fs = *fs_in; }   /* test seam: private schema */
+    else {
+        sch = load_schema(db_root, object);
+        init_field_schema(&fs, db_root, object);
+    }
 
     {
         char verr[256];
@@ -4305,329 +4448,101 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         }
     }
 
-    /* Fast path: single-spec SUM / AVG / MIN / MAX on an indexed non-varchar
-       field with no criteria / group_by / having. Walk btree leaves
-       directly across the field's idx shards, decode encoded leaf bytes
-       via decode_index_key_to_double (no record fetch, no slot probe),
-       accumulate per-shard, merge.
-
-       MIN  → first leaf entry per shard (ASC iter), take global min.
-       MAX  → last  leaf entry per shard (DESC iter), take global max.
-       SUM  → walk every entry, sum decoded values.
-       AVG  → SUM with running count, divide at end.
-
-       Skipped for varchar — typed_field_to_double atof()'s string content,
-       so sum/avg/min/max on names is degenerate by design and a leaf-byte
-       decode wouldn't change the output. Skipped for composite ("a+b")
-       since those aren't a single typed scalar. Saves 200-400ms per
-       query at 1M records vs the full record-decode scan. */
+    /* Fast path: single-spec text min/max on an indexed calendar field.
+       Varchar declines this bounded text decoder and uses full record spans,
+       including with an index present (D8). */
     if (!tree && no_group && no_having && nspecs == 1 &&
-        (specs[0].fn == AGG_SUM || specs[0].fn == AGG_AVG ||
-         specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
+        (specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
         fs.ts && specs[0].field[0] && !strchr(specs[0].field, '+')) {
         int fi = typed_field_index(fs.ts, specs[0].field);
-        if (fi >= 0 && (specs[0].fn == AGG_MIN || specs[0].fn == AGG_MAX) &&
+        if (fi >= 0 &&
             agg_type_is_text(fs.ts->fields[fi].type) &&
+            fs.ts->fields[fi].type != FT_VARCHAR &&
             btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
-            agg_minmax_text_indexed(db_root, object, &sch, &specs[0],
+            int tr = agg_minmax_text_indexed(db_root, object, &sch, &specs[0],
                                     &fs.ts->fields[fi], format, delimiter,
                                     want_total);
-            return 0;
-        }
-        if (fi >= 0 && !agg_type_is_text(fs.ts->fields[fi].type) &&
-            btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
-            const TypedField *tf = &fs.ts->fields[fi];
-            int n_idx = index_splits_for(sch.splits);
-            enum AggFn fn = specs[0].fn;
-            int min_or_max = (fn == AGG_MIN || fn == AGG_MAX);
-            int desc = (fn == AGG_MAX) ? 1 : 0;
-            double accum = 0.0;       /* sum, or running min/max */
-            int64_t count = 0;
-            int have = 0;
-
-            /* Parallelise per-shard btree walks. Each shard's worker
-               accumulates locally; merge after. At 25M records with
-               16 idx shards this drops sum/avg from a sequential
-               9-15 s cold to ~2-3 s as the shards' cold reads
-               overlap on the I/O queue. */
-            AggSingleArg *args = calloc((size_t)n_idx, sizeof(AggSingleArg));
-            if (args) {
-                for (int s = 0; s < n_idx; s++) {
-                    args[s].db_root    = db_root;
-                    args[s].object     = object;
-                    args[s].field      = specs[0].field;
-                    args[s].shard_id   = s;
-                    args[s].tf         = tf;
-                    args[s].fn         = fn;
-                    args[s].min_or_max = min_or_max;
-                    args[s].desc       = desc;
-                }
-                parallel_for_io(agg_single_shard_worker, args, n_idx,
-                                 sizeof(AggSingleArg));
-                for (int s = 0; s < n_idx; s++) {
-                    if (!args[s].have) continue;
-                    if (!have) {
-                        accum = args[s].accum;
-                        count = args[s].count;
-                        have  = 1;
-                    } else {
-                        switch (fn) {
-                            case AGG_SUM:
-                            case AGG_AVG: accum += args[s].accum; count += args[s].count; break;
-                            case AGG_MIN: if (args[s].accum < accum) accum = args[s].accum;
-                                          count += args[s].count; break;
-                            case AGG_MAX: if (args[s].accum > accum) accum = args[s].accum;
-                                          count += args[s].count; break;
-                            default: break;
-                        }
-                    }
-                }
-                free(args);
-            } else {
-                /* Sequential fallback on calloc OOM. */
-                for (int s = 0; s < n_idx; s++) {
-                    char idx_path[PATH_MAX];
-                    build_idx_path(idx_path, sizeof(idx_path), db_root, object,
-                                   specs[0].field, s);
-                    BtRangeIter *it = btree_range_iter_open(
-                        idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, desc);
-                    if (!it) continue;
-                    const char *val; size_t vlen; const uint8_t *hash16;
-                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-                        double v;
-                        if (decode_index_key_to_double(tf, (const uint8_t *)val,
-                                                       vlen, &v) == AGG_VALUE_PRESENT) {
-                            if (!have) { accum = v; have = 1; count = 1; }
-                            else {
-                                switch (fn) {
-                                    case AGG_SUM:
-                                    case AGG_AVG: accum += v; count++; break;
-                                    case AGG_MIN: if (v < accum) accum = v; count++; break;
-                                    case AGG_MAX: if (v > accum) accum = v; count++; break;
-                                    default: break;
-                                }
-                            }
-                        }
-                        if (min_or_max) break;
-                    }
-                    btree_range_iter_close(it);
-                }
-            }
-            double result = 0.0;
-            switch (fn) {
-                case AGG_SUM: result = have ? accum : 0.0; break;
-                case AGG_AVG: result = (have && count > 0) ? accum / (double)count : 0.0; break;
-                case AGG_MIN:
-                case AGG_MAX: result = have ? accum : 0.0; break;
-                default: break;
-            }
-            char vbuf[64];
-            fmt_double(vbuf, sizeof(vbuf), result);
-            char csv_delim_local = (format && strcmp(format, "csv") == 0)
-                                     ? parse_csv_delim(delimiter) : 0;
-            if (csv_delim_local) {
-                csv_emit_cell(specs[0].alias, csv_delim_local);
-                OUT("\n");
-                csv_emit_cell(vbuf, csv_delim_local);
-                OUT("\n");
-            } else if (want_total) {
-                OUT("{\"rows\":{\"%s\":%s},\"total\":1}\n", specs[0].alias, vbuf);
-            } else {
-                OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
-            }
-            return 0;
+            return tr < 0 ? -1 : 0;
         }
     }
 
-    /* Fast path: bundled multi-spec aggregate, no criteria, no group, no
-       having. Every spec must be COUNT (count(*) or count(non-varchar))
-       or SUM/AVG/MIN/MAX on an indexed non-varchar non-composite field.
-       Walks each unique non-count agg field's btree ONCE, accumulating
-       sum/min/max into every spec sharing that field — `count + sum +
-       avg + min + max balance` is one balance walk, not five. COUNT
-       specs read live_count (typed records always carry every field;
-       count metadata path semantics).
-
-       Subsumes the single-spec path above when nspecs > 1; nspecs == 1
-       still routes through that path so MIN/MAX retain their first-leaf
-       early-exit (~50µs vs ~25ms full walk). Saves ~16x on the bench's
-       `sum/avg/min/max balance` (404ms → ~25ms). */
-    if (!tree && no_group && no_having && nspecs > 1 && fs.ts) {
-        int eligible = 1;
-        int has_noncount = 0;
+    /* Fast path: no criteria, no group, no having. Every spec is count(*),
+       count(field) on an indexed numeric-class field, or sum/avg/min/max on
+       an indexed numeric-class field whose index key carries its full value
+       (D1). One exact walk per distinct field; count(*) reads metadata. */
+    if (!tree && no_group && no_having && fs.ts) {
+        int eligible = 1, has_walk = 0;
         for (int i = 0; i < nspecs && eligible; i++) {
             AggSpec *sp = &specs[i];
-            if (sp->fn == AGG_COUNT) {
-                if (sp->field[0]) {
-                    if (strchr(sp->field, '+')) { eligible = 0; break;
-                    }
-                    int fi = typed_field_index(fs.ts, sp->field);
-                    /* Presence-doctrine counts need per-record marker
-                       checks — bail to the general scan path. */
-                    if (fi >= 0 && agg_count_inspects_presence(fs.ts->fields[fi].type)) {
-                        eligible = 0; break;
-                    }
-                }
-                continue;
-            }
-            if (sp->fn != AGG_SUM && sp->fn != AGG_AVG &&
-                sp->fn != AGG_MIN && sp->fn != AGG_MAX) {
-                eligible = 0; break;
-            }
-            if (!sp->field[0] || strchr(sp->field, '+')) {
-                eligible = 0; break;
-            }
-            int fi = typed_field_index(fs.ts, sp->field);
-            if (fi < 0 || agg_type_is_text(fs.ts->fields[fi].type) ||
-                !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
-                eligible = 0; break;
-            }
-            has_noncount = 1;
+            if (sp->fn == AGG_COUNT && !sp->field[0]) continue;
+            AggNumSpec ns;
+            int fi = sp->field[0] && !strchr(sp->field, '+')
+                         ? typed_field_index(fs.ts, sp->field) : -1;
+            if (fi < 0 || !agg_num_spec_for(fs.ts, (size_t)fi, &ns) ||
+                !agg_index_exact(&ns) ||
+                !btree_idx_exists(db_root, object, sp->field, sch.splits))
+                eligible = 0;
+            else has_walk = 1;
         }
-
-        if (eligible) {
-            long live = (long)get_live_count(db_root, object);
-            int64_t counts[MAX_AGG_SPECS] = {0};
-            double  sums[MAX_AGG_SPECS]   = {0};
-            double  mins[MAX_AGG_SPECS], maxs[MAX_AGG_SPECS];
-            int     present[MAX_AGG_SPECS] = {0};
-            for (int i = 0; i < nspecs; i++) {
-                mins[i] = 1e308;
-                maxs[i] = -1e308;
-            }
-
-            int processed[MAX_AGG_SPECS] = {0};
+        if (eligible && has_walk) {
+            QueryDeadline wdl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
+            _Atomic size_t wbytes = 0;
+            atomic_init(&wbytes, 0);
+            AggCell cells[MAX_AGG_SPECS];
+            memset(cells, 0, sizeof cells);
+            agg_cells_bind(cells, nspecs, &wbytes, g_query_buffer_max_bytes);
+            int done[MAX_AGG_SPECS] = {0}, err = 0;
             int n_idx = index_splits_for(sch.splits);
-            for (int i = 0; i < nspecs && has_noncount; i++) {
-                if (processed[i] || specs[i].fn == AGG_COUNT) continue;
-                const char *fld = specs[i].field;
-                int fi = typed_field_index(fs.ts, fld);
-                if (fi < 0) { processed[i] = 1; continue; }
-                const TypedField *tf = &fs.ts->fields[fi];
-                /* Collect every spec sharing this field — including
-                   count(field) siblings: the tier-clamped walk counts
-                   PRESENT entries, which IS the non-NULL record count
-                   (§2.5: the bitmap is the truth; live_count would
-                   over-count NULLs). */
-                int sibs[MAX_AGG_SPECS]; int nsibs = 0;
-                for (int j = i; j < nspecs; j++) {
-                    if (specs[j].fn == AGG_COUNT && !specs[j].field[0]) continue;
-                    if (strcmp(specs[j].field, fld) != 0) continue;
-                    sibs[nsibs++] = j;
-                    processed[j] = 1;
-                }
-                for (int s = 0; s < n_idx; s++) {
-                    char idx_path[PATH_MAX];
-                    build_idx_path(idx_path, sizeof(idx_path), db_root, object, fld, s);
-                    BtRangeIter *it = btree_range_iter_open(
-                        idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, 0);
-                    if (!it) continue;
-                    const char *val; size_t vlen; const uint8_t *hash16;
-                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-                        double v;
-                        if (decode_index_key_to_double(tf, (const uint8_t *)val,
-                                                       vlen, &v) != AGG_VALUE_PRESENT) continue;
-                        for (int k = 0; k < nsibs; k++) {
-                            int idx = sibs[k];
-                            counts[idx]++;
-                            sums[idx] += v;
-                            if (v < mins[idx]) mins[idx] = v;
-                            if (v > maxs[idx]) maxs[idx] = v;
-                            present[idx] = 1;
-                        }
-                    }
-                    btree_range_iter_close(it);
-                }
-            }
-
-            /* count(field) specs whose field had no walking sibling:
-               same tier-clamped PRESENT count, own walk. */
-            for (int i = 0; i < nspecs && has_noncount; i++) {
-                if (processed[i] || specs[i].fn != AGG_COUNT ||
-                    !specs[i].field[0] || strchr(specs[i].field, '+'))
-                    continue;
+            for (int i = 0; i < nspecs && !err; i++) {
+                if (done[i] || !specs[i].field[0]) continue;
                 int fi = typed_field_index(fs.ts, specs[i].field);
-                if (fi < 0) { processed[i] = 1; continue; }
-                const TypedField *tf = &fs.ts->fields[fi];
-                processed[i] = 1;
-                for (int s = 0; s < n_idx; s++) {
-                    char idx_path[PATH_MAX];
-                    build_idx_path(idx_path, sizeof(idx_path), db_root,
-                                   object, specs[i].field, s);
-                    BtRangeIter *it = btree_range_iter_open(
-                        idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, 0);
-                    if (!it) continue;
-                    const char *val; size_t vlen; const uint8_t *hash16;
-                    while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
-                        double v;
-                        if (decode_index_key_to_double(tf, (const uint8_t *)val,
-                                                       vlen, &v) == AGG_VALUE_PRESENT)
-                            counts[i]++;
-                    }
-                    btree_range_iter_close(it);
+                AggNumSpec ns;
+                agg_num_spec_for(fs.ts, (size_t)fi, &ns);
+                int sibs[MAX_AGG_SPECS], nsibs = 0, nmin = 0, nmax = 0, nfull = 0;
+                for (int j = i; j < nspecs; j++) {
+                    if (done[j] || strcmp(specs[j].field, specs[i].field) != 0) continue;
+                    sibs[nsibs++] = j; done[j] = 1;
+                    if (specs[j].fn == AGG_MIN) nmin++;
+                    else if (specs[j].fn == AGG_MAX) nmax++;
+                    else nfull++;
                 }
+                AggWalkArg proto = { .db_root = db_root, .object = object,
+                    .field = specs[i].field, .spec = &ns, .dl = &wdl,
+                    .budget = &wbytes, .limit = g_query_buffer_max_bytes };
+                if (!nfull && (nmin == 0 || nmax == 0)) {   /* pure min or pure max */
+                    proto.first_only = 1;
+                    proto.desc = nmax > 0;
+                }
+                AggNum num; memset(&num, 0, sizeof num);
+                int64_t cnt = 0;
+                AggEnv env; agg_env_init(&env, &wbytes, g_query_buffer_max_bytes);
+                int rc = agg_walk_field(&proto, n_idx, &num, &cnt);
+                if (rc < 0) err = errno ? errno : EILSEQ;
+                else if (rc > 0 || wdl.timed_out) err = ETIMEDOUT;
+                for (int k = 0; k < nsibs && !err; k++) {
+                    int si = sibs[k];
+                    if (specs[si].fn == AGG_COUNT) {
+                        if (agg_cell_count(&cells[si], cnt)) err = errno;
+                    } else if (agg_cell_from_num(&ns, &num, specs[si].fn, cnt, &cells[si])) {
+                        err = errno;
+                    }
+                }
+                agg_num_release(&num, ns.cls, &env);
+                agg_env_free(&env);
             }
-
-            char csv_delim_local = (format && strcmp(format, "csv") == 0)
-                                     ? parse_csv_delim(delimiter) : 0;
-            if (csv_delim_local) {
-                for (int i = 0; i < nspecs; i++) {
-                    if (i > 0) { char d[2] = {csv_delim_local, '\0'}; OUT("%s", d); }
-                    csv_emit_cell(specs[i].alias, csv_delim_local);
-                }
-                OUT("\n");
-                for (int i = 0; i < nspecs; i++) {
-                    if (i > 0) { char d[2] = {csv_delim_local, '\0'}; OUT("%s", d); }
-                    char vbuf[64];
-                    switch (specs[i].fn) {
-                    case AGG_COUNT:
-                        snprintf(vbuf, sizeof(vbuf), "%ld",
-                                 specs[i].field[0] ? (long)counts[i] : live);
-                        break;
-                    case AGG_SUM:   fmt_double(vbuf, sizeof(vbuf), present[i] ? sums[i] : 0.0); break;
-                    case AGG_AVG:   fmt_double(vbuf, sizeof(vbuf),
-                                               counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0); break;
-                    case AGG_MIN:   fmt_double(vbuf, sizeof(vbuf), present[i] ? mins[i] : 0.0); break;
-                    case AGG_MAX:   fmt_double(vbuf, sizeof(vbuf), present[i] ? maxs[i] : 0.0); break;
-                    default: vbuf[0] = '\0'; break;
-                    }
-                    csv_emit_cell(vbuf, csv_delim_local);
-                }
-                OUT("\n");
-            } else {
-                OUT(want_total ? "{\"rows\":{" : "{");
-                for (int i = 0; i < nspecs; i++) {
-                    if (i > 0) OUT(",");
-                    char vbuf[64];
-                    switch (specs[i].fn) {
-                    case AGG_COUNT:
-                        if (specs[i].field[0])
-                            OUT("\"%s\":%lld", specs[i].alias, (long long)counts[i]);
-                        else
-                            OUT("\"%s\":%ld", specs[i].alias, live);
-                        break;
-                    case AGG_SUM:
-                        fmt_double(vbuf, sizeof(vbuf), present[i] ? sums[i] : 0.0);
-                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
-                    case AGG_AVG:
-                        fmt_double(vbuf, sizeof(vbuf),
-                                   counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0);
-                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
-                    case AGG_MIN:
-                        fmt_double(vbuf, sizeof(vbuf), present[i] ? mins[i] : 0.0);
-                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
-                    case AGG_MAX:
-                        fmt_double(vbuf, sizeof(vbuf), present[i] ? maxs[i] : 0.0);
-                        OUT("\"%s\":%s", specs[i].alias, vbuf); break;
-                    }
-                }
-                OUT(want_total ? "},\"total\":1}\n" : "}\n");
+            for (int i = 0; i < nspecs && !err; i++)
+                if (specs[i].fn == AGG_COUNT && !specs[i].field[0] &&
+                    agg_cell_count(&cells[i], (int64_t)get_live_count(db_root, object)))
+                    err = errno;
+            if (err) {
+                agg_cells_free(cells, nspecs);
+                return agg_report_error(err);
             }
+            agg_emit_scalar_cells(specs, nspecs, cells, csv_delim, want_total);
+            agg_cells_free(cells, nspecs);
             return 0;
         }
     }
-
-
 
     /* Streaming top-N dispatch: eligible_for_topn_stream + agg_run_topn_stream.
      * Build a CSV form of group_by_json for the eligibility check. */
@@ -4679,6 +4594,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             if (rc == 0) {
                 return 0;
             }
+            if (rc == -3) return -1; /* error response was already written */
             if (rc == -1) {
                 OUT("{\"error\":\"query_timeout\"}\n");
                 return -1;
@@ -4775,6 +4691,23 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         }
     }
 
+    agg_env_init(&ctx.env, &agg_budget_bytes, g_query_buffer_max_bytes);
+    for (int i = 0; i < ctx.nspecs && i < MAX_AGG_SPECS; i++)
+        if (ctx.spec_tfs[i] && ctx.specs[i].fn != AGG_COUNT)
+            ctx.spec_is_num[i] = (uint8_t)agg_num_spec_for(
+                fs.ts, (size_t)(ctx.spec_tfs[i] - fs.ts->fields), &ctx.spec_nums[i]);
+    for (int i = 0; i < ctx.ngroups; i++)
+        if (ctx.group_tfs[i])
+            ctx.group_is_num[i] = (uint8_t)(agg_num_spec_for(
+                fs.ts, (size_t)ctx.group_idx[i], &ctx.group_nums[i]) &&
+                ctx.group_tfs[i]->type != FT_BOOL);
+    /* Packed decimals are variable-width values. Legacy numeric's 8-byte
+       raw grouping shortcut would collide or disagree with index keys. */
+    if (fs.ts && fs.ts->packed.nfields)
+        for (int i = 0; i < ctx.ngroups; i++)
+            if (ctx.group_is_num[i] && ctx.group_nums[i].cls == AGC_DEC)
+                ctx.use_int_keys = 0;
+
     /* Pre-scan having validation: every leaf's field must resolve to an
        aggregate alias or group_by field, and its operator must fit the
        statically known result kind — before any scan or index walk. */
@@ -4820,12 +4753,13 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         int sf_agg_fi = typed_field_index(fs.ts, specs[0].field);
         if (sf_leaf_node && sf_agg_fi >= 0 &&
             !agg_type_is_text(fs.ts->fields[sf_agg_fi].type) &&
+            agg_index_exact_field(fs.ts, &fs.ts->fields[sf_agg_fi]) &&
             btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
             const TypedField *agg_tf = &fs.ts->fields[sf_agg_fi];
             SearchCriterion *crit = &sf_leaf_node->leaf;
             int minmax_status0=agg_minmax_same_field_btree(
                     db_root, object, specs[0].field, specs[0].alias,
-                    agg_tf, sch.splits,
+                    agg_tf, fs.ts, sch.splits,
                     specs[0].fn == AGG_MAX, crit, format, delimiter, want_total);
             if(minmax_status0<0)return -1;
             if(minmax_status0) {
@@ -4849,8 +4783,11 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         int agg_fi = typed_field_index(fs.ts, specs[0].field);
         if (agg_fi >= 0 &&
             !agg_type_is_text(fs.ts->fields[agg_fi].type) &&
+            agg_index_exact_field(fs.ts, &fs.ts->fields[agg_fi]) &&
             btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
             const TypedField *agg_tf = &fs.ts->fields[agg_fi];
+            AggNumSpec wfc_ns;
+            agg_num_spec_for(fs.ts, (size_t)agg_fi, &wfc_ns);
             int n_idx = index_splits_for(sch.splits);
             int desc = (specs[0].fn == AGG_MAX) ? 1 : 0;
             WfcArg *wargs = calloc((size_t)n_idx, sizeof(WfcArg));
@@ -4867,46 +4804,49 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     wargs[s].fs        = &fs;
                     wargs[s].deadline  = &dl;
                     wargs[s].budget    = 10000;
+                    wargs[s].spec      = &wfc_ns;
                 }
                 parallel_for(wfc_worker, wargs, n_idx, sizeof(WfcArg));
 
                 int any_indefinite = 0;
                 int predicate_error=0;
-                double best = 0.0;
-                int have = 0;
+                int found = 0;
+                AggNum total; memset(&total, 0, sizeof total);
+                AggEnv wenv; agg_env_init(&wenv, NULL, 0);
                 for (int s = 0; s < n_idx; s++) {
                     if (wargs[s].budget_exceeded) any_indefinite = 1;
                     if(wargs[s].predicate_error)predicate_error=wargs[s].predicate_error;
-                    if (wargs[s].found) {
-                        if (!have) { best = wargs[s].best; have = 1; }
-                        else if (desc) { if (wargs[s].best > best) best = wargs[s].best; }
-                        else           { if (wargs[s].best < best) best = wargs[s].best; }
-                    }
+                    if (!predicate_error &&
+                        agg_num_merge(&total, &wargs[s].num, wfc_ns.cls, &wenv))
+                        predicate_error = errno ? errno : EILSEQ;
+                    agg_num_release(&wargs[s].num, wfc_ns.cls, &wenv);
+                    agg_env_free(&wargs[s].env);   /* worker scratch (T3) */
+                    if (wargs[s].found) found = 1;
                 }
+                agg_env_free(&wenv);
                 free(wargs);
-                if(predicate_error){OUT("{\"error\":\"invalid typed record\"}\n");errno=predicate_error;return -1;}
+                if(predicate_error){int e=predicate_error;agg_num_release(&total,wfc_ns.cls,&wenv);return agg_report_error(e);}
                 if (dl.timed_out) {
                     LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query deadline exceeded (single-shard fast path)");
+                    agg_num_release(&total, wfc_ns.cls, &wenv);
                     OUT("{\"error\":\"query_timeout\"}\n");
                     return -1;
                 }
                 if (!any_indefinite) {
-                    char vbuf[64];
-                    fmt_double(vbuf, sizeof(vbuf), have ? best : 0.0);
+                    AggCell cell; memset(&cell, 0, sizeof cell);
+                    agg_cells_bind(&cell, 1, ctx.shared_buffer_bytes, g_query_buffer_max_bytes);
+                    int err = 0;
+                    if (agg_cell_from_num(&wfc_ns, &total, specs[0].fn, found ? 1 : 0, &cell))
+                        err = errno ? errno : EILSEQ;
+                    agg_num_release(&total, wfc_ns.cls, &wenv);
+                    if (err) { agg_cells_free(&cell, 1); return agg_report_error(err); }
                     char csv_delim_local = (format && strcmp(format, "csv") == 0)
                                              ? parse_csv_delim(delimiter) : 0;
-                    if (csv_delim_local) {
-                        csv_emit_cell(specs[0].alias, csv_delim_local);
-                        OUT("\n");
-                        csv_emit_cell(vbuf, csv_delim_local);
-                        OUT("\n");
-                    } else if (want_total) {
-                        OUT("{\"rows\":{\"%s\":%s},\"total\":1}\n", specs[0].alias, vbuf);
-                    } else {
-                        OUT("{\"%s\":%s}\n", specs[0].alias, vbuf);
-                    }
+                    agg_emit_scalar_cells(&specs[0], 1, &cell, csv_delim_local, want_total);
+                    agg_cells_free(&cell, 1);
                     return 0;
                 }
+                agg_num_release(&total, wfc_ns.cls, &wenv);
                 /* else: fall through to keyset/intersect paths below */
             }
         }
@@ -4917,7 +4857,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
        the agg field's btree in ASC (MIN) or DESC (MAX) order — the first
        leaf entry whose hash is in the KeySet is the answer. No record
        fetches; the agg value comes straight from the leaf bytes via
-       decode_index_key_to_double. ~10× faster than agg_run_plan's path
+       the exact key decoder. ~10× faster than agg_run_plan's path
        which collects all hashes then decodes per record.
 
        Reached only when walk-fetch-check above bailed (low-selectivity
@@ -4934,6 +4874,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         int agg_fi = typed_field_index(fs.ts, specs[0].field);
         if (crit_leaf_node && agg_fi >= 0 &&
             !agg_type_is_text(fs.ts->fields[agg_fi].type) &&
+            agg_index_exact_field(fs.ts, &fs.ts->fields[agg_fi]) &&
             btree_idx_exists(db_root, object, specs[0].field, sch.splits) &&
             leaf_is_indexed(&crit_leaf_node->leaf, db_root, object, NULL, 0)) {
             const TypedField *agg_tf = &fs.ts->fields[agg_fi];
@@ -4945,7 +4886,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                see agg_minmax_same_field_btree for the full walk. */
             int minmax_status1=agg_minmax_same_field_btree(
                     db_root, object, specs[0].field, specs[0].alias,
-                    agg_tf, sch.splits,
+                    agg_tf, fs.ts, sch.splits,
                     specs[0].fn == AGG_MAX, crit, format, delimiter, want_total);
             if(minmax_status1<0)return -1;
             if(minmax_status1) {
@@ -4972,10 +4913,16 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
 
                 if (!atomic_load_explicit(&sk.full, memory_order_relaxed) &&
                     !dl.timed_out && keyset_size(ks) > 0) {
-                    emit_min_max_via_keyset(db_root, object, &sch,
-                                            &specs[0], agg_tf, ks,
+                    int ks_rc = emit_min_max_via_keyset(db_root, object, &sch,
+                                            &specs[0], agg_tf, fs.ts, ks,
                                             format, delimiter, want_total);
-                    return 0;
+                    if (ks_rc > 0) return 0;        /* answered */
+                    if (ks_rc < 0) return -1;       /* error already emitted */
+                    /* 0: declined — fall through to the general path. The
+                       callee frees ks itself on the declined path. Today
+                       unreachable: both callers gate on agg_index_exact_field,
+                       the same condition the callee declines on (defense in
+                       depth for D1), so no behavioural test can force it. */
                 }
                 keyset_free(ks);
             }
@@ -4999,6 +4946,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         int agg_fi = typed_field_index(fs.ts, specs[0].field);
         if (agg_fi >= 0 &&
             !agg_type_is_text(fs.ts->fields[agg_fi].type) &&
+            agg_index_exact_field(fs.ts, &fs.ts->fields[agg_fi]) &&
             btree_idx_exists(db_root, object, specs[0].field, sch.splits)) {
             const TypedField *agg_tf = &fs.ts->fields[agg_fi];
             SearchCriterion *isect_leaves[MAX_INTERSECT_LEAVES];
@@ -5018,10 +4966,16 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                                                       &dl, &small_primary);
                 if (ks && !small_primary && !dl.timed_out &&
                     keyset_size(ks) > 0) {
-                    emit_min_max_via_keyset(db_root, object, &sch,
-                                            &specs[0], agg_tf, ks,
+                    int ks_rc = emit_min_max_via_keyset(db_root, object, &sch,
+                                            &specs[0], agg_tf, fs.ts, ks,
                                             format, delimiter, want_total);
-                    return 0;
+                    if (ks_rc > 0) return 0;        /* answered */
+                    if (ks_rc < 0) return -1;       /* error already emitted */
+                    /* 0: declined — fall through to the general path. The
+                       callee frees ks itself on the declined path. Today
+                       unreachable: both callers gate on agg_index_exact_field,
+                       the same condition the callee declines on (defense in
+                       depth for D1), so no behavioural test can force it. */
                 }
                 if (ks) keyset_free(ks);
             }
@@ -5069,6 +5023,13 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     if (fi >= 0 && agg_count_inspects_presence(fs.ts->fields[fi].type)) {
                         aw_eligible = 0; break;
                     }
+                    /* count(field) on this route = walked PRESENT entries
+                       (scan parity: NULLs excluded), so the field must be
+                       walked here too. */
+                    if (fi < 0 || !agg_index_exact_field(fs.ts, &fs.ts->fields[fi]) ||
+                        !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
+                        aw_eligible = 0; break;
+                    }
                 }
                 aw_min_max_only = 0;
                 continue;
@@ -5083,7 +5044,10 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             /* This walk accumulates leaf bytes as doubles only. Textual
                min/max must route to the general text-aware path. */
             int fi = typed_field_index(fs.ts, sp->field);
-            if (fi < 0 || agg_type_is_text(fs.ts->fields[fi].type) ||
+            AggNumSpec aw_ns;
+            if (fi < 0 || !agg_num_spec_for(fs.ts, (size_t)fi, &aw_ns) ||
+                !agg_index_exact(&aw_ns) ||
+                agg_type_is_text(fs.ts->fields[fi].type) ||
                 !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
                 aw_eligible = 0; break;
             }
@@ -5152,148 +5116,54 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
 
             if (!aw_indef && crit_ks && !dl.timed_out) {
                 long match_count = (long)keyset_size(crit_ks);
-                int64_t counts[MAX_AGG_SPECS] = {0};
-                double  sums[MAX_AGG_SPECS]   = {0};
-                double  mins[MAX_AGG_SPECS], maxs[MAX_AGG_SPECS];
-                int     present[MAX_AGG_SPECS] = {0};
-                for (int i = 0; i < nspecs; i++) {
-                    mins[i] = 1e308;
-                    maxs[i] = -1e308;
-                }
-                int processed[MAX_AGG_SPECS] = {0};
+                AggCell cells[MAX_AGG_SPECS];
+                memset(cells, 0, sizeof cells);
+                agg_cells_bind(cells, nspecs, ctx.shared_buffer_bytes, g_query_buffer_max_bytes);
+                int done[MAX_AGG_SPECS] = {0}, err = 0;
                 int n_idx = index_splits_for(sch.splits);
-                for (int i = 0; i < nspecs; i++) {
-                    if (processed[i] || specs[i].fn == AGG_COUNT) continue;
-                    const char *fld = specs[i].field;
-                    int fi = typed_field_index(fs.ts, fld);
-                    /* typed_field_index returns -1 when the field name
-                       isn't in the schema. Skip — callers above have
-                       already validated specs against the schema, but
-                       Coverity CID 1693851 can't see that, and a real
-                       runtime mismatch shouldn't deref fields[-1]. */
-                    if (fi < 0) { processed[i] = 1; continue; }
-                    const TypedField *tf = &fs.ts->fields[fi];
-                    int sibs[MAX_AGG_SPECS]; int nsibs = 0;
+                for (int i = 0; i < nspecs && !err; i++) {
+                    if (done[i] || !specs[i].field[0]) continue;
+                    int fi = typed_field_index(fs.ts, specs[i].field);
+                    if (fi < 0) continue;
+                    AggNumSpec ns;
+                    agg_num_spec_for(fs.ts, (size_t)fi, &ns);
+                    int sibs[MAX_AGG_SPECS], nsibs = 0;
                     for (int j = i; j < nspecs; j++) {
-                        if (specs[j].fn == AGG_COUNT) continue;
-                        if (strcmp(specs[j].field, fld) != 0) continue;
-                        sibs[nsibs++] = j;
-                        processed[j] = 1;
+                        if (done[j] || strcmp(specs[j].field, specs[i].field) != 0) continue;
+                        sibs[nsibs++] = j; done[j] = 1;
                     }
-                    /* Parallelise across the agg field's idx shards. Each
-                       worker walks one shard with local accumulators; we
-                       merge after parallel_for returns. Per-worker memory
-                       is small (4 × MAX_AGG_SPECS × 8B ≈ 1KB) so spawn
-                       cost is the only worry — n_idx ≤ 128 here, well
-                       within the pool's tolerance. */
-                    AwcShardArg *wargs = calloc((size_t)n_idx, sizeof(AwcShardArg));
-                    int64_t (*w_counts)[MAX_AGG_SPECS] =
-                        calloc((size_t)n_idx, sizeof(*w_counts));
-                    double (*w_sums)[MAX_AGG_SPECS] =
-                        calloc((size_t)n_idx, sizeof(*w_sums));
-                    double (*w_mins)[MAX_AGG_SPECS] =
-                        calloc((size_t)n_idx, sizeof(*w_mins));
-                    double (*w_maxs)[MAX_AGG_SPECS] =
-                        calloc((size_t)n_idx, sizeof(*w_maxs));
-                    int (*w_present)[MAX_AGG_SPECS] =
-                        calloc((size_t)n_idx, sizeof(*w_present));
-                    if (!wargs || !w_counts || !w_sums || !w_mins ||
-                        !w_maxs || !w_present) {
-                        LOG_ERROR(LOG_SUB_QUERY, "cmd_aggregate_do: calloc failed for n_idx=%d shard workers", n_idx);
-                        free(wargs); free(w_counts); free(w_sums);
-                        free(w_mins); free(w_maxs); free(w_present);
-                        keyset_free(crit_ks);
-                        OUT(QUERY_BUFFER_ERR);
-                        return -1;
-                    }
-                    for (int s = 0; s < n_idx; s++) {
-                        for (int k = 0; k < nsibs; k++) {
-                            w_mins[s][sibs[k]] = 1e308;
-                            w_maxs[s][sibs[k]] = -1e308;
-                        }
-                        wargs[s].db_root  = db_root;
-                        wargs[s].object   = object;
-                        wargs[s].fld      = fld;
-                        wargs[s].shard_id = s;
-                        wargs[s].tf       = tf;
-                        wargs[s].crit_ks  = crit_ks;
-                        wargs[s].sibs     = sibs;
-                        wargs[s].nsibs    = nsibs;
-                        wargs[s].deadline = &dl;
-                        wargs[s].counts   = w_counts[s];
-                        wargs[s].sums     = w_sums[s];
-                        wargs[s].mins     = w_mins[s];
-                        wargs[s].maxs     = w_maxs[s];
-                        wargs[s].present  = w_present[s];
-                    }
-                    parallel_for(awc_shard_worker, wargs, n_idx, sizeof(AwcShardArg));
-                    /* Merge per-shard results into the outer accumulators. */
-                    for (int s = 0; s < n_idx; s++) {
-                        for (int k = 0; k < nsibs; k++) {
-                            int idx = sibs[k];
-                            counts[idx] += w_counts[s][idx];
-                            sums[idx]   += w_sums[s][idx];
-                            if (w_present[s][idx]) {
-                                if (w_mins[s][idx] < mins[idx]) mins[idx] = w_mins[s][idx];
-                                if (w_maxs[s][idx] > maxs[idx]) maxs[idx] = w_maxs[s][idx];
-                                present[idx] = 1;
-                            }
+                    AggWalkArg proto = { .db_root = db_root, .object = object,
+                        .field = specs[i].field, .spec = &ns, .ks = crit_ks,
+                        .dl = &dl, .budget = ctx.shared_buffer_bytes,
+                        .limit = g_query_buffer_max_bytes };
+                    AggNum num; memset(&num, 0, sizeof num);
+                    int64_t cnt = 0;
+                    int rc = agg_walk_field(&proto, n_idx, &num, &cnt);
+                    if (rc < 0) err = errno ? errno : EILSEQ;
+                    else if (rc > 0 || dl.timed_out) err = ETIMEDOUT;
+                    for (int k = 0; k < nsibs && !err; k++) {
+                        int si = sibs[k];
+                        if (specs[si].fn == AGG_COUNT) {
+                            /* count(field) = walked PRESENT entries within the
+                               criteria set — scan parity (NULLs excluded). */
+                            if (agg_cell_count(&cells[si], cnt)) err = errno;
+                        } else if (agg_cell_from_num(&ns, &num, specs[si].fn, cnt, &cells[si])) {
+                            err = errno;
                         }
                     }
-                    free(wargs); free(w_counts); free(w_sums);
-                    free(w_mins); free(w_maxs); free(w_present);
+                    agg_num_release(&num, ns.cls, &ctx.env);
                 }
-
-                /* Emit. COUNT specs use match_count (= |KeySet|). */
-                char csv_delim_local = (format && strcmp(format, "csv") == 0)
-                                         ? parse_csv_delim(delimiter) : 0;
-                if (csv_delim_local) {
-                    for (int i = 0; i < nspecs; i++) {
-                        if (i > 0) { char d[2] = { csv_delim_local, '\0' }; OUT("%s", d); }
-                        csv_emit_cell(specs[i].alias, csv_delim_local);
-                    }
-                    OUT("\n");
-                    for (int i = 0; i < nspecs; i++) {
-                        if (i > 0) { char d[2] = { csv_delim_local, '\0' }; OUT("%s", d); }
-                        char vbuf[64];
-                        if (specs[i].fn == AGG_COUNT) {
-                            snprintf(vbuf, sizeof(vbuf), "%ld", match_count);
-                        } else {
-                            double r = 0.0;
-                            switch (specs[i].fn) {
-                                case AGG_SUM: r = sums[i]; break;
-                                case AGG_AVG: r = counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0; break;
-                                case AGG_MIN: r = present[i] ? mins[i] : 0.0; break;
-                                case AGG_MAX: r = present[i] ? maxs[i] : 0.0; break;
-                                default: break;
-                            }
-                            fmt_double(vbuf, sizeof(vbuf), r);
-                        }
-                        csv_emit_cell(vbuf, csv_delim_local);
-                    }
-                    OUT("\n");
-                } else {
-                    OUT(want_total ? "{\"rows\":{" : "{");
-                    for (int i = 0; i < nspecs; i++) {
-                        if (i > 0) OUT(",");
-                        if (specs[i].fn == AGG_COUNT) {
-                            OUT("\"%s\":%ld", specs[i].alias, match_count);                        } else {
-                            double r = 0.0;
-                            switch (specs[i].fn) {
-                                case AGG_SUM: r = sums[i]; break;
-                                case AGG_AVG: r = counts[i] > 0 ? sums[i] / (double)counts[i] : 0.0; break;
-                                case AGG_MIN: r = present[i] ? mins[i] : 0.0; break;
-                                case AGG_MAX: r = present[i] ? maxs[i] : 0.0; break;
-                                default: break;
-                            }
-                            char vbuf[64];
-                            fmt_double(vbuf, sizeof(vbuf), r);
-                            OUT("\"%s\":%s", specs[i].alias, vbuf);
-                        }
-                    }
-                    OUT(want_total ? "},\"total\":1}\n" : "}\n");
+                for (int i = 0; i < nspecs && !err; i++)
+                    if (specs[i].fn == AGG_COUNT && !specs[i].field[0] &&
+                        agg_cell_count(&cells[i], match_count))
+                        err = errno;   /* count(*) = |KeySet| */
+                if (err) {
+                    agg_cells_free(cells, nspecs);
+                    keyset_free(crit_ks);
+                    return agg_report_error(err);
                 }
-
+                agg_emit_scalar_cells(specs, nspecs, cells, csv_delim, want_total);
+                agg_cells_free(cells, nspecs);
                 keyset_free(crit_ks);
                 return 0;
             }
@@ -5347,13 +5217,14 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
     /* Per-spec eligibility:
         - COUNT(*) or COUNT(group_field) — no lookup needed
         - SUM/AVG/MIN/MAX on an indexed non-varchar non-composite field
-          (record fetch by hash16 + typed_field_to_double). */
+          (record fetch by hash16 + exact row offer). */
     int vs_need_lookup = 0;
     if (vs_eligible) {
         for (int i = 0; i < nspecs; i++) {
             AggSpec *sp = &specs[i];
             if (sp->fn == AGG_COUNT) {
-                if (sp->field[0] && strcmp(sp->field, ctx.group_fields[0]) != 0) {
+                if (sp->field[0]) {
+                    /* Even the group field can be NULL or an unset marker. */
                     vs_eligible = 0; break;
                 }
                 continue;
@@ -5362,7 +5233,9 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 sp->fn != AGG_MIN && sp->fn != AGG_MAX) {
                 vs_eligible = 0; break;
             }
-            if (!ctx.spec_tfs[i] || ctx.spec_tfs[i]->type == FT_VARCHAR ||
+            if (!ctx.spec_tfs[i] || !ctx.spec_is_num[i] ||
+                ctx.spec_nums[i].cls == AGC_DEC ||
+                ctx.spec_tfs[i]->type == FT_VARCHAR ||
                 strchr(sp->field, '+') ||
                 !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
                 vs_eligible = 0; break;
@@ -5400,10 +5273,15 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
            abort and fall through to IGB if a run exceeds the cap without
            leaving partial buckets in ctx.ht. */
         VSStaged *staged = calloc((size_t)limit, sizeof(VSStaged));
+        AggNum *vs_nums = (!vs_need_lookup || limit <= 0) ? NULL
+            : calloc((size_t)limit * (size_t)nspecs, sizeof(AggNum));
+        int64_t *vs_counts = (!vs_need_lookup || limit <= 0) ? NULL
+            : calloc((size_t)limit * (size_t)nspecs, sizeof(int64_t));
         if (!iters || !cur_keys || !cur_klens || !has_cur || !cur_hash16 ||
-            !staged) {
+            !staged || (vs_need_lookup && (!vs_nums || !vs_counts))) {
             free(iters); free(cur_keys); free(cur_klens);
             free(has_cur); free(cur_hash16); free(staged);
+            free(vs_nums); free(vs_counts);
             goto vs_skip;
         }
         for (int s = 0; s < n_idx_g; s++) {
@@ -5508,12 +5386,6 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             cur->key[min_klen] = '\0';
             cur->klen = min_klen;
             cur->total_count = total_count;
-            for (int i = 0; i < nspecs; i++) {
-                cur->spec_sum[i] = 0.0;
-                cur->spec_min[i] = 0.0;
-                cur->spec_max[i] = 0.0;
-                cur->spec_count[i] = 0;
-            }
 
             emitted++;
 
@@ -5527,6 +5399,11 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     .spec_tfs = ctx.spec_tfs,
                     .spec_tidx = vs_spec_tidx,
                     .nspecs   = nspecs,
+                    .ts       = fs.ts,
+                    .nums     = vs_nums,
+                    .counts   = vs_counts,
+                    .spec_nums = ctx.spec_nums,
+                    .env      = &ctx.env,
                 };
                 pthread_mutex_init(&lc.mu, NULL);
                 vs_flush_pending(vs_sdb, &lc, pend, pend_n,
@@ -5535,6 +5412,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                                  ctx.group_fields[0], 1 /* reopen */);
                 pthread_mutex_destroy(&lc.mu);
                 pend_n = 0;
+                if (lc.err && !ctx.agg_error) { ctx.agg_error = lc.err; aborted = 1; }
             }
         }
 
@@ -5548,6 +5426,11 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 .spec_tfs = ctx.spec_tfs,
                 .spec_tidx = vs_spec_tidx,
                 .nspecs   = nspecs,
+                .ts       = fs.ts,
+                .nums     = vs_nums,
+                .counts   = vs_counts,
+                .spec_nums = ctx.spec_nums,
+                .env      = &ctx.env,
             };
             pthread_mutex_init(&lc.mu, NULL);
             vs_flush_pending(vs_sdb, &lc, pend, pend_n,
@@ -5556,6 +5439,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                              ctx.group_fields[0], 0 /* no reopen */);
             pthread_mutex_destroy(&lc.mu);
             pend_n = 0;
+            if (lc.err && !ctx.agg_error) { ctx.agg_error = lc.err; aborted = 1; }
         }
         free(pend);
 
@@ -5564,8 +5448,11 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
 
         if (aborted) {
             /* Low-cardinality data — let IGB handle it. ctx.ht hasn't
-               been touched yet because we staged everything. */
-            free(staged);
+               been touched yet because we staged everything. Released
+               exact states were never committed into ctx buckets. */
+            for (size_t k = 0; k < (size_t)limit * (size_t)nspecs; k++)
+                if (vs_nums) agg_num_release(&vs_nums[k], ctx.spec_nums[k % nspecs].cls, &ctx.env);
+            free(vs_counts); free(vs_nums); free(staged);
             goto vs_skip;
         }
 
@@ -5587,28 +5474,32 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             label[klen] = '\0';
             char *kvp[1] = { label };
             AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0, knull);
-            if (!b) continue;
+            if (!b) {
+                /* Budget/key failure (already flagged on ctx): release every
+                   staged num not yet committed — ownership moved only for
+                   buckets committed before this one — and fail the whole
+                   aggregate. Never a silent partial success. */
+                for (int ri = i; ri < emitted; ri++)
+                    for (int rj = 0; rj < nspecs; rj++) {
+                        if (specs[rj].fn == AGG_COUNT) continue;
+                        agg_num_release(&vs_nums[(size_t)ri * (size_t)nspecs + (size_t)rj],
+                                        ctx.spec_nums[rj].cls, &ctx.env);
+                    }
+                free(vs_counts); free(vs_nums); free(staged);
+                goto igb_skip;
+            }
             for (int j = 0; j < nspecs; j++) {
-                switch (specs[j].fn) {
-                case AGG_COUNT:
+                if (specs[j].fn == AGG_COUNT) {
                     b->accums[j].count = staged[i].total_count;
-                    break;
-                case AGG_SUM:
-                case AGG_AVG:
-                    b->accums[j].sum   = staged[i].spec_sum[j];
-                    b->accums[j].count = staged[i].spec_count[j];
-                    break;
-                case AGG_MIN:
-                    b->accums[j].min   = staged[i].spec_min[j];
-                    b->accums[j].count = staged[i].spec_count[j];
-                    break;
-                case AGG_MAX:
-                    b->accums[j].max   = staged[i].spec_max[j];
-                    b->accums[j].count = staged[i].spec_count[j];
-                    break;
+                    continue;
                 }
+                size_t k = (size_t)i * (size_t)nspecs + (size_t)j;
+                b->accums[j].num   = vs_nums[k];   /* ownership moves */
+                b->accums[j].count = vs_counts[k];
             }
         }
+        free(vs_counts);
+        free(vs_nums);
         free(staged);
 
         igb_done = 1;  /* ctx populated — skip the IGB block, emit below. */
@@ -5673,17 +5564,18 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
         for (int i = 0; i < ctx.nspecs; i++) {
             AggSpec *sp = &ctx.specs[i];
             if (sp->fn == AGG_COUNT) {
-                if (sp->field[0] && ctx.spec_tfs[i] &&
-                    agg_count_inspects_presence(ctx.spec_tfs[i]->type)) {
+                if (sp->field[0]) {
+                    /* Numeric fields can be NULL too: grouping-key counts
+                       cannot stand in for count(field)'s present counts. */
                     igb_eligible = 0; break;
-                     /* presence-doctrine count: per-record marker check */
                 }
                 continue;
             }
             /* sum/avg/min/max: need an indexed numeric agg field. The
                pass-2 walk accumulates leaf bytes as doubles only, so
                textual min/max must route to the general scan path. */
-            if (!ctx.spec_tfs[i] ||
+            if (!ctx.spec_tfs[i] || !ctx.spec_is_num[i] ||
+                !agg_index_exact(&ctx.spec_nums[i]) ||
                 agg_type_is_text(ctx.spec_tfs[i]->type) ||
                 strchr(sp->field, '+') ||
                 !btree_idx_exists(db_root, object, sp->field, sch.splits)) {
@@ -5741,7 +5633,6 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
              and criteria bitmaps simultaneously (no KeySet, no kf I/O).
            Avoids 12.5M btree leaf entries at 25M. */
         if (ctx.ngroups == 1 && !igb_needs_hbm && igb_group_uses_bitmap) {
-            const TypedField *gtf_bm = ctx.group_tfs[0];
             uint8_t  bm_vals[256][1024];
             size_t   bm_vlens[256];
             int      bm_n = 0;
@@ -5768,9 +5659,9 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                         sch.splits, bm_vals[i], bm_vlens[i]);
                     if (total == 0) continue;
                     char display[512];
-                    if (decode_idx_to_buf(gtf_bm, bm_vals[i], bm_vlens[i],
-                                          display, sizeof(display), 0) <= 0)
-                        continue;
+                    int dlen = agg_index_label(&ctx, 0, bm_vals[i], bm_vlens[i],
+                                               display, sizeof(display));
+                    if (dlen < 0) { ctx.agg_error = errno ? errno : EILSEQ; goto igb_skip; }
                     char *kvp[1] = { display };
                     AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0, NULL);
                     if (!b) break;
@@ -5861,9 +5752,11 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                         for (int i = 0; i < bm_n; i++) {
                             if (counts[i] == 0) continue;
                             char display[512];
-                            if (decode_idx_to_buf(gtf_bm, bm_vals[i], bm_vlens[i],
-                                                  display, sizeof(display), 0) <= 0)
-                                continue;
+                            if (agg_index_label(&ctx, 0, bm_vals[i], bm_vlens[i],
+                                                display, sizeof(display)) < 0) {
+                                ctx.agg_error = errno ? errno : EILSEQ;
+                                goto igb_skip;
+                            }
                             char *kvp[1] = { display };
                             AggBucket *b = agg_find_or_create(&ctx, kvp, 1, NULL, 0, NULL);
                             if (!b) break;
@@ -5906,7 +5799,6 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
             uint8_t  bm_vals_h[256][1024];
             size_t   bm_vlens_h[256];
             int      bm_n_h = 0;
-            const TypedField *gtf_bm_h = ctx.group_tfs[0];
             int      bm_dl_h = 0;
             for (int s = 0; s < sch.splits; s++) {
                 if (query_deadline_tick(&dl, &bm_dl_h)) goto igb_skip;
@@ -5951,12 +5843,13 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
 
                 int bm_aborted = 0;
                 for (int v = 0; v < bm_n_h && !bm_aborted; v++) {
-                    /* Decode display string for bucket key. */
+                    /* Decode display string for bucket key (D2 exact label). */
                     char display_h[512];
-                    if (decode_idx_to_buf(gtf_bm_h,
-                                          bm_vals_h[v], bm_vlens_h[v],
-                                          display_h, sizeof(display_h), 0) <= 0)
-                        continue;
+                    if (agg_index_label(&ctx, 0, bm_vals_h[v], bm_vlens_h[v],
+                                        display_h, sizeof(display_h)) < 0) {
+                        ctx.agg_error = errno ? errno : EILSEQ;
+                        goto igb_skip;
+                    }
                     char *kvp_h[1] = { display_h };
                     AggBucket *bkt_h = agg_find_or_create(&ctx, kvp_h, 1,
                                                            NULL, 0, NULL);
@@ -6128,9 +6021,13 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                     sw[s].cap_hint   = per_s_hint;
                     sw[s].arena_hint = per_s_arena;
                     sw[s].dl         = &dl;
+                    sw[s].actx       = &ctx;
+                    sw[s].gi         = g + 1;
                 }
                 parallel_for_io(sec_map_build_worker, sw, n_idx_s,
                                 sizeof(SecMapBuildWorker));
+                for (int s = 0; s < n_idx_s; s++)
+                    if (sw[s].err && !ctx.agg_error) ctx.agg_error = sw[s].err;
                 /* Serial merge: walk each per-worker local_map and insert
                    into the shared sec_maps[g].  hsm_insert on a single map
                    is safe here because the main thread is the only writer.
@@ -6237,7 +6134,7 @@ sec_aborted_label:
 
                        1. Scatter (parallel): each Pass1 worker walks its
                           local.ht and routes buckets into per-(worker,
-                          partition) queues by `agg_hash(group_key) % npart`.
+                          partition) queues by `agg_bucket_hash(b) % npart`.
                           Each worker writes only to its own row, so no
                           contention.
 
@@ -6360,7 +6257,7 @@ sec_aborted_label:
                                     AggBucket *b = pc->ht[i];
                                     while (b) {
                                         AggBucket *next = b->next;
-                                        uint32_t h = agg_hash(b->group_key) &
+                                        uint32_t h = agg_bucket_hash(&ctx, b) &
                                                      (uint32_t)ctx.ht_mask;
                                         b->next = ctx.ht[h];
                                         ctx.ht[h] = b;
@@ -6370,6 +6267,17 @@ sec_aborted_label:
                                 }
                             }
                             agg_arena_transfer(&ctx.arena, &pc->arena);
+                            /* Splice done: these buckets now belong to the
+                               main ctx and their exact states are released by
+                               agg_free's release walk over ctx.ht. Drop the
+                               partition's own table so the later
+                               agg_ctx_free_local release walk cannot traverse
+                               the spliced (now shared) chains — walking them
+                               here would zero main-ctx AggNum state. */
+                            free(pc->ht);
+                            pc->ht = NULL;
+                            pc->ht_cap = pc->ht_mask = 0;
+                            pc->total_buckets = 0;
                         }
                     }
 
@@ -6489,9 +6397,9 @@ sec_aborted_label:
                                decode_idx_to_buf returns 0 for a zero-length
                                payload without writing the buffer. */
                             gbufs[0][0] = '\0';
-                            int n = decode_idx_to_buf(gtf, prim,
-                                                      prim_len, gbufs[0], sizeof(gbufs[0]), 0);
-                            if (n < 0) continue;
+                            int n = agg_index_label(&ctx, 0, prim, prim_len,
+                                                    gbufs[0], sizeof(gbufs[0]));
+                            if (n < 0) { ctx.agg_error = errno ? errno : EILSEQ; aborted = 1; break; }
                             gvals[0] = gbufs[0];
                         } else {
                             gvals[0] = gbufs[0];
@@ -6566,7 +6474,6 @@ igb_pass2:
             for (int i = 0; i < ctx.nspecs && !aborted; i++) {
                 if (processed[i] || ctx.specs[i].fn == AGG_COUNT) continue;
                 const char *fld = ctx.specs[i].field;
-                const TypedField *atf = ctx.spec_tfs[i];
                 /* Collect every spec sharing this field. */
                 int sibs[MAX_AGG_SPECS]; int nsibs = 0;
                 for (int j = i; j < ctx.nspecs; j++) {
@@ -6587,7 +6494,7 @@ igb_pass2:
                    because btree_range_iter_next invalidates the previous
                    call's returned pointers. */
                 #define PFB 16
-                struct { uint8_t hash[16]; double v; } ring[PFB];
+                struct { uint8_t hash[16]; uint16_t klen; uint8_t key[560]; } ring[PFB];
                 for (int s = 0; s < n_idx_a && !aborted; s++) {
                     char idx_path[PATH_MAX];
                     build_idx_path(idx_path, sizeof(idx_path), db_root,
@@ -6598,18 +6505,16 @@ igb_pass2:
                     const char *val; size_t vlen; const uint8_t *hash16;
                     int filled = 0;
                     while (1) {
-                        /* Refill the ring (copies hash16 — iter pointer is
-                           invalidated on next iter_next call). */
+                        /* Refill the ring (copies hash16 + key — iter pointers
+                           are invalidated on the next iter_next call). */
                         while (filled < PFB) {
                             if (btree_range_iter_next(it, &val, &vlen, &hash16) != 1) break;
                             if (query_deadline_tick(&dl, &dl_counter)) { aborted = 1; break;
                     }
-                            double v;
-                            if (decode_index_key_to_double(atf,
-                                                           (const uint8_t *)val,
-                                                           vlen, &v) != AGG_VALUE_PRESENT) continue;
+                            if (vlen == 0 || vlen > sizeof ring[0].key) continue;
                             memcpy(ring[filled].hash, hash16, 16);
-                            ring[filled].v = v;
+                            memcpy(ring[filled].key, val, vlen);
+                            ring[filled].klen = (uint16_t)vlen;
                             __builtin_prefetch(&hbk.entries[hbk_index(&hbk, hash16)], 0, 0);
                             filled++;
                         }
@@ -6621,13 +6526,13 @@ igb_pass2:
                             struct AggBucket *bkt = hbk_get(&hbk, ring[r].hash);
                             if (!bkt) continue;
                             AggBucket *ab = (AggBucket *)bkt;
-                            double v = ring[r].v;
                             for (int k = 0; k < nsibs; k++) {
                                 AggAccum *a = &ab->accums[sibs[k]];
-                                a->count++;
-                                a->sum += v;
-                                if (v < a->min) a->min = v;
-                                if (v > a->max) a->max = v;
+                                int rr = agg_num_offer_key(&ctx.spec_nums[sibs[k]],
+                                                           ring[r].key, ring[r].klen,
+                                                           &a->num, &ctx.env);
+                                if (rr < 0) { ctx.agg_error = errno ? errno : EILSEQ; aborted = 1; break; }
+                                if (rr == 1) a->count++;
                             }
                         }
                         filled = 0;
@@ -6647,6 +6552,18 @@ igb_pass2:
         igb_done = 1;
     }
 igb_skip:
+    if (ctx.agg_error) {
+        int e = ctx.agg_error;
+        agg_free(&ctx);
+        return agg_report_error(e);
+    }
+    if (ctx.budget_exceeded) {
+        /* A fast path hit the per-query buffer cap: the whole aggregate is
+           one explicit error — never a partial success body (Task 6). */
+        agg_free(&ctx);
+        LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query buffer cap exceeded (fast path)");
+        return agg_report_error(ENOBUFS);
+    }
     if (igb_done) {
         /* fast path populated ctx — skip agg_run_plan, fall through to
            the shared having / sort / limit / emit pipeline below. */
@@ -6654,6 +6571,8 @@ igb_skip:
         if (dl.timed_out) {
             LOG_WARN(LOG_SUB_QUERY, "cmd_aggregate_do: query deadline exceeded");
             OUT("{\"error\":\"query_timeout\"}\n");
+        } else if (ctx.agg_error) {
+            agg_report_error(ctx.agg_error);
         } else if(ctx.predicate_error){
             OUT("{\"error\":\"invalid typed record\"}\n");
         } else if (ctx.budget_exceeded) {
@@ -6664,6 +6583,7 @@ igb_skip:
         return -1;
     }
 
+    if (ctx.agg_error) { int e = ctx.agg_error; agg_free(&ctx); return agg_report_error(e); }
     if(ctx.predicate_error){int error=ctx.predicate_error;agg_free(&ctx);OUT("{\"error\":\"invalid typed record\"}\n");errno=error;return -1;}
     /* Collect buckets */
     int nbuckets = 0;
@@ -6679,8 +6599,9 @@ igb_skip:
     if (having_tree) {
         int dst = 0;
         for (int i = 0; i < nbuckets; i++) {
-            if (agg_having_match_tree(&ctx, buckets[i], having_tree))
-                buckets[dst++] = buckets[i];
+            int m = agg_having_match_tree(&ctx, buckets[i], having_tree);
+            if (m < 0) { int e = errno; free(buckets); agg_free(&ctx); return agg_report_error(e); }
+            if (m) buckets[dst++] = buckets[i];
         }
         nbuckets = dst;
     } else {
@@ -6694,8 +6615,13 @@ igb_skip:
         if (nhaving > 0) {
             int dst = 0;
             for (int i = 0; i < nbuckets; i++) {
-                if (agg_having_match(&ctx, buckets[i], having, nhaving))
-                    buckets[dst++] = buckets[i];
+                int m = agg_having_match(&ctx, buckets[i], having, nhaving);
+                if (m < 0) {
+                    int e = errno;
+                    free(buckets); free_criteria(having, nhaving); agg_free(&ctx);
+                    return agg_report_error(e);
+                }
+                if (m) buckets[dst++] = buckets[i];
             }
             nbuckets = dst;
         }
@@ -6718,23 +6644,56 @@ igb_skip:
             free(buckets);
             return -1;
         }
-        g_sort_specs = specs;
-        g_sort_nspecs = nspecs;
-        strncpy(g_sort_field, order_by, 255);
-        g_sort_desc = order_desc;
-        g_sort_ngroups = ctx.ngroups;
-        g_sort_group_fields = ctx.group_fields;
-        g_sort_ctx = &ctx;
-        qsort(buckets, nbuckets, sizeof(AggBucket *), agg_sort_cmp);
-        /* The comparator's context points into this frame — drop it as
-           soon as the sort is done so no later use can see stale state. */
-        g_sort_ctx = NULL;
+        if (agg_sort_buckets(&ctx, buckets, nbuckets, order_by, order_desc)) {
+            int e = errno;
+            free(buckets); free_criteria(having, nhaving); agg_free(&ctx);
+            return agg_report_error(e);
+        }
     }
 
     /* Apply limit — capture pre-limit group count for total. */
     if (limit <= 0) limit = g_global_limit;
     int agg_total_groups = nbuckets;   /* distinct groups BEFORE limit truncation */
     if (nbuckets > limit) nbuckets = limit;
+
+    size_t ncell = (size_t)nbuckets * (size_t)nspecs;
+    size_t nlabel = (size_t)nbuckets * (size_t)ctx.ngroups;
+    AggCell *cells = agg_cells_alloc(ncell, ctx.shared_buffer_bytes, g_query_buffer_max_bytes);
+    int output_error = cells ? 0 : (errno ? errno : ENOMEM);
+    AggCell *labels = output_error ? NULL : agg_cells_alloc(nlabel,
+                         ctx.shared_buffer_bytes, g_query_buffer_max_bytes);
+    if (!output_error && !labels) output_error = errno ? errno : ENOMEM;
+    for (int bi = 0; bi < nbuckets && !output_error; bi++) {
+        AggBucket *bucket = buckets[bi];
+        for (int g = 0; g < ctx.ngroups && !output_error; g++) {
+            int present = !(bucket->group_nulls && bucket->group_nulls[g]);
+            const char *text = bucket->group_vals[g];
+            if (agg_cell_text(&labels[(size_t)bi * ctx.ngroups + g],
+                              text, present ? strlen(text) : 0, present))
+                output_error = errno ? errno : ENOMEM;
+        }
+        for (int i = 0; i < nspecs && !output_error; i++) {
+            AggAccum *acc = &bucket->accums[i];
+            AggCell *cell = &cells[(size_t)bi * nspecs + i];
+            if (specs[i].fn == AGG_COUNT) {
+                if (agg_cell_count(cell, acc->count)) output_error = errno;
+            } else if (ctx.spec_is_num[i]) {
+                if (agg_cell_from_num(&ctx.spec_nums[i], &acc->num, specs[i].fn,
+                                      acc->count, cell)) output_error = errno;
+            } else if (ctx.spec_tfs[i] && agg_type_is_text(ctx.spec_tfs[i]->type) &&
+                       (specs[i].fn == AGG_MIN || specs[i].fn == AGG_MAX)) {
+                const char *text = specs[i].fn == AGG_MIN ? acc->text_min : acc->text_max;
+                size_t len = specs[i].fn == AGG_MIN ? acc->text_min_len : acc->text_max_len;
+                if (agg_cell_text(cell, text, acc->text_present ? len : 0, acc->text_present))
+                    output_error = errno;
+            }
+        }
+    }
+    if (output_error) {
+        agg_cells_dispose(labels, nlabel); agg_cells_dispose(cells, ncell);
+        free(buckets); free_criteria(having, nhaving); agg_free(&ctx);
+        return agg_report_error(output_error);
+    }
 
     /* Output — CSV path short-circuits before JSON emit. */
     if (csv_delim) {
@@ -6750,30 +6709,19 @@ igb_skip:
         OUT("\n");
 
         for (int bi = 0; bi < nbuckets; bi++) {
-            AggBucket *b = buckets[bi];
             for (int g = 0; g < ctx.ngroups; g++) {
                 if (g > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
-                csv_emit_cell(b->group_vals[g], csv_delim);
+                agg_cell_emit_csv(&labels[(size_t)bi * ctx.ngroups + g], csv_delim);
             }
             for (int i = 0; i < nspecs; i++) {
                 if (ctx.ngroups > 0 || i > 0) { char d[2] = { csv_delim, '\0' }; OUT("%s", d); }
-                AggAccum *a = &b->accums[i];
-                char vbuf[64];
-                if (agg_csv_minmax_text(&specs[i], a, ctx.spec_tfs[i], csv_delim))
-                    continue;
-                switch (specs[i].fn) {
-                    case AGG_COUNT: snprintf(vbuf, sizeof(vbuf), "%ld", a->count); break;
-                    case AGG_SUM:   fmt_double(vbuf, sizeof(vbuf), a->sum); break;
-                    case AGG_AVG:   fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->sum / a->count : 0.0); break;
-                    case AGG_MIN:   fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->min : 0.0); break;
-                    case AGG_MAX:   fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->max : 0.0); break;
-                    default:        vbuf[0] = '\0'; break;
-                }
-                csv_emit_cell(vbuf, csv_delim);
+                agg_cell_emit_csv(&cells[(size_t)bi * nspecs + i], csv_delim);
             }
             OUT("\n");
         }
 
+        agg_cells_dispose(labels, nlabel);
+        agg_cells_dispose(cells, ncell);
         free(buckets);
         free_criteria(having, nhaving);
         agg_free(&ctx);
@@ -6782,48 +6730,17 @@ igb_skip:
 
     if (ctx.ngroups == 0 && nbuckets == 1) {
         /* No group_by: single object */
-        AggBucket *b = buckets[0];
         OUT(want_total ? "{\"rows\":{" : "{");
         for (int i = 0; i < nspecs; i++) {
-            AggAccum *a = &b->accums[i];
             if (i > 0) OUT(",");
-            char vbuf[64];
-            switch (specs[i].fn) {
-                case AGG_COUNT:
-                    OUT("\"%s\":%ld", specs[i].alias, a->count);
-                    break;
-                case AGG_SUM:
-                    fmt_double(vbuf, sizeof(vbuf), a->sum);
-                    OUT("\"%s\":%s", specs[i].alias, vbuf);
-                    break;
-                case AGG_AVG:
-                    /* §2.5: avg with zero contributing values (empty table
-                       or all-NULL group) renders null, not 0. */
-                    if (a->count > 0) {
-                        fmt_double(vbuf, sizeof(vbuf), a->sum / a->count);
-                        OUT("\"%s\":%s", specs[i].alias, vbuf);
-                    } else {
-                        OUT("\"%s\":null", specs[i].alias);
-                    }
-                    break;
-                case AGG_MIN:
-                    if (agg_json_minmax_text(&specs[i], a, ctx.spec_tfs[i])) break;
-                    fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->min : 0.0);
-                    OUT("\"%s\":%s", specs[i].alias, vbuf);
-                    break;
-                case AGG_MAX:
-                    if (agg_json_minmax_text(&specs[i], a, ctx.spec_tfs[i])) break;
-                    fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->max : 0.0);
-                    OUT("\"%s\":%s", specs[i].alias, vbuf);
-                    break;
-            }
+            OUT("\"%s\":", specs[i].alias);
+            agg_cell_emit_json(&cells[i]);
         }
         OUT(want_total ? "},\"total\":1}\n" : "}\n");
     } else {
         /* Group_by: array of objects */
         OUT(want_total ? "{\"rows\":[" : "[");
         for (int bi = 0; bi < nbuckets; bi++) {
-            AggBucket *b = buckets[bi];
             if (bi > 0) OUT(",");
             OUT("{");
             int first = 1;
@@ -6831,50 +6748,15 @@ igb_skip:
                "" and the literal "null" stay quoted strings. */
             for (int g = 0; g < ctx.ngroups; g++) {
                 if (!first) OUT(",");
-                if (b->group_nulls && b->group_nulls[g]) {
-                    OUT("\"%s\":null", ctx.group_fields[g]);
-                } else {
-                    char *gv = json_escape_const(b->group_vals[g]);
-                    OUT("\"%s\":\"%s\"", ctx.group_fields[g], gv ? gv : "");
-                    free(gv);
-                }
+                OUT("\"%s\":", ctx.group_fields[g]);
+                agg_cell_emit_json(&labels[(size_t)bi * ctx.ngroups + g]);
                 first = 0;
             }
             /* Aggregate values */
             for (int i = 0; i < nspecs; i++) {
-                AggAccum *a = &b->accums[i];
                 if (!first) OUT(",");
-                char vbuf[64];
-                if (agg_json_minmax_text(&specs[i], a, ctx.spec_tfs[i])) {
-                    first = 0;
-                    continue;
-                }
-                switch (specs[i].fn) {
-                    case AGG_COUNT:
-                        OUT("\"%s\":%ld", specs[i].alias, a->count);
-                        break;
-                    case AGG_SUM:
-                        fmt_double(vbuf, sizeof(vbuf), a->sum);
-                        OUT("\"%s\":%s", specs[i].alias, vbuf);
-                        break;
-                    case AGG_AVG:
-                        /* §2.5: all-NULL (or no contributing) values → null. */
-                        if (a->count > 0) {
-                            fmt_double(vbuf, sizeof(vbuf), a->sum / a->count);
-                            OUT("\"%s\":%s", specs[i].alias, vbuf);
-                        } else {
-                            OUT("\"%s\":null", specs[i].alias);
-                        }
-                        break;
-                    case AGG_MIN:
-                        fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->min : 0.0);
-                        OUT("\"%s\":%s", specs[i].alias, vbuf);
-                        break;
-                    case AGG_MAX:
-                        fmt_double(vbuf, sizeof(vbuf), a->count > 0 ? a->max : 0.0);
-                        OUT("\"%s\":%s", specs[i].alias, vbuf);
-                        break;
-                }
+                OUT("\"%s\":", specs[i].alias);
+                agg_cell_emit_json(&cells[(size_t)bi * nspecs + i]);
                 first = 0;
             }
             OUT("}");
@@ -6882,6 +6764,8 @@ igb_skip:
         if (want_total) OUT("],\"total\":%d}\n", agg_total_groups);
         else OUT("]\n");
     }
+    agg_cells_dispose(labels, nlabel);
+    agg_cells_dispose(cells, ncell);
 
     free(buckets);
     free_criteria(having, nhaving);
@@ -6936,7 +6820,7 @@ int cmd_aggregate(const char *db_root, const char *object,
                             group_by_json, NULL,
                             having_tree,
                             order_by, order_desc, limit,
-                            format, delimiter, want_total);
+                            format, delimiter, want_total, NULL, NULL);
     free_criteria_tree(having_tree);
     free_criteria_tree(tree);
     free(specs);
@@ -7028,7 +6912,34 @@ int cmd_aggregate_tree(const char *db_root, const char *object,
                             NULL,                  /* having_json — not used */
                             having_tree,           /* passed directly */
                             order_by, order_desc, limit,
-                            format, delimiter, want_total);
+                            format, delimiter, want_total, NULL, NULL);
     free(specs);
     return r;
 }
+#ifdef TEST_BUILD
+/* Aggregate over a caller-supplied (e.g. private packed) schema; the rest of
+   the pipeline is byte-for-byte the production path. */
+int cmd_aggregate_with_schema_for_test(const char *db_root, const char *object,
+        const Schema *schema, const FieldSchema *fields,
+        const char *criteria_json, const char *group_by_json,
+        const char *aggregates_json, const char *having_json,
+        const char *order_by, int order_desc, int limit,
+        const char *format, const char *delimiter, int want_total) {
+    if (!schema || !fields || !fields->ts) { errno = EINVAL; return -1; }
+    AggSpec *specs = NULL;
+    int nspecs = parse_agg_specs(aggregates_json, &specs);
+    if (nspecs <= 0) { free(specs); errno = EINVAL; return -1; }
+    const char *perr = NULL;
+    CriteriaNode *tree = criteria_json && criteria_json[0]
+        ? parse_criteria_tree(criteria_json, &perr) : NULL;
+    CriteriaNode *having = having_json && having_json[0]
+        ? parse_criteria_tree(having_json, &perr) : NULL;
+    int rc = perr ? -1 : cmd_aggregate_do(db_root, object, tree, specs, nspecs,
+                         group_by_json, NULL, having, order_by, order_desc,
+                         limit, format, delimiter, want_total, schema, fields);
+    free_criteria_tree(having);
+    free_criteria_tree(tree);
+    free(specs);
+    return rc;
+}
+#endif

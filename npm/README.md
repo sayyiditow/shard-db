@@ -264,6 +264,15 @@ parser that preserves number tokens when reading. JavaScript `Number` and
 `JSON.parse` cannot preserve arbitrary decimal precision. Existing `JSON.parse`
 examples above use bounded integers and are not a finance-decimal recipe.
 
+Aggregate responses also preserve exact number lexemes: summing two `long`
+values of `9007199254740993` returns `18014398509481986`, an integer
+average renders at the PostgreSQL result scale (`1010.0000000000000000`),
+and `float`/`double` aggregates print shortest round-trip lexemes (up to 17
+digits, e.g. `0.30000000000000004`). Keep this response as text or read it
+with a lossless JSON parser; `JSON.parse` converts number tokens to
+JavaScript `Number` and can lose digits. `ShardDb#query()` returns the raw
+response string; the package does not parse aggregate results.
+
 Ordinary fetch/multi-get/keys/existence CSV cells escape literal backslash as `\\` and control bytes as `\u00xx`.
 After normal CSV quote/delimiter decoding, `ShardDb.decodeCsvCellBytes(cell)`
 returns the original bytes. A literal six-character `\u0000` and an actual NUL
