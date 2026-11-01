@@ -6,6 +6,32 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**BREAKING (R4 — strict scalar grammars).** Malformed non-NULL input on
+`bool`/`date`/`datetime`/`datetimems`/`time`/`uuid`/`ipv4`/`ipv6`/`enum`
+fields is now rejected with a field-named error on every write route and on
+query comparison literals; it previously became a different valid value, zero,
+or NULL. Specifically: out-of-calendar or partial dates (`2024-02-30`,
+`2024-1-5`, `20240105x`) are errors; date-only datetimes no longer pad to
+midnight; out-of-range times no longer encode `00:00:00`; bool accepts only
+`1 t tr tru true y ye yes on` / `0 f fa fal fals false n no of off`
+(case-insensitive) — `yes` is now **true** (it previously stored false by
+first byte), and `trash`/`10` are errors; malformed `uuid`/`ipv4`/`ipv6` are
+errors instead of a NULL downgrade or zero-fill; the empty string `""` is an
+error for all of these types and for `enum` (it previously stored member 0 /
+false / zero bytes); an unknown enum member errors uniformly (previously
+member 0 on some routes, and a silent 0-row result as a query literal); a
+valid brace-wrapped UUID (`{…}`) is now accepted and exempt from the
+computed-update `{` gate. Criteria with invalid comparison literals fail at
+compile time with `invalid criteria value` (previously they compiled to
+unrelated keys — bool `eq yes` searched the false bucket). Outer ASCII
+whitespace (space/tab/newline/CR) is stripped on the new scalar types;
+`\v`/`\f` are not whitespace. Stored bytes, layouts, and previously stored
+values are unchanged — no migration; only new input is validated. `:default=`
+literals are validated at declaration time for the new types, and defaults
+re-read at insert time from schemas declared before this change now fail the
+insert if the literal is not in the grammar (e.g. `default=yes` on a bool now
+applies **true** where it previously applied false).
+
 Aggregates now preserve exact integer and decimal arithmetic through scans,
 indexes, parallel merging, grouping, `having`, ordering, and JSON/CSV
 output. Integer sums retain every digit beyond int64 and 2⁵³; decimal

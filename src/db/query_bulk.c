@@ -4502,7 +4502,8 @@ static int v2_bulk_upd_delim_value_compute(const SlotcaskOldRecord *old,
         if (cell_len > 0) {
             int tidx = w->active_indices[ai];
             if (!w->ts->fields[tidx].removed) {
-                if (w->ts->fields[tidx].type != FT_VARCHAR && *cell_start == '{')
+                if (w->ts->fields[tidx].type != FT_VARCHAR && *cell_start == '{' &&
+                    !value_is_braced_uuid(&w->ts->fields[tidx], cell_start, cell_len))
                     {ctx->error=errno?errno:EINVAL;return -1;}
                 char tmpcell[256];
                 char *cellbuf = (cell_len < sizeof(tmpcell))
@@ -5155,7 +5156,10 @@ static int v2_bulk_upd_json_value_compute(const SlotcaskOldRecord *old,
         }
         if (json_rec->field_values[i]) {
             if (w->ts->fields[tidx].type != FT_VARCHAR &&
-                json_rec->field_values[i][0] == '{') {ctx->error=errno?errno:EINVAL;return -1;}
+                json_rec->field_values[i][0] == '{' &&
+                !value_is_braced_uuid(&w->ts->fields[tidx], json_rec->field_values[i],
+                                      strlen(json_rec->field_values[i])))
+                {ctx->error=errno?errno:EINVAL;return -1;}
             if (encode_field_checked(&w->ts->fields[tidx], json_rec->field_values[i],
                                       strlen(json_rec->field_values[i]),
                                       new_buf + w->ts->nullmap_prefix +

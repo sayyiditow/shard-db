@@ -1,5 +1,6 @@
 #include "schema_wire.h"
 #include "types.h"
+#include "scalar_grammar.h"
 #include "typed_row.h"
 #include "slotcask.h"
 #include "bitmap.h"
@@ -2248,6 +2249,69 @@ static int conv_numeric(const TypedField *f, const char *val, size_t vlen,
     return 0;
 }
 
+/* Strict encoder for the grammar-backed scalar types — the single place
+   their bytes are packed. 0 = ok, -1 = not in the type's grammar. Callers
+   decide what an invalid span means (error vs. zero-fill). */
+static int encode_grammar_scalar(const TypedField *f, const char *val,
+                                 size_t vlen, uint8_t *out) {
+    switch (f->type) {
+    case FT_BOOL: {
+        uint8_t b;
+        if (sg_bool(val, vlen, &b)) return -1;
+        out[0] = b;
+        return 0;
+    }
+    case FT_DATE: {
+        int32_t d;
+        if (sg_date(val, vlen, &d)) return -1;
+        out[0] = (uint8_t)(d >> 24); out[1] = (uint8_t)(d >> 16);
+        out[2] = (uint8_t)(d >> 8);  out[3] = (uint8_t)d;
+        return 0;
+    }
+    case FT_DATETIME: {
+        int32_t d; uint32_t t;
+        if (sg_datetime(val, vlen, &d, &t)) return -1;
+        out[0] = (uint8_t)(d >> 24); out[1] = (uint8_t)(d >> 16);
+        out[2] = (uint8_t)(d >> 8);  out[3] = (uint8_t)d;
+        out[4] = (uint8_t)(t >> 16); out[5] = (uint8_t)(t >> 8); out[6] = (uint8_t)t;
+        return 0;
+    }
+    case FT_DATETIMEMS: {
+        int32_t d; uint32_t ms;
+        if (sg_datetimems(val, vlen, &d, &ms)) return -1;
+        out[0] = (uint8_t)(d >> 24);  out[1] = (uint8_t)(d >> 16);
+        out[2] = (uint8_t)(d >> 8);   out[3] = (uint8_t)d;
+        out[4] = (uint8_t)(ms >> 24); out[5] = (uint8_t)(ms >> 16);
+        out[6] = (uint8_t)(ms >> 8);  out[7] = (uint8_t)ms;
+        return 0;
+    }
+    case FT_TIME: {
+        uint32_t s;
+        if (sg_time(val, vlen, &s)) return -1;
+        out[0] = (uint8_t)(s >> 16); out[1] = (uint8_t)(s >> 8); out[2] = (uint8_t)s;
+        return 0;
+    }
+    case FT_UUID: return sg_uuid(val, vlen, out);
+    case FT_IPV4: return sg_ipv4(val, vlen, out);
+    case FT_IPV6: return sg_ipv6(val, vlen, out);
+    default: return -1;
+    }
+}
+
+static const char *grammar_scalar_hint(enum FieldType t) {
+    switch (t) {
+    case FT_BOOL: return "expected true/false (t, f, yes, no, on, off, 1, 0)";
+    case FT_DATE: return "expected YYYYMMDD or YYYY-MM-DD (a real calendar date)";
+    case FT_DATETIME: return "expected YYYYMMDDHHMMSS, 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DDTHH:MM:SS'";
+    case FT_DATETIMEMS: return "expected YYYYMMDDHHMMSSfff or 'YYYY-MM-DD HH:MM:SS.fff' (exactly 3 fraction digits)";
+    case FT_TIME: return "expected HH:MM:SS (00:00:00..23:59:59)";
+    case FT_UUID: return "expected 32 hex digits or the 36-character dashed form";
+    case FT_IPV4: return "not a valid IPv4 address";
+    case FT_IPV6: return "not a valid IPv6 address";
+    default: return "invalid value";
+    }
+}
+
 int encode_field_checked(const TypedField *f, const char *val, size_t vlen,
                          uint8_t *out, char *err, size_t errsz) {
     if (err && errsz > 0) err[0] = '\0';
@@ -2267,8 +2331,25 @@ int encode_field_checked(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     if (vlen == 0) {
-        /* Preserve the historic zero-filled representation for empty/NULL
-           spans. */
+        switch (f->type) {
+        case FT_BOOL: case FT_DATE: case FT_DATETIME: case FT_DATETIMEMS:
+        case FT_TIME: case FT_UUID: case FT_IPV4: case FT_IPV6:
+            /* R4: an empty span is not a value of these types; NULL is
+               expressed by the caller (JSON null / omitted / delimited
+               empty cell), never by a zero-length string reaching here. */
+            fmt_conv_err(err, errsz, f, "empty value");
+            return -1;
+        case FT_ENUM:
+            /* Empty is invalid unless it is an explicit declared member. */
+            if (enum_value_index(f, val, 0) < 0) {
+                fmt_conv_err(err, errsz, f, "unknown enum member");
+                return -1;
+            }
+            break;
+        default:
+            break;
+        }
+        /* Historic zero-filled representation for the remaining types. */
         memset(out, 0, f->size);
         return 0;
     }
@@ -2296,11 +2377,40 @@ int encode_field_checked(const TypedField *f, const char *val, size_t vlen,
             return -1;
         }
         break;
+    case FT_BOOL: case FT_DATE: case FT_DATETIME: case FT_DATETIMEMS:
+    case FT_TIME: case FT_UUID: case FT_IPV4: case FT_IPV6:
+        if (encode_grammar_scalar(f, val, vlen, out)) {
+            fmt_conv_err(err, errsz, f, grammar_scalar_hint(f->type));
+            return -1;
+        }
+        return 0;
+    case FT_ENUM:
+        if (enum_value_index(f, val, vlen) < 0) {
+            fmt_conv_err(err, errsz, f, "unknown enum member");
+            return -1;
+        }
+        break; /* encode_field_len writes the index */
     default:
         break;
     }
     encode_field_len(f, val, vlen, out);
     return 0;
+}
+
+/* 1 iff f is a uuid field and v is a valid uuid literal (including the
+   brace-wrapped form). Used to exempt such values from the "starts with
+   '{' ⇒ computed-update object" gate. */
+int value_is_braced_uuid(const TypedField *f, const char *v, size_t n) {
+    uint8_t tmp[16];
+    return f->type == FT_UUID && n && v[0] == '{' && sg_uuid(v, n, tmp) == 0;
+}
+
+/* Truth value of an already-validated bool literal (grammar: sg_bool);
+   0 for anything the grammar rejects. */
+uint8_t scalar_bool_value(const char *s) {
+    uint8_t b = 0;
+    if (s && sg_bool(s, strlen(s), &b)) b = 0;
+    return b;
 }
 
 void encode_field_len(const TypedField *f, const char *val, size_t vlen,
@@ -2357,130 +2467,18 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         memcpy(out, &v, 4);
         break;
     }
-    case FT_BOOL: {
-        out[0] = (vlen > 0 && (val[0] == 't' || val[0] == 'T' || val[0] == '1')) ? 1 : 0;
-        break;
-    }
     case FT_BYTE: {
         char cbuf[8]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         out[0] = (uint8_t)atoi(cbuf);
         break;
     }
-    case FT_DATE: {
-        /* Iterate the span directly, extract up to 8 digits. */
-        char clean[16]; int ci = 0;
-        for (size_t i = 0; i < vlen && ci < 8; i++)
-            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
-        clean[ci] = '\0';
-        int32_t v = (int32_t)atoi(clean);
-        out[0] = (v >> 24) & 0xFF; out[1] = (v >> 16) & 0xFF;
-        out[2] = (v >> 8) & 0xFF;  out[3] = v & 0xFF;
+    case FT_BOOL: case FT_DATE: case FT_DATETIME: case FT_DATETIMEMS:
+    case FT_TIME: case FT_UUID: case FT_IPV4: case FT_IPV6:
+        /* Lenient wrapper over the strict grammar: server-generated and
+           internal callers only; invalid input zero-fills. Client input
+           goes through encode_field_checked. */
+        if (encode_grammar_scalar(f, val, vlen, out)) memset(out, 0, f->size);
         break;
-    }
-    case FT_DATETIME: {
-        char clean[16]; int ci = 0;
-        for (size_t i = 0; i < vlen && ci < 14; i++)
-            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
-        while (ci < 14) clean[ci++] = '0';
-        clean[14] = '\0';
-        char datebuf[9]; memcpy(datebuf, clean, 8); datebuf[8] = '\0';
-        int32_t d = (int32_t)atoi(datebuf);
-        out[0] = (d >> 24) & 0xFF; out[1] = (d >> 16) & 0xFF;
-        out[2] = (d >> 8) & 0xFF;  out[3] = d & 0xFF;
-        int hh = (clean[8]-'0')*10 + (clean[9]-'0');
-        int mm = (clean[10]-'0')*10 + (clean[11]-'0');
-        int ss = (clean[12]-'0')*10 + (clean[13]-'0');
-        uint32_t t = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
-        out[4] = (uint8_t)(t >> 16);
-        out[5] = (uint8_t)(t >> 8);
-        out[6] = (uint8_t)t;
-        break;
-    }
-    case FT_DATETIMEMS: {
-        /* Parse up to 17 digits: yyyyMMddHHmmssfff. Short input zero-pads
-           on the right (mirrors FT_DATETIME's convention). */
-        char clean[24]; int ci = 0;
-        for (size_t i = 0; i < vlen && ci < 17; i++)
-            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
-        while (ci < 17) clean[ci++] = '0';
-        clean[17] = '\0';
-        char datebuf[9]; memcpy(datebuf, clean, 8); datebuf[8] = '\0';
-        int32_t d = (int32_t)atoi(datebuf);
-        out[0] = (d >> 24) & 0xFF; out[1] = (d >> 16) & 0xFF;
-        out[2] = (d >> 8) & 0xFF;  out[3] = d & 0xFF;
-        int hh = (clean[8]-'0')*10 + (clean[9]-'0');
-        int mm = (clean[10]-'0')*10 + (clean[11]-'0');
-        int ss = (clean[12]-'0')*10 + (clean[13]-'0');
-        int fff = (clean[14]-'0')*100 + (clean[15]-'0')*10 + (clean[16]-'0');
-        uint32_t ms = (uint32_t)((hh * 3600 + mm * 60 + ss) * 1000 + fff);
-        out[4] = (ms >> 24) & 0xFF; out[5] = (ms >> 16) & 0xFF;
-        out[6] = (ms >> 8) & 0xFF;  out[7] = ms & 0xFF;
-        break;
-    }
-    case FT_TIME: {
-        /* Parse "HH:MM:SS" into 3 bytes (seconds since midnight, big-endian).
-           Validate strictly: 8 chars, digits at 0/1/3/4/6/7, ':' at 2 and 5,
-           hh ≤ 23, mm ≤ 59, ss ≤ 59. Malformed → encode 0 (matches the UUID
-           "garbage in → zeroed" convention). */
-        uint32_t secs = 0;
-        if (vlen >= 8 && val[2] == ':' && val[5] == ':') {
-            int ok = 1;
-            for (int i = 0; i < 8 && ok; i++) {
-                if (i == 2 || i == 5) continue;
-                if (val[i] < '0' || val[i] > '9') ok = 0;
-            }
-            if (ok) {
-                int hh = (val[0]-'0')*10 + (val[1]-'0');
-                int mm = (val[3]-'0')*10 + (val[4]-'0');
-                int ss = (val[6]-'0')*10 + (val[7]-'0');
-                if (hh <= 23 && mm <= 59 && ss <= 59)
-                    secs = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
-            }
-        }
-        out[0] = (secs >> 16) & 0xFF;
-        out[1] = (secs >> 8) & 0xFF;
-        out[2] = secs & 0xFF;
-        break;
-    }
-    case FT_UUID: {
-        /* Parse 32 hex digits (skip hyphens), pack into 16 bytes BE.
-           On malformed input (not exactly 32 hex digits), zero the field. */
-        uint8_t buf[16] = {0};
-        int pos = 0;
-        for (size_t i = 0; i < vlen && pos < 32; i++) {
-            char c = val[i];
-            if (c == '-') continue;
-            int nibble = -1;
-            if (c >= '0' && c <= '9') nibble = c - '0';
-            else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
-            else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
-            if (nibble < 0) { pos = 0; break; }
-            if (pos % 2 == 0) buf[pos / 2] = nibble << 4;
-            else buf[pos / 2] |= nibble;
-            pos++;
-        }
-        if (pos != 32) memset(buf, 0, 16);
-        memcpy(out, buf, 16);
-        break;
-    }
-    case FT_IPV4: {
-        char ipbuf[16]; /* max "255.255.255.255" + NUL = 16 */
-        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
-        memcpy(ipbuf, val, n);
-        ipbuf[n] = '\0';
-        if (n == 0 || inet_pton(AF_INET, ipbuf, out) != 1)
-            memset(out, 0, 4);
-        break;
-    }
-    case FT_IPV6: {
-        char ipbuf[46]; /* INET6_ADDRSTRLEN */
-        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
-        memcpy(ipbuf, val, n);
-        ipbuf[n] = '\0';
-        if (n == 0 || inet_pton(AF_INET6, ipbuf, out) != 1)
-            memset(out, 0, 16);
-        break;
-    }
     case FT_NUMERIC: {
         char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         double dv = atof(cbuf);
@@ -2955,33 +2953,16 @@ int encode_json_field_checked(const TypedField *f, const char *val,
     return rc;
 }
 
-int sentinel_span_parses(enum FieldType t, const char *val, size_t vlen) {
+/* R4: types for which a zero-length string is an invalid value (it must
+   reach encode_field_checked, which rejects it) rather than the historic
+   "no value" no-op. */
+static int empty_span_invalid(enum FieldType t) {
     switch (t) {
-    case FT_IPV4: {
-        char ipbuf[16]; uint8_t sink[4];
-        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
-        memcpy(ipbuf, val, n); ipbuf[n] = '\0';
-        return n > 0 && inet_pton(AF_INET, ipbuf, sink) == 1;
-    }
-    case FT_IPV6: {
-        char ipbuf[46]; uint8_t sink[16];
-        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
-        memcpy(ipbuf, val, n); ipbuf[n] = '\0';
-        return n > 0 && inet_pton(AF_INET6, ipbuf, sink) == 1;
-    }
-    case FT_UUID: {
-        int pos = 0;
-        for (size_t i = 0; i < vlen && pos < 32; i++) {
-            char c = val[i];
-            if (c == '-') continue;
-            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
-                  (c >= 'A' && c <= 'F'))) return 0;
-            pos++;
-        }
-        return pos == 32;
-    }
-    default:
+    case FT_BOOL: case FT_DATE: case FT_DATETIME: case FT_DATETIMEMS:
+    case FT_TIME: case FT_UUID: case FT_IPV4: case FT_IPV6: case FT_ENUM:
         return 1;
+    default:
+        return 0;
     }
 }
 
@@ -3040,15 +3021,7 @@ int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out,
                 typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
                 break;
             }
-            if (el > 0) {
-                if (!sentinel_span_parses(ts->fields[i].type, ev, el)) {
-                    if (ts->fields[i].not_null) return -2;
-                    /* Malformed uuid/ipv4/ipv6 — the historic unset
-                       sentinel. Store NULL (bit set) rather than a
-                       visible zero value on nullmap records. */
-                    typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
-                    break;
-                }
+            if (el > 0 || empty_span_invalid(ts->fields[i].type)) {
                 /* Decode eligible JSON string fields exactly once before
                    full-span conversion; non-JSON defaults use the literal path. */
                 if (encode_json_field_checked(&ts->fields[i], ev, el, was_quoted,
@@ -3464,57 +3437,6 @@ char *generate_default_owned(const TypedField *f,const char *root,const char *ob
     return out;
 }
 
-/* Helper: render an actionable "unknown enum value" error message into
-   err_buf. Truncates the legal-values list cleanly when there's no room
-   left, keeping the message readable for large enums.
-
-   CodeQL #91 ("potentially overflowing call to snprintf"): the previous
-   implementation accumulated snprintf's *would-have-written* return
-   value into `pos`, then passed `err_buf_size - pos` as the next call's
-   remaining-size. If snprintf returned a value larger than the actual
-   space, `pos` walked past `err_buf_size` and the next subtraction
-   underflowed (size_t), letting subsequent snprintf calls write
-   unbounded. Fixed by clamping the running offset after every snprintf
-   so it never exceeds err_buf_size − 1 (the NUL terminator slot). */
-static void fmt_unknown_enum_err(const TypedField *f, const char *bad_val,
-                                  size_t bad_len, char *err_buf, size_t err_buf_size) {
-    if (!err_buf || err_buf_size == 0) return;
-    err_buf[0] = '\0';
-
-    #define APPEND(...) do {                                         \
-        if (pos + 1 >= err_buf_size) break;                          \
-        int _n = snprintf(err_buf + pos, err_buf_size - pos,         \
-                          __VA_ARGS__);                              \
-        if (_n < 0) { err_buf[pos] = '\0'; break; }                  \
-        if ((size_t)_n >= err_buf_size - pos) {                      \
-            pos = err_buf_size - 1; /* clamped + NUL-terminated */   \
-            err_buf[pos] = '\0';                                     \
-            break;                                                   \
-        }                                                            \
-        pos += (size_t)_n;                                           \
-    } while (0)
-
-    size_t pos = 0;
-    APPEND("unknown enum value '%.*s' for field [%s]; legal: [",
-           (int)bad_len, bad_val, f->name);
-
-    for (int i = 0; i < f->n_enum_values; i++) {
-        const char *v = f->enum_values[i];
-        if (!v) continue;
-        size_t vl = strlen(v);
-        /* Reserve 5 bytes for ",..." + "]" + NUL so the truncation
-           marker always fits, even if we have to bail mid-loop. */
-        if (pos + vl + 5 >= err_buf_size) {
-            APPEND("...");
-            break;
-        }
-        APPEND("%s%s", i ? "," : "", v);
-    }
-    APPEND("]");
-
-    #undef APPEND
-}
-
 /* Canonical :not_null rejection text — one source so single-request
    errors, bulk skip-log lines, and the error-code docs stay identical.
    err_buf may be NULL/0 (the no-channel encoder passes none). */
@@ -3600,33 +3522,11 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                     typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
                     break;
                 }
-                if (el > 0) {
-                    if (!sentinel_span_parses(ts->fields[i].type, ev, el)) {
-                        if (ts->fields[i].not_null) {
-                            char message[320];
-                            fmt_not_null_err(&ts->fields[i], message, sizeof(message));
-                            LOG_WARN(LOG_SUB_CONFIG, "%s/%s: %s (malformed sentinel)",
-                                     db_root ? db_root : "?", object ? object : "?", message);
-                            fmt_not_null_err(&ts->fields[i], err_buf, err_buf_size);
-                            return -2;
-                        }
-                        /* Malformed uuid/ipv4/ipv6 — the historic unset
-                           sentinel. Store NULL (bit set) rather than a
-                           visible zero value on nullmap records. */
-                        typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
-                        break;
-                    }
-                    /* Enum: strict membership check before the encode.
-                       Unknown values are silently zeroed by encode_field_len
-                       (legacy convention for other typed fields). For enum
-                       that would corrupt every record on a typo, so we
-                       reject at the wire layer instead. */
-                    if (ts->fields[i].type == FT_ENUM &&
-                        enum_value_index(&ts->fields[i], ev, el) < 0) {
-                        fmt_unknown_enum_err(&ts->fields[i], ev, el,
-                                              err_buf, err_buf_size);
-                        return -2;
-                    }
+                if (el > 0 || empty_span_invalid(ts->fields[i].type)) {
+                    /* R4: no sentinel downgrade and no separate enum
+                       pre-check — encode_field_checked enforces the strict
+                       grammar (malformed input is an error, never NULL,
+                       and unknown enum members are rejected uniformly). */
                     if (encode_json_field_checked(&ts->fields[i], ev, el, was_quoted,
                                                   out + ts->nullmap_prefix + ts->fields[i].offset,
                                                   err_buf, err_buf_size) != 0)

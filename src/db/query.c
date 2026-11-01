@@ -817,8 +817,7 @@ int btree_dispatch_schema_checked(const TypedSchema *literal_schema,const char *
                applies to FT_BOOL; every other type has too large a domain
                to enumerate "everything except X" cheaply. */
             if (tf && tf->type == FT_BOOL) {
-                int is_true = (search_criterion_value(pc)[0] == 't' || search_criterion_value(pc)[0] == 'T' ||
-                               search_criterion_value(pc)[0] == '1');
+                int is_true = scalar_bool_value(search_criterion_value(pc));
                 uint8_t inv[1] = { (uint8_t)(is_true ? 0 : 1) };
                 btree_idx_search(db_root, object, field, splits,
                                  (const char *)inv, 1, cb, ctx);
@@ -2009,8 +2008,7 @@ static int chunked_stream_dispatch(const TypedSchema *literal_schema,ChunkShared
         }
         case OP_NOT_EQUAL:
             if (tf && tf->type == FT_BOOL) {
-                int is_true = (search_criterion_value(pc)[0] == 't' || search_criterion_value(pc)[0] == 'T' ||
-                               search_criterion_value(pc)[0] == '1');
+                int is_true = scalar_bool_value(search_criterion_value(pc));
                 uint8_t inv[1] = { (uint8_t)(is_true ? 0 : 1) };
                 memcpy(buf2, inv, 1);
                 memset(buf2 + 1, 0xff, 4);
@@ -8047,7 +8045,11 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
                 }else {
                     int present=typed_index_text_key_into(driver_fs.ts,(size_t)ospec.parts[i].idx,
                         cur.part[i].value,cur.part[i].vlen,NULL,0,&payloads[i]);
-                    if(present!=1){free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(errno?errno:EINVAL);}
+                    if(present<0){free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(errno?errno:EINVAL);}
+                    /* R4: a data-derived probe outside the field's grammar
+                       (legacy zero/invalid stored text) encodes as an empty
+                       component, never an error. */
+                    if(present==0)payloads[i]=0;
                 }
                 if(payloads[i]>sizeof(cur_value_buf)-cur_value_len-1){
                     free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(E2BIG);
@@ -8062,9 +8064,10 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
                     size_t n=0;
                     if(typed_index_text_key_into(driver_fs.ts,(size_t)ospec.parts[i].idx,
                          cur.part[i].value,cur.part[i].vlen,cur_value_buf+pos,
-                         sizeof(cur_value_buf)-pos,&n)!=1){
+                         sizeof(cur_value_buf)-pos,&n)<0){
                         free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(errno);
                     }
+                    /* n==0: out-of-grammar probe (R4) → empty component. */
                 }
                 pos+=payloads[i];
             }

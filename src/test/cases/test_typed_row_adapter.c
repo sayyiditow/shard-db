@@ -408,8 +408,8 @@ static void enum_membership_regressions(void){
         ASSERT_TRUE(!out&&!n,"unknown enum clears owned outputs");
         free(out&&out!=(void*)1?out:NULL);
     }
-    const char *good[]={"{\"f0\":\"\\u0062lue\"}","{\"f0\":\"\"}","{\"f0\":null}"};
-    const char *expected[]={"{\"f0\":\"blue\"}","{\"f0\":\"red\"}","{\"f0\":null}"};
+    const char *good[]={"{\"f0\":\"\\u0062lue\"}","{\"f0\":null}"};
+    const char *expected[]={"{\"f0\":\"blue\"}","{\"f0\":null}"};
     for(size_t i=0;i<sizeof(good)/sizeof(good[0]);i++){
         out=NULL;n=0;
         ASSERT_EQ_INT(typed_encode_alloc(ts,good[i],1,NULL,NULL,&out,&n,err,sizeof(err)),0,"escaped member empty and null retain contracts");
@@ -420,6 +420,12 @@ static void enum_membership_regressions(void){
             free(out);
         }
     }
+    /* R4/D3: an empty string is an error for enum, not member 0. */
+    out=(void*)1;n=99;errno=0;err[0]=0;
+    ASSERT_EQ_INT(typed_encode_alloc(ts,"{\"f0\":\"\"}",1,NULL,NULL,&out,&n,err,sizeof(err)),-1,"empty enum member errors");
+    ASSERT_EQ_INT(errno,EINVAL,"empty enum errno");
+    ASSERT_TRUE(!out&&!n,"empty enum clears outputs");
+    free(out&&out!=(void*)1?out:NULL);
     TypedPrepared p;typed_prepared_init(&p);
     ASSERT_EQ_INT(typed_prepared_zero(ts,&p,err,sizeof(err)),0,"enum prepared zero");
     TypedInput valid={"blue",4,1,0,0},invalid={"bogus",5,1,0,0};

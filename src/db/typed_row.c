@@ -250,14 +250,9 @@ int typed_prepared_set(TypedPrepared *p,size_t i,const TypedInput *in,
         dec_free(&b);dec_free(&a);
         if(st!=DEC_OK){errno=st==DEC_ERR_NOMEM?ENOMEM:EINVAL;goto done;}
     }else{
-        if(f->type==FT_ENUM&&n&&enum_value_index(f,text,n)<0){
-            if(err&&cap)snprintf(err,cap,"unknown enum value for field '%s'",f->name);
-            errno=EINVAL;goto done;
-        }
-        if(!sentinel_span_parses(f->type,text,n)){
-            if(f->not_null){fmt_not_null_err(f,err,cap);errno=EINVAL;goto done;}
-            rc=replace_cell(p,i,NULL,NULL,0,1,err,cap);goto done;
-        }
+        /* R4: no sentinel downgrade and no separate enum pre-check —
+           row_encode_fixed reaches encode_field_checked, which enforces
+           the strict grammar (malformed input is an error, never NULL). */
         bytes=calloc(1,pf->width);if(!bytes){row_error(err,cap,ENOMEM,"oom");goto done;}
         if(row_encode_fixed(f,text,n,was_quoted,bytes,err,cap)!=0)goto done;
         used=pf->width;

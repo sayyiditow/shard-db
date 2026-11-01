@@ -7,6 +7,7 @@
 #include "io_direct.h"
 #include "query_internal.h"
 #include "typed_row.h"
+#include "scalar_grammar.h"
 #include <math.h>
 #include <dirent.h>
 
@@ -97,102 +98,40 @@ void search_criterion_move(SearchCriterion *dst,SearchCriterion *src){*dst=*src;
 /* Case-insensitive substring search moved to src/db/simd.c (simd_memcasemem)
    so the AVX2 path and the scalar fallback share one implementation. */
 
-/* Parse decimal date string "yyyyMMdd" (tolerant of separators) → int32. */
+/* R4 thin wrappers: the strict grammar module is the single parser. These
+   run only after predicate_validate has accepted the literal, or for the
+   unused value2 of non-BETWEEN ops, where failure-to-zero is harmless. */
 static int32_t parse_date_i32(const char *s) {
-    char clean[16]; int ci = 0;
-    for (const char *c = s; *c && ci < 8; c++)
-        if (*c >= '0' && *c <= '9') clean[ci++] = *c;
-    clean[ci] = '\0';
-    return (int32_t)atoi(clean);
+    int32_t d = 0;
+    if (s && sg_date(s, strlen(s), &d)) d = 0;
+    return d;
 }
-
-/* Parse "yyyyMMddHHmmss" (tolerant) → date (int32) + time (uint32 seconds). */
 static void parse_datetime(const char *s, int32_t *out_date, uint32_t *out_time) {
-    char clean[16]; int ci = 0;
-    for (const char *c = s; *c && ci < 14; c++)
-        if (*c >= '0' && *c <= '9') clean[ci++] = *c;
-    while (ci < 14) clean[ci++] = '0';
-    clean[14] = '\0';
-    char dbuf[9]; memcpy(dbuf, clean, 8); dbuf[8] = '\0';
-    *out_date = (int32_t)atoi(dbuf);
-    int hh = (clean[8]-'0')*10 + (clean[9]-'0');
-    int mm = (clean[10]-'0')*10 + (clean[11]-'0');
-    int ss = (clean[12]-'0')*10 + (clean[13]-'0');
-    *out_time = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
+    *out_date = 0; *out_time = 0;
+    if (s) (void)sg_datetime(s, strlen(s), out_date, out_time);
 }
-
-/* Parse "yyyyMMddHHmmssfff" (digit-only, right-zero-padded if short) into
-   a calendar date (int32, yyyyMMdd) and ms-of-day (uint32, 0..86399999). */
 static void parse_datetimems(const char *s, int32_t *out_date, uint32_t *out_ms) {
-    char clean[24]; int ci = 0;
-    for (const char *c = s; *c && ci < 17; c++)
-        if (*c >= '0' && *c <= '9') clean[ci++] = *c;
-    while (ci < 17) clean[ci++] = '0';
-    clean[17] = '\0';
-    char dbuf[9]; memcpy(dbuf, clean, 8); dbuf[8] = '\0';
-    *out_date = (int32_t)atoi(dbuf);
-    int hh = (clean[8]-'0')*10 + (clean[9]-'0');
-    int mm = (clean[10]-'0')*10 + (clean[11]-'0');
-    int ss = (clean[12]-'0')*10 + (clean[13]-'0');
-    int fff = (clean[14]-'0')*100 + (clean[15]-'0')*10 + (clean[16]-'0');
-    *out_ms = (uint32_t)((hh * 3600 + mm * 60 + ss) * 1000 + fff);
+    *out_date = 0; *out_ms = 0;
+    if (s) (void)sg_datetimems(s, strlen(s), out_date, out_ms);
 }
-
-/* Parse UUID string (32 hex digits, with or without hyphens) → 16 bytes.
-   On malformed input, output is all zeros. */
 static void parse_uuid(const char *s, uint8_t out[16]) {
     memset(out, 0, 16);
-    if (!s) return;
-    int pos = 0;
-    for (const char *c = s; *c && pos < 32; c++) {
-        if (*c == '-') continue;
-        int nibble = -1;
-        if (*c >= '0' && *c <= '9') nibble = *c - '0';
-        else if (*c >= 'a' && *c <= 'f') nibble = *c - 'a' + 10;
-        else if (*c >= 'A' && *c <= 'F') nibble = *c - 'A' + 10;
-        if (nibble < 0) { memset(out, 0, 16); return; }
-        if (pos % 2 == 0) out[pos / 2] = nibble << 4;
-        else out[pos / 2] |= nibble;
-        pos++;
-    }
-    if (pos != 32) { memset(out, 0, 16); }
+    if (s) (void)sg_uuid(s, strlen(s), out);
 }
-
-/* Parse a dotted-quad IPv4 string into 4 raw network-byte-order bytes.
-   Malformed/empty input zero-fills (mirrors parse_uuid's fallback). */
 static void parse_ipv4(const char *s, uint8_t out[4]) {
-    if (!s || !s[0] || inet_pton(AF_INET, s, out) != 1)
-        memset(out, 0, 4);
+    memset(out, 0, 4);
+    if (s) (void)sg_ipv4(s, strlen(s), out);
 }
-
-/* Parse a canonical IPv6 string into 16 raw network-byte-order bytes.
-   Malformed/empty input zero-fills (mirrors parse_ipv4/parse_uuid). */
 static void parse_ipv6(const char *s, uint8_t out[16]) {
-    if (!s || !s[0] || inet_pton(AF_INET6, s, out) != 1)
-        memset(out, 0, 16);
+    memset(out, 0, 16);
+    if (s) (void)sg_ipv6(s, strlen(s), out);
 }
-
-/* Parse "HH:MM:SS" into 3 bytes (seconds since midnight, big-endian) */
 static void parse_time(const char *s, uint8_t out[3]) {
-    /* Parse "HH:MM:SS" query operand into 3 bytes BE. Strict validation
-       (digits + ':' separators + range) matches the FT_TIME encode path in
-       config.c so an out-of-range or malformed criterion can never silently
-       compare against an unrelated wraparound value. Malformed → 0. */
+    uint32_t secs = 0;
     memset(out, 0, 3);
-    if (!s || strlen(s) < 8) return;
-    if (s[2] != ':' || s[5] != ':') return;
-    for (int i = 0; i < 8; i++) {
-        if (i == 2 || i == 5) continue;
-        if (s[i] < '0' || s[i] > '9') return;
+    if (s && sg_time(s, strlen(s), &secs) == 0) {
+        out[0] = (secs >> 16) & 0xFF; out[1] = (secs >> 8) & 0xFF; out[2] = secs & 0xFF;
     }
-    int hh = (s[0]-'0')*10 + (s[1]-'0');
-    int mm = (s[3]-'0')*10 + (s[4]-'0');
-    int ss = (s[6]-'0')*10 + (s[7]-'0');
-    if (hh > 23 || mm > 59 || ss > 59) return;
-    uint32_t secs = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
-    out[0] = (secs >> 16) & 0xFF;
-    out[1] = (secs >> 8) & 0xFF;
-    out[2] = secs & 0xFF;
 }
 
 /* Lowercase duplicate (ASCII). Caller frees. */
@@ -340,8 +279,10 @@ static int predicate_numeric_comparison(enum SearchOp op){
 }
 static int predicate_has_literal(enum SearchOp op){return op!=OP_EXISTS&&op!=OP_NOT_EXISTS&&!predicate_is_field(op)&&op!=OP_IN&&op!=OP_NOT_IN;}
 static int predicate_validate_value(const SearchCriterion *c,const TypedField *f,const char *s,size_t n,char *err,size_t cap){
-    if(f->type==FT_VARCHAR||f->type==FT_ENUM||f->type==FT_NUMERIC)return 0;
-    if(c->op==OP_REGEX||c->op==OP_NOT_REGEX||predicate_is_length(c->op))return 0;
+    if(f->type==FT_VARCHAR||f->type==FT_NUMERIC)return 0;
+    /* R4: strict grammar validation applies to comparison ops only.
+       Pattern/substring ops operate on rendered text and stay unvalidated. */
+    if(!predicate_numeric_comparison(c->op))return 0;
     uint8_t bytes[32];
     errno=0;int status=encode_json_field_checked(f,s,n,1,bytes,err,cap);
     if(status&&errno==0)errno=EINVAL;
@@ -510,7 +451,7 @@ int compile_one_checked(CompiledCriterion *cc, const SearchCriterion *c,
         cc->d2 = (double)strtof(search_criterion_value2(c), NULL);
         break;
     case FT_BOOL:
-        cc->b1 = (search_criterion_value(c)[0] == 't' || search_criterion_value(c)[0] == 'T' || search_criterion_value(c)[0] == '1') ? 1 : 0;
+        cc->b1 = scalar_bool_value(search_criterion_value(c));
         break;
     case FT_BYTE:
         cc->b1 = (uint8_t)atoi(search_criterion_value(c));
@@ -642,11 +583,9 @@ int compile_one_checked(CompiledCriterion *cc, const SearchCriterion *c,
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
             if(!cc->in_i64) goto fail;
             for (int i = 0; i < c->in_count; i++) {
-                if (cc->ftype == FT_BOOL && (c->in_values[i][0] == 't' ||
-                    c->in_values[i][0] == 'T' || c->in_values[i][0] == '1'))
-                    cc->in_i64[i] = 1;
-                else
-                    cc->in_i64[i] = (int64_t)strtoll(c->in_values[i], NULL, 10);
+                cc->in_i64[i] = cc->ftype == FT_BOOL
+                    ? (int64_t)scalar_bool_value(c->in_values[i])
+                    : (int64_t)strtoll(c->in_values[i], NULL, 10);
             }
             break;
         case FT_NUMERIC: break;

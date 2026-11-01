@@ -360,8 +360,15 @@ int typed_index_text_key_into(const TypedSchema *ts, size_t i, const char *text,
     return 0;
   uint8_t raw[16];
   errno = 0;
-  if (encode_field_checked(f, text, n, raw, NULL, 0))
-    return fail(errno == ENOMEM ? ENOMEM : EINVAL);
+  if (encode_field_checked(f, text, n, raw, NULL, 0)) {
+    /* R4: a probe text that is not in the field's grammar (a join driver
+       value of another type, a legacy stored zero/invalid date) cannot
+       equal any stored value: no match, not an error. Client literals are
+       rejected earlier by predicate_validate. */
+    if (errno == ENOMEM)
+      return fail(ENOMEM);
+    return 0;
+  }
   fixed_payload(f, raw, width, out);
   *len = width;
   return 1;

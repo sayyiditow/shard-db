@@ -1038,6 +1038,13 @@ void encode_field(const TypedField *f, const char *val, uint8_t *out);
    for the scalar numeric types only; varchar/enum are byte-exact. */
 int encode_field_checked(const TypedField *f, const char *val, size_t vlen,
                          uint8_t *out, char *err, size_t errsz);
+/* 1 iff f is a uuid field and v is a valid uuid literal (including the
+   brace-wrapped form). Used to exempt such values from the "starts with
+   '{' ⇒ computed-update object" gate. */
+int value_is_braced_uuid(const TypedField *f, const char *v, size_t n);
+/* Truth value of an already-validated bool literal (grammar: sg_bool);
+   0 for anything the grammar rejects. */
+uint8_t scalar_bool_value(const char *s);
 /* Exact decimal text -> scaled int64 for the field's declared scale,
    ties away from zero, with identical rounding for writes and criteria.
    0 = ok, -1 = invalid,

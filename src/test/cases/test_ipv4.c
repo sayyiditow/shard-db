@@ -98,17 +98,18 @@ static int test_ipv4_run(void) {
     ASSERT_CONTAINS(resp, "\"ipv4\"", "describe-object reports ipv4 type");
     free(resp); resp = NULL;
 
-    /* Malformed address should not crash; should encode to the zero/unset
-       sentinel and round-trip as absent (mirrors FT_UUID's parse-failure
-       fallback convention). */
+    /* R4: malformed addresses are rejected with the field-named grammar
+       error and the record is not written (was: silent zero/unset
+       sentinel downgrade). */
     tc_request(tc,
         "{\"mode\":\"insert\",\"dir\":\"ip4\",\"object\":\"hosts\","
         "\"key\":\"h4\",\"value\":{\"addr\":\"not-an-ip\",\"label\":\"bad\"}}", &resp);
-    ASSERT_CONTAINS(resp, "\"inserted\"", "insert with malformed addr does not error");
+    ASSERT_CONTAINS(resp, "\"error\"", "insert with malformed addr is rejected");
+    ASSERT_CONTAINS(resp, "not a valid ipv4", "field-named ipv4 grammar error");
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"ip4\",\"object\":\"hosts\",\"key\":\"h4\"}", &resp);
-    ASSERT_TRUE(SAFE_STRSTR(resp, "\"addr\":\"") == NULL,
-        "malformed addr encodes to the unset sentinel (field omitted or null)");
+    ASSERT_TRUE(strstr(resp, "\"error\"") != NULL,
+        "rejected record is not written");
     free(resp); resp = NULL;
 
     tc_close(tc);

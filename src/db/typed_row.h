@@ -172,7 +172,6 @@ char *typed_packed_csv_row(const TypedSchema *ts, const uint8_t *value,
 /* Existing scalar semantics, shared internally by the adapter. */
 int encode_json_field_checked(const TypedField *f, const char *text, size_t len,
                                 int quoted, uint8_t *out, char *err, size_t errsz);
-int sentinel_span_parses(enum FieldType type, const char *value, size_t len);
 const char *generate_default(const TypedField *f, char *buf, size_t cap,
                               const char *root, const char *object);
 int decode_field_to_buf(const TypedField *f, const uint8_t *data,

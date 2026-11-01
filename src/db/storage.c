@@ -1407,7 +1407,8 @@ int update_compose_new_from_old(const TypedSchema *ts,
             continue;
         }
         if (field_vals && field_vals[i]) {
-            if (f->type != FT_VARCHAR && field_vals[i][0] == '{') return -2;
+            if (f->type != FT_VARCHAR && field_vals[i][0] == '{' &&
+                !value_is_braced_uuid(f, field_vals[i], strlen(field_vals[i]))) return -2;
             if (encode_field_checked(f, field_vals[i], strlen(field_vals[i]),
                                      dst, err, errsz) != 0)
                 return -2;   /* field-specific message already in err */
