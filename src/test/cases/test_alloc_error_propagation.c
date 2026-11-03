@@ -60,7 +60,7 @@ static void aep_create(ShardDb *db, const char *obj, const char *fields,
                        const char *indexes) {
     char req[512], *resp = NULL;
     snprintf(req, sizeof(req),
-             "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"%s\","
+             "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"%s\","
              "\"splits\":8,\"max_key\":16,\"fields\":[%s],\"indexes\":[%s]}",
              obj, fields, indexes);
     aep_request(db, req, &resp);

@@ -62,7 +62,7 @@ static int lock_order_fixture_start(LockOrderFixture *f) {
             "create lock-order test tenant") != 0 ||
         request_contains(
             f->tc,
-            "{\"mode\":\"create-object\",\"dir\":\"lock_order\","
+            "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"lock_order\","
             "\"object\":\"rows\",\"splits\":8,\"max_key\":16,"
             "\"fields\":[\"bucket:varchar:8\",\"kind:varchar:8\","
             "\"score:int\"],"

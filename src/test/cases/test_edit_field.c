@@ -34,7 +34,7 @@ static int test_edit_field_run(void) {
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"users\","
         "\"splits\":8,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"age:int\",\"balance:numeric:18,2\","
                     "\"score:short\",\"bio:varchar:64\"],"

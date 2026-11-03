@@ -49,7 +49,7 @@ static int test_get_fields_run(void) {
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gf\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"gf\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"name:varchar:32\",\"age:int\"]}", &resp);
     free(resp); resp = NULL;
@@ -89,7 +89,7 @@ static int test_get_fields_run(void) {
        type.  This exercises the shared typed_get_field_str → projection
        emitter seam, including the numeric default-branch types and enum. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gf_types\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"gf_types\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"long_v:long\",\"timestamp_v:timestamp\",\"int_v:int\","
         "\"short_v:short\",\"double_v:double\",\"float_v:float\",\"byte_v:byte\","
@@ -175,7 +175,7 @@ static int test_get_fields_auto_key_run(void) {
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gfauto\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"gfauto\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"name:varchar:32\"],\"auto_key\":\"uuid\"}", &resp);
     free(resp); resp = NULL;
@@ -227,7 +227,7 @@ static int test_get_fields_composite_overflow_run(void) {
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gfbig\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"gfbig\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"f1:varchar:3000\",\"f2:varchar:3000\"]}", &resp);
     free(resp); resp = NULL;
@@ -305,7 +305,7 @@ static int test_startup_refuses_unreadable_kf_count_run(void) {
        forces a full scan_dispatch scan rather than an index-driven plan,
        regardless of which operator is used. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gfnotopen\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"gfnotopen\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"name:varchar:32\"]}", &resp);
     free(resp); resp = NULL;
 

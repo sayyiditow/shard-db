@@ -693,6 +693,14 @@ extern int g_marker_recovery_ran;
    stamp-directory fsync failure. Armed by the startup-migration cases in
    test_null_migration.c; no-op at 0. */
 void btri_stamp_test_inject(int mode);
+/* Test-only (db.env SCHEMA_CONF_TEST_FSYNC_FAIL_CALL): arm the n-th
+   durability_fsync call made inside the NEXT schema.conf rewrite to fail
+   with EIO; no-op at 0. */
+void schema_conf_test_fsync_fail_call(int n);
+/* Test-only (db.env LAYOUT_MIGRATE_TEST_CRASH=<phase>): the startup layout
+   migration raises SIGKILL at the named phase — after-recovery, after-audit,
+   after-stage, after-walk, after-publish, after-reindex, after-commit. */
+void layout_migrate_test_crash_phase(const char *phase);
 #endif
 
 #endif /* SHARD_DB_INTERNAL_H */

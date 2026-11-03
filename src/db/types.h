@@ -343,6 +343,10 @@ typedef struct {
        `auto_key=seq(<name>)` token. */
     enum AutoKeyKind { AK_NONE = 0, AK_UUID, AK_SEQ } auto_key;
     char auto_key_seq_name[128];   /* meaningful only when auto_key == AK_SEQ */
+    /* 0 = legacy layout, 1 = packed layout. Set from the strict
+       `layout=packed` schema.conf token (schema_tail_layout); a malformed
+       token makes load_schema refuse the object instead of defaulting. */
+    int packed_layout;
 } Schema;
 
 
@@ -928,6 +932,33 @@ int shard_db_version_decide(const char *disk_version, int version_present,
 /* config.c */
 int load_db_root(char *out, size_t outlen);
 Schema load_schema(const char *effective_root, const char *object);
+/* Strict layout-token reader over the text after "dir:object:" of a
+   schema.conf line. *out = 1 for exactly one `layout=packed` token, else 0.
+   Returns 0 ok, -2 for any malformed/unknown/duplicate `layout` token. */
+int schema_tail_layout(const char *tail, int *out);
+/* Layout of an object from the global schema.conf. Returns 0 (*out set;
+   0 when the object has no line or the root is outside DB_ROOT), -1 when
+   schema.conf is unreadable, -2 for a malformed token. *out is 0 on error. */
+int schema_conf_layout(const char *effective_root, const char *object, int *out);
+/* Sets (packed=1) or clears (packed=0) the `layout=packed` token on the
+   object's schema.conf line, preserving every other token; checked
+   publication; -1 when the line is absent or anything fails. */
+int update_schema_conf_layout(const char *effective_root, const char *object, int packed);
+/* fields.conf legacy->packed declaration rewrite and the uncached packed
+   builder used by create-object and the startup migration. */
+int layout_packed_decl_line(const char *line, char *out, size_t cap);
+int typed_schema_build_packed(const char *const *lines, size_t nlines,
+                              TypedSchema *out, char *err, size_t errsz);
+void typed_schema_release(TypedSchema *ts);
+/* Startup migration of ONE legacy object to the packed layout. dry_run=1:
+   read-only audit (nothing is written). Returns 0 ok, 1 when records do not
+   fit their packed declaration (diag lists up to 8, one per line), -1 on
+   any other failure (diag has the reason). Caller holds objlock_wrlock. */
+int layout_migrate_object(const char *effective_root, const char *object,
+                          int dry_run, char *diag, size_t diagsz);
+/* No-op outside TEST_BUILD; in TEST_BUILD raises SIGKILL when the db.env
+   knob LAYOUT_MIGRATE_TEST_CRASH names this phase. */
+void layout_test_crash_point(const char *phase);
 int load_splits(const char *db_root, const char *object);
 int load_index_fields(const char *db_root, const char *object, char fields[][256], int max_fields);
 /* Companion to load_index_fields — fills `types[i]` with the IndexType for
@@ -1572,7 +1603,7 @@ int cmd_list_files(const char *db_root, const char *object,
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
-                      const char *auto_key_spec);
+                      const char *auto_key_spec, int packed);
 /* Drops an object entirely: data, metadata, indexes, fields.conf, indexes/,
    counts, and the schema.conf line. Invalidates caches. if_exists=1 makes
    the call idempotent (no-op if the object is already gone). */

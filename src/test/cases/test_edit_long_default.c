@@ -44,7 +44,7 @@ static int test_edit_long_default_run(void) {
 
     /* 1. absent default: the edit supplies a 250-char literal. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ld1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"ld1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"big:varchar:300\",\"n:int\"]}", &resp);
     ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"error\"") == NULL, "create ld1");
@@ -77,7 +77,7 @@ static int test_edit_long_default_run(void) {
 
     /* 2. existing long default: a type resize carries it forward. */
     snprintf(req, sizeof(req),
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ld2\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"ld2\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"big:varchar:300:default=%s\",\"n:int\"]}", g_lit1);
     tc_request(tc, req, &resp);

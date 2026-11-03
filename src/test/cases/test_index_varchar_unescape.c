@@ -26,7 +26,7 @@ static int test_idx_varchar_find_eq(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"idx1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"idx1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"category:varchar:64\"],\"indexes\":[\"category\"]}", &resp);
     free(resp); resp = NULL;
@@ -66,7 +66,7 @@ static int test_update_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"upd1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"upd1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"category:varchar:64\"],\"indexes\":[\"category\"]}", &resp);
     free(resp); resp = NULL;
@@ -111,7 +111,7 @@ static int test_bulk_update_criteria_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"bu1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"bu1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\",\"tag:varchar:16\"]}", &resp);
     free(resp); resp = NULL;
 
@@ -155,7 +155,7 @@ static int test_bulk_update_json_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"bj1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"bj1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
@@ -173,7 +173,7 @@ static int test_bulk_update_json_varchar_unescape(void) {
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"bj2\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"bj2\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
@@ -209,7 +209,7 @@ static int test_criteria_unindexed_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"un1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"un1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
 
@@ -247,7 +247,7 @@ static int test_criteria_in_list_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"in1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"in1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
 
@@ -286,7 +286,7 @@ static int test_criteria_between_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"bt1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"bt1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
 
@@ -323,7 +323,7 @@ static int test_varchar_embedded_nul_rejected(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"nul1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"nul1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
 
@@ -351,7 +351,7 @@ static int test_varchar_trailing_backslash(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"trail1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"trail1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"],"
         "\"indexes\":[\"category\"]}", &resp);
     free(resp); resp = NULL;
@@ -395,7 +395,7 @@ static int test_upsert_json_index_routes_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"routes1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"routes1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"category:varchar:64\",\"region:varchar:64\","
         "\"kind:varchar:64\",\"bio:varchar:128\"],"
@@ -465,7 +465,7 @@ static int test_simple_criteria_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"simple1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"simple1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"category:varchar:64\",\"tag:varchar:16\"]}", &resp);
     free(resp); resp = NULL;
@@ -513,7 +513,7 @@ static int test_varchar_malformed_escape_policies(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"bad1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"bad1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"category:varchar:64\",\"tag:varchar:16\"]}", &resp);
     free(resp); resp = NULL;
@@ -630,7 +630,7 @@ static int test_cursor_order_by_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"curs1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"curs1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"tag:varchar:16\"],\"indexes\":[\"tag\"]}", &resp);
     free(resp); resp = NULL;
@@ -712,7 +712,7 @@ static int test_get_multi_csv_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vue\",\"object\":\"csvm1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"csvm1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;

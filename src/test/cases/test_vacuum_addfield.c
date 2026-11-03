@@ -29,7 +29,7 @@ static int test_vacuum_addfield_run(void) {
 
     /* Plain vacuum: 5 inserts, delete 2, vacuum cleans=2. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"vac1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"vac1\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"age:int\"],\"indexes\":[]}",
         &resp); free(resp); resp = NULL;
@@ -61,7 +61,7 @@ static int test_vacuum_addfield_run(void) {
 
     /* vacuum --compact drops tombstoned fields. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"vac2\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"vac2\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"email:varchar:40\","
                     "\"age:int\",\"score:int\"],\"indexes\":[]}",
@@ -117,7 +117,7 @@ static int test_vacuum_addfield_run(void) {
 
     /* vacuum --splits N reshards. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"vac3\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"vac3\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:16\"],\"indexes\":[\"name\"]}",
         &resp); free(resp); resp = NULL;
@@ -161,7 +161,7 @@ static int test_vacuum_addfield_run(void) {
 
     /* TASK #6: add-field appends new fields. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"add1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"add1\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:16\"],\"indexes\":[]}",
         &resp); free(resp); resp = NULL;
@@ -226,7 +226,7 @@ static int test_vacuum_addfield_run(void) {
 
     /* INTEGRATION: remove-field + vacuum --compact + add-field. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"integ\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"integ\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"a:varchar:16\",\"b:varchar:16\",\"c:int\"],\"indexes\":[]}",
         &resp); free(resp); resp = NULL;

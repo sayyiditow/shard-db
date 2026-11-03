@@ -292,6 +292,7 @@ struct RebuildTxn {
     int old_splits;
     int old_streams;
     int indexes_may_change;
+    int old_layout_packed;   /* layout token at begin; restored by abort (F19) */
 };
 
 static int path_join2(char *out, size_t cap, const char *a, const char *b) {
@@ -393,9 +394,10 @@ static int write_meta(RebuildTxn *txn) {
     if (!f) return -1;
     int rc = fprintf(f,
                      "version=1\nold_splits=%d\nold_streams=%d\n"
-                     "indexes_may_change=%d\n",
+                     "indexes_may_change=%d\nold_layout=%d\n",
                      txn->old_splits, txn->old_streams,
-                     txn->indexes_may_change ? 1 : 0) < 0 ? -1 : 0;
+                     txn->indexes_may_change ? 1 : 0,
+                     txn->old_layout_packed ? 1 : 0) < 0 ? -1 : 0;
     if (fclose(f) != 0) rc = -1;
     if (rc == 0 && rename(tmp, meta) != 0) rc = -1;
     if (rc != 0) unlink(tmp);
@@ -423,6 +425,7 @@ static int parse_meta(RebuildTxn *txn) {
         return -1;
     }
     int seen_version = 0, seen_splits = 0, seen_streams = 0, seen_indexes = 0;
+    int seen_layout = 0, layout = 0;   /* old_layout is optional: absent = legacy (pre-2026.11.1 meta) */
     int version = 0, splits = 0, streams = 0, indexes = -1;
     int bad = 0;
     char line[256];
@@ -439,6 +442,8 @@ static int parse_meta(RebuildTxn *txn) {
         } else if (sscanf(line, "indexes_may_change=%d%c", &indexes,
                           &extra) == 1) {
             if (seen_indexes++) bad = 1;
+        } else if (sscanf(line, "old_layout=%d%c", &layout, &extra) == 1) {
+            if (seen_layout++) bad = 1;
         } else {
             bad = 1;
         }
@@ -448,10 +453,12 @@ static int parse_meta(RebuildTxn *txn) {
     fclose(f);
     if (bad || seen_version != 1 || seen_splits != 1 || seen_streams != 1 ||
         seen_indexes != 1 || version != 1 || !valid_old_splits(splits) ||
-        streams <= 0 || (indexes != 0 && indexes != 1)) return -1;
+        streams <= 0 || (indexes != 0 && indexes != 1) ||
+        (layout != 0 && layout != 1)) return -1;
     txn->old_splits = splits;
     txn->old_streams = streams;
     txn->indexes_may_change = indexes;
+    txn->old_layout_packed = layout;
     return 0;
 }
 
@@ -464,6 +471,14 @@ RebuildTxn *rebuild_txn_begin(const char *db_root, const char *object,
     txn->old_splits = old_splits;
     txn->old_streams = old_streams;
     txn->indexes_may_change = indexes_may_change ? 1 : 0;
+    {
+        int lp = 0;
+        if (schema_conf_layout(db_root, object, &lp) != 0) {
+            rebuild_txn_free(txn);
+            return NULL;   /* layout unreadable: do not stage anything */
+        }
+        txn->old_layout_packed = lp;
+    }
 
     struct stat st;
     if (lstat(txn->active, &st) == 0 || errno != ENOENT ||
@@ -540,10 +555,16 @@ int rebuild_txn_abort(RebuildTxn *txn) {
                  txn->fields_path, (int)getpid()) >= (int)sizeof(fields_tmp) ||
         copy_regular_file_atomic(txn->fields_rollback, txn->fields_path,
                                  fields_tmp) != 0) return -1;
-    invalidate_schema_caches(txn->db_root, txn->object);
     if (update_schema_conf_splits_streams(txn->db_root, txn->object,
                                           txn->old_splits,
                                           txn->old_streams) != 0) return -1;
+    {
+        int cur = 0;
+        if (schema_conf_layout(txn->db_root, txn->object, &cur) != 0) return -1;
+        if (cur != txn->old_layout_packed &&
+            update_schema_conf_layout(txn->db_root, txn->object,
+                                      txn->old_layout_packed) != 0) return -1;
+    }
     invalidate_schema_caches(txn->db_root, txn->object);
     invalidate_idx_cache(txn->db_root, txn->object);
     slotcask_registry_invalidate(txn->db_root, txn->object);

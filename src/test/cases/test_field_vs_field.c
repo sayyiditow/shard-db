@@ -38,7 +38,7 @@ static int test_field_vs_field_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"fft\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"fft\","
         "\"fields\":[\"received_at:int\",\"scheduled_at:int\","
                     "\"name:varchar:32\",\"alias:varchar:32\","
                     "\"amount:numeric:10,2\",\"budget:numeric:10,2\","

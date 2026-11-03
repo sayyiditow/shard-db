@@ -438,8 +438,9 @@ int cmd_backup(const char *db_root, const char *object) {
     if (mf) {
         /* storage_version slot kept in the backup metadata for forward
            compatibility — every object the daemon writes is v2. */
-        fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":2,\"streams\":%d}\n",
-                sch.splits, sch.max_key, sch.streams);
+        fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":2,\"streams\":%d,\"layout\":\"%s\"}\n",
+                sch.splits, sch.max_key, sch.streams,
+                sch.packed_layout ? "packed" : "legacy");
         fclose(mf);
     }
 
@@ -452,7 +453,7 @@ int cmd_backup(const char *db_root, const char *object) {
    Returns 1 on success. Defaults out_storage_version to 1 / out_streams
    to 0 when missing, matching legacy semantics. */
 static int parse_object_meta(const char *path, int *out_splits, int *out_max_key,
-                              int *out_storage_version, int *out_streams) {
+                              int *out_storage_version, int *out_streams, int *out_packed) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     char buf[256] = {0};
@@ -470,11 +471,13 @@ static int parse_object_meta(const char *path, int *out_splits, int *out_max_key
     if (p) sv = atoi(p + strlen("\"storage_version\":"));
     p = strstr(buf, "\"streams\":");
     if (p) streams = atoi(p + strlen("\"streams\":"));
+    int packed = strstr(buf, "\"layout\":\"packed\"") != NULL;
     if (splits < 0 || max_key < 0) return 0;
     *out_splits = splits;
     *out_max_key = max_key;
     if (out_storage_version) *out_storage_version = sv;
     if (out_streams)         *out_streams = streams;
+    if (out_packed)          *out_packed = packed;
     return 1;
 }
 
@@ -484,7 +487,7 @@ static int parse_object_meta(const char *path, int *out_splits, int *out_max_key
    Returns 0 on success, -1 on IO failure. */
 static int ensure_schema_conf_line(const char *db_root, const char *object,
                                    int splits, int max_key,
-                                   int storage_version, int streams) {
+                                   int storage_version, int streams, int packed) {
     const char *dir = db_root + strlen(g_db_root);
     if (*dir == '/') dir++;
 
@@ -511,8 +514,8 @@ static int ensure_schema_conf_line(const char *db_root, const char *object,
     if (!found) {
         fseek(f, 0, SEEK_END);
         if (storage_version >= 2)
-            fprintf(f, "%s%d:%d:%d:%d\n", prefix, splits, max_key,
-                    storage_version, streams);
+            fprintf(f, "%s%d:%d:%d:%d%s\n", prefix, splits, max_key,
+                    storage_version, streams, packed ? ":layout=packed" : "");
         else
             fprintf(f, "%s%d:%d\n", prefix, splits, max_key);
     }
@@ -592,11 +595,26 @@ int cmd_restore(const char *db_root, const char *object,
        object.json — accept and skip. */
     char meta_src[PATH_MAX];
     snprintf(meta_src, sizeof(meta_src), "%s/object.json", src_dir);
-    int bak_splits = 0, bak_max_key = 0, bak_sv = 1, bak_streams = 0;
+    int bak_splits = 0, bak_max_key = 0, bak_sv = 1, bak_streams = 0, bak_packed = 0;
     int have_meta = parse_object_meta(meta_src, &bak_splits, &bak_max_key,
-                                       &bak_sv, &bak_streams);
+                                       &bak_sv, &bak_streams, &bak_packed);
+    if (!have_meta) {
+        /* No layout evidence: after the layout migration every live object
+           is packed, so unknown bytes must never be copied over it. */
+        objlock_wrunlock(db_root, object);
+        OUT("{\"error\":\"backup has no layout metadata (object.json); restore refused\"}\n");
+        return 1;
+    }
     if (have_meta) {
         Schema live = load_schema(db_root, object);
+        if ((live.splits > 0 && (live.packed_layout ? 1 : 0) != bak_packed) ||
+            (live.splits <= 0 && !bak_packed)) {
+            objlock_wrunlock(db_root, object);
+            OUT("{\"error\":\"backup layout (%s) does not match the live object's layout (%s); restore refused — a backup taken before the layout migration cannot be restored into a migrated object\"}\n",
+                bak_packed ? "packed" : "legacy",
+                live.splits > 0 ? (live.packed_layout ? "packed" : "legacy") : "absent");
+            return 1;
+        }
         if (live.splits > 0 && (live.splits != bak_splits || live.max_key != bak_max_key) && !force) {
             objlock_wrunlock(db_root, object);
             OUT("{\"error\":\"schema mismatch: live splits=%d max_key=%d, "
@@ -605,7 +623,7 @@ int cmd_restore(const char *db_root, const char *object,
             return 1;
         }
         if (ensure_schema_conf_line(db_root, object, bak_splits, bak_max_key,
-                                     bak_sv, bak_streams) != 0) {
+                                     bak_sv, bak_streams, bak_packed) != 0) {
             objlock_wrunlock(db_root, object);
             OUT("{\"error\":\"failed to update schema.conf\"}\n");
             return 1;

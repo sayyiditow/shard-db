@@ -6,6 +6,12 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**2026.11.1 — packed layout metadata, strict `layout=` token, version gate (R5, in progress).**
+`SHARD_DB_VERSION` is now `2026.11.1` and the minimum supported source release is
+`2026.10.2`; roots must carry 2026.10.2 clean-open evidence to open (older roots get
+the existing TOO_OLD upgrade hint). The strict `layout=packed` schema.conf token is
+the authoritative object layout; a malformed token refuses the object's load.
+
 **BREAKING (R4 — strict scalar grammars).** Malformed non-NULL input on
 `bool`/`date`/`datetime`/`datetimems`/`time`/`uuid`/`ipv4`/`ipv6`/`enum`
 fields is now rejected with a field-named error on every write route and on

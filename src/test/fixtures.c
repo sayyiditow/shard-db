@@ -150,10 +150,20 @@ static int fixture_pool_size(void) {
     return g_test_jobs <= 4 ? 4 : 2;
 }
 
-static int wait_daemon_ready(int port, int timeout_ms) {
+static int wait_daemon_ready(int port, int timeout_ms, pid_t pid) {
     int waited = 0;
     int last_step = 0, last_errno = 0;
     while (waited < timeout_ms) {
+        /* A daemon that already exited (e.g. startup refusal) can never
+           become ready: stop waiting without reaping it, so callers still
+           see the exit status via their own waitpid. */
+        siginfo_t si;
+        memset(&si, 0, sizeof(si));
+        if (pid > 0 && waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+            si.si_pid == pid) {
+            last_step = 3; last_errno = 0;
+            break;
+        }
         TestClientCfg cfg = { .port = port, .connect_timeout_ms = 200 };
         TestClient *tc = tc_connect(&cfg);
         if (!tc) {
@@ -373,7 +383,7 @@ respawn:;
        ~5-15x); a full-parallel run-all burst of concurrent daemon spawns
        widens this further. Match test_env_start_at's restart-path wait,
        which already accounts for this. */
-    if (wait_daemon_ready(env->port, 30000) != 0) {
+    if (wait_daemon_ready(env->port, 30000, env->daemon_pid) != 0) {
         fprintf(stderr,
             "wait_daemon_ready: timeout on port %d (last_step=%d errno=%d %s)\n",
             env->port, g_wait_last_step, g_wait_last_errno,
@@ -557,7 +567,7 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
        serving.  Sanitizer builds make that recovery path much slower;
        allow the restart helper to wait for the daemon to become ready
        without weakening the production startup path. */
-    if (wait_daemon_ready(env->port, 30000) != 0) {
+    if (wait_daemon_ready(env->port, 30000, env->daemon_pid) != 0) {
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
         if (env->test_control_fd > 0) {

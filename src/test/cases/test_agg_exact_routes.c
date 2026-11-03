@@ -447,8 +447,10 @@ static int ar_limits_run(void) {
             "[{\"g\":\"a\",\"c\":2},{\"g\":\"b\",\"c\":3},{\"g\":\"c\",\"c\":1}]",
             "cell allocation recovers with exact complete response");
     }
+    /* The packed exact path has more fault points than the legacy one, so the
+       sweep runs wide enough to pass the last fault point and reach success. */
     int saw_error = 0, saw_ok = 0;
-    for (int n = 1; n <= 12; n++) {
+    for (int n = 1; n <= 64; n++) {
         agg_exact_test_set_fail_alloc(n);
         r = ar_req("{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"r3flt\","
                    "\"aggregates\":[" AR_S("sum","n","sn") "," AR_S("avg","n","an") "]}");

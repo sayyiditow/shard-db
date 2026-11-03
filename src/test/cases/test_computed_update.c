@@ -31,7 +31,7 @@ static int test_computed_update_run(void) {
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"cp\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"cp\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"balance:long\",\"shares:int\","
         "\"price:numeric:12,2\",\"ratio:double\",\"note:varchar:20\","
@@ -257,7 +257,7 @@ static int test_computed_update_run(void) {
            legacy fixture below preserves coverage of that $copy guard.
            Keep a finite-source $copy check here as well. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"cx\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"cx\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"s:double\",\"t:double\"]}",
         &resp);
     free(resp); resp = NULL;
@@ -469,7 +469,7 @@ static int test_computed_update_legacy_nonfinite_run(void) {
     for (int i = 0; i < 2; i++) {
         char req[512];
         snprintf(req, sizeof(req),
-            "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"%s\","
+            "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"%s\","
             "\"splits\":8,\"max_key\":16,"
             "\"fields\":[\"s:double\",\"t:double\"]}", objects[i]);
         tc_request(tc, req, &resp);

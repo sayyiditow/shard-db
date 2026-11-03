@@ -405,18 +405,23 @@ static int startup_schema_line(char *line, StartupSchemaEntry *out) {
     if (!*p || *p == '#') return 1;
 
     char *save = NULL;
-    char *parts[7] = {0};
+    char *parts[8] = {0};
     int n = 0;
-    for (char *part = strtok_r(p, ":", &save);
-         part && n < 7; part = strtok_r(NULL, ":", &save))
+    char *part = strtok_r(p, ":", &save);
+    while (part && n < 8) {
         parts[n++] = part;
+        part = strtok_r(NULL, ":", &save);
+    }
+    /* A ninth token is not part of any known line shape: refuse instead of
+       letting the cap silently drop it. */
+    if (part) return -1;
     /* dir_name_ok is a pure string-format check (no path separators,
        no control chars, no leading dot). is_valid_dir would additionally
        require the dir to be currently registered in dirs.conf, which is
        wrong here — a schema.conf entry for a since-removed tenant dir
        must still parse so the caller can treat it as a soft/stale entry
        instead of a hard parse failure. */
-    if (n < 6 || n > 7 || !dir_name_ok(parts[0]) ||
+    if (n < 6 || n > 8 || !dir_name_ok(parts[0]) ||
         !is_valid_object(parts[1]))
         return -1;
 
@@ -426,6 +431,15 @@ static int startup_schema_line(char *line, StartupSchemaEntry *out) {
         *end != '\0' || streams <= 0 || streams > SLOTCASK_MAX_STREAMS)
         return -1;
     if (strcmp(parts[4], "2") != 0) return -1;
+    {
+        int layouts = 0;
+        for (int i = 6; i < n; i++) {
+            if (strncmp(parts[i], "layout", 6) != 0 ||
+                (parts[i][6] != '\0' && parts[i][6] != '='))
+                continue;
+            if (layouts++ || strcmp(parts[i], "layout=packed") != 0) return -1;
+        }
+    }
 
     snprintf(out->dir, sizeof(out->dir), "%s", parts[0]);
     snprintf(out->object, sizeof(out->object), "%s", parts[1]);
@@ -764,6 +778,170 @@ static int btri_migration_stamp_write(const char *db_root) {
     return (sync_rc == 0 && close_rc == 0) ? 0 : -1;
 }
 
+/* ── Layout migration (R5 Task 8) ──
+   Converts every legacy object to the packed layout. See the plan for the
+   ordering rationale: audit and preconditions first, version stamp second,
+   per-object RebuildTxn conversion third, completion stamp last. */
+#define LAYOUT_MIGRATION_STAMP  ".layout-migrated"
+#define LAYOUT_MIGRATION_REPORT ".layout-migration-report"
+
+static int layout_stamp_exists(const char *db_root) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", db_root, LAYOUT_MIGRATION_STAMP);
+    return access(path, F_OK) == 0;
+}
+
+static int layout_stamp_write(const char *db_root) {
+    char tmp[PATH_MAX], final[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s/%s.tmp", db_root, LAYOUT_MIGRATION_STAMP);
+    snprintf(final, sizeof(final), "%s/%s", db_root, LAYOUT_MIGRATION_STAMP);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    int rc = dprintf(fd, "layout-migration complete (binary %s)\n", SHARD_DB_VERSION) > 0 ? 0 : -1;
+    if (close(fd) != 0) rc = -1;
+    if (rc != 0) { (void)unlink(tmp); return -1; }
+    int prc = durability_publish_replace(final, tmp, NULL, NULL);   /* fsync(tmp) → rename → fsync(dir) */
+    if (prc < 0) { (void)unlink(tmp); return -1; }
+    return prc == 0 ? 0 : -1;   /* renamed but unconfirmed durable: refuse; the next start re-checks */
+}
+
+static void layout_report_write(const char *db_root, const char *text) {
+    char tmp[PATH_MAX], final[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s/%s.tmp", db_root, LAYOUT_MIGRATION_REPORT);
+    snprintf(final, sizeof(final), "%s/%s", db_root, LAYOUT_MIGRATION_REPORT);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    int ok = fputs(text, f) >= 0;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok || rename(tmp, final) != 0) (void)unlink(tmp);
+}
+
+static void layout_report_remove(const char *db_root) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", db_root, LAYOUT_MIGRATION_REPORT);
+    (void)unlink(path);
+}
+
+static int layout_migration_run(const char *db_root) {
+    if (layout_stamp_exists(db_root)) return 0;
+    layout_test_crash_point("after-recovery");
+
+    StartupSchemaEntry *ents = NULL;
+    size_t n = 0;
+    if (startup_read_schema(db_root, &ents, &n) != 0) return -1;
+
+    size_t nlegacy = 0;
+    for (size_t i = 0; i < n; i++) {
+        char eff[PATH_MAX];
+        snprintf(eff, sizeof(eff), "%s/%s", db_root, ents[i].dir);
+        int packed = 0;
+        if (schema_conf_layout(eff, ents[i].object, &packed) != 0) {
+            fprintf(stderr, "shard-db: refusing to start: unreadable layout token for %s/%s\n",
+                    ents[i].dir, ents[i].object);
+            free(ents);
+            return -1;
+        }
+        if (!packed) nlegacy++;
+    }
+    if (nlegacy == 0) {
+        free(ents);
+        if (layout_stamp_write(db_root) != 0) return -1;
+        layout_report_remove(db_root);
+        return 0;
+    }
+
+    char disk[64] = {0};
+    int decision = shard_db_version_check(db_root, disk, sizeof(disk));
+    if (decision != SHARD_DB_VERSION_STAMP && decision != SHARD_DB_VERSION_NOOP) {
+        free(ents);
+        return -1;
+    }
+    int first_start = decision == SHARD_DB_VERSION_STAMP;
+
+    /* D7: the previous version must have closed cleanly with no pending
+       markers. Nothing has been touched yet. */
+    if (first_start && !clean_flag_exists(db_root)) {
+        fprintf(stderr,
+                "shard-db: refusing to start: database was not closed cleanly by shard-db %s. "
+                "Start shard-db %s against this DB_ROOT, stop it cleanly, then upgrade to %s.\n",
+                disk, SHARD_DB_REQUIRED_SOURCE_VERSION, SHARD_DB_VERSION);
+        free(ents);
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char data_dir[PATH_MAX];
+        snprintf(data_dir, sizeof(data_dir), "%s/%s/%s", db_root, ents[i].dir, ents[i].object);
+        if (object_has_pending_markers(data_dir) != 0) {
+            fprintf(stderr,
+                    "shard-db: refusing to start: %s/%s has pending commit markers. "
+                    "Start shard-db %s against this DB_ROOT, stop it cleanly, then upgrade to %s.\n",
+                    ents[i].dir, ents[i].object, SHARD_DB_REQUIRED_SOURCE_VERSION, SHARD_DB_VERSION);
+            free(ents);
+            return -1;
+        }
+    }
+
+    /* D5 audit: read-only, whole root, before the stamp. */
+    char report[2048];
+    size_t rl = 0;
+    int refused = 0;
+    report[0] = '\0';
+    for (size_t i = 0; i < n; i++) {
+        char eff[PATH_MAX], diag[1024];
+        int packed = 0;
+        snprintf(eff, sizeof(eff), "%s/%s", db_root, ents[i].dir);
+        (void)schema_conf_layout(eff, ents[i].object, &packed);
+        if (packed) continue;
+        if (objlock_wrlock(eff, ents[i].object) != 0) { free(ents); return -1; }
+        int rc = layout_migrate_object(eff, ents[i].object, 1, diag, sizeof(diag));
+        objlock_wrunlock(eff, ents[i].object);
+        if (rc != 0) {
+            refused = 1;
+            if (rl + 1 < sizeof(report))
+                rl += (size_t)snprintf(report + rl, sizeof(report) - rl,
+                                       "%s/%s: layout migration refused:\n%s%s",
+                                       ents[i].dir, ents[i].object, diag,
+                                       diag[0] && diag[strlen(diag) - 1] == '\n' ? "" : "\n");
+        }
+    }
+    if (refused) {
+        fputs(report, stderr);
+        layout_report_write(db_root, report);
+        free(ents);
+        return -1;
+    }
+    layout_test_crash_point("after-audit");
+
+    /* F16: the new version must be stamped BEFORE any packed layout is
+       published, otherwise a crash leaves a packed object under an old
+       stamp that 2026.10.2 would open as legacy. */
+    if (first_start && shard_db_version_stamp(db_root) != SHARD_DB_VERSION_STAMP_OK) {
+        free(ents);
+        return -1;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        char eff[PATH_MAX], diag[1024];
+        int packed = 0;
+        snprintf(eff, sizeof(eff), "%s/%s", db_root, ents[i].dir);
+        (void)schema_conf_layout(eff, ents[i].object, &packed);
+        if (packed) continue;
+        if (objlock_wrlock(eff, ents[i].object) != 0) { free(ents); return -1; }
+        int rc = layout_migrate_object(eff, ents[i].object, 0, diag, sizeof(diag));
+        objlock_wrunlock(eff, ents[i].object);
+        if (rc != 0) {
+            fprintf(stderr, "shard-db: refusing to start: layout migration failed for %s/%s: %s\n",
+                    ents[i].dir, ents[i].object, diag);
+            free(ents);
+            return -1;
+        }
+    }
+    free(ents);
+    if (layout_stamp_write(db_root) != 0) return -1;
+    layout_report_remove(db_root);
+    return 0;
+}
+
 int shard_db_recover_before_stamp(const char *db_root,
                                   int *out_markers_replayed) {
     if (!out_markers_replayed) return -1;
@@ -815,6 +993,10 @@ int shard_db_recover_before_stamp(const char *db_root,
         free(ments);
         btri_migration_ran = 1;
     }
+
+    /* Layout migration: after artifact recovery and the BTRI migration,
+       before the clean flag is consumed (its presence is a D7 precondition). */
+    if (layout_migration_run(db_root) != 0) return -1;
 
     int was_clean = clean_flag_exists(db_root);
     if (clean_flag_remove(db_root) != 0) return -1;

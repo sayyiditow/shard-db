@@ -31,7 +31,7 @@ static int test_not_null_edit_modifiers_run(void) {
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ed\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"ed\","
         "\"splits\":8,\"max_key\":32,"
         "\"fields\":[\"n:int:not_null\",\"m:varchar:20:not_null\","
                     "\"p:long\"]}", &resp);
@@ -142,7 +142,7 @@ static int test_not_null_edit_modifiers_run(void) {
     /* 6. unrelated-field edit leaves other lines byte-intact, and a
           resize on a default+token field carries BOTH. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ed2\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"ed2\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"q:int:default=5:not_null\"]}", &resp);
     ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"error\"") == NULL, "create ed2");
@@ -182,7 +182,7 @@ static int test_not_null_edit_modifiers_run(void) {
        carrying the old default; then replace default and constraint
        together. Each canonical line must appear exactly once. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ed3\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"ed3\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"x:int:default=5\"]}", &resp);
     ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""), "create ed3");
     free(resp); resp = NULL;

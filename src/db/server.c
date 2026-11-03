@@ -1402,18 +1402,38 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
     if (strcmp(mode, "create-object") == 0) {
         const char *stream_value=NULL,*manifest_layout=NULL;size_t stream_len=0,manifest_len=0;
         int marked_manifest=json_obj_get(&req,"declaration_layout",&manifest_layout,&manifest_len);
-        if(marked_manifest&&json_obj_get(&req,"streams",&stream_value,&stream_len)){
+        int legacy_fixture=0;
+#ifdef TEST_BUILD
+        /* TEST_BUILD legacy fixtures choose their own stream count. */
+        legacy_fixture=marked_manifest&&manifest_len==8&&!memcmp(manifest_layout,"\"legacy\"",8);
+#endif
+        if(marked_manifest&&!legacy_fixture&&json_obj_get(&req,"streams",&stream_value,&stream_len)){
             char expected[32];int n=snprintf(expected,sizeof(expected),"%d",slotcask_streams_for_nproc());
             if(n<1||stream_len!=(size_t)n||memcmp(stream_value,expected,stream_len)){
                 OUT("{\"error\":\"imported stream count differs from this host; explicit geometry import awaits migration integration\"}\n");
                 free(mode);free(dir);free(object);return;
             }
         }
+        /* declaration_layout names the GRAMMAR of the request's fields strings
+           (D10). "packed" (and, once the default flips, absent) creates a
+           packed object. "legacy" exists only in TEST_BUILD so the migration
+           tests can build legacy fixtures. */
         const char *layout_value=NULL;size_t layout_len=0;
-        if(json_obj_get(&req,"declaration_layout",&layout_value,&layout_len)&&
-           (layout_len!=8||memcmp(layout_value,"\"legacy\"",8))){
-            OUT("{\"error\":\"packed or unknown schema layout import is inactive until migration integration\"}\n");
-            free(mode);free(dir);free(object);return;
+        int create_packed=1;
+        if(json_obj_get(&req,"declaration_layout",&layout_value,&layout_len)){
+            if(layout_len==8&&!memcmp(layout_value,"\"packed\"",8)){
+                create_packed=1;
+            }else if(layout_len==8&&!memcmp(layout_value,"\"legacy\"",8)){
+#ifdef TEST_BUILD
+                create_packed=0;
+#else
+                OUT("{\"error\":\"legacy layout objects can no longer be created\"}\n");
+                free(mode);free(dir);free(object);return;
+#endif
+            }else{
+                OUT("{\"error\":\"unknown declaration_layout; expected \\\"packed\\\"\"}\n");
+                free(mode);free(dir);free(object);return;
+            }
         }
         char *fields_j = json_obj_strdup_raw(&req, "fields");
         char *indexes_j = json_obj_strdup_raw(&req, "indexes");
@@ -1437,7 +1457,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                           splits_s ? atoi(splits_s) : 0,
                           max_key_s ? atoi(max_key_s) : 0,
                           if_not_exists,
-                          auto_key_s);
+                          auto_key_s, create_packed);
         free(fields_j); free(indexes_j);
         free(splits_s); free(max_key_s); free(ine_s); free(sv_s);
         free(auto_key_s);

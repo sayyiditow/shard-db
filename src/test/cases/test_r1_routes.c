@@ -128,7 +128,7 @@ static void r_schema_routes(void){
     ASSERT_NOT_NULL(client,"schema route connect");if(!client){test_env_stop(&env);return;}
     char *response=NULL;
     tc_request(client,"{\"mode\":\"add-dir\",\"dir\":\"r1\"}",&response);free(response);
-    tc_request(client,"{\"mode\":\"create-object\",\"dir\":\"r1\",\"object\":\"roundtrip\",\"fields\":[\"\\u0063ash:numeric:26,10:default=0:not_null\",\"note:varchar:30:default=a\\\\b\"]}",&response);
+    tc_request(client,"{\"mode\":\"create-object\",\"dir\":\"r1\",\"object\":\"roundtrip\",\"declaration_layout\":\"legacy\",\"fields\":[\"\\u0063ash:numeric:26,10:default=0:not_null\",\"note:varchar:30:default=a\\\\b\"]}",&response);
     ASSERT_TRUE(response&&!strstr(response,"\"error\""),"escaped declarations accepted");free(response);
     tc_request(client,"{\"mode\":\"describe-object\",\"dir\":\"r1\",\"object\":\"roundtrip\"}",&response);
     ASSERT_CONTAINS(response,"\"spec\":\"cash:numeric:26,10:default=0:not_null\"","original precision and modifier declaration preserved");
@@ -140,8 +140,10 @@ static void r_schema_routes(void){
     tc_request(client,"{\"mode\":\"create-object\",\"dir\":\"r1\",\"object\":\"bad\",\"fields\":[\"x:int:default=999999999999\"]}",&response);
     ASSERT_CONTAINS(response,"\"error\"","invalid literal default refused at create");free(response);
     tc_request(client,"{\"mode\":\"create-object\",\"dir\":\"r1\",\"object\":\"wronglayout\",\"declaration_layout\":\"packed\",\"fields\":[\"x:numeric:26,10\"]}",&response);
-    ASSERT_CONTAINS(response,"\"error\"","packed export never silently imported as legacy");free(response);
-    tc_request(client,"{\"mode\":\"create-object\",\"dir\":\"r1\",\"object\":\"streamloss\",\"declaration_layout\":\"legacy\",\"streams\":3,\"fields\":[\"x:int\"]}",&response);
+    ASSERT_CONTAINS(response,"\"status\":\"created\"","packed declaration creates a packed object (R5)");free(response);
+    tc_request(client,"{\"mode\":\"describe-object\",\"dir\":\"r1\",\"object\":\"wronglayout\"}",&response);
+    ASSERT_CONTAINS(response,"\"declaration_layout\":\"packed\"","packed object never described as legacy");free(response);
+    tc_request(client,"{\"mode\":\"create-object\",\"dir\":\"r1\",\"object\":\"streamloss\",\"declaration_layout\":\"packed\",\"streams\":3,\"fields\":[\"x:int\"]}",&response);
     ASSERT_CONTAINS(response,"\"error\"","unsupported imported stream count never silently replaced");free(response);
     tc_close(client);test_env_stop(&env);
 }

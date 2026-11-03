@@ -451,6 +451,14 @@ int load_db_root(char *out, size_t outlen) {
                refuse to serve under either. Not a documented production
                setting. */
             btri_stamp_test_inject(atoi(p + 21));
+        } else if (strncmp(p, "SCHEMA_CONF_TEST_FSYNC_FAIL_CALL=", 33) == 0) {
+            /* Test-only knob; not a documented production setting. */
+            schema_conf_test_fsync_fail_call(atoi(p + 33));
+        } else if (strncmp(p, "LAYOUT_MIGRATE_TEST_CRASH=", 26) == 0) {
+            /* Test-only knob; not a documented production setting. */
+            char *v = p + 26;
+            v[strcspn(v, "\r\n")] = '\0';
+            layout_migrate_test_crash_phase(v);
 #endif
         } else if (strncmp(p, "LOG_DIR=", 8) == 0) {
             p += 8;
@@ -919,6 +927,7 @@ Schema load_schema(const char *effective_root, const char *object) {
     char line[512];
     int found = 0;
     int legacy_v1 = 0;
+    int layout_bad = 0;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
         if (strncmp(line, prefix, pfxlen) == 0) {
@@ -975,6 +984,7 @@ Schema load_schema(const char *effective_root, const char *object) {
                     scan = next;
                 }
             }
+            if (schema_tail_layout(p, &s.packed_layout) != 0) layout_bad = 1;
             if (parsed_version != 2) legacy_v1 = 1;
             found = 1;
             break;
@@ -991,6 +1001,15 @@ Schema load_schema(const char *effective_root, const char *object) {
                 "Error: Object [%s] is in legacy v1 storage; this binary "
                 "supports v2 only. Install 2026.05.4 first and run "
                 "`./migrate` to convert v1 → v2, then upgrade.\n",
+                object);
+        Schema zeroed = {0};
+        return zeroed;
+    }
+
+    if (found && layout_bad) {
+        /* Never fall back to legacy on a malformed layout token: an
+           unreadable layout means the bytes cannot be interpreted. */
+        fprintf(stderr, "Error: Object [%s] has a malformed schema layout token\n",
                 object);
         Schema zeroed = {0};
         return zeroed;
@@ -1020,6 +1039,54 @@ Schema load_schema(const char *effective_root, const char *object) {
     }
     pthread_mutex_unlock(&g_schema_lock);
     return s;
+}
+
+int schema_tail_layout(const char *tail, int *out) {
+    int seen = 0;
+    *out = 0;
+    const char *p = tail;
+    while (p && *p) {
+        const char *next = strchr(p, ':');
+        size_t tlen = next ? (size_t)(next - p) : strlen(p);
+        if (tlen >= 6 && strncmp(p, "layout", 6) == 0 &&
+            (tlen == 6 || p[6] == '=')) {
+            if (seen) { *out = 0; return -2; }
+            if (tlen != 13 || strncmp(p, "layout=packed", 13) != 0) {
+                *out = 0;
+                return -2;
+            }
+            seen = 1;
+            *out = 1;
+        }
+        p = next ? next + 1 : NULL;
+    }
+    return 0;
+}
+
+int schema_conf_layout(const char *effective_root, const char *object, int *out) {
+    *out = 0;
+    size_t rootlen = strlen(g_db_root);
+    if (strncmp(effective_root, g_db_root, rootlen) != 0) return 0;
+    const char *dir = effective_root + rootlen;
+    if (*dir == '/') dir++;
+    char path[PATH_MAX], prefix[512];
+    snprintf(path, sizeof(path), "%s/schema.conf", g_db_root);
+    int pfxlen = snprintf(prefix, sizeof(prefix), "%s:%s:", dir, object);
+    if (pfxlen < 0 || (size_t)pfxlen >= sizeof(prefix)) return -1;
+    FILE *f = fopen(path, "r");
+    if (!f) return errno == ENOENT ? 0 : -1;
+    char line[4096];
+    int rc = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, prefix, (size_t)pfxlen) != 0) continue;
+        line[strcspn(line, "\r\n")] = '\0';
+        rc = schema_tail_layout(line + pfxlen, out);
+        break;
+    }
+    if (ferror(f)) rc = -1;
+    if (fclose(f) != 0) rc = -1;
+    if (rc != 0) *out = 0;
+    return rc;
 }
 
 /* Backward compat wrapper */
@@ -1703,6 +1770,24 @@ char *conf_read_line(FILE *fp, size_t max_len, int *err) {
     }
 }
 
+/* Packed layouts declare varchar/numeric/currency with the bare grammar that
+   the legacy parse_field_type rejects (it would return FT_NONE and the field
+   would be silently dropped). Pre-set the logical type so the line survives
+   until typed_schema_bind_packed assigns the real width. */
+static void packed_declared_type(const char *spec, TypedField *tf) {
+    if (!strncmp(spec, "varchar", 7) || !strncmp(spec, "numeric", 7) ||
+        !strcmp(spec, "currency")) {
+        tf->type = spec[0] == 'v' ? FT_VARCHAR : FT_NUMERIC;
+        tf->size = 1;   /* placeholder; overwritten by typed_schema_bind_packed */
+        return;
+    }
+    parse_field_type(spec, tf);
+}
+
+static void ptypes_free(char **ptypes, int n) {
+    for (int i = 0; i < n; i++) free(ptypes[i]);
+}
+
 TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     char cache_key[512];
     snprintf(cache_key, sizeof(cache_key), "%s:%s", db_root, object);
@@ -1720,11 +1805,21 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     }
     pthread_mutex_unlock(&g_typed_lock);
 
-    /* Cache miss — read from file */
+    /* Cache miss — establish the authoritative layout BEFORE parsing any
+       field. A layout that cannot be established is a load failure: never
+       cached, never a legacy fallback. */
+    int layout_packed = 0;
+    if (schema_conf_layout(db_root, object, &layout_packed) != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG,
+                  "%s/%s: schema layout unreadable or malformed — load refused",
+                  db_root, object);
+        return NULL;
+    }
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s/fields.conf", db_root, object);
     FILE *f = fopen(path, "r");
     if (!f) {
+        if (layout_packed) return NULL;   /* packed object without fields.conf: refuse, do not negative-cache */
         /* No fields.conf — cache as non-typed */
         pthread_mutex_lock(&g_typed_lock);
         uint32_t sidx = str_hash(cache_key) % TYPED_BUCKETS;
@@ -1747,6 +1842,7 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     ts.typed = 0;
     ts.nfields = 0;
     int offset = 0;
+    char *ptypes[MAX_FIELDS] = {0};   /* packed: one type token per accepted field */
 
     for (;;) {
         int rderr = 0;
@@ -1763,6 +1859,7 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
                           MAX_FIELD_DEF - 1);
                 for (int i = 0; i < ts.nfields; i++)
                     free_enum_values(&ts.fields[i]);
+                ptypes_free(ptypes, ts.nfields);
                 fclose(f);
                 return NULL;   /* not cached; next load retries the file */
             }
@@ -1804,7 +1901,7 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
            Format: :auto_create, :auto_update, :default=<val>
            These are always the last colon-segment (before :removed). */
         char *default_check=strdup(type_spec);
-        if(!default_check){free(line);fclose(f);for(int i=0;i<ts.nfields;i++)free_enum_values(&ts.fields[i]);return NULL;}
+        if(!default_check){free(line);fclose(f);for(int i=0;i<ts.nfields;i++)free_enum_values(&ts.fields[i]);ptypes_free(ptypes,ts.nfields);return NULL;}
         TypedField checked_default={0};
         tf->default_invalid=parse_default_modifier_checked(default_check,&checked_default)<0;
         free(default_check);
@@ -1817,17 +1914,32 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
             for (int i = 0; i < ts.nfields; i++)
                 free_enum_values(&ts.fields[i]);
             free_enum_values(tf);
+            ptypes_free(ptypes, ts.nfields);
             free(line);
             fclose(f);
             return NULL;
         }
 
-        parse_field_type(type_spec, tf);
+        if (layout_packed) packed_declared_type(type_spec, tf);
+        else parse_field_type(type_spec, tf);
+        char *ptype_copy = layout_packed ? strdup(type_spec) : NULL;
         free(line);
+        if (layout_packed && (!ptype_copy || tf->type == FT_NONE || tf->size <= 0)) {
+            /* Packed: a field line we cannot parse is a load failure, never a
+               silently dropped field (it would shift every later position). */
+            free(ptype_copy);
+            free_enum_values(tf);
+            for (int i = 0; i < ts.nfields; i++)
+                free_enum_values(&ts.fields[i]);
+            ptypes_free(ptypes, ts.nfields);
+            fclose(f);
+            return NULL;
+        }
         if (tf->type == FT_NONE || tf->size <= 0) continue;
 
         tf->offset = offset;
         offset += tf->size;
+        ptypes[ts.nfields] = ptype_copy;
         ts.nfields++;
         ts.typed = 1;
     }
@@ -1840,6 +1952,21 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
        field-region-relative. */
     ts.nullmap_prefix = 1 + typed_nullmap_bytes(ts.nfields);
     ts.total_size += ts.nullmap_prefix;
+
+    if (layout_packed) {
+        char berr[160] = {0};
+        if (typed_schema_bind_packed(&ts, (const char *const *)ptypes,
+                                     (size_t)ts.nfields, berr, sizeof(berr)) != 0) {
+            LOG_ERROR(LOG_SUB_CONFIG,
+                      "%s/%s: packed layout does not match fields.conf (%s) — load refused",
+                      db_root, object, berr[0] ? berr : "bind failed");
+            for (int i = 0; i < ts.nfields; i++)
+                free_enum_values(&ts.fields[i]);
+            ptypes_free(ptypes, ts.nfields);
+            return NULL;   /* not cached */
+        }
+    }
+    ptypes_free(ptypes, ts.nfields);
 
     /* Store in cache, capture the slot we wrote to so we can return the
        pointer without doing a second (lock-free) linear-probe lookup. */
@@ -1866,6 +1993,119 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
         : NULL;
     pthread_mutex_unlock(&g_typed_lock);
     return result;
+}
+
+void typed_schema_release(TypedSchema *ts) {
+    if (!ts) return;
+    for (int i = 0; i < ts->nfields; i++) free_enum_values(&ts->fields[i]);
+    memset(ts, 0, sizeof(*ts));
+}
+
+/* Rewrites one fields.conf line from the legacy grammar to the packed
+   grammar. The ONLY change: a legacy `numeric:N` (no comma — historical
+   scale 2, F20) becomes `numeric:N,2`; every other line is copied verbatim.
+   0 ok, -1 if the result does not fit in cap. */
+int layout_packed_decl_line(const char *line, char *out, size_t cap) {
+    size_t n = strlen(line);
+    const char *colon = strchr(line, ':');
+    if (colon && strncmp(colon + 1, "numeric:", 8) == 0) {
+        const char *digits = colon + 9;
+        const char *p = digits;
+        while (*p >= '0' && *p <= '9') p++;
+        if (p > digits && (*p == '\0' || *p == ':')) {
+            size_t head = (size_t)(p - line), tail = strlen(p);
+            if (head + 2 + tail >= cap) return -1;
+            memcpy(out, line, head);
+            memcpy(out + head, ",2", 2);
+            memcpy(out + head + 2, p, tail + 1);
+            return 0;
+        }
+    }
+    if (n >= cap) return -1;
+    memcpy(out, line, n + 1);
+    return 0;
+}
+
+/* Builds an UNCACHED packed TypedSchema from fields.conf lines (declaration
+   order; blank and '#' lines are skipped). This mirrors load_typed_schema's
+   packed parse exactly — same modifiers, same `:removed` handling, same
+   typed_schema_bind_packed call — so the migration converts to precisely
+   what the loader will later read (the migration re-verifies this after
+   publication). 0 ok; -1 with err filled. On success the caller owns the
+   enum value lists: release with typed_schema_release(). */
+int typed_schema_build_packed(const char *const *lines, size_t nlines,
+                              TypedSchema *out, char *err, size_t errsz) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    TypedSchema ts;
+    memset(&ts, 0, sizeof(ts));
+    char *ptypes[MAX_FIELDS] = {0};
+    int offset = 0;
+#define BP_FAIL(...) do { if (err && errsz) snprintf(err, errsz, __VA_ARGS__); goto fail; } while (0)
+    for (size_t li = 0; li < nlines; li++) {
+        const char *src = lines[li];
+        if (!src || !src[0] || src[0] == '#') continue;
+        if (ts.nfields >= MAX_FIELDS) BP_FAIL("too many fields (max %d)", MAX_FIELDS);
+        char *line = strdup(src);
+        if (!line) BP_FAIL("out of memory");
+        TypedField *tf = &ts.fields[ts.nfields];
+        char *colon = strchr(line, ':');
+        if (!colon || colon == line || (size_t)(colon - line) >= sizeof(tf->name)) {
+            free(line);
+            BP_FAIL("invalid field line");
+        }
+        size_t name_len = (size_t)(colon - line);
+        memcpy(tf->name, line, name_len);
+        tf->name[name_len] = '\0';
+        tf->name_len = (int)name_len;
+        tf->removed = 0;
+        tf->default_kind = DK_NONE;
+        tf->default_val[0] = '\0';
+        char *type_spec = colon + 1;
+        size_t ts_len = strlen(type_spec);
+        if (ts_len >= 8 && strcmp(type_spec + ts_len - 8, ":removed") == 0) {
+            type_spec[ts_len - 8] = '\0';
+            tf->removed = 1;
+        }
+        char *default_check = strdup(type_spec);
+        if (!default_check) { free(line); BP_FAIL("out of memory"); }
+        TypedField checked_default = {0};
+        tf->default_invalid = parse_default_modifier_checked(default_check, &checked_default) < 0;
+        free(default_check);
+        if (parse_default_modifier(type_spec, tf) < 0) {
+            free_enum_values(tf);
+            free(line);
+            BP_FAIL("invalid nullability structure in field '%s'", tf->name);
+        }
+        packed_declared_type(type_spec, tf);
+        if (tf->type == FT_NONE || tf->size <= 0) {
+            free_enum_values(tf);
+            free(line);
+            BP_FAIL("unparseable type for field '%s'", tf->name);
+        }
+        ptypes[ts.nfields] = strdup(type_spec);
+        free(line);
+        if (!ptypes[ts.nfields]) { free_enum_values(tf); BP_FAIL("out of memory"); }
+        tf->offset = offset;
+        offset += tf->size;
+        ts.nfields++;
+        ts.typed = 1;
+    }
+    if (ts.nfields < 1) BP_FAIL("no fields");
+    ts.total_size = offset;
+    ts.nullmap_prefix = 1 + typed_nullmap_bytes(ts.nfields);
+    ts.total_size += ts.nullmap_prefix;
+    if (typed_schema_bind_packed(&ts, (const char *const *)ptypes,
+                                 (size_t)ts.nfields, err, errsz) != 0)
+        goto fail;
+    ptypes_free(ptypes, ts.nfields);
+    *out = ts;
+    return 0;
+fail:
+    for (int i = 0; i < ts.nfields; i++) free_enum_values(&ts.fields[i]);
+    ptypes_free(ptypes, ts.nfields);
+    return -1;
+#undef BP_FAIL
 }
 
 /* Find field index by name. Tombstoned fields are invisible to lookups. */
@@ -4424,6 +4664,10 @@ int cmd_add_fields(const char *db_root, const char *object,
     TypedSchema *ts = load_typed_schema(db_root, object);
     if (!ts) {
         OUT("{\"error\":\"fields.conf missing for [%s]\"}\n", object);
+        return 1;
+    }
+    if (ts->packed.nfields) {
+        OUT("{\"error\":\"add-field is not supported on packed-layout objects yet\"}\n");
         return 1;
     }
 

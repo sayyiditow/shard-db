@@ -116,7 +116,7 @@ static int test_vacuum_streams_mismatch_run(void) {
 
     /* Create v2 object — streams gets nproc-derived value. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"vmstreams\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"vmstreams\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"age:int\"],\"indexes\":[]}",
         &resp);

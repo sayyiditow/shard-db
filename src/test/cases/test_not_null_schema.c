@@ -31,7 +31,7 @@ static int test_not_null_schema_run(void) {
           :default= on enum (exercises the membership-check dval rule) —
           and :nullable as an explicit no-op. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"inv\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"inv\","
         "\"splits\":8,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"amount:numeric:18,2:not_null\","
                     "\"status:enum(open,paid):default=open:not_null\","
@@ -84,28 +84,28 @@ static int test_not_null_schema_run(void) {
           do; varchar/numeric tolerate trailing bytes and must be caught
           by the explicit structure rule), and duplicates must fail. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bad1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"bad1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"x:int:not_null:default=5\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"error\"", "int non-trailing rejected");
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bad2\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"bad2\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"s:varchar:30:not_null:default=hello\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"error\"", "varchar non-trailing rejected");
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bad3\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"bad3\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"d:varchar:30:not_null:not_null\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"error\"", "duplicate token rejected");
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"bad4\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"bad4\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"n:numeric:18,2:not_null:default=1\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"error\"", "numeric non-trailing rejected");

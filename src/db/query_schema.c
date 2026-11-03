@@ -4,6 +4,7 @@
 #include "slotcask.h"
 #include "bitmap.h"
 #include "query_internal.h"
+#include "packed_record.h"
 #include <dirent.h>
 
 /* ========== edit-field ==========
@@ -625,6 +626,10 @@ int cmd_edit_fields(const char *db_root, const char *object,
         OUT("{\"error\":\"fields.conf missing for [%s]\"}\n", object);
         return 1;
     }
+    if (old_ts->packed.nfields) {
+        OUT("{\"error\":\"edit-field is not supported on packed-layout objects yet\"}\n");
+        return 1;
+    }
 
     /* Parse each edit line, validate name/type, look up target field. */
     TypedField parsed[MAX_FIELDS];
@@ -978,6 +983,67 @@ static int validate_field_type(const char *field_spec) {
 
 
 
+/* Packed-grammar counterpart of validate_field_type: returns > 0 on a valid
+   declaration, 0 otherwise. Bare `varchar` / `numeric` are legal; numeric
+   precision/scale and varchar capacity are validated by the packed parser;
+   every other type keeps the existing fixed-width grammar. */
+static int validate_packed_field_type(const char *field_spec) {
+    const char *colon = strchr(field_spec, ':');
+    if (!colon || colon == field_spec) return 0;
+    char *buf = strdup(colon + 1);
+    if (!buf) return 0;
+    TypedField modifiers = {0};
+    PkrField pf;
+    int is_pkr = 0, rc = 0;
+    if (parse_default_modifier_checked(buf, &modifiers) >= 0) {
+        /* strip :removed / :not_null / :nullable exactly as the legacy
+           validator does, then look at the bare type token */
+        size_t blen = strlen(buf);
+        if (blen >= 8 && strcmp(buf + blen - 8, ":removed") == 0) buf[blen - 8] = '\0';
+        blen = strlen(buf);
+        if (blen >= 9 && (strcmp(buf + blen - 9, ":not_null") == 0 ||
+                          strcmp(buf + blen - 9, ":nullable") == 0)) buf[blen - 9] = '\0';
+        if (!strstr(buf, ":not_null") && !strstr(buf, ":nullable")) {
+            if (!strncmp(buf, "varchar", 7) || !strncmp(buf, "numeric", 7) ||
+                !strcmp(buf, "currency")) {
+                is_pkr = 1;
+                rc = pkr_field_parse(buf, &pf) == DEC_OK ? 1 : 0;
+            } else {
+                rc = typed_legacy_decl_size(buf);   /* fixed-width types: identical grammar */
+            }
+        }
+    }
+    if (rc > 0 && is_pkr) {
+        /* :default= literal must fit the declaration (legacy validated it via
+           typed_default_validate; that cannot parse bare/packed types). */
+        if (modifiers.default_kind == DK_LITERAL) {
+            size_t dl = strlen(modifiers.default_val);
+            if (pf.kind == PKR_VARCHAR) {
+                if (dl > pf.payload_max) rc = 0;
+            } else {
+                uint8_t payload[DEC_PAYLOAD_MAX];
+                size_t used = 0;
+                char perr[64];
+                if (pkr_numeric_encode(&pf, modifiers.default_val, dl, payload,
+                                       sizeof(payload), &used, perr, sizeof(perr)) != DEC_OK)
+                    rc = 0;
+            }
+        }
+    } else if (rc > 0) {
+        char *again = strdup(colon + 1);
+        TypedField dm = {0};
+        if (again && parse_default_modifier_checked(again, &dm) >= 0) {
+            parse_field_type(again, &dm);
+            if (dm.type != FT_ENUM && typed_default_validate(&dm)) rc = 0;
+            free_enum_values(&dm);
+        }
+        free(again);
+    }
+    free_enum_values(&modifiers);
+    free(buf);
+    return rc;
+}
+
 /* Validate + parse the auto_key spec. Returns 0 on AK_NONE, 1 on
    AK_UUID, 2 on AK_SEQ (with seq_name filled). On invalid input writes
    the {"error":...} JSON to OUT and returns -1. Empty/NULL → 0. */
@@ -1035,10 +1101,12 @@ static void *create_bm_worker(void *raw) {
     return NULL;
 }
 
+static void typed_schema_release_p(TypedSchema *ts) { typed_schema_release(ts); }
+
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
-                      const char *auto_key_spec) {
+                      const char *auto_key_spec, int packed) {
     if (!dir || !dir[0]) {
         OUT("{\"error\":\"dir is required\"}\n");
         return 1;
@@ -1082,7 +1150,8 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     }
     int nfields=0,total_value_size=0;
     for(;nfields<(int)parsed_fields;nfields++){
-        int field_size = validate_field_type(field_specs[nfields]);
+        int field_size = packed ? validate_packed_field_type(field_specs[nfields])
+                                : validate_field_type(field_specs[nfields]);
         if (field_size <= 0) {
             OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, datetimems, time, timestamp, uuid, ipv4, ipv6, currency, numeric:P,S, enum(v1,v2,...)\"}\n",
                    field_specs[nfields]);
@@ -1136,6 +1205,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
             return 1;
         }
 
+        if (packed) continue;   /* packed sizes come from the bound codec below */
         if(field_size>INT_MAX-total_value_size){OUT("{\"error\":\"schema size overflow\"}\n");return 1;}
         total_value_size+=field_size;
     }
@@ -1143,6 +1213,24 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     if (nfields == 0) {
         OUT("{\"error\":\"fields array is empty — at least one typed field required\"}\n");
         return 1;
+    }
+
+    /* Packed: bind the codec once from the declared field lines so slot_size
+       and value_size come from pkr (single source of truth, same builder the
+       loader and the migration use). The cleanup attribute releases the enum
+       value lists on every return path (no-op on a zeroed schema). */
+    TypedSchema packed_ts __attribute__((cleanup(typed_schema_release_p)));
+    memset(&packed_ts, 0, sizeof(packed_ts));
+    size_t packed_slot = 0;
+    if (packed) {
+        char perr[160] = {0};
+        if (typed_schema_build_packed((const char *const *)field_specs,
+                                      (size_t)nfields, &packed_ts,
+                                      perr, sizeof(perr)) != 0) {
+            OUT("{\"error\":\"invalid packed field declarations: %s\"}\n", perr);
+            return 1;
+        }
+        total_value_size = packed_ts.total_size;
     }
 
     /* Defaults + strict validation. As of 2026.05.1, splits must be a
@@ -1160,6 +1248,14 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         OUT("{\"error\":\"max_key %d exceeds ceiling %d — keys larger than this bloat slot_size; use a shorter key (UUIDs are 36B)\"}\n",
             max_key, MAX_KEY_CEILING);
         return 1;
+    }
+
+    if (packed) {
+        if (pkr_slot_bound(&packed_ts.packed, (size_t)max_key, &packed_slot) != DEC_OK ||
+            packed_slot > INT_MAX) {
+            OUT("{\"error\":\"packed schema exceeds the maximum slot size\"}\n");
+            return 1;
+        }
     }
 
     /* Parse + validate `indexes` into an in-memory list of (name, type) so
@@ -1380,9 +1476,16 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         OUT("{\"error\":\"cannot write fields.conf\"}\n");
         return 1;
     }
+    int fields_ok = 1;
     for (int i = 0; i < nfields; i++)
-        fprintf(f, "%s\n", field_specs[i]);
-    fclose(f);
+        if (fprintf(f, "%s\n", field_specs[i]) < 0) fields_ok = 0;
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0) fields_ok = 0;
+    if (fclose(f) != 0) fields_ok = 0;
+    if (!fields_ok) {
+        unlink(path);
+        OUT("{\"error\":\"cannot write fields.conf\"}\n");
+        return 1;
+    }
 
     /* Add to schema.conf if not already there */
     char schema_path[PATH_MAX];
@@ -1440,23 +1543,33 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     }
 
     if (!exists) {
+        /* Schema line: dir:object:splits:max_key:2:streams[:auto_key=...][:layout=packed].
+           The literal `2` is the storage-version slot (kept for forward
+           compatibility). The write is checked and synced: a failure here
+           removes the fields.conf written above so a retry starts clean. */
+        char extra[192];
+        extra[0] = '\0';
+        if (auto_key_kind == 1)
+            snprintf(extra, sizeof(extra), ":auto_key=uuid");
+        else if (auto_key_kind == 2)
+            snprintf(extra, sizeof(extra), ":auto_key=seq(%s)", auto_seq_name);
+        if (packed) {
+            size_t el = strlen(extra);
+            snprintf(extra + el, sizeof(extra) - el, ":layout=packed");
+        }
         f = fopen(schema_path, "a");
+        int line_ok = f != NULL;
         if (f) {
-            /* Schema line: dir:object:splits:max_key:2:streams[:auto_key=...].
-               The literal `2` is the storage-version slot — kept in the on-disk
-               format for forward compatibility with future engine versions,
-               even though every object the daemon writes is v2. */
-            if (auto_key_kind == 1) {
-                fprintf(f, "%s:%s:%d:%d:2:%d:auto_key=uuid\n",
-                        dir, object, splits, max_key, streams);
-            } else if (auto_key_kind == 2) {
-                fprintf(f, "%s:%s:%d:%d:2:%d:auto_key=seq(%s)\n",
-                        dir, object, splits, max_key, streams, auto_seq_name);
-            } else {
-                fprintf(f, "%s:%s:%d:%d:2:%d\n",
-                        dir, object, splits, max_key, streams);
-            }
-            fclose(f);
+            if (fprintf(f, "%s:%s:%d:%d:2:%d%s\n",
+                        dir, object, splits, max_key, streams, extra) < 0) line_ok = 0;
+            if (fflush(f) != 0 || fsync(fileno(f)) != 0) line_ok = 0;
+            if (fclose(f) != 0) line_ok = 0;
+        }
+        if (!line_ok) {
+            snprintf(path, sizeof(path), "%s/%s/fields.conf", eff_root, object);
+            unlink(path);
+            OUT("{\"error\":\"cannot write schema.conf\"}\n");
+            return 1;
         }
     }
 
@@ -1489,6 +1602,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         /* slot_size includes the 24B per-record inline header. */
         int slot_size = (24 + max_key + total_value_size + 7) & ~7;
         if (slot_size < 32) slot_size = 32;
+        if (packed) slot_size = (int)packed_slot;
         SlotcaskDb sdb;
         if (slotcask_open(&sdb, obj_data_dir, splits, streams, slot_size) != 0) {
             OUT("{\"error\":\"slotcask_open failed for %s/%s\"}\n", dir, object);

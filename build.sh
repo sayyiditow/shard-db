@@ -358,6 +358,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_scalar_grammar_routes.c \
     src/test/cases/test_decnum_core.c \
     src/test/cases/test_scalar_grammar_core.c \
+    src/test/cases/test_layout_manifest.c \
     src/test/cases/test_decimal_order_decode.c \
     src/test/cases/test_agg_exact_core.c \
     src/test/cases/test_packed_record_codec.c \
@@ -374,6 +375,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_packed_csv_commands.c \
     src/test/cases/test_r1_routes.c src/test/cases/test_r2_predicate_verification.c \
     src/test/cases/test_version_gate.c \
+    src/test/cases/test_version_gate_2026_11.c \
     src/test/cases/test_datetime_evening.c \
     src/test/cases/test_error_paths.c \
     src/test/cases/test_explain.c \

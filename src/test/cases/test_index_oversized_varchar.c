@@ -23,7 +23,7 @@ static void ov_build_limits(TestClient *tc){
     ASSERT_NOT_NULL(part,"large composite component");
     if(!request||!big||!part){free(request);free(big);free(part);return;}
     memset(big,'z',4500);big[4500]=0;memset(part,'q',3000);part[3000]=0;
-    tc_request(tc,"{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ovz_big\",\"splits\":8,\"max_key\":64,\"fields\":[\"big:varchar:5000\",\"a:varchar:3000\",\"b:varchar:3000\"]}",&r);
+    tc_request(tc,"{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"ovz_big\",\"splits\":8,\"max_key\":64,\"fields\":[\"big:varchar:5000\",\"a:varchar:3000\",\"b:varchar:3000\"]}",&r);
     ASSERT_CONTAINS(r,"created","create large unindexed fields");free(r);
     size_t used=(size_t)snprintf(request,cap,"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ovz_big\",\"records\":[");
     for(int i=0;i<20;i++){
@@ -53,7 +53,7 @@ static void ov_build_limits(TestClient *tc){
     ASSERT_TRUE(r&&strstr(r,"\"error\"")==NULL,"failed additions leave no broken reindex declaration");free(r);
     tc_request(tc,"{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"ovz_big\"}",&r);
     ASSERT_EQ_INT(tu_parse_count(r),20,"large records survive failed builds and reindex");free(r);
-    tc_request(tc,"{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ovz_prefix\",\"splits\":8,\"max_key\":16,\"fields\":[\"a:varchar:8\",\"b:int\"],\"indexes\":[\"a+b\"]}",&r);
+    tc_request(tc,"{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"ovz_prefix\",\"splits\":8,\"max_key\":16,\"fields\":[\"a:varchar:8\",\"b:int\"],\"indexes\":[\"a+b\"]}",&r);
     ASSERT_CONTAINS(r,"created","legacy varchar-leading composite stays creatable");free(r);
     tc_request(tc,"{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"ovz_prefix\",\"records\":{\"one\":{\"a\":\"open\",\"b\":1},\"two\":{\"a\":\"open\",\"b\":2}}}",&r);
     ASSERT_CONTAINS(r,"\"inserted\":2","legacy varchar-leading composite stays writable");free(r);
@@ -68,7 +68,7 @@ static int test_index_oversized_varchar_run(void){
     ASSERT_NOT_NULL(tc,"connect");if(!tc){test_env_stop(&env);return 1;}
     char *r=NULL,req[4096],big[545],ok[544];memset(big,'x',544);big[544]=0;memset(ok,'x',543);ok[543]=0;
     tc_request(tc,"{\"mode\":\"add-dir\",\"dir\":\"default\"}",&r);free(r);
-    tc_request(tc,"{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ovz_t\",\"splits\":8,\"max_key\":16,\"fields\":[\"tag:varchar:600\"],\"indexes\":[\"tag\"]}",&r);
+    tc_request(tc,"{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"ovz_t\",\"splits\":8,\"max_key\":16,\"fields\":[\"tag:varchar:600\"],\"indexes\":[\"tag\"]}",&r);
     ASSERT_CONTAINS(r,"created","create indexed object");free(r);
     snprintf(req,sizeof(req),"{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"ovz_t\",\"key\":\"a\",\"value\":{\"tag\":\"%s\"}}",ok);
     tc_request(tc,req,&r);ASSERT_CONTAINS(r,"inserted","544 bytes admitted");free(r);ov_state(tc,ok);

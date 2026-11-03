@@ -62,7 +62,7 @@ static int test_long_field_def_run(void) {
     /* === A: 637-byte enum (125 four-char values) — rejected on base at G2 === */
     char *spec_a = enum_spec("status", 125, 4);
     snprintf(req, sizeof(req),
-             "{\"mode\":\"create-object\",\"dir\":\"lfd\",\"object\":\"a\","
+             "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"lfd\",\"object\":\"a\","
              "\"splits\":8,\"max_key\":16,"
              "\"fields\":[\"%s\",\"name:varchar:32\"],"
              "\"indexes\":[\"status:bitmap\"]}", spec_a);
@@ -90,7 +90,7 @@ static int test_long_field_def_run(void) {
     /* === B: 337-byte enum — created on base, dropped on base reload (G4) === */
     char *spec_b = enum_spec("state", 65, 4);
     snprintf(req, sizeof(req),
-             "{\"mode\":\"create-object\",\"dir\":\"lfd\",\"object\":\"b\","
+             "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"lfd\",\"object\":\"b\","
              "\"splits\":8,\"max_key\":16,"
              "\"fields\":[\"%s\",\"n:varchar:8\"]}", spec_b);
     tc_request(tc, req, &resp);
@@ -113,7 +113,7 @@ static int test_long_field_def_run(void) {
        value stays exactly vlen digits (see enum_spec precondition). */
     char *spec_big = enum_spec("huge", 13999, 5);
     snprintf(req, sizeof(req),
-             "{\"mode\":\"create-object\",\"dir\":\"lfd\",\"object\":\"c\","
+             "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"lfd\",\"object\":\"c\","
              "\"splits\":8,\"max_key\":16,\"fields\":[\"%s\"]}", spec_big);
     tc_request(tc, req, &resp);
     ASSERT_CONTAINS(resp, "\"error\"", "E: over-cap spec rejected");
@@ -132,7 +132,7 @@ static int test_long_field_def_run(void) {
     big_lit[sizeof(big_lit) - 1] = '\0';
 
     snprintf(req, sizeof(req),
-             "{\"mode\":\"create-object\",\"dir\":\"lfd\",\"object\":\"f\","
+             "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"lfd\",\"object\":\"f\","
              "\"splits\":8,\"max_key\":16,"
              "\"fields\":[\"v:varchar:400:default=%s\"]}", big_lit);
     tc_request(tc, req, &resp);
@@ -156,7 +156,7 @@ static int test_long_field_def_run(void) {
     /* === G: an on-disk default too large to carry (older binary or hand
        edit) must not be silently dropped when its own field is edited
        without restating the default — the rewrite refuses wholesale === */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"lfd\",\"object\":\"g\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"lfd\",\"object\":\"g\","
                    "\"splits\":8,\"max_key\":16,"
                    "\"fields\":[\"v:varchar:32:default=short\",\"n:varchar:8\"]}",
                &resp);

@@ -30,7 +30,7 @@ static int create_object_with_records(TestEnv *env, const char *object,
 
     char req[768];
     snprintf(req, sizeof(req),
-        "{\"mode\":\"create-object\",\"dir\":\"default\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\","
         "\"object\":\"%s\",\"splits\":8,\"streams\":1,\"max_key\":16,"
         "\"fields\":[\"score:int\",\"title:varchar:64\"]}", object);
     resp = NULL;

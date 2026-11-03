@@ -63,7 +63,7 @@ static int test_slotcask_v2_schema_run(void) {
 
     /* ===== no-arg vacuum on v2 → no-op ===== */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"sch2\",\"object\":\"vac\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"sch2\",\"object\":\"vac\","
         "\"splits\":8,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"age:int\"]}", &resp);
     free(resp); resp = NULL;
@@ -85,7 +85,7 @@ static int test_slotcask_v2_schema_run(void) {
 
     /* ===== add-field with backfill ===== */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"sch2\",\"object\":\"users\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"sch2\",\"object\":\"users\","
         "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"name:varchar:32\",\"age:int\"],\"indexes\":[\"age\"]}", &resp);
     free(resp); resp = NULL;

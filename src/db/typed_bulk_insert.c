@@ -28,7 +28,7 @@ typedef struct {
     BulkMemory *memory;size_t charged;
     const char *line;
     size_t line_len;
-    int shard,error;
+    int shard,error,generated;
     uint8_t *owned;
     const TypedSchema *ts;
     const Schema *sc;
@@ -307,6 +307,7 @@ static int bulk_normalize(BulkRows *b,const Schema *sc,const char *root,const ch
         BulkRow *r=&b->rows[i];
         if(sc->auto_key!=AK_NONE){
             uint8_t bytes[16];size_t width=sc->auto_key==AK_UUID?16:8;
+            r->generated=!r->klen;
             if(r->klen&&strlen(r->key)!=r->klen){free(uuids);return bulk_fail(EINVAL);}
             if(sc->auto_key==AK_UUID){
                 if(!r->klen)memcpy(bytes,uuids+16*generated++,16);
@@ -406,7 +407,8 @@ static int typed_bulk_command(const char *root,const char *object,
         BulkRow *r=&b.rows[i];r->ts=ts;r->sc=sc;r->root=root;r->object=object;
         r->indexes=(const char (*)[256])indexes;r->index_types=index_types;r->nidx=nidx;
         cells[i]=(BulkCell){r,delimiter,update};
-        recs[i]=(SlotcaskBulkRec){.key=r->key,.klen=r->klen,.hdr2=PKR_FLAGS,.user_ctx=&cells[i],.status=-1};
+        recs[i]=(SlotcaskBulkRec){.key=r->key,.klen=r->klen,.hdr2=PKR_FLAGS,.user_ctx=&cells[i],.status=-1,
+            .if_not_exists=r->generated};
         if(!i||r->shard!=b.rows[i-1].shard){
             if(i)g++;
             inputs[g]=(SlotcaskBulkShardInput){.kf_shard_id=r->shard,.recs=recs+i,

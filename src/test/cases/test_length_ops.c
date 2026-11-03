@@ -37,7 +37,7 @@ static int test_length_ops_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"lent\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"lent\","
         "\"fields\":[\"name:varchar:64\",\"bio:varchar:200\"],"
         "\"indexes\":[\"name\"],\"splits\":16}", &resp); free(resp); resp = NULL;
 
