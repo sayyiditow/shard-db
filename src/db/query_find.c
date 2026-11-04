@@ -809,6 +809,77 @@ int parse_field_line(const char *line, TypedField *out) {
     return out->type != FT_NONE && out->size > 0 && !typed_default_validate(out);
 }
 
+int parse_field_line_packed(const char *line, TypedField *out, PkrField *pf_out) {
+    const char *colon = strchr(line, ':');
+    if (!colon || colon == line) return 0;
+    size_t nlen = colon - line;
+    if (nlen >= sizeof(out->name)) return 0;
+    if (validate_packed_field_type(line) <= 0) return 0;   /* the single packed-grammar authority */
+    out->name_len = (int)nlen;
+    memcpy(out->name, line, nlen);
+    out->name[nlen] = '\0';
+    char *clean_spec = strdup(colon + 1);
+    if (!clean_spec) return 0;
+    if (parse_default_modifier_checked(clean_spec, out) < 0) { free(clean_spec); return 0; }
+    PkrField pf = {0};
+    int ok = 0;
+    if (!strncmp(clean_spec, "varchar", 7) || !strncmp(clean_spec, "numeric", 7) ||
+        !strcmp(clean_spec, "currency")) {
+        if (pkr_field_parse(clean_spec, &pf) == DEC_OK) {
+            out->type = pf.kind == PKR_VARCHAR ? FT_VARCHAR : FT_NUMERIC;
+            out->size = (int)pf.width;
+            out->numeric_scale = pf.scale;
+            ok = 1;
+        }
+    } else {
+        parse_field_type(clean_spec, out);
+        ok = out->type != FT_NONE && out->size > 0 && pkr_field_fixed((uint32_t)out->size, &pf) == DEC_OK &&
+             !typed_default_validate(out);
+    }
+    free(clean_spec);
+    if (ok && pf_out) *pf_out = pf;
+    return ok;
+}
+
+int packed_read_decl_lines(const char *obj_dir, char ***lines_out, size_t *n_out) {
+    *lines_out = NULL;
+    *n_out = 0;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/fields.conf", obj_dir) >= (int)sizeof(path)) return -1;
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char **v = calloc(MAX_FIELDS, sizeof(char *));
+    size_t n = 0;
+    if (!v) { fclose(f); return -1; }
+    for (;;) {
+        int rderr = 0;
+        char *line = conf_read_line(f, MAX_FIELD_DEF, &rderr);
+        if (!line) {
+            if (rderr) goto fail;
+            break;
+        }
+        if (line[0] == '\0' || line[0] == '#' || !strchr(line, ':')) { free(line); continue; }
+        if (n >= MAX_FIELDS) { free(line); goto fail; }
+        v[n++] = line;
+    }
+    fclose(f);
+    *lines_out = v;
+    *n_out = n;
+    return 0;
+fail:
+    fclose(f);
+    packed_free_decl_lines(v, n);
+    return -1;
+}
+
+void packed_free_decl_lines(char **lines, size_t n) {
+    if (!lines) return;
+    for (size_t i = 0; i < n; i++) free(lines[i]);
+    free(lines);
+}
+
+
+
 /* === v2 (slotcask) rebuild path ===
  *
  * Used by add-fields, vacuum --compact, and vacuum --splits when the object
@@ -853,6 +924,7 @@ typedef struct {
     BackfillSpec      *backfill;     /* malloc'd in rebuild_object_v2; size = new_ts->nfields */
     const char        *db_root;       /* for seq_next_val_batch (DK_SEQ pre-reserve) */
     const char        *object;
+    char               why[192];      /* packed recompose: first failure, JSON-safe */
 } V2RebuildCtx;
 
 /* Re-encode one field's bytes from old size/scale to new. Same-type only;
@@ -989,6 +1061,418 @@ inline int field_needs_transform(const TypedField *old_f,
     return 0;
 }
 
+/* ===================== Packed recompose (R5b) ===================== */
+
+static void layout_diag_key(char *out, size_t cap, const void *key, size_t klen);
+
+/* Replace every byte that could break the {"error":"..."} envelope. */
+static void packed_json_safe(char *s) {
+    for (; *s; s++)
+        if (*s == '"' || *s == '\\' || (unsigned char)*s < 0x20 || (unsigned char)*s > 0x7e) *s = '?';
+}
+
+typedef struct {
+    const TypedSchema *old_ts;
+    const TypedSchema *new_ts;
+    const int         *new_to_old;   /* new index -> old index; -1 = added field */
+    BackfillSpec      *backfill;     /* per NEW field; NULL when nothing is added */
+} PackedRowCtx;
+
+static int64_t packed_be_signed(const uint8_t *p, uint32_t w) {
+    uint64_t u = 0;
+    for (uint32_t i = 0; i < w; i++) u = (u << 8) | p[i];
+    unsigned sh = 64u - 8u * w;
+    return (int64_t)(u << sh) >> sh;   /* arithmetic shift, same as decode_be_signed */
+}
+
+/* Exact decimal text of a numeric payload. 0 ok (*text malloc'd), -1 error. */
+static int packed_numeric_text(const uint8_t *payload, size_t n, char **text, size_t *tlen) {
+    dec_t d;
+    dec_init(&d);
+    if (dec_unpack(payload, n, &d) != DEC_OK) { dec_free(&d); return -1; }
+    size_t need = dec_text_len(&d), used = 0;
+    char *buf = malloc(need ? need : 1);
+    if (!buf || dec_to_text(&d, buf, need, &used) != DEC_OK) { free(buf); dec_free(&d); return -1; }
+    dec_free(&d);
+    *text = buf;
+    *tlen = strlen(buf);
+    return 0;
+}
+
+/* Convert one present OLD cell to the NEW field's declaration.
+   0 ok, 1 the value does not fit (why), -1 hard error (why).
+   Borrowed cells point into the OLD record, which outlives the TypedPrepared
+   (the row is composed before the caller returns). Owned buffers are handed to
+   p->owned[k] and released by typed_prepared_free. */
+static int packed_convert_cell(const TypedField *of, const PkrField *opf,
+                               const TypedField *nf, const PkrField *npf,
+                               const TypedRowSpan *sp, TypedPrepared *p, int k,
+                               char *why, size_t whysz) {
+    if (opf->kind != npf->kind) {
+        snprintf(why, whysz, "unsupported transition between field kinds");
+        return -1;
+    }
+    if (npf->kind == PKR_VARCHAR) {
+        if (sp->len > npf->payload_max) {
+            snprintf(why, whysz, "varchar: value of length %zu exceeds new cap %u",
+                     sp->len, npf->payload_max);
+            return 1;
+        }
+        p->cells[k] = (PkrCell){sp->data, sp->len, 0};
+        return 0;
+    }
+    if (npf->kind == PKR_NUMERIC) {
+        if (opf->bare == npf->bare && opf->precision == npf->precision &&
+            opf->scale == npf->scale) {
+            p->cells[k] = (PkrCell){sp->data, sp->len, 0};   /* currency<->numeric(19,4): same bytes */
+            return 0;
+        }
+        char *text = NULL;
+        size_t tlen = 0;
+        if (packed_numeric_text(sp->data, sp->len, &text, &tlen) != 0) {
+            snprintf(why, whysz, "malformed numeric payload");
+            return -1;
+        }
+        TypedInput in = {text, tlen, 1, 0, 0};
+        char err[96] = {0};
+        errno = 0;   /* classify ENOMEM only if the callee set it */
+        int rc = typed_prepared_set(p, (size_t)k, &in, err, sizeof(err));
+        int en = errno;
+        if (rc) {
+            if (npf->bare)
+                snprintf(why, whysz, "numeric: value %.60s is not representable: %s", text, err);
+            else
+                snprintf(why, whysz, "numeric: value %.60s does not fit numeric(%d,%d): %s",
+                         text, npf->precision, npf->scale, err);
+        }
+        free(text);
+        return rc ? (en == ENOMEM ? -1 : 1) : 0;
+    }
+    /* PKR_FIXED */
+    if (opf->width == npf->width) {   /* same width ⇒ same encoding (cross-type edits were refused earlier) */
+        p->cells[k] = (PkrCell){sp->data, sp->len, 0};
+        return 0;
+    }
+    int oint = of->type == FT_SHORT || of->type == FT_INT || of->type == FT_LONG;
+    int nint = nf->type == FT_SHORT || nf->type == FT_INT || nf->type == FT_LONG;
+    uint8_t *b = NULL;
+    if (oint && nint) {
+        int64_t v = packed_be_signed(sp->data, opf->width);
+        if (npf->width < opf->width) {
+            int64_t lo = -(INT64_C(1) << (npf->width * 8 - 1));
+            int64_t hi = (INT64_C(1) << (npf->width * 8 - 1)) - 1;
+            if (v < lo || v > hi) {
+                snprintf(why, whysz, "integer narrow: value %lld out of range [%lld, %lld]",
+                         (long long)v, (long long)lo, (long long)hi);
+                return 1;
+            }
+        }
+        b = malloc(npf->width);
+        if (!b) { snprintf(why, whysz, "out of memory"); return -1; }
+        for (uint32_t i = npf->width; i-- > 0; ) { b[i] = (uint8_t)(v & 0xFF); v >>= 8; }
+    } else if (of->type == FT_FLOAT && nf->type == FT_DOUBLE &&
+               opf->width == 4 && npf->width == 8) {
+        float fv;
+        double dv;
+        memcpy(&fv, sp->data, 4);       /* stored native-order by encode_field */
+        dv = (double)fv;
+        b = malloc(8);
+        if (!b) { snprintf(why, whysz, "out of memory"); return -1; }
+        memcpy(b, &dv, 8);
+    } else if (of->type == FT_ENUM && nf->type == FT_ENUM &&
+               opf->width == 1 && npf->width == 2) {
+        b = malloc(2);
+        if (!b) { snprintf(why, whysz, "out of memory"); return -1; }
+        b[0] = 0;
+        b[1] = sp->data[0];
+    } else {
+        snprintf(why, whysz, "unsupported fixed-width transition (%u -> %u bytes)",
+                 opf->width, npf->width);
+        return -1;
+    }
+    free(p->owned[k]);
+    p->owned[k] = b;
+    p->cells[k] = (PkrCell){b, npf->width, 0};
+    return 0;
+}
+
+/* Encode `text` as field k's value (strict packed grammar). 0 ok, -1 + err. */
+static int packed_set_text(TypedPrepared *p, int k, const char *text, char *err, size_t errsz) {
+    TypedInput in = {text, strlen(text), 1, 0, 0};
+    return typed_prepared_set(p, (size_t)k, &in, err, errsz) == 0 ? 0 : -1;
+}
+
+/* Value for a field that did not exist in OLD. 0 ok, 1 unstorable, -1 hard. */
+static int packed_fill_added(const PackedRowCtx *ctx, TypedPrepared *p, int k,
+                             char *why, size_t whysz) {
+    const TypedField *nf = &ctx->new_ts->fields[k];
+    BackfillSpec *bf = ctx->backfill ? &ctx->backfill[k] : NULL;
+    char text[600];
+    const char *src = NULL;
+    switch (bf ? bf->kind : DK_NONE) {
+    case DK_LITERAL:
+        src = nf->default_val;
+        break;
+    case DK_SEQ: {
+        int64_t v = atomic_fetch_add_explicit(&bf->seq_next, 1, memory_order_relaxed);
+        snprintf(text, sizeof(text), "%lld", (long long)v);
+        src = text;
+        break;
+    }
+    case DK_UUID: {
+        uint8_t raw[16];
+        if (gen_uuid4_raw(raw) != 0) { snprintf(why, whysz, "uuid generator failed"); return -1; }
+        snprintf(text, sizeof(text),
+                 "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                 raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                 raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]);
+        src = text;
+        break;
+    }
+    case DK_RANDOM: {
+        int n = bf->random_bytes;
+        uint8_t raw[256];
+        if (n <= 0 || n > 256 || fill_random(raw, (size_t)n) != 0) {
+            snprintf(why, whysz, "random generator failed");
+            return -1;
+        }
+        for (int i = 0; i < n; i++) snprintf(text + i * 2, 3, "%02x", raw[i]);
+        src = text;
+        break;
+    }
+    default:   /* DK_NONE, DK_AUTO_CREATE, DK_AUTO_UPDATE: inert during backfill (A-2) */
+        break;
+    }
+    if (!src) {
+        /* No usable default (A-1): NULL for a nullable field, refusal for NOT NULL. */
+        if (nf->not_null) {
+            snprintf(why, whysz, "Field '%s' is NOT NULL and has no default; existing rows cannot be backfilled", nf->name);
+            return 1;
+        }
+        p->cells[k] = (PkrCell){NULL, 0, 1};
+        return 0;
+    }
+    char err[96] = {0};
+    errno = 0;   /* classify ENOMEM only if the callee set it */
+    int rc = packed_set_text(p, k, src, err, sizeof(err));
+    if (rc) {
+        int en = errno;
+        snprintf(why, whysz, "default for field '%s' cannot be stored: %s",
+                 nf->name, err[0] ? err : "invalid value");
+        return en == ENOMEM ? -1 : 1;
+    }
+    return 0;
+}
+
+/* Re-compose one OLD packed record under the NEW packed schema.
+   0 ok (*out malloc'd), 1 value does not fit (*bad_field, why), -1 hard error. */
+static int packed_recompose_record(const PackedRowCtx *ctx, size_t klen,
+                                   const void *value, size_t vlen, uint8_t hdr2,
+                                   uint8_t **out, size_t *outlen,
+                                   int *bad_field, char *why, size_t whysz) {
+    const TypedSchema *ots = ctx->old_ts, *nts = ctx->new_ts;
+    *out = NULL; *outlen = 0; *bad_field = -1;
+    TypedRowView view;
+    if (typed_row_open(ots, (const uint8_t *)value, vlen, hdr2, &view) != 0) {
+        snprintf(why, whysz, "malformed source record (hdr2=%u vlen=%zu)", hdr2, vlen);
+        return -1;
+    }
+    TypedPrepared p;
+    typed_prepared_init(&p);
+    p.schema = nts;
+    int rc = -1;
+    for (int k = 0; k < nts->nfields; k++) {
+        const TypedField *nf = &nts->fields[k];
+        int oi = ctx->new_to_old[k];
+        if (nf->removed) { p.cells[k] = (PkrCell){NULL, 0, 1}; continue; }
+        if (oi < 0) {
+            rc = packed_fill_added(ctx, &p, k, why, whysz);
+            if (rc) { *bad_field = k; goto done; }
+            continue;
+        }
+        const TypedField *of = &ots->fields[oi];
+        if (of->removed) { p.cells[k] = (PkrCell){NULL, 0, 1}; continue; }
+        TypedRowSpan sp;
+        if (typed_row_span(&view, (size_t)oi, &sp) != 0) {
+            snprintf(why, whysz, "malformed source field '%s'", of->name);
+            rc = -1;
+            goto done;
+        }
+        if (sp.is_null) { p.cells[k] = (PkrCell){NULL, 0, 1}; continue; }   /* NULL stays NULL */
+        rc = packed_convert_cell(of, &ots->packed.fields[oi], nf, &nts->packed.fields[k],
+                                 &sp, &p, k, why, whysz);
+        if (rc) { *bad_field = k; goto done; }
+    }
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    char err[160] = {0};
+    errno = 0;   /* classify ENOMEM only if the callee set it */
+    if (typed_prepared_alloc(&p, &buf, &len, err, sizeof(err)) != 0) {
+        int en = errno;
+        snprintf(why, whysz, "%s", err[0] ? err : "record composition failed");
+        rc = en == ENOMEM ? -1 : 1;
+        goto done;
+    }
+    size_t record_bytes = 0;
+    if (pkr_record_fits(&nts->packed, len, klen, SLOTCASK_SEG_MAX_BYTES, &record_bytes) != DEC_OK) {
+        free(buf);
+        snprintf(why, whysz, "record exceeds the segment limit under the new layout");
+        rc = 1;
+        goto done;
+    }
+    *out = buf;
+    *outlen = len;
+    rc = 0;
+done:
+    typed_prepared_free(&p);
+    return rc;
+}
+
+static void packed_fail_text(V2RebuildCtx *ctx, int bad_field, size_t klen,
+                             const void *key, const char *why) {
+    char k[128];
+    layout_diag_key(k, sizeof(k), key, klen);
+    snprintf(ctx->why, sizeof(ctx->why), "field '%s' key '%s': %s",
+             bad_field >= 0 ? ctx->new_ts->fields[bad_field].name : "-", k, why);
+    packed_json_safe(ctx->why);
+}
+
+/* v2_rebuild_walk_cb's slot_changed branch for packed objects. */
+static int packed_rebuild_walk(V2RebuildCtx *ctx, const void *key, size_t klen,
+                               const void *value, size_t vlen, uint8_t hdr2) {
+    PackedRowCtx row = { ctx->old_ts, ctx->new_ts, ctx->new_to_old, ctx->backfill };
+    uint8_t *out = NULL;
+    size_t outlen = 0;
+    int bad = -1;
+    char why[160] = {0};
+    int rc = packed_recompose_record(&row, klen, value, vlen, hdr2, &out, &outlen,
+                                     &bad, why, sizeof(why));
+    if (rc != 0) {
+        packed_fail_text(ctx, bad, klen, key, why);
+        ctx->error = 1;
+        return 1;
+    }
+    SlotcaskUpsertOpts o = {0};
+    o.record_hdr2 = typed_schema_hdr2(ctx->new_ts);
+    if (slotcask_insert_with_hooks(ctx->new_db, -1, key, klen, out, outlen, &o, NULL) != 0) {
+        free(out);
+        snprintf(ctx->why, sizeof(ctx->why), "insert into the rebuilt object failed");
+        ctx->error = 1;
+        return 1;
+    }
+    free(out);
+    ctx->live_count++;
+    return 0;
+}
+
+/* Read-only walk used by edit-field's pre-flight and dry_run. */
+typedef struct {
+    PackedRowCtx row;
+    int          failed;      /* 1 = a row does not fit, -1 = hard error */
+    char         field[128];
+    char         reason[192];
+} PackedPreflightCtx;
+
+static int packed_preflight_cb(const uint8_t hash16[16], const void *key, size_t klen,
+                               const void *value, size_t vlen, uint8_t hdr2, void *ud) {
+    (void)hash16;
+    PackedPreflightCtx *c = (PackedPreflightCtx *)ud;
+    if (c->failed) return 1;
+    uint8_t *out = NULL;
+    size_t outlen = 0;
+    int bad = -1;
+    char why[160] = {0};
+    int rc = packed_recompose_record(&c->row, klen, value, vlen, hdr2, &out, &outlen,
+                                     &bad, why, sizeof(why));
+    free(out);
+    if (rc == 0) return 0;
+    char k[128];
+    layout_diag_key(k, sizeof(k), key, klen);
+    snprintf(c->field, sizeof(c->field), "%s",
+             bad >= 0 ? c->row.new_ts->fields[bad].name : "-");
+    snprintf(c->reason, sizeof(c->reason), "key '%s': %s", k, why);
+    packed_json_safe(c->field);
+    packed_json_safe(c->reason);
+    c->failed = rc;
+    return 1;
+}
+
+/* 0 every row converts, 1 a row does not fit (field/reason filled), -1 hard error. */
+int packed_preflight_walk(SlotcaskDb *sdb, const TypedSchema *old_ts,
+                          const TypedSchema *new_ts, const int *new_to_old,
+                          char *field, size_t fsz, char *reason, size_t rsz) {
+    PackedPreflightCtx c;
+    memset(&c, 0, sizeof(c));
+    c.row = (PackedRowCtx){ old_ts, new_ts, new_to_old, NULL };
+    /* Strict (caller holds the object write lock): an unreadable live entry
+       must not be skipped, or dry_run could promise a rebuild that then fails
+       on its live-count check. */
+    int wrc = slotcask_walk_live_strict(sdb, packed_preflight_cb, &c);
+    if (wrc < 0 && !c.failed) {
+        snprintf(field, fsz, "-");
+        snprintf(reason, rsz, "unreadable live record; run vacuum-check/reindex first");
+        return -1;
+    }
+    if (c.failed) {
+        snprintf(field, fsz, "%s", c.field);
+        snprintf(reason, rsz, "%s", c.reason);
+    }
+    return c.failed;
+}
+
+/* Encode `text` as field k of `nts` to prove it is storable. 0 ok, -1 + err.
+   Shared by add-field's probe (below), rebuild_object_v2's seq-range probe,
+   and cmd_edit_fields' packed default probe (review fix: an edit that swaps
+   in an unstorable computed default must refuse, like add-field does). */
+int packed_probe_text(const TypedSchema *nts, int k, const char *text,
+                      char *err, size_t errsz) {
+    TypedPrepared p;
+    typed_prepared_init(&p);
+    p.schema = nts;
+    char e[128] = {0};
+    int rc = packed_set_text(&p, k, text, e, sizeof(e));
+    typed_prepared_free(&p);
+    if (rc) snprintf(err, errsz, "default for field '%s' cannot be stored: %s",
+                     nts->fields[k].name, e[0] ? e : "invalid value");
+    return rc;
+}
+
+/* Pre-transaction proof that every added field's default is storable (A-3).
+   Literal: the literal itself. seq: "1" (type compatibility; the last value of
+   the reserved range is probed again after reservation). uuid(): a sample
+   UUID. random(N): 2N hex characters. */
+int packed_probe_added(const TypedSchema *nts, const int *new_to_old,
+                       char *err, size_t errsz) {
+    for (int k = 0; k < nts->nfields; k++) {
+        if (new_to_old[k] >= 0 || nts->fields[k].removed) continue;
+        const TypedField *nf = &nts->fields[k];
+        char buf[600];
+        const char *sample = NULL;
+        switch (nf->default_kind) {
+        case DK_LITERAL: sample = nf->default_val; break;
+        case DK_SEQ:     sample = "1"; break;
+        case DK_UUID:    sample = "00000000-0000-4000-8000-000000000000"; break;
+        case DK_RANDOM: {
+            int n = atoi(nf->default_val);
+            if (n < 1 || n > 256) {
+                snprintf(err, errsz, "random(N) requires 1 <= N <= 256 in field '%s'", nf->name);
+                return -1;
+            }
+            memset(buf, 'a', (size_t)n * 2);
+            buf[n * 2] = '\0';
+            sample = buf;
+            break;
+        }
+        default: continue;   /* none / auto_*: NULL (or a NOT NULL refusal in the walk) */
+        }
+        if (packed_probe_text(nts, k, sample, err, errsz) != 0) return -1;
+    }
+    return 0;
+}
+
+/* ================================================================== */
+
+
 int v2_rebuild_walk_cb(const uint8_t hash16[16],
                                 const void *key, size_t klen,
                                 const void *value, size_t vlen,
@@ -1015,6 +1499,9 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
         ctx->live_count++;
         return 0;
     }
+
+    if (ctx->old_ts->packed.nfields)
+        return packed_rebuild_walk(ctx, key, klen, value, vlen, hdr2);
 
     /* Slot layout changed (compact, add-field, edit-field, or any combo):
        recompose typed payload by mapping new field offsets ← old field
@@ -1432,7 +1919,7 @@ static int layout_walk_cb(const uint8_t hash16[16], const void *key, size_t klen
     return 0;
 }
 
-static int packed_schema_same(const PkrSchema *a, const PkrSchema *b) {
+int packed_schema_same(const PkrSchema *a, const PkrSchema *b) {
     if (a->nfields != b->nfields || a->prefix != b->prefix ||
         a->directory != b->directory || a->maximum != b->maximum) return 0;
     for (uint32_t i = 0; i < a->nfields; i++) {
@@ -1645,6 +2132,75 @@ out:
 #undef LM_FAIL
 }
 
+/* Bitmap bits are keyfile slot numbers. A recompose re-inserts every record
+   into a fresh keyfile, so probe order and shard capacity — and therefore slot
+   numbers — can differ from the old files; every bitmap must be rebuilt
+   afterwards (btree/trigram entries key on (value, hash), not slots, and are
+   untouched). Rebuilds exactly the bitmap specs of index.conf (explicit
+   `:bitmap`, or a bare bool/enum auto-promoted to bitmap) through the forced
+   index builder. *out_rebuilt = number of bitmap specs rebuilt.
+   0 ok (also when there is none), -1 failure. */
+static int rebuild_bitmap_indexes(const char *db_root, const char *object,
+                                  const TypedSchema *ts, RebuildTxn *txn,
+                                  int *out_rebuilt) {
+    *out_rebuilt = 0;
+    char ic_path[PATH_MAX];
+    if (snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf",
+                 db_root, object) >= (int)sizeof(ic_path)) return -1;
+    FILE *ic = fopen(ic_path, "r");
+    if (!ic) return errno == ENOENT ? 0 : -1;
+    size_t cap = (size_t)MAX_FIELDS * 520 + 8;
+    char *json = malloc(cap);
+    if (!json) { fclose(ic); return -1; }
+    size_t pos = 0;
+    int n = 0, rc = 0;
+    pos += (size_t)snprintf(json + pos, cap - pos, "[");
+    char line[512];
+    while (fgets(line, sizeof(line), ic)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (!line[0]) continue;
+        ParsedIndexSpec ps;
+        if (parse_index_spec(line, &ps) != 0) continue;
+        int is_bm = ps.type == IT_BITMAP;
+        if (!is_bm && !ps.is_composite) {
+            int fi = typed_field_index(ts, ps.name);
+            is_bm = fi >= 0 &&
+                    idx_should_auto_bitmap(ps.had_explicit_type, ts->fields[fi].type);
+        }
+        if (!is_bm) continue;
+        /* A stale spec for a field that no longer exists is not ours to
+           rebuild (cmd_add_indexes would refuse the whole request). */
+        if (!ps.is_composite && typed_field_index(ts, ps.name) < 0) continue;
+        if (n >= MAX_FIELDS || strchr(line, '"') || strchr(line, '\\')) { rc = -1; break; }
+        pos += (size_t)snprintf(json + pos, cap - pos, "%s\"%s\"", n ? "," : "", line);
+        n++;
+    }
+    fclose(ic);
+    if (rc == 0 && n > 0) {
+        /* Durable BEFORE the first bitmap file is touched: a crash or failure
+           from here on makes abort/recovery rebuild the bitmaps again against
+           the restored keyfile. No bitmap => nothing is marked. */
+        if (rebuild_txn_set_indexes_may_change(txn) != 0) {
+            free(json);
+            return -1;
+        }
+        snprintf(json + pos, cap - pos, "]");
+        FILE *saved_out = g_out;
+        FILE *devnull = fopen("/dev/null", "w");
+        if (!devnull) {   /* never let the helper's own reply reach the client */
+            free(json);
+            return -1;
+        }
+        g_out = devnull;
+        rc = cmd_add_indexes(db_root, object, json, 1) == 0 ? 0 : -1;
+        g_out = saved_out;
+        fclose(devnull);
+        if (rc == 0) *out_rebuilt = n;
+    }
+    free(json);
+    return rc;
+}
+
 int rebuild_object_v2(const char *db_root, const char *object,
                       const Schema *old_sch, const TypedSchema *old_ts,
                       const Schema *new_sch, TypedSchema *new_ts,
@@ -1659,16 +2215,44 @@ int rebuild_object_v2(const char *db_root, const char *object,
         return 1;
     }
 
-    /* D9: record-recomposing operations are not implemented for the packed
-       layout in R5. Verbatim copies (splits/streams only) are layout-
-       agnostic and stay allowed. Refuse before touching anything. */
-    if (old_ts->packed.nfields && (slot_changed || drop_tombstoned || n_added > 0)) {
-        OUT("{\"error\":\"vacuum compact / add-field / edit-field are not supported on packed-layout objects yet\"}\n");
+    /* R5b: packed objects recompose through packed_rebuild_walk. The layout
+       never changes inside this function; the slot bound must be the one the
+       loader will derive (load_schema: 24 + max_key + maximum, aligned). */
+    const int packed = old_ts->packed.nfields != 0;
+    if (packed != (new_ts->packed.nfields != 0)) {
+        OUT("{\"error\":\"internal: layout mismatch between old and new schema\"}\n");
         return 1;
+    }
+    if (packed) {
+        size_t bound = 0;
+        if (pkr_slot_bound(&new_ts->packed, (size_t)old_sch->max_key, &bound) != DEC_OK ||
+            bound > INT_MAX || (int)bound != new_sch->slot_size) {
+            OUT("{\"error\":\"packed schema exceeds the maximum slot size\"}\n");
+            return 1;
+        }
+    }
+    /* A-1: a :not_null field with no usable default cannot be backfilled into
+       existing rows. Refuse before the transaction stages anything (the
+       per-row refusal in packed_fill_added stays as defence in depth). */
+    if (packed && n_added > 0 && get_live_count_ll(db_root, object) > 0) {
+        for (int k = 0; k < new_ts->nfields; k++) {
+            if (new_to_old[k] != -1) continue;
+            const TypedField *nf = &new_ts->fields[k];
+            if (nf->removed || !nf->not_null) continue;
+            if (nf->default_kind == DK_NONE || nf->default_kind == DK_AUTO_CREATE ||
+                nf->default_kind == DK_AUTO_UPDATE) {
+                char fname[128];
+                snprintf(fname, sizeof(fname), "%s", nf->name);
+                packed_json_safe(fname);
+                OUT("{\"error\":\"Field '%s' is NOT NULL and has no default; existing rows cannot be backfilled\"}\n", fname);
+                return 1;
+            }
+        }
     }
     RebuildTxn *txn = rebuild_txn_begin(
         db_root, object, old_sch->splits, old_sch->streams,
-        splits_changed || (finalize && finalize->indexes_may_change));
+        splits_changed ||
+        (finalize && finalize->indexes_may_change));
     if (!txn) {
         OUT("{\"error\":\"Failed to begin rebuild transaction\"}\n");
         return 1;
@@ -1679,7 +2263,7 @@ int rebuild_object_v2(const char *db_root, const char *object,
     V2RebuildCtx walk_ctx = {0};
     int legacy_open = 0, new_open = 0;
     char *failure = "Rebuild transaction failed";
-    char failure_buf[128];
+    char failure_buf[320];
     legacy_open = slotcask_open(&legacy_db, rebuild_txn_legacy_root(txn),
                                 old_sch->splits, old_sch->streams,
                                 old_sch->slot_size) == 0;
@@ -1753,6 +2337,18 @@ int rebuild_object_v2(const char *db_root, const char *object,
                 walk_ctx.backfill[k].seq_count = pf_live;
                 atomic_store_explicit(&walk_ctx.backfill[k].seq_next,
                                        start, memory_order_relaxed);
+                if (packed) {
+                    /* A-3: the reserved range is already consumed (documented);
+                       prove its LAST value is storable before any row is written. */
+                    char last[32], perr[160] = {0};
+                    snprintf(last, sizeof(last), "%lld", (long long)(start + pf_live - 1));
+                    if (packed_probe_text(new_ts, k, last, perr, sizeof(perr)) != 0) {
+                        snprintf(failure_buf, sizeof(failure_buf), "Sequence values do not fit field: %s", perr);
+                        packed_json_safe(failure_buf);
+                        failure = failure_buf;
+                        goto txn_fail;
+                    }
+                }
             } else if (nf->default_kind == DK_RANDOM) {
                 walk_ctx.backfill[k].random_bytes = atoi(nf->default_val);
             }
@@ -1772,7 +2368,12 @@ int rebuild_object_v2(const char *db_root, const char *object,
     rebuild_test_pause(obj_dir, "after-walk");
 
     if (walk_err) {
-        failure = "Rebuild walk failed";
+        if (walk_ctx.why[0]) {
+            snprintf(failure_buf, sizeof(failure_buf), "Rebuild walk failed: %s", walk_ctx.why);
+            failure = failure_buf;
+        } else {
+            failure = "Rebuild walk failed";
+        }
         goto txn_fail;
     }
     if (live_count != expected_live) {
@@ -1817,7 +2418,7 @@ int rebuild_object_v2(const char *db_root, const char *object,
                 free(line);
                 continue;
             }
-            if (drop_tombstoned && strstr(line, ":removed")) {
+            if (drop_tombstoned && fields_line_is_removed(line)) {
                 free(line);
                 continue;
             }
@@ -1827,8 +2428,23 @@ int rebuild_object_v2(const char *db_root, const char *object,
         }
         for (int a = 0; a < n_added; a++) fprintf(fout, "%s\n", added_lines[a]);
         fclose(fin);
-        fclose(fout);
-        if (rename(fpath_new, fpath) != 0) {
+        if (fflush(fout) != 0 || ferror(fout)) {
+            fclose(fout);
+            unlink(fpath_new);
+            failure = "Failed to write fields.conf";
+            goto txn_fail;
+        }
+        if (fclose(fout) != 0) {
+            unlink(fpath_new);
+            failure = "Failed to write fields.conf";
+            goto txn_fail;
+        }
+        /* fsync(tmp) -> rename -> fsync(parent). prc==1 (renamed, parent sync
+           failed) is a failure too: txn_fail restores fields.conf from the
+           rollback copy while the transaction is still active. */
+        int fprc = durability_publish_replace(fpath, fpath_new, NULL, NULL);
+        if (fprc != 0) {
+            if (fprc < 0) unlink(fpath_new);
             failure = "Failed to swap fields.conf";
             goto txn_fail;
         }
@@ -1853,11 +2469,43 @@ int rebuild_object_v2(const char *db_root, const char *object,
     invalidate_idx_cache(db_root, object);
     slotcask_registry_invalidate(db_root, object);
 
+    if (packed) {
+        /* F5: the schema the walk composed against must be exactly what the
+           loader now reads from the swapped fields.conf. old_ts may alias a
+           cache slot that this load can reuse — it is not touched below. */
+        Schema chk_sch = load_schema(db_root, object);
+        TypedSchema *chk = load_typed_schema(db_root, object);
+        int same = chk && chk->nfields == new_ts->nfields &&
+                   chk->packed.nfields == new_ts->packed.nfields &&
+                   chk_sch.slot_size == new_sch->slot_size &&
+                   packed_schema_same(&chk->packed, &new_ts->packed);
+        for (int i = 0; same && i < new_ts->nfields; i++)
+            same = strcmp(chk->fields[i].name, new_ts->fields[i].name) == 0 &&
+                   chk->fields[i].removed == new_ts->fields[i].removed;
+        if (!same) {
+            failure = "Rebuilt fields.conf does not match the in-memory packed schema";
+            goto txn_fail;
+        }
+        invalidate_schema_caches(db_root, object);
+        invalidate_idx_cache(db_root, object);
+        slotcask_registry_invalidate(db_root, object);
+    }
+
     int idx_rebuilt = 0;
     if (splits_changed &&
         reindex_object_checked(db_root, object, 0, &idx_rebuilt) != 0) {
         failure = "Failed to rebuild indexes";
         goto txn_fail;
+    }
+    if (!splits_changed) {
+        /* Slot numbers changed: rebuild every bitmap against the new keyfile
+           (names resolve against the post-metadata schema). */
+        int bm_rebuilt = 0;
+        if (rebuild_bitmap_indexes(db_root, object, new_ts, txn, &bm_rebuilt) != 0) {
+            failure = "Failed to rebuild bitmap indexes";
+            goto txn_fail;
+        }
+        if (!(finalize && finalize->rebuild_indexes)) idx_rebuilt += bm_rebuilt;
     }
     if (finalize && finalize->rebuild_indexes) {
         int finalized_count = 0;
@@ -1867,6 +2515,7 @@ int rebuild_object_v2(const char *db_root, const char *object,
         }
         idx_rebuilt += finalized_count;
     }
+    rebuild_test_pause(obj_dir, "after-indexes");
     invalidate_schema_caches(db_root, object);
     invalidate_idx_cache(db_root, object);
     slotcask_registry_invalidate(db_root, object);
@@ -1908,6 +2557,116 @@ txn_fail:
     return 1;
 }
 
+/* Packed-layout rebuild. Verbatim copy (splits/streams only) is unchanged from
+   R5; add-field / vacuum compact recompose every record (R5b). */
+static int rebuild_object_packed(const char *db_root, const char *object,
+                                 const Schema *old_sch, const TypedSchema *old_ts,
+                                 int new_splits, int splits_changed, int new_streams,
+                                 int drop_tombstoned,
+                                 char (*added_lines)[MAX_FIELD_DEF], int n_added) {
+    int streams_changed = (new_streams != old_sch->streams);
+    if (!drop_tombstoned && n_added == 0) {
+        if (!splits_changed && !streams_changed) {
+            OUT("{\"status\":\"noop\",\"reason\":\"no change requested\"}\n");
+            return 0;
+        }
+        TypedSchema same = *old_ts;
+        int identity[MAX_FIELDS];
+        for (int i = 0; i < old_ts->nfields; i++) identity[i] = i;
+        Schema same_sch = *old_sch;
+        same_sch.splits = new_splits;
+        same_sch.streams = new_streams;
+        return rebuild_object_v2(db_root, object, old_sch, old_ts,
+                                 &same_sch, &same, identity,
+                                 0, splits_changed, 0, added_lines, 0, NULL);
+    }
+
+    /* Recompose: the new declaration list is the old fields.conf lines
+       (compact drops tombstones) followed by the added lines — the exact list
+       rebuild_object_v2 writes back to fields.conf. */
+    char obj_dir[PATH_MAX];
+    if (snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object) >= (int)sizeof(obj_dir)) {
+        OUT("{\"error\":\"Object path too long\"}\n");
+        return 1;
+    }
+    char **decl = NULL;
+    size_t ndecl = 0;
+    if (packed_read_decl_lines(obj_dir, &decl, &ndecl) != 0 || ndecl != (size_t)old_ts->nfields) {
+        packed_free_decl_lines(decl, ndecl);
+        OUT("{\"error\":\"fields.conf does not match the loaded schema; refusing to rebuild\"}\n");
+        return 1;
+    }
+    const char *kept[MAX_FIELDS];
+    int new_to_old[MAX_FIELDS];
+    size_t nk = 0;
+    int rc = 1;
+    TypedSchema new_ts;
+    memset(&new_ts, 0, sizeof(new_ts));
+    int built = 0;
+    for (size_t i = 0; i < ndecl; i++) {
+        if (drop_tombstoned && fields_line_is_removed(decl[i])) continue;
+        kept[nk] = decl[i];
+        new_to_old[nk++] = (int)i;
+    }
+    for (int a = 0; a < n_added; a++) {
+        if (nk >= MAX_FIELDS) {
+            OUT("{\"error\":\"Too many fields (max %d)\"}\n", MAX_FIELDS);
+            goto out;
+        }
+        kept[nk] = added_lines[a];
+        new_to_old[nk++] = -1;
+    }
+    if (nk == 0) {
+        OUT("{\"error\":\"compact refused: every field is tombstoned; an object needs at least one field\"}\n");
+        goto out;
+    }
+    for (size_t i = 0; i < nk; i++) {          /* duplicate names (tombstoned included) */
+        const char *ci = strchr(kept[i], ':');
+        size_t li = ci ? (size_t)(ci - kept[i]) : strlen(kept[i]);
+        for (size_t j = i + 1; j < nk; j++) {
+            const char *cj = strchr(kept[j], ':');
+            size_t lj = cj ? (size_t)(cj - kept[j]) : strlen(kept[j]);
+            if (li == lj && memcmp(kept[i], kept[j], li) == 0) {
+                char dup[256];                 /* JSON-safe echo of a raw conf name */
+                snprintf(dup, sizeof(dup), "%.*s", (int)li, kept[i]);
+                packed_json_safe(dup);
+                OUT("{\"error\":\"Field [%s] already exists\"}\n", dup);
+                goto out;
+            }
+        }
+    }
+    char berr[192] = {0};
+    if (typed_schema_build_packed(kept, nk, &new_ts, berr, sizeof(berr)) != 0) {
+        packed_json_safe(berr);
+        OUT("{\"error\":\"Invalid packed field declarations: %s\"}\n", berr);
+        goto out;
+    }
+    built = 1;
+    if (packed_probe_added(&new_ts, new_to_old, berr, sizeof(berr)) != 0) {
+        packed_json_safe(berr);
+        OUT("{\"error\":\"%s\"}\n", berr);
+        goto out;
+    }
+    size_t bound = 0;
+    if (pkr_slot_bound(&new_ts.packed, (size_t)old_sch->max_key, &bound) != DEC_OK || bound > INT_MAX) {
+        OUT("{\"error\":\"packed schema exceeds the maximum slot size\"}\n");
+        goto out;
+    }
+    Schema new_sch = *old_sch;
+    new_sch.splits = new_splits;
+    new_sch.streams = new_streams;
+    new_sch.max_value = new_ts.total_size;
+    new_sch.slot_size = (int)bound;
+    rc = rebuild_object_v2(db_root, object, old_sch, old_ts, &new_sch, &new_ts,
+                           new_to_old, 1 /* always recompose */, splits_changed,
+                           drop_tombstoned, added_lines, n_added, NULL);
+out:
+    if (built) typed_schema_release(&new_ts);
+    packed_free_decl_lines(decl, ndecl);
+    return rc;
+}
+
+
 int rebuild_object(const char *db_root, const char *object,
                    int new_splits_arg, int drop_tombstoned,
                    char (*added_lines)[MAX_FIELD_DEF], int n_added,
@@ -1939,28 +2698,12 @@ int rebuild_object(const char *db_root, const char *object,
                       ? new_streams_arg : old_streams;
     int streams_changed = (new_streams != old_streams);
 
-    /* D9: a packed object supports only verbatim splits/streams rebuilds.
-       Reuse the bound schema as-is; the legacy-shaped construction below
-       would re-sum descriptor widths and mis-size the slot. */
-    if (old_ts->packed.nfields) {
-        if (drop_tombstoned || n_added > 0) {
-            OUT("{\"error\":\"vacuum compact / add-field / edit-field are not supported on packed-layout objects yet\"}\n");
-            return 1;
-        }
-        if (!splits_changed && !streams_changed) {
-            OUT("{\"status\":\"noop\",\"reason\":\"no change requested\"}\n");
-            return 0;
-        }
-        TypedSchema same = *old_ts;
-        int identity[MAX_FIELDS];
-        for (int i = 0; i < old_ts->nfields; i++) identity[i] = i;
-        Schema same_sch = old_sch;
-        same_sch.splits = new_splits;
-        same_sch.streams = new_streams;
-        return rebuild_object_v2(db_root, object, &old_sch, old_ts,
-                                 &same_sch, &same, identity,
-                                 0, splits_changed, 0, added_lines, 0, NULL);
-    }
+    /* A packed object never goes through the legacy-shaped construction below
+       (it would re-sum descriptor widths and mis-size the slot). */
+    if (old_ts->packed.nfields)
+        return rebuild_object_packed(db_root, object, &old_sch, old_ts,
+                                     new_splits, splits_changed, new_streams,
+                                     drop_tombstoned, added_lines, n_added);
 
     /* Build new TypedSchema:
          1. Copy existing fields (skip tombstoned if drop_tombstoned).
@@ -1989,7 +2732,7 @@ int rebuild_object(const char *db_root, const char *object,
         memset(&tf, 0, sizeof(tf));
         if (!parse_field_line(added_lines[a], &tf)) {
             free_enum_values(&tf);
-            OUT("{\"error\":\"Invalid field line: %s\"}\n", added_lines[a]);
+            OUT_ERR_ESC("{\"error\":\"Invalid field line: %s\"}\n", added_lines[a]);
             return 1;
         }
         /* Reject duplicate names against existing active fields */

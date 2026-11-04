@@ -179,6 +179,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_crash_safety.c \
     src/test/cases/test_rename_field.c \
     src/test/cases/test_edit_field.c \
+    src/test/cases/test_packed_recompose.c \
+    src/test/cases/test_legacy_recompose.c \
     src/test/cases/test_edit_field_polish.c \
     src/test/cases/test_add_field_computed_defaults.c \
     src/test/cases/test_auto_key.c \

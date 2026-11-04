@@ -379,16 +379,21 @@ static int copy_regular_file_atomic(const char *src, const char *dst,
         if (rc != 0) break;
     }
     if (close(in) != 0) rc = -1;
+    /* Power-loss durability: the bytes must reach disk before the rename can
+       publish them, and the rename itself must be durable before the caller
+       relies on the copy (rollback evidence, restored fields.conf). */
+    if (rc == 0 && fsync(out) != 0) rc = -1;
     if (close(out) != 0) rc = -1;
     if (rc == 0 && rename(tmp, dst) != 0) rc = -1;
+    if (rc == 0 && fsync_parent_dir(dst) != 0) rc = -1;
     if (rc != 0) unlink(tmp);
     return rc;
 }
 
-static int write_meta(RebuildTxn *txn) {
+static int write_meta(RebuildTxn *txn, const char *dir) {
     char meta[PATH_MAX], tmp[PATH_MAX];
-    if (path_join2(meta, sizeof(meta), txn->preparing, "meta") != 0 ||
-        path_join2(tmp, sizeof(tmp), txn->preparing, "meta.tmp") != 0)
+    if (path_join2(meta, sizeof(meta), dir, "meta") != 0 ||
+        path_join2(tmp, sizeof(tmp), dir, "meta.tmp") != 0)
         return -1;
     FILE *f = fopen(tmp, "w");
     if (!f) return -1;
@@ -398,8 +403,10 @@ static int write_meta(RebuildTxn *txn) {
                      txn->old_splits, txn->old_streams,
                      txn->indexes_may_change ? 1 : 0,
                      txn->old_layout_packed ? 1 : 0) < 0 ? -1 : 0;
+    if (rc == 0 && (fflush(f) != 0 || fsync(fileno(f)) != 0)) rc = -1;
     if (fclose(f) != 0) rc = -1;
     if (rc == 0 && rename(tmp, meta) != 0) rc = -1;
+    if (rc == 0 && fsync_parent_dir(meta) != 0) rc = -1;
     if (rc != 0) unlink(tmp);
     return rc;
 }
@@ -494,14 +501,31 @@ RebuildTxn *rebuild_txn_begin(const char *db_root, const char *object,
         path_join2(rollback_tmp, sizeof(rollback_tmp), txn->preparing,
                    "fields.conf.rollback.tmp") != 0 ||
         copy_regular_file_atomic(txn->fields_path, rollback, rollback_tmp) != 0 ||
-        write_meta(txn) != 0 ||
+        write_meta(txn, txn->preparing) != 0 ||
         rename(txn->preparing, txn->active) != 0) {
         (void)remove_non_authoritative_dir(txn->preparing);
         rebuild_txn_free(txn);
         return NULL;
     }
+    /* `active` must be durable before the data tree is moved, or a power loss
+       could persist the data move without the evidence needed to undo it. If
+       the sync fails nothing has moved yet: un-publish and fail the begin. */
+    if (fsync_parent_dir(txn->active) != 0) {
+        if (rename(txn->active, txn->preparing) == 0)
+            (void)remove_non_authoritative_dir(txn->preparing);
+        else
+            LOG_ERROR(LOG_SUB_SLOTCASK,
+                      "rebuild txn: cannot un-publish %s after failed sync: %s",
+                      txn->active, strerror(errno));
+        rebuild_txn_free(txn);
+        return NULL;
+    }
     slotcask_registry_invalidate(db_root, object);
-    if (rename(txn->data_dir, txn->legacy_data) != 0) {
+    /* Sync both directories touched by the move (object dir loses `data`,
+       the transaction dir gains it) so the staged state is one durable unit. */
+    if (rename(txn->data_dir, txn->legacy_data) != 0 ||
+        fsync_parent_dir(txn->legacy_data) != 0 ||
+        fsync_parent_dir(txn->data_dir) != 0) {
         LOG_ERROR(LOG_SUB_SLOTCASK, "rebuild txn: cannot stage data for %s/%s: %s",
                   db_root, object, strerror(errno));
         (void)rebuild_txn_abort(txn);
@@ -515,6 +539,19 @@ const char *rebuild_txn_legacy_root(const RebuildTxn *txn) {
     return txn ? txn->active : NULL;
 }
 
+int rebuild_txn_set_indexes_may_change(RebuildTxn *txn) {
+    if (!txn) return -1;
+    if (txn->indexes_may_change) return 0;
+    /* Durable BEFORE the caller starts touching index files, so abort and
+       crash recovery know to rebuild them against the restored keyfile. */
+    txn->indexes_may_change = 1;
+    if (write_meta(txn, txn->active) != 0) {
+        txn->indexes_may_change = 0;
+        return -1;
+    }
+    return 0;
+}
+
 int rebuild_txn_commit(RebuildTxn *txn) {
     if (!txn) return -1;
     if (rename(txn->active, txn->done) != 0) {
@@ -522,6 +559,12 @@ int rebuild_txn_commit(RebuildTxn *txn) {
                   strerror(errno));
         return -1;
     }
+    /* The rename is the commit point and has happened; returning failure now
+       would send callers to rebuild_txn_abort, which cannot run once `active`
+       is gone. So a failed directory sync is logged, not propagated. */
+    if (fsync_parent_dir(txn->done) != 0)
+        LOG_ERROR(LOG_SUB_SLOTCASK, "rebuild txn: commit rename not proven durable (parent sync failed): %s",
+                  strerror(errno));
     return 0;
 }
 
@@ -545,7 +588,8 @@ int rebuild_txn_abort(RebuildTxn *txn) {
             rmrf(txn->data_dir);
             if (verify_absent(txn->data_dir) != 0) return -1;
         }
-        if (rename(txn->legacy_data, txn->data_dir) != 0) return -1;
+        if (rename(txn->legacy_data, txn->data_dir) != 0 ||
+            fsync_parent_dir(txn->data_dir) != 0) return -1;
     } else if (!has_live) {
         return -1;
     }
@@ -574,7 +618,8 @@ int rebuild_txn_abort(RebuildTxn *txn) {
                                    &ignored) != 0) return -1;
     }
     slotcask_registry_invalidate(txn->db_root, txn->object);
-    if (rename(txn->active, txn->done) != 0) return -1;
+    if (rename(txn->active, txn->done) != 0 ||
+        fsync_parent_dir(txn->done) != 0) return -1;
     rebuild_txn_cleanup_committed(txn);
     return verify_absent(txn->done);
 }

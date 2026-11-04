@@ -551,15 +551,7 @@ static int test_create_object_packed_refusals(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-static int lm_expect_error(TestClient *tc, const char *req, const char *needle) {
-    char *r = NULL;
-    int ok = tc_request(tc, req, &r) == 0 && r && strstr(r, "\"error\"") &&
-             (!needle || strstr(r, needle));
-    free(r);
-    return ok;
-}
-
-static int test_packed_recompose_ops_refused(void) {
+static int test_packed_recompose_ops_supported(void) {
     LmRoot m; lm_init(&m); if (t_ctx->failed) return 1;
     lm_env(&m, NULL);
     TestEnv env;
@@ -573,15 +565,16 @@ static int test_packed_recompose_ops_refused(void) {
         "\"max_key\":16,\"declaration_layout\":\"packed\","
         "\"fields\":[\"name:varchar:20\",\"qty:int\"]}", &r);
     free(r);
-    ASSERT_TRUE(lm_expect_error(tc,
-        "{\"mode\":\"add-field\",\"dir\":\"lay\",\"object\":\"p\",\"fields\":[\"extra:int\"]}",
-        "not supported on packed"), "add-field refused");
-    ASSERT_TRUE(lm_expect_error(tc,
-        "{\"mode\":\"edit-field\",\"dir\":\"lay\",\"object\":\"p\",\"fields\":[\"name:varchar:30\"]}",
-        "not supported on packed"), "edit-field refused");
-    ASSERT_TRUE(lm_expect_error(tc,
-        "{\"mode\":\"vacuum\",\"dir\":\"lay\",\"object\":\"p\",\"compact\":true}",
-        "not supported on packed"), "compact refused");
+    {
+        char *a = NULL, *e = NULL, *c = NULL;
+        tc_request(tc, "{\"mode\":\"add-field\",\"dir\":\"lay\",\"object\":\"p\",\"fields\":[\"extra:int\"]}", &a);
+        ASSERT_TRUE(a && strstr(a, "\"status\":\"rebuilt\""), "add-field succeeds on a packed object");
+        tc_request(tc, "{\"mode\":\"edit-field\",\"dir\":\"lay\",\"object\":\"p\",\"fields\":[\"name:varchar:30\"]}", &e);
+        ASSERT_TRUE(e && strstr(e, "\"status\":\"edited\""), "edit-field succeeds on a packed object");
+        tc_request(tc, "{\"mode\":\"vacuum\",\"dir\":\"lay\",\"object\":\"p\",\"compact\":true}", &c);
+        ASSERT_TRUE(c && strstr(c, "\"status\":\"rebuilt\""), "compact succeeds on a packed object");
+        free(a); free(e); free(c);
+    }
     /* supported: splits change on a packed object copies verbatim */
     tc_request(tc,
         "{\"mode\":\"insert\",\"dir\":\"lay\",\"object\":\"p\",\"key\":\"k1\","
@@ -608,7 +601,7 @@ static int test_packed_recompose_ops_refused(void) {
     lm_destroy(&m);
     return t_ctx->failed > 0 ? 1 : 0;
 }
-TEST_REGISTER("test-packed-recompose-ops-refused", test_packed_recompose_ops_refused)
+TEST_REGISTER("test-packed-recompose-ops-supported", test_packed_recompose_ops_supported)
 static int lm_write_file(const char *path, const char *text) {
     FILE *f = fopen(path, "w");
     if (!f) return -1;

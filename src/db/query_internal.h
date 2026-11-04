@@ -143,6 +143,13 @@ int selective_reindex_dirty(const char *db_root, const char *object,
                             char dirty_names[][128], int n_dirty,
                             int *out_rebuilt, int *out_skipped);
 int parse_field_line(const char *line, TypedField *out);
+int packed_preflight_walk(SlotcaskDb *sdb, const TypedSchema *old_ts,
+                          const TypedSchema *new_ts, const int *new_to_old,
+                          char *field, size_t fsz, char *reason, size_t rsz);
+int packed_probe_added(const TypedSchema *nts, const int *new_to_old,
+                       char *err, size_t errsz);
+int packed_probe_text(const TypedSchema *nts, int k, const char *text,
+                      char *err, size_t errsz);
 void transform_field_value(const TypedField *old_f,
                            const TypedField *new_f,
                            const uint8_t *src,

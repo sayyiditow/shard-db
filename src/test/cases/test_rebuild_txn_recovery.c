@@ -504,6 +504,269 @@ static int test_embedded_open_respects_daemon_lock(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+/* ---- R5b: packed recompose crash states (S1,S2,S3,S5) ---- */
+
+static int create_packed_fixture(TestEnv *env, const char *object, int count, const char *extra_remove) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return -1;
+    char req[1024], *resp = NULL;
+    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
+    free(resp);
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\","
+        "\"object\":\"%s\",\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"title:varchar:64\",\"amt:numeric:12,4\",\"junk:int\"],\"indexes\":[\"amt\"]}", object);
+    resp = NULL;
+    if (tc_request(tc, req, &resp) != 0 || !SAFE_STRSTR(resp, "\"status\":\"created\"")) { free(resp); tc_close(tc); return -1; }
+    free(resp);
+    for (int i = 0; i < count; i++) {
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"%s\",\"key\":\"item%04d\","
+            "\"value\":{\"title\":\"t%d\",\"amt\":\"%d.1250\",\"junk\":%d}}", object, i, i, i, i);
+        resp = NULL;
+        if (tc_request(tc, req, &resp) != 0 || !SAFE_STRSTR(resp, "\"status\":\"inserted\"")) { free(resp); tc_close(tc); return -1; }
+        free(resp);
+    }
+    if (extra_remove) {
+        snprintf(req, sizeof(req),
+            "{\"mode\":\"remove-field\",\"dir\":\"default\",\"object\":\"%s\",\"fields\":[\"%s\"]}", object, extra_remove);
+        resp = NULL;
+        if (tc_request(tc, req, &resp) != 0 || !SAFE_STRSTR(resp, "\"status\":\"removed\"")) { free(resp); tc_close(tc); return -1; }
+        free(resp);
+    }
+    tc_close(tc);
+    return 0;
+}
+
+static pid_t trigger_request_child(TestEnv *env, const char *json) {
+    pid_t child = fork();
+    if (child != 0) return child;
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) _exit(2);
+    char *resp = NULL;
+    int rc = tc_request(tc, json, &resp);
+    free(resp);
+    tc_close(tc);
+    _exit(rc == 0 ? 0 : 3);
+}
+
+static int packed_find_amt(TestEnv *env, const char *object, const char *value, const char *want_key) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return 0;
+    char req[512], *resp = NULL;
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"%s\","
+        "\"criteria\":[{\"field\":\"amt\",\"op\":\"eq\",\"value\":\"%s\"}]}", object, value);
+    int ok = tc_request(tc, req, &resp) == 0 && SAFE_STRSTR(resp, want_key);
+    free(resp);
+    tc_close(tc);
+    return ok;
+}
+
+/* op: 0 = add-field, 1 = edit-field (rescale, indexed), 2 = vacuum compact (tombstoned field) */
+static int packed_crash_case(int op, const char *phase) {
+    static const char *const request[3] = {
+        "{\"mode\":\"add-field\",\"dir\":\"default\",\"object\":\"%s\",\"fields\":[\"extra:int:default=7\"]}",
+        "{\"mode\":\"edit-field\",\"dir\":\"default\",\"object\":\"%s\",\"fields\":[\"amt:numeric:12,2\"]}",
+        "{\"mode\":\"vacuum\",\"dir\":\"default\",\"object\":\"%s\",\"compact\":true}",
+    };
+    char object[32];
+    snprintf(object, sizeof(object), "pk%d%.6s", op, phase);
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) return 1;
+    int saved_port = env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", env.db_root);
+    ASSERT_EQ_INT(create_packed_fixture(&env, object, 40, op == 2 ? "junk" : NULL), 0, "create packed crash fixture");
+    char fpath[PATH_MAX];
+    snprintf(fpath, sizeof(fpath), "%s/default/%s/fields.conf", root, object);
+    char *conf0 = tu_read_file(fpath);
+    char *row0 = request_get(&env, object, "item0007");
+    ASSERT_TRUE(conf0 && row0, "baseline captured");
+    test_env_stop_keep(&env);
+    ASSERT_EQ_INT(append_pause_config(root, phase), 0, "enable pause");
+    ASSERT_EQ_INT(test_env_start_at(&env, root, saved_port), 0, "restart with pause hook");
+    if (env.daemon_pid <= 0) { free(conf0); free(row0); return 1; }
+    char req[512];
+    snprintf(req, sizeof(req), request[op], object);
+    pid_t child = trigger_request_child(&env, req);
+    ASSERT_TRUE(child > 0, "spawn request");
+    char marker[PATH_MAX];
+    snprintf(marker, sizeof(marker), "%s/default/%s/.rebuild-test-%s.active", root, object, phase);
+    ASSERT_EQ_INT(wait_for_path(marker, 20000), 0, "rebuild reaches the pause");
+    test_env_kill(&env);          /* unconditional: a live paused daemon would hold the DB lock */
+    unlink(marker);
+    if (child > 0) waitpid(child, NULL, 0);
+    ASSERT_EQ_INT(test_env_start_at(&env, root, saved_port), 0, "restart recovers");
+    if (env.daemon_pid > 0) {
+        char *conf1 = tu_read_file(fpath);
+        char *row1 = request_get(&env, object, "item0007");
+        char act[PATH_MAX];
+        snprintf(act, sizeof(act), "%s/default/%s/.rebuild_txn.active", root, object);
+        ASSERT_EQ_INT(request_count(&env, object), 40, "all rows present");
+        ASSERT_TRUE(access(act, F_OK) != 0, "no active transaction after recovery");
+        if (strcmp(phase, "after-commit") != 0) {
+            ASSERT_TRUE(conf1 && strcmp(conf0, conf1) == 0, "rollback restores fields.conf byte-for-byte");
+            ASSERT_TRUE(row1 && strcmp(row0, row1) == 0, "rollback restores the original record");
+            ASSERT_TRUE(op != 1 || packed_find_amt(&env, object, "7.1250", "item0007"), "index consistent after rollback");
+        } else if (op == 0) {
+            ASSERT_TRUE(conf1 && strstr(conf1, "extra:int") && SAFE_STRSTR(row1, "\"extra\":7"), "committed add-field is complete");
+        } else if (op == 1) {
+            ASSERT_TRUE(conf1 && strstr(conf1, "amt:numeric:12,2") && packed_find_amt(&env, object, "7.13", "item0007"),
+                        "committed edit-field is complete, index rebuilt (7.1250 -> 7.13)");
+        } else {
+            ASSERT_TRUE(conf1 && !strstr(conf1, "junk") && SAFE_STRSTR(row1, "\"title\":\"t7\""), "committed compact is complete");
+        }
+        free(conf1); free(row1);
+        test_env_stop(&env);
+    }
+    free(conf0); free(row0);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+
+/* Bitmaps are rebuilt against the NEW keyfile before commit. A crash after
+   that rebuild but before commit rolls the keyfile back, so recovery must
+   rebuild the bitmaps again (the transaction records indexes_may_change). */
+/* Resolve the bitmap's slots back to records: `find` through the bitmap on
+   `field`. Returns the number of rows returned when EVERY returned row really
+   has `value` in `field`, else -1. A popcount cannot see a misplaced bit. */
+static int bitmap_count(TestEnv *env, const char *field, const char *value) {
+    TestClientCfg cfg = { .port = env->port, .io_timeout_ms = 60000 };
+    TestClient *tc = tc_connect(&cfg);
+    if (!tc) return -1;
+    char req[384], *resp = NULL;
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"bmc\",\"format\":\"dict\",\"limit\":100000,"
+        "\"criteria\":[{\"field\":\"%s\",\"op\":\"eq\",\"value\":\"%s\"}]}", field, value);
+    int n = -1;
+    if (tc_request(tc, req, &resp) == 0 && resp) {
+        char hit[48], any[48];
+        snprintf(hit, sizeof(hit), "\"%s\":\"%s\"", field, value);
+        snprintf(any, sizeof(any), "\"%s\":\"", field);
+        int matching = 0, all = 0;
+        for (const char *p = resp; (p = strstr(p, hit)); p += strlen(hit)) matching++;
+        for (const char *p = resp; (p = strstr(p, any)); p += strlen(any)) all++;
+        n = matching == all ? matching : -1;
+    }
+    free(resp);
+    tc_close(tc);
+    return n;
+}
+
+static int append_kf_seam_config(const char *db_root, int slots) {
+    char base[PATH_MAX], env_path[PATH_MAX];
+    snprintf(base, sizeof(base), "%s", db_root);
+    char *slash = strrchr(base, '/');
+    if (!slash) return -1;
+    *slash = '\0';
+    snprintf(env_path, sizeof(env_path), "%s/db.env", base);
+    FILE *f = fopen(env_path, "a");
+    if (!f) return -1;
+    fprintf(f, "export KF_TEST_INITIAL_SLOTS=%d\n", slots);
+    return fclose(f);
+}
+
+static int test_pk_bitmap_after_indexes(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) return 1;
+    int saved_port = env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", env.db_root);
+    /* Shrink the kf tier for this daemon AND every restart (db.env), so 2400
+       rows grow the shards: after a re-insert the slot numbers genuinely
+       differ, and a bitmap left at the new numbering is wrong against the
+       restored keyfile. */
+    test_env_stop_keep(&env);
+    ASSERT_EQ_INT(append_kf_seam_config(root, 64), 0, "persist the kf tier seam");
+    ASSERT_EQ_INT(test_env_start_at(&env, root, saved_port), 0, "restart under the small kf tier");
+    if (env.daemon_pid <= 0) return 1;
+    {
+        TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 60000 };
+        TestClient *tc = tc_connect(&cfg);
+        ASSERT_NOT_NULL(tc, "connect");
+        if (!tc) { test_env_stop(&env); return 1; }
+        char *resp = NULL;
+        tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
+        tc_request(tc,
+            "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"bmc\","
+            "\"splits\":8,\"max_key\":16,\"fields\":[\"kind:varchar:8\",\"kind2:varchar:8\"],"
+            "\"indexes\":[\"kind:bitmap\"]}", &resp);
+        ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create bitmap fixture");
+        free(resp); resp = NULL;
+        size_t cap = 2400 * 80 + 256;
+        char *bulk = malloc(cap);
+        ASSERT_NOT_NULL(bulk, "alloc bulk request");
+        if (!bulk) { tc_close(tc); test_env_stop(&env); return 1; }
+        size_t n = (size_t)snprintf(bulk, cap, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"bmc\",\"records\":{");
+        for (int i = 0; i < 2400; i++)
+            n += (size_t)snprintf(bulk + n, cap - n, "%s\"r%05d\":{\"kind\":\"c%d\",\"kind2\":\"c%d\"}", i ? "," : "", i, i % 4, i % 4);
+        snprintf(bulk + n, cap - n, "}}");
+        tc_request(tc, bulk, &resp);
+        ASSERT_CONTAINS(resp, "inserted", "bulk insert fixture rows");
+        free(bulk); free(resp); resp = NULL;
+        for (int i = 0; i < 2400; i += 3) {
+            char req[160];
+            snprintf(req, sizeof(req), "{\"mode\":\"delete\",\"dir\":\"default\",\"object\":\"bmc\",\"key\":\"r%05d\"}", i);
+            tc_request(tc, req, &resp); free(resp); resp = NULL;
+        }
+        tc_close(tc);
+    }
+    char fpath[PATH_MAX];
+    snprintf(fpath, sizeof(fpath), "%s/default/bmc/fields.conf", root);
+    char *conf0 = tu_read_file(fpath);
+    int base[4];
+    for (int c = 0; c < 4; c++) {
+        char v[8]; snprintf(v, sizeof(v), "c%d", c);
+        base[c] = bitmap_count(&env, "kind2", v);
+        ASSERT_TRUE(base[c] > 0 && bitmap_count(&env, "kind", v) == base[c], "baseline bitmap equals scan");
+    }
+    test_env_stop_keep(&env);
+    ASSERT_EQ_INT(append_pause_config(root, "after-indexes"), 0, "enable pause");
+    ASSERT_EQ_INT(test_env_start_at(&env, root, saved_port), 0, "restart with pause hook");
+    if (env.daemon_pid <= 0) { free(conf0); return 1; }
+    pid_t child = trigger_request_child(&env,
+        "{\"mode\":\"add-field\",\"dir\":\"default\",\"object\":\"bmc\",\"fields\":[\"extra:int:default=7\"]}");
+    ASSERT_TRUE(child > 0, "spawn request");
+    char marker[PATH_MAX];
+    snprintf(marker, sizeof(marker), "%s/default/bmc/.rebuild-test-after-indexes.active", root);
+    ASSERT_EQ_INT(wait_for_path(marker, 60000), 0, "rebuild reaches the post-index pause");
+    test_env_kill(&env);
+    unlink(marker);
+    if (child > 0) waitpid(child, NULL, 0);
+    ASSERT_EQ_INT(test_env_start_at(&env, root, saved_port), 0, "restart recovers");
+    if (env.daemon_pid > 0) {
+        char *conf1 = tu_read_file(fpath);
+        ASSERT_TRUE(conf0 && conf1 && strcmp(conf0, conf1) == 0, "rollback restores fields.conf");
+        for (int c = 0; c < 4; c++) {
+            char v[8]; snprintf(v, sizeof(v), "c%d", c);
+            ASSERT_EQ_INT(bitmap_count(&env, "kind", v), base[c], "bitmap rebuilt against the restored keyfile");
+        }
+        free(conf1);
+        test_env_stop(&env);
+    }
+    free(conf0);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+#define PACKED_CRASH(name, op, phase) \
+    static int name(void) { return packed_crash_case(op, phase); }
+PACKED_CRASH(test_pk_add_stage,    0, "after-stage")
+PACKED_CRASH(test_pk_add_walk,     0, "after-walk")
+PACKED_CRASH(test_pk_add_meta,     0, "after-metadata")
+PACKED_CRASH(test_pk_add_commit,   0, "after-commit")
+PACKED_CRASH(test_pk_edit_stage,   1, "after-stage")
+PACKED_CRASH(test_pk_edit_walk,    1, "after-walk")
+PACKED_CRASH(test_pk_edit_meta,    1, "after-metadata")
+PACKED_CRASH(test_pk_edit_commit,  1, "after-commit")
+PACKED_CRASH(test_pk_compact_stage,  2, "after-stage")
+PACKED_CRASH(test_pk_compact_walk,   2, "after-walk")
+PACKED_CRASH(test_pk_compact_meta,   2, "after-metadata")
+PACKED_CRASH(test_pk_compact_commit, 2, "after-commit")
+
 TEST_REGISTER("test-rebuild-legacy-stage1-safe-restore", test_legacy_stage1)
 TEST_REGISTER("test-rebuild-legacy-stage2-no-data-safe-restore", test_legacy_stage2_no_data)
 TEST_REGISTER("test-rebuild-legacy-ambiguous-refuses-start", test_legacy_ambiguous)
@@ -514,3 +777,16 @@ TEST_REGISTER("test-rebuild-txn-edit-field-after-metadata", test_edit_crash_afte
 TEST_REGISTER("test-rebuild-txn-done-cleanup-never-restores", test_done_cleanup)
 TEST_REGISTER("test-rebuild-txn-recovery-idempotent", test_recovery_idempotent)
 TEST_REGISTER("test-rebuild-txn-embedded-lock", test_embedded_open_respects_daemon_lock)
+TEST_REGISTER("test-rebuild-txn-packed-add-after-stage", test_pk_add_stage)
+TEST_REGISTER("test-rebuild-txn-packed-add-after-walk", test_pk_add_walk)
+TEST_REGISTER("test-rebuild-txn-packed-add-after-metadata", test_pk_add_meta)
+TEST_REGISTER("test-rebuild-txn-packed-add-after-commit", test_pk_add_commit)
+TEST_REGISTER("test-rebuild-txn-packed-edit-after-stage", test_pk_edit_stage)
+TEST_REGISTER("test-rebuild-txn-packed-edit-after-walk", test_pk_edit_walk)
+TEST_REGISTER("test-rebuild-txn-packed-edit-after-metadata", test_pk_edit_meta)
+TEST_REGISTER("test-rebuild-txn-packed-edit-after-commit", test_pk_edit_commit)
+TEST_REGISTER("test-rebuild-txn-packed-compact-after-stage", test_pk_compact_stage)
+TEST_REGISTER("test-rebuild-txn-packed-compact-after-walk", test_pk_compact_walk)
+TEST_REGISTER("test-rebuild-txn-packed-compact-after-metadata", test_pk_compact_meta)
+TEST_REGISTER("test-rebuild-txn-packed-compact-after-commit", test_pk_compact_commit)
+TEST_REGISTER("test-rebuild-txn-packed-bitmap-after-indexes", test_pk_bitmap_after_indexes)

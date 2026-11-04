@@ -29,7 +29,7 @@ static int test_vacuum_addfield_run(void) {
 
     /* Plain vacuum: 5 inserts, delete 2, vacuum cleans=2. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"vac1\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"vac1\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"age:int\"],\"indexes\":[]}",
         &resp); free(resp); resp = NULL;
@@ -61,7 +61,7 @@ static int test_vacuum_addfield_run(void) {
 
     /* vacuum --compact drops tombstoned fields. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"vac2\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"vac2\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"email:varchar:40\","
                     "\"age:int\",\"score:int\"],\"indexes\":[]}",
@@ -117,7 +117,7 @@ static int test_vacuum_addfield_run(void) {
 
     /* vacuum --splits N reshards. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"vac3\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"vac3\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:16\"],\"indexes\":[\"name\"]}",
         &resp); free(resp); resp = NULL;
@@ -161,7 +161,7 @@ static int test_vacuum_addfield_run(void) {
 
     /* TASK #6: add-field appends new fields. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"add1\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"add1\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:16\"],\"indexes\":[]}",
         &resp); free(resp); resp = NULL;
@@ -185,11 +185,9 @@ static int test_vacuum_addfield_run(void) {
 
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"add1\",\"key\":\"k1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"name\":\"alice\"", "k1 name preserved");
-    ASSERT_CONTAINS(resp, "\"age\":0", "k1 age defaults to 0");
-    /* add-field backfill is zeros with a CLEAR bit (§2.10: new fields are
-       never NULL — documents today's behavior); on the rebuilt nullmap
-       record the empty varchar renders as "" (§2.3 zero rendering). */
-    ASSERT_CONTAINS(resp, "\"email\":\"\"", "k1 email empty string (new-field backfill)");
+    ASSERT_CONTAINS(resp, "\"age\":null", "k1 age is NULL (packed new-field backfill)");
+    /* Packed add-field backfill: no default and nullable → NULL (R5b A-1). */
+    ASSERT_CONTAINS(resp, "\"email\":null", "k1 email is NULL (packed new-field backfill)");
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"add1\","
@@ -226,7 +224,7 @@ static int test_vacuum_addfield_run(void) {
 
     /* INTEGRATION: remove-field + vacuum --compact + add-field. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"integ\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"integ\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"a:varchar:16\",\"b:varchar:16\",\"c:int\"],\"indexes\":[]}",
         &resp); free(resp); resp = NULL;
@@ -258,8 +256,8 @@ static int test_vacuum_addfield_run(void) {
     ASSERT_CONTAINS(resp, "\"a\":\"aa\"", "k1 a preserved");
     ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"b\"") == NULL, "k1 b gone");
     ASSERT_CONTAINS(resp, "\"c\":42", "k1 c preserved");
-    /* added field d backfills zeros with a clear bit (§2.10) → renders "" */
-    ASSERT_CONTAINS(resp, "\"d\":\"\"", "k1 d empty string (new-field backfill)");
+    /* added field d: packed backfill with no default → NULL (R5b A-1) */
+    ASSERT_CONTAINS(resp, "\"d\":null", "k1 d is NULL (packed new-field backfill)");
     free(resp); resp = NULL;
 
     tc_request(tc, "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"integ\","

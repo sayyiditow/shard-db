@@ -34,6 +34,12 @@ Clients should match on the `error` string, not on the full message.
 | `fields array is empty` | Empty `fields` array in `create-object` or batch ops. | Provide at least one element. |
 | `invalid field type: "<spec>"` | Unknown type or malformed size. | Check spelling; see [Typed records](../concepts/typed-records.md). |
 | `invalid field name (no :, +, /, spaces)` | Reserved character in field name. | Use `[a-zA-Z0-9_-]`. |
+| `default for field '<f>' cannot be stored: <reason>` | Packed `add-field`: a literal / `seq` / `uuid()` / `random(N)` default is not representable in the field's declared type. | Fix the default or the field type. |
+| `random(N) requires 1 <= N <= 256` | `random(N)` outside 1..256 on a packed `add-field`. | Use `1 ≤ N ≤ 256`. |
+| `Sequence values do not fit field: <reason>` | The reserved `seq` range's last value overflows the field. The range stays consumed. | Use a wider type. |
+| `Pre-flight failed on field [<f>]: key '<k>': <reason>` | Packed `edit-field`: an existing row does not fit the new declaration (nothing changed). | Widen the declaration or fix the row. |
+| `compact refused: every field is tombstoned; …` | `vacuum compact` would leave no field. | Keep or re-add a field first. |
+| `Rebuild walk failed: field '<f>' key '<k>': <reason>` | Packed rebuild aborted mid-walk; original data restored. | Read the reason. |
 | `Invalid field name: <name>` | Same, from `remove-field`. | Fix the name. |
 | `max_key N exceeds ceiling 1024` | `create-object` with a too-large `max_key`. | Use ≤ 1024 (UUIDs fit in 36B). |
 | `too many fields (max 256)` | Schema exceeded `MAX_FIELDS`. | Consolidate or drop unused fields. |

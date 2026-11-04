@@ -604,6 +604,15 @@ int load_db_root(char *out, size_t outlen) {
                configuration.md. */
             int n = atoi(p + 29);
             if (n >= 0 && g_db) g_warmup_test_prelock_delay_ms = n;
+#ifdef TEST_BUILD
+        } else if (strncmp(p, "KF_TEST_INITIAL_SLOTS=", 22) == 0) {
+            /* TEST_BUILD-only: persists the W1 kf-tier seam across daemon
+               restarts (the control channel only reaches a running daemon),
+               so crash tests can reopen grown shards under the same tier. */
+            extern _Atomic size_t g_shard_test_kf_initial_slots;
+            long n = atol(p + 22);
+            if (n > 0) atomic_store(&g_shard_test_kf_initial_slots, (size_t)n);
+#endif
         } else if (strncmp(p, "SCHEMA_WRLOCK_TEST_DELAY_MS=", 28) == 0) {
             /* Test-only knob (widens dispatch_json_query's schema-mode
                objlock_wrlock-held window and publishes a synchronous marker
@@ -618,6 +627,7 @@ int load_db_root(char *out, size_t outlen) {
             if (strcmp(v, "after-stage") == 0 ||
                 strcmp(v, "after-walk") == 0 ||
                 strcmp(v, "after-metadata") == 0 ||
+                strcmp(v, "after-indexes") == 0 ||
                 strcmp(v, "after-commit") == 0) {
                 if (g_db) snprintf(g_rebuild_test_pause_phase,
                                    sizeof(g_rebuild_test_pause_phase), "%s", v);
@@ -4666,15 +4676,12 @@ int cmd_add_fields(const char *db_root, const char *object,
         OUT("{\"error\":\"fields.conf missing for [%s]\"}\n", object);
         return 1;
     }
-    if (ts->packed.nfields) {
-        OUT("{\"error\":\"add-field is not supported on packed-layout objects yet\"}\n");
-        return 1;
-    }
+    const int packed_obj = ts->packed.nfields != 0;   /* R5b: packed grammar below */
 
     for (int a = 0; a < nlines; a++) {
         char *colon = strchr(lines[a], ':');
         if (!colon || colon == lines[a]) {
-            OUT("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
+            OUT_ERR_ESC("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
             return 1;
         }
         size_t nlen = colon - lines[a];
@@ -4682,10 +4689,10 @@ int cmd_add_fields(const char *db_root, const char *object,
         char name[128];
         memcpy(name, lines[a], nlen); name[nlen] = '\0';
         if (!valid_field_name(name)) {
-            OUT("{\"error\":\"Invalid field name: %s\"}\n", name);
+            OUT_ERR_ESC("{\"error\":\"Invalid field name: %s\"}\n", name);
             return 1;
         }
-        if (strstr(lines[a], ":removed")) {
+        if (fields_line_is_removed(lines[a])) {
             OUT("{\"error\":\"Cannot add field with ':removed' marker\"}\n");
             return 1;
         }
@@ -4710,6 +4717,32 @@ int cmd_add_fields(const char *db_root, const char *object,
                 return 1;
             }
         }
+        if (packed_obj) {
+            TypedField ptf;
+            PkrField ppf;
+            memset(&ptf, 0, sizeof(ptf));
+            if (!parse_field_line_packed(lines[a], &ptf, &ppf)) {
+                free_enum_values(&ptf);
+                OUT_ERR_ESC("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
+                return 1;
+            }
+            if (ptf.default_kind == DK_RANDOM) {
+                int n_bytes = atoi(ptf.default_val);
+                if (n_bytes < 1 || n_bytes > 256) {
+                    free_enum_values(&ptf);
+                    OUT_ERR_ESC("{\"error\":\"random(N) requires 1 <= N <= 256 in: %s\"}\n", lines[a]);
+                    return 1;
+                }
+                if (ptf.type == FT_VARCHAR && (uint32_t)(n_bytes * 2) > ppf.payload_max) {
+                    free_enum_values(&ptf);
+                    OUT("{\"error\":\"random(%d) produces %d hex chars but field [%s] holds only %u\"}\n",
+                        n_bytes, n_bytes * 2, name, ppf.payload_max);
+                    return 1;
+                }
+            }
+            free_enum_values(&ptf);
+            continue;   /* storability of every default is probed in rebuild_object */
+        }
         /* Type parseability — use a throwaway TypedField. parse_default_modifier
            strips any trailing :default=... / :auto_* suffix so parse_field_type
            sees a clean spec ("int", "varchar:32", etc.) and the default kind
@@ -4729,7 +4762,7 @@ int cmd_add_fields(const char *db_root, const char *object,
         if (parse_default_modifier_checked(clean_spec, &tf) < 0) {
             free(clean_spec);
             free_enum_values(&tf);
-            OUT("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
+            OUT_ERR_ESC("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
             return 1;
         }
         if(typed_legacy_decl_size(clean_spec)<=0){
@@ -4738,7 +4771,7 @@ int cmd_add_fields(const char *db_root, const char *object,
         parse_field_type(clean_spec,&tf);
         free(clean_spec);
         if (tf.type == FT_NONE || tf.size <= 0) {
-            OUT("{\"error\":\"Invalid type in: %s\"}\n", lines[a]);
+            OUT_ERR_ESC("{\"error\":\"Invalid type in: %s\"}\n", lines[a]);
             return 1;
         }
         if(typed_default_validate(&tf)){
@@ -4763,7 +4796,7 @@ int cmd_add_fields(const char *db_root, const char *object,
                 }
             } else if (n_bytes <= 0) {
                 free_enum_values(&tf);
-                OUT("{\"error\":\"random(N) requires N > 0 in: %s\"}\n", lines[a]);
+                OUT_ERR_ESC("{\"error\":\"random(N) requires N > 0 in: %s\"}\n", lines[a]);
                 return 1;
             }
         }
@@ -4778,6 +4811,11 @@ int cmd_add_fields(const char *db_root, const char *object,
     if (rc == 0)
         LOG_AUDIT(LOG_SUB_CONFIG, "ADD-FIELD %s/%s: %d field(s) added", db_root, object, nlines);
     return rc;
+}
+
+int fields_line_is_removed(const char *line) {
+    size_t n = strlen(line);
+    return n >= 8 && strcmp(line + n - 8, ":removed") == 0;
 }
 
 /* ========== remove-field ==========
@@ -4878,7 +4916,7 @@ int cmd_remove_fields(const char *db_root, const char *object,
     }
     for (int i = 0; i < nnames; i++) {
         if (!valid_field_name(names[i])) {
-            OUT("{\"error\":\"Invalid field name: %s\"}\n", names[i]);
+            OUT_ERR_ESC("{\"error\":\"Invalid field name: %s\"}\n", names[i]);
             return 1;
         }
     }
@@ -4924,7 +4962,7 @@ int cmd_remove_fields(const char *db_root, const char *object,
             const char *colon = strchr(ln, ':');
             size_t nlen = colon ? (size_t)(colon - ln) : strlen(ln);
             if (token_matches(ln, nlen, names[r])) {
-                if (strstr(ln, ":removed")) {
+                if (fields_line_is_removed(ln)) {
                     OUT("{\"error\":\"Field [%s] is already removed\"}\n", names[r]);
                     return 1;
                 }
@@ -4953,7 +4991,7 @@ int cmd_remove_fields(const char *db_root, const char *object,
         for (int r = 0; r < nnames; r++) {
             if (token_matches(ln, nlen, names[r])) { tombstone_this = 1; break; }
         }
-        if (tombstone_this && !strstr(ln, ":removed"))
+        if (tombstone_this && !fields_line_is_removed(ln))
             fprintf(nf, "%s:removed\n", ln);
         else
             fprintf(nf, "%s\n", ln);
@@ -5022,7 +5060,7 @@ int cmd_rename_field(const char *db_root, const char *object,
             if (token_matches(ln, nlen, old_name)) found_old = 1;
             if (token_matches(ln, nlen, new_name)) {
                 /* tombstoned entry ending with :removed is not a conflict */
-                if (!strstr(ln, ":removed")) new_conflict = 1;
+                if (!fields_line_is_removed(ln)) new_conflict = 1;
             }
         }
         nlines++;

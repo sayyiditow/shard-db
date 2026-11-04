@@ -27,7 +27,7 @@ static int t_default_carryover(TestClient *tc) {
 
     /* 1. Create object with `id:varchar:16` and `age:int:default=42`. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"u_polish\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"u_polish\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"id:varchar:16\",\"age:int:default=42\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create-object u_polish");
@@ -59,7 +59,7 @@ static int t_auto_create_carryover(TestClient *tc) {
     char *resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"u_polish_ac\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"u_polish_ac\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"id:varchar:16:auto_create\",\"name:varchar:32\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create-object u_polish_ac");
@@ -88,7 +88,7 @@ static int t_auto_update_carryover(TestClient *tc) {
     char *resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"u_polish_au\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"u_polish_au\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"id:varchar:16\",\"updated_at:varchar:32:auto_update\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create-object u_polish_au");
@@ -121,7 +121,7 @@ static int t_smart_reindex(TestClient *tc) {
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"polish\",\"object\":\"smartidx\","
+        "{\"mode\":\"create-object\",\"dir\":\"polish\",\"object\":\"smartidx\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"id:varchar:16\",\"age:int\",\"name:varchar:64\"],"
         "\"indexes\":[\"age\",\"name\"]}", &resp);
@@ -186,7 +186,7 @@ static int t_dry_run(TestClient *tc) {
     char *resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"polish\",\"object\":\"dryrun\","
+        "{\"mode\":\"create-object\",\"dir\":\"polish\",\"object\":\"dryrun\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"id:varchar:16\",\"age:int\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create-object dryrun");

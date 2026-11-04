@@ -63,7 +63,7 @@ static int test_slotcask_v2_schema_run(void) {
 
     /* ===== no-arg vacuum on v2 → no-op ===== */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"sch2\",\"object\":\"vac\","
+        "{\"mode\":\"create-object\",\"dir\":\"sch2\",\"object\":\"vac\","
         "\"splits\":8,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"age:int\"]}", &resp);
     free(resp); resp = NULL;
@@ -85,7 +85,7 @@ static int test_slotcask_v2_schema_run(void) {
 
     /* ===== add-field with backfill ===== */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"sch2\",\"object\":\"users\","
+        "{\"mode\":\"create-object\",\"dir\":\"sch2\",\"object\":\"users\","
         "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"name:varchar:32\",\"age:int\"],\"indexes\":[\"age\"]}", &resp);
     free(resp); resp = NULL;
@@ -107,11 +107,11 @@ static int test_slotcask_v2_schema_run(void) {
     ASSERT_CONTAINS(resp, "\"live\":4", "add-field preserved live=4");
     free(resp); resp = NULL;
 
-    /* All 4 records readable, with new fields zero-initialized. */
+    /* All 4 records readable, with new nullable fields NULL (packed A-1). */
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"sch2\",\"object\":\"users\",\"key\":\"u2\"}", &resp);
     ASSERT_CONTAINS(resp, "\"name\":\"n2\"", "u2 name preserved");
     ASSERT_CONTAINS(resp, "\"age\":22", "u2 age preserved");
-    ASSERT_TRUE(SAFE_STRSTR(resp, "\"score\":0") != NULL, "u2 score zero-initialized");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"score\":null") != NULL, "u2 score NULL after add-field");
     free(resp); resp = NULL;
 
     ASSERT_EQ_INT(sch_count_total(tc, "users"), 4, "count still 4 post add-field");

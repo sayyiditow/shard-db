@@ -2170,37 +2170,28 @@ static int bm_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
     (void)hash16; (void)key; (void)klen;
     BmRebuildCtx *c = (BmRebuildCtx *)ctx;
     if (c->field_index < 0) return 0;
-    const TypedField *f = &c->ts->fields[c->field_index];
-    /* Field-region view (§2.1): nullmap records slide by the bitmap
-       prefix; trim-short records substitute the shared zero buffer. A
-       NULL field sets no bitmap bit (§2.4.2). */
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t region = 0;
-    if (typed_record_view((const uint8_t *)value, vlen, hdr2,
-                          &fbase, &bm, &bm_bytes, &region) != 0)
-        return 0;
-    if (typed_field_null(bm, bm_bytes, c->field_index)) return 0;
-    const uint8_t *vbase = ((size_t)f->offset + (size_t)f->size > region)
-        ? g_zero_field_65537 : fbase + f->offset;
-    /* Encode via the same path bitmap_update uses on insert. For fixed
-       types the raw stored bytes are already the index-key form;
-       varchar carries a 2-byte length prefix in storage that we need
-       to strip. */
-    uint8_t key_buf[1024];
-    size_t  key_len = 0;
-    if (f->type == FT_VARCHAR) {
-        uint16_t actual_len = ((uint16_t)vbase[0] << 8) | (uint16_t)vbase[1];
-        if (actual_len == 0 || actual_len > sizeof(key_buf)) return 0;
-        memcpy(key_buf, vbase + 2, actual_len);
-        key_len = actual_len;
-    } else {
-        size_t sz = (size_t)f->size;
-        if (sz == 0 || sz > sizeof(key_buf)) return 0;
-        memcpy(key_buf, vbase, sz);
-        key_len = sz;
+    /* Same payload the insert/update path and the seg-scan rebuild feed the
+       bitmap: layout-aware (legacy field region or packed cell), NULL
+       contributes no bit (§2.4.2), numeric dictionaries use the sortable
+       encoding. A malformed row (builder error) fails the build; a row the builder
+       reports as absent/invalid input (rc 0) sets no bit, exactly like the
+       insert path. */
+    uint8_t *payload = NULL; size_t plen = 0;
+    errno = 0;
+    int rc = build_index_payload_from_record(
+        c->ts, (const uint8_t *)value, vlen, hdr2,
+        c->ts->fields[c->field_index].name, &payload, &plen);
+    if (rc < 0) {
+        if (!c->failed) c->saved_errno = errno ? errno : EIO;
+        c->failed = 1;
+        return -1;
     }
-    if (bm_set(c->bm, key_buf, key_len, slot) != 0) {
-        if (!c->failed) c->saved_errno = errno;
+    if (rc == 0) return 0;
+    int set_rc = bm_set(c->bm, payload, plen, slot);
+    int set_errno = errno;
+    free(payload);
+    if (set_rc != 0) {
+        if (!c->failed) c->saved_errno = set_errno;
         c->failed = 1;
         return -1;
     }
@@ -2959,7 +2950,6 @@ typedef struct {
     char         target_path[PATH_MAX];
     char         tmp_path[PATH_MAX];
     int          kf_shard;
-    int          slots_per_shard;
     int          fi;
     int          bool_fastpath;
     uint32_t     max_values;
@@ -3014,7 +3004,10 @@ static void *bm_shard_walk_worker(void *arg) {
         return NULL;
     }
 
-    BitmapShard *bm = bm_open(a->tmp_path, a->slots_per_shard, 1,
+    /* Keyfile shards auto-grow independently of the default tier: size the
+       bitmap at THIS shard's actual capacity (as the seg-scan rebuild does),
+       or a live record above the default tier makes bm_set() fail. */
+    BitmapShard *bm = bm_open(a->tmp_path, (int)kh.capacity, 1,
                               a->bool_fastpath, a->max_values,
                               1 /* writer: reindex bm_set's */);
     if (!bm) {
@@ -3071,8 +3064,6 @@ index_build_result build_bitmap_pass(const char *db_root, const char *object,
         "BUILD-BITMAP %s/%s/%s: %d shards, max_values=%u, bool_fastpath=%d",
         db_root, object, field, sch->splits, max_values, bool_fastpath);
 
-    int slots_per_shard = (int)slotcask_default_slots_for_splits(sch->splits);
-
     /* Sibling temporaries require the field directory to exist. A first-time
        bitmap build has no live shard whose creation would have made it yet. */
     char first_target[PATH_MAX];
@@ -3107,7 +3098,6 @@ index_build_result build_bitmap_pass(const char *db_root, const char *object,
         bm_build_path(args[s].target_path, sizeof(args[s].target_path),
                       db_root, object, field, s);
         args[s].kf_shard       = s;
-        args[s].slots_per_shard= slots_per_shard;
         args[s].fi             = fi;
         args[s].bool_fastpath  = bool_fastpath;
         args[s].max_values     = max_values;

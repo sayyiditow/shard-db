@@ -140,7 +140,7 @@ static int test_not_null_edit_gate_run(void) {
 
     /* === g1: clean add on an all-values field. ==================== */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"g1\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"g1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"a:int\",\"n:int\"]}",
         &resp);
     free(resp); resp = NULL;
@@ -172,7 +172,7 @@ static int test_not_null_edit_gate_run(void) {
 
     /* === g2: NULL present → refuse (real + dry_run); data untouched. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"g2\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"g2\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"m:int\"]}", &resp);
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"g2\","
@@ -205,7 +205,7 @@ static int test_not_null_edit_gate_run(void) {
 
     /* === gs: unreadable live reference → refuse. === */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"gs\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gs\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"c:int\"]}", &resp);
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"gs\","
@@ -232,7 +232,7 @@ static int test_not_null_edit_gate_run(void) {
 
     /* === gc: invalid hdr2 prevents registry open; edit refuses. ==== */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"gc\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gc\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"c:int\"]}", &resp);
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"gc\","
@@ -259,7 +259,7 @@ static int test_not_null_edit_gate_run(void) {
        open this record; typed_record_view in the gate callback refuses it.
        Keep the original 6-byte value length and 40-byte padded record. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"gb\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gb\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"c:int\"]}", &resp);
     ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"error\""), "create bitmap fixture");
     free(resp); resp = NULL;
@@ -350,7 +350,7 @@ static int test_not_null_edit_gate_run(void) {
 
     /* === gx: composite index control — the constraint is per-field. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"gx\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gx\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"a:int\",\"n:int\"],"
         "\"indexes\":[\"a+n\"]}", &resp);
     free(resp); resp = NULL;

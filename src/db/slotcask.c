@@ -2140,6 +2140,12 @@ int slotcask_streams_for_nproc(void) {
    splits=4096); auto-resplit handles any tier overshoot. See the
    comment block in slotcask.h for the full table + rationale. */
 size_t slotcask_default_slots_for_splits(int splits) {
+#ifdef TEST_BUILD
+    /* Keep every consumer of the default tier (bitmap sizing included)
+       consistent with slotcask_open under the W1 test seam. */
+    size_t test_initial = atomic_load(&g_shard_test_kf_initial_slots);
+    if (test_initial) return test_initial;
+#endif
     if (splits <= 16)   return 1024u * 1024;   /* 1M  */
     if (splits <= 128)  return 256u  * 1024;   /* 256K */
     if (splits <= 1024) return 128u  * 1024;   /* 128K */

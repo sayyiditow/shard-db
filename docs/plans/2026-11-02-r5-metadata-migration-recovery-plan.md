@@ -3224,6 +3224,13 @@ Every object has one layout, recorded as the `layout=packed` token on its `schem
 Deferred by D9: packed-layout **recompose** of `add-field`, `edit-field` and `vacuum compact` (also `compact`+`splits`). In R5 they are refused with `"... not supported on packed-layout objects yet"` (Task 6). R5b needs the human's decisions on: (1) numeric rescale/precision edits (text re-encode via `pkr_numeric_encode`, refuse on loss vs round); (2) computed-default backfill (`seq`, `uuid()`, `random`) on packed rows; (3) bare vs bounded `varchar`/`numeric` edits; (4) re-pointing `validate_field_type`/`typed_legacy_decl_size`/`parse_field_line` at the packed grammar for packed objects; and implementation of the `slot_changed` branch of `v2_rebuild_walk_cb` for packed (the `layout_convert_record` shape in Task 8 is the template). Until R5b, the only way to add/edit a field on a migrated object is to recreate it. R6 (acceptance, docs, clients, sanitizers, push/PR) is blocked on R5b.
 
 
+### R5b decisions (confirmed by the human, 2026-11-03)
+
+1. **Numeric rescale/precision edits: "convention".** Scale reduction rounds half away from zero using the existing `pkr_numeric_encode` rules; the edit is refused only when the integer part no longer fits the new precision. All-or-nothing: if any row overflows, no row changes.
+2. **Computed-default backfill: per-row.** `seq`, `uuid()` and `random(N)` defaults are evaluated once per existing row inside the transactional rebuild (as legacy `add-field` does). `seq` values follow shard-scan order; document it.
+3. **Bare vs bounded `varchar`/`numeric`: every direction allowed, existing rows validated** during the rebuild; the whole edit fails with no change if any row does not fit.
+4. **Grammar:** `validate_field_type`, `typed_legacy_decl_size` and `parse_field_line` use the packed grammar for packed objects.
+
 ## Open items handed to the human
 
 **D9 and D10 are CONFIRMED** (D9: staging only — R5b restores the three operations before anything is released; D10: legacy create is `TEST_BUILD`-only). Remaining notes:

@@ -67,7 +67,7 @@ static char *extract_str_value(const char *json, const char *key) {
 static void t_literal(TestClient *tc) {
     char *resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"lit\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"lit\","
         "\"splits\":8,\"max_key\":32,\"fields\":[\"name:varchar:32\"]}", &resp);
     free(resp); resp = NULL;
     for (int i = 1; i <= 3; i++) {
@@ -97,7 +97,7 @@ static void t_literal(TestClient *tc) {
 static void t_seq(TestClient *tc) {
     char *resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sq\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"sq\","
         "\"splits\":8,\"max_key\":32,\"fields\":[\"name:varchar:32\"]}", &resp);
     free(resp); resp = NULL;
     for (int i = 1; i <= 4; i++) {
@@ -134,7 +134,7 @@ static void t_seq(TestClient *tc) {
 static void t_uuid(TestClient *tc) {
     char *resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"uu\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"uu\","
         "\"splits\":8,\"max_key\":32,\"fields\":[\"name:varchar:32\"]}", &resp);
     free(resp); resp = NULL;
     for (int i = 1; i <= 4; i++) {
@@ -181,7 +181,7 @@ static void t_uuid(TestClient *tc) {
 static void t_random(TestClient *tc) {
     char *resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"rr\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"rr\","
         "\"splits\":8,\"max_key\":32,\"fields\":[\"name:varchar:32\"]}", &resp);
     free(resp); resp = NULL;
     const int N = 32;
@@ -228,7 +228,7 @@ static void t_random(TestClient *tc) {
 static void t_edit_field_change_default(TestClient *tc) {
     char *resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"ed\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ed\","
         "\"splits\":8,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"flag:int:default=7\"]}", &resp);
     free(resp); resp = NULL;
@@ -268,7 +268,7 @@ static void t_edit_field_change_default(TestClient *tc) {
 static void t_random_too_big(TestClient *tc) {
     char *resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"rtb\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"rtb\","
         "\"splits\":8,\"max_key\":32,\"fields\":[\"name:varchar:32\"]}", &resp);
     free(resp); resp = NULL;
     /* random(8) generates 16 hex chars; varchar:4 holds at most 4 chars

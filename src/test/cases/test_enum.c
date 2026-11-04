@@ -35,7 +35,7 @@ static int test_enum_run(void) {
 
     /* Happy path: bool-shape enum with 3 values. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"e\",\"object\":\"a\","
+        "{\"mode\":\"create-object\",\"dir\":\"e\",\"object\":\"a\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"color:enum(red,green,blue)\",\"name:varchar:32\"],"
         "\"indexes\":[\"color:bitmap\"]}",
@@ -51,28 +51,28 @@ static int test_enum_run(void) {
 
     /* Empty value list → error. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"e\",\"object\":\"empty_enum\","
+        "{\"mode\":\"create-object\",\"dir\":\"e\",\"object\":\"empty_enum\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"c:enum()\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"error\"", "empty enum() rejected");
     free(resp); resp = NULL;
 
     /* Duplicate values → error. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"e\",\"object\":\"dup_enum\","
+        "{\"mode\":\"create-object\",\"dir\":\"e\",\"object\":\"dup_enum\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"c:enum(red,red,blue)\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"error\"", "duplicate enum value rejected");
     free(resp); resp = NULL;
 
     /* Missing close paren → error. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"e\",\"object\":\"badparens\","
+        "{\"mode\":\"create-object\",\"dir\":\"e\",\"object\":\"badparens\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"c:enum(red,green\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"error\"", "missing ) rejected");
     free(resp); resp = NULL;
 
     /* Default value NOT in the declared list → rejected at create-object. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"e\",\"object\":\"baddefault\","
+        "{\"mode\":\"create-object\",\"dir\":\"e\",\"object\":\"baddefault\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"c:enum(red,green,blue):default=purple\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"error\"",      "default-not-in-list: error");
@@ -81,7 +81,7 @@ static int test_enum_run(void) {
 
     /* Default value IN the list → accepted. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"e\",\"object\":\"gooddefault\","
+        "{\"mode\":\"create-object\",\"dir\":\"e\",\"object\":\"gooddefault\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"c:enum(red,green,blue):default=red\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "default-in-list: created");

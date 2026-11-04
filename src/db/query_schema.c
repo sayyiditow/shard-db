@@ -5,6 +5,7 @@
 #include "bitmap.h"
 #include "query_internal.h"
 #include "packed_record.h"
+#include "typed_row.h"
 #include <dirent.h>
 
 /* ========== edit-field ==========
@@ -225,17 +226,106 @@ static int line_has_default_modifier(const char *line) {
    is silently dropped from the rewritten line. */
 #define FIELD_MODS_MAX 512
 
-/* Rewrite fields.conf in place, replacing each edited line with its new
-   spec. Edited lines preserve the trailing :removed marker if present
-   (edit-field rejects tombstoned fields up front, so this is defensive).
-   Lines unaffected by the edit pass through unchanged. */
+/* Nullability tokens are always the LAST modifier. Only an exact trailing
+   token counts: ":not_null" inside a default literal is data. Returns a
+   pointer to the suffix inside `s`, or NULL. */
+static char *trailing_token(char *s, const char *tok) {
+    size_t n = strlen(s), t = strlen(tok);
+    return (n >= t && strcmp(s + n - t, tok) == 0) ? s + n - t : NULL;
+}
+
+/* Merge one edit spec into an existing fields.conf line: carry the old default
+   when the edit omits one, resolve :not_null / :nullable independently, emit
+   canonically (base + at most one default modifier + at most one trailing
+   nullability token). 0 ok, -1 refuse (logged). `out` needs
+   MAX_FIELD_DEF + FIELD_MODS_MAX + 16 bytes. Single implementation shared by
+   rewrite_fields_conf_for_edit and the packed edit path (F6). */
+static int edit_merge_line(const char *line, const char *edit_spec,
+                           const char *edit_name, char *out, size_t outcap) {
+    char old_mods[FIELD_MODS_MAX] = "";
+    default_modifiers_for_line(line, old_mods, sizeof(old_mods));
+    /* A modifier that exceeds the carry buffer can't be re-emitted — writing
+       the replacement without it would silently drop the field's default. */
+    if (!old_mods[0] && line_has_default_modifier(line)) {
+        LOG_ERROR(LOG_SUB_CONFIG,
+                  "edit_merge_line: a field line carries a default modifier larger "
+                  "than %d bytes — refusing to rewrite (an edit would drop it)",
+                  (int)sizeof(old_mods) - 1);
+        return -1;
+    }
+    char old_default[FIELD_MODS_MAX] = "";
+    memcpy(old_default, old_mods, sizeof(old_default));
+    char line_copy[MAX_FIELD_DEF];
+    snprintf(line_copy, sizeof(line_copy), "%s", line);
+    int old_has_not_null = trailing_token(line_copy, ":not_null") != NULL;
+    char *old_nn = trailing_token(old_default, ":not_null");
+    char *old_nl = trailing_token(old_default, ":nullable");
+    if (old_nn) *old_nn = '\0';
+    if (old_nl) *old_nl = '\0';
+
+    char new_spec[MAX_FIELD_DEF];
+    size_t slen = strlen(edit_spec);
+    memcpy(new_spec, edit_spec, slen + 1);
+    char new_default[FIELD_MODS_MAX] = "";
+    default_modifiers_for_line(new_spec, new_default, sizeof(new_default));
+    if (!new_default[0] && line_has_default_modifier(new_spec)) {
+        LOG_ERROR(LOG_SUB_CONFIG,
+                  "edit_merge_line: edit spec for [%s] carries a default modifier "
+                  "larger than %d bytes — refusing to rewrite (the default would be dropped)",
+                  edit_name, (int)sizeof(new_default) - 1);
+        return -1;
+    }
+    int new_not_null = 0, new_nullable = 0;
+    char *nn_in_new = trailing_token(new_default, ":not_null");
+    char *nl_in_new = trailing_token(new_default, ":nullable");
+    if (nn_in_new && nl_in_new) {
+        LOG_ERROR(LOG_SUB_CONFIG,
+                  "edit_merge_line: edit spec for [%s] carries both nullability tokens — refusing",
+                  edit_name);
+        return -1;
+    }
+    if (nn_in_new) { *nn_in_new = '\0'; new_not_null = 1; }
+    if (nl_in_new) { *nl_in_new = '\0'; new_nullable = 1; }
+    if (!new_default[0]) {
+        size_t blen = strlen(new_spec);
+        if (blen >= 9 && strcmp(new_spec + blen - 9, ":not_null") == 0) {
+            new_spec[blen - 9] = '\0';
+            new_not_null = 1;
+        } else if (blen >= 9 && strcmp(new_spec + blen - 9, ":nullable") == 0) {
+            new_spec[blen - 9] = '\0';
+            new_nullable = 1;
+        }
+    }
+    char *new_dm = strstr(new_spec, ":default=");
+    if (!new_dm) new_dm = strstr(new_spec, ":auto_create");
+    if (!new_dm) new_dm = strstr(new_spec, ":auto_update");
+    if (new_dm) *new_dm = '\0';
+
+    const char *use_default = new_default[0] ? new_default : old_default;
+    int use_not_null = new_not_null ? 1 : new_nullable ? 0 : old_has_not_null;
+    int n = use_not_null ? snprintf(out, outcap, "%s%s:not_null", new_spec, use_default)
+                         : snprintf(out, outcap, "%s%s", new_spec, use_default);
+    if (n < 0 || (size_t)n >= outcap) return -1;
+    /* The loader refuses any fields.conf line of MAX_FIELD_DEF bytes or more
+       (and with it the whole schema), so a merged line that long must never
+       be written. */
+    if ((size_t)n >= MAX_FIELD_DEF) {
+        LOG_ERROR(LOG_SUB_CONFIG,
+                  "edit_merge_line: merged line for [%s] is %d bytes (limit %d) — refusing",
+                  edit_name, n, MAX_FIELD_DEF - 1);
+        return -1;
+    }
+    return 0;
+}
+
+/* Rewrite fields.conf in place, replacing each edited line with its merged
+   spec (edit_merge_line). Lines unaffected by the edit pass through unchanged. */
 static int rewrite_fields_conf_for_edit(const char *obj_dir,
                                          char (*edit_lines)[MAX_FIELD_DEF], int n_edits) {
     char fpath[PATH_MAX], fpath_new[PATH_MAX];
     snprintf(fpath,     sizeof(fpath),     "%s/fields.conf", obj_dir);
     snprintf(fpath_new, sizeof(fpath_new), "%s/fields.conf.new", obj_dir);
 
-    /* Extract just the field name from each edit_line (text up to first ':'). */
     char edit_names[MAX_FIELDS][128];
     for (int e = 0; e < n_edits; e++) {
         const char *colon = strchr(edit_lines[e], ':');
@@ -245,6 +335,9 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
         edit_names[e][nlen] = '\0';
     }
 
+    const size_t merged_cap = (size_t)MAX_FIELD_DEF + FIELD_MODS_MAX + 16;
+    char *merged = malloc(merged_cap);
+    if (!merged) return -1;
     FILE *fin = fopen(fpath, "r");
     int fin_errno = errno;
     FILE *fout = fopen(fpath_new, "w");
@@ -254,6 +347,7 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
         if (!fout) LOG_ERROR(LOG_SUB_CONFIG, "rewrite_fields_conf_for_edit: fopen %s failed: %s", fpath_new, strerror(fout_errno));
         if (fin) fclose(fin);
         if (fout) fclose(fout);
+        free(merged);
         return -1;
     }
     for (;;) {
@@ -268,6 +362,7 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
                 fclose(fin);
                 fclose(fout);
                 unlink(fpath_new);
+                free(merged);
                 return -1;
             }
             break;   /* EOF */
@@ -290,128 +385,110 @@ static int rewrite_fields_conf_for_edit(const char *obj_dir,
         }
         if (matched < 0) {
             fputs(line, fout);
-            fputc('\n', fout);   /* conf_read_line strips the newline */
+            fputc('\n', fout);
             free(line);
             continue;
         }
-        /* Carry default modifiers (:default=…, :auto_create, :auto_update)
-           from the OLD line to the new line when the user's new spec omits
-           them. Lets `edit-field age:long` change the type without wiping
-           an existing `:default=42`. */
-        char old_mods[FIELD_MODS_MAX] = "";
-        default_modifiers_for_line(line, old_mods, sizeof(old_mods));
-        /* A modifier that exceeds the carry buffer can't be re-emitted —
-           writing the replacement without it would silently drop the
-           field's default. Refuse the whole rewrite instead (the on-disk
-           line can only exceed the buffer via older binaries or hand
-           edits; the wire gates reject such specs). */
-        if (!old_mods[0] && line_has_default_modifier(line)) {
-            LOG_ERROR(LOG_SUB_CONFIG,
-                      "rewrite_fields_conf_for_edit: a field line carries a "
-                      "default modifier larger than %d bytes — refusing to "
-                      "rewrite (an edit would drop it)",
-                      (int)sizeof(old_mods) - 1);
+        if (edit_merge_line(line, edit_lines[matched], edit_names[matched], merged, merged_cap) != 0) {
             free(line);
             fclose(fin);
             fclose(fout);
             unlink(fpath_new);
+            free(merged);
             return -1;
         }
-        /* Nullability + default resolve INDEPENDENTLY, then emit
-           canonically: base + exactly one default modifier + at most one
-           trailing nullability token. Appending old_mods verbatim could
-           emit two defaults or bury the token mid-line, which the schema
-           loader would drop. The old :not_null can sit standalone at
-           line end OR ride inside the old_mods suffix
-           (":default=5:not_null") — both splits trim it out of the mods
-           string first. */
-        char old_default[FIELD_MODS_MAX] = "";
-        memcpy(old_default, old_mods, sizeof(old_default));
-        int old_has_not_null = strstr(line, ":not_null") != NULL;
-        char *old_nn = strstr(old_default, ":not_null");
-        char *old_nl = strstr(old_default, ":nullable");
-        if (old_nn) *old_nn = '\0';
-        if (old_nl) *old_nl = '\0';
-
-        char new_spec[MAX_FIELD_DEF];
-        size_t slen = strlen(edit_lines[matched]);
-        memcpy(new_spec, edit_lines[matched], slen + 1);
-        char new_default[FIELD_MODS_MAX] = "";
-        default_modifiers_for_line(new_spec, new_default, sizeof(new_default));
-        if (!new_default[0] && line_has_default_modifier(new_spec)) {
-            /* The edit spec's modifier suffix outgrew the carry buffer,
-               so nothing was extracted. Emitting without it would drop
-               the requested default from the rewritten line — refuse the
-               whole rewrite instead. */
-            LOG_ERROR(LOG_SUB_CONFIG,
-                      "rewrite_fields_conf_for_edit: edit spec for [%s] "
-                      "carries a default modifier larger than %d bytes — "
-                      "refusing to rewrite (the default would be dropped)",
-                      edit_names[matched], (int)sizeof(new_default) - 1);
-            free(line);
-            fclose(fin);
-            fclose(fout);
-            unlink(fpath_new);
-            return -1;
-        }
-        int new_not_null = 0, new_nullable = 0;
-        char *nn_in_new = strstr(new_default, ":not_null");
-        char *nl_in_new = strstr(new_default, ":nullable");
-        if (nn_in_new && nl_in_new) {
-            /* Structurally invalid edit — refuse rather than emit a
-               line the schema loader would drop. */
-            LOG_ERROR(LOG_SUB_CONFIG,
-                      "rewrite_fields_conf_for_edit: edit spec for [%s] "
-                      "carries both nullability tokens — refusing",
-                      edit_names[matched]);
-            free(line);
-            fclose(fin);
-            fclose(fout);
-            unlink(fpath_new);
-            return -1;
-        }
-        if (nn_in_new) { *nn_in_new = '\0'; new_not_null = 1; }
-        if (nl_in_new) { *nl_in_new = '\0'; new_nullable = 1; }
-        if (!new_default[0]) {
-            /* No default modifier — a token would sit at new_spec's end. */
-            size_t blen = strlen(new_spec);
-            if (blen >= 9 &&
-                strcmp(new_spec + blen - 9, ":not_null") == 0) {
-                new_spec[blen - 9] = '\0';
-                new_not_null = 1;
-            } else if (blen >= 9 &&
-                       strcmp(new_spec + blen - 9, ":nullable") == 0) {
-                new_spec[blen - 9] = '\0';
-                new_nullable = 1;
-            }
-        }
-
-        /* default_modifiers_for_line COPIES; it does not strip. Split
-           the base explicitly before appending the resolved modifier. */
-        char *new_dm = strstr(new_spec, ":default=");
-        if (!new_dm) new_dm = strstr(new_spec, ":auto_create");
-        if (!new_dm) new_dm = strstr(new_spec, ":auto_update");
-        if (new_dm) *new_dm = '\0';
-
-        const char *use_default = new_default[0] ? new_default : old_default;
-        int use_not_null = new_not_null ? 1
-                         : new_nullable ? 0
-                         : old_has_not_null;
-        if (use_not_null)
-            fprintf(fout, "%s%s:not_null\n", new_spec, use_default);
-        else
-            fprintf(fout, "%s%s\n", new_spec, use_default);
+        fprintf(fout, "%s\n", merged);
         free(line);
     }
     fclose(fin);
-    fclose(fout);
-    if (rename(fpath_new, fpath) != 0) {
-        LOG_ERROR(LOG_SUB_CONFIG, "rewrite_fields_conf_for_edit: rename %s -> %s failed: %s", fpath_new, fpath, strerror(errno));
+    int wok = (fflush(fout) == 0 && !ferror(fout));
+    if (fclose(fout) != 0) wok = 0;
+    free(merged);
+    if (!wok) {
+        LOG_ERROR(LOG_SUB_CONFIG, "rewrite_fields_conf_for_edit: write %s failed", fpath_new);
         unlink(fpath_new);
         return -1;
     }
+    /* D-6: fsync(tmp) -> rename -> fsync(parent). Returns 0 on success, -1 if
+       the file was not replaced, and 1 if it WAS replaced but the parent sync
+       failed (applied, durability unconfirmed): the caller must invalidate its
+       caches because the new fields.conf is live. */
+    int prc = durability_publish_replace(fpath, fpath_new, NULL, NULL);
+    if (prc != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "rewrite_fields_conf_for_edit: durable replace of %s failed (rc=%d): %s", fpath, prc, strerror(errno));
+        if (prc < 0) { unlink(fpath_new); return -1; }
+        return 1;
+    }
     return 0;
 }
+
+/* Packed edit: build the NEW packed TypedSchema from the old fields.conf lines
+   with each edit merged in (the exact lines rewrite_fields_conf_for_edit will
+   write). 0 ok (caller releases new_ts with typed_schema_release), -1 + err. */
+static int edit_build_packed_ts(const char *db_root, const char *object,
+                                const TypedSchema *old_ts,
+                                char (*edit_lines)[MAX_FIELD_DEF],
+                                const int *edited_old_idx, int n_edits,
+                                TypedSchema *new_ts, int *new_to_old,
+                                char *err, size_t errsz) {
+    char obj_dir[PATH_MAX];
+    snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
+    char **decl = NULL;
+    size_t n = 0;
+    int rc = -1;
+    if (packed_read_decl_lines(obj_dir, &decl, &n) != 0 || n != (size_t)old_ts->nfields) {
+        snprintf(err, errsz, "fields.conf does not match the loaded schema");
+        goto out;
+    }
+    const size_t cap = (size_t)MAX_FIELD_DEF + FIELD_MODS_MAX + 16;
+    for (int e = 0; e < n_edits; e++) {
+        int oi = edited_old_idx[e];
+        char *merged = malloc(cap);
+        if (!merged) { snprintf(err, errsz, "out of memory"); goto out; }
+        if (edit_merge_line(decl[oi], edit_lines[e], old_ts->fields[oi].name, merged, cap) != 0) {
+            free(merged);
+            snprintf(err, errsz, "cannot merge the edit for field [%s]", old_ts->fields[oi].name);
+            goto out;
+        }
+        free(decl[oi]);
+        decl[oi] = merged;
+    }
+    if (typed_schema_build_packed((const char *const *)decl, n, new_ts, err, errsz) != 0) goto out;
+    for (int i = 0; i < old_ts->nfields; i++) {
+        new_to_old[i] = i;
+        if (strcmp(new_ts->fields[i].name, old_ts->fields[i].name) != 0 ||
+            new_ts->fields[i].removed != old_ts->fields[i].removed) {
+            typed_schema_release(new_ts);
+            snprintf(err, errsz, "edit changed the identity of field %d", i);
+            goto out;
+        }
+    }
+    rc = 0;
+out:
+    packed_free_decl_lines(decl, n);
+    return rc;
+}
+
+static void edit_release_packed_ts(TypedSchema **p) {
+    if (p && *p) typed_schema_release(*p);
+}
+
+/* JSON-envelope safety for messages that may echo field names / parser text. */
+static void packed_json_safe_edit(char *s) {
+    for (; *s; s++)
+        if (*s == '"' || *s == '\\' || (unsigned char)*s < 0x20 || (unsigned char)*s > 0x7e) *s = '?';
+}
+
+/* True when an edit changes the field's stored encoding (drives reindex). */
+static int edit_field_dirty(const TypedSchema *old_ts, const TypedSchema *new_ts, int i) {
+    if (!old_ts->packed.nfields)
+        return field_needs_transform(&old_ts->fields[i], &new_ts->fields[i]);
+    const PkrField *a = &old_ts->packed.fields[i], *b = &new_ts->packed.fields[i];
+    return a->kind != b->kind || a->width != b->width || a->payload_max != b->payload_max ||
+           a->precision != b->precision || a->scale != b->scale || a->bare != b->bare ||
+           old_ts->fields[i].type != new_ts->fields[i].type;
+}
+
 
 /* Selective reindex driver — walks index.conf and only rebuilds indexes
    whose referenced fields appear in dirty_names[]. Returns (rebuilt,
@@ -506,6 +583,7 @@ int selective_reindex_dirty(const char *db_root, const char *object,
    return failure. Callback decode failures also refuse the edit.
    The walk is sequential; caller holds objlock_wrlock throughout. */
 typedef struct {
+    const TypedSchema *ts;      /* NULL-safe; packed schemas scan by cell  */
     const TypedField *fld;      /* field under test                      */
     int               field_idx;
     uint8_t          *scratch;  /* fld->size bytes — legacy bounded copy */
@@ -518,6 +596,17 @@ static int not_null_scan_cb(const uint8_t hash16[16], const void *key,
                             uint8_t hdr2, void *ud) {
     (void)hash16; (void)key; (void)klen;
     NotNullScanCtx *c = (NotNullScanCtx *)ud;
+    if (c->ts && c->ts->packed.nfields) {
+        TypedRowView rv;
+        TypedRowSpan sp;
+        if (typed_row_open(c->ts, (const uint8_t *)value, vlen, hdr2, &rv) != 0 ||
+            typed_row_span(&rv, (size_t)c->field_idx, &sp) != 0) {
+            c->broken = 1;
+            return 1;
+        }
+        if (sp.is_null) c->nulls++;
+        return 0;
+    }
     const uint8_t *base = NULL; const uint8_t *bm = NULL;
     int bm_bytes = 0; size_t region = 0;
     if (typed_record_view((const uint8_t *)value, vlen, hdr2,
@@ -566,6 +655,7 @@ static int count_nulls_for_field(const char *db_root, const char *object,
     if (!scratch) return -1;
     NotNullScanCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
+    ctx.ts = ts;
     ctx.fld = fld;
     ctx.field_idx = field_idx;
     ctx.scratch = scratch;
@@ -626,10 +716,6 @@ int cmd_edit_fields(const char *db_root, const char *object,
         OUT("{\"error\":\"fields.conf missing for [%s]\"}\n", object);
         return 1;
     }
-    if (old_ts->packed.nfields) {
-        OUT("{\"error\":\"edit-field is not supported on packed-layout objects yet\"}\n");
-        return 1;
-    }
 
     /* Parse each edit line, validate name/type, look up target field. */
     TypedField parsed[MAX_FIELDS];
@@ -637,23 +723,24 @@ int cmd_edit_fields(const char *db_root, const char *object,
 
     for (int e = 0; e < n_edits; e++) {
         memset(&parsed[e], 0, sizeof(parsed[e]));
-        if (strstr(lines[e], ":removed")) {
+        if (fields_line_is_removed(lines[e])) {
             OUT("{\"error\":\"Cannot edit with ':removed' marker; use remove-field\"}\n");
             for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
-        if (!parse_field_line(lines[e], &parsed[e])) {
-            OUT("{\"error\":\"Invalid field line: %s\"}\n", lines[e]);
+        if (!(old_ts->packed.nfields ? parse_field_line_packed(lines[e], &parsed[e], NULL)
+                                     : parse_field_line(lines[e], &parsed[e]))) {
+            OUT_ERR_ESC("{\"error\":\"Invalid field line: %s\"}\n", lines[e]);
             for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
         if (!edit_valid_name(parsed[e].name)) {
-            OUT("{\"error\":\"Invalid field name: %s\"}\n", parsed[e].name);
+            OUT_ERR_ESC("{\"error\":\"Invalid field name: %s\"}\n", parsed[e].name);
             for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
         if (field_default_too_long(lines[e])) {
-            OUT("{\"error\":\"field [%s]: :default= literal too long (max 255 bytes)\"}\n",
+            OUT_ERR_ESC("{\"error\":\"field [%s]: :default= literal too long (max 255 bytes)\"}\n",
                 parsed[e].name);
             for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
@@ -661,7 +748,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
         /* Duplicate-edit-in-request check. */
         for (int b = 0; b < e; b++) {
             if (strcmp(parsed[b].name, parsed[e].name) == 0) {
-                OUT("{\"error\":\"Duplicate edit for field [%s] in request\"}\n",
+                OUT_ERR_ESC("{\"error\":\"Duplicate edit for field [%s] in request\"}\n",
                     parsed[e].name);
                 for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
                 return 1;
@@ -676,12 +763,12 @@ int cmd_edit_fields(const char *db_root, const char *object,
             }
         }
         if (found < 0) {
-            OUT("{\"error\":\"Field [%s] not found\"}\n", parsed[e].name);
+            OUT_ERR_ESC("{\"error\":\"Field [%s] not found\"}\n", parsed[e].name);
             for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
         if (old_ts->fields[found].removed) {
-            OUT("{\"error\":\"Field [%s] is tombstoned; cannot edit\"}\n",
+            OUT_ERR_ESC("{\"error\":\"Field [%s] is tombstoned; cannot edit\"}\n",
                 parsed[e].name);
             for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
@@ -754,13 +841,62 @@ int cmd_edit_fields(const char *db_root, const char *object,
         edited_old_idx[e] = found;
     }
 
-    /* Build new_ts: clone old_ts, overlay each edit, recompute offsets. */
     TypedSchema new_ts;
+    TypedSchema *packed_new_owner __attribute__((cleanup(edit_release_packed_ts))) = NULL;
+    int new_to_old[MAX_FIELDS];
+    if (old_ts->packed.nfields) {
+        char berr[192] = {0};
+        if (edit_build_packed_ts(db_root, object, old_ts, lines, edited_old_idx, n_edits,
+                                 &new_ts, new_to_old, berr, sizeof(berr)) != 0) {
+            for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
+            packed_json_safe_edit(berr);
+            OUT_ERR_ESC("{\"error\":\"Invalid field declaration: %s\"}\n", berr);
+            return 1;
+        }
+        packed_new_owner = &new_ts;
+        /* A-3 on the edit path (review fix): a declared default must be
+           storable in the new declaration. packed_probe_added only covers
+           ADDED fields, and the pre-flight/recompose never encode defaults
+           for existing fields — probe each edited field's default here, or a
+           metadata-only edit could leave fields.conf carrying a default
+           every later insert fails to encode. */
+        for (int e = 0; e < n_edits; e++) {
+            const TypedField *nf = &new_ts.fields[edited_old_idx[e]];
+            const char *sample = NULL;
+            char pbuf[600], perr[192] = {0};
+            switch (nf->default_kind) {
+            case DK_LITERAL: sample = nf->default_val; break;
+            case DK_SEQ:     sample = "1"; break;
+            case DK_UUID:    sample = "00000000-0000-4000-8000-000000000000"; break;
+            case DK_RANDOM: {
+                int n = atoi(nf->default_val);
+                if (n < 1 || n > 256) {
+                    for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
+                    OUT_ERR_ESC("{\"error\":\"random(N) requires 1 <= N <= 256 in: %s\"}\n", lines[e]);
+                    return 1;
+                }
+                memset(pbuf, 'a', (size_t)n * 2);
+                pbuf[n * 2] = '\0';
+                sample = pbuf;
+                break;
+            }
+            default: continue;   /* none / auto_*: nothing to probe */
+            }
+            if (packed_probe_text(&new_ts, edited_old_idx[e], sample, perr, sizeof(perr)) != 0) {
+                packed_json_safe_edit(perr);
+                for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
+                OUT_ERR_ESC("{\"error\":\"Invalid field declaration: %s\"}\n", perr);
+                return 1;
+            }
+        }
+    }
+    /* Legacy: clone old_ts, overlay each edit, recompute offsets (not reindented
+       on purpose — the packed schema above replaces this whole block). */
+    int noff = 0;
+    if (!old_ts->packed.nfields) {
     memset(&new_ts, 0, sizeof(new_ts));
     new_ts.typed = 1;
     new_ts.nfields = old_ts->nfields;
-    int new_to_old[MAX_FIELDS];
-    int noff = 0;
     for (int i = 0; i < old_ts->nfields; i++) {
         new_ts.fields[i] = old_ts->fields[i];
         int edit_for_i = -1;
@@ -810,6 +946,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
        rebuild's trim/encode hooks run against THIS schema. */
     new_ts.nullmap_prefix = 1 + typed_nullmap_bytes(new_ts.nfields);
     new_ts.total_size += new_ts.nullmap_prefix;
+    }   /* end legacy overlay */
 
     /* Per-edit dirty tracking. A field is dirty when its encoding actually
        changed; only those fields' indexes need to be rebuilt. */
@@ -817,7 +954,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
     int n_dirty = 0;
     for (int e = 0; e < n_edits; e++) {
         int oi = edited_old_idx[e];
-        if (field_needs_transform(&old_ts->fields[oi], &new_ts.fields[oi])) {
+        if (edit_field_dirty(old_ts, &new_ts, oi)) {
             size_t nlen = strlen(parsed[e].name);
             if (nlen >= sizeof(dirty_names[0])) nlen = sizeof(dirty_names[0]) - 1;
             memcpy(dirty_names[n_dirty], parsed[e].name, nlen);
@@ -825,7 +962,9 @@ int cmd_edit_fields(const char *db_root, const char *object,
             n_dirty++;
         }
     }
-    int needs_rebuild = (n_dirty > 0);
+    int needs_rebuild = old_ts->packed.nfields
+        ? !packed_schema_same(&old_ts->packed, &new_ts.packed)   /* F4 */
+        : (n_dirty > 0);
 
     char obj_dir[PATH_MAX];
     snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
@@ -862,8 +1001,13 @@ int cmd_edit_fields(const char *db_root, const char *object,
             for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
             return 0;
         }
-        if (rewrite_fields_conf_for_edit(obj_dir, lines, n_edits) != 0) {
-            OUT("{\"error\":\"Failed to rewrite fields.conf\"}\n");
+        int wrc = rewrite_fields_conf_for_edit(obj_dir, lines, n_edits);
+        if (wrc != 0) {
+            if (wrc > 0) invalidate_schema_caches(db_root, object);   /* new file is live */
+            OUT(wrc > 0
+                ? "{\"error\":\"fields.conf was replaced but its directory sync failed; durability unconfirmed, retry the edit\"}\n"
+                : "{\"error\":\"Failed to rewrite fields.conf\"}\n");
+            for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
         invalidate_schema_caches(db_root, object);
@@ -883,6 +1027,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         OUT("{\"error\":\"Failed to open slotcask for pre-flight\"}\n");
+        for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
         return 1;
     }
     EditPreflightCtx pf = {0};
@@ -890,10 +1035,26 @@ int cmd_edit_fields(const char *db_root, const char *object,
     pf.new_ts        = &new_ts;
     pf.edited_old_idx = edited_old_idx;
     pf.n_edits       = n_edits;
-    slotcask_walk_live(sdb, edit_preflight_walk_cb, &pf);
+    if (old_ts->packed.nfields) {
+        /* Same converter as the rebuild (D-3). edit_preflight_walk_cb cannot be
+           used: typed_record_view rejects packed records and would skip them. */
+        int prc = packed_preflight_walk(sdb, old_ts, &new_ts, new_to_old,
+                                        pf.fail_field, sizeof(pf.fail_field),
+                                        pf.fail_reason, sizeof(pf.fail_reason));
+        if (prc < 0) {
+            OUT("{\"error\":\"Pre-flight failed on field [%s]: %s\"}\n",
+                pf.fail_field, pf.fail_reason);
+            for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
+            return 1;
+        }
+        pf.failed = prc;
+    } else {
+        slotcask_walk_live(sdb, edit_preflight_walk_cb, &pf);
+    }
     if (pf.failed) {
         OUT("{\"error\":\"Pre-flight failed on field [%s]: %s\"}\n",
             pf.fail_field, pf.fail_reason);
+        for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
         return 1;
     }
 
@@ -912,8 +1073,18 @@ int cmd_edit_fields(const char *db_root, const char *object,
     /* Compute the new slot_size and run the v2 rebuild. */
     Schema new_sch = old_sch;
     new_sch.max_value = new_ts.total_size;
-    new_sch.slot_size = (24 + new_sch.max_key + new_sch.max_value + 7) & ~7;
-    if (new_sch.slot_size < 32) new_sch.slot_size = 32;
+    if (old_ts->packed.nfields) {
+        size_t bound = 0;
+        if (pkr_slot_bound(&new_ts.packed, (size_t)new_sch.max_key, &bound) != DEC_OK || bound > INT_MAX) {
+            OUT("{\"error\":\"packed schema exceeds the maximum slot size\"}\n");
+            for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
+            return 1;
+        }
+        new_sch.slot_size = (int)bound;
+    } else {
+        new_sch.slot_size = (24 + new_sch.max_key + new_sch.max_value + 7) & ~7;
+        if (new_sch.slot_size < 32) new_sch.slot_size = 32;
+    }
 
     /* v2_rebuild_walk_cb takes the verbatim re-insert path when
        slot_changed=0 — which would skip transform_field_value for
@@ -940,6 +1111,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
                                 &finalize);
     if (rc != 0) {
         /* rebuild_object_v2 already emitted an {"error":..} response. */
+        for (int _i = 0; _i < n_edits; _i++) free_enum_values(&parsed[_i]);
         return rc;
     }
 
@@ -987,7 +1159,7 @@ static int validate_field_type(const char *field_spec) {
    declaration, 0 otherwise. Bare `varchar` / `numeric` are legal; numeric
    precision/scale and varchar capacity are validated by the packed parser;
    every other type keeps the existing fixed-width grammar. */
-static int validate_packed_field_type(const char *field_spec) {
+int validate_packed_field_type(const char *field_spec) {
     const char *colon = strchr(field_spec, ':');
     if (!colon || colon == field_spec) return 0;
     char *buf = strdup(colon + 1);

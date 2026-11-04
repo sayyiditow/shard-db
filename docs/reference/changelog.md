@@ -12,6 +12,8 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 the existing TOO_OLD upgrade hint). The strict `layout=packed` schema.conf token is
 the authoritative object layout; a malformed token refuses the object's load.
 
+**Packed recompose (R5b).** `add-field`, `edit-field` and `vacuum compact` (also with `splits`) are supported on packed-layout objects, with the same transactional rebuild, crash recovery and index handling as legacy objects. Numeric scale reduction rounds half away from zero and is refused only if the integer part no longer fits; bare↔bounded `varchar`/`numeric` edits are allowed with every existing row validated first; `seq(...)` backfill follows shard-scan order. `vacuum compact`, `remove-field`, `rename-field`, `add-field` and `edit-field` no longer mistake a live field whose `:default=` literal merely contains the text `:removed` for a tombstone (only an exact trailing `:removed` is the marker). Bitmap indexes are now rebuilt after every recompose (`add-field`, `edit-field`, `vacuum compact`, legacy and packed): bitmap bits are keyfile slot numbers and a rebuild renumbers slots, so un-rebuilt bitmaps could miss rows. A forced bitmap build (`add-index … "force":true`, reindex of a single bitmap field) on a packed object now reads packed cells correctly — it previously produced an empty bitmap. Rebuild transaction staging (rollback copy, metadata, directory entries) is now fsynced so a power loss during a rebuild still recovers.
+
 **BREAKING (R4 — strict scalar grammars).** Malformed non-NULL input on
 `bool`/`date`/`datetime`/`datetimems`/`time`/`uuid`/`ipv4`/`ipv6`/`enum`
 fields is now rejected with a field-named error on every write route and on

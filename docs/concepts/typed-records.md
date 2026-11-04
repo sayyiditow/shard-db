@@ -240,8 +240,12 @@ Rewriting a legacy record into the nullmap format (bulk-update merge,
 vacuum recompose, schema-mutation rebuilds) follows one rule: an explicit
 null beats the old value; an omitted field carries the old value forward;
 a legacy **absent** marker (field bytes beyond the record region) converts
-to NULL. New fields added by add-field are never NULL — existing records
-read zeros/backfill, never NULL.
+to NULL. On legacy-layout
+objects, fields added by add-field are never NULL — existing records read
+zeros/backfill. On packed objects a new field reads its declared default, or
+NULL if it is nullable and has none (a `:not_null` field with no default is
+refused while the object has records); explicit NULLs in other fields survive
+the rebuild.
 
 ### NOT NULL constraint (`:not_null`, 2026.10.2)
 

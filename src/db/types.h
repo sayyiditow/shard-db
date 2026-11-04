@@ -950,6 +950,24 @@ int layout_packed_decl_line(const char *line, char *out, size_t cap);
 int typed_schema_build_packed(const char *const *lines, size_t nlines,
                               TypedSchema *out, char *err, size_t errsz);
 void typed_schema_release(TypedSchema *ts);
+/* R5b packed recompose helpers (query_find.c / query_schema.c). */
+int  packed_schema_same(const PkrSchema *a, const PkrSchema *b);
+/* Packed-grammar twin of parse_field_line: "name:type[:param][:default=..]".
+   Returns 1 on a valid declaration (out->type/size/name/defaults/not_null/enum
+   filled; pf_out, when non-NULL, receives the PkrField), 0 otherwise. Caller
+   frees enum lists with free_enum_values(out). */
+int  parse_field_line_packed(const char *line, TypedField *out, PkrField *pf_out);
+/* >0 when "name:type..." is valid in the packed grammar, 0 otherwise. */
+int  validate_packed_field_type(const char *field_spec);
+/* Exact-suffix tombstone test: the loader treats only a fields.conf line that
+   ENDS in ":removed" as a tombstone; ":removed" inside a default literal is
+   data. Every remove/rename/compact/add decision must use this, never strstr. */
+int  fields_line_is_removed(const char *line);
+/* Reads fields.conf declaration lines exactly as load_typed_schema counts
+   them (blank, '#' and colon-less lines skipped). 0 ok; caller releases with
+   packed_free_decl_lines. */
+int  packed_read_decl_lines(const char *obj_dir, char ***lines_out, size_t *n_out);
+void packed_free_decl_lines(char **lines, size_t n);
 /* Startup migration of ONE legacy object to the packed layout. dry_run=1:
    read-only audit (nothing is written). Returns 0 ok, 1 when records do not
    fit their packed declaration (diag lists up to 8, one per line), -1 on
@@ -1420,6 +1438,11 @@ char *json_projected_field(const char *raw, size_t raw_len, const char *field,
 char *json_typed_row_cell(const TypedSchema *ts, const uint8_t *raw,
                           int raw_len, int idx, uint8_t hdr2);
 char *json_escape_const(const char *v);
+/* Echo caller-supplied text inside a hand-built {"error":"..."} line with JSON
+   escaping (quotes, backslashes, control characters). FMT must contain exactly
+   one %s. */
+#define OUT_ERR_ESC(FMT, SRC) do { char *_esc = json_escape_const(SRC); \
+    OUT(FMT, _esc ? _esc : "?"); free(_esc); } while (0)
 
 /* Typed-binary fast path: compile criteria against a TypedSchema once, then
    call match_typed() per record during scan. Composite/unknown fields fall
@@ -1681,6 +1704,9 @@ RebuildTxn *rebuild_txn_begin(const char *db_root, const char *object,
                               int old_splits, int old_streams,
                               int indexes_may_change);
 const char *rebuild_txn_legacy_root(const RebuildTxn *txn);
+/* Record (durably) that index files are about to be rewritten, so abort and
+   recovery reindex against the restored keyfile. Idempotent. 0 ok, -1 failed. */
+int rebuild_txn_set_indexes_may_change(RebuildTxn *txn);
 int rebuild_txn_commit(RebuildTxn *txn);
 int rebuild_txn_abort(RebuildTxn *txn);
 void rebuild_txn_cleanup_committed(RebuildTxn *txn);

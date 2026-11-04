@@ -34,7 +34,7 @@ static int test_edit_field_run(void) {
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"users\","
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"users\","
         "\"splits\":8,\"max_key\":32,"
         "\"fields\":[\"name:varchar:32\",\"age:int\",\"balance:numeric:18,2\","
                     "\"score:short\",\"bio:varchar:64\"],"
@@ -99,7 +99,7 @@ static int test_edit_field_run(void) {
     tc_request(tc, "{\"mode\":\"edit-field\",\"dir\":\"default\",\"object\":\"users\","
                    "\"fields\":[\"bio:varchar:5\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"error\"", "varchar shrink overflow error");
-    ASSERT_CONTAINS(resp, "varchar shrink", "varchar shrink overflow reason");
+    ASSERT_CONTAINS(resp, "exceeds new cap", "varchar shrink overflow reason");
     free(resp); resp = NULL;
 
     /* Record + schema unchanged after refusal. */
@@ -165,7 +165,7 @@ static int test_edit_field_run(void) {
     ASSERT_CONTAINS(resp, "\"balance\":100.5", "numeric scale-up value preserved");
     free(resp); resp = NULL;
 
-    /* === 7. numeric scale down: 18,4 → 18,2 truncates toward zero =========== */
+    /* === 7. numeric scale down: 18,4 → 18,2 rounds half away from zero =========== */
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"users\","
                    "\"key\":\"u4\",\"value\":{\"name\":\"Dan\",\"age\":1,"
                    "\"balance\":\"3.1499\",\"score\":1,\"bio\":\"d\"}}", &resp);
@@ -175,9 +175,9 @@ static int test_edit_field_run(void) {
     ASSERT_CONTAINS(resp, "\"status\":\"edited\"", "numeric scale down status");
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"users\",\"key\":\"u4\"}", &resp);
-    /* 3.1499 with S=4 stored as int64 31499; rescale to S=2 truncates
-       /100 = 314 toward zero (matches Postgres); decodes /10^2 = 3.14. */
-    ASSERT_CONTAINS(resp, "\"balance\":3.14", "numeric scale-down truncates toward zero");
+    /* 3.1499 with S=4 stored as int64 31499; rescale to S=2 rounds half
+       away from zero: 314.99 → 315; decodes /10^2 = 3.15. */
+    ASSERT_CONTAINS(resp, "\"balance\":3.15", "numeric scale-down rounds half away from zero");
     free(resp); resp = NULL;
 
     /* === 8. cross-type refused: name varchar → int ========================== */
