@@ -84,7 +84,7 @@ Top-level menus: Server / Browse / Query / Schema / Maintenance / Auth / Stats. 
 Two on-disk layers per object (under `<db_root>/<dir>/<object>/`):
 
 - **Keyfile shards** (`data/kf/NNN.kf`, 3 hex digits, max `MAX_SPLITS=4096`): open-addressed hash table mapping each key's xxh128 hash to its segment location. Each entry is a 24-byte slot header (16B hash, 2B key_len, 1B flag, 1B stream_id, 4B file_id) + key bytes. `flag`: 0=empty, 1=live, 2=tombstone. Shard routed by `hash[0..1] % splits`.
-- **Segment files** (`data/streams/NNN/NNNNNN.dat`): append-only rotating files, one stream per the object's `streams` schema field. Each segment record is 24B header (16B hash, 2B key_len, 1B flag, 1B reserved, 4B vlen) + key bytes + value bytes, padded to `slot_size`. This is what the sequential reindex scan reads via `seg_scan_o_direct`.
+- **Segment files** (`data/streams/NNN/NNNNNN.dat`): append-only rotating files, one stream per the object's `streams` schema field. Each segment record is 24B header (16B hash, 2B key_len, 1B flag, 1B reserved, 4B vlen) + key bytes + value bytes, at the record's **actual size** rounded up to 8 bytes (variable-length records); a rewrite may reuse a larger tombstoned slot from the stream's size-bucketed free pool, leaving zero-filled padding. This is what the sequential reindex scan reads via `seg_scan_o_direct`.
 - **Addressing**: kf shard = `hash[0..1] % splits`; slot = `hash[2..5] % slots_per_shard`, linear probing; segment stream = `hash[15] % num_streams` (hash-routed so a key's insert/update history stays in one stream, maximising free-pool slot reuse).
 - **Dynamic growth**: at 75–80% kf load the shard doubles `slots_per_shard` **in place** (per-shard, no global rehash; pre-grow targets ≤75%, inline resplit fires at 80%) with **no ceiling** — growth continues for the life of the object and inserts never refuse for capacity. `MAX_SPLITS=4096` caps shard *files*, not slots; the nightly auto-reshard sweep (default on) widens objects whose record counts outgrow their splits, and a `RESHARD-HINT` log line fires inline when the sizing table says they have.
 - **I/O**: kf writes use slotcask's kfcache (mmap MAP_SHARED); segment writes append-only; reindex reads segments via O_DIRECT double-buffered scan.
@@ -98,7 +98,7 @@ Deep dives: [docs/concepts/storage-model.md](docs/concepts/storage-model.md), [d
 
 ## Typed binary record format
 
-Driven by fields.conf. One slot = sum of field sizes (fixed). Every
+Driven by fields.conf. New objects (and every object migrated by 2026.11.1) use the **packed layout**: fixed-width scalars plus an 8-byte descriptor per varchar/numeric field whose payload is stored at its actual size (varchar up to 4 MiB; numeric:P,S exact up to P=1000; bare numeric up to 131 072 integer + 16 383 fractional digits). The widths in the table below are the legacy fixed widths. Every
 record carries a per-record null bitmap (`1 + ceil(nfields/8)` bytes at
 the head of the value region; bit set = NULL) — see
 docs/concepts/typed-records.md for NULL write/read/index/aggregate
@@ -106,7 +106,7 @@ semantics.
 
 | Type | Encoding |
 |---|---|
-| `varchar:N` | `[uint16 BE length][content]` → on-disk N+2 bytes. Max content **65535**. |
+| `varchar:N` | Legacy layout: `[uint16 BE length][content]` → N+2 bytes, max content **65535**. Packed layout (default): 8-byte descriptor + content at actual length, N up to **4 194 304**. |
 | `int / long / short` | 4 / 8 / 2 bytes BE signed |
 | `double` | 8 bytes IEEE 754 |
 | `float` | 4 bytes IEEE 754 |
@@ -297,7 +297,7 @@ Optional, off by default. `TLS_ENABLE=1` in db.env makes `PORT` TLS-only (single
 - `MAX_SPLITS = 4096` — max kf shards per object (3 hex digits in `data/kf/NNN.kf`).
 - `DEFAULT_SPLITS = 8`, `MIN_SPLITS = 8` — `create-object` default. Sweet spot 78K–200K records/shard. Sizing table: [docs/operations/tuning.md](docs/operations/tuning.md).
 - `MAX_KEY_CEILING = 1024` — hard ceiling on per-object `max_key`.
-- `varchar` max content = **65535 bytes** (uint16 length prefix).
+- `varchar` max content = **4 194 304 bytes** (4 MiB) on packed objects (the default); **65535** on legacy-layout objects (uint16 length prefix).
 - `MAX_FIELDS = 256` (bumped from 64 in 2026.04.2).
 - **Auto-key** (2026.05.5+): per-object opt-in flag at `create-object` (`"auto_key":"uuid"` or `"auto_key":"seq(<name>)"`). Server generates the key on insert when the client omits it; provided keys go through upsert (CAS modifiers respected). Stored as 16 bytes UUID binary or 8 bytes int64 BE; rendered as 36-char dashed / decimal string on every read. `update`/`delete` always require keys. Not retroactive — no schema mutation to add later. See [docs/query-protocol/schema-mutations.md → Auto-generated keys](docs/query-protocol/schema-mutations.md#auto-generated-keys).
 - `MAX_AGG_SPECS = 32`.

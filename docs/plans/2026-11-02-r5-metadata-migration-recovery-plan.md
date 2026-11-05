@@ -1,5 +1,7 @@
 # R5 — Authoritative layout metadata, version gating, durable publication, conversion and recovery
 
+> Executed; R5b and R6 landed on top of it. Superseded hunks were not applied.
+
 Status: **REV 1 — PART A (Tasks 0–4) and PART B (Tasks 5–12) written; executable once approved. D9 and D10 CONFIRMED by the human.** All of D1–D8 are decided. Part A hunks below are complete and anchored on text read at HEAD `b6911a1`. The human must approve §2 (D1–D8). Release/min-version and live-vs-gated are decided (see D2, D4); executor is GLM 5.3 Flash (rev 1 hunks must therefore be complete, literal and anchor-quoted — no judgment left to the executor). Exact quoted-anchor code hunks (CORE-PROCESS "a plan is not done until…") are written in rev 1, *after* the decisions, because D1/D2/D4 change every hunk's site. No code is written under this revision.
 
 Parent: `docs/plans/2026-10-19-type-correctness-recovery-plan.md` row R5 = Phase 3C + Phase 8. R1–R4 are committed (R4 = `b6911a1`). R6 (public activation, application acceptance, sanitizer gate, push/PR) and R7 (varchar NUL audit) are out of scope. **No sanitizers and no benchmarks in this plan** (human runs sanitizers once, in R6). Concurrency constraint of the parent plan applies: no new locks, no new lock order, no stronger reader semantics; conversion uses the existing exclusive per-object lock and `RebuildTxn`.
@@ -3218,18 +3220,6 @@ Every object has one layout, recorded as the `layout=packed` token on its `schem
 - [ ] No leftover `TODO`/`FIXME`/debug prints; `git diff --check` clean; only the files named in Tasks 5–12 changed (plus the test additions in `test_layout_manifest.c`, the evidence/triage files, and the docs listed).
 - [ ] Uncommitted; blind-reviewer pass required (diff touches an on-disk format, version gating, crash recovery and startup ordering).
 - [ ] No sanitizers, no benches (R6 gate). Note for R6: `layout_migrate_object` and the new startup path run with all locks single-threaded at startup, but the sanitizer gate must still cover the migration cases.
-
-## FOLLOW-UP NOTE — R5b (must land before R6; not part of this plan)
-
-Deferred by D9: packed-layout **recompose** of `add-field`, `edit-field` and `vacuum compact` (also `compact`+`splits`). In R5 they are refused with `"... not supported on packed-layout objects yet"` (Task 6). R5b needs the human's decisions on: (1) numeric rescale/precision edits (text re-encode via `pkr_numeric_encode`, refuse on loss vs round); (2) computed-default backfill (`seq`, `uuid()`, `random`) on packed rows; (3) bare vs bounded `varchar`/`numeric` edits; (4) re-pointing `validate_field_type`/`typed_legacy_decl_size`/`parse_field_line` at the packed grammar for packed objects; and implementation of the `slot_changed` branch of `v2_rebuild_walk_cb` for packed (the `layout_convert_record` shape in Task 8 is the template). Until R5b, the only way to add/edit a field on a migrated object is to recreate it. R6 (acceptance, docs, clients, sanitizers, push/PR) is blocked on R5b.
-
-
-### R5b decisions (confirmed by the human, 2026-11-03)
-
-1. **Numeric rescale/precision edits: "convention".** Scale reduction rounds half away from zero using the existing `pkr_numeric_encode` rules; the edit is refused only when the integer part no longer fits the new precision. All-or-nothing: if any row overflows, no row changes.
-2. **Computed-default backfill: per-row.** `seq`, `uuid()` and `random(N)` defaults are evaluated once per existing row inside the transactional rebuild (as legacy `add-field` does). `seq` values follow shard-scan order; document it.
-3. **Bare vs bounded `varchar`/`numeric`: every direction allowed, existing rows validated** during the rebuild; the whole edit fails with no change if any row does not fit.
-4. **Grammar:** `validate_field_type`, `typed_legacy_decl_size` and `parse_field_line` use the packed grammar for packed objects.
 
 ## Open items handed to the human
 

@@ -30,7 +30,9 @@ Changing these requires recompiling. Most don't need to change.
 | Thing | Limit | Notes |
 |---|---|---|
 | Key length | `max_key` bytes (per-object, max 1024) | Set at `create-object`. Keys longer than this error on insert. |
-| varchar content | 65 535 bytes | uint16 length prefix. |
+| varchar content | 4 194 304 bytes (4 MiB) | Packed layout (default). Bare `varchar` and `varchar:N` up to 4 MiB; ceiling+1 is rejected with no record written. Legacy-layout objects: 65 535 (uint16 length prefix). |
+| numeric precision / scale | P ≤ 1000, S −1000..1000 | `numeric:P,S` on packed objects. Legacy: S ≤ 18, value must fit a scaled int64. |
+| bare numeric digits | 131 072 integer + 16 383 fractional | Bare `numeric` on packed objects; one more digit in either part is rejected. |
 | Total record payload | derived | Sum of typed-field sizes (`value_size` in `describe-object`). Not user-configurable. Stored in segment files; the 24-byte seg header + `klen` bytes of key precede it. |
 | Per-kf-shard live records (default tier) | 12.8M | Resplit ceiling × 80 % load. A `splits=4096` object can hold tens of billions of live records before any single shard hits the ceiling. |
 | Fields per object | 256 | `MAX_FIELDS`. Includes tombstoned fields until compact. |

@@ -355,6 +355,9 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_trigram_index.c \
     src/test/cases/test_config_encode.c \
     src/test/cases/test_scalar_conversion_safety.c \
+    src/test/cases/test_type_correctness_acceptance.c \
+    src/test/cases/test_finance_routes.c \
+    src/test/cases/test_predicate_equivalence.c \
     src/test/cases/test_scalar_routes_checked.c \
     src/test/cases/test_scalar_csv_update.c \
     src/test/cases/test_scalar_grammar_routes.c \

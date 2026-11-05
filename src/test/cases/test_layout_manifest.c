@@ -929,3 +929,200 @@ TEST_REGISTER("test-loader-packed-with-legacy-fields-refused", test_loader_packe
 TEST_REGISTER("test-loader-same-object-two-tenants", test_loader_same_object_two_tenants)
 TEST_REGISTER("test-loader-packed-edge-cases", test_loader_packed_edge_cases)
 TEST_REGISTER("test-layout-startup-agreement", test_layout_startup_agreement)
+
+/* ---- R6: finance-shaped migration acceptance ---------------------------
+   A populated legacy root (decimal, currency, scale-2 legacy numeric, date,
+   bool, varchar, three btree indexes + a bitmap) is stopped cleanly, aged to
+   2026.10.2, and migrated by the first start of this binary. Every value is
+   compared as text against a pre-migration snapshot and every index route is
+   compared against its pre-migration answer. */
+#define LM_FIN_ROWS 3000
+#define LM_FIN_CHUNK 1000
+
+static int lm_cmp_lines(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Splits `text` in place into lines, sorts them and rejoins into a new string. */
+static char *lm_sorted_lines(const char *text) {
+    if (!text) return NULL;
+    char *copy = strdup(text);
+    size_t cap = 1024, n = 0;
+    char **lines = malloc(cap * sizeof(*lines));
+    if (!copy || !lines) { free(copy); free(lines); return NULL; }
+    for (char *s = strtok(copy, "\n"); s; s = strtok(NULL, "\n")) {
+        if (n == cap) {
+            cap *= 2;
+            char **grown = realloc(lines, cap * sizeof(*lines));
+            if (!grown) { free(copy); free(lines); return NULL; }
+            lines = grown;
+        }
+        lines[n++] = s;
+    }
+    qsort(lines, n, sizeof(*lines), lm_cmp_lines);
+    char *out = malloc(strlen(text) + n + 2);
+    if (out) {
+        out[0] = '\0';
+        for (size_t i = 0; i < n; i++) { strcat(out, lines[i]); strcat(out, "\n"); }
+    }
+    free(copy); free(lines);
+    return out;
+}
+
+static char *lm_fin_csv(TestClient *tc) {
+    char *r = NULL;
+    if (tc_request(tc,
+        "{\"mode\":\"fetch\",\"dir\":\"lay\",\"object\":\"fin\",\"offset\":0,"
+        "\"limit\":100000,\"format\":\"csv\"}", &r) != 0) return NULL;
+    char *sorted = lm_sorted_lines(r);
+    free(r);
+    return sorted;
+}
+
+typedef struct { int qty7, amt_range, bool_true, date_range; char sum[64]; } LmFinProbe;
+
+static int lm_fin_count(TestClient *tc, const char *criteria) {
+    char req[400];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"count\",\"dir\":\"lay\",\"object\":\"fin\",\"criteria\":%s}", criteria);
+    char *r = NULL;
+    int rc = tc_request(tc, req, &r);
+    int n = rc == 0 ? tu_parse_count(r) : -1;
+    free(r);
+    return n;
+}
+
+static void lm_fin_probe(TestClient *tc, LmFinProbe *p) {
+    p->qty7 = lm_fin_count(tc, "[{\"field\":\"qty\",\"op\":\"eq\",\"value\":\"7\"}]");
+    p->amt_range = lm_fin_count(tc,
+        "[{\"field\":\"amt\",\"op\":\"between\",\"value\":[\"100.0000\",\"250.5000\"]}]");
+    p->bool_true = lm_fin_count(tc, "[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"}]");
+    p->date_range = lm_fin_count(tc,
+        "[{\"field\":\"d\",\"op\":\"between\",\"value\":[\"20260101\",\"20260630\"]}]");
+    p->sum[0] = '\0';
+    char *r = NULL;
+    if (tc_request(tc,
+        "{\"mode\":\"aggregate\",\"dir\":\"lay\",\"object\":\"fin\","
+        "\"aggregates\":[{\"fn\":\"sum\",\"field\":\"amt\",\"alias\":\"s\"}]}", &r) == 0 && r) {
+        const char *s = strstr(r, "\"s\":");
+        if (s) { s += 4; size_t l = strcspn(s, ",}] \r\n"); if (l < sizeof(p->sum)) { memcpy(p->sum, s, l); p->sum[l] = '\0'; } }
+    }
+    free(r);
+}
+
+static int lm_build_finance(LmRoot *m, TestEnv *env) {
+    TestClient *tc = lm_start_client(m, env);
+    if (!tc) return -1;
+    lm_add_dir(tc);
+    char *r = NULL;
+    int ok = tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"lay\",\"object\":\"fin\",\"splits\":8,"
+        "\"max_key\":16,\"declaration_layout\":\"legacy\","
+        "\"fields\":[\"amt:numeric:18,4\",\"cur:currency\",\"scaled2:numeric:12\","
+        "\"note:varchar:40\",\"qty:int\",\"d:date\",\"flag:bool\"],"
+        "\"indexes\":[\"qty\",\"amt\",\"d\",\"flag:bitmap\"]}", &r) == 0 &&
+        r && strstr(r, "\"status\":\"created\"");
+    free(r);
+    r = NULL;
+    ok = ok && tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"lay\",\"object\":\"zs\",\"splits\":8,"
+        "\"max_key\":16,\"declaration_layout\":\"legacy\",\"fields\":[\"v:numeric:12\"]}", &r) == 0 &&
+        r && strstr(r, "\"status\":\"created\"");
+    free(r);
+    r = NULL;
+    ok = ok && tc_request(tc,
+        "{\"mode\":\"insert\",\"dir\":\"lay\",\"object\":\"zs\",\"key\":\"w\","
+        "\"value\":{\"v\":\"100\"}}", &r) == 0 && r && strstr(r, "\"status\":\"inserted\"");
+    free(r);
+    for (int chunk = 0; ok && chunk < LM_FIN_ROWS / LM_FIN_CHUNK; chunk++) {
+        size_t cap = (size_t)LM_FIN_CHUNK * 220 + 256, len;
+        char *bulk = malloc(cap);
+        if (!bulk) { ok = 0; break; }
+        len = (size_t)snprintf(bulk, cap,
+            "{\"mode\":\"bulk-insert\",\"dir\":\"lay\",\"object\":\"fin\",\"records\":[");
+        for (int j = 0; j < LM_FIN_CHUNK; j++) {
+            int i = chunk * LM_FIN_CHUNK + j + 1;
+            long long whole = (i % 11 == 0) ? -(long long)i : i;
+            len += (size_t)snprintf(bulk + len, cap - len,
+                "%s{\"key\":\"f%05d\",\"value\":{\"amt\":\"%s%lld.%04d\",\"cur\":\"%d.%04d\","
+                "\"scaled2\":\"%d.%02d\",\"note\":\"memo %d\",\"qty\":%d,"
+                "\"d\":\"2026%02d%02d\",\"flag\":%s}}",
+                j ? "," : "", i, whole < 0 ? "-" : "", whole < 0 ? -whole : whole,
+                (i * 37) % 10000, i, (i * 91) % 10000, i, 1 + (i * 13) % 99, i, i % 13,
+                1 + i % 12, 1 + i % 28, i % 3 == 0 ? "true" : "false");
+        }
+        snprintf(bulk + len, cap - len, "]}");
+        r = NULL;
+        ok = tc_request(tc, bulk, &r) == 0 && r && !strstr(r, "\"error\"");
+        free(r);
+        free(bulk);
+    }
+    tc_close(tc);
+    test_env_stop_keep(env);
+    return ok ? 0 : -1;
+}
+
+static int test_layout_migration_finance_acceptance(void) {
+    LmRoot m; lm_init(&m); if (t_ctx->failed) return 1;
+    lm_env(&m, NULL);
+    TestEnv env;
+    ASSERT_EQ_INT(lm_build_finance(&m, &env), 0, "build legacy finance root");
+
+    /* snapshot while still legacy: restart on the old layout, read, stop cleanly */
+    TestClient *tc = lm_start_client(&m, &env);
+    ASSERT_NOT_NULL(tc, "legacy restart for the snapshot");
+    char *before = NULL; LmFinProbe pre = {0};
+    if (tc) {
+        char *r = NULL;
+        tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"lay\",\"object\":\"fin\"}", &r);
+        ASSERT_CONTAINS(r, "\"declaration_layout\":\"legacy\"", "fixture is legacy before migration");
+        free(r);
+        before = lm_fin_csv(tc);
+        lm_fin_probe(tc, &pre);
+        r = NULL;
+        tc_request(tc, "{\"mode\":\"get\",\"dir\":\"lay\",\"object\":\"zs\",\"key\":\"w\"}", &r);
+        ASSERT_CONTAINS(r, "\"v\":100}", "legacy renders a whole scale-2 value without decimals");
+        free(r);
+        tc_close(tc);
+        test_env_stop_keep(&env);
+    }
+    ASSERT_TRUE(before && strlen(before) > (size_t)LM_FIN_ROWS * 20, "snapshot captured");
+    ASSERT_TRUE(pre.qty7 > 0 && pre.amt_range > 0 && pre.bool_true == LM_FIN_ROWS / 3 &&
+                pre.date_range > 0 && pre.sum[0], "pre-migration probes are non-trivial");
+
+    lm_make_pre_migration(&m);
+    tc = lm_start_client(&m, &env);
+    ASSERT_NOT_NULL(tc, "first start migrates");
+    if (tc) {
+        char *r = NULL;
+        tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"lay\",\"object\":\"fin\"}", &r);
+        ASSERT_CONTAINS(r, "\"declaration_layout\":\"packed\"", "object is packed after migration");
+        free(r);
+        r = NULL;
+        tc_request(tc, "{\"mode\":\"get\",\"dir\":\"lay\",\"object\":\"zs\",\"key\":\"w\"}", &r);
+        ASSERT_CONTAINS(r, "\"v\":100.00}",
+                        "documented display change: migrated numeric:N renders its declared scale (100 -> 100.00)");
+        free(r);
+        char *after = lm_fin_csv(tc);
+        ASSERT_TRUE(before && after && strcmp(before, after) == 0,
+                    "every row is textually identical to the pre-migration snapshot");
+        free(after);
+        LmFinProbe post = {0};
+        lm_fin_probe(tc, &post);
+        ASSERT_EQ_INT(post.qty7, pre.qty7, "btree eq answer unchanged");
+        ASSERT_EQ_INT(post.amt_range, pre.amt_range, "decimal range answer unchanged");
+        ASSERT_EQ_INT(post.bool_true, pre.bool_true, "bitmap answer unchanged");
+        ASSERT_EQ_INT(post.date_range, pre.date_range, "date range answer unchanged");
+        ASSERT_EQ_STR(post.sum, pre.sum, "exact decimal sum unchanged");
+        r = NULL;
+        tc_request(tc, "{\"mode\":\"count\",\"dir\":\"lay\",\"object\":\"fin\"}", &r);
+        ASSERT_EQ_INT(tu_parse_count(r), LM_FIN_ROWS, "record count unchanged");
+        free(r);
+        tc_close(tc);
+        test_env_stop_keep(&env);
+    }
+    free(before);
+    lm_destroy(&m);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+TEST_REGISTER("test-layout-migration-finance-acceptance", test_layout_migration_finance_acceptance)

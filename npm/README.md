@@ -56,6 +56,17 @@ db.close()
 
 `query()` returns a `Promise<string>` — queries run on worker threads so the event loop is never blocked.
 
+### Exact numerics and long strings
+
+`query()` resolves to the **raw response text**. `numeric` and `currency` values are emitted as exact JSON number tokens
+(`1234567890123456.1234567890`, `-98765432109876543210.123456789012345678`) and bare `varchar` values can be up to 4 MiB.
+`JSON.parse()` turns a number token into an IEEE-754 double and silently drops digits, so for money:
+
+- read the token from the raw text (or use a parser with a lossless number/BigInt hook) instead of `JSON.parse(...)`, or
+- project the field as a string where your client allows it.
+
+`npm/test/precision.js` demonstrates the exact round trip and asserts that `JSON.parse()` is lossy for a 26-digit decimal.
+
 ## CRUD
 
 ```js

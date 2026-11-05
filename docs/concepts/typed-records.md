@@ -45,7 +45,7 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 
 | Type | Spec | On-disk bytes | Notes |
 |---|---|---|---|
-| `varchar` | `name:varchar:N` (N = 1..65535) | `N + 2` | `[uint16 BE length][content]` — content occupies exactly `length` bytes, unused slack padded. |
+| `varchar` | `name:varchar:N` (N = 1..4194304) or bare `name:varchar` | descriptor + content | Packed objects store an 8-byte descriptor plus the content bytes at their **actual length**; the cap is N bytes (bare = 4 MiB, 4 194 304). Legacy objects keep `N + 2` bytes (`[uint16 BE length][content]`, N ≤ 65535). |
 | `int` | `age:int` | 4 | Signed 32-bit, big-endian. Range ±2.1 B. |
 | `long` | `id:long` | 8 | Signed 64-bit, big-endian. |
 | `short` | `flags:short` | 2 | Signed 16-bit, big-endian. Range ±32 k. |
@@ -61,7 +61,7 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 | `uuid` | `id:uuid` | 16 | Raw 128-bit UUID. Parsed from 32 hex digits or the 36-char dashed form, optionally wrapped in one `{…}` pair; case-insensitive. Anything else is rejected with a field-named error (R4). |
 | `ipv4` | `addr:ipv4` | 4 | Raw 4-byte IPv4 address, network byte order. Parsed from a dotted-quad string (e.g. `192.168.1.1`); the whole input must parse. Anything else is rejected with a field-named error (R4). Byte-lexicographic order matches numeric IPv4 order. |
 | `ipv6` | `addr:ipv6` | 16 | Raw 16-byte IPv6 address, network byte order. Parsed from a canonical IPv6 string (e.g. `2001:db8::1`); the whole input must parse. Anything else is rejected with a field-named error (R4). Byte-lexicographic order matches numeric IPv6 order. |
-| `numeric` | `price:numeric:P,S` | 8 | Scaled int64 BE: stored value = value × 10^S, parsed exactly (no float), rounded half-away-from-zero to the declared scale — identically on writes and in query literals. P is informational until the packed exact format; S is validated to 0..18. Values whose scaled magnitude exceeds int64 are rejected with an explicit error. |
+| `numeric` | `price:numeric:P,S` (P ≤ 1000, S −1000..1000) or bare `price:numeric` | descriptor + digits | Packed objects store an exact decimal (8-byte descriptor + 16-byte header + ⌈digits/2⌉ coefficient bytes), parsed exactly (no float) and rounded half-away-from-zero to the declared scale on writes and query literals; bare `numeric` keeps each value's own scale (up to 131 072 integer + 16 383 fractional digits); P is enforced. A value whose integer part exceeds P−S digits is rejected. Legacy objects store a scaled int64 (8 bytes, S ≤ 18). |
 | `currency` | `amount:currency` | 8 | Alias for `numeric:19,4`. |
 | `enum` | `color:enum(red,green,blue)` | 1 or 2 | Declared closed value list. Stored as the value's 0-based byte index; **1 byte** for ≤256 values, **2 bytes BE** for 257–65535. Wire format is the display string (`"red"`); the engine validates against the list on insert. Commas inside enum values aren't supported in v1. Bitmap index is opt-in (declare `color:bitmap`, or the bare field name which promotes to bitmap). Available since 2026.05.7. Value lists share the 65,535-byte field-definition cap (see [limits](../reference/limits.md)) — ≈13k four-char values. |
 
@@ -106,7 +106,7 @@ Typical patterns:
 - `email:varchar:200`
 - `name:varchar:100`
 - `sku:varchar:32`
-- Notes/freeform: `varchar:1000` up to the 65535 byte ceiling.
+- Notes/freeform: `varchar:1000`, up to the 4 MiB packed ceiling (65535 on legacy-layout objects).
 
 For larger blobs — images, PDFs — store them via [put-file](../query-protocol/files.md) and reference them by filename in a varchar.
 
@@ -309,7 +309,9 @@ recognizes explicitly bound packed schemas; it does not activate their loaders,
 projection/query consumers or migration. GET validates and builds its actual
 JSON response before output, with checked allocation/write errors.
 
-No field-separator bytes, no length tags (varchar has its own uint16 length prefix, but nothing separates fields from each other). Position is everything: field `i` starts at the sum of sizes of fields `0..i-1`. This makes `typed_get_field_str(ts, raw, field_index)` a direct memcpy of a known byte range.
+**Legacy layout:** no field-separator bytes, no length tags (varchar has its own uint16 length prefix, but nothing separates fields from each other). Position is everything: field `i` starts at the sum of sizes of fields `0..i-1`. This makes `typed_get_field_str(ts, raw, field_index)` a direct memcpy of a known byte range.
+
+**Packed layout (default):** fixed-width scalars sit at fixed offsets; each `varchar`/`numeric` field has an 8-byte descriptor at its fixed offset pointing at its payload, which is stored at its actual length after the fixed region. Readers resolve a field through its descriptor rather than a prefix sum.
 
 ## Schema mutations
 
