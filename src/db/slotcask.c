@@ -59,6 +59,11 @@ _Atomic long g_shard_test_bulk_chains;
  * the channel ACK is not C synchronization. */
 _Atomic size_t g_shard_test_kf_initial_slots;
 _Atomic size_t g_shard_test_kf_max_slots;
+/* Bitmap-remap fault injection (tests): mode 1 = fail the prepare/stage step,
+   2 = report the commit msync as unconfirmed, 3 = fail the keyfile rename;
+   the next `count` hits of that mode fire. */
+_Atomic int g_shard_test_bmfix_fault_mode;
+_Atomic int g_shard_test_bmfix_fault_count;
 long g_shard_test_fail_phase = -1;
 long g_shard_test_fail_occurrence;
 int  g_shard_test_fail_postlink;
@@ -2232,6 +2237,288 @@ static inline uint64_t kf_now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
 
+#ifdef TEST_BUILD
+static int kf_bmfix_fault(int mode) {
+    if (atomic_load(&g_shard_test_bmfix_fault_mode) != mode) return 0;
+    int c = atomic_load(&g_shard_test_bmfix_fault_count);
+    while (c > 0)
+        if (atomic_compare_exchange_weak(&g_shard_test_bmfix_fault_count, &c, c - 1)) return 1;
+    return 0;
+}
+#else
+#define kf_bmfix_fault(mode) 0
+#endif
+
+/* Cap on bitmap files remapped per kf shard (one per bitmap-indexed field). */
+#define KF_BMFIX_MAX_BM_PER_SHARD MAX_FIELDS
+
+/* ── Bitmap remap across a keyfile rebuild ──
+   Bitmap bit i == "kf slot i" (bitmap.h). A keyfile rebuild moves entries to
+   new slot numbers, so every <obj>/indexes/<field>/<shard>.bm of the rebuilt
+   shard is rewritten with its bits renumbered. Sequence (all under the kf
+   wrlock the caller holds; lock order kf -> bitmap, docs/concepts/concurrency.md;
+   the bitmap write locks are taken in canonical path order, see bm_open_many_ro):
+     prepare  - per .bm: writer handle, fsynced "<shard>.bm.remap" image, live
+                file extended and the image mapped (bm_slotmap_stage). Any
+                failure aborts the whole rebuild with the old kf and bitmaps
+                untouched.
+     marker   - durable <obj>/indexes/.bmfix-<shard>; from here a crash is
+                repaired at startup by a full reindex of the object.
+     (kf rename happens in kfcache_resplit_locked)
+     commit   - copy each staged image over its live mapping in place and msync
+                it (bm_slotmap_apply: nothing in it can fail except the msync).
+     finish   - drop the marker once the keyfile mapping was also swapped
+                (Phase E); a Phase E failure leaves it for startup. A marker
+                that existed before this rebuild, or that covers a skipped
+                corrupt bitmap, is never removed here. */
+typedef struct {
+    BitmapShard   *bm;
+    char           tmp[PATH_MAX];
+    BmSlotmapStage stage;
+} KfBmFixEntry;
+
+typedef struct {
+    int           n;
+    KfBmFixEntry *e;                    /* n entries, NULL when no bitmaps */
+    char          indexes_dir[PATH_MAX];
+    char          marker[PATH_MAX];     /* "" until the marker is in place */
+    int           marker_preexisting;   /* marker came from an earlier failure: never removed here */
+    int           keep_marker;          /* a corrupt bitmap was skipped: only startup may clear it */
+    int           skipped;              /* corrupt bitmaps left for the startup rebuild */
+} KfBmFix;
+
+typedef struct {
+    const SlotcaskKfEntry *old_map; size_t old_cap;
+    const SlotcaskKfEntry *new_map; size_t new_cap;
+} KfRemapCtx;
+
+/* New slot of the live entry that sat at `old_slot`, found by probing the
+   rebuilt table for its hash (Phase B placed every live entry). UINT32_MAX
+   drops the bit: the old slot was not live. */
+static uint32_t kf_remap_slot(uint32_t old_slot, void *vctx) {
+    const KfRemapCtx *c = (const KfRemapCtx *)vctx;
+    if ((size_t)old_slot >= c->old_cap) return UINT32_MAX;
+    const SlotcaskKfEntry *src = &c->old_map[old_slot];
+    if (src->flag != 1) return UINT32_MAX;
+    size_t start = kf_slot_for(src->hash, c->new_cap);
+    for (size_t j = 0; j < c->new_cap; j++) {
+        size_t s = (start + j) % c->new_cap;
+        if (c->new_map[s].flag == 0) break;
+        if (memcmp(c->new_map[s].hash, src->hash, 16) == 0) return (uint32_t)s;
+    }
+    return UINT32_MAX;
+}
+
+/* "<obj>/data/kf/NNN.kf" -> "<obj>" and the decimal shard number.
+   0 = ok; 1 = not an object-layout keyfile (raw slotcask files cannot have
+   bitmaps); -1 = object layout but unparseable or too long (fail closed). */
+static int kf_bmfix_split_path(const char *kf_path, char *objdir, size_t objlen, int *shard) {
+    static const char suffix[] = "/data/kf";
+    const char *slash = strrchr(kf_path, '/');
+    if (!slash) return 1;
+    size_t dlen = (size_t)(slash - kf_path);
+    size_t slen = sizeof(suffix) - 1;
+    if (dlen <= slen || memcmp(kf_path + dlen - slen, suffix, slen) != 0) return 1;
+    char tail = 0;
+    if (sscanf(slash + 1, "%d.k%c", shard, &tail) != 2 || tail != 'f' || *shard < 0) return -1;
+    size_t olen = dlen - slen;
+    if (olen + 1 > objlen) return -1;
+    memcpy(objdir, kf_path, olen);
+    objdir[olen] = '\0';
+    return 0;
+}
+
+static void kf_bmfix_release(KfBmFix *fix) {
+    for (int i = 0; i < fix->n; i++) {
+        KfBmFixEntry *en = &fix->e[i];
+        bm_slotmap_stage_release(&en->stage);
+        bm_slotmap_discard(en->tmp);
+        en->tmp[0] = '\0';
+        if (en->bm) bm_close(en->bm);
+        en->bm = NULL;
+    }
+    free(fix->e);
+    fix->e = NULL;
+    fix->n = 0;
+}
+
+/* Rebuild did not happen: drop temps, handles and the marker we created. */
+static void kf_bmfix_abort(KfBmFix *fix) {
+    kf_bmfix_release(fix);
+    if (fix->marker[0] && !fix->marker_preexisting) {
+        (void)unlink(fix->marker);
+        (void)fsync_dir(fix->indexes_dir);
+    }
+    fix->marker[0] = '\0';
+}
+
+static int kf_bmfix_path_cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* 0 = ready (fix may be empty: no bitmaps), -1 = failed with everything
+   released/removed (errno set) -- the caller must abandon the rebuild. */
+static int kf_bmfix_prepare(KfBmFix *fix, const char *kf_path, const KfRemapCtx *ctx) {
+    memset(fix, 0, sizeof(*fix));
+    char objdir[PATH_MAX];
+    int shard = 0;
+    int sp = kf_bmfix_split_path(kf_path, objdir, sizeof(objdir), &shard);
+    if (sp == 1) return 0;
+    if (sp != 0) { errno = EINVAL; return -1; }
+    int n = snprintf(fix->indexes_dir, sizeof(fix->indexes_dir), "%s/indexes", objdir);
+    if (n < 0 || (size_t)n >= sizeof(fix->indexes_dir)) { errno = ENAMETOOLONG; return -1; }
+    DIR *d = opendir(fix->indexes_dir);
+    if (!d) return errno == ENOENT ? 0 : -1;
+
+    /* Collect this shard's bitmap files, then lock them in canonical order. */
+    char **paths = NULL;
+    int npaths = 0, rc = 0;
+    struct dirent *de;
+    for (;;) {
+        errno = 0;
+        de = readdir(d);
+        if (!de) { if (errno) rc = -1; break; }
+        if (de->d_name[0] == '.') continue;
+        char bm_path[PATH_MAX];
+        n = snprintf(bm_path, sizeof(bm_path), "%s/%s/%03x.bm", fix->indexes_dir, de->d_name, shard);
+        if (n < 0 || (size_t)n >= sizeof(bm_path)) { errno = ENAMETOOLONG; rc = -1; break; }
+        struct stat st;
+        if (stat(bm_path, &st) != 0) {
+            if (errno == ENOENT || errno == ENOTDIR) continue;   /* btree dir / no file for this shard */
+            rc = -1;                                             /* anything else: fail closed */
+            break;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        if (npaths >= KF_BMFIX_MAX_BM_PER_SHARD || ctx->new_cap > (size_t)(UINT32_MAX / 2)) {
+            errno = EOVERFLOW;
+            rc = -1;
+            break;
+        }
+        char **np = realloc(paths, (size_t)(npaths + 1) * sizeof(*paths));
+        if (!np) { rc = -1; break; }
+        paths = np;
+        paths[npaths] = strdup(bm_path);
+        if (!paths[npaths]) { rc = -1; break; }
+        npaths++;
+    }
+    int saved = errno;
+    closedir(d);
+
+    if (rc == 0 && npaths > 0) {
+        qsort(paths, (size_t)npaths, sizeof(*paths), kf_bmfix_path_cmp);
+        fix->e = calloc((size_t)npaths, sizeof(*fix->e));
+        if (!fix->e) { saved = errno; rc = -1; }
+    }
+    for (int i = 0; rc == 0 && i < npaths; i++) {
+        BitmapShard *bm = bm_open(paths[i], 0, 0, 0, 0, 1 /* writer: kf -> bm lock order */);
+        if (!bm) {
+            if (bm_file_is_corrupt(paths[i])) {
+                /* Unreadable already (header does not fit the file): do not let
+                   it stop the keyfile from growing; the startup rebuild repairs it. */
+                LOG_WARN(LOG_SUB_SLOTCASK,
+                         "KF_BMFIX_SKIP path=%s: corrupt bitmap left for the startup rebuild", paths[i]);
+                fix->skipped++;
+                continue;
+            }
+            saved = errno ? errno : EIO;
+            rc = -1;
+            break;
+        }
+        if (!bm_handle_cached(bm)) {
+            /* An uncached handle holds no lock: an in-place rewrite could not
+               exclude readers. Abandon (and back off) rather than race them. */
+            bm_close(bm);
+            saved = EBUSY;
+            rc = -1;
+            break;
+        }
+        KfBmFixEntry *en = &fix->e[fix->n++];
+        en->bm = bm;
+        if (bm_slotmap_prepare(bm, (uint32_t)ctx->new_cap, kf_remap_slot, (void *)ctx,
+                               en->tmp, sizeof(en->tmp)) != 0) {
+            int pe = errno ? errno : EIO;
+            en->tmp[0] = '\0';
+            if (pe == EUCLEAN) {
+                /* Corrupt bitmap: it was already unreadable, so do not let it
+                   stop the keyfile from growing. Leave it for the startup
+                   rebuild (the marker below is then never removed here). */
+                LOG_WARN(LOG_SUB_SLOTCASK,
+                         "KF_BMFIX_SKIP path=%s: corrupt bitmap left for the startup rebuild", paths[i]);
+                bm_close(en->bm);
+                en->bm = NULL;
+                fix->n--;
+                fix->skipped++;
+                continue;
+            }
+            saved = pe;
+            rc = -1;
+            break;
+        }
+        if (kf_bmfix_fault(SHARD_TEST_BMFIX_PREPARE)) { saved = ENOSPC; rc = -1; break; }
+        if (bm_slotmap_stage(bm, en->tmp, &en->stage) != 0) {
+            saved = errno ? errno : EIO;
+            rc = -1;
+            break;
+        }
+    }
+    for (int i = 0; i < npaths; i++) free(paths[i]);
+    free(paths);
+
+    if (rc == 0 && (fix->n > 0 || fix->skipped > 0)) {
+        if (fix->skipped > 0) fix->keep_marker = 1;
+        snprintf(fix->marker, sizeof(fix->marker), "%s/.bmfix-%03x", fix->indexes_dir, shard);
+        if (access(fix->marker, F_OK) == 0) {
+            fix->marker_preexisting = 1;   /* an earlier unconfirmed commit: keep it durable and in place */
+        } else {
+            int fd = open(fix->marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) {
+                saved = errno;
+                fix->marker[0] = '\0';
+                rc = -1;
+            } else {
+                if (fsync(fd) != 0) { saved = errno; rc = -1; }
+                if (close(fd) != 0 && rc == 0) { saved = errno; rc = -1; }
+                if (rc == 0 && fsync_dir(fix->indexes_dir) != 0) { saved = errno; rc = -1; }
+            }
+        }
+    }
+    if (rc != 0) {
+        kf_bmfix_abort(fix);
+        errno = saved ? saved : EIO;
+        return -1;
+    }
+    if (fix->n == 0) { free(fix->e); fix->e = NULL; }
+    return 0;
+}
+
+/* Called right after the new keyfile is renamed in. The copies cannot fail;
+   -1 only means a bitmap msync did not confirm durability. The marker stays
+   until kf_bmfix_finish, which skips it when this returned -1. The in-memory
+   bitmaps are correct either way. */
+static int kf_bmfix_commit(KfBmFix *fix) {
+    int rc = 0;
+    for (int i = 0; i < fix->n; i++) {
+        KfBmFixEntry *en = &fix->e[i];
+        if (!en->bm) continue;
+        int arc = bm_slotmap_apply(en->bm, &en->stage);
+        if (arc != 0 || kf_bmfix_fault(SHARD_TEST_BMFIX_COMMIT_SYNC)) rc = -1;
+    }
+    kf_bmfix_release(fix);
+    return rc;
+}
+
+/* Last step of a successful rebuild (after the keyfile mapping was swapped):
+   drop the marker unless it must outlive this rebuild. */
+static int kf_bmfix_finish(KfBmFix *fix, int commit_rc) {
+    int rc = commit_rc;
+    if (rc == 0 && fix->marker[0] && !fix->marker_preexisting && !fix->keep_marker) {
+        if (unlink(fix->marker) != 0 && errno != ENOENT) rc = -1;
+        else if (fsync_dir(fix->indexes_dir) != 0) rc = -1;
+    }
+    fix->marker[0] = '\0';
+    return rc;
+}
+
 static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     if (kh->slot < 0 || !kh->writer) return -1;
     /* Allow same-cap rebuild: used by vacuum's kf-compaction path to
@@ -2245,6 +2532,13 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     size_t new_size = SLOTCASK_KF_HDR_SIZE + new_cap * sizeof(SlotcaskKfEntry);
 
     uint64_t t_start = kf_now_us();
+    /* A bitmap-remap prepare failed recently on this shard (see Phase C2):
+       do not redo the whole rebuild until the retry time passes. */
+    if (new_cap > kh->capacity && e->bmfix_retry_ms > t_start / 1000ULL &&
+        e->bmfix_retry_gen == atomic_load_explicit(&e->gen, memory_order_acquire)) {
+        errno = EAGAIN;
+        return -1;
+    }
 
     /* === Phase A: open + ftruncate + mmap new file === */
     char new_path[PATH_MAX];
@@ -2298,32 +2592,85 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
 
     /* === Phase C: msync(MS_SYNC) === */
     msync(new_base, new_size, MS_SYNC);
-    munmap(new_base, new_size);
-    close(new_fd);
+
+    /* === Phase C2: prepare slot-remapped bitmaps (abortable) ===
+       Entries just moved to new slot numbers and bitmap bits are slot
+       numbers. Runs after the keyfile msync so bitmap-only readers are not
+       blocked behind it, and while the new table is still mapped (it is
+       probed to find each entry's new slot). Failure aborts the whole rebuild
+       with the old kf and bitmaps untouched; the next attempt is delayed so a
+       persistent error does not redo a full rebuild on every insert. This
+       phase's time is counted in msync_us of the KF_RESPLIT log line. */
+    KfBmFix bmfix;
+    {
+        KfRemapCtx rctx = { .old_map = kh->map, .old_cap = old_cap,
+                            .new_map = new_entries, .new_cap = new_cap };
+        if (kf_bmfix_prepare(&bmfix, e->path, &rctx) != 0) {
+            int perr = errno;
+            LOG_ERROR(LOG_SUB_SLOTCASK,
+                      "KF_BMFIX_PREPARE_FAILED path=%s new_cap=%zu: %s (resplit abandoned, nothing changed; retry in 5s)",
+                      e->path, new_cap, strerror(perr));
+            munmap(new_base, new_size);
+            close(new_fd);
+            unlink(new_path);
+            if (new_cap > old_cap) {   /* growth only: vacuum reports its error and does not retry */
+                e->bmfix_retry_ms = kf_now_us() / 1000ULL + 5000ULL;
+                e->bmfix_retry_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
+            }
+            errno = perr;
+            return -1;
+        }
+    }
+    /* The new table stays mapped and open from here on: after the rename it
+       becomes the live mapping (Phase E), so nothing in Phase E can fail. */
     uint64_t t_after_msync = kf_now_us();
 
     /* === Phase D: rename + parent-dir fsync === */
-    if (rename(new_path, e->path) != 0) {
+    if (kf_bmfix_fault(SHARD_TEST_BMFIX_RENAME) || rename(new_path, e->path) != 0) {
+        munmap(new_base, new_size);
+        close(new_fd);
         unlink(new_path);
+        kf_bmfix_abort(&bmfix);   /* kf unchanged: drop temps, marker, bitmap locks */
+        if (new_cap > old_cap) {  /* a persistent failure must not redo the rebuild on every insert */
+            e->bmfix_retry_ms = kf_now_us() / 1000ULL + 5000ULL;
+            e->bmfix_retry_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
+        }
         return -1;
     }
     char parent[PATH_MAX];
     snprintf(parent, sizeof(parent), "%s", e->path);
     char *slash = strrchr(parent, '/');
+    int kf_dir_synced = 1;
     if (slash) {
         *slash = '\0';
+        kf_dir_synced = 0;
         int dfd = open(parent, O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) { fsync(dfd); close(dfd); }
+        if (dfd >= 0) { kf_dir_synced = fsync(dfd) == 0; close(dfd); }
     }
     uint64_t t_after_rename = kf_now_us();
 
-    /* === Phase E: remap (close old, open new path, mmap fresh) === */
-    int reopen_fd = open(e->path, O_RDWR);
-    if (reopen_fd < 0) return -1;
-    void *fresh = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
-                        MAP_SHARED, reopen_fd, 0);
-    if (fresh == MAP_FAILED) { close(reopen_fd); return -1; }
-    SHARD_MADV_HUGEPAGE(fresh, new_size);  /* THP hint for resplit remap */
+    /* Apply the remapped bitmaps in place now, before Phase E, so disk state
+       is consistent even if the remap below fails. Still under the kf wrlock. */
+    int bmfix_rc = kf_bmfix_commit(&bmfix);
+    /* The bitmaps now describe the new keyfile: if the rename is not durable
+       yet, a power loss could bring back the old keyfile with them. Keep the
+       marker until a later start repairs it. */
+    if (!kf_dir_synced) bmfix_rc = -1;
+    if (bmfix_rc != 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "KF_BMFIX_FAILED path=%s: remapped bitmaps are applied in memory but a bitmap msync did not "
+                  "confirm durability; marker retained, startup rebuilds the object's indexes if the process "
+                  "dies before writeback", e->path);
+    }
+
+    /* === Phase E: swap in the new mapping (close old) ===
+       The file mapped in Phase A is the inode that was just renamed over
+       e->path, and its contents were msync'd in Phase C. Using that fd and
+       mapping directly, instead of reopening the path, leaves no step after
+       the point of no return that can fail: a reopen failure here would have
+       left the remapped bitmaps in front of the old keyfile mapping. */
+    int reopen_fd = new_fd;
+    void *fresh = new_base;
 
     /* The replacement was MS_SYNC'd and renamed before this old-inode
        mapping is discarded, so no flush of the superseded inode is needed. */
@@ -2363,6 +2710,11 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
             (unsigned long)(t_after_msync   - t_after_rebuild),
             (unsigned long)(t_after_rename  - t_after_msync),
             (unsigned long)(t_end           - t_after_rename));
+    }
+    if (kf_bmfix_finish(&bmfix, bmfix_rc) != 0 && bmfix_rc == 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "KF_BMFIX_FAILED path=%s: could not remove the bitmap-remap marker durably; "
+                  "the next start rebuilds the object's indexes once and clears it", e->path);
     }
     return 0;
 }
@@ -2628,6 +2980,14 @@ static size_t req_res_count(const ReqSlotRes *map, size_t cap) {
     return n;
 }
 
+/* 1 if no slot is reserved. Stops at the first reservation, so the common
+   (non-empty) answer is cheap; only an empty map is scanned in full. */
+static int req_res_empty(const ReqSlotRes *map, size_t cap) {
+    for (size_t i = 0; map && i < cap; i++)
+        if (map[i].used) return 0;
+    return 1;
+}
+
 static int req_res_copy(ReqSlotRes *dst, size_t dst_cap,
                         const ReqSlotRes *src, size_t src_cap) {
     for (size_t i = 0; src && i < src_cap; i++) {
@@ -2723,7 +3083,13 @@ static int kf_plan_window_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh,
     if (kh->hdr) {
         uint64_t total = kh->hdr->total;
         uint64_t cap = (uint64_t)kh->capacity;
-        if (cap > 0 && total * 4 >= cap * 3) {
+        /* Never resplit while this window or request holds planned-but-
+           uncommitted slots: they are numbered for the current table and a
+           resplit would commit them into the wrong places. The stage
+           pre-grow sizes the table up front; without that, the record fails
+           (status -1) instead of corrupting the keyfile. */
+        if (cap > 0 && total * 4 >= cap * 3 &&
+            nreserved == 0 && req_res_empty(res_map, res_cap)) {
             if (kfcache_resplit_locked(kh, kh->capacity * 2) == 0)
                 reshard_hint_check(db);
         }
@@ -7257,7 +7623,8 @@ static int slotcask_bulk_stage_shard(SlotcaskBulkRequest *req,
                                      int kf_shard_id,
                                      SlotcaskBulkRec *recs, size_t n,
                                      const SlotcaskBulkOpts *ups,
-                                     const SlotcaskBulkDeleteOpts *dels) {
+                                     const SlotcaskBulkDeleteOpts *dels,
+                                     uint64_t chain_pending) {
     if (!req || kf_shard_id < 0 || kf_shard_id >= req->num_shards ||
         !request_owns_shard(req, kf_shard_id) || !recs || n == 0 ||
         (!!ups == !!dels)) {
@@ -7310,7 +7677,11 @@ static int slotcask_bulk_stage_shard(SlotcaskBulkRequest *req,
        IO-pool worker. The 75% trigger matches kf_put_new's inline check;
        loop because one doubling may still be insufficient. */
     if (kh.hdr) {
-        uint64_t projected = kh.hdr->total + (uint64_t)n;
+        /* chain_pending: records of earlier chain members that are staged but
+           not yet planned into the table. Their slots are planned later, at
+           publish, where no resplit is allowed, so this stage must size the
+           table for the whole chain. */
+        uint64_t projected = kh.hdr->total + chain_pending + (uint64_t)n;
         while (kh.capacity < kf_max_slots() &&
                projected * 4 >= (uint64_t)kh.capacity * 3) {
             if (kfcache_resplit_locked(&kh, kh.capacity * 2) != 0) break;
@@ -8292,7 +8663,7 @@ static void slotcask_bulk_shard_pipeline(SlotcaskBulkRequest *req,
     if (slotcask_bulk_stage_shard(req, s, in->recs, in->nrecs,
             in->kind == SLOTCASK_BULK_INPUT_UPSERT ? &in->opts.upsert : NULL,
             in->kind == SLOTCASK_BULK_INPUT_DELETE ? &in->opts.delete_
-                                                   : NULL) != 0) {
+                                                   : NULL, 0) != 0) {
         rs->step_failed = 1;
         if (!rs->step_errno) rs->step_errno = errno ? errno : EIO;
     }
@@ -8328,6 +8699,7 @@ static void slotcask_bulk_shard_pipeline(SlotcaskBulkRequest *req,
         bulk_commit_chain_add(&chain, jd->req, jd->in,
                               &jd->req->shards[s], jd);
     }
+    uint64_t chain_pending = (uint64_t)in->nrecs;
     for (size_t j = 0; j < njoiners; j++) {
         BulkGateWaiter *jd = joiners[j];
         uint64_t t0js = now_us();
@@ -8336,7 +8708,9 @@ static void slotcask_bulk_shard_pipeline(SlotcaskBulkRequest *req,
                 jd->in->kind == SLOTCASK_BULK_INPUT_UPSERT
                     ? &jd->in->opts.upsert : NULL,
                 jd->in->kind == SLOTCASK_BULK_INPUT_DELETE
-                    ? &jd->in->opts.delete_ : NULL);
+                    ? &jd->in->opts.delete_ : NULL,
+                chain_pending);
+        chain_pending += (uint64_t)jd->in->nrecs;
         if (jrc != 0) {
             ReqShard *jrs = &jd->req->shards[s];
             jrs->step_failed = 1;
@@ -11266,6 +11640,80 @@ int slotcask_compact_segs(SlotcaskDb *db, int *out_dropped) {
     if (out_dropped) *out_dropped = total;
     return 0;
 }
+
+int slotcask_bmfix_pending(const char *data_dir) {
+    char idx[PATH_MAX];
+    int n = snprintf(idx, sizeof(idx), "%s/indexes", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(idx)) return -1;
+    DIR *d = opendir(idx);
+    if (!d) return errno == ENOENT ? 0 : -1;
+    int found = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, ".bmfix-", 7) == 0) { found = 1; break; }
+    }
+    closedir(d);
+    return found;
+}
+
+static int bmfix_unlink_remaps(const char *idx) {
+    DIR *d = opendir(idx);
+    if (!d) return errno == ENOENT ? 0 : -1;
+    int rc = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char fdir[PATH_MAX];
+        int n = snprintf(fdir, sizeof(fdir), "%s/%s", idx, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof(fdir)) { rc = -1; continue; }
+        DIR *fd = opendir(fdir);
+        if (!fd) continue;                         /* not a field directory */
+        struct dirent *fe;
+        while ((fe = readdir(fd)) != NULL) {
+            size_t len = strlen(fe->d_name);
+            if (len > 9 && strcmp(fe->d_name + len - 9, ".bm.remap") == 0) {
+                char p[PATH_MAX];
+                n = snprintf(p, sizeof(p), "%s/%s", fdir, fe->d_name);
+                if (n < 0 || (size_t)n >= sizeof(p)) { rc = -1; continue; }
+                if (unlink(p) != 0 && errno != ENOENT) rc = -1;
+            }
+        }
+        closedir(fd);
+    }
+    closedir(d);
+    return rc;
+}
+
+/* Remove leftover "<NNN>.bm.remap" temporaries (a crash during prepare, before
+   any marker existed). Safe at startup only. */
+int slotcask_bmfix_sweep(const char *data_dir) {
+    char idx[PATH_MAX];
+    int n = snprintf(idx, sizeof(idx), "%s/indexes", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(idx)) return -1;
+    return bmfix_unlink_remaps(idx);
+}
+
+int slotcask_bmfix_clear(const char *data_dir) {
+    char idx[PATH_MAX];
+    int n = snprintf(idx, sizeof(idx), "%s/indexes", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(idx)) return -1;
+    DIR *d = opendir(idx);
+    if (!d) return errno == ENOENT ? 0 : -1;
+    int rc = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, ".bmfix-", 7) != 0) continue;
+        char p[PATH_MAX];
+        n = snprintf(p, sizeof(p), "%s/%s", idx, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof(p)) { rc = -1; continue; }
+        if (unlink(p) != 0 && errno != ENOENT) rc = -1;
+    }
+    closedir(d);
+    if (bmfix_unlink_remaps(idx) != 0) rc = -1;
+    if (fsync_dir(idx) != 0) rc = -1;
+    return rc;
+}
+
 /* Rebuild every kf shard in place to drop tombstones (flag=2 entries).
    Reuses the resplit machinery with new_cap = current_cap, so the rebuilt
    kf has total = live count and deleted = 0. Holds each shard's wrlock

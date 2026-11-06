@@ -843,18 +843,26 @@ int test_env_ctl_set_kf_seams(TestEnv *env, size_t initial, size_t max) {
     return 0;
 }
 
-int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
+static int ctl_set_globals(TestEnv *env, int phase, uint64_t a, uint64_t b) {
     if (!env || env->test_control_fd < 0) return -1;
-    /* phase 1 = TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL (test_control.c). */
     TestHookMessage msg = { .kind = TEST_HOOK_SET_GLOBALS,
-                            .phase = 1, .a = (uint64_t)(fail ? 1 : 0) };
+                            .phase = phase, .a = a, .b = b };
     if (test_hook_write_full(env->test_control_fd, &msg, sizeof(msg)) != 0)
         return -1;
     TestHookMessage rep = {0};
     if (test_hook_read_full(env->test_control_fd, &rep, sizeof(rep)) != 0)
         return -1;
-    if (rep.kind != TEST_HOOK_ACK) return -1;
-    return 0;
+    return rep.kind == TEST_HOOK_ACK ? 0 : -1;
+}
+
+int test_env_ctl_set_bmfix_fault(TestEnv *env, int mode, int count) {
+    /* phase 2 = TEST_HOOK_SET_GLOBALS_BMFIX_FAULT (test_control.c). */
+    return ctl_set_globals(env, 2, (uint64_t)mode, (uint64_t)count);
+}
+
+int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
+    /* phase 1 = TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL (test_control.c). */
+    return ctl_set_globals(env, 1, (uint64_t)(fail ? 1 : 0), 0);
 }
 
 int test_env_test_hook_wait(TestEnv *env, int *out_phase) {

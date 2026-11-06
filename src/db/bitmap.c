@@ -508,6 +508,15 @@ static int bm_file_open_mmap(const char *path,
     if (out_hdr->magic != BM_MAGIC) {
         munmap(map, st.st_size); close(fd); return -1;
     }
+    /* A header that describes more bytes than the file has (a torn in-place
+       rewrite after power loss) must not be mapped: every accessor trusts it. */
+    if (out_hdr->stride != bm_stride_for(out_hdr->slots) ||
+        (size_t)out_hdr->bitmaps_off + (size_t)out_hdr->n_values * (size_t)out_hdr->stride
+            > (size_t)st.st_size) {
+        munmap(map, st.st_size); close(fd);
+        errno = EUCLEAN;
+        return -1;
+    }
     *out_fd = fd;
     *out_map = map;
     *out_size = (size_t)st.st_size;
@@ -1116,6 +1125,254 @@ int bm_grow(BitmapShard *bm, uint32_t new_slots) {
     close(fd);
 
     return bm_publish(bm, tmp);
+}
+
+/* ─────────────────────── slot remap (kf rebuild) ─────────────────────── */
+
+int bm_slotmap_prepare(BitmapShard *bm, uint32_t new_slots,
+                       uint32_t (*map_fn)(uint32_t old_slot, void *ctx), void *ctx,
+                       char *tmp_path, size_t tmp_len) {
+    if (!bm || !map_fn || !tmp_path || tmp_len == 0 || new_slots == 0 || !bm->writer) {
+        errno = EINVAL;
+        return -1;
+    }
+    int n = snprintf(tmp_path, tmp_len, "%s.remap", bm->path);
+    if (n < 0 || (size_t)n >= tmp_len) {
+        tmp_path[0] = '\0';
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    const struct BmHeader *oh = &bm->hdr;
+    size_t old_end = (size_t)oh->bitmaps_off + (size_t)oh->n_values * (size_t)oh->stride;
+    if (oh->stride != bm_stride_for(oh->slots) || old_end > bm->mmap_size ||
+        oh->bitmaps_off < oh->dict_off) {
+        tmp_path[0] = '\0';
+        errno = EUCLEAN;
+        return -1;
+    }
+
+    struct BmHeader nhdr = *oh;
+    nhdr.slots = new_slots;
+    nhdr.stride = bm_stride_for(new_slots);
+    size_t total = bm_file_size(&nhdr);
+
+    int saved = 0;
+    int fd = -1;
+    uint8_t *obuf = malloc(nhdr.stride);
+    if (!obuf) { saved = ENOMEM; goto fail; }
+    fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { saved = errno; goto fail; }
+    if (ftruncate(fd, (off_t)total) != 0) { saved = errno; goto fail; }
+    if (pwrite(fd, &nhdr, sizeof(nhdr), 0) != (ssize_t)sizeof(nhdr)) {
+        saved = errno ? errno : EIO;
+        goto fail;
+    }
+    /* Dictionary and its alignment padding pass through unchanged. */
+    size_t dict_bytes = (size_t)oh->bitmaps_off - (size_t)oh->dict_off;
+    if (dict_bytes &&
+        pwrite(fd, (const uint8_t *)bm->mmap_ptr + oh->dict_off, dict_bytes,
+               (off_t)nhdr.dict_off) != (ssize_t)dict_bytes) {
+        saved = errno ? errno : EIO;
+        goto fail;
+    }
+    for (uint32_t v = 0; v < oh->n_values; v++) {
+        const uint8_t *src = (const uint8_t *)bm->mmap_ptr + oh->bitmaps_off +
+                             (size_t)v * (size_t)oh->stride;
+        memset(obuf, 0, nhdr.stride);
+        for (uint32_t bi = 0; bi < oh->stride; bi++) {
+            uint8_t byte = src[bi];
+            while (byte) {
+                uint32_t slot = bi * 8u + (uint32_t)__builtin_ctz(byte);
+                byte &= (uint8_t)(byte - 1u);
+                if (slot >= oh->slots) break;   /* padding bits, as bm_walk */
+                uint32_t ns = map_fn(slot, ctx);
+                if (ns == UINT32_MAX) continue;
+                if (ns >= new_slots) { saved = EUCLEAN; goto fail; }
+                obuf[ns >> 3] |= (uint8_t)(1u << (ns & 7u));
+            }
+        }
+        if (pwrite(fd, obuf, nhdr.stride,
+                   (off_t)nhdr.bitmaps_off + (off_t)v * (off_t)nhdr.stride)
+                != (ssize_t)nhdr.stride) {
+            saved = errno ? errno : EIO;
+            goto fail;
+        }
+    }
+    if (fsync(fd) != 0) { saved = errno; goto fail; }
+    {
+        int cfd = fd;
+        fd = -1;
+        if (close(cfd) != 0) { saved = errno; goto fail; }
+    }
+    free(obuf);
+    return 0;
+
+fail:
+    if (fd >= 0) close(fd);
+    unlink(tmp_path);
+    free(obuf);
+    tmp_path[0] = '\0';
+    errno = saved ? saved : EIO;
+    return -1;
+}
+
+int bm_slotmap_stage(BitmapShard *bm, const char *tmp_path, BmSlotmapStage *st) {
+    if (!bm || !bm->writer || !tmp_path || !tmp_path[0] || !st) {
+        errno = EINVAL;
+        return -1;
+    }
+    st->src = NULL;
+    st->len = 0;
+    int tfd = open(tmp_path, O_RDONLY);
+    if (tfd < 0) return -1;
+    struct stat ts;
+    if (fstat(tfd, &ts) != 0 || ts.st_size < (off_t)sizeof(struct BmHeader)) {
+        int e = errno ? errno : EUCLEAN;
+        close(tfd);
+        errno = e;
+        return -1;
+    }
+    size_t len = (size_t)ts.st_size;
+    void *src = mmap(NULL, len, PROT_READ, MAP_SHARED, tfd, 0);
+    int saved = errno;
+    close(tfd);
+    if (src == MAP_FAILED) { errno = saved; return -1; }
+
+    if (len > bm->mmap_size) {
+        /* Reserve the blocks now: a later store into a sparse hole could
+           otherwise fault with SIGBUS on ENOSPC at apply time. Filesystems
+           without fallocate fall back to a plain extend. */
+        int fr = posix_fallocate(bm->fd, 0, (off_t)len);
+        if (fr != 0 && fr != EOPNOTSUPP && fr != EINVAL) {
+            munmap(src, len);
+            errno = fr;
+            return -1;
+        }
+        if (fr != 0 && ftruncate(bm->fd, (off_t)len) != 0) {
+            saved = errno;
+            munmap(src, len);
+            errno = saved;
+            return -1;
+        }
+        /* The new size must be durable before any byte of the new header can
+           be: a crash must never leave a header that describes more bytes
+           than the file has. */
+        if (fdatasync(bm->fd) != 0) {
+            saved = errno;
+            munmap(src, len);
+            errno = saved;
+            return -1;
+        }
+        /* Map the larger window before dropping the old one so a failure
+           leaves the handle and the cache entry exactly as they were. */
+        void *nm = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, bm->fd, 0);
+        if (nm == MAP_FAILED) {
+            saved = errno;
+            munmap(src, len);
+            errno = saved;
+            return -1;
+        }
+        munmap(bm->mmap_ptr, bm->mmap_size);
+        bm->mmap_ptr = nm;
+        bm->mmap_size = len;
+        if (bm->slot >= 0 && g_bm_cache) {
+            BmCacheEntry *e = &g_bm_cache[bm->slot];
+            e->map = nm;
+            e->map_size = len;
+        }
+    }
+    st->src = src;
+    st->len = len;
+    return 0;
+}
+
+int bm_slotmap_apply(BitmapShard *bm, const BmSlotmapStage *st) {
+    if (!bm || !bm->writer || !st || !st->src || st->len > bm->mmap_size) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(bm->mmap_ptr, st->src, st->len);
+    memcpy(&bm->hdr, bm->mmap_ptr, sizeof(struct BmHeader));
+    return msync(bm->mmap_ptr, st->len, MS_SYNC);
+}
+
+void bm_slotmap_stage_release(BmSlotmapStage *st) {
+    if (st && st->src) munmap((void *)st->src, st->len);
+    if (st) { st->src = NULL; st->len = 0; }
+}
+
+void bm_slotmap_discard(const char *tmp_path) {
+    if (tmp_path && tmp_path[0]) unlink(tmp_path);
+}
+
+int bm_field_lock_cmp(const char *a, const char *b) {
+    for (size_t i = 0;; i++) {
+        int ea = a[i] == '\0', eb = b[i] == '\0';
+        unsigned char ca = ea ? (unsigned char)'/' : (unsigned char)a[i];
+        unsigned char cb = eb ? (unsigned char)'/' : (unsigned char)b[i];
+        if (ca != cb) return ca < cb ? -1 : 1;
+        if (ea && eb) return 0;
+    }
+}
+
+void bm_close_many(BitmapShard **h, int n) {
+    int uniq[BM_OPEN_MANY_MAX];
+    if (!h || n < 0 || n > BM_OPEN_MANY_MAX) return;
+    for (int i = 0; i < n; i++) {                  /* decide before anything is freed */
+        uniq[i] = h[i] != NULL;
+        for (int j = 0; j < i && uniq[i]; j++)
+            if (h[j] == h[i]) uniq[i] = 0;
+    }
+    for (int i = 0; i < n; i++)
+        if (uniq[i]) bm_close(h[i]);
+    for (int i = 0; i < n; i++) h[i] = NULL;
+}
+
+int bm_file_is_corrupt(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat st;
+    struct BmHeader h;
+    int bad = 0;
+    if (fstat(fd, &st) == 0) {
+        if (st.st_size < (off_t)sizeof(h)) bad = 1;
+        else if (pread(fd, &h, sizeof(h), 0) == (ssize_t)sizeof(h))
+            bad = h.magic != BM_MAGIC ||
+                  h.stride != bm_stride_for(h.slots) ||
+                  (size_t)h.bitmaps_off + (size_t)h.n_values * (size_t)h.stride > (size_t)st.st_size;
+    }
+    close(fd);
+    return bad;
+}
+
+int bm_handle_cached(const BitmapShard *bm) {
+    return bm && bm->slot >= 0;
+}
+
+int bm_open_many_ro(const char *const *paths, int n, BitmapShard **out) {
+    if (!paths || !out || n < 0 || n > BM_OPEN_MANY_MAX) { errno = EINVAL; return -1; }
+    int order[BM_OPEN_MANY_MAX];
+    for (int i = 0; i < n; i++) { order[i] = i; out[i] = NULL; }
+    for (int i = 1; i < n; i++) {                  /* insertion sort by path */
+        int k = order[i], j = i - 1;
+        while (j >= 0 && strcmp(paths[order[j]], paths[k]) > 0) { order[j + 1] = order[j]; j--; }
+        order[j + 1] = k;
+    }
+    for (int i = 0; i < n; i++) {
+        if (i > 0 && strcmp(paths[order[i]], paths[order[i - 1]]) == 0) {
+            out[order[i]] = out[order[i - 1]];     /* same file: share the one read lock */
+            continue;
+        }
+        out[order[i]] = bm_open(paths[order[i]], 0, 0, 0, 0, 0);
+        if (!out[order[i]]) {
+            int saved = errno;
+            bm_close_many(out, n);
+            errno = saved;
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /* ─────────────────────── observability ─────────────────────── */

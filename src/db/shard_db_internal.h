@@ -48,6 +48,8 @@ typedef struct {
     _Atomic uint64_t gen;   /* incremented on eviction; SlotRef validation */
     dev_t    file_dev;      /* identity of the file open at install time — */
     ino_t    file_ino;      /* detects rename-away-and-recreate at `path` */
+    uint64_t bmfix_retry_ms;   /* kf-writer-only: no bitmap-remap retry before this time ... */
+    uint64_t bmfix_retry_gen;  /* ... and only while gen still equals this (slot not reused) */
 } KfCacheEntry;
 
 /* slotcask.c — kf_open_file() single-flight guard */

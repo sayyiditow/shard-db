@@ -1009,11 +1009,19 @@ static void *shard_count_worker(void *arg) {
                 sdb = NULL;  // disable KF probe if acquire fails
             }
         }
-        for (int b = 0; b < sc->n_bm_postfilter; b++) {
-            char bp[PATH_MAX];
-            bm_build_path(bp, sizeof(bp), sc->db_root, sc->object,
-                          sc->bm_criteria[b]->field, shard_id);
-            sc->bm_handles[b] = bm_open(bp, 0, 0, 0, 0, 0);
+        {
+            /* Several bitmaps held at once: canonical lock order. If any
+               cannot be opened all are left NULL (record-fetch fallback). */
+            char bps[MAX_INTERSECT_LEAVES][PATH_MAX];
+            const char *bpp[MAX_INTERSECT_LEAVES];
+            BitmapShard *opened[MAX_INTERSECT_LEAVES] = {0};
+            for (int b = 0; b < sc->n_bm_postfilter; b++) {
+                bm_build_path(bps[b], sizeof(bps[b]), sc->db_root, sc->object,
+                              sc->bm_criteria[b]->field, shard_id);
+                bpp[b] = bps[b];
+            }
+            if (bm_open_many_ro(bpp, sc->n_bm_postfilter, opened) == 0)
+                for (int b = 0; b < sc->n_bm_postfilter; b++) sc->bm_handles[b] = opened[b];
         }
     }
 
@@ -1169,8 +1177,11 @@ static void *shard_count_worker(void *arg) {
 cleanup:
     /* Close pre-opened handles */
     if (kh.map) kfcache_release(&kh);
-    for (int b = 0; b < sc->n_bm_postfilter; b++) {
-        if (sc->bm_handles[b]) bm_close((BitmapShard *)sc->bm_handles[b]);
+    {
+        BitmapShard *held[MAX_INTERSECT_LEAVES] = {0};
+        for (int b = 0; b < sc->n_bm_postfilter; b++) held[b] = (BitmapShard *)sc->bm_handles[b];
+        bm_close_many(held, sc->n_bm_postfilter);
+        for (int b = 0; b < sc->n_bm_postfilter; b++) sc->bm_handles[b] = NULL;
     }
 
     sc->count = local;
@@ -3332,13 +3343,21 @@ static void *bm_intersect_shard_worker(void *raw) {
     uint8_t *merged[MAX_INTERSECT_LEAVES] = {0};
     uint32_t min_stride = UINT32_MAX;
 
-    for (int i = 0; i < a->n_leaves; i++) {
-        char bp[PATH_MAX];
-        bm_build_path(bp, sizeof(bp), a->db_root, a->object,
-                      a->leaves[i]->field, a->shard_idx);
-        bm[i] = bm_open(bp, 0, 0, 0, 0, 0);
-        if (!bm[i]) goto cleanup;
+    {
+        /* All of this shard's bitmaps are held at once: take the locks in the
+           canonical order so a keyfile-rebuild remap (which holds several
+           bitmap write locks) cannot deadlock against this reader. */
+        char bps[MAX_INTERSECT_LEAVES][PATH_MAX];
+        const char *bpp[MAX_INTERSECT_LEAVES];
+        for (int i = 0; i < a->n_leaves; i++) {
+            bm_build_path(bps[i], sizeof(bps[i]), a->db_root, a->object,
+                          a->leaves[i]->field, a->shard_idx);
+            bpp[i] = bps[i];
+        }
+        if (bm_open_many_ro(bpp, a->n_leaves, bm) != 0) goto cleanup;
+    }
 
+    for (int i = 0; i < a->n_leaves; i++) {
         if (a->leaves[i]->op == OP_EQUAL) {
             uint32_t this_stride = 0;
             bmap_bytes[i] = bm_get_value_bitmap(bm[i], vals[i], vlens[i],
@@ -3387,10 +3406,8 @@ static void *bm_intersect_shard_worker(void *raw) {
     a->count = local;
 
 cleanup:
-    for (int i = 0; i < a->n_leaves; i++) {
-        if (bm[i]) bm_close(bm[i]);
-        free(merged[i]);
-    }
+    bm_close_many(bm, a->n_leaves);
+    for (int i = 0; i < a->n_leaves; i++) free(merged[i]);
     return NULL;
 }
 

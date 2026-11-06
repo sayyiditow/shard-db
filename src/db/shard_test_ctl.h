@@ -115,6 +115,14 @@ extern _Atomic int g_shard_test_find_flush_gate_hit;
  * TEST_BUILD). _Atomic: control-thread writes, request-thread reads. */
 extern _Atomic size_t g_shard_test_kf_initial_slots;
 extern _Atomic size_t g_shard_test_kf_max_slots;
+/* Bitmap-remap fault points (g_shard_test_bmfix_fault_mode values; 0 = disarmed). */
+enum {
+    SHARD_TEST_BMFIX_PREPARE = 1,      /* fail bitmap prepare/stage */
+    SHARD_TEST_BMFIX_COMMIT_SYNC = 2,  /* unconfirmed commit msync */
+    SHARD_TEST_BMFIX_RENAME = 3        /* fail the keyfile rename */
+};
+extern _Atomic int g_shard_test_bmfix_fault_mode;
+extern _Atomic int g_shard_test_bmfix_fault_count;
 /* Fault injection: force the update-error JSON escape to fail so tests
  * can exercise the static-fallback emission (defined in storage.c under
  * TEST_BUILD, set via the control channel's SET_GLOBALS phase 1). */
@@ -140,6 +148,8 @@ static inline void shard_test_ctl_reset(void) {
     atomic_store(&g_shard_test_count_gap_hit, 0);
     atomic_store(&g_shard_test_kf_initial_slots, 0);
     atomic_store(&g_shard_test_kf_max_slots, 0);
+    atomic_store(&g_shard_test_bmfix_fault_mode, 0);
+    atomic_store(&g_shard_test_bmfix_fault_count, 0);
     atomic_store(&g_shard_test_json_escape_fail, 0);
     atomic_store(&g_shard_test_gate_held_max, 0);
     atomic_store(&g_shard_test_bulk_chains, 0);

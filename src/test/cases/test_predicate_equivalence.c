@@ -103,7 +103,7 @@ static int test_predicate_equivalence_run(void) {
     TestEnv env = {0};
     if (test_env_start(&env) != 0) return 1;
 
-    /* NOTE: no kf-tier seam here -- bitmaps are keyed by kf slot and go stale after a kf resplit (known issue, tracked separately) */
+    ASSERT_EQ_INT(test_env_ctl_set_kf_seams(&env, 64, 0), 0, "shrink the kf tier to force growth");
     TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 60000 };
     TestClient *tc = tc_connect(&cfg);
     ASSERT_NOT_NULL(tc, "connect");

@@ -5712,25 +5712,20 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                         char bp[1024];
                         bm_build_path(bp, sizeof(bp), db_root, object,
                                       ctx.group_fields[0], s);
-                        BitmapShard *gb_bm = bm_open(bp, 0, 0, 0, 0, 0);
-                        if (!gb_bm) continue;
-
-                        BitmapShard *c_bms[MAX_INTERSECT_LEAVES];
-                        int c_ok = 1;
+                        /* Group bitmap + criteria bitmaps are held together:
+                           canonical lock order (see bm_open_many_ro). */
+                        BitmapShard *held[MAX_INTERSECT_LEAVES + 1];
+                        char cps[MAX_INTERSECT_LEAVES][1024];
+                        const char *hpaths[MAX_INTERSECT_LEAVES + 1];
+                        hpaths[0] = bp;
                         for (int ci = 0; ci < n_crit; ci++) {
-                            char cp[1024];
-                            bm_build_path(cp, sizeof(cp), db_root, object,
+                            bm_build_path(cps[ci], sizeof(cps[ci]), db_root, object,
                                           igb_crit_fp.source_leaves[ci]->field, s);
-                            c_bms[ci] = bm_open(cp, 0, 0, 0, 0, 0);
-                            if (!c_bms[ci]) { c_ok = 0; break;
-                    }
+                            hpaths[1 + ci] = cps[ci];
                         }
-                        if (!c_ok) {
-                            for (int ci = 0; ci < n_crit; ci++)
-                                if (c_bms[ci]) bm_close(c_bms[ci]);
-                            bm_close(gb_bm);
-                            continue;
-                        }
+                        if (bm_open_many_ro(hpaths, 1 + n_crit, held) != 0) continue;
+                        BitmapShard *gb_bm = held[0];
+                        BitmapShard **c_bms = &held[1];
 
                         for (int v = 0; v < bm_n; v++) {
                             BmIntersectWalkCtx wc = {
@@ -5744,8 +5739,7 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                                     bm_intersect_walk_cb, &wc);
                         }
 
-                        for (int ci = 0; ci < n_crit; ci++) bm_close(c_bms[ci]);
-                        bm_close(gb_bm);
+                        bm_close_many(held, 1 + n_crit);
                     }
 
                     if (!dl.timed_out) {

@@ -60,6 +60,9 @@ int test_env_test_hook_clear(TestEnv *env);
    (initial slots at open, test-only growth cap in pre-grow/stage).
    0/0 disarms. Requires a test-server daemon (test_control_fd >= 0). */
 int test_env_ctl_set_kf_seams(TestEnv *env, size_t initial, size_t max);
+/* Bitmap-remap fault injection: mode 1 = fail prepare/stage, 2 = unconfirmed commit msync,
+   3 = fail the keyfile rename; the next `count` hits fire. mode 0 disarms. */
+int test_env_ctl_set_bmfix_fault(TestEnv *env, int mode, int count);
 /* Fault injection: force the daemon's update-error JSON escape to fail
    (static-fallback emission). fail=0 disarms. Requires a test-server
    daemon (test_control_fd >= 0). */

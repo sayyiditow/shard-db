@@ -1,6 +1,6 @@
 # Finding: bitmap indexes under-count after a keyfile shard grows during inserts (2026-11-04)
 
-**Status:** reproduced on this stack; **not fixed**; found while verifying R6. Not caused by the type-correctness
+**Status:** fixed by `docs/plans/2026-11-05-bitmap-stale-after-resplit-fix.md` (option 1: remap in the resplit + durable marker).
 work: the identical result occurs on a `declaration_layout:"legacy"` object. Needs the human's decision (R6 D-R6-5).
 
 ## Symptom

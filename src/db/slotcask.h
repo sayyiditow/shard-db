@@ -388,6 +388,15 @@ int  slotcask_bucket_for(uint32_t capacity, int max_slot_size);
    file). Holds each shard's wrlock for the rebuild duration. */
 int  slotcask_compact_kf(SlotcaskDb *db);
 
+/* Bitmap-remap crash markers (<data_dir>/indexes/.bmfix-NNN, see slotcask.c).
+   pending: 1 if any marker exists, 0 if none, -1 on I/O error.
+   clear: remove every marker and every leftover "<NNN>.bm.remap" temporary
+   (call only after the object's indexes were rebuilt). 0 / -1. */
+int  slotcask_bmfix_pending(const char *data_dir);
+int  slotcask_bmfix_clear(const char *data_dir);
+/* Remove leftover "<NNN>.bm.remap" temporaries only (startup, no marker). 0 / -1. */
+int  slotcask_bmfix_sweep(const char *data_dir);
+
 /* ============================================================ Two-phase bulk fetch
  *
  * Resolved record location — output of phase 1 KF probe.

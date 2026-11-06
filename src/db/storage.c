@@ -1,6 +1,7 @@
 #include "typed_index.h"
 #include "types.h"
 #include "slotcask.h"
+#include "bitmap.h"
 #include "typed_row.h"
 #include "packed_csv_command.h"
 #include "typed_read_command.h"
@@ -706,8 +707,23 @@ static int v2_insert_prepare_commit(const uint8_t *new_value, size_t new_vlen,
         return -1;
     }
 
+    /* bitmap_prepare_set_add keeps every shard's writer handle until apply:
+       stage the fields in canonical lock order so this path, bitmap readers
+       and the keyfile-rebuild remap never wait on each other in a cycle. */
+    int bm_order[MAX_FIELDS];
+    int n_bm_order = 0;
     for (int i = 0; i < c->nfields; i++) {
         if (c->idx_types[i] != IT_BITMAP) continue;
+        int j = n_bm_order - 1;
+        while (j >= 0 && bm_field_lock_cmp(c->fields[bm_order[j]], c->fields[i]) > 0) {
+            bm_order[j + 1] = bm_order[j];
+            j--;
+        }
+        bm_order[j + 1] = i;
+        n_bm_order++;
+    }
+    for (int oi = 0; oi < n_bm_order; oi++) {
+        int i = bm_order[oi];
         /* Composite + bitmap is rejected at create-object; defensive. */
         if (strchr(c->fields[i], '+')) continue;
         uint8_t *nk = NULL;

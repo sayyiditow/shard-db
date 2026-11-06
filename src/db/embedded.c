@@ -942,6 +942,54 @@ static int layout_migration_run(const char *db_root) {
     return 0;
 }
 
+/* A keyfile rebuild interrupted between its keyfile rename and its bitmap
+   publication (or whose bitmap publication failed and was logged) leaves
+   <obj>/indexes/.bmfix-NNN. Bitmap bits are kf slot numbers, so those bitmaps
+   may name old slots: rebuild the object's indexes from kf + segments (pure
+   function of durable state) with the strict reindex used by the BTRI
+   migration, then drop the markers. On the unclean path it runs BEFORE the
+   KFM2 replay, like the BTRI migration (replay then applies pending windows
+   to the rebuilt indexes): a torn bitmap must not be written by replay. It
+   also removes leftover "<NNN>.bm.remap" temporaries of every object. */
+static int bmfix_recover_all(const char *db_root) {
+    StartupSchemaEntry *ents = NULL;
+    size_t cnt = 0;
+    if (startup_read_schema(db_root, &ents, &cnt) != 0) return -1;
+    for (size_t i = 0; i < cnt; i++) {
+        char eff_root[PATH_MAX], data_dir[PATH_MAX];
+        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, ents[i].dir);
+        snprintf(data_dir, sizeof(data_dir), "%s/%s/%s", db_root, ents[i].dir, ents[i].object);
+        int pending = slotcask_bmfix_pending(data_dir);
+        if (pending < 0) { free(ents); return -1; }
+        if (!pending) {
+            (void)slotcask_bmfix_sweep(data_dir);   /* best effort: only disk space */
+            continue;
+        }
+        LOG_WARN(LOG_SUB_REINDEX, "BMFIX-RECOVER %s/%s: interrupted bitmap remap; rebuilding indexes",
+                 ents[i].dir, ents[i].object);
+        if (objlock_wrlock(eff_root, ents[i].object) != 0) { free(ents); return -1; }
+        int n = 0, eno = 0;
+        int rc = reindex_object_durable_checked_ex(eff_root, ents[i].object, 0, &n, &eno);
+        objlock_wrunlock(eff_root, ents[i].object);
+        if (rc != 0) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: reindex failed (errno=%d); startup refused, retried next start",
+                      ents[i].dir, ents[i].object, eno);
+            free(ents);
+            return -1;
+        }
+        if (slotcask_bmfix_clear(data_dir) != 0) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: could not remove the repair markers (errno=%d); startup refused, retried next start",
+                      ents[i].dir, ents[i].object, errno);
+            free(ents);
+            return -1;
+        }
+    }
+    free(ents);
+    return 0;
+}
+
 int shard_db_recover_before_stamp(const char *db_root,
                                   int *out_markers_replayed) {
     if (!out_markers_replayed) return -1;
@@ -1001,12 +1049,17 @@ int shard_db_recover_before_stamp(const char *db_root,
     int was_clean = clean_flag_exists(db_root);
     if (clean_flag_remove(db_root) != 0) return -1;
     if (was_clean) {
-        /* Clean stop: no markers can be pending, so the migration (if it
-           ran) is the last recovery work — stamp completion and serve. */
+        /* Clean stop: no KFM2 markers can be pending, but a bitmap-remap
+           marker can survive a logged commit failure: repair it before
+           serving. The migration (if it ran) is then the last recovery work. */
+        if (bmfix_recover_all(db_root) != 0) return -1;
         if (btri_migration_ran &&
             btri_migration_stamp_write(db_root) != 0) return -1;
         return 0;
     }
+
+    /* Bitmap-remap repair runs before the replay (see bmfix_recover_all). */
+    if (bmfix_recover_all(db_root) != 0) return -1;
 
     StartupSchemaEntry *entries = NULL;
     size_t count = 0;

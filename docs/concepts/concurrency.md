@@ -31,6 +31,10 @@ CRUD writer can hold the kfcache wrlock while waiting for the bitmap wrlock; a
 reader holding the bitmap rdlock while waiting for the kfcache rdlock would
 complete an AB-BA deadlock.
 
+Keyfile rebuilds (growth resplit, vacuum compaction) follow the same order: `kfcache_resplit_locked` holds the kf entry wrlock and takes each affected bitmap shard's wrlock, applying the slot-remapped images in place, so no reader can observe a new keyfile with old bitmap bits.
+
+**Order between bitmaps.** Code that holds more than one bitmap shard lock at once (the keyfile-rebuild remap, the single-insert bitmap staging in `v2_insert_prepare_commit`, the bitmap-only AND-count `bm_intersect_shard_worker`, and the bitmap group-by aggregate) acquires them in one canonical order: ascending path of `<field>/NNN.bm` (`bm_open_many_ro`, `bm_field_lock_cmp`). Bitmap-only readers take no kf lock, so without a shared order a reader holding `kind` and waiting for `flag` would deadlock against a rebuild holding `flag` and waiting for `kind`. The bulk-insert window (`bitmap_window_find_or_open`) still opens its bitmap shards lazily in first-use order; that pre-existing exposure is tracked separately.
+
 ## Per-kfcache-entry rwlock — the commit lock
 
 Every mmapped keyfile shard has its own rwlock. This is the hot path for both reads and writes:

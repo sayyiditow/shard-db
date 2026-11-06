@@ -206,6 +206,61 @@ const uint8_t *bm_get_value_bitmap(BitmapShard *bm, const uint8_t *value,
    bitmap with zero bytes. Returns 0 on success. */
 int  bm_grow(BitmapShard *bm, uint32_t new_slots);
 
+/* Keyfile-rebuild support. The keyfile resplit / compaction renumbers kf slots;
+   bit i of a bitmap means "kf slot i", so the bits must move with the entries.
+   Three steps, all on one writer handle:
+     bm_slotmap_prepare - write a copy of `bm`'s file to a sibling temporary
+        (`<path>.remap`, name returned in tmp_path) in which every set bit `s`
+        is moved to `map_fn(s, ctx)` and the slot space is resized to
+        `new_slots`. map_fn returns UINT32_MAX to drop a bit (dead slot); a
+        return >= new_slots is corruption (errno EUCLEAN). The live file is not
+        modified; the temporary is fsynced.
+     bm_slotmap_stage   - make the live file and mapping large enough for the
+        new image (blocks are reserved with posix_fallocate) and map the
+        temporary read-only. Everything that can fail runs here, before the
+        caller's point of no return; the old content stays valid and the old
+        header still describes it.
+     bm_slotmap_apply   - copy the staged image over the live mapping in place
+        and msync it. No allocation, no rename, no reopen: the copy cannot
+        fail. The return value only reports whether the msync confirmed
+        durability; the in-memory (and page-cache) content is correct either way.
+   Release the stage and discard the temporary afterwards. */
+typedef struct {
+    const void *src;
+    size_t      len;
+} BmSlotmapStage;
+
+int  bm_slotmap_prepare(BitmapShard *bm, uint32_t new_slots,
+                        uint32_t (*map_fn)(uint32_t old_slot, void *ctx), void *ctx,
+                        char *tmp_path, size_t tmp_len);
+int  bm_slotmap_stage(BitmapShard *bm, const char *tmp_path, BmSlotmapStage *st);
+int  bm_slotmap_apply(BitmapShard *bm, const BmSlotmapStage *st);
+void bm_slotmap_stage_release(BmSlotmapStage *st);
+/* Remove an unpublished temporary (safe on "" / NULL). */
+void bm_slotmap_discard(const char *tmp_path);
+
+/* Open up to BM_OPEN_MANY_MAX bitmap shards for reading in canonical lock
+   order (ascending path, which is ascending field name within one object and
+   shard) and return the handles in the caller's order. Every code path that
+   holds more than one bitmap shard lock at once acquires them in this order
+   (the keyfile-rebuild remap does too), so two such paths can never wait on
+   each other. Returns 0, or -1 with every handle closed and out[] cleared. */
+/* Canonical lock order for two field names of one object and shard: the order
+   bm_open_many_ro uses (compares the paths "<field>/NNN.bm"). */
+int  bm_field_lock_cmp(const char *a, const char *b);
+#define BM_OPEN_MANY_MAX 16
+int  bm_open_many_ro(const char *const *paths, int n, BitmapShard **out);
+/* Close handles opened by bm_open_many_ro: repeated paths share one handle (a
+   second read lock on the same non-recursive lock could deadlock behind a
+   queued writer), so each distinct handle is closed once. Clears out[]. */
+void bm_close_many(BitmapShard **h, int n);
+/* 1 if `bm` holds its cache entry's rwlock (a writer handle without it cannot
+   be used for an in-place rewrite). */
+int  bm_handle_cached(const BitmapShard *bm);
+/* 1 if `path` exists but its header does not describe a file of that size
+   (bm_open refuses such a file with EUCLEAN); 0 otherwise. */
+int  bm_file_is_corrupt(const char *path);
+
 /* Observability — used by tests + describe-object debugging paths. */
 uint32_t bm_n_values(const BitmapShard *bm);
 uint32_t bm_slots(const BitmapShard *bm);
