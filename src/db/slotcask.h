@@ -388,6 +388,12 @@ int  slotcask_bucket_for(uint32_t capacity, int max_slot_size);
    file). Holds each shard's wrlock for the rebuild duration. */
 int  slotcask_compact_kf(SlotcaskDb *db);
 
+/* Path of the bitmap file for (object, field, kf shard) as used by the bulk chain commit flush.
+   Must equal bm_build_path() for the same inputs. Exposed for tests. */
+void req_bitmap_file_path(char *out, size_t outlen,
+                          const char *db_root, const char *object,
+                          const char *field, int shard_idx);
+
 /* Bitmap-remap crash markers (<data_dir>/indexes/.bmfix-NNN, see slotcask.c).
    pending: 1 if any marker exists, 0 if none, -1 on I/O error.
    clear: remove every marker and every leftover "<NNN>.bm.remap" temporary

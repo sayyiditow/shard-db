@@ -359,6 +359,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_finance_routes.c \
     src/test/cases/test_predicate_equivalence.c \
     src/test/cases/test_bitmap_resplit.c \
+    src/test/cases/test_bulk_chain_bitmap_path.c \
     src/test/cases/test_scalar_routes_checked.c \
     src/test/cases/test_scalar_csv_update.c \
     src/test/cases/test_scalar_grammar_routes.c \

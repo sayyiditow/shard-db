@@ -7831,13 +7831,12 @@ typedef struct {
     size_t            nmembers;
 } BulkCommitChain;
 
-/* Bitmap file path for the chain commit flush (mirrors index.c's
-   bm_build_path: <root>/<obj>/indexes/<field>/<NNN>.bm). */
-static void req_bitmap_file_path(char *out, size_t outlen,
-                                 const char *db_root, const char *object,
-                                 const char *field, int shard_idx) {
-    snprintf(out, outlen, "%s/%s/indexes/%s/%03d.bm",
-             db_root, object, field, shard_idx);
+/* Bitmap file path for the chain commit flush. Delegates to bm_build_path so the
+   shard spelling (%03x, hex) can never drift from the creators/readers. */
+void req_bitmap_file_path(char *out, size_t outlen,
+                          const char *db_root, const char *object,
+                          const char *field, int shard_idx) {
+    bm_build_path(out, outlen, db_root, object, field, shard_idx);
 }
 
 /* fdatasync a file by path without touching any cache. B3a: routed
