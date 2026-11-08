@@ -64,6 +64,7 @@ _Atomic size_t g_shard_test_kf_max_slots;
    the next `count` hits of that mode fire. */
 _Atomic int g_shard_test_bmfix_fault_mode;
 _Atomic int g_shard_test_bmfix_fault_count;
+_Atomic int g_shard_test_bmlock_log;
 long g_shard_test_fail_phase = -1;
 long g_shard_test_fail_occurrence;
 int  g_shard_test_fail_postlink;

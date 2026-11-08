@@ -609,18 +609,27 @@ int bitmap_prepare_set_init(BitmapPrepareSet *set, size_t max_entries) {
     return 0;
 }
 
-static BitmapShard *bitmap_prepare_open(const UpdateIdxArg *arg) {
+/* Shared opener: path build + default tier + create + writer handle. The
+   caller decides bool_fastpath (key-length heuristic here, schema-derived
+   for the bulk window preopen). Growing the shard (if kf_slot doesn't fit
+   yet) is deferred to apply time — bm_grow() can fsync+publish a rewritten
+   file, a durable mutation that must not happen during prepare, before any
+   commit-intent marker exists for a record that might still be rejected. */
+static BitmapShard *bitmap_open_shard(const char *db_root, const char *object,
+                                      const char *field, int kf_shard, int splits,
+                                      int bool_fastpath, uint32_t bm_max_values) {
     char path[1024];
-    bitmap_shard_path(path, sizeof(path), arg->db_root, arg->object, arg->field, arg->kf_shard);
+    bitmap_shard_path(path, sizeof(path), db_root, object, field, kf_shard);
+    int slots = (int)slotcask_default_slots_for_splits(splits);
+    return bm_open(path, slots, 1, bool_fastpath, bm_max_values, 1 /* writer */);
+}
+
+static BitmapShard *bitmap_prepare_open(const UpdateIdxArg *arg) {
     int bool_fastpath = 0;
     if (arg->new_key && arg->new_len == 1) bool_fastpath = 1;
     else if (arg->old_key && arg->old_len == 1) bool_fastpath = 1;
-    int slots = (int)slotcask_default_slots_for_splits(arg->splits);
-    /* Growing the shard (if kf_slot doesn't fit yet) is deferred to apply
-       time — bm_grow() can fsync+publish a rewritten file, a durable
-       mutation that must not happen during prepare, before any commit-
-       intent marker exists for a record that might still be rejected. */
-    return bm_open(path, slots, 1, bool_fastpath, arg->bm_max_values, 1 /* writer */);
+    return bitmap_open_shard(arg->db_root, arg->object, arg->field, arg->kf_shard,
+                             arg->splits, bool_fastpath, arg->bm_max_values);
 }
 
 /* Grow bm (if needed) so kf_slot fits, right before the apply-phase set/
@@ -724,25 +733,79 @@ int bitmap_prepare_window_init(BitmapPrepareWindow *win, size_t max_fields, size
     return 0;
 }
 
+/* Lookup only: every (field, kf_shard) pair the window can touch was opened
+   by bitmap_prepare_window_preopen in canonical lock order before the first
+   record was processed. A miss here is a caller bug (unpreopened field),
+   not a lazy open: opening here would take this window's bitmap writer
+   locks in first-use order and deadlock against canonical holders
+   (bm_open_many_ro readers, the keyfile-rebuild remap). */
 static BitmapWindowEntry *bitmap_window_find_or_open(BitmapPrepareWindow *win, const UpdateIdxArg *arg) {
     for (size_t i = 0; i < win->n_entries; i++) {
         BitmapWindowEntry *e = &win->entries[i];
         if (e->kf_shard == arg->kf_shard && strcmp(e->field, arg->field) == 0) return e;
     }
-    if (win->n_entries >= win->cap_entries) return NULL;
-    BitmapShard *bm = bitmap_prepare_open(arg);
-    if (!bm) return NULL;
-    BitmapWindowEntry *e = &win->entries[win->n_entries++];
-    snprintf(e->field, sizeof(e->field), "%s", arg->field);
-    e->kf_shard = arg->kf_shard;
-    e->bm = bm;
-    e->bm_max_values = arg->bm_max_values;
-    e->bool_fastpath = (arg->new_key && arg->new_len == 1) ||
-                       (arg->old_key && arg->old_len == 1);
-    e->pending = NULL;
-    e->npending = 0;
-    e->pending_cap = 0;
-    return e;
+    return NULL;
+}
+
+int bitmap_prepare_window_preopen(BitmapPrepareWindow *win, int kf_shard,
+                                  const BitmapPreopenField *fields, size_t n,
+                                  char *err_field, size_t err_field_len) {
+    if (!win || (!fields && n > 0)) { errno = EINVAL; return -2; }
+    if (n == 0) return 0;
+    if (n > (size_t)win->cap_entries || n > MAX_FIELDS) { errno = EOVERFLOW; return -2; }
+    /* Canonical lock order: ascending <field>/NNN.bm path. One kf shard per
+       window, so ordering by field name via bm_field_lock_cmp is the same
+       order bm_open_many_ro and the keyfile-rebuild remap use. */
+    size_t order[MAX_FIELDS];
+    for (size_t i = 0; i < n; i++) order[i] = i;
+    for (size_t i = 1; i < n; i++) {
+        size_t k = order[i], j = i;
+        while (j > 0 &&
+               bm_field_lock_cmp(fields[order[j - 1]].field, fields[k].field) > 0) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = k;
+    }
+    for (size_t i = 0; i < n; i++) {
+        const BitmapPreopenField *f = &fields[order[i]];
+        /* Composite + bitmap is rejected at create-object; defensive skip,
+           matching the single-insert staging loop. */
+        if (strchr(f->field, '+')) continue;
+        /* Duplicate declarations of the same bitmap field (create-object
+           accepts "indexes":["flag:bitmap","flag:bitmap"]) must open one
+           writer handle, not two: the second wrlock on the same cache
+           entry returns EDEADLK (ignored by the opener) and the two
+           handles unlock the same lock twice at apply. The sort above
+           made duplicates adjacent; only the first occurrence opens. */
+        if (i > 0 &&
+            bm_field_lock_cmp(fields[order[i - 1]].field, f->field) == 0)
+            continue;
+        /* bm_max_values 0: the bulk path's convention — an existing file's
+           header wins; a created file takes the default cap. Identical to
+           the first record-driven open this replaces. */
+        BitmapShard *bm = bitmap_open_shard(win->db_root, win->object, f->field,
+                                            kf_shard, win->splits,
+                                            f->bool_fastpath, 0);
+        if (!bm) {
+            int saved = errno ? errno : EIO;
+            bitmap_prepare_window_abort(win);
+            if (err_field && err_field_len)
+                snprintf(err_field, err_field_len, "%s", f->field);
+            errno = saved;
+            return -2;
+        }
+        BitmapWindowEntry *e = &win->entries[win->n_entries++];
+        snprintf(e->field, sizeof(e->field), "%s", f->field);
+        e->kf_shard = kf_shard;
+        e->bm = bm;
+        e->bm_max_values = 0;
+        e->bool_fastpath = f->bool_fastpath;
+        e->pending = NULL;
+        e->npending = 0;
+        e->pending_cap = 0;
+    }
+    return 0;
 }
 
 int bitmap_prepare_window_add(BitmapPrepareWindow *win, const UpdateIdxArg *arg,
@@ -820,15 +883,29 @@ static BitmapShard *bitmap_window_entry_reopen(BitmapPrepareWindow *win,
 
 int bitmap_prepare_window_apply(BitmapPrepareWindow *win) {
     int rc = 0;
+    /* Reacquire every handle this apply needs BEFORE the op loop, in
+       canonical entry order (preopen installed the entries sorted). The op
+       loop must not reopen lazily: op order is first-use order, so a lazy
+       reopen holds an earlier entry's writer lock while taking a later
+       one's — the exact inversion that deadlocks against canonical
+       bitmap-only readers (docs/concepts/concurrency.md). */
+    unsigned char needed[MAX_FIELDS] = { 0 };
+    for (size_t i = 0; i < win->n_ops; i++) {
+        size_t ei = win->ops[i].entry_idx;
+        if (ei < MAX_FIELDS && ei < win->n_entries) needed[ei] = 1;
+    }
+    for (size_t i = 0; i < win->n_entries && i < MAX_FIELDS; i++) {
+        BitmapWindowEntry *e = &win->entries[i];
+        if (e->bm || !needed[i]) continue;
+        /* Parked by prepare (unpark before the wave boundary): reacquire
+           within this call stack, canonically. */
+        e->bm = bitmap_window_entry_reopen(win, e);
+        if (!e->bm) rc = -1;
+    }
     for (size_t i = 0; i < win->n_ops; i++) {
         BitmapWindowOp *op = &win->ops[i];
         BitmapWindowEntry *e = &win->entries[op->entry_idx];
-        if (!e->bm) {
-            /* Parked by prepare (unpark before the wave boundary):
-               reacquire within this call stack. */
-            e->bm = bitmap_window_entry_reopen(win, e);
-            if (!e->bm) { rc = -1; continue; }
-        }
+        if (!e->bm) { rc = -1; continue; }   /* reopen failed above */
         BitmapShard *bm = (BitmapShard *)e->bm;
         if (!bm) continue;
         if (bitmap_apply_grow_for_slot(bm, op->kf_slot) != 0) {

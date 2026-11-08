@@ -17,6 +17,21 @@
 #define _GNU_SOURCE
 #include "types.h"
 #include "bitmap.h"
+#ifdef TEST_BUILD
+#include <stdatomic.h>
+#include <pthread.h>
+#include "log.h"
+#include "shard_test_ctl.h"
+/* F7b: paired events on cached writer handles; thread identity allows
+   concurrent per-shard windows to be checked independently.
+   Compiled only into TEST_BUILD binaries; inert unless armed via the
+   control channel (SET_GLOBALS phase 3). */
+static void bm_lock_order_trace(const char *path, char op) {
+    if (!atomic_load(&g_shard_test_bmlock_log)) return;
+    LOG_WARN(LOG_SUB_BITMAP, "BMLOCK-ORDER tid=%lu op=%c %s",
+             (unsigned long)pthread_self(), op, path);
+}
+#endif
 #include <errno.h>
 
 #include <fcntl.h>
@@ -637,6 +652,9 @@ retry_bm_acquire:;
             bm->mmap_ptr = e->map;
             bm->mmap_size = e->map_size;
             snprintf(bm->path, sizeof(bm->path), "%s", path);
+#ifdef TEST_BUILD
+            if (writer) bm_lock_order_trace(bm->path, '+');
+#endif
             memcpy(&bm->hdr, e->map, sizeof(struct BmHeader));
             if (bm->hdr.max_values == 0 && writer) {
                 bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
@@ -777,6 +795,9 @@ retry_bm_acquire:;
     bm->mmap_size = sz;
     bm->hdr = hdr;
     snprintf(bm->path, sizeof(bm->path), "%s", path);
+#ifdef TEST_BUILD
+    if (writer) bm_lock_order_trace(bm->path, '+');
+#endif
     if (bm->hdr.max_values == 0 && writer) {
         bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
         memcpy(bm->mmap_ptr, &bm->hdr, sizeof(struct BmHeader));
@@ -827,6 +848,9 @@ int bm_close_checked(BitmapShard *bm) {
             BmCacheEntry *e = &g_bm_cache[bm->slot];
             durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
         }
+#ifdef TEST_BUILD
+        if (bm->writer) bm_lock_order_trace(bm->path, '-');
+#endif
         int rc = pthread_rwlock_unlock(&g_bm_cache[bm->slot].rwlock);
         if (rc != 0) saved_errno = rc;
     } else {

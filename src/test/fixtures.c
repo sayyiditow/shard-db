@@ -860,6 +860,11 @@ int test_env_ctl_set_bmfix_fault(TestEnv *env, int mode, int count) {
     return ctl_set_globals(env, 2, (uint64_t)mode, (uint64_t)count);
 }
 
+int test_env_ctl_set_bmlock_log(TestEnv *env, int on) {
+    /* phase 3 = TEST_HOOK_SET_GLOBALS_BMLOCK_LOG (test_control.c). */
+    return ctl_set_globals(env, 3, (uint64_t)(on ? 1 : 0), 0);
+}
+
 int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
     /* phase 1 = TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL (test_control.c). */
     return ctl_set_globals(env, 1, (uint64_t)(fail ? 1 : 0), 0);

@@ -742,6 +742,28 @@ static int v2_bulk_ins_prepare_window(SlotcaskBulkRec *recs, const size_t *activ
              "%s", sw->object);
     ws->bw_window.splits = sw->sch->splits;
 
+    /* F1: preopen every bitmap field's handle for this window's shard in
+       canonical lock order before any record is processed. The old lazy
+       first-use open could pin kind while later opening flag and deadlock
+       against canonical readers / the keyfile-rebuild remap. */
+    {
+        BitmapPreopenField pre[MAX_FIELDS];
+        size_t npre = 0;
+        for (int fi = 0; fi < sw->nidx && npre < MAX_FIELDS; fi++) {
+            if (!sw->idx_types || sw->idx_types[fi] != IT_BITMAP) continue;
+            int fi_t = typed_field_index(sw->ts, sw->idx_fields[fi]);
+            pre[npre].field = sw->idx_fields[fi];
+            pre[npre].bool_fastpath = (fi_t >= 0 && sw->ts->fields[fi_t].type == FT_BOOL);
+            npre++;
+        }
+        char pre_err[128];
+        if (bitmap_prepare_window_preopen(&ws->bw_window, sw->shard_id,
+                                          pre, npre, pre_err, sizeof(pre_err)) != 0) {
+            v2_bulk_ins_window_release_state(sw, ws);
+            return -1;
+        }
+    }
+
     size_t nsurvive = 0;
 
     for (size_t a = 0; a < nactive; a++) {

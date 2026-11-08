@@ -1964,6 +1964,25 @@ typedef struct {
 
 int  bitmap_prepare_window_init(BitmapPrepareWindow *win, size_t max_fields,
                                 size_t max_records);
+
+/* One window entry per bitmap field, preopened before any record is
+   processed. */
+typedef struct {
+    const char *field;        /* borrowed; lives for the call */
+    int         bool_fastpath; /* schema-derived: field type == FT_BOOL */
+} BitmapPreopenField;
+/* Open every bitmap (field, kf_shard) handle the bulk window can touch, in
+   the canonical lock order (ascending <field>/NNN.bm, bm_field_lock_cmp) —
+   the same order bm_open_many_ro, the keyfile-rebuild remap and the
+   single-insert staging use. After this returns 0, no window path takes a
+   bitmap writer lock in any other order: add() only looks entries up, and
+   apply() reopens parked handles in entry order. Untouched fields keep a
+   valid empty .bm file (the same artifact set a reindex produces).
+   Returns 0, or -2 with every handle released (err_field filled with the
+   failing field). */
+int  bitmap_prepare_window_preopen(BitmapPrepareWindow *win, int kf_shard,
+                                   const BitmapPreopenField *fields, size_t n,
+                                   char *err_field, size_t err_field_len);
 /* Stages one record's bitmap mutation for `arg->field` at `arg->kf_shard`.
    Returns 0 (staged), 1 (this record would exceed the field's cap — the
    caller marks only this record rejected and does NOT call add() again
