@@ -405,24 +405,91 @@ static int br_restart_kill(Br *b, int kill) {
 /* A prepare failure (ENOSPC) must abandon the resplit with the old keyfile and
    bitmaps untouched and no marker or temporary left; after the back-off the
    rebuild goes through and the answers stay exact. */
+
+/* F2: submit a fault-window chunk without changing the expected-live oracle.
+   Only a completely successful retry may publish those rows to the oracle. */
+static int br_fault_stage_bulk(Br *b, int from, int to, int *inserted, int *errors) {
+    size_t cap = (size_t)(to - from) * 128 + 256;
+    char *req = malloc(cap);
+    if (!req) return -1;
+    size_t n = (size_t)snprintf(req, cap,
+        "{\"mode\":\"bulk-insert\",\"dir\":\"br\",\"object\":\"t\",\"records\":[");
+    for (int i = from; i < to; i++)
+        n += (size_t)snprintf(req + n, cap - n,
+            "%s{\"key\":\"k%05d\",\"value\":{\"flag\":%s,\"kind\":\"%s\",\"n\":%d}}",
+            i > from ? "," : "", i, b->rows[i].flag ? "true" : "false",
+            br_kind[b->rows[i].kind], i);
+    snprintf(req + n, cap - n, "]}");
+    char *resp = NULL;
+    int rc = tc_request(b->tc, req, &resp);
+    free(req);
+    if (rc != 0 || !resp) { free(resp); return -1; }
+    const char *ins = strstr(resp, "\"inserted\":");
+    const char *err = strstr(resp, "\"errors\":");
+    *inserted = ins ? (int)strtol(ins + strlen("\"inserted\":"), NULL, 10) : -1;
+    *errors = err ? (int)strtol(err + strlen("\"errors\":"), NULL, 10) : 0;
+    int failed = strstr(resp, "\"error\"") != NULL || *errors > 0;
+    free(resp);
+    if (*inserted < 0) return -1;
+    return failed ? 1 : 0;
+}
+
+static int br_fault_stage_log(Br *b, const char *what) {
+    for (int i = 0; i < 500; i++) {
+        if (br_log_has(b, what)) return 1;
+        usleep(10000);
+    }
+    return 0;
+}
+
+static int br_fault_stage_retry(Br *b, int from, int to) {
+    for (int attempt = 0; attempt < 200; attempt++) {
+        int inserted = -1, errors = -1;
+        int rc = br_fault_stage_bulk(b, from, to, &inserted, &errors);
+        if (rc < 0) return -1;
+        if (rc == 0) {
+            for (int i = from; i < to; i++) b->rows[i].live = 1;
+            return 0;
+        }
+        /* Cooldowns are per shard. A retry may commit recovered shards;
+           retrying every key is safe because bulk-insert is an upsert. */
+        usleep(100000);
+    }
+    return -1;
+}
+
 static int test_bitmap_resplit_fault_prepare(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
     if (br_open(b, 0) != 0) { free(b); return 1; }
+    ASSERT_EQ_INT(br_bulk(b, 0, 220), 0, "seed records before the fault");
+    br_check(b, "before failed prepares");
     ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, SHARD_TEST_BMFIX_PREPARE, 1000), 0, "arm: fail every bitmap prepare");
-    for (int from = 0; from < 330; from += 110)
-        ASSERT_EQ_INT(br_bulk(b, from, from + 110), 0, "bulk-insert chunk (resplits fail)");
+    int inserted = -1, errors = -1;
+    ASSERT_EQ_INT(br_fault_stage_bulk(b, 220, 732, &inserted, &errors), 1,
+                  "fault-blocked growth rejects the new stages");
+    ASSERT_EQ_INT(inserted, 0, "no record committed from rejected stages");
+    ASSERT_EQ_INT(errors, 512, "every submitted record was rejected");
+    ASSERT_EQ_INT(br_count(b->tc, "[]"), 220, "seeded records unchanged after rejection");
     br_check(b, "after failed prepares");
-    ASSERT_TRUE(br_log_has(b, "KF_BMFIX_PREPARE_FAILED"), "a resplit attempt failed and logged");
-    ASSERT_TRUE(!br_marker_exists(b), "no marker after an abandoned resplit");
-    ASSERT_TRUE(!br_remap_leftovers(b), "no .bm.remap temporaries after an abandoned resplit");
+    ASSERT_TRUE(br_fault_stage_log(b, "BULK_STAGE_UNGROWN"), "growth failure reported by stage");
+    ASSERT_TRUE(br_fault_stage_log(b, "KF_BMFIX_PREPARE_FAILED"), "a resplit attempt failed and logged");
+    ASSERT_TRUE(!br_marker_exists(b), "no marker after abandoned prepare");
+    ASSERT_TRUE(!br_remap_leftovers(b), "no remap temporaries after abandoned prepare");
     ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, 0, 0), 0, "disarm");
     sleep(6);                                   /* the 5 s retry back-off */
-    for (int from = 330; from < 1500; from += 170)
-        ASSERT_EQ_INT(br_bulk(b, from, from + 170), 0, "bulk-insert chunk (resplits succeed)");
+    ASSERT_EQ_INT(br_fault_stage_retry(b, 220, 732), 0, "retry every rejected key succeeds");
+    ASSERT_EQ_INT(br_count(b->tc, "[]"), 732, "all rejected keys present after retry");
+    br_check(b, "after retrying rejected keys");
+    for (int from = 732; from < 1500; from += 170) {
+        int to = from + 170 < 1500 ? from + 170 : 1500;
+        ASSERT_EQ_INT(br_bulk(b, from, to), 0, "later growth succeeds");
+    }
+    ASSERT_EQ_INT(br_count(b->tc, "[]"), 1500, "final record count is exact");
     br_check(b, "after the retry");
-    ASSERT_TRUE(!br_marker_exists(b), "marker removed after a successful rebuild");
+    ASSERT_TRUE(!br_marker_exists(b), "marker removed after successful rebuild");
+    ASSERT_TRUE(!br_remap_leftovers(b), "no remap temporaries after successful rebuild");
     br_close(b);
     free(b);
     return t_ctx->failed > 0 ? 1 : 0;
@@ -436,17 +503,32 @@ static int test_bitmap_resplit_fault_rename(void) {
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
     if (br_open(b, 0) != 0) { free(b); return 1; }
+    ASSERT_EQ_INT(br_bulk(b, 0, 220), 0, "seed records before the fault");
+    br_check(b, "before failed renames");
     ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, SHARD_TEST_BMFIX_RENAME, 1000), 0, "arm: fail every keyfile rename");
-    for (int from = 0; from < 330; from += 110)
-        ASSERT_EQ_INT(br_bulk(b, from, from + 110), 0, "bulk-insert chunk (renames fail)");
+    int inserted = -1, errors = -1;
+    ASSERT_EQ_INT(br_fault_stage_bulk(b, 220, 732, &inserted, &errors), 1,
+                  "fault-blocked growth rejects the new stages");
+    ASSERT_EQ_INT(inserted, 0, "no record committed from rejected stages");
+    ASSERT_EQ_INT(errors, 512, "every submitted record was rejected");
+    ASSERT_EQ_INT(br_count(b->tc, "[]"), 220, "seeded records unchanged after rejection");
     br_check(b, "after failed renames");
-    ASSERT_TRUE(!br_marker_exists(b), "marker removed by the abort path");
-    ASSERT_TRUE(!br_remap_leftovers(b), "temporaries removed by the abort path");
+    ASSERT_TRUE(br_fault_stage_log(b, "BULK_STAGE_UNGROWN"), "growth failure reported by stage");
+    ASSERT_TRUE(!br_marker_exists(b), "no marker after abandoned rename");
+    ASSERT_TRUE(!br_remap_leftovers(b), "no remap temporaries after abandoned rename");
     ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, 0, 0), 0, "disarm");
     sleep(6);                                   /* a failed rename also delays the next attempt by 5 s */
-    for (int from = 330; from < 1500; from += 170)
-        ASSERT_EQ_INT(br_bulk(b, from, from + 170), 0, "bulk-insert chunk (renames succeed)");
+    ASSERT_EQ_INT(br_fault_stage_retry(b, 220, 732), 0, "retry every rejected key succeeds");
+    ASSERT_EQ_INT(br_count(b->tc, "[]"), 732, "all rejected keys present after retry");
+    br_check(b, "after retrying rejected keys");
+    for (int from = 732; from < 1500; from += 170) {
+        int to = from + 170 < 1500 ? from + 170 : 1500;
+        ASSERT_EQ_INT(br_bulk(b, from, to), 0, "later growth succeeds");
+    }
+    ASSERT_EQ_INT(br_count(b->tc, "[]"), 1500, "final record count is exact");
     br_check(b, "after the retry");
+    ASSERT_TRUE(!br_marker_exists(b), "marker removed after successful rebuild");
+    ASSERT_TRUE(!br_remap_leftovers(b), "no remap temporaries after successful rebuild");
     br_close(b);
     free(b);
     return t_ctx->failed > 0 ? 1 : 0;

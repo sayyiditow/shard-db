@@ -3086,10 +3086,15 @@ static int kf_plan_window_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh,
         uint64_t cap = (uint64_t)kh->capacity;
         /* Never resplit while this window or request holds planned-but-
            uncommitted slots: they are numbered for the current table and a
-           resplit would commit them into the wrong places. The stage
-           pre-grow sizes the table up front; without that, the record fails
-           (status -1) instead of corrupting the keyfile. */
+           resplit would commit them into the wrong places. After a successful
+           stage pre-grow this trigger is unreachable while reservations exist
+           (the stage fails closed on under-coverage — BULK_STAGE_UNGROWN), so
+           this resplit only ever runs for the first, reservation-free plan.
+           The kf_max_slots check keeps the TEST_BUILD tier seam coherent: the
+           stage loop and this planner path respect the same cap (production
+           kf_max_slots() is SIZE_MAX, so this is a no-op there). */
         if (cap > 0 && total * 4 >= cap * 3 &&
+            cap < kf_max_slots() &&
             nreserved == 0 && req_res_empty(res_map, res_cap)) {
             if (kfcache_resplit_locked(kh, kh->capacity * 2) == 0)
                 reshard_hint_check(db);
@@ -7683,9 +7688,43 @@ static int slotcask_bulk_stage_shard(SlotcaskBulkRequest *req,
            publish, where no resplit is allowed, so this stage must size the
            table for the whole chain. */
         uint64_t projected = kh.hdr->total + chain_pending + (uint64_t)n;
+        int grow_errno = 0;
         while (kh.capacity < kf_max_slots() &&
                projected * 4 >= (uint64_t)kh.capacity * 3) {
-            if (kfcache_resplit_locked(&kh, kh.capacity * 2) != 0) break;
+            if (kfcache_resplit_locked(&kh, kh.capacity * 2) != 0) {
+                grow_errno = errno ? errno : EIO;
+                break;
+            }
+        }
+        /* F2: coverage must be established before publish. Planning refuses
+           to resplit once this window or request holds planned-but-uncommitted
+           slots, and no other writer can resize this shard between stage and
+           publish (the pipeline holds the writer gate throughout; vacuum is
+           excluded by the object lock), so an under-sized table would fail
+           records mid-request with faceless per-record errors and a partial
+           success. Fail the stage atomically instead: every record of this
+           shard errors, the request reports it, and the client retries the
+           failed records (bulk-insert is an upsert). Reachable when a
+           bitmap-remap prepare failure put this shard's growth on its 5 s
+           back-off, on a resplit I/O error, or under the TEST_BUILD
+           kf_max_slots seam. Deletes need no insertion slots, so only
+           upsert stages take this new failure path. */
+        if (ups && projected * 4 >= (uint64_t)kh.capacity * 3) {
+            char kf_path[PATH_MAX];
+            kf_path_for(kf_path, req->db->data_dir, kf_shard_id);
+            LOG_ERROR(LOG_SUB_SLOTCASK,
+                      "BULK_STAGE_UNGROWN path=%s projected=%llu cap=%llu chain_pending=%llu errno=%s "
+                      "(pre-grow could not size the table; failing this shard's stage, retry the request)",
+                      kf_path, (unsigned long long)projected,
+                      (unsigned long long)kh.capacity,
+                      (unsigned long long)chain_pending,
+                      strerror(grow_errno ? grow_errno : EAGAIN));
+            kfcache_release(&kh);
+            reshard_hint_check(req->db);
+            rs->stage_failed = 1;
+            for (size_t i = 0; i < n; i++) recs[i].status = -1;
+            errno = grow_errno ? grow_errno : EAGAIN;
+            return -1;
         }
     }
     kfcache_release(&kh);

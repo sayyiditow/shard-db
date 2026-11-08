@@ -6,6 +6,8 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**Bulk insert stages fail closed when growth is impossible.** A bulk upsert shard stage whose pre-grow cannot size the keyfile table (bitmap-remap back-off, resplit I/O error, TEST_BUILD tier cap) used to continue and let publish fail records one by one with a faceless partial-success response; it now fails the stage atomically (`BULK_STAGE_UNGROWN` in the error log, every record of the shard errors, no partial commit) and the client retries via bulk-insert's upsert semantics. Bulk-delete keeps its existing behavior because deletes need no new insertion slots. The bulk window planner additionally respects the TEST_BUILD kf tier cap, and its reservation-free resplit is now documented as the only path that can hit the 75% trigger.
+
 **2026.11.1 — packed layout metadata, strict `layout=` token, version gate (R5, in progress).**
 `SHARD_DB_VERSION` is now `2026.11.1` and the minimum supported source release is
 `2026.10.2`; roots must carry 2026.10.2 clean-open evidence to open (older roots get
