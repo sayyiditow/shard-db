@@ -35,6 +35,38 @@ Keyfile rebuilds (growth resplit, vacuum compaction) follow the same order: `kfc
 
 **Order between bitmaps.** Code that holds more than one bitmap shard lock at once (the keyfile-rebuild remap, the single-insert bitmap staging in `v2_insert_prepare_commit`, the bitmap-only AND-count `bm_intersect_shard_worker`, and the bitmap group-by aggregate) acquires them in one canonical order: ascending path of `<field>/NNN.bm` (`bm_open_many_ro`, `bm_field_lock_cmp`). Bitmap-only readers take no kf lock, so without a shared order a reader holding `kind` and waiting for `flag` would deadlock against a rebuild holding `flag` and waiting for `kind`. The bulk-insert window preopens every bitmap (field, shard) handle it can touch in the same canonical order (`bitmap_prepare_window_preopen`) and reopens parked handles in entry order at apply, so every multi-bitmap holder — readers, the keyfile-rebuild remap, the single-insert staging and the bulk window — shares one acquisition order.
 
+### Returned lock errors in the bitmap cache (Plan C)
+
+Cache-hit and cache-fill rwlock acquisition errors fail `bm_open` immediately
+with the exact pthread error in `errno`: no handle is returned and no
+unacquired lock is unlocked. A fill's installed fd/map remain cache-owned.
+`bm_cache_invalidate_checked` also propagates acquisition errors as `-1`.
+
+Eviction treats nonblocking `EBUSY` as ordinary contention. Other errors make
+that candidate unusable, but another candidate may still be evicted
+successfully. If no candidate succeeds, a writer waits on the selected busy
+candidate; a returned blocking error overrides an earlier try error. Thus a
+selected candidate write-held by the calling thread can return `EDEADLK`,
+which fails the writer open instead of being retried forever. Ordinary
+contention still waits for the other holder to release. Reader opens retain
+their existing uncached fallback when admission fails; removing that fallback
+is separate work.
+
+This is deliberately narrow. `EDEADLK` is a pthread result, not portable
+ownership detection: a reader that self-upgrades from a read hold can still
+block without an error, and a candidate held by a *different* thread can still
+participate in cross-thread circular waits. The guarantee is only: **when an
+open fails on a returned lock error it fails promptly with that errno;
+ordinary contention still waits.** An error on one eviction candidate does not
+by itself fail the open: a later candidate's successful eviction can still
+satisfy it, and for writers a selected blocking-wait error is returned only
+when no successful eviction remains (a failed try's error is reported only if
+no later eviction succeeds either). The
+`bm_cache_drop_slot` wait-return-0 identity-change path keeps its successful-
+acquire verification and retry, and no error erasure: a blocking-wait failure
+overrides an earlier try error, and busy/identity-change results never erase
+one.
+
 ## Per-kfcache-entry rwlock — the commit lock
 
 Every mmapped keyfile shard has its own rwlock. This is the hot path for both reads and writes:

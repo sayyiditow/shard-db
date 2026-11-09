@@ -115,10 +115,132 @@ static int bm_test_consume_failure(_Atomic int *counter) {
     }
     return 0;
 }
+
+/* ─── TEST_BUILD test seams: lock-acquisition faults, observation, cap
+ * override. Compiled only into TEST_BUILD binaries; inert unless a test
+ * arms them. */
+
+static __thread int bm_test_lock_fault[BM_TEST_LOCK_SITE_COUNT];
+static __thread int bm_test_lock_consumed[BM_TEST_LOCK_SITE_COUNT];
+/* Cross-thread acquisition-entry observation: published before the pthread
+ * call so a coordinating thread can see a contended waiter reach the real
+ * lock attempt. Never changes the pthread result. */
+static _Atomic int bm_test_lock_entered_count[BM_TEST_LOCK_SITE_COUNT];
+/* Thread-local cache-entry rwlock unlock counter (scoped measurement only). */
+static __thread int bm_test_entry_unlocks_count;
+/* Startup-only capacity override; 0 = configured default. */
+static int bm_test_cache_cap_override;
+/* Fire-once-per-site diagnostic gate (bounded even if a caller retries). */
+static _Atomic int bm_test_lock_diag_done[BM_TEST_LOCK_SITE_COUNT];
+
+static const char *bm_test_lock_site_name(int site) {
+    switch (site) {
+    case BM_TEST_LOCK_HIT_RD:   return "hit-rd";
+    case BM_TEST_LOCK_HIT_WR:   return "hit-wr";
+    case BM_TEST_LOCK_FILL_RD:  return "fill-rd";
+    case BM_TEST_LOCK_FILL_WR:  return "fill-wr";
+    case BM_TEST_LOCK_DROP_TRY: return "drop-try";
+    case BM_TEST_LOCK_DROP_WAIT: return "drop-wait";
+    default:                    return "?";
+    }
+}
+
+void bm_test_fail_lock_next(int site, int error) {
+    if (site < 0 || site >= BM_TEST_LOCK_SITE_COUNT || error == 0) return;
+    bm_test_lock_fault[site] = error;
+}
+
+int bm_test_lock_failure_consumed(int site) {
+    if (site < 0 || site >= BM_TEST_LOCK_SITE_COUNT) return -1;
+    return bm_test_lock_consumed[site];
+}
+
+void bm_test_reset_lock_failure(void) {
+    for (int i = 0; i < BM_TEST_LOCK_SITE_COUNT; i++) {
+        bm_test_lock_fault[i] = 0;
+        bm_test_lock_consumed[i] = 0;
+    }
+}
+
+int bm_test_lock_entered(int site) {
+    if (site < 0 || site >= BM_TEST_LOCK_SITE_COUNT) return -1;
+    return atomic_load_explicit(&bm_test_lock_entered_count[site],
+                                memory_order_acquire);
+}
+
+int bm_test_entry_unlock_count(void) {
+    return bm_test_entry_unlocks_count;
+}
+
+int bm_test_set_cache_cap(int cap) {
+    /* g_bm_cache dereferences g_db, which the daemon does not create until
+     * after config loading; a NULL g_db means no cache can be live. */
+    if (g_db && g_bm_cache) { errno = EBUSY; return -1; }
+    if (cap != 0 && cap != 16) { errno = EINVAL; return -1; }
+    bm_test_cache_cap_override = cap;
+    return 0;
+}
+
+/* TEST_BUILD acquisition-failure diagnostic, gated on the bmlock-log
+ * observability flag (armed for daemon-backed cases via the test control
+ * channel) and emitted at most once per site per process. Observation only;
+ * emitted before retry handling so repeated acquisition failures remain
+ * observable. */
+static void bm_test_lock_diag(int site, int rc, const char *path) {
+    if (atomic_load(&g_shard_test_bmlock_log) == 0) return;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&bm_test_lock_diag_done[site],
+                                        &expected, 1))
+        return;
+    LOG_WARN(LOG_SUB_BITMAP, "BMLOCK-ACQUIRE-FAIL site=%s error=%d path=%s",
+             bm_test_lock_site_name(site), rc, path);
+}
+#else  /* !TEST_BUILD */
+static void bm_test_lock_diag(int site, int rc, const char *path) {
+    (void)site; (void)rc; (void)path;
+}
 #endif
+
+/* Scoped TEST_BUILD measurement: count entry-rwlock unlocks performed by
+ * this thread through bitmap.c. No-op in production builds. */
+static void bm_test_note_entry_unlock(void) {
+#ifdef TEST_BUILD
+    bm_test_entry_unlocks_count++;
+#endif
+}
+
+/* Lock-acquisition call for a bitmap cache entry rwlock. TEST_BUILD: an
+ * armed thread-local one-shot fault is consumed and returned instead of
+ * calling pthread (never synthesizing success); otherwise, and always in
+ * production builds, the real pthread operation runs. */
+static int bm_entry_lock_call(int site,
+                              int (*op)(pthread_rwlock_t *),
+                              pthread_rwlock_t *lock) {
+#ifdef TEST_BUILD
+    if (site >= 0 && site < BM_TEST_LOCK_SITE_COUNT) {
+        int err = bm_test_lock_fault[site];
+        if (err != 0) {
+            bm_test_lock_fault[site] = 0;
+            bm_test_lock_consumed[site]++;
+            return err;
+        }
+        atomic_fetch_add_explicit(&bm_test_lock_entered_count[site], 1,
+                                  memory_order_release);
+    }
+#else
+    (void)site;
+#endif
+    return op(lock);
+}
 
 void bm_cache_init(int cap) {
     if (g_bm_cache) return;
+#ifdef TEST_BUILD
+    /* Startup-only test override (bm_test_set_cache_cap): consulted on the
+     * first initialization, before the ordinary floor/sizing arithmetic.
+     * Not a supported configuration knob. */
+    if (bm_test_cache_cap_override) cap = bm_test_cache_cap_override;
+#endif
     if (cap < 16) cap = 16;
     g_bm_cache_slots = bm_next_pow2(cap * 2);
     g_bm_cache = calloc((size_t)g_bm_cache_slots, sizeof(BmCacheEntry));
@@ -127,6 +249,14 @@ void bm_cache_init(int cap) {
         rwlock_init_writer_preferring(&g_bm_cache[i].rwlock);
         g_bm_cache[i].fd = -1;
     }
+#ifdef TEST_BUILD
+    if (bm_test_cache_cap_override)
+        LOG_WARN(LOG_SUB_BITMAP,
+                 "BM_TEST_CACHE_CAP=%d: effective cap=%d hash slots=%d "
+                 "eviction threshold=%d",
+                 bm_test_cache_cap_override, cap, g_bm_cache_slots,
+                 g_bm_cache_slots / 2);
+#endif
 }
 
 void bm_cache_shutdown(void) {
@@ -175,21 +305,38 @@ static int bm_cache_drop_slot(int slot, int wait) {
     char expected_path[PATH_MAX];
     snprintf(expected_path, sizeof(expected_path), "%s", e->path);
     pthread_mutex_unlock(&g_bm_cache_lock);
-    int lock_rc = wait ? pthread_rwlock_wrlock(&e->rwlock)
-                       : pthread_rwlock_trywrlock(&e->rwlock);
+    int lock_rc = bm_entry_lock_call(wait ? BM_TEST_LOCK_DROP_WAIT
+                                          : BM_TEST_LOCK_DROP_TRY,
+                                     wait ? pthread_rwlock_wrlock
+                                          : pthread_rwlock_trywrlock,
+                                     &e->rwlock);
+    if (lock_rc != 0)
+        bm_test_lock_diag(wait ? BM_TEST_LOCK_DROP_WAIT : BM_TEST_LOCK_DROP_TRY,
+                          lock_rc, expected_path);
     pthread_mutex_lock(&g_bm_cache_lock);
-    if (lock_rc != 0) return 0;
+    if (lock_rc != 0) {
+        /* Only a nonblocking EBUSY is ordinary contention. Every other
+           pthread result — including a blocking wait's EDEADLK (the calling
+           thread holds this entry's write lock) — is a returned acquisition
+           error: fail with it instead of looping. */
+        if (!wait && lock_rc == EBUSY) return 0;
+        errno = lock_rc;
+        return -1;
+    }
     if (!e->used) {
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(&e->rwlock);
         return 1;
     }
     if (strcmp(e->path, expected_path) != 0) {
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(&e->rwlock);
         return 0;
     }
     if (e->map && e->map_size > 0 &&
         durability_flush_dirty(&e->dirty, &e->dirty_since_ms,
                                e->map, e->map_size) < 0) {
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(&e->rwlock);
         return -1;
     }
@@ -197,6 +344,7 @@ static int bm_cache_drop_slot(int slot, int wait) {
        complete entry so a later invalidation can safely retry teardown. */
     if (e->map && munmap(e->map, e->map_size) != 0) {
         int saved_errno = errno;
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(&e->rwlock);
         errno = saved_errno;
         return -1;
@@ -213,6 +361,7 @@ static int bm_cache_drop_slot(int slot, int wait) {
     atomic_store_explicit(&e->used, 0, memory_order_relaxed);
     e->path[0] = '\0';
     g_bm_cache_count--;
+    bm_test_note_entry_unlock();
     pthread_rwlock_unlock(&e->rwlock);
     if (saved_errno) {
         errno = saved_errno;
@@ -232,7 +381,10 @@ int bm_cache_invalidate_checked(const char *path) {
            identity is rechecked after taking the entry wrlock. */
         rc = bm_cache_drop_slot(slot, 1);
     }
+    /* Propagate the helper's -1 and exact errno across mutex cleanup. */
+    int saved_errno = errno;
     pthread_mutex_unlock(&g_bm_cache_lock);
+    errno = saved_errno;
     if (rc < 0) return -1;
 #ifdef TEST_BUILD
     if (bm_test_consume_failure(&g_bm_test_fail_invalidate_count)) {
@@ -269,7 +421,10 @@ static int bm_cache_invalidate_nowait(const char *path) {
     int slot = bm_cache_probe(path, &found);
     if (found && slot >= 0) {
         int rc = bm_cache_drop_slot(slot, 0);
+        /* Propagate the helper's -1 and exact errno across mutex cleanup. */
+        int saved_errno = errno;
         pthread_mutex_unlock(&g_bm_cache_lock);
+        errno = saved_errno;
         return rc;
     }
     pthread_mutex_unlock(&g_bm_cache_lock);
@@ -595,8 +750,20 @@ retry_bm_acquire:;
         pthread_rwlock_t *lock = &g_bm_cache[slot].rwlock;
         pthread_mutex_unlock(&g_bm_cache_lock);
 
-        if (writer) pthread_rwlock_wrlock(lock);
-        else        pthread_rwlock_rdlock(lock);
+        int hit_rc = bm_entry_lock_call(writer ? BM_TEST_LOCK_HIT_WR
+                                               : BM_TEST_LOCK_HIT_RD,
+                                        writer ? pthread_rwlock_wrlock
+                                               : pthread_rwlock_rdlock,
+                                        lock);
+        if (hit_rc != 0) {
+            /* Returned acquisition error: no entry access, no unlock, no
+               handle. The table mutex was already released above. */
+            bm_test_lock_diag(writer ? BM_TEST_LOCK_HIT_WR
+                                     : BM_TEST_LOCK_HIT_RD,
+                              hit_rc, path);
+            errno = hit_rc;
+            return NULL;
+        }
 
         BmCacheEntry *e = &g_bm_cache[slot];
         if (e->used && strcmp(e->path, path) == 0) {
@@ -612,6 +779,7 @@ retry_bm_acquire:;
                     /* Stale target: retire it non-blockingly, never waiting
                        on its entry lock. If it is busy, serve the current
                        path from a fresh uncached mapping. */
+                    bm_test_note_entry_unlock();
                     pthread_rwlock_unlock(lock);
                     if (bm_cache_invalidate_nowait(path) > 0)
                         goto retry_bm_acquire;
@@ -645,7 +813,7 @@ retry_bm_acquire:;
                coverity[missing_unlock] rwlock handoff to caller is intentional
                coverity[atomicity] slot stability guaranteed by rwlock + verify */
             BitmapShard *bm = calloc(1, sizeof(*bm));
-            if (!bm) { pthread_rwlock_unlock(lock); return NULL; }
+            if (!bm) { bm_test_note_entry_unlock(); pthread_rwlock_unlock(lock); return NULL; }
             bm->slot = slot;
             bm->writer = writer;
             bm->fd = e->fd;
@@ -664,6 +832,7 @@ retry_bm_acquire:;
         }
 
         /* Slot was evicted+reused while we were blocked on the rwlock. */
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(lock);
         if (++retries >= 4) {
             slot = -1; found = 0;
@@ -714,15 +883,23 @@ retry_bm_acquire:;
         }
         if (slot < 0 && writer && wait_candidate >= 0) {
             int drop_rc = bm_cache_drop_slot(wait_candidate, 1);
-            if (drop_rc > 0) slot = wait_candidate;
-            else if (drop_rc < 0 && first_error == 0) first_error = errno;
-            else if (drop_rc == 0) first_error = 0;
+            if (drop_rc > 0) {
+                slot = wait_candidate;
+            } else if (drop_rc < 0) {
+                /* A selected blocking-wait failure overrides any earlier try
+                   error and is returned promptly — never retried. */
+                first_error = errno;
+            }
+            /* drop_rc == 0 (identity changed under the lock): retain any
+               earlier try error; only when no error exists does the changed
+               identity retry. */
         }
         if (slot < 0 && writer && first_error != 0) {
+            int saved_error = first_error;
             pthread_mutex_unlock(&g_bm_cache_lock);
             munmap(map, sz);
             close(fd);
-            errno = first_error;
+            errno = saved_error;
             return NULL;
         }
     }
@@ -778,11 +955,25 @@ retry_bm_acquire:;
        against that. Verify-and-retry exactly like the hit path handles the
        resulting window where a concurrent evictor can steal this slot
        before we lock it. */
-    if (writer) pthread_rwlock_wrlock(lock);
-    else        pthread_rwlock_rdlock(lock);
+    int fill_rc = bm_entry_lock_call(writer ? BM_TEST_LOCK_FILL_WR
+                                            : BM_TEST_LOCK_FILL_RD,
+                                     writer ? pthread_rwlock_wrlock
+                                            : pthread_rwlock_rdlock,
+                                     lock);
+    if (fill_rc != 0) {
+        /* Returned acquisition error: free only the prospective handle. The
+           fd/map installed before the acquisition belong to the cache (or to
+           an intervening evictor) — never closed, unmapped or unlocked here. */
+        bm_test_lock_diag(writer ? BM_TEST_LOCK_FILL_WR : BM_TEST_LOCK_FILL_RD,
+                          fill_rc, path);
+        free(bm);
+        errno = fill_rc;
+        return NULL;
+    }
     if (!e->used || strcmp(e->path, path) != 0) {
         /* Stolen by a concurrent evictor; they now own disposing our
            fd/map. Retry from scratch. */
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(lock);
         free(bm);
         goto retry_bm_acquire;
@@ -851,6 +1042,7 @@ int bm_close_checked(BitmapShard *bm) {
 #ifdef TEST_BUILD
         if (bm->writer) bm_lock_order_trace(bm->path, '-');
 #endif
+        bm_test_note_entry_unlock();
         int rc = pthread_rwlock_unlock(&g_bm_cache[bm->slot].rwlock);
         if (rc != 0) saved_errno = rc;
     } else {

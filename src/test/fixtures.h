@@ -33,6 +33,29 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override);
    Returns the previous value so a specialized case can restore it. */
 int test_fixture_set_jobs(int jobs);
 
+/* Opt-in absolute startup deadline. `wait_daemon_ready`'s
+   readiness loop counts only its 50ms sleeps and excludes the time spent
+   inside tc_connect/tc_request, so a parked or trickling readiness probe is
+   not wall-clock bounded by the legacy path. When a deadline is active for
+   the calling thread, wait_daemon_ready runs its readiness loop in a
+   dedicated probe child and bounds the whole wait by
+   min(now+timeout, deadline), killing/reaping the probe child on expiry.
+   `absolute_monotonic_ms` is a CLOCK_MONOTONIC timestamp (0 disables the
+   override). Returns the previous deadline; a negative input returns -1
+   with errno=EINVAL and leaves the prior deadline unchanged. Thread-local:
+   set it in the thread that owns the TestEnv. */
+int64_t test_fixture_set_start_deadline_ms(int64_t absolute_monotonic_ms);
+
+/* One-shot readiness wait bounded by an explicit absolute monotonic
+   deadline: saves the scoped override, runs the same readiness watchdog
+   (probe child when an override is active), and restores the previous
+   override on all returns. Returns 0 when the daemon answers a db-dirs
+   probe, -1 on failure (errno=ETIMEDOUT when the deadline — already
+   expired or reached — caused the failure). Owns only its readiness probe
+   child; the caller still owns the daemon/stub identified by `pid`. */
+int test_fixture_wait_ready_until(int port, pid_t pid,
+                                  int64_t absolute_monotonic_ms);
+
 /* Stop the daemon (SIGTERM, then SIGKILL if it doesn't exit in 5s) and
    rm -rf the db_root. */
 void test_env_stop(TestEnv *env);

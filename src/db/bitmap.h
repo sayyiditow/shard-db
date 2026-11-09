@@ -102,7 +102,11 @@ void bm_cache_init(int cap);
 void bm_cache_shutdown(void);
 
 /* Drop the cache entry for `path` (e.g. after a reindex unlinks it).
-   Caller must ensure no thread holds the entry's rwlock. */
+   The blocking form returns -1 with the entry acquisition's exact errno when
+   the lock acquisition fails (e.g. EDEADLK when the calling thread holds the
+   entry's write lock); ordinary teardown errors propagate the same way.
+   Caller must ensure no OTHER thread holds the entry's rwlock. The void form
+   deliberately discards the result. */
 int bm_cache_invalidate_checked(const char *path);
 void bm_cache_invalidate(const char *path);
 
@@ -124,6 +128,10 @@ bm_publish_result bm_publish_replace(const char *target, const char *tmp_path);
 /* `writer`: 0 takes an rdlock on the cache slot (multiple concurrent
    readers allowed), 1 takes a wrlock (exclusive). Writers must use 1
    so bm_set / bm_clear / bm_grow are serialised. */
+/* Failure: NULL with errno set. Lock-acquisition errors surface the exact
+   pthread result (e.g. EDEADLK when a writer open's selected eviction
+   candidate is write-held by this thread); ordinary contention on another
+   thread's candidate still waits and succeeds on release. */
 BitmapShard *bm_open(const char *path, int slots, int create,
                      int bool_fastpath, uint32_t max_values, int writer);
 
@@ -140,6 +148,53 @@ void bm_close(BitmapShard *bm);
 void bm_test_fail_close_next(int count);
 void bm_test_fail_invalidate_next(int count);
 void bm_test_fail_reset(void);
+#endif
+
+/* Bitmap-cache seam site identifiers: the four bm_open_impl acquisition
+ * sites (hit/fill × reader/writer) and the two bm_cache_drop_slot modes
+ * (nonblocking try / selected blocking wait). Plain identifiers in all
+ * builds; the seam functions below are TEST_BUILD-only. */
+typedef enum {
+    BM_TEST_LOCK_HIT_RD = 0,
+    BM_TEST_LOCK_HIT_WR,
+    BM_TEST_LOCK_FILL_RD,
+    BM_TEST_LOCK_FILL_WR,
+    BM_TEST_LOCK_DROP_TRY,
+    BM_TEST_LOCK_DROP_WAIT,
+    BM_TEST_LOCK_SITE_COUNT
+} BmTestLockSite;
+
+#ifdef TEST_BUILD
+/* TEST_BUILD test seams: observation + one-shot fault injection for the
+ * bitmap cache's lock acquisition sites. Production builds contain none of
+ * this. */
+
+/* Arm one thread-local, per-site one-shot fault: the next acquisition at
+ * `site` on THIS thread returns `error` without calling pthread. Arming 0
+ * or an out-of-range site is a no-op; never synthesizes success. */
+void bm_test_fail_lock_next(int site, int error);
+
+/* How many one-shot faults this thread has consumed at `site`. */
+int  bm_test_lock_failure_consumed(int site);
+
+/* Zero this thread's armed faults and consumption counts. */
+void bm_test_reset_lock_failure(void);
+
+/* Process-wide count of acquisition attempts entered at `site` (published
+ * immediately before the pthread call, so a contended waiter is visible to
+ * the coordinating test thread before completion). Pure observation. */
+int  bm_test_lock_entered(int site);
+
+/* Thread-local count of cache-entry rwlock unlocks performed by this thread
+ * through bitmap.c (matched handoffs, evictions, closes). Scoped measurement
+ * for "a failed acquisition performed no unlock" assertions. */
+int  bm_test_entry_unlock_count(void);
+
+/* Startup-only bitmap cache capacity override for tests: 0 resets to the
+ * configured default, 16 forces the 16-entry/32-slot regression geometry.
+ * Any other value, or a call while a cache is initialized, is rejected
+ * (-1 with errno EINVAL / EBUSY). Not a supported configuration knob. */
+int  bm_test_set_cache_cap(int cap);
 #endif
 
 /* Synchronously fdatasync the bitmap file. `bm` must be opened with

@@ -412,6 +412,12 @@ int load_db_root(char *out, size_t outlen) {
     if (!f) { fprintf(stderr, "Error: db.env not found\n"); return -1; }
     char line[PATH_MAX + 64];
     int found_root = 0;
+#ifdef TEST_BUILD
+    /* Reset the startup-only bitmap-cache test override before parsing. An
+     * EBUSY here means a cache is already live: ordinary reentrant config
+     * loads leave the live cache (and override) unchanged. */
+    (void)bm_test_set_cache_cap(0);
+#endif
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
         if (strncmp(p, "export ", 7) == 0) p += 7;
@@ -612,6 +618,27 @@ int load_db_root(char *out, size_t outlen) {
             extern _Atomic size_t g_shard_test_kf_initial_slots;
             long n = atol(p + 22);
             if (n > 0) atomic_store(&g_shard_test_kf_initial_slots, (size_t)n);
+        } else if (strncmp(p, "BM_TEST_CACHE_CAP=", 18) == 0) {
+            /* TEST_BUILD-only startup seam for the bitmap-cache lock-error
+               regression cases: accepts exactly 16 (→ 32 hash slots, 16-entry
+               eviction threshold). Not a documented production setting; the
+               production parser neither changes BT_CACHE_MAX nor exposes any
+               operational override. An explicit value after cache
+               initialization is an error; malformed values are rejected. */
+            char *v = p + 18;
+            v[strcspn(v, "\r\n")] = '\0';
+            if (strcmp(v, "16") == 0) {
+                if (bm_test_set_cache_cap(16) != 0)
+                    fprintf(stderr,
+                            "config: BM_TEST_CACHE_CAP=16 rejected (%s); "
+                            "keeping default bitmap cache capacity\n",
+                            strerror(errno));
+            } else {
+                fprintf(stderr,
+                        "config: BM_TEST_CACHE_CAP=\"%s\" unsupported (only "
+                        "16 is valid); keeping default bitmap cache capacity\n",
+                        v);
+            }
 #endif
         } else if (strncmp(p, "SCHEMA_WRLOCK_TEST_DELAY_MS=", 28) == 0) {
             /* Test-only knob (widens dispatch_json_query's schema-mode
