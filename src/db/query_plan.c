@@ -2982,8 +2982,17 @@ CardEst card_est_leaf(const char *db_root, const char *object,
         for (int s = 0; s < splits; s++) {
             char bp[1024];
             bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
+            errno = 0;
             BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-            if (!bm) continue;
+            if (!bm) {
+                /* Never-written shard: zero. Any other failure makes the
+                   estimate unknown — discard the partial sum rather than
+                   under-estimate (estimates are not result answers). */
+                if (errno == ENOENT) continue;
+                e.k = 0;
+                e.estimable = 0;
+                return e;
+            }
             e.k += bm_count(bm, val, vlen);
             bm_close(bm);
         }

@@ -48,9 +48,9 @@ successfully. If no candidate succeeds, a writer waits on the selected busy
 candidate; a returned blocking error overrides an earlier try error. Thus a
 selected candidate write-held by the calling thread can return `EDEADLK`,
 which fails the writer open instead of being retried forever. Ordinary
-contention still waits for the other holder to release. Reader opens retain
-their existing uncached fallback when admission fails; removing that fallback
-is separate work.
+contention still waits for the other holder to release. Reader opens apply
+the same error precedence (they have no selected blocking wait); see
+"Cached-only bitmap handles" below for what happens when no error exists.
 
 This is deliberately narrow. `EDEADLK` is a pthread result, not portable
 ownership detection: a reader that self-upgrades from a read hold can still
@@ -66,6 +66,69 @@ no later eviction succeeds either). The
 acquire verification and retry, and no error erasure: a blocking-wait failure
 overrides an earlier try error, and busy/identity-change results never erase
 one.
+
+
+### Cached-only bitmap handles and checked corrupt-file retirement (Plan D)
+
+**Cached-only handles.** Once the bitmap cache is initialized (always, in the
+daemon and embedded mode) every handle `bm_open` returns holds its cache
+entry's rwlock, so an in-place keyfile-rebuild remap — which takes the
+entry's write lock — can never change the layout under a reader. The two
+former uncached returns are gone:
+
+- *Stale publication.* When a cached entry's inode no longer matches the path
+  (a replacement was published), the acquirer retires the entry
+  non-blockingly and retries. A retirement error fails the open with its exact
+  errno; a busy entry (another holder still reads the old inode) consumes an
+  admission retry.
+- *Saturation.* When every evictable entry is busy and no acquisition error
+  occurred, the private mapping is disposed and admission is retried.
+
+Admission is bounded: an initial attempt plus 4 retries, 2 ms apart, shared by
+both paths; exhaustion fails the open with `EBUSY`. The bound covers admission
+retrying only — an individual lock acquisition (e.g. a writer waiting for a
+reader to release, or the selected writer eviction wait) still blocks
+normally, so total open latency is not time-bounded. The Plan C error
+precedence is unchanged and applies to readers too: a returned acquisition
+error with no successful eviction fails the open with that error (never
+replaced by `EBUSY`); a later candidate's successful eviction can still
+satisfy the open. Only an uninitialized cache (test fixtures) hands out
+uncached reader handles; writers require the cache (`ENODEV`).
+
+A file whose header does not describe it — short file, bad magic, invalid
+stride/body bounds — fails the open with `EUCLEAN`; open/fstat/mmap failures
+keep their real errno.
+
+**Checked retirement before a corrupt skip.** A keyfile rebuild
+(`kf_bmfix_prepare`, under the shard's kf write lock, bitmaps in canonical
+path order) may skip a corrupt bitmap and leave it to the startup rebuild
+(`.bmfix-NNN` kept). It now does so only after retiring that path's cache
+entry with `bm_cache_invalidate_checked`:
+
+- open failed: only an `EUCLEAN` open is skip-eligible (the on-disk corruption
+  probe confirms it but never outranks an acquisition error such as
+  `EDEADLK`/`EIO`/`EBUSY`, which abort the rebuild);
+- prepare rejected the mapped header (`EUCLEAN`): the rebuild first releases
+  its own writer handle for that entry (checked), then retires the entry —
+  never while still holding that entry's write lock. Earlier retained paths
+  precede it in canonical order, so the order is preserved.
+
+`KF_BMFIX_SKIP` is logged only after a successful retirement. If the release
+or the retirement fails, the rebuild of that shard is abandoned instead
+(`KF_BMFIX_PREPARE_FAILED`, 5 s growth back-off): light vacuum reports
+`keyfile compaction failed` and the refused shard's keyfile is unchanged
+(vacuum compacts shards independently, so other shards may already have been
+compacted). A growth resplit that cannot run keeps the shard ungrown, and a
+bulk upsert stage needing that growth fails closed (`BULK_STAGE_UNGROWN`) for
+the client to retry.
+
+**Bitmap read failures are errors, not missing rows.** Read consumers treat a
+never-written shard file (`ENOENT`) as logically empty, but any other open
+failure is a hard error that propagates out of every worker fan-out after all
+workers join; KeySet collectors check every insert, and a full set (matches
+grew between sizing and enumeration) discards the collection with `ENOBUFS`
+rather than returning a truncated one. Bitmap handles are released before any
+record fetch (kfcache-before-bitmap order is unchanged).
 
 ## Per-kfcache-entry rwlock — the commit lock
 
@@ -494,3 +557,13 @@ re-fired after the chunked-resumable fetch rework — no lock is ever
 held across a `bt_cache_lock` re-probe). See
 `docs/plans/2026-08-28-eliminate-tsan-supp.md` for the per-finding
 rationale. Any new TSan report fails the gate and must be root-caused.
+
+Bitmap candidate sizing prefers `next_power_of_two(max(8192, 2*m))` actual
+slots for estimated matches `m`, subject to exact simultaneous request-budget
+reservations. If that floor alone does not fit, ordinary sizing may be used;
+allocation failures are not retried as smaller allocations. Actual insertion
+overflow after concurrent growth discards the incomplete optimization and
+recovers count/find/aggregate once from original record criteria, preserving
+the original absolute deadline. Hard read errors outrank insertion overflow
+after workers have joined. The floor is headroom, not a growth guarantee;
+queries retain existing concurrent-generation semantics, not snapshot isolation.

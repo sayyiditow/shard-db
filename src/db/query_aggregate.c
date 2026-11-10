@@ -12,6 +12,51 @@
 #include <math.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#ifdef TEST_BUILD
+#define AGG_CAPACITY_RECOVERY_NOTE() query_test_candidate_fallback_note("aggregate")
+
+/* TEST_BUILD-only top-N deadline trap: armed by a regression test, consumed
+ * once at a streaming top-N capacity handoff (after a real insertion
+ * overflow, before the caller's recovery decision). The trap spins, bounded,
+ * until the request's ORIGINAL absolute deadline has genuinely elapsed, so
+ * the caller must observe the expiry and refuse to start a recovery scan.
+ * It never writes the deadline, restarts it, or shortens it. */
+static __thread struct {
+    int      armed;
+    unsigned consumed;
+    int64_t  max_wait_ms;
+} agg_topn_dl_trap;
+
+void query_test_agg_topn_arm_deadline_trap(int max_wait_ms) {
+    agg_topn_dl_trap.armed = max_wait_ms > 0;
+    agg_topn_dl_trap.consumed = 0;
+    agg_topn_dl_trap.max_wait_ms = max_wait_ms;
+}
+
+unsigned query_test_agg_topn_deadline_trap_consumed(void) {
+    return agg_topn_dl_trap.consumed;
+}
+
+static void agg_topn_deadline_trap(QueryDeadline *dl) {
+    if (!agg_topn_dl_trap.armed || !dl || dl->timeout_ms == 0) return;
+    if (candidate_deadline_expired(dl)) return;
+    agg_topn_dl_trap.armed = 0;   /* one-shot per arm */
+    agg_topn_dl_trap.consumed++;
+    int64_t start = now_ms_coarse();
+    /* Spin until candidate_deadline_expired itself flips: its strict
+       `now - t0 > timeout` is the same predicate the caller re-checks
+       after the handoff, so exiting on `now >= t0 + timeout` instead
+       could land on the boundary and let the guard miss by a tick. */
+    while (!candidate_deadline_expired(dl) &&
+           now_ms_coarse() - start < (uint64_t)agg_topn_dl_trap.max_wait_ms) {
+        struct timespec ts = { 0, 2 * 1000 * 1000L };
+        nanosleep(&ts, NULL);
+    }
+}
+#else
+#define AGG_CAPACITY_RECOVERY_NOTE() ((void)0)
+static inline void agg_topn_deadline_trap(QueryDeadline *dl) { (void)dl; }
+#endif
 /* Forward decls — defined below. */
 static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ctx);
 static void agg_note_error(void*,int);
@@ -133,10 +178,15 @@ static void agg_note_predicate_error(void*,int);
 static void keyset_agg_from_or(const char *db_root, const char *object,
                                const Schema *sch, void *agg_ctx,
                                CriteriaNode *or_node, QueryDeadline *dl,
-                               int *out_budget_exceeded) {
+                               int *out_budget_exceeded, int *out_capacity) {
     /* Aggregate needs the full union — no short-circuit (target_count=0). */
-    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl,
-                                 out_budget_exceeded, 0);
+    CandidateBuildOut cb;
+    KeySet *ks = build_or_keyset_ck(db_root, object, sch->splits, or_node, dl,
+                                    out_budget_exceeded, 0, NULL, &cb);
+    if (!ks && cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+        *out_capacity = 1;
+        return;
+    }
     if (!ks){if(errno)agg_note_predicate_error(agg_ctx,errno);return;}
     if (dl->timed_out) { keyset_free(ks); return; }
     keyset_emit_agg(db_root, object, sch, ks, agg_ctx, dl);
@@ -153,12 +203,17 @@ static int keyset_agg_from_intersect(const char *db_root, const char *object,
                                      const Schema *sch, void *agg_ctx,
                                      const FilterPlan *fp, CriteriaNode *full_tree,
                                      CriteriaNode **agg_ctx_tree_field,
-                                     QueryDeadline *dl) {
+                                     QueryDeadline *dl, int *out_capacity) {
     int small_primary = 0;
-    KeySet *ks = intersect_indexed_leaves(db_root, object, sch->splits,
-                                          (SearchCriterion **)fp->source_leaves,
-                                          fp->n_source, dl,
-                                          &small_primary);
+    CandidateBuildOut cb;
+    KeySet *ks = intersect_indexed_leaves_ck(db_root, object, sch->splits,
+                                             (SearchCriterion **)fp->source_leaves,
+                                             fp->n_source, dl,
+                                             &small_primary, NULL, &cb);
+    if (!ks && cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+        *out_capacity = 1;
+        return 0;
+    }
     if (!ks){if(errno)agg_note_predicate_error(agg_ctx,errno);return 0;}
 
     if (small_primary || fp->n_postfilter > 0) {
@@ -840,7 +895,8 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
                                       int limit,
                                       CriteriaNode *tree,
                                       QueryDeadline *dl,
-                                      int want_total)
+                                      int want_total,
+                                      int *out_capacity)
 {
     int order_spec_idx = -1;
     for (int i = 0; i < nspecs; i++) {
@@ -887,10 +943,18 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
         }
         if (topn_fp.kind == FP_INTERSECT) {
             int sp = 0;
-            prefilter = intersect_indexed_leaves(db_root, object, sch->splits,
-                                                  topn_fp.source_leaves,
-                                                  topn_fp.n_source,
-                                                  dl, &sp);
+            CandidateBuildOut cb;
+            prefilter = intersect_indexed_leaves_ck(db_root, object, sch->splits,
+                                                    topn_fp.source_leaves,
+                                                    topn_fp.n_source,
+                                                    dl, &sp, NULL, &cb);
+            if (!prefilter && cb.reason == CBF_INSERT_CAPACITY &&
+                !candidate_deadline_expired(dl)) {
+                *out_capacity = 1;
+                agg_topn_deadline_trap(dl);
+                topn_heap_destroy(heap);
+                return -2;   /* caller's agg_run_plan goes straight to scan */
+            }
             /* small_primary: intersect_indexed_leaves returned ONLY the
                smallest leaf's keyset (the rest expect a per-record
                post-filter, which the walk can't do). The prefilter is
@@ -908,18 +972,44 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
                inverts membership when we built the complement. */
             if (prim && (prim->op == OP_EQUAL || prim->op == OP_IN) &&
                 field_has_index_type(db_root, object, prim->field, IT_BITMAP)) {
-                prefilter = build_smaller_bitmap_keyset(
+                CandidateBuildOut cb;
+                prefilter = build_smaller_bitmap_keyset_ck(
                     db_root, object, sch->splits, prim,
                     resolve_idx_field(fs->ts, prim->field),
-                    dl, &prefilter_inverted);
+                    dl, &prefilter_inverted, NULL, &cb);
+                if (!prefilter && cb.reason == CBF_INSERT_CAPACITY &&
+                    !candidate_deadline_expired(dl)) {
+                    *out_capacity = 1;
+                    agg_topn_deadline_trap(dl);
+                    topn_heap_destroy(heap);
+                    return -2;
+                }
             } else {
-                prefilter = build_keyset_from_leaf(db_root, object, sch->splits,
-                                                   prim, dl);
+                CandidateBuildOut cb;
+                prefilter = build_keyset_from_leaf_ck(db_root, object,
+                                                      sch->splits, prim, dl,
+                                                      NULL, &cb);
+                if (!prefilter && cb.reason == CBF_INSERT_CAPACITY &&
+                    !candidate_deadline_expired(dl)) {
+                    *out_capacity = 1;
+                    agg_topn_deadline_trap(dl);
+                    topn_heap_destroy(heap);
+                    return -2;
+                }
             }
         } else if (topn_fp.kind == FP_UNION) {
             int budget = 0;
-            prefilter = build_or_keyset(db_root, object, sch->splits,
-                                        topn_fp.or_node, dl, &budget, 0);
+            CandidateBuildOut cb;
+            prefilter = build_or_keyset_ck(db_root, object, sch->splits,
+                                           topn_fp.or_node, dl, &budget, 0,
+                                           NULL, &cb);
+            if (!prefilter && cb.reason == CBF_INSERT_CAPACITY &&
+                !candidate_deadline_expired(dl)) {
+                *out_capacity = 1;
+                agg_topn_deadline_trap(dl);
+                topn_heap_destroy(heap);
+                return -2;
+            }
         } else {
             topn_heap_destroy(heap);
             return -2;
@@ -932,9 +1022,11 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
         /* Criteria existed but no prefilter could be built (budget overflow
            or builder error). Do NOT walk unfiltered — that silently drops
            the criterion and over-counts. Fall back to the scan+hashmap path
-           which evaluates criteria per record. */
+           which evaluates criteria per record (no bucket has accumulated
+           yet, so the whole-record fallback is exact). */
         if (!prefilter) {
             topn_heap_destroy(heap);
+            errno = 0;   /* deliberate fallback, not a reported error */
             return -2;
         }
     }
@@ -1103,6 +1195,7 @@ typedef struct {
        classification of every aggregate and group field. */
     AggEnv     env;
     int        agg_error;
+    int        disable_candidate_plans; /* capacity recovery ran */
     AggNumSpec spec_nums[MAX_AGG_SPECS];
     uint8_t    spec_is_num[MAX_AGG_SPECS];
     AggNumSpec group_nums[MAX_FIELDS];
@@ -3675,6 +3768,22 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
      * fetching=0: intersect stays index-only for count-like paths; the
      * executor fetches records itself when specs require it. */
     size_t agg_run_N = (size_t)get_live_count(db_root, object);
+    /* One-way recovery: once candidate capacity overflow forced a
+       whole-record aggregate, no candidate plan may run again in this
+       request — the full kf-shard scan evaluates the original tree. */
+    if (ctx->disable_candidate_plans) {
+        SlotcaskSchemaInfo info = {
+            .splits = sch->splits, .slot_size = sch->slot_size,
+            .streams = sch->streams,
+        };
+        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
+        if (sdb) parallel_agg_scan_shards_o_direct(ctx, sdb);
+        else ctx->agg_error = EIO;   /* no scan possible: error, not empty */
+        if (ctx->deadline->timed_out) return -1;
+        if (ctx->budget_exceeded || ctx->predicate_error || ctx->agg_error) return -1;
+        return 0;
+    }
+
     FilterPlan agg_run_fp = plan_filter(tree, db_root, object, ctx->fs,
                                          sch->splits, agg_run_N,
                                          NULL /*order_by*/, 0 /*fetching*/,
@@ -3726,14 +3835,24 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
     } else if (agg_run_fp.kind == FP_INTERSECT) {
         CriteriaNode *saved = ctx->tree;
         ctx->tree = NULL;
+        int capacity = 0;
         keyset_agg_from_intersect(db_root, object, sch, ctx, &agg_run_fp,
-                                  saved, &ctx->tree, ctx->deadline);
+                                  saved, &ctx->tree, ctx->deadline, &capacity);
         ctx->tree = saved;
+        if (capacity) {
+            AGG_CAPACITY_RECOVERY_NOTE();
+            ctx->disable_candidate_plans = 1;
+        }
     } else if (agg_run_fp.kind == FP_UNION) {
         int budget_exceeded = 0;
+        int capacity = 0;
         keyset_agg_from_or(db_root, object, sch, ctx, agg_run_fp.or_node,
-                           ctx->deadline, &budget_exceeded);
+                           ctx->deadline, &budget_exceeded, &capacity);
         if (budget_exceeded) ctx->budget_exceeded = 1;
+        if (capacity) {
+            AGG_CAPACITY_RECOVERY_NOTE();
+            ctx->disable_candidate_plans = 1;
+        }
     } else {
         /* Hash aggregation: parallel kf shard scan with per-worker cloned
            AggCtx (own hash table per kf shard), merged at end. */
@@ -3744,6 +3863,22 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
         SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
         if (sdb) parallel_agg_scan_shards_o_direct(ctx, sdb);
         else ctx->agg_error = EIO;   /* no scan possible: error, not empty */
+    }
+
+    if (ctx->disable_candidate_plans && !ctx->deadline->timed_out &&
+        !ctx->budget_exceeded && !ctx->predicate_error && !ctx->agg_error) {
+        /* Candidate overflow — discard candidate state (no buckets were
+           emitted: emission only runs on success) and scan every live
+           record once, evaluating the original tree. */
+        LOG_WARN(LOG_SUB_QUERY, "candidate capacity exceeded after concurrent growth; "
+                 "recovering from full record scan (aggregate)");
+        SlotcaskSchemaInfo info = {
+            .splits = sch->splits, .slot_size = sch->slot_size,
+            .streams = sch->streams,
+        };
+        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
+        if (sdb) parallel_agg_scan_shards_o_direct(ctx, sdb);
+        else ctx->agg_error = EIO;
     }
 
     if (ctx->deadline->timed_out) return -1;
@@ -4397,6 +4532,7 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                             const Schema *sch_in, const FieldSchema *fs_in) {
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
 
+    int topn_cap_fb = 0;   /* set when the streaming top-N hit capacity */
     Schema sch;
     FieldSchema fs;
     if (sch_in && fs_in) { sch = *sch_in; fs = *fs_in; }   /* test seam: private schema */
@@ -4544,6 +4680,8 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         }
     }
 
+    QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
+
     /* Streaming top-N dispatch: eligible_for_topn_stream + agg_run_topn_stream.
      * Build a CSV form of group_by_json for the eligibility check. */
     {
@@ -4585,17 +4723,20 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                        text_order = 1;
                }
                !text_order; })) {
-            QueryDeadline topn_dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
             int rc = agg_run_topn_stream(db_root, object, &sch, &fs,
                                           specs, nspecs, gb_csv,
                                           order_by, order_desc,
-                                          limit, tree, &topn_dl,
-                                          want_total);
+                                          limit, tree, &dl,
+                                          want_total, &topn_cap_fb);
             if (rc == 0) {
                 return 0;
             }
             if (rc == -3) return -1; /* error response was already written */
             if (rc == -1) {
+                OUT("{\"error\":\"query_timeout\"}\n");
+                return -1;
+            }
+            if (candidate_deadline_expired(&dl)) {
                 OUT("{\"error\":\"query_timeout\"}\n");
                 return -1;
             }
@@ -4606,11 +4747,17 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
     /* Build context */
     AggCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
+    if (topn_cap_fb) {
+        AGG_CAPACITY_RECOVERY_NOTE();
+        ctx.disable_candidate_plans = 1;
+        LOG_WARN(LOG_SUB_QUERY, "candidate capacity exceeded after "
+                 "concurrent growth; recovering from full record scan "
+                 "(aggregate)");
+    }
     ctx.tree = tree;
     ctx.fs = &fs;
     ctx.specs = specs;
     ctx.nspecs = nspecs;
-    QueryDeadline dl = { now_ms_coarse(), resolve_timeout_ms(), 0 };
     ctx.deadline = &dl;
     _Atomic size_t agg_budget_bytes = 0;
     atomic_init(&agg_budget_bytes, 0);
@@ -5085,16 +5232,30 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                     if (op_needs_check_primary(lop) || op_is_length(lop)) {
                         aw_indef = 1;
                     } else {
-                        crit_ks = build_keyset_from_leaf(db_root, object, sch.splits,
-                                                          aw_prim, &dl);
+                        CandidateBuildOut cb;
+                        crit_ks = build_keyset_from_leaf_ck(db_root, object,
+                                                            sch.splits, aw_prim,
+                                                            &dl, NULL, &cb);
+                        if (!crit_ks && cb.reason == CBF_INSERT_CAPACITY &&
+                            !dl.timed_out) {
+                            AGG_CAPACITY_RECOVERY_NOTE();
+                            ctx.disable_candidate_plans = 1;
+                        }
                     }
                 }
             } else if (aw_fp.kind == FP_INTERSECT) {
                 int small_primary = 0;
-                crit_ks = intersect_indexed_leaves(db_root, object, sch.splits,
-                                                    aw_fp.source_leaves,
-                                                    aw_fp.n_source,
-                                                    &dl, &small_primary);
+                CandidateBuildOut cb;
+                crit_ks = intersect_indexed_leaves_ck(db_root, object, sch.splits,
+                                                      aw_fp.source_leaves,
+                                                      aw_fp.n_source,
+                                                      &dl, &small_primary, NULL,
+                                                      &cb);
+                if (!crit_ks && cb.reason == CBF_INSERT_CAPACITY &&
+                    !dl.timed_out) {
+                    AGG_CAPACITY_RECOVERY_NOTE();
+                    ctx.disable_candidate_plans = 1;
+                }
                 if (small_primary) {
                     if (crit_ks) keyset_free(crit_ks);
                     crit_ks = NULL;
@@ -5102,9 +5263,15 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                 }
             } else if (aw_fp.kind == FP_UNION) {
                 int budget_exceeded = 0;
-                crit_ks = build_or_keyset(db_root, object, sch.splits,
-                                           aw_fp.or_node, &dl,
-                                           &budget_exceeded, 0);
+                CandidateBuildOut cb;
+                crit_ks = build_or_keyset_ck(db_root, object, sch.splits,
+                                             aw_fp.or_node, &dl,
+                                             &budget_exceeded, 0, NULL, &cb);
+                if (!crit_ks && cb.reason == CBF_INSERT_CAPACITY &&
+                    !dl.timed_out) {
+                    AGG_CAPACITY_RECOVERY_NOTE();
+                    ctx.disable_candidate_plans = 1;
+                }
                 if (budget_exceeded) {
                     if (crit_ks) keyset_free(crit_ks);
                     crit_ks = NULL;
@@ -5642,8 +5809,15 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                 char bp[1024];
                 bm_build_path(bp, sizeof(bp), db_root, object,
                               ctx.group_fields[0], s);
+                errno = 0;
                 BitmapShard *bms = bm_open(bp, 0, 0, 0, 0, 0);
-                if (!bms) continue;
+                if (!bms) {
+                    /* A never-written shard has no values; any other open
+                       failure would silently drop that shard's groups. */
+                    if (errno == ENOENT) continue;
+                    ctx.agg_error = errno ? errno : EIO;
+                    goto igb_skip;
+                }
                 BmDictCollectCtx dc = { .vals = bm_vals, .vlens = bm_vlens,
                                         .n = &bm_n, .cap = 256 };
                 bm_iter_values(bms, bm_collect_uniq_cb, &dc);
@@ -5657,6 +5831,10 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                     size_t total = bm_popcount_one_value(
                         db_root, object, ctx.group_fields[0],
                         sch.splits, bm_vals[i], bm_vlens[i]);
+                    if (total == SIZE_MAX) {
+                        ctx.agg_error = errno ? errno : EIO;
+                        goto igb_skip;
+                    }
                     if (total == 0) continue;
                     char display[512];
                     int dlen = agg_index_label(&ctx, 0, bm_vals[i], bm_vlens[i],
@@ -5723,7 +5901,15 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                                           igb_crit_fp.source_leaves[ci]->field, s);
                             hpaths[1 + ci] = cps[ci];
                         }
-                        if (bm_open_many_ro(hpaths, 1 + n_crit, held) != 0) continue;
+                        if (bm_open_many_ro(hpaths, 1 + n_crit, held) != 0) {
+                            /* A missing input makes this shard's slot
+                               intersection logically empty; any other
+                               failure is a hard error, never a dropped
+                               shard. */
+                            if (errno == ENOENT) continue;
+                            ctx.agg_error = errno ? errno : EIO;
+                            goto igb_skip;
+                        }
                         BitmapShard *gb_bm = held[0];
                         BitmapShard **c_bms = &held[1];
 
@@ -5799,8 +5985,13 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                 char bp[1024];
                 bm_build_path(bp, sizeof(bp), db_root, object,
                               ctx.group_fields[0], s);
+                errno = 0;
                 BitmapShard *bms = bm_open(bp, 0, 0, 0, 0, 0);
-                if (!bms) continue;
+                if (!bms) {
+                    if (errno == ENOENT) continue;
+                    ctx.agg_error = errno ? errno : EIO;
+                    goto igb_skip;
+                }
                 BmDictCollectCtx dc = { .vals = bm_vals_h, .vlens = bm_vlens_h,
                                         .n = &bm_n_h, .cap = 256 };
                 bm_iter_values(bms, bm_collect_uniq_cb, &dc);
@@ -5856,10 +6047,18 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                         if (query_deadline_tick(&dl, &bm_dl_h)) {
                             bm_aborted = 1; break;
                         }
-                        bitmap_emit_for_shard(db_root, object,
-                                              ctx.group_fields[0], s,
-                                              bm_vals_h[v], bm_vlens_h[v],
-                                              bm_hbk_insert_cb, &bx, bm_sdb);
+                        if (bitmap_emit_for_shard(db_root, object,
+                                                  ctx.group_fields[0], s,
+                                                  bm_vals_h[v], bm_vlens_h[v],
+                                                  bm_hbk_insert_cb, &bx,
+                                                  bm_sdb) < 0) {
+                            /* A shard whose bitmap cannot be read would
+                               under-count its bucket: fail the aggregate
+                               instead of emitting partial groups. */
+                            ctx.agg_error = errno ? errno : EIO;
+                            hbk_free(&hbk_bm);
+                            goto igb_skip;
+                        }
                     }
                 }
 
@@ -5921,14 +6120,33 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                     if (hbk_ready) hbk_free(&hbk);
                     goto igb_skip;
                 }
-                crit_ks = build_keyset_from_leaf(db_root, object, sch.splits,
-                                                  igb_prim, &dl);
+                CandidateBuildOut cb;
+                crit_ks = build_keyset_from_leaf_ck(db_root, object, sch.splits,
+                                                    igb_prim, &dl, NULL, &cb);
+                if (!crit_ks && cb.reason == CBF_INSERT_CAPACITY &&
+                    !dl.timed_out) {
+                    AGG_CAPACITY_RECOVERY_NOTE();
+                    ctx.disable_candidate_plans = 1;
+                    LOG_WARN(LOG_SUB_QUERY, "candidate capacity exceeded after "
+                             "concurrent growth; recovering from full record "
+                             "scan (aggregate)");
+                }
             } else if (igb_crit_fp.kind == FP_INTERSECT) {
                 int small_primary = 0;
-                crit_ks = intersect_indexed_leaves(db_root, object, sch.splits,
-                                                    igb_crit_fp.source_leaves,
-                                                    igb_crit_fp.n_source,
-                                                    &dl, &small_primary);
+                CandidateBuildOut cb;
+                crit_ks = intersect_indexed_leaves_ck(db_root, object, sch.splits,
+                                                      igb_crit_fp.source_leaves,
+                                                      igb_crit_fp.n_source,
+                                                      &dl, &small_primary, NULL,
+                                                      &cb);
+                if (!crit_ks && cb.reason == CBF_INSERT_CAPACITY &&
+                    !dl.timed_out) {
+                    AGG_CAPACITY_RECOVERY_NOTE();
+                    ctx.disable_candidate_plans = 1;
+                    LOG_WARN(LOG_SUB_QUERY, "candidate capacity exceeded after "
+                             "concurrent growth; recovering from full record "
+                             "scan (aggregate)");
+                }
                 if (small_primary) {
                     /* Small-primary intersect needs criteria_match_tree per
                        record to confirm — that's the scan-path's job, not
@@ -5939,9 +6157,18 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                 }
             } else if (igb_crit_fp.kind == FP_UNION) {
                 int budget_exceeded = 0;
-                crit_ks = build_or_keyset(db_root, object, sch.splits,
-                                           igb_crit_fp.or_node, &dl,
-                                           &budget_exceeded, 0);
+                CandidateBuildOut cb;
+                crit_ks = build_or_keyset_ck(db_root, object, sch.splits,
+                                             igb_crit_fp.or_node, &dl,
+                                             &budget_exceeded, 0, NULL, &cb);
+                if (!crit_ks && cb.reason == CBF_INSERT_CAPACITY &&
+                    !dl.timed_out) {
+                    AGG_CAPACITY_RECOVERY_NOTE();
+                    ctx.disable_candidate_plans = 1;
+                    LOG_WARN(LOG_SUB_QUERY, "candidate capacity exceeded after "
+                             "concurrent growth; recovering from full record "
+                             "scan (aggregate)");
+                }
                 if (budget_exceeded) {
                     if (crit_ks) keyset_free(crit_ks);
                     if (hbk_ready) hbk_free(&hbk);

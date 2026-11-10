@@ -1070,6 +1070,12 @@ int test_env_ctl_set_bmlock_log(TestEnv *env, int on) {
     return ctl_set_globals(env, 3, (uint64_t)(on ? 1 : 0), 0);
 }
 
+int test_env_ctl_set_bmks_race(TestEnv *env, int stage) {
+    /* stage > 0 arms the one-shot barrier; 0 releases the gate + disarms.
+     * phase 4 = TEST_HOOK_SET_GLOBALS_BMKS_RACE (test_control.c). */
+    return ctl_set_globals(env, 4, (uint64_t)stage, 0);
+}
+
 int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
     /* phase 1 = TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL (test_control.c). */
     return ctl_set_globals(env, 1, (uint64_t)(fail ? 1 : 0), 0);

@@ -503,15 +503,45 @@ typedef struct CriteriaNode {
    from their respective B+ tree lookups; duplicates are deduplicated via
    lock-free CAS inserts. Capacity is fixed at construction — callers must
    pre-size large enough to avoid hitting full (probes return failure). */
+/* Request-owned candidate memory budget for prepared bitmap find sources.
+   `limit` is fixed at creation; `used`/`peak` are the live and highest
+   simultaneous actual charges (exact allocation bytes). */
+typedef struct {
+    size_t         limit;
+    _Atomic size_t used;
+    _Atomic size_t peak;
+} KeySetBudget;
+
 typedef struct {
     uint8_t  (*keys)[16];    /* cap buckets of 16-byte xxh128 */
     uint32_t *state;          /* 0=empty, 1=filling, 2=filled */
     size_t   cap;             /* power of two */
     size_t   mask;            /* cap - 1 */
     _Atomic size_t n;         /* filled count (approximate until all threads join) */
+    KeySetBudget *budget;     /* charged budget, NULL when unbudgeted */
+    size_t   budget_charge;   /* exact bytes released by keyset_free */
 } KeySet;
 
 KeySet *keyset_new(size_t capacity_hint);
+/* Exact bytes keyset_new(hint) allocates (object + keys + state at the shared
+   capacity rule). 0, or -1 with errno EOVERFLOW. */
+int     keyset_allocation_bytes(size_t capacity_hint, size_t *out);
+/* Slot capacity keyset_new(hint) would use (shared rule; no second
+   formula). 0, or -1 with errno EOVERFLOW. */
+int     keyset_capacity_hint_slots(size_t capacity_hint, size_t *out_slots);
+/* keyset_new charged against `budget` (exact bytes, reserved before
+   allocation, rolled back on failure). NULL/ENOBUFS when it does not fit.
+   NULL budget = keyset_new. */
+KeySet *keyset_new_budgeted(size_t capacity_hint, KeySetBudget *budget);
+/* Charge / release non-KeySet candidate memory against the same budget.
+   reserve: 0, or -1/ENOBUFS without charging. NULL budget = no-op. */
+int     keyset_budget_reserve(KeySetBudget *budget, size_t bytes);
+void    keyset_budget_release(KeySetBudget *budget, size_t bytes);
+#ifdef TEST_BUILD
+/* Thread-local one-shot: the next budgeted allocation on this thread fails
+   (ENOMEM) after its reservation, exercising the rollback. */
+void    keyset_test_fail_budgeted_alloc_next(int on);
+#endif
 void    keyset_free(KeySet *ks);
 /* Returns 1 if newly inserted, 0 if duplicate, -1 if set is full. */
 int     keyset_insert(KeySet *ks, const uint8_t hash[16]);

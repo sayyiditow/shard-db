@@ -131,7 +131,17 @@ bm_publish_result bm_publish_replace(const char *target, const char *tmp_path);
 /* Failure: NULL with errno set. Lock-acquisition errors surface the exact
    pthread result (e.g. EDEADLK when a writer open's selected eviction
    candidate is write-held by this thread); ordinary contention on another
-   thread's candidate still waits and succeeds on release. */
+   thread's candidate still waits and succeeds on release.
+   With an initialized cache every returned handle is cache-backed (it holds
+   its entry's rwlock, so an in-place rebuild remap excludes it): a stale
+   entry that cannot be retired, or a cache saturated with busy entries,
+   retries admission a bounded number of times and then fails with EBUSY
+   instead of returning an uncached mapping. That bound covers admission
+   retrying only; an individual lock acquisition still blocks normally.
+   A file whose header does not describe it (short file, bad magic, invalid
+   stride/body bounds) fails with EUCLEAN; open/fstat/mmap failures keep
+   their real syscall errno. Only an uninitialized cache (test fixtures)
+   returns uncached reader handles; writers need the cache (ENODEV). */
 BitmapShard *bm_open(const char *path, int slots, int create,
                      int bool_fastpath, uint32_t max_values, int writer);
 
@@ -148,6 +158,13 @@ void bm_close(BitmapShard *bm);
 void bm_test_fail_close_next(int count);
 void bm_test_fail_invalidate_next(int count);
 void bm_test_fail_reset(void);
+/* Test-only corruption helper (TEST_BUILD builds only): open the normal
+ * writer handle for `path` and rewrite only the mapped header's n_values
+ * so the described body extends past the file, then msync + close. The
+ * next cold open fails with EUCLEAN; a warm cached mapping carries the
+ * damaged header into bm_slotmap_prepare's bounds check. Returns 0 or
+ * -1 with errno. No production disk-format surface. */
+int bm_test_damage_header_bounds(const char *path);
 #endif
 
 /* Bitmap-cache seam site identifiers: the four bm_open_impl acquisition
@@ -179,6 +196,12 @@ int  bm_test_lock_failure_consumed(int site);
 
 /* Zero this thread's armed faults and consumption counts. */
 void bm_test_reset_lock_failure(void);
+typedef struct {
+    int faults[BM_TEST_LOCK_SITE_COUNT];
+    int consumed[BM_TEST_LOCK_SITE_COUNT];
+} BmTestLockFaultState;
+void bm_test_lock_fault_save(BmTestLockFaultState *state);
+void bm_test_lock_fault_restore(const BmTestLockFaultState *state);
 
 /* Process-wide count of acquisition attempts entered at `site` (published
  * immediately before the pthread call, so a contended waiter is visible to

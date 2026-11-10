@@ -10,10 +10,237 @@
 #include "typed_row.h"
 #include <math.h>
 #include <dirent.h>
+/* Bitmap-KeySet race seam stage ids: plain identifiers in all builds; the
+ * seam functions below are TEST_BUILD-only (see query_internal.h). */
+#define BMKS_RACE_EQ         1
+#define BMKS_RACE_GENERIC    2
+#define BMKS_RACE_COMPLEMENT 3
+#define BMKS_RACE_OR         4
+
 #ifdef TEST_BUILD
+static void bm_defer_gate_park(void);   /* defined with the find-flush gate */
+
 #include <stdatomic.h>
 #include "shard_test_ctl.h"
 #include "test_control.h"
+
+/* Bitmap-KeySet race seam (TEST_BUILD only, inert in production builds):
+ * a one-shot barrier parked between a bitmap candidate builder's sizing
+ * pass and its enumeration pass so a concurrent writer can add matches
+ * that overflow the already-allocated KeySet. Arming is per calling thread
+ * with an explicit stage id, so only that thread's own build consumes the
+ * barrier; the coordination state (parked flag, gate, observation counters)
+ * is process-visible so the test's writer thread can observe the park and
+ * release it. No production code path reads any of this state. */
+
+/* Daemon-side arm (control channel SET_GLOBALS phase 4; see shard_test_ctl.h).
+ * A stage armed here is consumed once by the next matching build on any
+ * thread; the gate is released via the same channel or the test hook. */
+_Atomic int g_shard_test_bmks_stage;
+_Atomic int g_shard_test_bmks_gate;
+
+static __thread _Atomic int bm_ks_race_armed;   /* BMKS_RACE_* stage or 0 */
+
+static _Atomic int      bm_ks_race_reached;     /* barrier consumed */
+static _Atomic int      bm_ks_race_gate;        /* 0 = parked, 1 = released */
+static _Atomic int      bm_ks_race_gate_opened; /* gate released for this run */
+static _Atomic unsigned bm_ks_race_cap;         /* KeySet cap behind barrier */
+static _Atomic unsigned bm_ks_race_sized;       /* sizing-pass estimate */
+static _Atomic unsigned bm_ks_race_fail_inserts;
+
+int query_bm_test_arm_keyset_race(int stage) {
+    if (stage <= 0) return -1;
+    atomic_store(&bm_ks_race_armed, stage);
+    atomic_store(&bm_ks_race_reached, 0);
+    atomic_store(&bm_ks_race_gate, 0);
+    atomic_store(&bm_ks_race_gate_opened, 0);
+    atomic_store(&bm_ks_race_cap, 0);
+    atomic_store(&bm_ks_race_sized, 0);
+    atomic_store(&bm_ks_race_fail_inserts, 0);
+    return 0;
+}
+
+void query_bm_test_race_open_gate(void) {
+    atomic_store(&bm_ks_race_gate, 1);
+    atomic_store(&bm_ks_race_gate_opened, 1);
+}
+
+int query_bm_test_race_reached(void) {
+    return atomic_load(&bm_ks_race_reached);
+}
+
+int query_bm_test_race_gate_opened(void) {
+    return atomic_load(&bm_ks_race_gate_opened);
+}
+
+unsigned query_bm_test_race_allocated_cap(void) {
+    return atomic_load(&bm_ks_race_cap);
+}
+
+unsigned query_bm_test_race_sized_total(void) {
+    return atomic_load(&bm_ks_race_sized);
+}
+
+unsigned query_bm_test_race_insert_fails(void) {
+    return atomic_load(&bm_ks_race_fail_inserts);
+}
+
+void query_bm_test_race_reset(void) {
+    atomic_store(&bm_ks_race_armed, 0);
+    atomic_store(&bm_ks_race_gate, 0);
+}
+
+/* Barrier call site: consume the armed stage, publish the sizing result
+ * and the allocated capacity, then poll the gate (bounded; the test's
+ * child watchdog is the outer bound). One-shot: disarms itself. */
+static void bm_ks_race_barrier(int stage, size_t sized_total, size_t cap) {
+    int global_armed = atomic_load(&g_shard_test_bmks_stage) == stage;
+    int local_armed = atomic_load(&bm_ks_race_armed) == stage;
+    if (!local_armed && !global_armed) return;
+    atomic_store(&bm_ks_race_sized, (unsigned)sized_total);
+    atomic_store(&bm_ks_race_cap, (unsigned)cap);
+    atomic_store(&bm_ks_race_reached, 1);
+    if (global_armed) {
+        atomic_store(&g_shard_test_bmks_stage, 0);   /* one-shot */
+        LOG_WARN(LOG_SUB_QUERY,
+                 "BMKS-BARRIER-REACHED stage=%d sized=%zu cap=%u",
+                 stage, sized_total, (unsigned)cap);
+        /* The find-flush gate hook blocks until the test releases it; its
+         * return IS the release for the daemon path (no second wait). */
+        bm_defer_gate_park();
+        return;
+    }
+    for (int i = 0; i < 40000; i++) {          /* bounded park (~120 s max) */
+        if (atomic_load_explicit(&bm_ks_race_gate, memory_order_acquire) ||
+            atomic_load_explicit(&g_shard_test_bmks_gate,
+                                 memory_order_acquire))
+            break;
+        struct timespec ts = { 0, 3 * 1000 * 1000L };
+        nanosleep(&ts, NULL);
+    }
+    atomic_store(&bm_ks_race_armed, 0);
+    atomic_store(&bm_ks_race_gate, 0);
+}
+
+/* Observation seams are thread-local and request-scoped in test builds:
+ * per-thread counters for candidate allocation sizing, actual insertion
+ * overflows (keyset_insert == -1 in a bitmap collector), whole-record
+ * capacity fallback recoveries, and the last prepared-find budget peak.
+ * Arming happens on the thread that runs the query. */
+static __thread struct {
+    unsigned last_alloc_slots;
+    unsigned overflow_hits;
+    unsigned fallbacks;
+    unsigned last_budget_peak;
+    int      observing;
+} bm_ks_test_stats;
+
+static __thread char bm_ks_parallel_field[256];
+static __thread int bm_ks_parallel_stage;
+static __thread char bm_ks_parallel_fault_field[256];
+static __thread int bm_ks_parallel_fault_site;
+static __thread int bm_ks_parallel_fault_error;
+static __thread unsigned bm_ks_parallel_stats[6];
+
+int query_test_parallel_candidate_race(const char *field, int stage) {
+    if (stage == 0) {
+        bm_ks_parallel_stage = 0;
+        bm_ks_parallel_field[0] = '\0';
+        return 0;
+    }
+    if (!field || strlen(field) >= sizeof(bm_ks_parallel_field) ||
+        stage < BMKS_RACE_EQ || stage > BMKS_RACE_OR)
+        return -1;
+    if (query_bm_test_arm_keyset_race(stage) != 0) return -1;
+    atomic_store(&bm_ks_race_armed, 0);
+    snprintf(bm_ks_parallel_field, sizeof(bm_ks_parallel_field), "%s", field);
+    bm_ks_parallel_stage = stage;
+    memset(bm_ks_parallel_stats, 0, sizeof(bm_ks_parallel_stats));
+    return 0;
+}
+
+int query_test_parallel_candidate_fault(const char *field, int site, int error) {
+    if (error == 0) { bm_ks_parallel_fault_error = 0; return 0; }
+    if (!field || strlen(field) >= sizeof(bm_ks_parallel_fault_field) ||
+        site < 0 || site >= BM_TEST_LOCK_SITE_COUNT)
+        return -1;
+    snprintf(bm_ks_parallel_fault_field, sizeof(bm_ks_parallel_fault_field), "%s", field);
+    bm_ks_parallel_fault_site = site;
+    bm_ks_parallel_fault_error = error;
+    return 0;
+}
+
+void query_test_parallel_candidate_stats(unsigned *workers, unsigned *joined,
+                                         unsigned *capacity, unsigned *hard,
+                                         unsigned *offthread, unsigned *consumed) {
+    if (workers) *workers = bm_ks_parallel_stats[0];
+    if (joined) *joined = bm_ks_parallel_stats[1];
+    if (capacity) *capacity = bm_ks_parallel_stats[2];
+    if (hard) *hard = bm_ks_parallel_stats[3];
+    if (offthread) *offthread = bm_ks_parallel_stats[4];
+    if (consumed) *consumed = bm_ks_parallel_stats[5];
+}
+
+void query_test_candidate_observe(int on) {
+    memset(&bm_ks_test_stats, 0, sizeof(bm_ks_test_stats));
+    bm_ks_test_stats.observing = on;
+}
+void query_test_candidate_stats(unsigned *last_slots, unsigned *overflow_hits,
+                                unsigned *fallbacks, unsigned *budget_peak) {
+    if (last_slots) *last_slots = bm_ks_test_stats.last_alloc_slots;
+    if (overflow_hits) *overflow_hits = bm_ks_test_stats.overflow_hits;
+    if (fallbacks) *fallbacks = bm_ks_test_stats.fallbacks;
+    if (budget_peak) *budget_peak = bm_ks_test_stats.last_budget_peak;
+}
+#define BMKS_STAT_OVERFLOW() do { if (bm_ks_test_stats.observing) \
+        bm_ks_test_stats.overflow_hits++; } while (0)
+#define BMKS_STAT_FALLBACK(kind) do { \
+        if (bm_ks_test_stats.observing) bm_ks_test_stats.fallbacks++; \
+        if (bm_ks_test_stats.observing || atomic_load(&g_shard_test_bmlock_log)) \
+            LOG_WARN(LOG_SUB_QUERY, \
+                     "candidate capacity exceeded after concurrent growth; " \
+                     "recovering from full record scan (%s)", kind); \
+    } while (0)
+#define BMKS_STAT_ALLOC(slots) do { if (bm_ks_test_stats.observing) \
+        bm_ks_test_stats.last_alloc_slots = (unsigned)(slots); } while (0)
+#define BMKS_STAT_BUDGET_PEAK(pk) do { if (bm_ks_test_stats.observing) \
+        bm_ks_test_stats.last_budget_peak = (unsigned)(pk); } while (0)
+
+static inline int bm_ks_counted_insert(KeySet *ks, const uint8_t *hash) {
+    int rc = keyset_insert(ks, hash);
+    if (rc < 0) {
+        atomic_fetch_add_explicit(&bm_ks_race_fail_inserts, 1,
+                                  memory_order_relaxed);
+        BMKS_STAT_OVERFLOW();
+    }
+    return rc;
+}
+
+/* TEST_BUILD override for a prepared find's request budget limit (0 = the
+ * query-buffer default). Thread-local: scoped to the calling request. */
+static __thread size_t bm_ks_test_budget_limit;
+void query_test_prepared_budget_limit(size_t limit) {
+    bm_ks_test_budget_limit = limit;
+}
+size_t query_test_prepared_budget_limit_value(void) {
+    return bm_ks_test_budget_limit;
+}
+
+void query_test_candidate_fallback_note(const char *kind) {
+    BMKS_STAT_FALLBACK(kind);
+}
+#else
+#define BMKS_STAT_FALLBACK(kind) ((void)0)
+static inline void bm_ks_race_barrier(int stage, size_t sized_total,
+                                      size_t cap) {
+    (void)stage; (void)sized_total; (void)cap;
+}
+static inline int bm_ks_counted_insert(KeySet *ks, const uint8_t *hash) {
+    return keyset_insert(ks, hash);
+}
+static inline size_t query_test_prepared_budget_limit_value(void) {
+    return 0;
+}
 #endif
 
 /* ========== ADVANCED SEARCH (multi-criteria, all operators) ========== */
@@ -512,10 +739,13 @@ typedef struct BmShardWalkArg {
     void        *ctx;
     SlotcaskDb  *sdb;
     int         *stop_flag;     /* manipulated via __atomic_* */
+    int          error;         /* worker-owned; read after parallel_for_io */
 } BmShardWalkArg;
 
 /* Walk a single shard's bitmap for `value`, emitting cb(value, vlen, hash)
-   per live matching slot. */
+   per live matching slot. Returns 1 when cb signalled stop, 0 when the shard
+   was walked completely (or is logically empty), -1 with errno on a hard
+   bitmap read failure. */
 int bitmap_emit_for_shard(const char *db_root, const char *object,
                                  const char *field, int shard_idx,
                                  const uint8_t *value, size_t vlen,
@@ -651,11 +881,19 @@ int btree_dispatch_schema_checked(const TypedSchema *literal_schema,const char *
                     args[s] = (BmShardWalkArg){
                         .db_root = db_root, .object = object, .field = field,
                         .shard_idx = s, .value = valbuf, .vlen = vallen,
-                        .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag
+                        .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag,
+                        .error = 0
                     };
                 }
                 parallel_for_io(bm_shard_walk_worker, args, splits, sizeof(BmShardWalkArg));
                 free(valbuf);
+                /* Every worker joined: a hard read failure on any shard —
+                   even after other shards produced candidates — fails the
+                   whole dispatch rather than yielding a partial set. */
+                int error = 0;
+                for (int s = 0; s < splits; s++)
+                    if (args[s].error && !error) error = args[s].error;
+                if (error) { free(args); errno = error; return -1; }
             }
             free(args);
             return 0;
@@ -1387,9 +1625,10 @@ void shard_db_test_set_find_flush_gate_hook(shard_db_test_gate_fn fn,
 }
 
 /* Called inside batch_buf_flush_copy on the legacy collector (kf+bitmap
-   handles still held when the bitmap walk drove the flush) and, after
-   the deferred collector lands, inside bm_defer_drain_if_armed (no
-   handles held). */
+   handles still held when the bitmap walk drove the flush), inside
+   bm_defer_drain_if_armed (no handles held), and before each record fetch
+   of the prepared small-limit bitmap iterator (no handles held: candidates
+   were prepared and every bitmap handle released before emission). */
 static void bm_defer_gate_park(void) {
     if (!atomic_load(&g_shard_test_find_flush_gate)) return;
     int expected = 0;
@@ -2129,6 +2368,128 @@ static int idx_find_streaming(const char *db_root, const char *object,
     batch_buf_destroy(&sc.bfb);
     pthread_mutex_destroy(&sc.lock);
     if(sc.predicate_error){errno=sc.predicate_error;return -1;}
+    return sc.printed;
+}
+
+/* ========== Prepared small-limit bitmap find iterator ==========
+   Serves the former small-limit streaming shapes (no joins, no rows
+   envelope, no ordering, offset+limit <= 1000) after their bitmap-dependent
+   candidates were prepared before the response envelope. Walks the prepared
+   KeySet and fetches one record at a time: the deadline is checked before
+   every fetch, at most one RecordRef is live, and iteration stops as soon as
+   the requested rows are emitted, the deadline expires, or a hard error is
+   recorded. Row matching, exclusions and pagination are exactly
+   stream_find_record_cb's. Not a batching optimization. */
+
+#ifdef TEST_BUILD
+/* Request-thread observer: armed on the thread that runs the find, it
+   counts prepared-iterator invocations, record fetches and live RecordRefs
+   (current and peak). */
+static __thread struct {
+    int      armed;
+    unsigned calls, fetches, live, peak_live;
+} prep_stream_obs;
+
+void query_test_prepared_stream_observe(int on) {
+    memset(&prep_stream_obs, 0, sizeof(prep_stream_obs));
+    prep_stream_obs.armed = on;
+}
+
+void query_test_prepared_stream_stats(unsigned *calls, unsigned *fetches,
+                                      unsigned *live, unsigned *peak_live) {
+    if (calls) *calls = prep_stream_obs.calls;
+    if (fetches) *fetches = prep_stream_obs.fetches;
+    if (live) *live = prep_stream_obs.live;
+    if (peak_live) *peak_live = prep_stream_obs.peak_live;
+}
+#define PREP_OBS_CALL()  do { if (prep_stream_obs.armed) prep_stream_obs.calls++; } while (0)
+#define PREP_OBS_ACQUIRE() do { if (prep_stream_obs.armed) { \
+        prep_stream_obs.fetches++; prep_stream_obs.live++; \
+        if (prep_stream_obs.live > prep_stream_obs.peak_live) \
+            prep_stream_obs.peak_live = prep_stream_obs.live; } } while (0)
+#define PREP_OBS_RELEASE() do { if (prep_stream_obs.armed && prep_stream_obs.live) \
+        prep_stream_obs.live--; } while (0)
+#else
+#define PREP_OBS_CALL()    ((void)0)
+#define PREP_OBS_ACQUIRE() ((void)0)
+#define PREP_OBS_RELEASE() ((void)0)
+#endif
+
+/* Unamortized deadline check (query_deadline_tick samples every 1024). */
+static int prepared_deadline_expired(QueryDeadline *dl) {
+    if (!dl || dl->timeout_ms == 0) return 0;
+    if (atomic_load_explicit(&dl->timed_out, memory_order_relaxed)) return 1;
+    if (now_ms_coarse() - dl->t0_ms > (uint64_t)dl->timeout_ms) {
+        atomic_store_explicit(&dl->timed_out, 1, memory_order_relaxed);
+        return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    StreamFindCtx *sc;
+    const char    *db_root;
+    const char    *object;
+    const Schema  *sch;
+    QueryDeadline *dl;
+} PreparedStreamIter;
+
+static int prepared_stream_iter_cb(const uint8_t hash[16], void *raw) {
+    PreparedStreamIter *it = (PreparedStreamIter *)raw;
+    StreamFindCtx *sc = it->sc;
+    if (__atomic_load_n(&sc->stop, __ATOMIC_ACQUIRE) || sc->predicate_error)
+        return 1;
+    if (prepared_deadline_expired(it->dl)) return 1;
+#ifdef TEST_BUILD
+    bm_defer_gate_park();   /* parks before a fetch with NO handles held */
+#endif
+    RecordRef ref;
+    PREP_OBS_ACQUIRE();
+    int rr = read_record_ref(it->db_root, it->object, it->sch, hash, &ref);
+    int rc = 0;
+    /* A candidate whose record is gone keeps the existing validation
+       semantics: it simply does not match. */
+    if (rr == 0)
+        rc = stream_find_record_cb(hash, ref.key, ref.klen, ref.val, ref.vlen,
+                                   ref.hdr2, sc);
+    release_record_ref(&ref);
+    PREP_OBS_RELEASE();
+    return rc != 0 ? 1 : 0;
+}
+
+static int prepared_bitmap_find_stream(const char *db_root, const char *object,
+                                       const Schema *sch, KeySet *ks,
+                                       CriteriaNode *tree,
+                                       ExcludedKeys *excluded,
+                                       int offset, int limit,
+                                       const char **proj_fields, int proj_count,
+                                       FieldSchema *fs,
+                                       int rows_fmt, int dict_fmt, char csv_delim,
+                                       QueryDeadline *dl) {
+    PREP_OBS_CALL();
+    StreamFindCtx sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.db_root = db_root;
+    sc.object = object;
+    sc.sch = sch;
+    sc.tree = tree;
+    sc.fs = fs;
+    sc.excluded = excluded;
+    sc.proj_fields = proj_fields;
+    sc.proj_count = proj_count;
+    sc.rows_fmt = rows_fmt;
+    sc.dict_fmt = dict_fmt;
+    sc.csv_delim = csv_delim;
+    sc.offset = offset;
+    sc.limit = limit;
+    sc.deadline = dl;
+    sc.parent_out = g_out;
+    int mrc = pthread_mutex_init(&sc.lock, NULL);
+    if (mrc != 0) { errno = mrc; return -1; }
+    PreparedStreamIter it = { &sc, db_root, object, sch, dl };
+    if (ks) keyset_iter(ks, prepared_stream_iter_cb, &it);
+    pthread_mutex_destroy(&sc.lock);
+    if (sc.predicate_error) { errno = sc.predicate_error; return -1; }
     return sc.printed;
 }
 
@@ -3117,6 +3478,19 @@ failed:
     return 1;
 }
 
+/* Reader open for a bitmap read consumer. 0 = handle opened; 1 = the shard's
+   file does not exist (never written: logically empty, not an error); -1 =
+   hard read failure with errno set (corruption, acquisition error,
+   admission exhaustion, I/O). */
+static int bm_open_read(const char *path, BitmapShard **out) {
+    errno = 0;
+    *out = bm_open(path, 0, 0, 0, 0, 0 /* reader */);
+    if (*out) return 0;
+    if (errno == ENOENT) return 1;
+    if (errno == 0) errno = EIO;
+    return -1;
+}
+
 /* Walk a single shard's bitmap dict-scan style. Returns 1 if cb
    signalled stop. Mirrors bitmap_emit_for_shard's contract. */
 static int bitmap_emit_generic_for_shard(const char *db_root, const char *object,
@@ -3135,9 +3509,12 @@ static int bitmap_emit_generic_for_shard(const char *db_root, const char *object
 
     char bp[1024];
     bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
-    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-    if (!bm) {
+    BitmapShard *bm = NULL;
+    int orc = bm_open_read(bp, &bm);
+    if (orc != 0) {
+        int saved = errno;
         kfcache_release(&kh);
+        if (orc < 0) { errno = saved; return -1; }
         return 0;
     }
 
@@ -3189,13 +3566,28 @@ static void *bm_generic_shard_worker(void *arg) {
 }
 
 /* bt_result_cb adapter for the generic dict-scan → KeySet path.
-   Inserts each emitted hash into the keyset, respects deadline. */
-typedef struct { KeySet *ks; QueryDeadline *dl; } BmKsEmitCtx;
+   Inserts each emitted hash into the keyset, respects deadline. A full
+   KeySet is a capacity failure: it is recorded (ENOBUFS) and stops the walk;
+   the caller discards the whole collection. */
+typedef struct {
+    KeySet *ks;
+    QueryDeadline *dl;
+    int error;                  /* errno diagnostic */
+    CandidateBuildFailure reason;
+} BmKsEmitCtx;
 static int bm_ks_insert_cb(const char *v, size_t vl, const uint8_t *h, void *c) {
     (void)v; (void)vl;
     BmKsEmitCtx *kc = (BmKsEmitCtx *)c;
-    if (kc->dl && kc->dl->timed_out) return -1;
-    keyset_insert(kc->ks, h);
+    if (kc->reason != CBF_NONE) return -1;
+    if (kc->dl && kc->dl->timed_out) {
+        kc->reason = CBF_TIMEOUT;
+        return -1;
+    }
+    if (bm_ks_counted_insert(kc->ks, h) < 0) {
+        kc->reason = CBF_INSERT_CAPACITY;
+        kc->error = ENOBUFS;
+        return -1;
+    }
     return 0;
 }
 
@@ -3223,8 +3615,13 @@ static void *bm_popcount_generic_shard_worker(void *raw) {
     BmPopcountGenericShardArg *a = (BmPopcountGenericShardArg *)raw;
     char bp[1024];
     bm_build_path(bp, sizeof(bp), a->db_root, a->object, a->field, a->shard_idx);
-    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
-    if (!bm) { a->count = 0; return NULL; }
+    a->count = 0;
+    BitmapShard *bm = NULL;
+    int orc = bm_open_read(bp, &bm);
+    if (orc != 0) {
+        if (orc < 0) a->error = errno;
+        return NULL;
+    }
     BmDictMatchCtx m = { .crit = a->crit, .tf = a->tf,
                          .schema = a->schema, .budget = a->budget };
     bm_iter_values(bm, bm_dict_match_cb, &m);
@@ -3259,8 +3656,10 @@ static size_t bm_popcount_generic_for_crit(const char *db_root, const char *obje
         for (int s = 0; s < splits; s++) {
             char bp[1024];
             bm_build_path(bp, sizeof(bp), db_root, object, field, s);
-            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
-            if (!bm) continue;
+            BitmapShard *bm = NULL;
+            int orc = bm_open_read(bp, &bm);
+            if (orc > 0) continue;
+            if (orc < 0) return SIZE_MAX;
             BmDictMatchCtx m = { .crit = crit, .tf = tf, .schema = schema,
                                  .budget = budget };
             bm_iter_values(bm, bm_dict_match_cb, &m);
@@ -3354,7 +3753,12 @@ static void *bm_intersect_shard_worker(void *raw) {
                           a->leaves[i]->field, a->shard_idx);
             bpp[i] = bps[i];
         }
-        if (bm_open_many_ro(bpp, a->n_leaves, bm) != 0) goto cleanup;
+        if (bm_open_many_ro(bpp, a->n_leaves, bm) != 0) {
+            /* A missing AND input makes this shard's intersection logically
+               empty; any other failure is a hard error, never a zero. */
+            if (errno != ENOENT) a->predicate_error = errno ? errno : EIO;
+            goto cleanup;
+        }
     }
 
     for (int i = 0; i < a->n_leaves; i++) {
@@ -3455,10 +3859,11 @@ static size_t bm_popcount_intersect(const char *db_root, const char *object,
     return (!dl || !dl->timed_out) ? total : 0;
 }
 
-/* Walk a single shard's bitmap for `value`, emitting cb per live
-   matching slot. Returns 1 if cb signalled stop (limit reached), so
-   the outer shard loop can short-circuit and skip the remaining
-   kf_acquire + bm_open syscalls. */
+/* Walk a single shard's bitmap for `value`, emitting cb per live matching
+   slot. Returns 1 if cb signalled stop (limit reached) so the outer shard
+   loop can short-circuit, 0 when the shard was walked completely or is
+   logically empty (no keyfile/bitmap file yet), -1 with errno preserved
+   across the keyfile release on a hard bitmap read failure. */
 int bitmap_emit_for_shard(const char *db_root, const char *object,
                                  const char *field, int shard_idx,
                                  const uint8_t *value, size_t vlen,
@@ -3471,9 +3876,12 @@ int bitmap_emit_for_shard(const char *db_root, const char *object,
 
     char bp[1024];
     bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
-    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-    if (!bm) {
+    BitmapShard *bm = NULL;
+    int orc = bm_open_read(bp, &bm);
+    if (orc != 0) {
+        int saved = errno;
         kfcache_release(&kh);
+        if (orc < 0) { errno = saved; return -1; }
         return 0;
     }
 
@@ -3484,12 +3892,13 @@ int bitmap_emit_for_shard(const char *db_root, const char *object,
 
     bm_close(bm);
     kfcache_release(&kh);
-    return ec.stop;
+    return ec.stop ? 1 : 0;
 }
 
 /* parallel_for worker for shard fan-out. Checks the shared stop flag
    before doing any I/O so a peer's limit-hit propagates immediately.
-   On a cb-driven stop, raises the flag so subsequent peers also bail. */
+   On a cb-driven stop, raises the flag so subsequent peers also bail; a
+   hard read failure is recorded in the worker-owned error slot. */
 static void *bm_shard_walk_worker(void *arg) {
     BmShardWalkArg *a = (BmShardWalkArg *)arg;
     if (a->stop_flag && __atomic_load_n(a->stop_flag, __ATOMIC_RELAXED)) {
@@ -3498,8 +3907,9 @@ static void *bm_shard_walk_worker(void *arg) {
     int stopped = bitmap_emit_for_shard(a->db_root, a->object, a->field,
                                         a->shard_idx, a->value, a->vlen,
                                         a->cb, a->ctx, a->sdb);
+    if (stopped < 0) a->error = errno ? errno : EIO;
     bm_defer_drain_if_armed(a->cb, a->sdb);
-    if (stopped && a->stop_flag) {
+    if (stopped > 0 && a->stop_flag) {
         __atomic_store_n(a->stop_flag, 1, __ATOMIC_RELAXED);
     }
     return NULL;
@@ -3513,15 +3923,27 @@ typedef struct {
     size_t           kf_capacity;
     KeySet          *ks;
     QueryDeadline   *dl;
+    int              error;   /* errno diagnostic (ENOBUFS on capacity) */
+    CandidateBuildFailure reason;
 } BmCollectCtx;
 
 static int bm_collect_to_keyset_cb(uint32_t slot, void *ctx) {
     BmCollectCtx *c = (BmCollectCtx *)ctx;
-    if (c->dl && c->dl->timed_out) return 1;
+    if (c->reason != CBF_NONE) return 1;
+    if (c->dl && c->dl->timed_out) {
+        c->reason = CBF_TIMEOUT;
+        return 1;
+    }
     if (slot >= c->kf_capacity) return 0;
     SlotcaskKfEntry *e = &c->kf_map[slot];
     if (e->flag != 1) return 0;
-    keyset_insert(c->ks, e->hash);
+    if (bm_ks_counted_insert(c->ks, e->hash) < 0) {
+        /* Actual keyset_insert -1: insertion capacity, never a truncated
+           successful set. ENOBUFS stays as the errno diagnostic. */
+        c->reason = CBF_INSERT_CAPACITY;
+        c->error = ENOBUFS;
+        return 1;
+    }
     return 0;
 }
 
@@ -3748,19 +4170,27 @@ typedef struct {
     const uint8_t *value;
     size_t         vlen;
     size_t         count;   /* output — this worker's contribution */
+    int            error;   /* worker-owned; hard read failure errno */
 } BmPopcountShardArg;
 
 static void *bm_popcount_one_shard_worker(void *raw) {
     BmPopcountShardArg *a = (BmPopcountShardArg *)raw;
     char bp[1024];
     bm_build_path(bp, sizeof(bp), a->db_root, a->object, a->field, a->shard_idx);
-    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-    if (!bm) { a->count = 0; return NULL; }
+    a->count = 0;
+    BitmapShard *bm = NULL;
+    int orc = bm_open_read(bp, &bm);
+    if (orc != 0) {
+        if (orc < 0) a->error = errno;
+        return NULL;
+    }
     a->count = bm_count(bm, a->value, a->vlen);
     bm_close(bm);
     return NULL;
 }
 
+/* SIZE_MAX with errno on a hard bitmap read failure; a shard whose file
+   does not exist contributes zero. */
 size_t bm_popcount_one_value(const char *db_root, const char *object,
                                      const char *field, int splits,
                                      const uint8_t *value, size_t vlen) {
@@ -3777,8 +4207,10 @@ size_t bm_popcount_one_value(const char *db_root, const char *object,
         for (int s = 0; s < splits; s++) {
             char bp[1024];
             bm_build_path(bp, sizeof(bp), db_root, object, field, s);
-            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
-            if (!bm) continue;
+            BitmapShard *bm = NULL;
+            int orc = bm_open_read(bp, &bm);
+            if (orc > 0) continue;
+            if (orc < 0) return SIZE_MAX;
             total += bm_count(bm, value, vlen);
             bm_close(bm);
         }
@@ -3788,19 +4220,26 @@ size_t bm_popcount_one_value(const char *db_root, const char *object,
         args[s] = (BmPopcountShardArg){
             .db_root = db_root, .object = object, .field = field,
             .shard_idx = s, .value = value, .vlen = vlen, .count = 0,
+            .error = 0,
         };
     }
     parallel_for_io(bm_popcount_one_shard_worker, args, splits, sizeof(BmPopcountShardArg));
     size_t total = 0;
-    for (int s = 0; s < splits; s++) total += args[s].count;
+    int error = 0;
+    for (int s = 0; s < splits; s++) {
+        if (args[s].error && !error) error = args[s].error;
+        total += args[s].count;
+    }
     free(args);
+    if (error) { errno = error; return SIZE_MAX; }
     return total;
 }
 
 /* Total bitmap match count for an OP_EQUAL / OP_IN criterion.
    Per-value bitmaps are disjoint by construction (each record's value
    sets exactly one bit across the per-value maps), so summing across
-   the IN values gives the exact match count without dedup. */
+   the IN values gives the exact match count without dedup. SIZE_MAX with
+   errno on a hard read failure. */
 static size_t bm_popcount_for_crit(const char *db_root,const char *object,
     int splits,const SearchCriterion *crit,const TypedField *tf){
     const TypedSchema *ts=load_typed_schema(db_root,object);
@@ -3815,7 +4254,9 @@ static size_t bm_popcount_for_crit(const char *db_root,const char *object,
         if(rc<0)return SIZE_MAX;
         if(rc==0){free(key);continue;}
         size_t n=bm_popcount_one_value(db_root,object,crit->field,splits,key,len);
+        int saved=errno;
         free(key);
+        if(n==SIZE_MAX){errno=saved;return SIZE_MAX;}
         if(n>SIZE_MAX-total){errno=EOVERFLOW;return SIZE_MAX;}
         total+=n;
     }
@@ -3835,12 +4276,100 @@ static size_t bm_popcount_for_crit(const char *db_root,const char *object,
    12.5M matches). We now popcount across all shards first (cheap —
    bm_count is a byte popcount) to size the keyset exactly, mirroring
    the btree path's leaf_capacity_hint behaviour. */
+/* Allocate a bitmap candidate KeySet. With a request budget the exact
+   charge is reserved (NULL/ENOBUFS when it does not fit — a hard error for
+   prepared find); without one the exact charge is checked against the
+   per-query buffer and an over-budget set is the deliberate fallback (NULL
+   with errno 0). Allocation failure is NULL with errno set. */
+/* Checked-build exit: records the reason and normalizes errno so callers
+ * can branch on reason alone (INSERT_CAPACITY keeps ENOBUFS as the
+ * diagnostic; deliberate budget/empty/timeout exits present errno 0; hard
+ * failures keep their errno). */
+static KeySet *bm_build_fail(CandidateBuildOut *out, CandidateBuildFailure r,
+                             int err) {
+    out->reason = r;
+    out->saved_errno = err;
+    switch (r) {
+    case CBF_INSERT_CAPACITY: errno = ENOBUFS; break;
+    case CBF_HARD:            errno = err ? err : EIO; break;
+    case CBF_BUDGET:          errno = err; break;
+    default:                  errno = 0; break;
+    }
+    return NULL;
+}
+
+/* Candidate KeySet allocation for the bitmap sizing-pass count m:
+ * preferred actual slots = next_power_of_two(max(8192, 2*m)) — approved
+ * headroom for growth between sizing and enumeration, not a measured
+ * optimum or a guarantee against sustained growth. keyset_new doubles its
+ * hint, so the preferred hint is max(4096, m), never the slot count.
+ * Without a budget the preferred exact charge must fit the per-query cap;
+ * if only the floor exceeds it, ordinary sizing is tried once. With a
+ * budget the atomic reservation decides: a preferred refusal solely for
+ * lack of budget permits one ordinary attempt. ENOMEM or sizing-overflow
+ * failures are never retried at the other size. Callers pass the initial
+ * sizing-pass count m unchanged (no 1024 substitution). */
+static KeySet *bm_candidate_keyset_new(size_t initial_matches,
+                                       KeySetBudget *budget,
+                                       const char *who) {
+    size_t preferred_hint = initial_matches > 4096 ? initial_matches : 4096;
+    size_t preferred_bytes = 0, ordinary_bytes = 0;
+    if (keyset_allocation_bytes(preferred_hint, &preferred_bytes) != 0 ||
+        keyset_allocation_bytes(initial_matches, &ordinary_bytes) != 0)
+        return NULL;
+
+    KeySet *ks = NULL;
+    size_t chosen_hint = preferred_hint;
+    if (budget) {
+        ks = keyset_new_budgeted(preferred_hint, budget);
+        if (!ks && errno == ENOBUFS && ordinary_bytes != preferred_bytes) {
+            chosen_hint = initial_matches;
+            ks = keyset_new_budgeted(chosen_hint, budget);
+        }
+    } else {
+        if (preferred_bytes > g_query_buffer_max_bytes) {
+            if (ordinary_bytes > g_query_buffer_max_bytes) {
+                LOG_WARN(LOG_SUB_QUERY,
+                         "%s: keyset for estimate %zu exceeds query buffer cap %zu",
+                         who, initial_matches, g_query_buffer_max_bytes);
+                errno = 0;
+                return NULL;
+            }
+            chosen_hint = initial_matches;
+        }
+        ks = keyset_new(chosen_hint);
+    }
+    if (!ks) { if (!errno) errno = ENOMEM; return NULL; }
+#ifdef TEST_BUILD
+    BMKS_STAT_ALLOC(ks->cap);
+    if (atomic_load(&g_shard_test_bmlock_log))
+        LOG_WARN(LOG_SUB_QUERY,
+                 "BMKS-CANDIDATE-ALLOC slots=%zu hint=%zu preferred=%d budget=%d",
+                 ks->cap, chosen_hint, chosen_hint == preferred_hint, budget != NULL);
+#endif
+    return ks;
+}
+
+#ifdef TEST_BUILD
+KeySet *query_test_candidate_keyset_alloc(size_t m, size_t *out_slots) {
+    KeySet *ks = bm_candidate_keyset_new(m, NULL, "query_test_candidate_keyset_alloc");
+    if (ks && out_slots) *out_slots = ks->cap;
+    if (!ks && out_slots) *out_slots = 0;
+    return ks;
+}
+#endif
+
 static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
                                         int splits,
                                         const SearchCriterion *leaf,
                                         const TypedField *tf,
                                         QueryDeadline *dl,
-                                        const TypedSchema *literal_schema) {
+                                        const TypedSchema *literal_schema,
+                                        KeySetBudget *budget,
+                                        CandidateBuildOut *out) {
+    cb_out_init(out);
+    errno = 0;
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
     /* Bitmap serves eq and IN through the fast value-walk; everything
        else (range, LIKE, CONTAINS, REGEX, len_X, exists, i-variants,
        NEQ, NOT_IN) goes through the generic dict-scan path below —
@@ -3853,41 +4382,54 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
         };
         SlotcaskDb *sdb_g SDB_REG_REF = slotcask_registry_get(db_root, object, &info_g);
         if (!sdb_g) {
+            int saved = errno ? errno : EIO;
             LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_from_bitmap: slotcask_registry_get failed for %s/%s", db_root, object);
-            return NULL;
+            return bm_build_fail(out, CBF_HARD, saved);
         }
 
         size_t tot_g = bm_popcount_generic_for_crit(db_root, object,
                                                      leaf->field, splits,
                                                      (SearchCriterion *)leaf, tf,
                                                      literal_schema);
-        if (tot_g == SIZE_MAX) return NULL;
+        if (tot_g == SIZE_MAX)
+            return bm_build_fail(out, CBF_HARD, errno);
 
-        size_t ks_bytes_est_g = (tot_g ? tot_g : 1024)
-                                * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
-        if (ks_bytes_est_g > g_query_buffer_max_bytes) {
-            LOG_WARN(LOG_SUB_QUERY, "build_keyset_from_bitmap: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes_est_g, g_query_buffer_max_bytes);
-            return NULL;
-        }
-
-        KeySet *ks_g = keyset_new(tot_g > 0 ? tot_g : 1024);
+        KeySet *ks_g = bm_candidate_keyset_new(tot_g, budget,
+                                               "build_keyset_from_bitmap");
         if (!ks_g) {
-            LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_bitmap: keyset_new(%zu) failed", tot_g > 0 ? tot_g : 1024);
-            return NULL;
+            int saved = errno;
+            return bm_build_fail(out, !saved || saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                 saved);
         }
+        bm_ks_race_barrier(BMKS_RACE_GENERIC, tot_g, ks_g->cap);
 
-        BmKsEmitCtx kec = { ks_g, dl };
+        BmKsEmitCtx kec = { ks_g, dl, 0, CBF_NONE };
         for (int s = 0; s < splits; s++) {
-            if (dl && dl->timed_out) { keyset_free(ks_g); return NULL; }
+            if (dl && dl->timed_out) {
+                keyset_free(ks_g);
+                return bm_build_fail(out, CBF_TIMEOUT, 0);
+            }
             if (bitmap_emit_generic_for_shard(db_root, object, leaf->field, s,
                                            (SearchCriterion *)leaf, tf,
                                            bm_ks_insert_cb, &kec, sdb_g,
                                            literal_schema,
                                            g_query_buffer_max_bytes / (size_t)(splits > 0 ? splits : 1)) < 0) {
-                keyset_free(ks_g); return NULL;
+                int saved = errno;
+                keyset_free(ks_g);
+                return bm_build_fail(out, CBF_HARD, saved);
+            }
+            /* The callback stop is not an error channel: check the
+               recorded reason explicitly (hard beats capacity). */
+            if (kec.reason != CBF_NONE) {
+                CandidateBuildFailure r = kec.reason;
+                keyset_free(ks_g);
+                return bm_build_fail(out, r, kec.error);
             }
         }
-        if (dl && dl->timed_out) { keyset_free(ks_g); return NULL; }
+        if (dl && dl->timed_out) {
+            keyset_free(ks_g);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
         return ks_g;
     }
 
@@ -3896,20 +4438,30 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
        for OP_IN. Bool/byte/numeric values all fit in <= 8B; even
        varchar bitmaps (future enum-text) cap at 1024 here. */
     int n_vals = (leaf->op == OP_EQUAL) ? 1 : leaf->in_count;
-    if (n_vals <= 0) return NULL;
+    if (n_vals <= 0) return bm_build_fail(out, CBF_NONE, 0);
     uint8_t **vals = calloc((size_t)n_vals, sizeof(*vals));
     size_t *vlens = calloc((size_t)n_vals, sizeof(*vlens));
     if (!vals || !vlens) {
+        int saved = errno ? errno : ENOMEM;
         LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_bitmap: calloc failed for n_vals=%d", n_vals);
-        bitmap_values_clear(vals,n_vals); free(vlens); return NULL;
+        bitmap_values_clear(vals,n_vals); free(vlens);
+        return bm_build_fail(out, CBF_HARD, saved);
     }
     if (leaf->op == OP_EQUAL) {
         if(bitmap_text_key_alloc(literal_schema,tf,search_criterion_value(leaf),search_criterion_value_len(leaf),
-             g_query_buffer_max_bytes/(size_t)n_vals,&vals[0],&vlens[0])<0){bitmap_values_clear(vals,n_vals);free(vlens);return NULL;}
+             g_query_buffer_max_bytes/(size_t)n_vals,&vals[0],&vlens[0])<0){
+            int saved = errno ? errno : EILSEQ;
+            bitmap_values_clear(vals,n_vals);free(vlens);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
     } else {
         for (int i = 0; i < n_vals; i++) {
             if(bitmap_text_key_alloc(literal_schema,tf,leaf->in_values[i],strlen(leaf->in_values[i]),
-                 g_query_buffer_max_bytes/(size_t)n_vals,&vals[i],&vlens[i])<0){bitmap_values_clear(vals,n_vals);free(vlens);return NULL;}
+                 g_query_buffer_max_bytes/(size_t)n_vals,&vals[i],&vlens[i])<0){
+                int saved = errno ? errno : EILSEQ;
+                bitmap_values_clear(vals,n_vals);free(vlens);
+                return bm_build_fail(out, CBF_HARD, saved);
+            }
         }
     }
     /* Drop any zero-length encodings (e.g. NULL/empty); they'd cause
@@ -3924,7 +4476,10 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
         }
         n_kept++;
     }
-    if (n_kept == 0) { bitmap_values_clear(vals,n_vals); free(vlens); return NULL; }
+    if (n_kept == 0) {
+        bitmap_values_clear(vals,n_vals); free(vlens);
+        return bm_build_fail(out, CBF_NONE, 0);   /* deliberate empty */
+    }
 
     /* Need a slotcask handle to read kf entries. */
     Schema sc = load_schema(db_root, object);
@@ -3933,8 +4488,10 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
     };
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
+        int saved = errno ? errno : EIO;
         LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_from_bitmap: slotcask_registry_get failed for %s/%s", db_root, object);
-        bitmap_values_clear(vals,n_vals); free(vlens); return NULL;
+        bitmap_values_clear(vals,n_vals); free(vlens);
+        return bm_build_fail(out, CBF_HARD, saved);
     }
 
     /* Pass A: sum bm_count across every (shard × value). Each bm_count
@@ -3944,35 +4501,39 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
        exact match cardinality even for IN. */
     size_t total_matches = 0;
     for (int s = 0; s < splits; s++) {
-        if (dl && dl->timed_out) {
-            bitmap_values_clear(vals,n_vals); free(vlens); return NULL;
+        if (candidate_deadline_expired(dl)) {
+            bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
         }
         char bp[1024];
         bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) continue;
+        BitmapShard *bm = NULL;
+        int orc = bm_open_read(bp, &bm);
+        if (orc > 0) continue;             /* never-written shard: empty */
+        if (orc < 0) {
+            int saved = errno;
+            bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
         for (int i = 0; i < n_kept; i++) {
             total_matches += bm_count(bm, vals[i], vlens[i]);
         }
         bm_close(bm);
     }
 
-    /* Budget check: keyset_new rounds up to next_pow2(hint*2); each slot
-       is keys[16] + state[4] = 20 B. Match the btree path's guard so
-       monster keysets (e.g. 50%-selective bitmap on a billion-row table)
-       fall through to scan instead of OOM-ing the daemon. */
-    size_t ks_bytes_est = (total_matches ? total_matches : 1024)
-                           * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
-    if (ks_bytes_est > g_query_buffer_max_bytes) {
-        LOG_WARN(LOG_SUB_QUERY, "build_keyset_from_bitmap: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes_est, g_query_buffer_max_bytes);
-        bitmap_values_clear(vals,n_vals); free(vlens); return NULL;
-    }
-
-    KeySet *ks = keyset_new(total_matches > 0 ? total_matches : 1024);
+    /* Exact admission: the actual rounded keys + state arrays (not a hint
+       estimate) are charged before allocation, so monster keysets fall
+       through to scan (or fail a budgeted request) instead of being
+       admitted over the per-query cap. */
+    KeySet *ks = bm_candidate_keyset_new(total_matches,
+                                         budget, "build_keyset_from_bitmap");
     if (!ks) {
-        LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_bitmap: keyset_new(%zu) failed", total_matches > 0 ? total_matches : 1024);
-        bitmap_values_clear(vals,n_vals); free(vlens); return NULL;
+        int saved = errno;
+        bitmap_values_clear(vals,n_vals); free(vlens);
+        return bm_build_fail(out, !saved || saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                 saved);
     }
+    bm_ks_race_barrier(BMKS_RACE_EQ, total_matches, ks->cap);
 
     /* Pass B: walk the bitmaps and lift matching hashes via kf lookup.
        Serial across shards — the inserts themselves run lock-free
@@ -3983,34 +4544,53 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
        impossible (values are distinct → bitmaps disjoint) so no extra
        check needed. */
     for (int s = 0; s < splits; s++) {
-        if (dl && dl->timed_out) {
-            keyset_free(ks); bitmap_values_clear(vals,n_vals); free(vlens); return NULL;
+        if (candidate_deadline_expired(dl)) {
+            keyset_free(ks); bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
         }
 
         char kfp[PATH_MAX];
         slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, s);
         SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0)
-            continue;
+        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
+            int saved = errno ? errno : EIO;
+            if (saved == ENOENT) continue;
+            keyset_free(ks); bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
 
         char bp[1024];
         bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) {
+        BitmapShard *bm = NULL;
+        int orc = bm_open_read(bp, &bm);
+        if (orc != 0) {
+            int saved = errno;
             kfcache_release(&kh);
-            continue;
+            if (orc > 0) continue;         /* never-written shard: empty */
+            keyset_free(ks); bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, CBF_HARD, saved);
         }
 
-        BmCollectCtx c = { kh.map, kh.capacity, ks, dl };
-        for (int i = 0; i < n_kept; i++) {
+        BmCollectCtx c = { kh.map, kh.capacity, ks, dl, 0, CBF_NONE };
+        for (int i = 0; i < n_kept && c.reason == CBF_NONE; i++) {
             bm_walk(bm, vals[i], vlens[i], bm_collect_to_keyset_cb, &c);
         }
 
         bm_close(bm);
         kfcache_release(&kh);
+        if (c.reason != CBF_NONE) {
+            /* Matches grew since sizing (capacity) or the deadline hit:
+               discard the whole collection instead of returning a
+               truncated set. */
+            keyset_free(ks); bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, c.reason, c.error);
+        }
     }
     bitmap_values_clear(vals,n_vals); free(vlens);
-    if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+    if (dl && dl->timed_out) {
+        keyset_free(ks);
+        return bm_build_fail(out, CBF_TIMEOUT, 0);
+    }
     return ks;
 }
 
@@ -4035,13 +4615,15 @@ typedef struct {
 
 static int bm_complement_value_cb(const uint8_t *value, size_t vlen, void *ctx) {
     BmComplementCtx *cc = (BmComplementCtx *)ctx;
+    if (cc->collect->error) return 1;
     if (cc->collect->dl && cc->collect->dl->timed_out) return 1;
     for (int t = 0; t < cc->nt; t++) {
         if (vlen == cc->tvlens[t] && memcmp(value, cc->tvals[t], vlen) == 0)
             return 0;  /* target value — excluded from the complement */
     }
     bm_walk(cc->bm, value, vlen, bm_collect_to_keyset_cb, cc->collect);
-    return 0;
+    /* A nested failure stops the dictionary iteration too. */
+    return cc->collect->reason != CBF_NONE ? 1 : 0;
 }
 
 static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *object,
@@ -4049,13 +4631,12 @@ static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *o
                                               QueryDeadline *dl,
                                               const uint8_t (*tvals)[1024],
                                               const size_t *tvlens, int nt,
-                                              size_t comp_hint) {
-    size_t ks_bytes_est = (comp_hint ? comp_hint : 1024)
-                           * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
-    if (ks_bytes_est > g_query_buffer_max_bytes) {
-        LOG_WARN(LOG_SUB_QUERY, "build_keyset_bitmap_complement: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes_est, g_query_buffer_max_bytes);
-        return NULL;
-    }
+                                              size_t comp_hint,
+                                              KeySetBudget *budget,
+                                              CandidateBuildOut *out) {
+    cb_out_init(out);
+    errno = 0;
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
 
     Schema sc = load_schema(db_root, object);
     SlotcaskSchemaInfo info = {
@@ -4064,39 +4645,60 @@ static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *o
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_bitmap_complement: slotcask_registry_get failed for %s/%s", db_root, object);
-        return NULL;
+        return bm_build_fail(out, CBF_HARD, errno ? errno : EIO);
     }
 
-    KeySet *ks = keyset_new(comp_hint > 0 ? comp_hint : 1024);
+    KeySet *ks = bm_candidate_keyset_new(comp_hint,
+                                         budget, "build_keyset_bitmap_complement");
     if (!ks) {
-        LOG_ERROR(LOG_SUB_QUERY, "build_keyset_bitmap_complement: keyset_new(%zu) failed", comp_hint > 0 ? comp_hint : 1024);
-        return NULL;
+        int saved = errno;
+        return bm_build_fail(out, !saved || saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                             saved);
     }
+    bm_ks_race_barrier(BMKS_RACE_COMPLEMENT, comp_hint, ks->cap);
 
     for (int s = 0; s < splits; s++) {
-        if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+        if (candidate_deadline_expired(dl)) {
+            keyset_free(ks);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
         char kfp[PATH_MAX];
         slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, s);
         SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0)
-            continue;
+        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
+            int saved = errno ? errno : EIO;
+            if (saved == ENOENT) continue;
+            keyset_free(ks);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
 
         char bp[1024];
         bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) {
+        BitmapShard *bm = NULL;
+        int orc = bm_open_read(bp, &bm);
+        if (orc != 0) {
+            int saved = errno;
             kfcache_release(&kh);
-            continue;
+            if (orc > 0) continue;         /* never-written shard: empty */
+            keyset_free(ks);
+            return bm_build_fail(out, CBF_HARD, saved);
         }
 
-        BmCollectCtx c = { kh.map, kh.capacity, ks, dl };
+        BmCollectCtx c = { kh.map, kh.capacity, ks, dl, 0, CBF_NONE };
         BmComplementCtx cc = { bm, tvals, tvlens, nt, &c };
         bm_iter_values(bm, bm_complement_value_cb, &cc);
 
         bm_close(bm);
         kfcache_release(&kh);
+        if (c.reason != CBF_NONE) {
+            keyset_free(ks);
+            return bm_build_fail(out, c.reason, c.error);
+        }
     }
-    if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+    if (dl && dl->timed_out) {
+        keyset_free(ks);
+        return bm_build_fail(out, CBF_TIMEOUT, 0);
+    }
     return ks;
 }
 
@@ -4105,46 +4707,69 @@ static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *o
  * majority side. *inverted=1 ⇒ the complement was built and the caller counts
  * a row when its hash is NOT in the set. Returns NULL on budget/error so the
  * caller falls back rather than counting unfiltered. */
-KeySet *build_smaller_bitmap_keyset(const char *db_root, const char *object,
-                                           int splits, const SearchCriterion *leaf,
-                                           const TypedField *tf, QueryDeadline *dl,
-                                           int *inverted) {
+KeySet *build_smaller_bitmap_keyset_ck(const char *db_root, const char *object,
+                                              int splits, const SearchCriterion *leaf,
+                                              const TypedField *tf, QueryDeadline *dl,
+                                              int *inverted, KeySetBudget *budget,
+                                              CandidateBuildOut *out) {
+    cb_out_init(out);
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
     const TypedSchema *literal_schema=load_typed_schema(db_root,object);
     *inverted = 0;
+    errno = 0;
     if (!bitmap_literal_fits(literal_schema,leaf,1024))
-        return build_keyset_from_bitmap(db_root,object,splits,leaf,tf,dl,literal_schema);
+        return build_keyset_from_bitmap(db_root,object,splits,leaf,tf,dl,literal_schema,budget,out);
     if (!tf || (leaf->op != OP_EQUAL && leaf->op != OP_IN))
-        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema);
+        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema,budget,out);
 
     int n_vals = (leaf->op == OP_EQUAL) ? 1 : leaf->in_count;
     if (n_vals <= 0)
-        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema);
+        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema,budget,out);
 
     uint8_t (*tvals)[1024] = calloc((size_t)n_vals, sizeof(*tvals));
     size_t  *tvlens = calloc((size_t)n_vals, sizeof(*tvlens));
     if (!tvals || !tvlens) {
         LOG_ERROR(LOG_SUB_QUERY, "build_smaller_bitmap_keyset: calloc failed for n_vals=%d", n_vals);
-        free(tvals); free(tvlens); return NULL;
+        int saved = errno ? errno : ENOMEM;
+        free(tvals); free(tvlens);
+        return bm_build_fail(out, CBF_HARD, saved);
     }
     int nt = 0;
     for (int i = 0; i < n_vals; i++) {
         const char *v = (leaf->op == OP_EQUAL) ? search_criterion_value(leaf) : leaf->in_values[i];
-        if(encode_criterion_value_checked(literal_schema,tf,v,strlen(v),tvals[nt],sizeof(tvals[nt]),&tvlens[nt])<0){free(tvals);free(tvlens);return NULL;}
+        if (encode_criterion_value_checked(literal_schema, tf, v, strlen(v),
+                                             tvals[nt], sizeof(tvals[nt]),
+                                             &tvlens[nt]) < 0) {
+            int saved = errno ? errno : EILSEQ;
+            free(tvals); free(tvlens);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
         if (tvlens[nt] > 0) nt++;
     }
     if (nt == 0) {
         free(tvals); free(tvlens);
-        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema);
+        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema,budget,out);
     }
 
-    /* Sum bm_count across shards — cheap stride popcount per (shard, value). */
+    /* Sum bm_count across shards — cheap stride popcount per (shard, value).
+       A hard read failure fails the build: no complement estimate may be
+       derived from a partial count. */
     size_t matches = 0;
     for (int s = 0; s < splits; s++) {
-        if (dl && dl->timed_out) { free(tvals); free(tvlens); return NULL; }
+        if (dl && dl->timed_out) {
+            free(tvals); free(tvlens);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
         char bp[1024];
         bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) continue;
+        BitmapShard *bm = NULL;
+        int orc = bm_open_read(bp, &bm);
+        if (orc > 0) continue;
+        if (orc < 0) {
+            int saved = errno;
+            free(tvals); free(tvlens);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
         for (int i = 0; i < nt; i++) matches += bm_count(bm, tvals[i], tvlens[i]);
         bm_close(bm);
     }
@@ -4153,14 +4778,26 @@ KeySet *build_smaller_bitmap_keyset(const char *db_root, const char *object,
 
     KeySet *ks;
     if (matches <= comp) {
-        ks = build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema);
+        ks = build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema,budget,out);
     } else {
         ks = build_keyset_bitmap_complement(db_root, object, splits, leaf, dl,
                                             (const uint8_t (*)[1024])tvals,
-                                            tvlens, nt, comp);
+                                            tvlens, nt, comp, budget, out);
         if (ks) *inverted = 1;
     }
     free(tvals); free(tvlens);
+    return ks;
+}
+
+KeySet *build_smaller_bitmap_keyset(const char *db_root, const char *object,
+                                    int splits, const SearchCriterion *leaf,
+                                    const TypedField *tf, QueryDeadline *dl,
+                                    int *inverted) {
+    CandidateBuildOut out;
+    KeySet *ks = build_smaller_bitmap_keyset_ck(db_root, object, splits, leaf,
+                                                tf, dl, inverted, NULL, &out);
+    if (!ks) errno = out.reason == CBF_HARD ? out.saved_errno
+                    : out.reason == CBF_INSERT_CAPACITY ? ENOBUFS : 0;
     return ks;
 }
 
@@ -4171,14 +4808,19 @@ typedef struct {
     KeySet        *ks;
     QueryDeadline *dl;
     int            timed_out;
+    CandidateBuildFailure reason;
 } TgCollectCtx;
 
 static int tg_collect_to_keyset_cb(const char *value, size_t vlen,
                                    const uint8_t hash[16], void *ctx) {
     (void)value; (void)vlen;
     TgCollectCtx *c = (TgCollectCtx *)ctx;
-    if (c->dl && c->dl->timed_out) { c->timed_out = 1; return 1; }
-    keyset_insert(c->ks, hash);
+    if (c->reason != CBF_NONE) return 1;
+    if (c->dl && c->dl->timed_out) { c->timed_out = 1; c->reason = CBF_TIMEOUT; return 1; }
+    if (keyset_insert(c->ks, hash) < 0) {
+        c->reason = CBF_INSERT_CAPACITY;
+        return 1;
+    }
     return 0;
 }
 
@@ -4263,14 +4905,18 @@ typedef struct {
     KeySet        *next;      /* matches accumulate here */
     QueryDeadline *dl;
     int            timed_out;
+    CandidateBuildFailure reason;
 } TgFilterCtx;
 
 static int tg_filter_cb(const char *value, size_t vlen,
                         const uint8_t hash[16], void *ctx) {
     (void)value; (void)vlen;
     TgFilterCtx *c = (TgFilterCtx *)ctx;
-    if (c->dl && c->dl->timed_out) { c->timed_out = 1; return 1; }
-    if (keyset_contains(c->running, hash)) keyset_insert(c->next, hash);
+    if (c->reason != CBF_NONE) return 1;
+    if (c->dl && c->dl->timed_out) { c->timed_out = 1; c->reason = CBF_TIMEOUT; return 1; }
+    if (keyset_contains(c->running, hash)) {
+        if (keyset_insert(c->next, hash) < 0) c->reason = CBF_INSERT_CAPACITY;
+    }
     return 0;
 }
 
@@ -4303,36 +4949,47 @@ static size_t tg_posting_count(const char *db_root, const char *object,
 static KeySet *tg_intersect_streaming(const char *db_root, const char *object,
                                       const char *field, int splits,
                                       const uint8_t trigram[3],
-                                      KeySet *running, QueryDeadline *dl) {
+                                      KeySet *running, QueryDeadline *dl,
+                                      KeySetBudget *budget,
+                                      CandidateBuildOut *out) {
     if (!running || keyset_size(running) == 0) return running;
     int idx_n = index_splits_for(splits);
 
     /* Result size ≤ |running|. Size to fit. */
-    KeySet *next = keyset_new(keyset_size(running));
+    KeySet *next = keyset_new_budgeted(keyset_size(running), budget);
     if (!next) {
+        int saved = errno;
         LOG_ERROR(LOG_SUB_QUERY, "tg_intersect_streaming: keyset_new(%zu) failed", keyset_size(running));
-        keyset_free(running); return NULL;
+        keyset_free(running);
+        return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD, saved);
     }
-    TgFilterCtx c = { running, next, dl, 0 };
+    TgFilterCtx c = { running, next, dl, 0, CBF_NONE };
     for (int s = 0; s < idx_n; s++) {
         char tp[PATH_MAX];
         tg_build_path(tp, sizeof(tp), db_root, object, field, s);
         btree_range(tp, (const char *)trigram, 3,
                     (const char *)trigram, 3,
                     tg_filter_cb, &c);
-        if (c.timed_out) { keyset_free(running); keyset_free(next); return NULL; }
+        if (c.reason != CBF_NONE) {
+            keyset_free(running); keyset_free(next);
+            return bm_build_fail(out, c.reason, 0);
+        }
     }
     keyset_free(running);
     return next;
 }
 
-KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
-                                        int splits,
-                                        const SearchCriterion *leaf,
-                                        QueryDeadline *dl) {
-    if (!leaf) return NULL;
+static KeySet *build_keyset_from_trigram_b(const char *db_root, const char *object,
+                                           int splits,
+                                           const SearchCriterion *leaf,
+                                           QueryDeadline *dl,
+                                           KeySetBudget *budget,
+                                           CandidateBuildOut *out) {
+    cb_out_init(out);
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
+    if (!leaf) return bm_build_fail(out, CBF_NONE, 0);
     size_t plen = strlen(search_criterion_value(leaf));
-    if (plen < 3) return NULL;
+    if (plen < 3) return bm_build_fail(out, CBF_NONE, 0);
 
     uint8_t pattern_lc[1024];
     if (plen > sizeof(pattern_lc)) plen = sizeof(pattern_lc);
@@ -4346,7 +5003,7 @@ KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
 
     uint8_t trigrams[TG_MAX_DISTINCT][3];
     size_t  n = tg_extract_distinct(pattern_lc, plen, trigrams, TG_MAX_DISTINCT);
-    if (n == 0) return NULL;
+    if (n == 0) return bm_build_fail(out, CBF_NONE, 0);
 
     /* Sort trigrams by posting size ascending — rarest first. The
        seed keyset is the smallest posting list (saves allocation +
@@ -4358,18 +5015,29 @@ KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
     typedef struct { uint8_t tg[3]; size_t count; } TgEntry;
     TgEntry *order = malloc(n * sizeof(TgEntry));
     if (!order) {
+        int saved = errno ? errno : ENOMEM;
         LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_trigram: malloc failed for n=%zu TgEntry", n);
-        return NULL;
+        return bm_build_fail(out, CBF_HARD, saved);
     }
     for (size_t i = 0; i < n; i++) {
         memcpy(order[i].tg, trigrams[i], 3);
         order[i].count = tg_posting_count(db_root, object, leaf->field,
                                           splits, trigrams[i], dl);
-        if (dl && dl->timed_out) { free(order); return NULL; }
+        if (candidate_deadline_expired(dl)) {
+            free(order);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
         /* Any zero-posting trigram → intersection is empty. */
         if (order[i].count == 0) {
+            KeySet *empty = keyset_new_budgeted(16, budget);
+            if (!empty) {
+                int saved = errno;
+                free(order);
+                return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                     saved);
+            }
             free(order);
-            return keyset_new(16);  /* empty */
+            return empty;
         }
     }
     /* Simple insertion sort — n ≤ TG_MAX_DISTINCT (4096) but typically <50. */
@@ -4383,31 +5051,47 @@ KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
     }
 
     /* Seed from rarest trigram — sized exactly to its posting count. */
-    KeySet *acc = keyset_new(order[0].count);
+    KeySet *acc = keyset_new_budgeted(order[0].count, budget);
     if (!acc) {
+        int saved = errno;
         LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_trigram: keyset_new(%zu) failed", (size_t)order[0].count);
-        free(order); return NULL;
+        free(order);
+        return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD, saved);
     }
     int idx_n = index_splits_for(splits);
-    TgCollectCtx cc = { acc, dl, 0 };
+    TgCollectCtx cc = { acc, dl, 0, CBF_NONE };
     for (int s = 0; s < idx_n; s++) {
         char tp[PATH_MAX];
         tg_build_path(tp, sizeof(tp), db_root, object, leaf->field, s);
         btree_range(tp, (const char *)order[0].tg, 3,
                     (const char *)order[0].tg, 3,
                     tg_collect_to_keyset_cb, &cc);
-        if (cc.timed_out) { keyset_free(acc); free(order); return NULL; }
+        if (cc.reason != CBF_NONE) {
+            keyset_free(acc); free(order);
+            return bm_build_fail(out, cc.reason, 0);
+        }
     }
 
     /* Streaming intersect against each subsequent trigram. Early-exit
        once running is empty. */
     for (size_t i = 1; i < n && keyset_size(acc) > 0; i++) {
         acc = tg_intersect_streaming(db_root, object, leaf->field, splits,
-                                     order[i].tg, acc, dl);
+                                     order[i].tg, acc, dl, budget, out);
         if (!acc) { free(order); return NULL; }
     }
     free(order);
     return acc;
+}
+
+KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
+                                  int splits, const SearchCriterion *leaf,
+                                  QueryDeadline *dl) {
+    CandidateBuildOut o;
+    KeySet *ks = build_keyset_from_trigram_b(db_root, object, splits, leaf, dl,
+                                             NULL, &o);
+    if (!ks) errno = o.reason == CBF_HARD ? o.saved_errno
+                    : o.reason == CBF_INSERT_CAPACITY ? ENOBUFS : 0;
+    return ks;
 }
 
 /* ============================================================
@@ -4444,7 +5128,7 @@ static int find_via_trigram_starts_with(const char *db_root, const char *object,
     if (!ks) return 0;
 
     int idx_n = index_splits_for(sch->splits);
-    TgCollectCtx cc = { ks, dl, 0 };
+    TgCollectCtx cc = { .ks = ks, .dl = dl };
     for (int s = 0; s < idx_n; s++) {
         char tp[PATH_MAX];
         tg_build_path(tp, sizeof(tp), db_root, object, seed->field, s);
@@ -4472,11 +5156,14 @@ void build_keyset_leaf_test_set_fail_alloc(int fail_n) {
 }
 #endif
 
-KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
-                                      int splits,
-                                      SearchCriterion *leaf,
-                                      QueryDeadline *dl) {
+KeySet *build_keyset_from_leaf_ck(const char *db_root, const char *object,
+                                  int splits, SearchCriterion *leaf,
+                                  QueryDeadline *dl, KeySetBudget *budget,
+                                  CandidateBuildOut *out) {
+    cb_out_init(out);
     errno=0;
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
+    if (!leaf) return bm_build_fail(out, CBF_NONE, 0);
     /* Dispatch on the plan-time picker's choice — single index per leaf,
        no runtime cascade between index types.  If the picker says
        IT_TRIGRAM and the trigram builder returns NULL (e.g. transient
@@ -4484,15 +5171,16 @@ KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
        via btree.  The picker has already considered all available
        indexes for this (field, op, pattern-length) tuple. */
     int picked = pick_index_for_leaf(db_root, object, leaf);
-    if (picked < 0) return NULL;
+    if (picked < 0) return bm_build_fail(out, CBF_NONE, 0);   /* not indexed */
     if (picked == IT_TRIGRAM) {
-        return build_keyset_from_trigram(db_root, object, splits, leaf, dl);
+        return build_keyset_from_trigram_b(db_root, object, splits, leaf, dl,
+                                           budget, out);
     }
     if (picked == IT_BITMAP) {
         TypedSchema *ts = load_typed_schema(db_root, object);
         const TypedField *tf = resolve_idx_field(ts, leaf->field);
         return build_keyset_from_bitmap(db_root, object, splits,
-                                        leaf, tf, dl, ts);
+                                        leaf, tf, dl, ts, budget, out);
     }
     /* IT_BTREE — tiered KeySet allocation. Pre-2026-05-25 this function pre-allocated
        a KeySet sized to (file-size hint floored at live count), which on a
@@ -4541,24 +5229,44 @@ KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
                                __ATOMIC_ACQ_REL) == 0) {
             errno = ENOMEM;
             LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_leaf: injected alloc failure (tier %d)", t);
-            return NULL;
+            return bm_build_fail(out, CBF_HARD, ENOMEM);
         }
 #endif
-        KeySet *ks = keyset_new(hints[t]);
+        KeySet *ks = keyset_new_budgeted(hints[t], budget);
         if (!ks) {
+            int saved = errno;
             LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_leaf: keyset_new(%zu) failed (tier %d)", hints[t], t);
-            return NULL;
+            return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                 saved);
         }
         IntersectCollectCtx c = { ks, dl, 0, 0 };
         if(btree_dispatch_checked(db_root, object, leaf->field, splits,
-                       leaf, tf, intersect_collect_cb, &c)<0){keyset_free(ks);return NULL;}
-        if (dl->timed_out) { keyset_free(ks); return NULL; }
+                       leaf, tf, intersect_collect_cb, &c)<0){
+            int saved = errno;
+            keyset_free(ks);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
+        if (dl->timed_out) {
+            keyset_free(ks);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
         if (!c.overflowed) return ks;
         keyset_free(ks);
         /* Tier-1 overflowed; loop retries at tier 2.  Tier-2 overflow
-           exits the loop and returns NULL. */
+           exits the loop as a budget-class fallback. */
     }
-    return NULL;
+    return bm_build_fail(out, CBF_BUDGET, 0);
+}
+
+KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
+                               int splits, SearchCriterion *leaf,
+                               QueryDeadline *dl) {
+    CandidateBuildOut o;
+    KeySet *ks = build_keyset_from_leaf_ck(db_root, object, splits, leaf, dl,
+                                          NULL, &o);
+    if (!ks) errno = o.reason == CBF_HARD ? o.saved_errno
+                    : o.reason == CBF_INSERT_CAPACITY ? ENOBUFS : 0;
+    return ks;
 }
 
 /* Below this threshold for the most-selective leaf, fan out the candidates as
@@ -4582,6 +5290,17 @@ typedef struct {
     SearchCriterion  *leaf;
     KeySet          **slot;       /* &per_leaf[my_idx] */
     QueryDeadline    *deadline;
+    KeySetBudget     *budget;     /* request budget (NULL = unbudgeted) */
+#ifdef TEST_BUILD
+    int               test_race_stage;
+    pthread_t         test_owner;
+    int               test_offthread;
+    int               test_fault_site;
+    int               test_fault_error;
+    unsigned          test_fault_consumed;
+#endif
+    CandidateBuildOut worker_out; /* storage; bout points here */
+    CandidateBuildOut *bout;      /* passed to build_keyset_from_leaf_b */
     int               err;        /* captured errno when slot stayed NULL;
                                      0 = success or the historical
                                      budget-fallback NULL. Slots are
@@ -4589,11 +5308,44 @@ typedef struct {
 } LeafBuildArg;
 
 static void *leaf_build_worker(void *arg) {
-    LeafBuildArg *a = (LeafBuildArg *)arg;
+    LeafBuildArg *a = arg;
+#ifdef TEST_BUILD
+    int previous_stage = atomic_load(&bm_ks_race_armed);
+    if (a->test_race_stage)
+        atomic_store(&bm_ks_race_armed, a->test_race_stage);
+    a->test_offthread = !pthread_equal(pthread_self(), a->test_owner);
+    if (a->test_fault_error) {
+        BmTestLockFaultState previous_faults;
+        bm_test_lock_fault_save(&previous_faults);
+        bm_test_reset_lock_failure();
+        bm_test_fail_lock_next(a->test_fault_site, a->test_fault_error);
+        char path[1024];
+        bm_build_path(path, sizeof(path), a->db_root, a->object, a->leaf->field, 0);
+        BitmapShard *probe = bm_open(path, 0, 0, 0, 0, 0);
+        int saved = errno;
+        a->test_fault_consumed = (unsigned)bm_test_lock_failure_consumed(a->test_fault_site);
+        bm_test_lock_fault_restore(&previous_faults);
+        if (!probe) {
+            *a->slot = bm_build_fail(a->bout, CBF_HARD, saved);
+            a->err = errno;
+            atomic_store(&bm_ks_race_armed, previous_stage);
+            return NULL;
+        }
+        bm_close(probe);
+    }
+#endif
     errno = 0;
-    *a->slot = build_keyset_from_leaf(a->db_root, a->object, a->splits,
-                                      a->leaf, a->deadline);
+    *a->slot = build_keyset_from_leaf_ck(a->db_root, a->object, a->splits,
+                                        a->leaf, a->deadline, a->budget,
+                                        a->bout);
     a->err = *a->slot ? 0 : errno;
+    if (!*a->slot && a->bout->reason == CBF_NONE && a->err) {
+        a->bout->reason = CBF_HARD;
+        a->bout->saved_errno = a->err;
+    }
+#ifdef TEST_BUILD
+    atomic_store(&bm_ks_race_armed, previous_stage);
+#endif
     return NULL;
 }
 
@@ -4643,14 +5395,16 @@ static int intersect_all_cb(const uint8_t hash[16], void *ctx) {
    which beats walking the rest of the leaves in full.
 
    Caller frees the returned KeySet. */
-KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
-                                        int splits,
-                                        SearchCriterion **leaves, int n,
-                                        QueryDeadline *dl,
-                                        int *out_small_primary) {
+KeySet *intersect_indexed_leaves_ck(const char *db_root, const char *object,
+                                    int splits, SearchCriterion **leaves,
+                                    int n, QueryDeadline *dl,
+                                    int *out_small_primary,
+                                    KeySetBudget *budget,
+                                    CandidateBuildOut *out) {
+    cb_out_init(out);
     errno=0;
     *out_small_primary = 0;
-    if (n < 2) return NULL;
+    if (n < 2) return bm_build_fail(out, CBF_NONE, 0);
 
     /* Parallel build per-leaf KeySets when n > 2. Nested parallel_for is
        structurally safe (work-stealing in parallel.c). For n == 2 the
@@ -4660,11 +5414,18 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
     if (n > 2 && parallel_pool_size() > 0) {
         /* Parallel build per-leaf sets, then walk smallest and keep entries
            present in all others. */
+        /* Per-leaf argument/result arrays are candidate memory too: charged
+           to the request budget before allocation, released with them. */
+        size_t arr_bytes = (size_t)n * (sizeof(KeySet *) + sizeof(LeafBuildArg));
+        if (keyset_budget_reserve(budget, arr_bytes) != 0)
+            return bm_build_fail(out, CBF_BUDGET, errno);
         KeySet **per_leaf = calloc((size_t)n, sizeof(KeySet *));
         LeafBuildArg *args = calloc((size_t)n, sizeof(LeafBuildArg));
         if (!per_leaf || !args) {
             LOG_ERROR(LOG_SUB_QUERY, "intersect_indexed_leaves: calloc failed for n=%d leaves", n);
-            free(per_leaf); free(args); return NULL;
+            int saved = errno ? errno : ENOMEM;
+            free(per_leaf); keyset_budget_release(budget, arr_bytes); free(args);
+            return bm_build_fail(out, CBF_HARD, saved);
         }
         for (int i = 0; i < n; i++) {
             args[i].db_root  = db_root;
@@ -4673,8 +5434,39 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
             args[i].leaf     = leaves[i];
             args[i].slot     = &per_leaf[i];
             args[i].deadline = dl;
+            args[i].budget   = budget;
+            args[i].bout     = &args[i].worker_out;
+#ifdef TEST_BUILD
+            args[i].test_owner = pthread_self();
+            if (bm_ks_parallel_stage &&
+                strcmp(args[i].leaf->field, bm_ks_parallel_field) == 0)
+                args[i].test_race_stage = bm_ks_parallel_stage;
+            if (bm_ks_parallel_fault_error &&
+                strcmp(args[i].leaf->field, bm_ks_parallel_fault_field) == 0) {
+                args[i].test_fault_site = bm_ks_parallel_fault_site;
+                args[i].test_fault_error = bm_ks_parallel_fault_error;
+            }
+#endif
         }
+#ifdef TEST_BUILD
+        int observe_parallel = bm_ks_parallel_stage != 0;
+        bm_ks_parallel_stage = 0;
+        bm_ks_parallel_field[0] = '\0';
+        bm_ks_parallel_fault_error = 0;
+#endif
         parallel_for(leaf_build_worker, args, n, sizeof(LeafBuildArg));
+#ifdef TEST_BUILD
+        if (observe_parallel) {
+            bm_ks_parallel_stats[0] = (unsigned)n;
+            bm_ks_parallel_stats[1] = (unsigned)n;
+            for (int i = 0; i < n; i++) {
+                bm_ks_parallel_stats[2] += args[i].worker_out.reason == CBF_INSERT_CAPACITY;
+                bm_ks_parallel_stats[3] += args[i].worker_out.reason == CBF_HARD;
+                bm_ks_parallel_stats[4] += args[i].test_offthread;
+                bm_ks_parallel_stats[5] += args[i].test_fault_consumed;
+            }
+        }
+#endif
         /* Carry the worker's captured errno through the join: the worker
            thread's thread-local errno dies with it, and losing it made
            worker allocation failures indistinguishable from an empty
@@ -4684,24 +5476,40 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
         int worker_err = 0;
         for (int i = 0; i < n; i++)
             if (!worker_err && args[i].err) worker_err = args[i].err;
-        free(args);
 
         if (dl->timed_out) {
+            free(args);
             for (int i = 0; i < n; i++) keyset_free(per_leaf[i]);
-            free(per_leaf);
+            free(per_leaf); keyset_budget_release(budget, arr_bytes);
             return NULL;
         }
         for (int i = 0; i < n; i++) {
             if (!per_leaf[i]) {
-                /* Build failed for this leaf — surface its captured
-                   errno, then clean up and bail. */
-                if (worker_err) errno = worker_err;
+                /* Build failed for this leaf — fold the worst reason
+                   (hard beats insertion-capacity beats budget), surface
+                   its errno, clean up, bail. */
+                CandidateBuildFailure r = CBF_NONE;
+                for (int k = 0; k < n; k++) {
+                    CandidateBuildFailure kr = args[k].bout->reason;
+                    if (kr == CBF_HARD || r == CBF_NONE) r = kr;
+                    else if (r != CBF_HARD && kr == CBF_INSERT_CAPACITY)
+                        r = CBF_INSERT_CAPACITY;
+                }
+                int saved = worker_err;
+                for (int k = 0; k < n; k++)
+                    if (args[k].worker_out.reason == r &&
+                        args[k].worker_out.saved_errno) {
+                        saved = args[k].worker_out.saved_errno;
+                        break;
+                    }
+                free(args);
                 for (int k = 0; k < n; k++) keyset_free(per_leaf[k]);
-                free(per_leaf);
-                return NULL;
+                free(per_leaf); keyset_budget_release(budget, arr_bytes);
+                return bm_build_fail(out, r, saved);
             }
         }
 
+        free(args);
         int smallest_i = 0;
         for (int i = 1; i < n; i++) {
             if (keyset_size(per_leaf[i]) < keyset_size(per_leaf[smallest_i]))
@@ -4712,29 +5520,37 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
             *out_small_primary = 1;
             KeySet *result = per_leaf[smallest_i];
             for (int i = 0; i < n; i++) if (i != smallest_i) keyset_free(per_leaf[i]);
-            free(per_leaf);
+            free(per_leaf); keyset_budget_release(budget, arr_bytes);
             return result;
         }
 
-        KeySet *result = keyset_new(keyset_size(per_leaf[smallest_i]));
+        KeySet *result = keyset_new_budgeted(keyset_size(per_leaf[smallest_i]),
+                                             budget);
         if (!result) {
+            int saved = errno;
             LOG_ERROR(LOG_SUB_QUERY, "intersect_indexed_leaves: keyset_new(%zu) failed", keyset_size(per_leaf[smallest_i]));
             for (int i = 0; i < n; i++) keyset_free(per_leaf[i]);
-            free(per_leaf);
-            return NULL;
+            free(per_leaf); keyset_budget_release(budget, arr_bytes);
+            return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                 saved);
         }
         IntersectAllCtx ic = { per_leaf, n, smallest_i, result, dl, 0 };
         keyset_iter(per_leaf[smallest_i], intersect_all_cb, &ic);
 
         for (int i = 0; i < n; i++) keyset_free(per_leaf[i]);
-        free(per_leaf);
+        free(per_leaf); keyset_budget_release(budget, arr_bytes);
         if (dl->timed_out) { keyset_free(result); return NULL; }
         return result;
     }
 
     /* Serial path (n == 2 or pool unavailable). */
-    KeySet *running = build_keyset_from_leaf(db_root, object, splits, leaves[0], dl);
-    if (!running || dl->timed_out) { keyset_free(running); return NULL; }
+    KeySet *running = build_keyset_from_leaf_ck(db_root, object, splits, leaves[0],
+                                               dl, budget, out);
+    if (!running) return NULL;   /* reason and errno already recorded in out */
+    if (dl->timed_out) {
+        keyset_free(running);
+        return bm_build_fail(out, CBF_TIMEOUT, 0);
+    }
 
     /* Small-primary heuristic: skip the second-leaf btree walk; let the
        caller fan out a record-fetch + post-filter pass instead. */
@@ -4749,22 +5565,45 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
         size_t cur = keyset_size(running);
         if (cur == 0) break;  /* empty intersection — short-circuit */
 
-        KeySet *next = keyset_new(cur);  /* intersection cardinality ≤ |running| */
+        /* Source and result coexist at their combined charge; the superseded
+           running set is freed as soon as the probe finishes. */
+        KeySet *next = keyset_new_budgeted(cur, budget);  /* ≤ |running| */
         if (!next) {
+            int saved = errno;
             LOG_ERROR(LOG_SUB_QUERY, "intersect_indexed_leaves: keyset_new(%zu) failed (serial path)", cur);
-            keyset_free(running); return NULL;
+            keyset_free(running);
+            return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                 saved);
         }
 
         IntersectProbeCtx p = { running, next, dl, 0 };
         if(btree_dispatch_checked(db_root, object, leaves[i]->field, splits,
                        leaves[i], resolve_idx_field(ts, leaves[i]->field),
-                       intersect_probe_cb, &p)<0){keyset_free(running);keyset_free(next);return NULL;}
+                       intersect_probe_cb, &p)<0){
+            int saved = errno;
+            keyset_free(running); keyset_free(next);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
 
         keyset_free(running);
         running = next;
-        if (dl->timed_out) { keyset_free(running); return NULL; }
+        if (dl->timed_out) {
+            keyset_free(running);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
     }
     return running;
+}
+
+KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
+                                 int splits, SearchCriterion **leaves, int n,
+                                 QueryDeadline *dl, int *out_small_primary) {
+    CandidateBuildOut o;
+    KeySet *ks = intersect_indexed_leaves_ck(db_root, object, splits, leaves, n,
+                                            dl, out_small_primary, NULL, &o);
+    if (!ks) errno = o.reason == CBF_HARD ? o.saved_errno
+                    : o.reason == CBF_INSERT_CAPACITY ? ENOBUFS : 0;
+    return ks;
 }
 
 /* Iterate a KeySet, computing shard_id + start_slot from each hash, into a
@@ -4823,6 +5662,7 @@ typedef struct {
        that genuinely need every candidate. */
     int target_count;
     int predicate_error;
+    _Atomic CandidateBuildFailure reason;
 } OrChildWorkerCtx;
 
 /* btree callback — drops every hit into the shared KeySet. Returns -1 to
@@ -4832,9 +5672,18 @@ typedef struct {
 static int or_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
     (void)val; (void)vlen;
     OrChildWorkerCtx *w = (OrChildWorkerCtx *)ctx;
-    if (query_deadline_tick(w->deadline, &w->dl_counter)) return -1;
-    if (keyset_insert(w->ks, hash16) < 0) {
+    if (w->reason != CBF_NONE) return -1;
+    if (query_deadline_tick(w->deadline, &w->dl_counter)) {
+        CandidateBuildFailure expected = CBF_NONE;
+        atomic_compare_exchange_strong_explicit(&w->reason, &expected,
+                                                 CBF_TIMEOUT,
+                                                 memory_order_relaxed,
+                                                 memory_order_relaxed);
+        return -1;
+    }
+    if (bm_ks_counted_insert(w->ks, hash16) < 0) {
         LOG_WARN(LOG_SUB_QUERY, "or_collect_cb: destination keyset capacity exhausted");
+        w->reason = CBF_INSERT_CAPACITY;
         return -1;
     }
     if (w->target_count > 0 &&
@@ -4850,7 +5699,10 @@ static void *or_child_worker(void *arg) {
     if(btree_dispatch_checked(w->db_root, w->object, w->leaf->field, w->splits,
                    (SearchCriterion *)w->leaf,
                    resolve_idx_field(ts, w->leaf->field),
-                   or_collect_cb, w)<0){w->predicate_error=errno?errno:EILSEQ;}
+                   or_collect_cb, w)<0){
+        w->predicate_error=errno?errno:EILSEQ;
+        w->reason = CBF_HARD;
+    }
     return NULL;
 }
 
@@ -4865,9 +5717,11 @@ static void *or_child_worker(void *arg) {
    be consumed without re-matching against a wider tree (i.e., need_rematch
    is false). For find with limit=N, callers pass N + offset; for count and
    aggregate, callers pass 0 (need every candidate). */
-KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
-                               const CriteriaNode *or_node, QueryDeadline *dl,
-                               int *out_budget_exceeded, int target_count) {
+KeySet *build_or_keyset_ck(const char *db_root, const char *object, int splits,
+                           const CriteriaNode *or_node, QueryDeadline *dl,
+                           int *out_budget_exceeded, int target_count,
+                           KeySetBudget *budget, CandidateBuildOut *out) {
+    cb_out_init(out);
     errno=0;
     int n = or_node->n_children;
     if (n <= 0) return NULL;
@@ -4889,25 +5743,35 @@ KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
     size_t est_total = (size_t)(live_int > 0 ? live_int : 1024);
     if (est_total < 1024) est_total = 1024;
 
-    /* Budget check: KeySet alloc is O(cap_pow2 * 24 bytes) — keys[] + state[].
-       Cap est_total to fit the per-query buffer cap. */
-    size_t ks_cap_guess = est_total * 2; /* keyset_new doubles + rounds up */
-    size_t ks_bytes = ks_cap_guess * (sizeof(uint8_t[16]) + sizeof(uint32_t));
+    size_t ks_bytes = 0;
+    if (keyset_allocation_bytes(est_total, &ks_bytes) != 0)
+        return bm_build_fail(out, CBF_HARD, errno);
     if (ks_bytes > g_query_buffer_max_bytes) {
-        LOG_WARN(LOG_SUB_QUERY, "build_or_keyset: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes, g_query_buffer_max_bytes);
+        LOG_WARN(LOG_SUB_QUERY,
+                 "build_or_keyset: actual keyset size %zu exceeds query buffer cap %zu",
+                 ks_bytes, g_query_buffer_max_bytes);
         if (out_budget_exceeded) *out_budget_exceeded = 1;
-        return NULL;
+        return bm_build_fail(out, CBF_BUDGET, 0);
     }
-
-    /* coverity[tainted_data] CID 1693838: est_total is bounded above by
-       the explicit g_query_buffer_max_bytes check immediately above. */
-    KeySet *ks = keyset_new(est_total);
+    KeySet *ks = keyset_new_budgeted(est_total, budget);
     if (!ks) {
+        int saved = errno;
         LOG_ERROR(LOG_SUB_QUERY, "build_or_keyset: keyset_new(%zu) failed", est_total);
-        return NULL;
+        return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD, saved);
     }
 
+    bm_ks_race_barrier(BMKS_RACE_OR, est_total, ks->cap);
+    size_t ctx_bytes = (size_t)n * sizeof(OrChildWorkerCtx);
+    if (keyset_budget_reserve(budget, ctx_bytes) != 0) {
+        keyset_free(ks);
+        return bm_build_fail(out, CBF_BUDGET, ENOBUFS);
+    }
     OrChildWorkerCtx *ctxs = calloc(n, sizeof(OrChildWorkerCtx));
+    if (!ctxs) {
+        keyset_budget_release(budget, ctx_bytes);
+        keyset_free(ks);
+        return bm_build_fail(out, CBF_HARD, ENOMEM);
+    }
     for (int i = 0; i < n; i++) {
         CriteriaNode *c = or_node->children[i];
         ctxs[i].db_root = db_root;
@@ -4917,6 +5781,7 @@ KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
         ctxs[i].ks = ks;
         ctxs[i].deadline = dl;
         ctxs[i].target_count = target_count;
+        atomic_init(&ctxs[i].reason, CBF_NONE);
     }
 
     /* Parallel across OR children via parallel_for. or_child_worker calls
@@ -4944,11 +5809,44 @@ KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
         }
     }
 
-    int error=0;for(int i=0;i<n;i++)if(ctxs[i].predicate_error)error=ctxs[i].predicate_error;
+    int error=0;
+    CandidateBuildFailure reason = CBF_NONE;
+    for(int i=0;i<n;i++){
+        if(ctxs[i].predicate_error)error=ctxs[i].predicate_error;
+        /* Hard beats insertion-capacity beats timeout. */
+        CandidateBuildFailure kr = ctxs[i].reason;
+        if (kr == CBF_HARD || reason == CBF_NONE) reason = kr;
+        else if (reason != CBF_HARD && kr == CBF_INSERT_CAPACITY)
+            reason = CBF_INSERT_CAPACITY;
+    }
     free(ctxs);
-    if(error){keyset_free(ks);errno=error;return NULL;}
+    keyset_budget_release(budget, ctx_bytes);
+    if(error){
+        keyset_free(ks);
+        return bm_build_fail(out, reason == CBF_NONE ? CBF_HARD : reason, error);
+    }
+    if (reason != CBF_NONE) {
+        keyset_free(ks);
+        return bm_build_fail(out, reason, 0);
+    }
+    if (dl && dl->timed_out) {
+        keyset_free(ks);
+        return bm_build_fail(out, CBF_TIMEOUT, 0);
+    }
     return ks;
 }
+
+KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
+                        const CriteriaNode *or_node, QueryDeadline *dl,
+                        int *out_budget_exceeded, int target_count) {
+    CandidateBuildOut o;
+    KeySet *ks = build_or_keyset_ck(db_root, object, splits, or_node, dl,
+                                   out_budget_exceeded, target_count, NULL, &o);
+    if (!ks) errno = o.reason == CBF_HARD ? o.saved_errno
+                    : o.reason == CBF_INSERT_CAPACITY ? ENOBUFS : 0;
+    return ks;
+}
+
 
 /* (legacy KeysetRecordRead / read_record_by_hash / release_record_read removed
    2026-05-07 — superseded by RecordRef + read_record_ref/release_record_ref in
@@ -5234,13 +6132,50 @@ static int or_count_batch_cb(const uint8_t hash16[16],
 /* Count records matching `tree` by iterating a KeySet built from the OR branch.
    For pure-OR trees (root IS the or_node), returns |KeySet| directly.
    For hybrid (AND + OR), re-matches each keyed record against the full tree. */
+/* Full-record count with the original compiled tree (recovery for
+ * bitmap candidate insertion-capacity exhaustion). Never a candidate route:
+ * every live record is fetched and matched against the complete tree.
+ * 0 = *out_count valid (dl->timed_out may still be set — callers keep their
+ * existing timeout rendering); -1 = real scan error in errno. */
+int count_full_record_checked(const char *db_root, const char *object,
+                              CriteriaNode *tree, FieldSchema *fs,
+                              const Schema *sch, QueryDeadline *dl,
+                              size_t *out_count) {
+    if (candidate_deadline_expired(dl)) { *out_count = 0; return 0; }
+    SlotcaskSchemaInfo info = {
+        .splits = sch->splits, .slot_size = sch->slot_size,
+        .streams = sch->streams,
+    };
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) { errno = EIO; return -1; }
+    int64_t match_count = 0;
+    /* fast_cc = NULL: the full tree decides every record. */
+    int status = scan_shards_v2_o_direct_match_checked(sdb, fs, NULL, tree,
+                                                       dl, &match_count);
+    if (status) { errno = EILSEQ; return -1; }
+    *out_count = (size_t)match_count;
+    return 0;
+}
+
 static size_t keyset_count_from_or(const char *db_root, const char *object,
                                    const Schema *sch, CriteriaNode *tree,
                                    CriteriaNode *or_node, FieldSchema *fs,
                                    QueryDeadline *dl, int *out_budget_exceeded) {
     /* Count needs the full union — no short-circuit. */
-    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl,
-                                 out_budget_exceeded, 0);
+    CandidateBuildOut cb;
+    KeySet *ks = build_or_keyset_ck(db_root, object, sch->splits, or_node, dl,
+                                    out_budget_exceeded, 0, NULL, &cb);
+    if (!ks && cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+        /* One-shot whole-record recovery. */
+        size_t full = 0;
+        if (count_full_record_checked(db_root, object, tree, fs, sch, dl,
+                                      &full) != 0) {
+            if (!dl->timed_out) return SIZE_MAX;
+            return 0;
+        }
+        BMKS_STAT_FALLBACK("count");
+        return full;
+    }
     if (!ks) return errno?SIZE_MAX:0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
@@ -5782,6 +6717,15 @@ int cas_guard_request(const char *db_root, const char *object,
     return 0;
 }
 
+
+/* Checked idx_count_for_leaf: bitmap/trigram candidate build reasons are
+ * visible to the caller so insertion-capacity can recover without
+ * masquerading as a hard error. */
+size_t idx_count_for_leaf_ck(const char *db_root, const char *object,
+                             const Schema *sch, const FieldSchema *fs,
+                             SearchCriterion *leaf, QueryDeadline *dl,
+                             CandidateBuildOut *out);
+
 static int cmd_count_with_tree(const char *db_root, const char *object,
                                 CriteriaNode *tree) {
     Schema sch = load_schema(db_root, object);
@@ -5826,8 +6770,21 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
         const TypedField *pc_tf = resolve_idx_field(fs.ts, pc->field);
 
         if (is_single_leaf) {
-            size_t count = idx_count_for_leaf(db_root, object, &sch,
-                                              &fs, pc, &dl);
+            CandidateBuildOut cb;
+            size_t count = idx_count_for_leaf_ck(db_root, object, &sch,
+                                                 &fs, pc, &dl, &cb);
+            if ((cb.reason == CBF_INSERT_CAPACITY ||
+             (cb.reason == CBF_BUDGET && cb.saved_errno == 0)) &&
+            !candidate_deadline_expired(&dl)) {
+                /* One-shot whole-record recovery. */
+                if (count_full_record_checked(db_root, object, tree, &fs,
+                                              &sch, &dl, &count) != 0 &&
+                    !dl.timed_out) {
+                    OUT("{\"error\":\"invalid typed record\"}\n");
+                    return -1;
+                }
+                BMKS_STAT_FALLBACK("count");
+            }
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else if(count==SIZE_MAX)OUT("{\"error\":\"invalid typed record\"}\n");
                     else OUT("%zu\n", count);
@@ -5884,9 +6841,31 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
            record fetch revalidates at the Kf reader. The KeySet is a
            candidate producer, never the answer. */
         int small_primary = 0;
-        KeySet *result = intersect_indexed_leaves(db_root, object, sch.splits,
-                                                  fp.source_leaves, fp.n_source,
-                                                  &dl, &small_primary);
+        CandidateBuildOut cb;
+        KeySet *result = intersect_indexed_leaves_ck(db_root, object, sch.splits,
+                                                     fp.source_leaves, fp.n_source,
+                                                     &dl, &small_primary, NULL, &cb);
+        if (!result && (cb.reason == CBF_INSERT_CAPACITY ||
+                        (cb.reason == CBF_BUDGET && cb.saved_errno == 0)) &&
+            !candidate_deadline_expired(&dl)) {
+            /* One-shot whole-record recovery: never zero for
+               capacity failure. */
+            size_t full = 0;
+            if (count_full_record_checked(db_root, object, tree, &fs, &sch,
+                                          &dl, &full) != 0) {
+                if (!dl.timed_out) {
+                    OUT("{\"error\":\"invalid typed record\"}\n");
+                    return -1;
+                }
+                OUT("{\"error\":\"query_timeout\"}\n");
+                return 0;
+            }
+            if (cb.reason == CBF_INSERT_CAPACITY)
+                BMKS_STAT_FALLBACK("count");
+            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            else OUT("%zu\n", full);
+            return 0;
+        }
         if (!result) {
             if(errno)OUT("{\"error\":\"index candidate construction failed\"}\n");
             else if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
@@ -5992,9 +6971,11 @@ int cmd_count_tree(const char *db_root, const char *object, CriteriaNode *tree) 
      IT_TRIGRAM  → trigram KeySet + parallel_indexed_count
      IT_BITMAP   → bm_popcount_for_crit / bm_popcount_generic_for_crit
      IT_BTREE    → btree_dispatch + idx_count_cb  */
-size_t idx_count_for_leaf(const char *db_root, const char *object,
-                          const Schema *sch, const FieldSchema *fs,
-                          SearchCriterion *leaf, QueryDeadline *dl) {
+size_t idx_count_for_leaf_ck(const char *db_root, const char *object,
+                             const Schema *sch, const FieldSchema *fs,
+                             SearchCriterion *leaf, QueryDeadline *dl,
+                             CandidateBuildOut *out) {
+    cb_out_init(out);
     int picked = pick_index_for_leaf(db_root, object, leaf);
     const TypedField *tf = resolve_idx_field(fs->ts, leaf->field);
 
@@ -6019,8 +7000,9 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
            candidate at the Kf reader — the raw popcount success paths
            are gone. */
         KeySet *ks = (picked == IT_TRIGRAM)
-            ? build_keyset_from_trigram(db_root, object, sch->splits, leaf, dl)
-            : build_keyset_from_bitmap(db_root, object, sch->splits, leaf, tf, dl,fs->ts);
+            ? build_keyset_from_trigram_b(db_root, object, sch->splits, leaf, dl,
+                                          NULL, out)
+            : build_keyset_from_bitmap(db_root, object, sch->splits, leaf, tf, dl,fs->ts,NULL,out);
         if (ks) {
             CollectedHash *entries = NULL;
             size_t n = 0;
@@ -6030,9 +7012,39 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
                                          &leaf_node, (FieldSchema *)fs, dl, NULL);
             free(entries);
             keyset_free(ks);
-        } else if(errno) {
-            free_compiled_criteria(cc,1);
-            return SIZE_MAX;
+        } else {
+            if ((out->reason == CBF_INSERT_CAPACITY ||
+                 (out->reason == CBF_BUDGET && out->saved_errno == 0)) &&
+                !candidate_deadline_expired(dl)) {
+                /* Candidate set overflowed after concurrent growth:
+                   recover once from the full record scan with the original
+                   tree and deadline. */
+                size_t full = 0;
+                if (count_full_record_checked(db_root, object, &leaf_node,
+                                              (FieldSchema *)fs, sch, dl,
+                                              &full) != 0) {
+                    int saved = errno;
+                    free_compiled_criteria(cc, 1);
+                    errno = saved;
+                    out->reason = dl->timed_out ? CBF_TIMEOUT : CBF_HARD;
+                    out->saved_errno = saved;
+                    if (!dl->timed_out) return SIZE_MAX;
+                    return 0;   /* timeout: caller renders it */
+                }
+                if (out->reason == CBF_INSERT_CAPACITY)
+                    BMKS_STAT_FALLBACK("count");
+                cb_out_init(out);
+                free_compiled_criteria(cc, 1);
+                return full;
+            }
+            if (out->reason == CBF_HARD) {
+                int saved = out->saved_errno;
+                free_compiled_criteria(cc, 1);
+                errno = saved;
+                return SIZE_MAX;
+            }
+            /* budget / deliberate empty keep their historical behavior */
+            errno = 0;
         }
         free_compiled_criteria(cc, 1);
         return cnt;
@@ -6062,6 +7074,15 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
     }
     free_compiled_criteria(cc, 1);
     return cnt;
+}
+
+size_t idx_count_for_leaf(const char *db_root, const char *object,
+                          const Schema *sch, const FieldSchema *fs,
+                          SearchCriterion *leaf, QueryDeadline *dl) {
+    CandidateBuildOut o;
+    size_t n = idx_count_for_leaf_ck(db_root, object, sch, fs, leaf, dl, &o);
+    if (n == SIZE_MAX && o.reason != CBF_HARD) errno = 0;
+    return n;
 }
 
 /* find <object> <criteria_json> [offset] [limit] [fields]
@@ -7089,6 +8110,25 @@ static void *cursor_fetch_worker(void *arg) {
     return NULL;
 }
 
+/* One-way request flag: once candidate capacity overflow forced a whole
+ * record fallback, no later stage of the SAME request may rebuild bitmap
+ * candidates (prefilters, probes, totals). Thread-local: one request never
+ * spans threads at the orchestration level; set and cleared strictly inside
+ * cmd_find_do_impl on every exit path. */
+static __thread int bm_find_candidates_disabled;
+static __thread int bm_find_candidates_active;
+typedef struct {
+    int disabled;
+    int active;
+} BmFindScope;
+
+/* Scope guard: the request-scoped flag is always cleared, on every exit
+ * path, when the owning cmd_find_do_impl frame unwinds. */
+static void bm_find_flag_reset(BmFindScope *saved) {
+    bm_find_candidates_disabled = saved->disabled;
+    bm_find_candidates_active = saved->active;
+}
+
 /* Forward declaration — defined further down alongside the other
    filter-plan adapters; the D2 executor below uses it. */
 static KeySet *build_keyset_from_plan(const FilterPlan *fp,
@@ -7302,7 +8342,9 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
                                   int offset, int limit,
                                   const char **proj_fields, int proj_count,
                                   int dict_fmt,
-                                  QueryDeadline *dl)
+                                  QueryDeadline *dl,
+                                  KeySet *prebuilt, int have_prebuilt,
+                                  KeySetBudget *budget)
 {
     /* Resolve order_by → typed-field index for typed_field_to_index_key. */
     int order_field_idx = -1;
@@ -7314,26 +8356,41 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
             }
         }
     }
-    if(order_field_idx<0){errno=EINVAL;return SIZE_MAX;}
+    if(order_field_idx<0){keyset_free(prebuilt);errno=EINVAL;return SIZE_MAX;}
 
-    /* Build the candidate KeySet from the planner's source.  NULL or
-       empty → nothing to emit. */
-    errno=0;
-    KeySet *prefilter_ks=build_keyset_from_plan(fp,db_root,object,sch,dl);
-    if(!prefilter_ks){if(!errno)errno=EIO;return SIZE_MAX;}
+    /* The candidate KeySet comes from the pre-emission preparation when a
+       bitmap source is involved (ownership transferred; NULL = deadline
+       expired during preparation → nothing to emit), else it is built from
+       the planner's source here. */
+    KeySet *prefilter_ks;
+    if (have_prebuilt) {
+        prefilter_ks = prebuilt;
+        if (!prefilter_ks) return 0;
+    } else {
+        errno=0;
+        prefilter_ks=build_keyset_from_plan(fp,db_root,object,sch,dl);
+        if(!prefilter_ks){if(!errno)errno=EIO;return SIZE_MAX;}
+    }
     if (keyset_size(prefilter_ks) == 0) { keyset_free(prefilter_ks); return 0; }
 
     /* For D1 composite plans where a more-selective non-seed leaf exists,
        replace the broad composite-seed KeySet with a narrow KeySet built
-       from the most-selective leaf. */
+       from the most-selective leaf. The replacement charges the same
+       request budget; the two sets coexist only until the broad one is
+       freed below. On a refused/failing build the broad set stays. */
     if (fp->prefilter_source_leaf &&
         fp->prefilter_card > 0 &&
         fp->prefilter_card < keyset_size(prefilter_ks)) {
-        KeySet *narrow = build_keyset_from_leaf(db_root, object, sch->splits,
-                                                 fp->prefilter_source_leaf, dl);
+        CandidateBuildOut ncb;
+        errno = 0;
+        KeySet *narrow = build_keyset_from_leaf_ck(db_root, object, sch->splits,
+                                                   fp->prefilter_source_leaf,
+                                                   dl, budget, &ncb);
         if (narrow) {
             keyset_free(prefilter_ks);
             prefilter_ks = narrow;
+        } else {
+            errno = 0;   /* keep the already-built broad prefilter */
         }
     }
 
@@ -7496,12 +8553,16 @@ size_t g_ordered_find_keyset_max = 100000;
    table in cmd_find's primary-source switch but isolated so the
    ordered paths can size-check the candidate set and choose
    filter-first vs walk-ordered. */
-static KeySet *build_keyset_from_plan(const FilterPlan *fp,
+static KeySet *build_keyset_from_plan_ck(const FilterPlan *fp,
                                       const char *db_root,
                                       const char *object,
                                       const Schema *sch,
-                                      QueryDeadline *dl) {
-    if (!fp) return NULL;
+                                      QueryDeadline *dl, KeySetBudget *budget,
+                                         CandidateBuildOut *out) {
+    cb_out_init(out);
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
+    if (!fp) return bm_build_fail(out, CBF_NONE, 0);
+    if (bm_find_candidates_disabled) return bm_build_fail(out, CBF_NONE, 0);   /* one-way fallback */
     switch (fp->kind) {
     case FP_PRIMARY_LEAF:
     case FP_BITMAP_SMALLER: {
@@ -7530,10 +8591,12 @@ static KeySet *build_keyset_from_plan(const FilterPlan *fp,
                                                     leaf->field, sch->splits,
                                                     leaf, tf, ts);
             }
-            if (pop == SIZE_MAX || pop > g_ordered_find_keyset_max) return NULL;
+            if (pop == SIZE_MAX) return bm_build_fail(out, CBF_HARD, errno);
+            if (pop > g_ordered_find_keyset_max)
+                return bm_build_fail(out, CBF_NONE, 0);
         }
-        return build_keyset_from_leaf(db_root, object, sch->splits,
-                                      leaf, dl);
+        return build_keyset_from_leaf_ck(db_root, object, sch->splits,
+                                         leaf, dl, budget, out);
     }
     case FP_INTERSECT: {
         /* Broad-set guard (parity with FP_PRIMARY_LEAF above): when every
@@ -7560,24 +8623,39 @@ static KeySet *build_keyset_from_plan(const FilterPlan *fp,
             size_t pop = bm_popcount_intersect(db_root, object, sch->splits,
                                                (SearchCriterion **)fp->source_leaves,
                                                fp->n_source, ts, dl);
-            if (pop == SIZE_MAX || pop > g_ordered_find_keyset_max) return NULL;
+            if (pop == SIZE_MAX) return bm_build_fail(out, CBF_HARD, errno);
+            if (pop > g_ordered_find_keyset_max)
+                return bm_build_fail(out, CBF_NONE, 0);
         }
         int small_primary = 0;
-        return intersect_indexed_leaves(db_root, object, sch->splits,
+        return intersect_indexed_leaves_ck(db_root, object, sch->splits,
                                         (SearchCriterion **)fp->source_leaves,
                                         fp->n_source,
-                                        dl, &small_primary);
+                                        dl, &small_primary, budget, out);
     }
     case FP_UNION: {
         int budget_exceeded = 0;
-        return build_or_keyset(db_root, object, sch->splits,
+        return build_or_keyset_ck(db_root, object, sch->splits,
                                fp->or_node, dl,
-                               &budget_exceeded, 0);
+                               &budget_exceeded, 0, budget, out);
     }
     case FP_FULL_SCAN:
     default:
-        return NULL;
+        return bm_build_fail(out, CBF_NONE, 0);
     }
+}
+
+static KeySet *build_keyset_from_plan(const FilterPlan *fp,
+                                      const char *db_root, const char *object,
+                                      const Schema *sch, QueryDeadline *dl) {
+    CandidateBuildOut out;
+    KeySet *ks = build_keyset_from_plan_ck(fp, db_root, object, sch, dl, NULL, &out);
+    if (!ks && out.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+        if (bm_find_candidates_active) bm_find_candidates_disabled = 1;
+        BMKS_STAT_FALLBACK("prefilter");
+        errno = 0;
+    }
+    return ks;
 }
 
 /* SlotcaskScanCb for bulk_delete_phase1_indexed: receives key + value from a
@@ -7645,6 +8723,10 @@ int bulk_delete_phase1_indexed(const char *db_root, const char *object,
                                        CriteriaNode *tree, int limit,
                                        QueryDeadline *dl,
                                        BulkCriteriaCtx *out_ctx) {
+    BmFindScope bm_flag_guard __attribute__((cleanup(bm_find_flag_reset))) =
+        { bm_find_candidates_disabled, bm_find_candidates_active };
+    bm_find_candidates_disabled = 0;
+    bm_find_candidates_active = 0;
     size_t N = (size_t)get_live_count(db_root, object);
     FilterPlan fp = plan_filter(tree, db_root, object, fs,
                                 sch->splits, N,
@@ -7653,7 +8735,7 @@ int bulk_delete_phase1_indexed(const char *db_root, const char *object,
     if (fp.kind == FP_FULL_SCAN) return 0;
 
     KeySet *ks = build_keyset_from_plan(&fp, db_root, object, sch, dl);
-    if (!ks) return 0;
+    if (!ks) { errno = 0; return 0; }   /* caller falls back to a full scan */
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
     if (keyset_size(ks) == 0) {
@@ -7706,119 +8788,380 @@ int bulk_delete_phase1_indexed(const char *db_root, const char *object,
  * postfilter-bearing plans where the count would need a full recheck). */
 /* hint_ks: when non-NULL and the plan is FP_PRIMARY_LEAF+postfilter, borrow this
    pre-built KeySet instead of re-walking the primary index.  Caller retains ownership. */
+static size_t prepared_count_candidates(const KeySet *ks, CriteriaNode *tree,
+                                        const char *root, const char *object,
+                                        const Schema *sch, FieldSchema *fs,
+                                        QueryDeadline *dl, int *out_null);
+
 static size_t fp_compute_total(const FilterPlan *fp, CriteriaNode *tree,
                                const char *db_root, const char *object,
                                const Schema *sch, FieldSchema *fs,
                                QueryDeadline *dl, int *out_null,
                                KeySet *hint_ks) {
-    (void)tree;
     *out_null = 1;
-    if (!fp || dl->timed_out) return 0;
+    if (!fp || candidate_deadline_expired(dl)) return 0;
+    if (bm_find_candidates_disabled) {
+        size_t total = 0;
+        if (count_full_record_checked(db_root, object, tree, fs, sch, dl,
+                                      &total) != 0)
+            return SIZE_MAX;
+        *out_null = dl->timed_out ? 1 : 0;
+        return total;
+    }
+    CandidateBuildOut cb;
+    cb_out_init(&cb);
+    KeySet *ks = NULL;
+    int owned = 1;
+    int budget_exceeded = 0;
     switch (fp->kind) {
     case FP_INTERSECT: {
         int small_primary = 0;
-        /* Cast away const on the source_leaves array: the function's signature
-         * is SearchCriterion** (mutates nothing in practice; the const is a
-         * caller-side guarantee that's just not threaded into the helper). */
-        SearchCriterion **leaves = (SearchCriterion **)(uintptr_t)fp->source_leaves;
-        KeySet *ks = intersect_indexed_leaves(db_root, object, sch->splits,
-                                              leaves, fp->n_source,
-                                              dl, &small_primary);
-        if (!ks || dl->timed_out) { if (ks) keyset_free(ks); return 0; }
-        size_t n = 0;
-        if (!small_primary && fp->n_postfilter == 0) {
-            /* Clean intersection: KeySet size IS the match count. */
-            n = keyset_size(ks);
-            *out_null = 0;
-        } else {
-            /* small_primary OR n_postfilter > 0 → KeySet is candidates,
-             * not the answer. Walk it, fetch + criteria_match_tree per
-             * record, count matches. Same cost as the explorer's
-             * separate count query; we just consolidate it here. */
-            CollectedHash *entries = NULL;
-            size_t nh = 0;
-            keyset_to_collected_hashes(ks, sch->splits, &entries, &nh);
-            if (entries && tree) {
-                n = parallel_indexed_count(db_root, object, sch,
-                                           entries, (int)nh,
-                                           tree, fs, dl, fp);
-                if (!dl->timed_out && n!=SIZE_MAX) *out_null = 0;
-            } else if (entries && !tree) {
-                /* No tree to verify against → every candidate is a match. */
-                n = nh;
-                *out_null = 0;
-            }
-            free(entries);
-        }
-        keyset_free(ks);
-        return n;
+        ks = intersect_indexed_leaves_ck(db_root, object, sch->splits,
+                                         (SearchCriterion **)fp->source_leaves,
+                                         fp->n_source, dl, &small_primary,
+                                         NULL, &cb);
+        break;
     }
     case FP_PRIMARY_LEAF:
-    case FP_BITMAP_SMALLER: {
-        /* Composite-driven plans (Phase A ordered, Phase B exact) set
-         * kind=PRIMARY_LEAF but source_leaves[0] is only the seed / first
-         * composite sub-field — idx_count_for_leaf would count that leaf
-         * alone and ignore the other pinned fields + siblings, overcounting.
-         * Exact mode always has ≥2 pinned fields; ordered-composite overcounts
-         * only when the criteria tree has siblings beyond the seed leaf. Emit
-         * null total in those cases (rows are still correct; the client can
-         * fire a separate count). */
+    case FP_BITMAP_SMALLER:
         if (fp->order == FP_ORDER_COMPOSITE_EXACT) return 0;
         if (fp->order == FP_ORDER_COMPOSITE && tree && tree->kind != CNODE_LEAF)
             return 0;
         if (fp->n_source == 0) return 0;
-        if (fp->n_postfilter != 0) {
-            /* Count via KeySet + full-tree verify.  Prefer hint_ks (built by
-               cursor path) to avoid re-walking the primary index. */
-            KeySet *ks = hint_ks;
-            int built = 0;
-            if (!ks) {
-                ks = build_keyset_from_leaf(db_root, object, sch->splits,
-                                            fp->source_leaves[0], dl);
-                built = 1;
-            }
-            if (!ks || dl->timed_out) { if (built && ks) keyset_free(ks); return 0; }
-            CollectedHash *entries = NULL; size_t nh = 0;
-            keyset_to_collected_hashes(ks, sch->splits, &entries, &nh);
-            size_t n = 0;
-            if (entries && tree) {
-                n = parallel_indexed_count(db_root, object, sch,
-                                           entries, (int)nh,
-                                           tree, fs, dl, fp);
-                if (!dl->timed_out && n!=SIZE_MAX) *out_null = 0;
-            } else if (entries && !tree) {
-                n = nh; *out_null = 0;
-            }
-            free(entries);
-            if (built) keyset_free(ks);
-            return n;
-        }
-        size_t n = idx_count_for_leaf(db_root, object, sch, fs,
-                                      fp->source_leaves[0], dl);
-        if (!dl->timed_out && n!=SIZE_MAX) *out_null = 0;
-        return n;
-    }
-    case FP_UNION: {
-        int budget_exc = 0;
-        KeySet *ks = build_or_keyset(db_root, object, sch->splits,
-                                     fp->or_node, dl, &budget_exc, 0);
-        size_t n = 0;
-        if (ks && !dl->timed_out && !budget_exc) {
-            n = keyset_size(ks);
-            *out_null = 0;
-        }
-        if (ks) keyset_free(ks);
-        return n;
-    }
-    case FP_FULL_SCAN:
+        if (hint_ks) { ks = hint_ks; owned = 0; }
+        else ks = build_keyset_from_leaf_ck(db_root, object, sch->splits,
+                                            fp->source_leaves[0], dl, NULL, &cb);
+        break;
+    case FP_UNION:
+        ks = build_or_keyset_ck(db_root, object, sch->splits, fp->or_node,
+                                dl, &budget_exceeded, 0, NULL, &cb);
+        break;
     default:
-        /* Full-scan count would mean another full scan over the
-         * same data — skip and emit null; caller can fire a separate
-         * count if they really need it for this shape. */
+        return 0;
+    }
+    if (!ks) {
+        if (cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+            if (bm_find_candidates_active) bm_find_candidates_disabled = 1;
+            size_t total = 0;
+            if (count_full_record_checked(db_root, object, tree, fs, sch, dl,
+                                          &total) != 0)
+                return SIZE_MAX;
+            BMKS_STAT_FALLBACK("total");
+            *out_null = dl->timed_out ? 1 : 0;
+            return total;
+        }
+        if (cb.reason == CBF_HARD) {
+            errno = cb.saved_errno ? cb.saved_errno : EIO;
+            return SIZE_MAX;
+        }
+        if (!budget_exceeded && errno && !dl->timed_out) return SIZE_MAX;
+        return 0;
+    }
+    size_t total = prepared_count_candidates(ks, tree, db_root, object,
+                                             sch, fs, dl, out_null);
+    int saved = errno;
+    if (owned) keyset_free(ks);
+    errno = saved;
+    return total;
+}
+
+
+/* ========== Prepared bitmap find sources (pre-emission boundary) ==========
+   A find whose plan reads bitmap sources prepares them — candidate KeySets
+   and any required total that would read bitmaps — before the response
+   envelope, so a bitmap failure is reported as one complete error object
+   instead of after rows. Records are filtered, paginated and emitted
+   afterwards by the existing executors. Not a general output transaction:
+   record/serialization errors after emission keep their existing
+   behavior. */
+typedef enum {
+    PREP_NONE = 0,
+    PREP_STREAM,     /* former small-limit streaming shape: 1-record iterator */
+    PREP_INTERSECT,  /* keyset_emit_find over the intersection candidates */
+    PREP_PRIMARY,    /* keyset_emit_find over the bitmap leaf candidates */
+    PREP_UNION       /* keyset_emit_find over the union candidates */
+} PrepRoute;
+
+typedef struct {
+    PrepRoute    route;
+    KeySet      *ks;              /* positive candidate set; NULL = none */
+    int          small_primary;   /* intersect returned only its smallest leaf */
+    int          need_rematch;    /* emit must re-check the full tree */
+    int          total_ready;     /* response total computed pre-emission */
+    size_t       total;
+    int          total_null;
+    int          d2_ready;        /* D2's required prefilter prepared */
+    KeySet      *d2_prefilter;    /* ownership handed to find_via_fetch_sort */
+    KeySetBudget budget;          /* request-owned candidate budget */
+    int          record_fallback; /* candidate overflow: whole-record mode is
+                                   one-way for the rest of this request */
+} PreparedBitmapFind;
+
+static int find_leaf_is_bitmap(const char *db_root, const char *object,
+                               const SearchCriterion *leaf) {
+    return leaf && pick_index_for_leaf(db_root, object, leaf) == IT_BITMAP;
+}
+
+static int find_plan_reads_bitmap(const FilterPlan *fp, const char *db_root,
+                                  const char *object) {
+    if (!fp) return 0;
+    switch (fp->kind) {
+    case FP_PRIMARY_LEAF:
+    case FP_BITMAP_SMALLER:
+    case FP_INTERSECT:
+        for (int i = 0; i < fp->n_source; i++)
+            if (find_leaf_is_bitmap(db_root, object, fp->source_leaves[i]))
+                return 1;
+        return 0;
+    case FP_UNION:
+        if (!fp->or_node) return 0;
+        for (int i = 0; i < fp->or_node->n_children; i++) {
+            const CriteriaNode *c = fp->or_node->children[i];
+            if (c && c->kind == CNODE_LEAF &&
+                find_leaf_is_bitmap(db_root, object, &c->leaf))
+                return 1;
+        }
+        return 0;
+    default:
         return 0;
     }
 }
 
+static void prepared_find_destroy(PreparedBitmapFind *p) {
+    keyset_free(p->ks);
+    p->ks = NULL;
+    keyset_free(p->d2_prefilter);
+    p->d2_prefilter = NULL;
+}
+
+/* One deterministic error object for a pre-emission failure; candidate
+   memory exhaustion keeps the existing buffer error text. */
+static void prepared_find_report(int err) {
+    if (err == ENOBUFS) OUT(QUERY_BUFFER_ERR);
+    else OUT("{\"error\":\"bitmap index unavailable\"}\n");
+}
+
+/* Response total for an ordered/D-path or tail fallback: the prepared value
+   when the plan's total was computed pre-emission, else the existing
+   fp_compute_total. */
+static size_t prepared_or_fp_total(const PreparedBitmapFind *p,
+                                   const FilterPlan *fp, CriteriaNode *tree,
+                                   const char *db_root, const char *object,
+                                   const Schema *sch, FieldSchema *fs,
+                                   QueryDeadline *dl, int *out_null) {
+    if (p->total_ready) { *out_null = p->total_null; return p->total; }
+    return fp_compute_total(fp, tree, db_root, object, sch, fs, dl, out_null,
+                            NULL);
+}
+
+/* Candidate overflow recovery — discard the prepared candidates, flip
+ * the request into whole-record mode (one-way), and compute any required
+ * total before the envelope with the original deadline. No candidate route
+ * runs again in this request; no new deadline; no snapshot isolation. */
+static int prepared_find_recover(PreparedBitmapFind *p, CriteriaNode *tree,
+                                  const char *db_root, const char *object,
+                                  const Schema *sch, FieldSchema *fs,
+                                  QueryDeadline *dl, int want_total,
+                                  const char *kind) {
+    keyset_free(p->ks);
+    p->ks = NULL;
+    keyset_free(p->d2_prefilter);
+    p->d2_prefilter = NULL;
+    p->d2_ready = 0;
+    p->small_primary = 0;
+    p->route = PREP_NONE;
+    p->need_rematch = 0;
+    p->total_ready = 0;          /* any cached candidate total is invalid */
+    p->total_null = 1;
+    p->record_fallback = 1;
+    BMKS_STAT_FALLBACK(kind);
+    if (want_total && !dl->timed_out) {
+        size_t full = 0;
+        if (count_full_record_checked(db_root, object, tree, fs, sch, dl,
+                                      &full) != 0)
+            return -1;
+        p->total = full;
+        p->total_null = dl->timed_out ? 1 : 0;
+        p->total_ready = 1;
+    }
+    return 0;
+}
+
+/* 0 = prepared (or nothing to prepare); -1 = failure with errno, to be
+   reported before any response byte. A deadline that expires during
+   preparation leaves an empty candidate set (partial-result semantics; no
+   work is restarted). */
+typedef struct {
+    const char *db_root;
+    const char *object;
+    const Schema *sch;
+    FieldSchema *fs;
+    CriteriaNode *tree;
+    QueryDeadline *deadline;
+    int dl_counter;
+    int error;
+    size_t count;
+} PreparedCountCtx;
+
+static int prepared_count_candidate_cb(const uint8_t hash[16], void *raw) {
+    PreparedCountCtx *c = raw;
+    if (candidate_deadline_expired(c->deadline)) return 1;
+    RecordRef rr;
+    if (read_record_ref(c->db_root, c->object, c->sch, hash, &rr) != 0)
+        return 0;
+    int matched = 0;
+    int status = criteria_match_tree_checked(rr.val, rr.vlen, c->tree, c->fs,
+                                             rr.hdr2, &matched);
+    int saved = errno;
+    release_record_ref(&rr);
+    if (status) {
+        c->error = saved ? saved : EILSEQ;
+        return 1;
+    }
+    if (matched) c->count++;
+    return 0;
+}
+
+static size_t prepared_count_candidates(const KeySet *ks, CriteriaNode *tree,
+                                        const char *root, const char *object,
+                                        const Schema *sch, FieldSchema *fs,
+                                        QueryDeadline *dl, int *out_null) {
+    PreparedCountCtx c = { .db_root = root, .object = object, .sch = sch,
+                            .fs = fs, .tree = tree, .deadline = dl };
+    keyset_iter(ks, prepared_count_candidate_cb, &c);
+    if (c.error) { errno = c.error; return SIZE_MAX; }
+    *out_null = dl->timed_out ? 1 : 0;
+    return c.count;
+}
+
+static int prepared_find_prepare(PreparedBitmapFind *p, const FilterPlan *fp,
+                                 CriteriaNode *tree, const char *db_root,
+                                 const char *object, const Schema *sch,
+                                 FieldSchema *fs, QueryDeadline *dl,
+                                 int has_order, int has_joins, int rows_fmt,
+                                 int csv_delim, int njoins, int offset,
+                                 int limit, int want_total,
+                                 const char *order_by) {
+    if (!find_plan_reads_bitmap(fp, db_root, object)) return 0;
+    if (!has_order && fp->order == FP_ORDER_NONE) {
+        int is_leafish = fp->kind == FP_PRIMARY_LEAF ||
+                         fp->kind == FP_BITMAP_SMALLER;
+        int stream = limit > 0 && (offset + limit) <= 1000 && njoins == 0 &&
+                     !rows_fmt &&
+                     (fp->kind == FP_INTERSECT || (is_leafish && tree)) &&
+                     !(is_leafish && fp->n_source > 0 && fp->source_leaves[0] &&
+                       (op_prefers_trigram(fp->source_leaves[0]->op) ||
+                        op_allows_trigram_starts(fp->source_leaves[0]->op)) &&
+                       field_has_index_type(db_root, object,
+                                            fp->source_leaves[0]->field,
+                                            IT_TRIGRAM));
+        errno = 0;
+        if (fp->kind == FP_INTERSECT) {
+            int sp = 0;
+            CandidateBuildOut cb;
+            p->ks = intersect_indexed_leaves_ck(db_root, object, sch->splits,
+                                               (SearchCriterion **)fp->source_leaves,
+                                               fp->n_source, dl, &sp, &p->budget,
+                                               &cb);
+            if (!p->ks && cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+                return prepared_find_recover(p, tree, db_root, object, sch, fs, dl,
+                                      want_total, "intersect");
+            }
+            if (!p->ks && errno && !dl->timed_out) return -1;
+            p->small_primary = sp;
+            p->route = stream ? PREP_STREAM : PREP_INTERSECT;
+            p->need_rematch = stream || sp || fp->n_postfilter > 0;
+        } else if (is_leafish) {
+            SearchCriterion *pc = fp->n_source > 0 ? fp->source_leaves[0] : NULL;
+            if (!find_leaf_is_bitmap(db_root, object, pc)) return 0;
+            CandidateBuildOut cb;
+            p->ks = build_keyset_from_leaf_ck(db_root, object, sch->splits, pc,
+                                             dl, &p->budget, &cb);
+            if (!p->ks && cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+                return prepared_find_recover(p, tree, db_root, object, sch, fs, dl,
+                                      want_total, "primary");
+            }
+            if (!p->ks && errno && !dl->timed_out) return -1;
+            p->route = stream ? PREP_STREAM : PREP_PRIMARY;
+            p->need_rematch = 1;
+        } else if (fp->kind == FP_UNION) {
+            CriteriaNode *or_node = fp->or_node;
+            int rematch_unnecessary =
+                (tree == or_node) || (tree && tree->kind == CNODE_OR) ||
+                (tree && tree->kind == CNODE_AND && tree->n_children == 1 &&
+                 tree->children[0] == or_node);
+            int need_rematch = !rematch_unnecessary;
+            int target = (!want_total && !need_rematch && limit > 0)
+                         ? offset + limit : 0;
+            int budget_exceeded = 0;
+            CandidateBuildOut cb;
+            p->ks = build_or_keyset_ck(db_root, object, sch->splits, or_node, dl,
+                                      &budget_exceeded, target, &p->budget, &cb);
+            if (budget_exceeded) { keyset_free(p->ks); p->ks = NULL; errno = ENOBUFS; return -1; }
+            if (!p->ks && cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+                return prepared_find_recover(p, tree, db_root, object, sch, fs, dl,
+                                      want_total, "union");
+            }
+            if (!p->ks && errno && !dl->timed_out) return -1;
+            p->route = PREP_UNION;
+            p->need_rematch = need_rematch;
+        }
+        if (want_total && p->ks && !dl->timed_out) {
+            /* Candidate counts are not match counts: postfilter leaves and
+               rematch shapes leave candidates that the full tree rejects,
+               and raw popcounts are optimization inputs, not validated
+               totals. Validate every candidate against the full tree here,
+               before the envelope, so total:true never reports a count
+               derived from an unverified candidate set. */
+            int tnull = 1;
+            size_t n = prepared_count_candidates(p->ks, tree, db_root, object,
+                                                 sch, fs, dl, &tnull);
+            if (n == SIZE_MAX) return -1;
+            p->total = n;
+            p->total_null = tnull;
+            p->total_ready = 1;
+        }
+        return 0;
+    }
+    /* Ordered paths: D2's prefilter is a required source; the others use
+       only optional probes (whole-record fallback). Their response totals
+       would read bitmap sources after rows, so compute them now. */
+    int d2 = fp->order == FP_ORDER_SORT && !has_joins && !rows_fmt &&
+             !csv_delim && fp->n_source > 0 &&
+             (!order_by || strchr(order_by, ',') == NULL);
+    if (d2) {
+        errno = 0;
+        CandidateBuildOut cb;
+        p->d2_prefilter = build_keyset_from_plan_ck(fp, db_root, object, sch, dl,
+                                                   &p->budget, &cb);
+        if (!p->d2_prefilter && cb.reason == CBF_INSERT_CAPACITY &&
+            !candidate_deadline_expired(dl))
+            return prepared_find_recover(p, tree, db_root, object, sch, fs, dl,
+                                          want_total, "ordered");
+        if (!p->d2_prefilter && !dl->timed_out) {
+            if (!errno) errno = ENOBUFS;   /* no bounded candidate set */
+            return -1;
+        }
+        if (want_total && !p->d2_prefilter && dl->timed_out) {
+            /* The deadline expired before a usable prefilter existed: no
+               rows can be walked and the true match count is unknown.
+               D2's walk-time total is then meaningless, so the close must
+               report null, not a fabricated zero. */
+            p->total_null = 1;
+            p->total_ready = 1;
+        }
+        p->d2_ready = 1;
+    } else if (want_total && !dl->timed_out) {
+        int tnull = 1;
+        size_t n = fp_compute_total(fp, tree, db_root, object, sch, fs, dl,
+                                    &tnull, NULL);
+        if (n == SIZE_MAX) return -1;
+        p->total = n;
+        p->total_null = tnull;
+        p->total_ready = 1;
+    }
+    return 0;
+}
 
 static int cmd_find_do_impl(const char *db_root, const char *object,
                         CriteriaNode *tree,
@@ -7829,6 +9172,10 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
                         const char *order_by, const char *order_dir,
                         const char *cursor_json,int want_total,
                         const Schema *explicit_schema,const FieldSchema *explicit_fields) {
+    BmFindScope bm_flag_guard __attribute__((cleanup(bm_find_flag_reset))) =
+        { bm_find_candidates_disabled, bm_find_candidates_active };
+    bm_find_candidates_disabled = 0;
+    bm_find_candidates_active = 1;
     _Atomic size_t sort_owned_bytes=0;
     int sort_error=0;
     int rows_fmt = (format && strcmp(format, "rows") == 0);
@@ -8063,7 +9410,7 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
                     int present=typed_index_text_key_into(driver_fs.ts,(size_t)ospec.parts[i].idx,
                         cur.part[i].value,cur.part[i].vlen,NULL,0,&payloads[i]);
                     if(present<0){free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(errno?errno:EINVAL);}
-                    /* R4: a data-derived probe outside the field's grammar
+                    /* A data-derived probe outside the field's grammar
                        (legacy zero/invalid stored text) encodes as an empty
                        component, never an error. */
                     if(present==0)payloads[i]=0;
@@ -8110,6 +9457,9 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
         KeySet *cursor_prefilter_ks = build_keyset_from_plan(&cursor_fp,
                                                             db_root, object,
                                                             &sch, &cdl);
+        /* Optional probe: any failure (hard or budget) discards the whole
+           optimization and the walk matches full records instead. */
+        if (!cursor_prefilter_ks) errno = 0;
         if (cursor_prefilter_ks &&
             keyset_size(cursor_prefilter_ks) > g_ordered_find_keyset_max) {
             keyset_free(cursor_prefilter_ks);
@@ -8128,6 +9478,34 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
             if (narrow) {
                 keyset_free(cursor_prefilter_ks);
                 cursor_prefilter_ks = narrow;
+            } else {
+                errno = 0;   /* keep the complete broader prefilter */
+            }
+        }
+
+        /* A requested total whose count plan reads bitmap sources is
+           computed before any cursor response byte: a hard bitmap error is
+           reported as one error object, never after the page. */
+        int cursor_total_ready = 0, cursor_total_null = 1;
+        size_t cursor_total = 0;
+        if (want_total) {
+            FilterPlan pre_fp = plan_filter(tree, db_root, object, &driver_fs,
+                                            sch.splits, cursor_N_live,
+                                            NULL, 0 /*fetching*/, 0 /*limit*/);
+            if (find_plan_reads_bitmap(&pre_fp, db_root, object)) {
+                cursor_total = fp_compute_total(&pre_fp, tree, db_root, object,
+                                                &sch, &driver_fs, &cdl,
+                                                &cursor_total_null,
+                                                cursor_prefilter_ks);
+                if (cursor_total == SIZE_MAX) {
+                    int err = errno ? errno : EIO;
+                    keyset_free(cursor_prefilter_ks);
+                    prepared_find_report(err);
+                    free_joins(joins, njoins); free_excluded(&excluded);
+                    errno = err;
+                    return -1;
+                }
+                cursor_total_ready = 1;
             }
         }
 
@@ -8419,10 +9797,12 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
                         &driver_fs, sch.splits, cursor_N_live,
                         NULL, 0 /*fetching*/, 0 /*limit*/);
                     int tnull = 1;
-                    size_t ctotal = fp_compute_total(&count_fp, tree, db_root,
-                                                     object, &sch, &driver_fs,
-                                                     &cdl, &tnull,
-                                                     cursor_prefilter_ks);
+                    size_t ctotal = cursor_total_ready ? cursor_total
+                        : fp_compute_total(&count_fp, tree, db_root,
+                                           object, &sch, &driver_fs,
+                                           &cdl, &tnull,
+                                           cursor_prefilter_ks);
+                    if (cursor_total_ready) tnull = cursor_total_null;
                     if (tnull && tree == NULL) { ctotal = cursor_N_live; tnull = 0; }
                     if (tnull) OUT(",\"total\":null");
                     else       OUT(",\"total\":%zu", ctotal);
@@ -8567,10 +9947,12 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
                 &driver_fs, sch.splits, cursor_N_live,
                 NULL, 0 /*fetching*/, 0 /*limit*/);
             int tnull = 1;
-            size_t ctotal = fp_compute_total(&count_fp, tree, db_root,
-                                             object, &sch, &driver_fs,
-                                             &cdl, &tnull,
-                                             cursor_prefilter_ks);
+            size_t ctotal = cursor_total_ready ? cursor_total
+                : fp_compute_total(&count_fp, tree, db_root,
+                                   object, &sch, &driver_fs,
+                                   &cdl, &tnull,
+                                   cursor_prefilter_ks);
+            if (cursor_total_ready) tnull = cursor_total_null;
             if (tnull && tree == NULL) { ctotal = cursor_N_live; tnull = 0; }
             if (tnull) OUT(",\"total\":null");
             else       OUT(",\"total\":%zu", ctotal);
@@ -8612,6 +9994,33 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
        Populated below for the kinds that can cheaply compute a total. */
     size_t find_total = 0;
     int    find_total_null = 1;
+
+    PreparedBitmapFind prep;
+    memset(&prep, 0, sizeof(prep));
+    {
+        size_t test_limit = query_test_prepared_budget_limit_value();
+        prep.budget.limit = test_limit ? test_limit
+                                       : (size_t)g_query_buffer_max_bytes;
+    }
+    atomic_init(&prep.budget.used, 0);
+    atomic_init(&prep.budget.peak, 0);
+    if (prepared_find_prepare(&prep, &fp, tree, db_root, object, &sch,
+                              (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+                              &dl, (order_by && order_by[0] && !has_joins),
+                              has_joins, rows_fmt, csv_delim != 0, njoins,
+                              offset, limit, want_total, order_by) != 0) {
+        int err = errno ? errno : EIO;
+        prepared_find_destroy(&prep);
+        bm_find_candidates_disabled = prep.record_fallback;
+        prepared_find_report(err);
+        free_excluded(&excluded);
+        free_joins(joins, njoins);
+        errno = err;
+        return -1;   /* guard clears the flag */
+    }
+    bm_find_candidates_disabled = prep.record_fallback;
+    /* Candidate-derived totals are invalid once recovery discarded them;
+       prepared_find_recover already recomputed from the full record scan. */
 
     if (has_joins) {
         /* Joined queries are tabular by default (rows_fmt-style). format=csv
@@ -8664,8 +10073,8 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
             tree, &excluded, offset, limit,
             proj_fields, proj_count, dict_fmt, &dl);
         size_t ex_total = 0; int ex_null = 1;
-        if (want_total) ex_total = fp_compute_total(&fp, tree, db_root, object,
-                                                    &sch, &driver_fs, &dl, &ex_null, NULL);
+        if (want_total) ex_total = prepared_or_fp_total(&prep, &fp, tree, db_root, object,
+                                                    &sch, &driver_fs, &dl, &ex_null);
         if(ex_total==SIZE_MAX){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (dict_fmt) {
             if (!want_total) OUT("}\n");
@@ -8699,8 +10108,8 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
          * same work the client would do firing a separate count; this
          * consolidates it into the find round-trip). */
         size_t d1_total = 0; int d1_null = 1;
-        if (want_total) d1_total = fp_compute_total(&fp, tree, db_root, object,
-                                                    &sch, &driver_fs, &dl, &d1_null, NULL);
+        if (want_total) d1_total = prepared_or_fp_total(&prep, &fp, tree, db_root, object,
+                                                    &sch, &driver_fs, &dl, &d1_null);
         if(d1_total==SIZE_MAX){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (dict_fmt) {
             if (!want_total) OUT("}\n");
@@ -8738,8 +10147,8 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
         /* Close the envelope opened above and return.  When want_total,
          * compute the real match count via fp_compute_total. */
         size_t d3_total = 0; int d3_null = 1;
-        if (want_total) d3_total = fp_compute_total(&fp, tree, db_root, object,
-                                                    &sch, &driver_fs, &dl, &d3_null, NULL);
+        if (want_total) d3_total = prepared_or_fp_total(&prep, &fp, tree, db_root, object,
+                                                    &sch, &driver_fs, &dl, &d3_null);
         if(d3_total==SIZE_MAX){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (dict_fmt) {
             if (!want_total) OUT("}\n");
@@ -8756,6 +10165,7 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
     } else if (fp.order == FP_ORDER_SORT &&
                !has_joins && !rows_fmt && !csv_delim &&
                fp.n_source > 0 &&
+               !prep.record_fallback &&   /* ordered-collect instead */
                (!order_by || strchr(order_by, ',') == NULL)) {
         /* ===== D2: fetch-and-sort with streaming top-N =====
            When plan_filter selected FP_ORDER_SORT the seed leaf's
@@ -8785,13 +10195,19 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
             &fp, order_by, desc,
             tree, &excluded, offset, limit,
-            proj_fields, proj_count, dict_fmt, &dl);
+            proj_fields, proj_count, dict_fmt, &dl,
+            prep.d2_prefilter, prep.d2_ready, &prep.budget);
+        prep.d2_prefilter = NULL;   /* ownership handed off */
         if(d2_matched==SIZE_MAX){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (dict_fmt) {
             if (!want_total) OUT("}\n");
+            else if (prep.total_ready && prep.total_null)
+                OUT("},\"total\":null}\n");
             else OUT("},\"total\":%zu}\n", d2_matched);
         } else {
             if (!want_total) OUT("]\n");
+            else if (prep.total_ready && prep.total_null)
+                OUT("],\"total\":null}\n");
             else OUT("],\"total\":%zu}\n", d2_matched);
         }
         free_excluded(&excluded);
@@ -8850,6 +10266,9 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
                CSV fallback path doesn't waste a build. */
             KeySet *prefilter_ks = build_keyset_from_plan(&fp, db_root,
                                                          object, &sch, &dl);
+            /* Optional probe: any failure discards the whole optimization
+               and the walk matches full records instead. */
+            if (!prefilter_ks) errno = 0;
             if (prefilter_ks &&
                 keyset_size(prefilter_ks) > g_ordered_find_keyset_max) {
                 keyset_free(prefilter_ks);
@@ -8868,6 +10287,8 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
                 if (narrow) {
                     keyset_free(prefilter_ks);
                     prefilter_ks = narrow;
+                } else {
+                    errno = 0;   /* keep the complete broader prefilter */
                 }
             }
 
@@ -9196,6 +10617,78 @@ find_ordered_fallback: ;
         free(oc.rows);
         pthread_mutex_destroy(&oc.lock);
         if(emit_error){free_excluded(&excluded);free_joins(joins,njoins);errno=emit_error;return -1;}
+    } else if (prep.route != PREP_NONE && !prep.record_fallback) {
+        /* ===== Prepared bitmap sources (candidates built pre-emission) =====
+           Bitmap reads already happened before the envelope; only record
+           fetch, filtering, pagination and emission remain. The former
+           small-limit streaming shapes fetch one record at a time; the
+           already-buffered shapes keep keyset_emit_find. */
+        FieldSchema *pfs = (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL;
+        int prc = 0;
+        if (prep.ks) {
+            if (prep.route == PREP_STREAM)
+                prc = prepared_bitmap_find_stream(db_root, object, &sch, prep.ks,
+                                                  tree, &excluded, offset, limit,
+                                                  proj_fields, proj_count, pfs,
+                                                  rows_fmt, dict_fmt, csv_delim, &dl);
+            else
+                prc = keyset_emit_find(db_root, object, &sch, prep.ks,
+                                       prep.need_rematch ? tree : NULL,
+                                       &excluded, offset, limit,
+                                       proj_fields, proj_count, pfs,
+                                       rows_fmt, dict_fmt, csv_delim,
+                                       joins, njoins, &dl);
+        }
+        prepared_find_destroy(&prep);
+        if (prc < 0) { free_excluded(&excluded); free_joins(joins, njoins); return -1; }
+        if (want_total && prep.total_ready) {
+            find_total = prep.total;
+            find_total_null = prep.total_null;
+        }
+    } else if (prep.record_fallback) {
+        /* ===== Whole-record recovery (one-way) =====
+           Candidate capacity overflow: run the existing full-record
+           executors with the original criteria, exclusions, joins,
+           projection, offset/limit and formatting. No bitmap candidates,
+           prefilters or probes run again (build_keyset_from_plan refuses);
+           the deadline is the same object; no re-plan into bitmap routes. */
+        FieldSchema *rfs = (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL;
+        const CompiledCriterion *fast_cc = NULL;
+        if (tree) {
+            const CriteriaNode *leaf = NULL;
+            if (tree->kind == CNODE_LEAF) leaf = tree;
+            else if (tree->kind == CNODE_AND && tree->n_children == 1 &&
+                     tree->children[0]->kind == CNODE_LEAF) leaf = tree->children[0];
+            if (leaf && leaf->compiled) fast_cc = leaf->compiled;
+        }
+        AdvSearchCtx rctx = { tree, fast_cc, offset, limit, 0, 0,
+                              proj_fields, proj_count, excluded, rfs,
+                              rows_fmt, dict_fmt, csv_delim,
+                              object, joins, njoins, db_root, &dl, 0,
+                              PTHREAD_MUTEX_INITIALIZER, 0 };
+        int use_streaming = (limit > 0 && limit <= 1000) &&
+                            !has_order;   /* ordered shapes use ordered-collect */
+        if (use_streaming) {
+            SlotcaskSchemaInfo info = {
+                .splits = sch.splits, .slot_size = sch.slot_size,
+                .streams = sch.streams,
+            };
+            SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
+            if (sdb) scan_shards_v2_streaming(sdb, adv_search_cb, &rctx);
+            else scan_dispatch(db_root, object, &sch, data_dir, adv_search_cb, &rctx);
+        } else {
+            scan_dispatch(db_root, object, &sch, data_dir, adv_search_cb, &rctx);
+        }
+        pthread_mutex_destroy(&rctx.lock);
+        if (rctx.predicate_error) {
+            free_excluded(&excluded); free_joins(joins, njoins);
+            errno = rctx.predicate_error; return -1;
+        }
+        if (want_total && prep.total_ready) {
+            find_total = prep.total;
+            find_total_null = prep.total_null;
+        }
+        prepared_find_destroy(&prep);
     } else if (limit > 0 && (offset + limit) <= 1000 && njoins == 0 && !rows_fmt &&
                (fp.kind == FP_INTERSECT ||
                 ((fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) &&
@@ -9418,7 +10911,10 @@ find_ordered_fallback: ;
          * shared fp_compute_total helper. Falls back to null when the
          * plan can't cheaply produce a count (e.g. FP_FULL_SCAN — caller
          * can fire a separate count query for those rare shapes). */
-        if (find_total_null && !dl.timed_out) {
+        if (find_total_null && prep.total_ready) {
+            find_total = prep.total;
+            find_total_null = prep.total_null;
+        } else if (find_total_null && !dl.timed_out) {
             int helper_null = 1;
             size_t n = fp_compute_total(&fp, tree, db_root, object,
                                          &sch, &driver_fs, &dl, &helper_null, NULL);
@@ -9428,7 +10924,7 @@ find_ordered_fallback: ;
                 find_total_null = 0;
             }
         }
-        const char *arr_close = (has_joins || rows_fmt) ? "]}" :
+        const char *arr_close = (has_joins || rows_fmt) ? "]" :
                                  dict_fmt                ? "}"  : "]";
         if (find_total_null)
             OUT("%s,\"total\":null}\n", arr_close);

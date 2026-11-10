@@ -192,6 +192,14 @@ scanning: an unknown field returns
 and pattern/length/regex operators on aggregate results return
 `{"error":"aggregate having unsupported for field type <type>"}`.
 
+## Bitmap-source errors
+
+Aggregate group-by paths that read bitmap sources (dictionary discovery,
+group popcounts, slot intersection, hash-bucket emission) treat a
+never-written shard as logically empty but fail the whole aggregate with a
+single error object when a bitmap file cannot be read, instead of emitting
+buckets that silently miss that shard's records.
+
 ## Cost
 
 - **Whole-table, no criteria** — O(N) scan of every record. Parallelized across shards.
@@ -283,3 +291,11 @@ The planner paths from [find](find.md#execution-paths) apply here too — when t
 - No `DISTINCT` — emulate with `group_by` + `count`.
 - No window functions — aggregate against a query, keep state in the app.
 - No nested aggregates.
+
+Bitmap candidate collections prefer 8,192 actual slots within the existing
+request budget, falling back to ordinary estimate-based sizing if only the
+floor does not fit. If concurrent growth exhausts the admitted collection,
+partial candidates are discarded and the complete original criteria run once
+through the full-record scan with the original deadline. Aggregate recovery
+starts with empty groups. Allocation-budget failures and real bitmap read
+errors retain their separate existing policies; they are not insertion overflow.

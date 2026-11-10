@@ -89,6 +89,12 @@ int test_env_ctl_set_bmfix_fault(TestEnv *env, int mode, int count);
 /* TEST_BUILD diagnostic: arm (on=1) / disarm (on=0) the bitmap lock-order
    trace in the daemon (BMLOCK-ORDER lines in $LOG_DIR, see bitmap.c). */
 int test_env_ctl_set_bmlock_log(TestEnv *env, int on);
+/* Bitmap candidate race barrier in the TEST_BUILD daemon: stage > 0 arms a
+   one-shot barrier (parks the next matching candidate build after its sizing
+   pass, publishes BMKS-BARRIER-REACHED in the daemon log, and fires the
+   find-flush gate hook); 0 releases the gate and disarms. Test support,
+   not a configuration knob. */
+int test_env_ctl_set_bmks_race(TestEnv *env, int stage);
 /* Fault injection: force the daemon's update-error JSON escape to fail
    (static-fallback emission). fail=0 disarms. Requires a test-server
    daemon (test_control_fd >= 0). */

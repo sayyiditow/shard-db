@@ -363,6 +363,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_bitmap_window_duplicates.c \
     src/test/cases/test_bitmap_resplit.c \
     src/test/cases/test_bitmap_cache_lock_errors.c \
+    src/test/cases/test_bitmap_open_failures.c \
     src/test/cases/test_bulk_chain_bitmap_path.c \
     src/test/cases/test_scalar_routes_checked.c \
     src/test/cases/test_scalar_csv_update.c \

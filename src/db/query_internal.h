@@ -11,6 +11,61 @@ void order_walk_test_set_pause_hook_after(order_walk_test_pause_fn fn,
                                           size_t callbacks_to_skip);
 void bulk_upd_json_test_set_fail_alloc(int fail_n);
 void query_plan_test_set_fail_grow(int fail_n);
+/* Bitmap-KeySet race seam (bitmap-keyset builders, TEST_BUILD only).
+ * Arm an explicit stage (BMKS_RACE_* ids below) on the CALLING thread: the
+ * next build_keyset_from_bitmap / build_keyset_bitmap_complement run on
+ * this thread parks between its sizing pass and its enumeration pass,
+ * publishing the sizing estimate and the allocated KeySet capacity, until
+ * query_bm_test_race_open_gate() releases it (one-shot; rearm for a new
+ * run). query_bm_test_race_reached/gate_opened report consumption;
+ * allocated_cap/sized_total/insert_fails expose the observation counters.
+ * query_bm_test_race_reset disarms without waiting. Stage ids must stay in
+ * sync with the definitions in query.c. */
+#define BMKS_RACE_EQ         1
+#define BMKS_RACE_GENERIC    2
+#define BMKS_RACE_COMPLEMENT 3
+#define BMKS_RACE_OR         4
+int query_bm_test_arm_keyset_race(int stage);
+void query_bm_test_race_open_gate(void);
+int query_bm_test_race_reached(void);
+int query_bm_test_race_gate_opened(void);
+unsigned query_bm_test_race_allocated_cap(void);
+unsigned query_bm_test_race_sized_total(void);
+unsigned query_bm_test_race_insert_fails(void);
+void query_bm_test_race_reset(void);
+/* Prepared small-limit find iterator observer (TEST_BUILD only): armed on
+ * the thread that runs the find; reports iterator invocations, record
+ * fetches, currently live RecordRefs and the peak live count. */
+void query_test_prepared_stream_observe(int on);
+void query_test_prepared_stream_stats(unsigned *calls, unsigned *fetches,
+                                      unsigned *live, unsigned *peak_live);
+/* Candidate sizing/overflow/fallback observation (thread that runs the
+ * query): last admitted candidate allocation's actual slot count, actual
+ * keyset_insert overflow hits in bitmap collectors, whole-record capacity
+ * fallback recoveries, and the last prepared-find budget peak. */
+void query_test_candidate_observe(int on);
+void query_test_candidate_fallback_note(const char *kind);
+int query_test_parallel_candidate_race(const char *field, int stage);
+int query_test_parallel_candidate_fault(const char *field, int site, int error);
+void query_test_parallel_candidate_stats(unsigned *workers, unsigned *joined,
+                                         unsigned *capacity, unsigned *hard,
+                                         unsigned *offthread, unsigned *consumed);
+void query_test_candidate_stats(unsigned *last_slots, unsigned *overflow_hits,
+                                unsigned *fallbacks, unsigned *budget_peak);
+/* Thread-local override of a prepared find's request budget limit (0 =
+ * query-buffer default); lets a test refuse only the preferred floor. */
+void query_test_prepared_budget_limit(size_t limit);
+size_t query_test_prepared_budget_limit_value(void);
+/* Allocate the bitmap candidate KeySet the policy helper would build for an
+ * initial estimate `m` (TEST_BUILD wrapper over the internal helper; reports
+ * the actual admitted slot count). */
+KeySet *query_test_candidate_keyset_alloc(size_t m, size_t *out_slots);
+/* Streaming top-N deadline trap (armed on the thread that runs the
+ * aggregate): consumed once at a capacity handoff, where it lets the
+ * request's original absolute deadline elapse (bounded by max_wait_ms)
+ * before the caller's recovery decision. Reports consumption count. */
+void query_test_agg_topn_arm_deadline_trap(int max_wait_ms);
+unsigned query_test_agg_topn_deadline_trap_consumed(void);
 #endif
 
 /* Prototypes for helpers shared across the query_*.c translation units.
@@ -20,6 +75,39 @@ void query_plan_test_set_fail_grow(int fail_n);
 typedef struct SlotcaskDb SlotcaskDb;  /* defined in slotcask.h */
 
 #define MAX_INTERSECT_LEAVES 8
+
+/* Why a bitmap candidate build produced NULL. errno stays available
+ * for diagnostics but never decides the category: budget reservation and
+ * read/lock errors can share errno values with capacity codes. */
+typedef enum {
+    CBF_NONE = 0,           /* success (KeySet returned) or deliberate empty */
+    CBF_INSERT_CAPACITY,    /* an actual keyset_insert returned -1 */
+    CBF_BUDGET,             /* budget reservation refused (owner's policy) */
+    CBF_TIMEOUT,            /* deadline expired during the build */
+    CBF_HARD                /* read/lock/allocation/arithmetic failure */
+} CandidateBuildFailure;
+
+/* Checked build outcome carried through candidate builders/consumers.
+ * Request/call-owned — never a global or TLS last-failure slot. */
+typedef struct {
+    CandidateBuildFailure reason;
+    int saved_errno;        /* meaningful for CBF_HARD and diagnostics */
+} CandidateBuildOut;
+
+static inline int candidate_deadline_expired(QueryDeadline *dl) {
+    if (!dl || dl->timeout_ms == 0) return 0;
+    if (atomic_load_explicit(&dl->timed_out, memory_order_relaxed)) return 1;
+    if (now_ms_coarse() - dl->t0_ms > (uint64_t)dl->timeout_ms) {
+        atomic_store_explicit(&dl->timed_out, 1, memory_order_relaxed);
+        return 1;
+    }
+    return 0;
+}
+
+static inline void cb_out_init(CandidateBuildOut *o) {
+    o->reason = CBF_NONE;
+    o->saved_errno = 0;
+}
 
 /* Filter plan types — shared by query.c and query_aggregate.c */
 typedef enum {
@@ -187,9 +275,41 @@ int shard_group_batch(CollectedHash *batch, int batch_count,
    (which revalidates each candidate at the Kf reader). Raw index
    popcounts are never the count answer. Used by count/find totals and
    query_aggregate.c's NEQ fast path. */
+int count_full_record_checked(const char *db_root, const char *object,
+                              CriteriaNode *tree, FieldSchema *fs,
+                              const Schema *sch, QueryDeadline *dl,
+                              size_t *out_count);
+
 size_t idx_count_for_leaf(const char *db_root, const char *object,
                           const Schema *sch, const FieldSchema *fs,
                           SearchCriterion *leaf, QueryDeadline *dl);
+/* Checked variant: candidate build reasons (insertion-capacity, budget,
+ * timeout, hard) are reported in *out for recovery decisions. */
+size_t idx_count_for_leaf_ck(const char *db_root, const char *object,
+                             const Schema *sch, const FieldSchema *fs,
+                             SearchCriterion *leaf, QueryDeadline *dl,
+                             CandidateBuildOut *out);
+/* Checked candidate builders (query.c): reasons reported via *out;
+ * external-facing signatures keep their wrappers. */
+KeySet *build_keyset_from_leaf_ck(const char *db_root, const char *object,
+                                  int splits, SearchCriterion *leaf,
+                                  QueryDeadline *dl, KeySetBudget *budget,
+                                  CandidateBuildOut *out);
+KeySet *intersect_indexed_leaves_ck(const char *db_root, const char *object,
+                                    int splits, SearchCriterion **leaves,
+                                    int n, QueryDeadline *dl,
+                                    int *out_small_primary,
+                                    KeySetBudget *budget,
+                                    CandidateBuildOut *out);
+KeySet *build_or_keyset_ck(const char *db_root, const char *object, int splits,
+                           const CriteriaNode *or_node, QueryDeadline *dl,
+                           int *out_budget_exceeded, int target_count,
+                           KeySetBudget *budget, CandidateBuildOut *out);
+KeySet *build_smaller_bitmap_keyset_ck(const char *db_root, const char *object,
+                                       int splits, const SearchCriterion *leaf,
+                                       const TypedField *tf, QueryDeadline *dl,
+                                       int *inverted, KeySetBudget *budget,
+                                       CandidateBuildOut *out);
 
 /* query_find.c — O_DIRECT scan helpers (used by query.c find/count paths) */
 int od_seg_record_cb(const uint8_t *rec, size_t vlen,
@@ -380,6 +500,9 @@ void btree_dispatch(const char *db_root, const char *object,
                     const char *field, int splits,
                     SearchCriterion *pc, const TypedField *tf,
                     bt_result_cb cb, void *ctx);
+/* 1 = cb signalled stop; 0 = shard walked completely or logically empty
+   (no keyfile / never-written bitmap); -1 = hard bitmap read failure with
+   errno preserved. Callers must not confuse a stop with a failure. */
 int bitmap_emit_for_shard(const char *db_root, const char *object,
                           const char *field, int shard_idx,
                           const uint8_t *value, size_t vlen,
@@ -404,6 +527,9 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
                        int fetching, int limit);
 
 /* query.c — bitmap/keyset builders (used by query_aggregate.c) */
+/* Raw popcount (optimization / aggregate group-count input, not a
+   validated count answer). A never-written shard contributes zero; a hard
+   read failure returns SIZE_MAX with errno — check before summing. */
 size_t bm_popcount_one_value(const char *db_root, const char *object,
                              const char *field, int splits,
                              const uint8_t *value, size_t vlen);

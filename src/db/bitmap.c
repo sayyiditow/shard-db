@@ -162,6 +162,16 @@ void bm_test_reset_lock_failure(void) {
     }
 }
 
+void bm_test_lock_fault_save(BmTestLockFaultState *state) {
+    memcpy(state->faults, bm_test_lock_fault, sizeof(bm_test_lock_fault));
+    memcpy(state->consumed, bm_test_lock_consumed, sizeof(bm_test_lock_consumed));
+}
+
+void bm_test_lock_fault_restore(const BmTestLockFaultState *state) {
+    memcpy(bm_test_lock_fault, state->faults, sizeof(bm_test_lock_fault));
+    memcpy(bm_test_lock_consumed, state->consumed, sizeof(bm_test_lock_consumed));
+}
+
 int bm_test_lock_entered(int site) {
     if (site < 0 || site >= BM_TEST_LOCK_SITE_COUNT) return -1;
     return atomic_load_explicit(&bm_test_lock_entered_count[site],
@@ -405,8 +415,9 @@ void bm_cache_invalidate(const char *path) {
    publication returns. Cache entries record the generation at which their
    open inode was validated; the first acquire after a generation change
    compares the cached fd's (st_dev, st_ino) with the current path. A
-   mismatched entry is retired non-blockingly when possible; otherwise that
-   acquire opens the current path uncached. An acquire overlapping
+   mismatched entry is retired non-blockingly; while it stays busy the
+   acquire retries admission under a bounded budget and then fails with
+   EBUSY — it never maps the current path uncached. An acquire overlapping
    publication may finish on the old inode, but an acquire beginning after
    publication completes cannot. The only remaining lock order is
    g_bm_cache_lock -> per-entry rwlock (never the reverse). */
@@ -661,22 +672,41 @@ static int bm_write_initial(const char *path, uint32_t slots, int bool_fastpath,
 }
 
 /* Open and mmap the on-disk file. Used by both the cached and uncached
-   paths. Reads the header into *out_hdr. Returns 0/fd on success. */
+   paths. Reads the header into *out_hdr. Returns 0/fd on success; -1 with
+   errno: the real syscall errno for open/fstat/mmap failures (preserved
+   across close/munmap), or deterministic EUCLEAN for a header that does not
+   describe the file (short file, bad magic, stride/body bounds). */
 static int bm_file_open_mmap(const char *path,
-                              int *out_fd, uint8_t **out_map, size_t *out_size,
-                              struct BmHeader *out_hdr) {
+                             int *out_fd, uint8_t **out_map, size_t *out_size,
+                             struct BmHeader *out_hdr) {
     int fd = open(path, O_RDWR);
     if (fd < 0) return -1;
+    int saved;
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(struct BmHeader)) {
-        close(fd); return -1;
+    if (fstat(fd, &st) != 0) {
+        saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    if (st.st_size < (off_t)sizeof(struct BmHeader)) {
+        close(fd);
+        errno = EUCLEAN;
+        return -1;
     }
     uint8_t *map = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE,
                         MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) { close(fd); return -1; }
+    if (map == MAP_FAILED) {
+        saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
     memcpy(out_hdr, map, sizeof(struct BmHeader));
     if (out_hdr->magic != BM_MAGIC) {
-        munmap(map, st.st_size); close(fd); return -1;
+        munmap(map, st.st_size); close(fd);
+        errno = EUCLEAN;
+        return -1;
     }
     /* A header that describes more bytes than the file has (a torn in-place
        rewrite after power loss) must not be mapped: every accessor trusts it. */
@@ -691,6 +721,16 @@ static int bm_file_open_mmap(const char *path,
     *out_map = map;
     *out_size = (size_t)st.st_size;
     return 0;
+}
+
+/* Bounded admission retrying: an initial attempt plus this many retries,
+ * 2 ms apart, shared by stale-entry retirement and cache-saturation paths.
+ * Bounds admission churn only — ordinary blocking lock waits stay unbounded. */
+#define BM_OPEN_ADMISSION_RETRIES 4
+
+static void bm_admission_backoff(void) {
+    struct timespec ts = { 0, 2 * 1000 * 1000L };
+    nanosleep(&ts, NULL);
 }
 
 static BitmapShard *bm_open_impl(const char *path, int slots, int create,
@@ -735,7 +775,12 @@ static BitmapShard *bm_open_impl(const char *path, int slots, int create,
         return bm;
     }
 
-    /* Cached path — mirror bt_acquire's verify-and-retry pattern. */
+    /* Cached path — mirror bt_acquire's verify-and-retry pattern. With an
+       initialized cache every returned handle is cache-backed: stale
+       retirements and cache-saturation retry admission under a shared
+       bounded budget instead of returning uncached mappings that an
+       in-place rebuild could remap. */
+    int admission_retries = 0;
 retry_bm_acquire:;
     int retries = 0;
     int found = 0;
@@ -776,30 +821,22 @@ retry_bm_acquire:;
                 &e->validated_publish_generation, memory_order_acquire);
             if (validated_generation != current_generation) {
                 if (!durability_same_open_inode(e->fd, path)) {
-                    /* Stale target: retire it non-blockingly, never waiting
-                       on its entry lock. If it is busy, serve the current
-                       path from a fresh uncached mapping. */
+                    /* Stale target: retire it non-blockingly and restart
+                       cached acquisition under the shared admission budget.
+                       A retirement error fails the open with its exact
+                       errno; a busy or already-gone entry consumes a retry.
+                       The new inode is never mapped directly. */
                     bm_test_note_entry_unlock();
                     pthread_rwlock_unlock(lock);
-                    if (bm_cache_invalidate_nowait(path) > 0)
-                        goto retry_bm_acquire;
-                    int nfd; uint8_t *nmap; size_t nsz; struct BmHeader nhdr;
-                    if (bm_file_open_mmap(path, &nfd, &nmap, &nsz, &nhdr) != 0)
+                    int inv_rc = bm_cache_invalidate_nowait(path);
+                    if (inv_rc < 0)
                         return NULL;
-                    BitmapShard *nbm = calloc(1, sizeof(*nbm));
-                    if (!nbm) { munmap(nmap, nsz); close(nfd); return NULL; }
-                    nbm->slot = -1;
-                    nbm->writer = writer;
-                    nbm->fd = nfd;
-                    nbm->mmap_ptr = nmap;
-                    nbm->mmap_size = nsz;
-                    nbm->hdr = nhdr;
-                    snprintf(nbm->path, sizeof(nbm->path), "%s", path);
-                    if (nbm->hdr.max_values == 0 && writer) {
-                        nbm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
-                        memcpy(nbm->mmap_ptr, &nbm->hdr, sizeof(struct BmHeader));
+                    if (++admission_retries > BM_OPEN_ADMISSION_RETRIES) {
+                        errno = EBUSY;
+                        return NULL;
                     }
-                    return nbm;
+                    bm_admission_backoff();
+                    goto retry_bm_acquire;
                 }
                 atomic_store_explicit(&e->validated_publish_generation,
                                       current_generation, memory_order_release);
@@ -894,7 +931,10 @@ retry_bm_acquire:;
                earlier try error; only when no error exists does the changed
                identity retry. */
         }
-        if (slot < 0 && writer && first_error != 0) {
+        if (slot < 0 && first_error != 0) {
+            /* Readers and writers alike: a returned acquisition error with
+               no successful eviction fails the open with that exact error
+               (the selected writer wait's error took precedence above). */
             int saved_error = first_error;
             pthread_mutex_unlock(&g_bm_cache_lock);
             munmap(map, sz);
@@ -904,32 +944,23 @@ retry_bm_acquire:;
         }
     }
 
-    if (slot < 0 && writer) {
+    if (slot < 0) {
+        /* Saturated with no error: dispose the private mapping and retry
+           admission under the shared budget; never fall back to an uncached
+           handle. */
         pthread_mutex_unlock(&g_bm_cache_lock);
         munmap(map, sz);
         close(fd);
+        if (++admission_retries > BM_OPEN_ADMISSION_RETRIES) {
+            errno = EBUSY;
+            return NULL;
+        }
+        bm_admission_backoff();
         goto retry_bm_acquire;
     }
 
     BitmapShard *bm = calloc(1, sizeof(*bm));
     if (!bm) { munmap(map, sz); close(fd); pthread_mutex_unlock(&g_bm_cache_lock); return NULL; }
-
-    if (slot < 0) {
-        /* Cache full — uncached fallback. */
-        pthread_mutex_unlock(&g_bm_cache_lock);
-        bm->slot = -1;
-        bm->writer = writer;
-        bm->fd = fd;
-        bm->mmap_ptr = map;
-        bm->mmap_size = sz;
-        bm->hdr = hdr;
-        snprintf(bm->path, sizeof(bm->path), "%s", path);
-        if (bm->hdr.max_values == 0 && writer) {
-            bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
-            memcpy(bm->mmap_ptr, &bm->hdr, sizeof(struct BmHeader));
-        }
-        return bm;
-    }
 
     BmCacheEntry *e = &g_bm_cache[slot];
     strncpy(e->path, path, PATH_MAX - 1);
@@ -972,10 +1003,16 @@ retry_bm_acquire:;
     }
     if (!e->used || strcmp(e->path, path) != 0) {
         /* Stolen by a concurrent evictor; they now own disposing our
-           fd/map. Retry from scratch. */
+           fd/map (the installed resources stay cache-owned). Retry under
+           the shared admission budget. */
         bm_test_note_entry_unlock();
         pthread_rwlock_unlock(lock);
         free(bm);
+        if (++admission_retries > BM_OPEN_ADMISSION_RETRIES) {
+            errno = EBUSY;
+            return NULL;
+        }
+        bm_admission_backoff();
         goto retry_bm_acquire;
     }
 
@@ -1565,6 +1602,39 @@ int bm_file_is_corrupt(const char *path) {
 int bm_handle_cached(const BitmapShard *bm) {
     return bm && bm->slot >= 0;
 }
+
+#ifdef TEST_BUILD
+/* Test-only damage helper for corruption-retirement regressions. Takes the
+ * normal writer handle for `path`, rewrites only the mapped header's
+ * n_values so the described bitmap body extends past the end of the file,
+ * syncs through the same msync path as every other writer, closes, and
+ * returns 0 or -1 with errno. It does not unlink, skip or invalidate
+ * anything itself: the damage simply makes the next cold open fail with
+ * EUCLEAN and a warm cached mapping carry the out-of-bounds description
+ * into bm_slotmap_prepare's bounds check. TEST_BUILD only; no production
+ * disk-format surface. */
+int bm_test_damage_header_bounds(const char *path) {
+    BitmapShard *bm = bm_open(path, 0, 0, 0, 0, 1);
+    if (!bm) return -1;
+    if (!bm->mmap_ptr || bm->mmap_size < sizeof(struct BmHeader)) {
+        bm_close(bm);
+        errno = EINVAL;
+        return -1;
+    }
+    struct BmHeader h;
+    memcpy(&h, bm->mmap_ptr, sizeof(h));
+    h.n_values = h.n_values + 4096u;
+    memcpy(bm->mmap_ptr, &h, sizeof(h));
+    if (msync(bm->mmap_ptr, bm->mmap_size, MS_SYNC) != 0) {
+        int saved = errno;
+        bm_close(bm);
+        errno = saved;
+        return -1;
+    }
+    bm_close(bm);
+    return 0;
+}
+#endif
 
 int bm_open_many_ro(const char *const *paths, int n, BitmapShard **out) {
     if (!paths || !out || n < 0 || n > BM_OPEN_MANY_MAX) { errno = EINVAL; return -1; }

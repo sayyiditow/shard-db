@@ -2413,15 +2413,26 @@ static int kf_bmfix_prepare(KfBmFix *fix, const char *kf_path, const KfRemapCtx 
     for (int i = 0; rc == 0 && i < npaths; i++) {
         BitmapShard *bm = bm_open(paths[i], 0, 0, 0, 0, 1 /* writer: kf -> bm lock order */);
         if (!bm) {
-            if (bm_file_is_corrupt(paths[i])) {
-                /* Unreadable already (header does not fit the file): do not let
-                   it stop the keyfile from growing; the startup rebuild repairs it. */
+            /* The open's own errno decides: only a corruption rejection may
+               be skipped; the disk probe confirms it but never outranks an
+               acquisition error (EDEADLK/EINVAL/EIO/EBUSY/ENOMEM abort). */
+            int oe = errno ? errno : EIO;
+            if (oe == EUCLEAN && bm_file_is_corrupt(paths[i])) {
+                /* Retire any cached mapping of the damaged file before the
+                   skip, so no stale mapping keeps serving it; a retirement
+                   failure abandons the rebuild instead. */
+                if (bm_cache_invalidate_checked(paths[i]) != 0) {
+                    saved = errno ? errno : EIO;
+                    rc = -1;
+                    break;
+                }
                 LOG_WARN(LOG_SUB_SLOTCASK,
-                         "KF_BMFIX_SKIP path=%s: corrupt bitmap left for the startup rebuild", paths[i]);
+                         "KF_BMFIX_SKIP path=%s: corrupt bitmap left for the startup rebuild (open: %s)",
+                         paths[i], strerror(oe));
                 fix->skipped++;
                 continue;
             }
-            saved = errno ? errno : EIO;
+            saved = oe;
             rc = -1;
             break;
         }
@@ -2440,14 +2451,29 @@ static int kf_bmfix_prepare(KfBmFix *fix, const char *kf_path, const KfRemapCtx 
             int pe = errno ? errno : EIO;
             en->tmp[0] = '\0';
             if (pe == EUCLEAN) {
-                /* Corrupt bitmap: it was already unreadable, so do not let it
-                   stop the keyfile from growing. Leave it for the startup
-                   rebuild (the marker below is then never removed here). */
-                LOG_WARN(LOG_SUB_SLOTCASK,
-                         "KF_BMFIX_SKIP path=%s: corrupt bitmap left for the startup rebuild", paths[i]);
-                bm_close(en->bm);
+                /* Corrupt bitmap: release this entry's writer handle (checked),
+                   drop it from the fix exactly once, then retire the cached
+                   entry before accepting the skip. Never invalidate while
+                   still holding this entry's writer lock; earlier retained
+                   paths precede this one in canonical order, so retiring the
+                   current path keeps that order. A close or retirement
+                   failure abandons the rebuild instead of skipping. */
+                BitmapShard *cur = en->bm;
                 en->bm = NULL;
                 fix->n--;
+                if (bm_close_checked(cur) != 0) {
+                    saved = errno ? errno : EIO;
+                    rc = -1;
+                    break;
+                }
+                if (bm_cache_invalidate_checked(paths[i]) != 0) {
+                    saved = errno ? errno : EIO;
+                    rc = -1;
+                    break;
+                }
+                LOG_WARN(LOG_SUB_SLOTCASK,
+                         "KF_BMFIX_SKIP path=%s: corrupt bitmap left for the startup rebuild (prepare: %s)",
+                         paths[i], strerror(pe));
                 fix->skipped++;
                 continue;
             }

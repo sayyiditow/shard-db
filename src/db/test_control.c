@@ -48,6 +48,7 @@ enum {
 #define TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL 1
 #define TEST_HOOK_SET_GLOBALS_BMFIX_FAULT 2
 #define TEST_HOOK_SET_GLOBALS_BMLOCK_LOG 3
+#define TEST_HOOK_SET_GLOBALS_BMKS_RACE 4
 
 typedef struct {
     uint32_t kind;   /* INSTALL..REACHED; SET_GLOBALS=6 */
@@ -260,6 +261,14 @@ static void *test_control_thread_main(void *arg) {
                 atomic_store(&g_shard_test_bmfix_fault_count, (int)msg.b);
             } else if (msg.phase == TEST_HOOK_SET_GLOBALS_BMLOCK_LOG) {
                 atomic_store(&g_shard_test_bmlock_log, (int)msg.a);
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_BMKS_RACE) {
+                if (msg.a) {
+                    atomic_store(&g_shard_test_bmks_gate, 0);
+                    atomic_store(&g_shard_test_bmks_stage, (int)msg.a);
+                } else {
+                    atomic_store(&g_shard_test_bmks_stage, 0);
+                    atomic_store(&g_shard_test_bmks_gate, 1);
+                }
             } else {
                 atomic_store(&g_shard_test_kf_initial_slots, (size_t)msg.a);
                 atomic_store(&g_shard_test_kf_max_slots, (size_t)msg.b);

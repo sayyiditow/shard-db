@@ -59,6 +59,13 @@ extern int  g_shard_test_fail_sticky;      /* fail every hit >= occurrence,
  * flags (test controls, not engine state). Plain lvalue reads/writes of
  * an _Atomic int are seq_cst atomic operations, so all existing call
  * sites stay valid unchanged. */
+/* Bitmap candidate KeySet race barrier (query.c, TEST_BUILD daemon only):
+ * stage>0 arms a one-shot barrier for that builder stage on any thread;
+ * 0 releases the gate and disarms. Pair with the existing find-flush gate
+ * (bm_defer_gate_park) for synchronized milestones. */
+extern _Atomic int g_shard_test_bmks_stage;
+extern _Atomic int g_shard_test_bmks_gate;
+
 extern _Atomic int g_shard_test_pause_phase;      /* -1 = disabled */
 extern _Atomic int g_shard_test_pause_occurrence; /* 1-based */
 extern _Atomic int g_shard_test_pause_hits;
