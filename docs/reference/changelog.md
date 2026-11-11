@@ -251,7 +251,7 @@ ceiling no longer exists. All growth paths (bulk pre-grow, bulk stage,
 and the inline resplits) double a shard's slot capacity at the 75–80 %
 load trigger for the life of the object, and inserts never refuse for
 capacity — an object grows for as long as the disk holds out, with no
-opt-in required. The nightly auto-reshard sweep is now **default on**
+opt-in required (the one transient exception is a bulk-insert shard stage that fails closed while that shard's growth is temporarily impossible — see "Bulk insert stages fail closed when growth is impossible" above). The nightly auto-reshard sweep is now **default on**
 (`AUTO_RESHARD_ENABLE=1`; set `0` to disable): it rebalances objects
 whose live record count outgrows their splits, keeping shards near the
 sweet spot so resplit doublings stay cheap. A new `RESHARD-HINT` log

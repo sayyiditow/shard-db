@@ -89,6 +89,13 @@ extern _Atomic long g_shard_test_gate_held_max;
 /* B3b: count of bulk commit-chain coordinator invocations. A solo
    request is 1; a merged pair is 1. */
 extern _Atomic long g_shard_test_bulk_chains;
+/* F9 drift detector (slotcask.c, TEST_BUILD): how often the reservation count
+   was cross-checked against a full scan, how many of those saw a non-empty
+   map, and how many disagreed (count != scan, or the gate's `clear` != scan
+   emptiness). Production builds do not have these. */
+extern _Atomic long g_shard_test_res_checks;
+extern _Atomic long g_shard_test_res_checks_nonempty;
+extern _Atomic long g_shard_test_res_mismatch;
 /* Count-worker pass-1 gap hook (docs/plans/2026-08-27-shard-count-worker-
    nested-kf-read.md Task 1): parks shard_count_worker after pass-1's
    inline KF probe — while the probe reader is still held — so the
@@ -176,6 +183,9 @@ static inline void shard_test_ctl_reset(void) {
     atomic_store(&g_shard_test_json_escape_fail, 0);
     atomic_store(&g_shard_test_gate_held_max, 0);
     atomic_store(&g_shard_test_bulk_chains, 0);
+    atomic_store(&g_shard_test_res_checks, 0);
+    atomic_store(&g_shard_test_res_checks_nonempty, 0);
+    atomic_store(&g_shard_test_res_mismatch, 0);
 }
 
 /* Barrier call: count the sync in `phase`; return 1 when this attempt is

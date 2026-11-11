@@ -1616,6 +1616,148 @@ static int test_bmfix_repair_shard_300(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+/* F11 pin (n == 0 branch): a plain no-marker restart sweeps every leftover
+ * "<NNN>.bm.remap" temporary out of every field directory, while a
+ * non-matching name survives, and the restart touches no other index file. */
+static int test_bmfix_remap_sweep(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    memset(b, 0, sizeof(*b));
+    for (int i = 0; i < BR_N; i++) {
+        b->rows[i].flag = (i % 3 == 0) || (i % 7 == 0);
+        b->rows[i].kind = i % 3;
+    }
+    if (test_env_start(&b->env) != 0) { free(b); return 1; }
+    if (test_env_ctl_set_kf_seams(&b->env, 64, 0) != 0 || br_connect(b) != 0) {
+        test_env_stop(&b->env);
+        free(b);
+        return 1;
+    }
+    char *r = br_q(b, "{\"mode\":\"add-dir\",\"dir\":\"br\"}");
+    free(r);
+    r = br_q(b,
+        "{\"mode\":\"create-object\",\"dir\":\"br\",\"object\":\"t\",\"splits\":512,\"max_key\":16,"
+        "\"fields\":[\"flag:bool\",\"kind:enum(a,b,c)\",\"n:int\"],"
+        "\"indexes\":[\"flag:bitmap\",\"kind:bitmap\",\"n\"]}");
+    ASSERT_CONTAINS(r, "\"status\":\"created\"", "create object (splits 512)");
+    free(r);
+    for (int from = 0; from < 500; from += 250)
+        ASSERT_EQ_INT(br_bulk(b, from, from + 250), 0, "bulk-insert chunk");
+    br_check(b, "after seed");
+    int port = b->env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", b->env.db_root);
+    tc_close(b->tc);
+    b->tc = NULL;
+    test_env_stop_keep(&b->env);
+    char rmA[600], rmB[600], rmC[600], keepf[600];
+    snprintf(rmA, sizeof(rmA),   "%s/br/t/indexes/flag/12c.bm.remap", root);   /* bitmap field, shard 300 */
+    snprintf(rmB, sizeof(rmB),   "%s/br/t/indexes/kind/1ff.bm.remap", root);   /* bitmap field, shard 511 */
+    snprintf(rmC, sizeof(rmC),   "%s/br/t/indexes/n/12c.bm.remap", root);      /* btree field dir: the sweep visits every field dir */
+    snprintf(keepf, sizeof(keepf), "%s/br/t/indexes/flag/12c.bm.remap.keep", root);   /* suffix control: must survive */
+    ASSERT_EQ_INT(tu_run_cmd(": > '%s' && : > '%s' && : > '%s' && : > '%s'", rmA, rmB, rmC, keepf), 0, "plant temporaries");
+    ASSERT_TRUE(tu_file_exists(rmA) && tu_file_exists(rmB) && tu_file_exists(rmC) && tu_file_exists(keepf),
+                "temporaries and control exist before the restart");
+    ASSERT_EQ_INT(tu_run_cmd("test -z \"$(find %s/br/t/indexes -maxdepth 1 -name '.bmfix-*')\"", root), 0,
+                "no repair marker (this is the no-marker branch)");
+    BrInoSnap before;
+    br_inode_snapshot(&before, root);
+    br_seam_once(root);
+    int saved_err = br_stderr_capture(root);
+    int started = test_env_start_at(&b->env, root, port) == 0;
+    br_stderr_restore(saved_err);
+    ASSERT_TRUE(started, "startup OK");
+    if (!started) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    ASSERT_EQ_INT(br_connect(b), 0, "reconnect");
+    ASSERT_TRUE(!tu_file_exists(rmA), "startup swept the flag/12c .bm.remap");
+    ASSERT_TRUE(!tu_file_exists(rmB), "startup swept the kind/1ff .bm.remap");
+    ASSERT_TRUE(!tu_file_exists(rmC), "startup swept the n/12c .bm.remap");
+    ASSERT_TRUE(tu_file_exists(keepf), "non-matching name survives the sweep");
+    br_check(b, "after sweep restart");
+    BrInoSnap after;
+    br_inode_snapshot(&after, root);
+    for (int i = 0; i < before.n; i++) {
+        if (strcmp(before.e[i].rel, "flag/12c.bm.remap") == 0 ||
+            strcmp(before.e[i].rel, "kind/1ff.bm.remap") == 0 ||
+            strcmp(before.e[i].rel, "n/12c.bm.remap") == 0)
+            continue;
+        ASSERT_TRUE(br_inode_same(&before, &after, before.e[i].rel),
+                    "the sweep touched only the temporaries");
+    }
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+/* F11 pin (n > 0 branch): a restart with a pending .bmfix-NNN marker repairs
+ * the named shards and slotcask_bmfix_clear then removes the .bm.remap
+ * temporaries; the repaired bitmap's changed inode proves the repair (not
+ * the sweep) ran. */
+static int test_bmfix_remap_clear_with_marker(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    memset(b, 0, sizeof(*b));
+    for (int i = 0; i < BR_N; i++) {
+        b->rows[i].flag = (i % 3 == 0) || (i % 7 == 0);
+        b->rows[i].kind = i % 3;
+    }
+    if (test_env_start(&b->env) != 0) { free(b); return 1; }
+    if (test_env_ctl_set_kf_seams(&b->env, 64, 0) != 0 || br_connect(b) != 0) {
+        test_env_stop(&b->env);
+        free(b);
+        return 1;
+    }
+    char *r = br_q(b, "{\"mode\":\"add-dir\",\"dir\":\"br\"}");
+    free(r);
+    r = br_q(b,
+        "{\"mode\":\"create-object\",\"dir\":\"br\",\"object\":\"t\",\"splits\":512,\"max_key\":16,"
+        "\"fields\":[\"flag:bool\",\"kind:enum(a,b,c)\",\"n:int\"],"
+        "\"indexes\":[\"flag:bitmap\",\"kind:bitmap\",\"n\"]}");
+    ASSERT_CONTAINS(r, "\"status\":\"created\"", "create object (splits 512)");
+    free(r);
+    for (int from = 0; from < 500; from += 250)
+        ASSERT_EQ_INT(br_bulk(b, from, from + 250), 0, "bulk-insert chunk");
+    br_check(b, "after seed");
+    int port = b->env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", b->env.db_root);
+    tc_close(b->tc);
+    b->tc = NULL;
+    test_env_stop_keep(&b->env);
+    char bm[600], marker[600], rmA[600], rmB[600];
+    snprintf(bm, sizeof(bm), "%s/br/t/indexes/flag/12c.bm", root);
+    snprintf(marker, sizeof(marker), "%s/br/t/indexes/.bmfix-12c", root);
+    snprintf(rmA, sizeof(rmA),   "%s/br/t/indexes/flag/12c.bm.remap", root);
+    snprintf(rmB, sizeof(rmB),   "%s/br/t/indexes/kind/12c.bm.remap", root);
+    ASSERT_TRUE(tu_file_exists(bm), "flag shard-300 bitmap exists");
+    ASSERT_EQ_INT(tu_run_cmd("truncate -s 33 '%s'", bm), 0, "corrupt flag shard-300 bitmap");
+    ASSERT_EQ_INT(tu_run_cmd(": > '%s'", marker), 0, "plant the shard-300 marker");
+    ASSERT_EQ_INT(tu_run_cmd(": > '%s' && : > '%s'", rmA, rmB), 0, "plant .bm.remap temporaries");
+    ASSERT_TRUE(tu_file_exists(rmA) && tu_file_exists(rmB),
+                "temporaries exist before the restart");
+    BrInoSnap before;
+    br_inode_snapshot(&before, root);
+    br_seam_once(root);
+    int saved_err = br_stderr_capture(root);
+    int started = test_env_start_at(&b->env, root, port) == 0;
+    br_stderr_restore(saved_err);
+    ASSERT_TRUE(started, "startup OK");
+    if (!started) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    ASSERT_EQ_INT(br_connect(b), 0, "reconnect");
+    ASSERT_TRUE(!br_repair_marker_exists(b), "marker gone");
+    ASSERT_TRUE(!tu_file_exists(rmA), "the repair path cleared the flag/12c .bm.remap temporary");
+    ASSERT_TRUE(!tu_file_exists(rmB), "the repair path cleared the kind/12c .bm.remap temporary");
+    BrInoSnap after;
+    br_inode_snapshot(&after, root);
+    ASSERT_TRUE(!br_inode_same(&before, &after, "flag/12c.bm"), "the repair actually ran");
+    br_check(b, "after repair restart");
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
 TEST_REGISTER("test-bitmap-resplit-bulk", test_bitmap_resplit_bulk)
 TEST_REGISTER("test-bitmap-resplit-legacy", test_bitmap_resplit_legacy)
 TEST_REGISTER("test-bitmap-resplit-single", test_bitmap_resplit_single)
@@ -1641,3 +1783,5 @@ TEST_REGISTER("test-bmfix-unclean-repair-fails-with-kfm2", test_bmfix_unclean_re
 TEST_REGISTER("test-bmfix-test-knobs-independent", test_bmfix_test_knobs_independent)
 TEST_REGISTER("test-bitmap-resplit-log-scope", test_bitmap_resplit_log_scope)
 TEST_REGISTER("test-bmfix-repair-shard-300", test_bmfix_repair_shard_300)
+TEST_REGISTER("test-bmfix-remap-sweep", test_bmfix_remap_sweep)
+TEST_REGISTER("test-bmfix-remap-clear-with-marker", test_bmfix_remap_clear_with_marker)

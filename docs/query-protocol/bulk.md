@@ -82,6 +82,8 @@ If any records were rejected (type mismatch, missing required field, etc.):
 {"inserted": 9997, "skipped": 0, "errors": 3, "error": "some_records_dropped"}
 ```
 
+A bulk-insert shard stage whose keyfile table cannot be grown (a transient condition — a failed bitmap remap puts that shard's growth on a 5 s back-off, or a resplit hit an I/O error) fails closed: nothing from that stage is committed, other shards' stages are unaffected, and the daemon logs `BULK_STAGE_UNGROWN`. On packed-layout objects (the default) the response carries `errors` and `"error":"some_records_dropped"` for every record of that shard's stage (with `auto_key`, the `keys` array is still appended, in input order, so the failed records can be resent under their keys); bulk-insert is an upsert, so re-sending the request or just the failed records is harmless. Legacy-layout objects without `auto_key` report the same `errors` shape; legacy-layout `auto_key` objects answer `{"status":"bulk-inserted","count":N,...}` without an `errors` member — compare `count` with the number of records sent and retry only the missing ones (re-sending a record whose key was omitted generates a new key).
+
 ### Performance
 
 - **Single-request bulk loads** — ~117 k records/sec single-thread on the invoice schema (1 M records, 14 indexes, splits=64). Add-indexes-from-scratch ≈ 350 k records/sec equivalent. See the README performance tables for the full set.

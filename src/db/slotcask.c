@@ -51,6 +51,9 @@
 long g_shard_test_sync_counts[SHARD_TEST_PHASE_COUNT];
 _Atomic long g_shard_test_gate_held_max;
 _Atomic long g_shard_test_bulk_chains;
+_Atomic long g_shard_test_res_checks;
+_Atomic long g_shard_test_res_checks_nonempty;
+_Atomic long g_shard_test_res_mismatch;
 /* W1: TEST_BUILD seams for the per-shard kf slot tier. initial
  * replaces slotcask_default_slots_for_splits() at slotcask_open; max
  * imposes a test-only growth cap on the pre-grow/stage loops (0 =
@@ -3027,14 +3030,6 @@ static size_t req_res_count(const ReqSlotRes *map, size_t cap) {
     return n;
 }
 
-/* 1 if no slot is reserved. Stops at the first reservation, so the common
-   (non-empty) answer is cheap; only an empty map is scanned in full. */
-static int req_res_empty(const ReqSlotRes *map, size_t cap) {
-    for (size_t i = 0; map && i < cap; i++)
-        if (map[i].used) return 0;
-    return 1;
-}
-
 static int req_res_copy(ReqSlotRes *dst, size_t dst_cap,
                         const ReqSlotRes *src, size_t src_cap) {
     for (size_t i = 0; src && i < src_cap; i++) {
@@ -3045,6 +3040,20 @@ static int req_res_copy(ReqSlotRes *dst, size_t dst_cap,
     }
     return 0;
 }
+
+#ifdef TEST_BUILD
+/* F9: cross-check the running count (and the gate's emptiness answer)
+   against a full scan. Called at window starts, after a chain seed and at
+   shard release — the only places the count can be observed wrong. */
+static void req_res_verify(const ReqSlotRes *map, size_t cap, size_t count,
+                           int clear) {
+    size_t scanned = req_res_count(map, cap);
+    atomic_fetch_add(&g_shard_test_res_checks, 1);
+    if (scanned) atomic_fetch_add(&g_shard_test_res_checks_nonempty, 1);
+    if (scanned != count || clear != (scanned == 0))
+        atomic_fetch_add(&g_shard_test_res_mismatch, 1);
+}
+#endif
 
 /* Non-mutating probe for a brand-new kf entry. Finds the slot a subsequent
    kf_commit_planned_slot call should write to, without touching the table.
@@ -3125,23 +3134,32 @@ static int kf_plan_window_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh,
                                        const char *data_dir,
                                        const KfInsertPlan *reserved, size_t nreserved,
                                        const ReqSlotRes *res_map, size_t res_cap,
+                                       size_t res_count,
                                        KfInsertPlan *out_plan) {
     (void)db;
+    const int res_clear = (res_count == 0);   /* running |res_map| (F9) */
+#ifdef TEST_BUILD
+    if (res_map && nreserved == 0)
+        req_res_verify(res_map, res_cap, res_count, res_clear);
+#endif
     if (kh->hdr) {
         uint64_t total = kh->hdr->total;
         uint64_t cap = (uint64_t)kh->capacity;
         /* Never resplit while this window or request holds planned-but-
            uncommitted slots: they are numbered for the current table and a
-           resplit would commit them into the wrong places. After a successful
-           stage pre-grow this trigger is unreachable while reservations exist
-           (the stage fails closed on under-coverage — BULK_STAGE_UNGROWN), so
-           this resplit only ever runs for the first, reservation-free plan.
-           The kf_max_slots check keeps the TEST_BUILD tier seam coherent: the
-           stage loop and this planner path respect the same cap (production
-           kf_max_slots() is SIZE_MAX, so this is a no-op there). */
+           resplit would commit them into the wrong places. res_clear is
+           `res_count == 0`, the running |res_map| maintained by
+           req_res_insert and the chain seed (F9) — the map is not scanned.
+           After a successful stage pre-grow this trigger is unreachable while
+           reservations exist (the stage fails closed on under-coverage —
+           BULK_STAGE_UNGROWN), so this resplit only ever runs for the first,
+           reservation-free plan. The kf_max_slots check keeps the TEST_BUILD
+           tier seam coherent: the stage loop and this planner path respect
+           the same cap (production kf_max_slots() is SIZE_MAX, so this is a
+           no-op there). */
         if (cap > 0 && total * 4 >= cap * 3 &&
             cap < kf_max_slots() &&
-            nreserved == 0 && req_res_empty(res_map, res_cap)) {
+            nreserved == 0 && res_clear) {
             if (kfcache_resplit_locked(kh, kh->capacity * 2) == 0)
                 reshard_hint_check(db);
         }
@@ -5565,6 +5583,7 @@ typedef struct {
     SegLoc    *p_locs; size_t np, cap_p;      /* payload bytes (epoch 1)   */
     ReqWindow *windows; size_t nwindows, cap_windows;
     ReqSlotRes *res_map; size_t res_cap;     /* cross-window planned slots */
+    size_t res_count;                        /* F9: running number of used buckets in res_map (I1) */
     int        failed;                 /* EINPROGRESS / unreplayed         */
     /* B1 per-shard pipeline outcome (folded before this shard's gate
        release; supersedes the request-wide payload_rc / publish_rc /
@@ -6248,16 +6267,19 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
             if (!s->old_found) {
                 const ReqSlotRes *res_map = NULL;
                 size_t res_cap = 0;
+                size_t res_count = 0;
                 if (txn->req) {
                     ReqShard *rs = &txn->req->shards[shard->kf_shard_id];
                     res_map = rs->res_map;
                     res_cap = rs->res_cap;
+                    res_count = rs->res_count;
                 }
                 if (kf_plan_window_insert_slot(txn->db, kh, s->hash,
                                                r->key, r->klen,
                                                txn->db->data_dir,
                                                reserved_plans, nreserved,
                                                res_map, res_cap,
+                                               res_count,
                                                &s->kf_plan) != 0) {
                     r->status = -1;
                     continue;
@@ -6266,7 +6288,8 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
                 reserved_plans[nreserved++] = s->kf_plan;
                 if (txn->req) {
                     ReqShard *rs = &txn->req->shards[shard->kf_shard_id];
-                    req_res_insert(rs->res_map, rs->res_cap, &s->kf_plan);
+                    if (req_res_insert(rs->res_map, rs->res_cap, &s->kf_plan))
+                        rs->res_count++;
                 }
             }
             /* OLD-derived records never went through the P wave (their
@@ -7643,8 +7666,13 @@ static void slotcask_bulk_shard_release(SlotcaskBulkRequest *req,
     rs->windows = NULL; rs->nwindows = 0; rs->cap_windows = 0;
     free(rs->p_locs);
     rs->p_locs = NULL; rs->np = 0; rs->cap_p = 0;
+#ifdef TEST_BUILD
+    if (rs->res_map)
+        req_res_verify(rs->res_map, rs->res_cap, rs->res_count, rs->res_count == 0);
+#endif
     free(rs->res_map);
     rs->res_map = NULL;
+    rs->res_count = 0;
 }
 
 /* Frees the request container. Since B1 every shard's terminal cleanup
@@ -7807,6 +7835,7 @@ static int slotcask_bulk_stage_shard(SlotcaskBulkRequest *req,
         return -1;
     }
     rs->res_cap = req_res_pow2(n * 2);
+    rs->res_count = 0;
     if (rs->res_cap != SIZE_MAX) {
         rs->res_map = calloc(rs->res_cap, sizeof(*rs->res_map));
         if (!rs->res_map) rs->res_cap = 0;
@@ -8366,6 +8395,10 @@ static int req_shard_seed_chain_reservations(ReqShard *dst,
     free(dst->res_map);
     dst->res_map = map;
     dst->res_cap = cap;
+    dst->res_count = src_n + dst_n;
+#ifdef TEST_BUILD
+    req_res_verify(dst->res_map, dst->res_cap, dst->res_count, dst->res_count == 0);
+#endif
     return 0;
 }
 
