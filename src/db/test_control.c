@@ -51,6 +51,7 @@ enum {
 #define TEST_HOOK_SET_GLOBALS_BMKS_RACE 4
 #define TEST_HOOK_SET_GLOBALS_FAIL_PHASE 5
 #define TEST_HOOK_SET_GLOBALS_FAIL_STICKY 6
+#define TEST_HOOK_SET_GLOBALS_BMFIX_BACKOFF 7
 
 typedef struct {
     uint32_t kind;   /* INSTALL..REACHED; SET_GLOBALS=6 */
@@ -293,6 +294,10 @@ static void *test_control_thread_main(void *arg) {
                 }
             } else if (msg.phase == TEST_HOOK_SET_GLOBALS_FAIL_STICKY) {
                 atomic_store(&g_shard_test_fail_sticky, msg.a ? 1 : 0);
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_BMFIX_BACKOFF) {
+                /* a = interval in ms ((int64_t) round-trip); <= 0 means the
+                   production default. */
+                atomic_store(&g_shard_test_bmfix_backoff_ms, (long)(int64_t)msg.a);
             } else {
                 atomic_store(&g_shard_test_kf_initial_slots, (size_t)msg.a);
                 atomic_store(&g_shard_test_kf_max_slots, (size_t)msg.b);

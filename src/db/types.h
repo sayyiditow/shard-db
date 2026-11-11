@@ -809,6 +809,11 @@ void index_test_conf_publish_fail_stage(int stage);
 /* One-shot: the next checked reindex build fails with this errno before
    touching any index file (BTRI startup-migration failure case). */
 void index_test_fail_next_build(int en);
+/* One-shot: the next bmfix startup bitmap repair fails with this errno
+   before touching any index file (consumed only by
+   bitmap_rebuild_shards_durable; independent of the reindex-build knob
+   above). */
+void index_test_bmfix_repair_fail_next(int en);
 /* After N successful durable index mutations, make the next completed
    mutation report EIO. The mutation is intentionally performed first so
    callers can exercise partial index apply and its abort/recovery path. */

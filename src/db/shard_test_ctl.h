@@ -135,6 +135,12 @@ enum {
 };
 extern _Atomic int g_shard_test_bmfix_fault_mode;
 extern _Atomic int g_shard_test_bmfix_fault_count;
+/* Growth back-off interval in ms after a bitmap-remap prepare/rename
+   failure (kfcache_resplit_locked's bmfix_retry window). 0 = the
+   production 5000 ms; set via the control channel's SET_GLOBALS
+   selector 7 so fault tests never sleep against a hard-coded
+   constant. */
+extern _Atomic long g_shard_test_bmfix_backoff_ms;
 /* Bitmap lock-order trace (F7b): 1 = cached writer acquire/release
    events log BMLOCK-ORDER lines (bitmap.c). Inert when 0. */
 extern _Atomic int g_shard_test_bmlock_log;
@@ -165,6 +171,7 @@ static inline void shard_test_ctl_reset(void) {
     atomic_store(&g_shard_test_kf_max_slots, 0);
     atomic_store(&g_shard_test_bmfix_fault_mode, 0);
     atomic_store(&g_shard_test_bmfix_fault_count, 0);
+    atomic_store(&g_shard_test_bmfix_backoff_ms, 0);
     atomic_store(&g_shard_test_bmlock_log, 0);
     atomic_store(&g_shard_test_json_escape_fail, 0);
     atomic_store(&g_shard_test_gate_held_max, 0);

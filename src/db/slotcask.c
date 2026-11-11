@@ -64,6 +64,7 @@ _Atomic size_t g_shard_test_kf_max_slots;
    the next `count` hits of that mode fire. */
 _Atomic int g_shard_test_bmfix_fault_mode;
 _Atomic int g_shard_test_bmfix_fault_count;
+_Atomic long g_shard_test_bmfix_backoff_ms;
 _Atomic int g_shard_test_bmlock_log;
 _Atomic long g_shard_test_fail_phase = -1;
 _Atomic long g_shard_test_fail_occurrence;
@@ -2242,6 +2243,17 @@ static inline uint64_t kf_now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
 
+/* F7d: growth back-off interval. Production 5000 ms; TEST_BUILD tests set
+   g_shard_test_bmfix_backoff_ms (control selector 7) so fault cases never
+   sleep against a hard-coded constant. */
+static uint64_t kf_bmfix_backoff_ms(void) {
+#ifdef TEST_BUILD
+    long ms = atomic_load(&g_shard_test_bmfix_backoff_ms);
+    if (ms > 0) return (uint64_t)ms;
+#endif
+    return 5000ULL;
+}
+
 #ifdef TEST_BUILD
 static int kf_bmfix_fault(int mode) {
     if (atomic_load(&g_shard_test_bmfix_fault_mode) != mode) return 0;
@@ -2649,7 +2661,7 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
             close(new_fd);
             unlink(new_path);
             if (new_cap > old_cap) {   /* growth only: vacuum reports its error and does not retry */
-                e->bmfix_retry_ms = kf_now_us() / 1000ULL + 5000ULL;
+                e->bmfix_retry_ms = kf_now_us() / 1000ULL + kf_bmfix_backoff_ms();
                 e->bmfix_retry_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
             }
             errno = perr;
@@ -2667,7 +2679,7 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
         unlink(new_path);
         kf_bmfix_abort(&bmfix);   /* kf unchanged: drop temps, marker, bitmap locks */
         if (new_cap > old_cap) {  /* a persistent failure must not redo the rebuild on every insert */
-            e->bmfix_retry_ms = kf_now_us() / 1000ULL + 5000ULL;
+            e->bmfix_retry_ms = kf_now_us() / 1000ULL + kf_bmfix_backoff_ms();
             e->bmfix_retry_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
         }
         return -1;

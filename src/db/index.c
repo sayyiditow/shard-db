@@ -42,6 +42,25 @@ void index_test_fail_next_build(int en) {
     (void)en;
 }
 #endif
+
+#ifdef TEST_BUILD
+/* One-shot "fail the next bmfix startup bitmap repair" seam (db.env
+   BMFIX_REPAIR_TEST_FAIL_NEXT): consumed ONLY by
+   bitmap_rebuild_shards_durable, so the repair and the checked reindex
+   build can be failed independently (the shared
+   INDEX_TEST_FAIL_NEXT_BUILD knob made the escape cases depend on "no
+   other build ran first"). */
+static _Atomic int g_bmfix_repair_test_fail_next;
+
+void index_test_bmfix_repair_fail_next(int en) {
+    atomic_store_explicit(&g_bmfix_repair_test_fail_next, en > 0 ? en : 0,
+                          memory_order_release);
+}
+#else
+void index_test_bmfix_repair_fail_next(int en) {
+    (void)en;
+}
+#endif
 #include "bitmap.h"
 #include "trigram.h"
 #include "slotcask.h"
@@ -4918,11 +4937,13 @@ int bitmap_rebuild_shards_durable(const char *eff_root, const char *object,
                                   const uint8_t *only_shards, int *out_errno) {
     if (out_errno) *out_errno = 0;
 #ifdef TEST_BUILD
+    /* Consumes the BMFIX_REPAIR_TEST_FAIL_NEXT db.env knob (the repair-only
+       one-shot), never the reindex-build knob. */
     {
-        int injected = atomic_load_explicit(&g_index_test_fail_next_build,
+        int injected = atomic_load_explicit(&g_bmfix_repair_test_fail_next,
                                             memory_order_acquire);
         if (injected != 0) {
-            atomic_store_explicit(&g_index_test_fail_next_build, 0,
+            atomic_store_explicit(&g_bmfix_repair_test_fail_next, 0,
                                   memory_order_release);
             LOG_ERROR(LOG_SUB_REINDEX,
                       "BMFIX-RECOVER %s/%s: test seam failing bitmap rebuild (errno=%d)",

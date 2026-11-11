@@ -101,6 +101,11 @@ int test_env_ctl_set_bmks_race(TestEnv *env, int stage);
    armed before the phase and cleared after the disarm. */
 int test_env_ctl_set_fail_phase(TestEnv *env, int phase, int occurrence,
                                 int sticky);
+/* Growth back-off seam (F7d): override the daemon's bitmap-remap retry
+   back-off interval (ms) so fault tests never sleep out a hard-coded 5 s.
+   ms <= 0 restores the production default. Requires a test-server daemon
+   (test_control_fd >= 0). */
+int test_env_ctl_set_bmfix_backoff(TestEnv *env, long ms);
 /* Fault injection: force the daemon's update-error JSON escape to fail
    (static-fallback emission). fail=0 disarms. Requires a test-server
    daemon (test_control_fd >= 0). */

@@ -1092,6 +1092,11 @@ int test_env_ctl_set_fail_phase(TestEnv *env, int phase, int occurrence,
     return 0;
 }
 
+int test_env_ctl_set_bmfix_backoff(TestEnv *env, long ms) {
+    /* phase 7 = TEST_HOOK_SET_GLOBALS_BMFIX_BACKOFF (test_control.c). */
+    return ctl_set_globals(env, 7, (uint64_t)(int64_t)ms, 0);
+}
+
 int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
     /* phase 1 = TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL (test_control.c). */
     return ctl_set_globals(env, 1, (uint64_t)(fail ? 1 : 0), 0);

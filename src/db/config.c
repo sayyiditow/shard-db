@@ -442,6 +442,13 @@ int load_db_root(char *out, size_t outlen) {
                process). Drives the BTRI startup-migration failure case.
                Not a documented production setting. */
             index_test_fail_next_build(atoi(p + 27));
+        } else if (strncmp(p, "BMFIX_REPAIR_TEST_FAIL_NEXT=", 28) == 0) {
+            /* Test-only knob: the next bmfix startup bitmap repair fails
+               with this errno before touching any index file (one-shot
+               per process; consumed only by bitmap_rebuild_shards_durable,
+               independent of INDEX_TEST_FAIL_NEXT_BUILD). Not a documented
+               production setting. */
+            index_test_bmfix_repair_fail_next(atoi(p + 28));
         } else if (strncmp(p, "BT_TEST_PUBLISH_FAIL_STAGE=", 27) == 0) {
             /* Test-only knob: fails the next btree replacement publication
                at 1=pre-rename or 2=post-rename parent-durability reporting
