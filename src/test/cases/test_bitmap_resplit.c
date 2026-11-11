@@ -9,12 +9,18 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "../../db/shard_test_ctl.h"
+#include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define BR_N 3000
@@ -636,6 +642,764 @@ static int test_bitmap_resplit_corrupt_bitmap(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+/* ==== Plan E: shard-scoped startup bitmap repair + escape (F5 + F7a) ====
+   A pending .bmfix-NNN marker names the one kf shard whose bitmaps may use
+   old slot numbers; startup repairs just that shard's bitmaps. When the
+   repair fails (and no KFM2 marker is pending), startup writes
+   .bmfix-disabled and serves the object read-only-with-bitmaps-off until
+   `reindex` heals it. All startup lines here are LOG_WARN/LOG_ERROR (the
+   fixture's db.env uses LOG_LEVEL=2). */
+
+#define BR_REFUSAL_JSON \
+    "{\"error\":\"object writes disabled: bitmap repair failed at startup; run reindex\"}"
+#define BR_REFUSAL_TEXT \
+    "Error: object writes disabled: bitmap repair failed at startup; run reindex"
+#define BR_MISSING_GET "{\"error\":\"Not found\"}"
+
+/* db.env seam line for direct starts: br_persist_seam appends
+   unconditionally, so direct `test_env_start_at`/raw spawns call this to
+   add the line only when an earlier start of the same root hasn't already. */
+static void br_seam_once(const char *root) {
+    ASSERT_EQ_INT(tu_run_cmd("grep -q KF_TEST_INITIAL_SLOTS \"$(dirname '%s')/db.env\" || "
+                             "echo 'export KF_TEST_INITIAL_SLOTS=64' >> \"$(dirname '%s')/db.env\"",
+                             root, root), 0, "ensure kf tier seam in db.env");
+}
+static void br_env_append(const char *root, const char *line) {
+    ASSERT_EQ_INT(tu_run_cmd("echo '%s' >> \"$(dirname '%s')/db.env\"", line, root),
+                  0, "append db.env knob");
+}
+static void br_env_remove_line(const char *root, const char *pattern) {
+    ASSERT_EQ_INT(tu_run_cmd("sed -i '/%s/d' \"$(dirname '%s')/db.env\"", pattern, root),
+                  0, "remove db.env knob");
+}
+
+/* A `.bmfix-*` entry other than `.bmfix-disabled` — every "marker" assertion
+   in the Plan E cases uses this, never br_marker_exists (which also matches
+   the flag). */
+static int br_repair_marker_exists(Br *b) {
+    return tu_run_cmd("test -n \"$(find %s/br/t/indexes -maxdepth 1 -name '.bmfix-*' "
+                      "! -name '.bmfix-disabled' 2>/dev/null)\"", b->env.db_root) == 0;
+}
+static int br_flag_exists(Br *b) {
+    char p[600];
+    snprintf(p, sizeof(p), "%s/br/t/indexes/.bmfix-disabled", b->env.db_root);
+    return tu_file_exists(p);
+}
+static int br_kfm2_marker_count(Br *b) {
+    char *out = tu_capture_cmd("find %s/br/t/data/kf -name '*_marker.dat' 2>/dev/null | wc -l",
+                               b->env.db_root);
+    int n = out ? atoi(out) : -1;
+    free(out);
+    return n;
+}
+
+static void br_trim(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) s[--n] = '\0';
+}
+
+/* Capture the (restart) daemon's stderr around a direct spawn: the startup
+   repair logs WARN/ERROR synchronously to stderr (the async disk writer is
+   not running yet), and test_env_start_at's child inherits the caller's
+   stderr, so dup fd 2 onto a file under <base> for the spawn window — the
+   same mechanism test_bitmap_cache_lock_errors.c uses for its startup
+   checkpoint. stderr is unbuffered, so the lines are on disk as soon as
+   the start returns, and br_log_has (grep -r over <base>) finds them. */
+static int br_stderr_capture(const char *root) {
+    fflush(stderr);
+    int saved = dup(2);
+    if (saved < 0) return -1;
+    char base[600];
+    snprintf(base, sizeof(base), "%s", root);
+    char *slash = strrchr(base, '/');
+    if (slash) *slash = '\0';
+    char p[700];
+    snprintf(p, sizeof(p), "%s/daemon-restart.log", base);
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { close(saved); return -1; }
+    if (dup2(fd, 2) < 0) { close(fd); close(saved); return -1; }
+    close(fd);
+    return saved;
+}
+static void br_stderr_restore(int saved) {
+    if (saved < 0) return;
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+}
+
+/* br_open with `kind` dual-declared (bitmap + btree, P0.6): lets the escape
+   case prove the btree plan survives while bitmap planning is disabled. */
+static int br_open_dual(Br *b) {
+    memset(b, 0, sizeof(*b));
+    for (int i = 0; i < BR_N; i++) {
+        b->rows[i].flag = (i % 3 == 0) || (i % 7 == 0);
+        b->rows[i].kind = i % 3;
+    }
+    if (test_env_start(&b->env) != 0) return -1;
+    if (test_env_ctl_set_kf_seams(&b->env, 64, 0) != 0 || br_connect(b) != 0) {
+        test_env_stop(&b->env);
+        return -1;
+    }
+    char *r = br_q(b, "{\"mode\":\"add-dir\",\"dir\":\"br\"}");
+    free(r);
+    r = br_q(b,
+        "{\"mode\":\"create-object\",\"dir\":\"br\",\"object\":\"t\",\"splits\":8,\"max_key\":16,"
+        "\"fields\":[\"flag:bool\",\"kind:enum(a,b,c)\",\"n:int\"],"
+        "\"indexes\":[\"flag:bitmap\",\"kind:bitmap\",\"kind:btree\",\"n\"]}");
+    ASSERT_CONTAINS(r, "\"status\":\"created\"", "create object (kind dual-declared)");
+    free(r);
+    return 0;
+}
+
+/* Seeded object for the Plan E cases: rows k00000..k01499 in 250-row chunks. */
+static void br_seed_1500(Br *b) {
+    for (int from = 0; from < 1500; from += 250)
+        ASSERT_EQ_INT(br_bulk(b, from, from + 250), 0, "bulk-insert chunk");
+    br_check(b, "after seed");
+}
+
+/* Inode+ctime snapshot of every bitmap and btree index file, keyed by
+   "<field>/<name>" relative to indexes/. Taken after test_env_stop_keep and
+   before any planted change; "unchanged" across a restart means the restart
+   did not rewrite the file. ctime guards against inode reuse on non-tmpfs.
+   2048 entries cover an 8-shard object as well as the 512-shard case
+   (2 bitmap fields x 512 shards = 1024 files). */
+#define BR_INO_MAX 2048
+typedef struct { char rel[24]; ino_t ino; struct timespec ctim; } BrInoEnt;
+typedef struct { BrInoEnt e[BR_INO_MAX]; int n; } BrInoSnap;
+
+static void br_ino_scan(BrInoSnap *s, const char *dir, const char *relprefix) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL && s->n < BR_INO_MAX) {
+        char p[600];
+        snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+        struct stat st;
+        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        BrInoEnt *e = &s->e[s->n++];
+        snprintf(e->rel, sizeof(e->rel), "%s/%s", relprefix, de->d_name);
+        e->ino = st.st_ino;
+        e->ctim = st.st_ctim;
+    }
+    closedir(d);
+}
+static void br_inode_snapshot(BrInoSnap *s, const char *root) {
+    memset(s, 0, sizeof(*s));
+    char p[600];
+    snprintf(p, sizeof(p), "%s/br/t/indexes/flag", root); br_ino_scan(s, p, "flag");
+    snprintf(p, sizeof(p), "%s/br/t/indexes/kind", root); br_ino_scan(s, p, "kind");
+    snprintf(p, sizeof(p), "%s/br/t/indexes/n", root);    br_ino_scan(s, p, "n");
+}
+/* 1 = present in both snapshots with identical inode and ctime. */
+static int br_inode_same(const BrInoSnap *a, const BrInoSnap *b, const char *rel) {
+    const BrInoEnt *ea = NULL, *eb = NULL;
+    for (int i = 0; i < a->n; i++)
+        if (strcmp(a->e[i].rel, rel) == 0) { ea = &a->e[i]; break; }
+    for (int i = 0; i < b->n; i++)
+        if (strcmp(b->e[i].rel, rel) == 0) { eb = &b->e[i]; break; }
+    if (!ea || !eb) return 0;
+    return ea->ino == eb->ino && ea->ctim.tv_sec == eb->ctim.tv_sec &&
+           ea->ctim.tv_nsec == eb->ctim.tv_nsec;
+}
+
+/* Local raw spawn (P0.8 pattern): fork the daemon against the stopped root
+   with a 60 s budget. Returns its exit status, or -1 on timeout after
+   SIGKILL+reap — so "exited with failure" is distinguishable from "timed
+   out". The child chdirs to <base> (dirname of root), reads the same db.env,
+   and writes stdout+stderr to <base>/refuse.log. Never br_connect after an
+   expected-failure start. */
+static int br_spawn_expect_exit(const char *root) {
+    const char *cands[] = { "./build/bin/shard-db-test-server",
+                            "./build/bin/shard-db",
+                            "./shard-db", NULL };
+    char bin[PATH_MAX];
+    int found = 0;
+    for (int i = 0; cands[i]; i++) {
+        if (access(cands[i], X_OK) == 0) {
+            if (!realpath(cands[i], bin)) continue;
+            found = 1;
+            break;
+        }
+    }
+    ASSERT_TRUE(found, "locate daemon binary for raw spawn");
+    if (!found) return -1;
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0, "fork raw daemon");
+    if (pid > 0) {
+        int status = -1;
+        for (int elapsed = 0; elapsed < 60000; elapsed += 100) {
+            pid_t r = waitpid(pid, &status, WNOHANG);
+            if (r == pid) return status;
+            usleep(100000);
+        }
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return -1;                       /* timeout — never a real exit status */
+    }
+    if (pid < 0) return -1;
+    char base[600];
+    snprintf(base, sizeof(base), "%s", root);
+    char *slash = strrchr(base, '/');
+    if (slash) *slash = '\0';
+    if (chdir(base) != 0) _exit(126);
+    char logp[700];
+    snprintf(logp, sizeof(logp), "%s/refuse.log", base);
+    int lfd = open(logp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (lfd >= 0) { dup2(lfd, 1); dup2(lfd, 2); close(lfd); }
+    execl(bin, bin, "server", (char *)NULL);
+    _exit(127);
+}
+
+static char *br_explain(Br *b, const char *crit) {
+    char req[1024];
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"count\",\"dir\":\"br\",\"object\":\"t\",\"criteria\":%s,\"explain\":true}",
+        crit);
+    return br_q(b, "%s", req);
+}
+
+static void br_expect_refusal(Br *b, const char *req, const char *what) {
+    char *r = br_q(b, "%s", req);
+    ASSERT_NOT_NULL(r, what);
+    if (r) {
+        br_trim(r);
+        ASSERT_TRUE(strcmp(r, BR_REFUSAL_JSON) == 0, what);
+    }
+    free(r);
+}
+
+/* Text fast-path record mutation: exact \x1F line format the text dispatcher
+   parses (cmd\x1Fdir\x1Fobj\x1Fkey\x1Fvalue). The \x1F escapes are followed
+   by explicit string concatenation — C hex escapes would greedily swallow
+   the following hex-digit characters ('b' of "br"!) into the escape. */
+static void br_text_insert_expect_refusal(Br *b, const char *key) {
+    char line[512];
+    snprintf(line, sizeof(line),
+             "insert" "\x1F" "br" "\x1F" "t" "\x1F" "%s" "\x1F"
+             "{\"flag\":true,\"kind\":\"a\",\"n\":2002}", key);
+    char *r = NULL;
+    int rc = tc_request(b->tc, line, &r);
+    ASSERT_EQ_INT(rc, 0, "text fast-path request answered");
+    if (r) {
+        br_trim(r);
+        char msg[640];
+        snprintf(msg, sizeof(msg), "text fast-path refusal (got: %.300s)", r);
+        ASSERT_TRUE(strcmp(r, BR_REFUSAL_TEXT) == 0, msg);
+    }
+    free(r);
+}
+
+static int test_bmfix_repair_shard_scoped(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    if (br_open(b, 0) != 0) { free(b); return 1; }
+    br_seed_1500(b);
+    int port = b->env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", b->env.db_root);
+    tc_close(b->tc);
+    b->tc = NULL;
+    test_env_stop_keep(&b->env);
+    char bm[600], marker[600];
+    snprintf(bm, sizeof(bm), "%s/br/t/indexes/flag/000.bm", root);
+    snprintf(marker, sizeof(marker), "%s/br/t/indexes/.bmfix-000", root);
+    ASSERT_TRUE(tu_file_exists(bm), "flag shard-0 bitmap exists");
+    ASSERT_EQ_INT(tu_run_cmd("truncate -s 33 '%s'", bm), 0, "corrupt flag shard-0 bitmap");
+    ASSERT_EQ_INT(tu_run_cmd(": > '%s'", marker), 0, "plant the shard-0 marker");
+    /* Snapshot AFTER planting the damage (same discipline as
+       test-bmfix-repair-shard-300): "changed" then means exactly "replaced
+       by the repair", never "ctime moved by my own truncate". */
+    BrInoSnap before;
+    br_inode_snapshot(&before, root);
+    br_seam_once(root);
+    int saved_err = br_stderr_capture(root);
+    int started = test_env_start_at(&b->env, root, port) == 0;
+    br_stderr_restore(saved_err);
+    ASSERT_TRUE(started, "startup OK");
+    if (!started) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    ASSERT_EQ_INT(br_connect(b), 0, "reconnect");
+    ASSERT_TRUE(!br_repair_marker_exists(b), "marker gone");
+    br_check(b, "after shard-scoped repair");
+    BrInoSnap after;
+    br_inode_snapshot(&after, root);
+    char rel[64];
+    snprintf(rel, sizeof(rel), "flag/%03d.bm", 0);
+    ASSERT_TRUE(!br_inode_same(&before, &after, rel), "flag/000.bm inode changed");
+    snprintf(rel, sizeof(rel), "kind/%03d.bm", 0);
+    ASSERT_TRUE(!br_inode_same(&before, &after, rel), "kind/000.bm inode changed");
+    for (int s = 1; s < 8; s++) {
+        snprintf(rel, sizeof(rel), "flag/%03d.bm", s);
+        ASSERT_TRUE(br_inode_same(&before, &after, rel), "other flag .bm unchanged");
+        snprintf(rel, sizeof(rel), "kind/%03d.bm", s);
+        ASSERT_TRUE(br_inode_same(&before, &after, rel), "other kind .bm unchanged");
+    }
+    for (int i = 0; i < before.n; i++) {
+        if (strncmp(before.e[i].rel, "n/", 2) != 0) continue;
+        ASSERT_TRUE(br_inode_same(&before, &after, before.e[i].rel), "n/ inode unchanged");
+    }
+    ASSERT_TRUE(br_log_has(b, "bitmap rebuild of 1 shard"), "repair scoped to 1 shard");
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+static int test_bmfix_repair_bad_marker_name(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    if (br_open(b, 0) != 0) { free(b); return 1; }
+    br_seed_1500(b);
+    int port = b->env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", b->env.db_root);
+    tc_close(b->tc);
+    b->tc = NULL;
+    test_env_stop_keep(&b->env);
+    BrInoSnap before;
+    br_inode_snapshot(&before, root);
+    char marker[600];
+    snprintf(marker, sizeof(marker), "%s/br/t/indexes/.bmfix-zz", root);
+    ASSERT_EQ_INT(tu_run_cmd(": > '%s'", marker), 0, "plant the malformed marker");
+    br_seam_once(root);
+    int started = test_env_start_at(&b->env, root, port) == 0;
+    ASSERT_TRUE(started, "startup OK");
+    if (!started) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    ASSERT_EQ_INT(br_connect(b), 0, "reconnect");
+    ASSERT_TRUE(!br_repair_marker_exists(b), "marker gone");
+    br_check(b, "after full-bitmap repair");
+    BrInoSnap after;
+    br_inode_snapshot(&after, root);
+    char rel[64];
+    for (int s = 0; s < 8; s++) {
+        snprintf(rel, sizeof(rel), "flag/%03d.bm", s);
+        ASSERT_TRUE(!br_inode_same(&before, &after, rel), "flag .bm inode changed");
+        snprintf(rel, sizeof(rel), "kind/%03d.bm", s);
+        ASSERT_TRUE(!br_inode_same(&before, &after, rel), "kind .bm inode changed");
+    }
+    for (int i = 0; i < before.n; i++) {
+        if (strncmp(before.e[i].rel, "n/", 2) != 0) continue;
+        ASSERT_TRUE(br_inode_same(&before, &after, before.e[i].rel), "n/ inode unchanged");
+    }
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+/* Escape case shared prologue: seeded dual-declared object, corrupt shard-0
+   bitmaps (both bitmap fields — the marker names the shard, and the repair
+   covers every bitmap field on it) + planted marker + armed build-failure
+   knob, first (repair-failing) start. The caller continues with either the
+   escape assertions (3) or the heal-at-startup flow (4). Returns 0 when the
+   daemon started. */
+static int br_escape_start(Br *b, char *root, size_t rootcap, int *port) {
+    int rc = br_open_dual(b);
+    if (rc != 0) return -1;
+    br_seed_1500(b);
+    *port = b->env.port;
+    snprintf(root, rootcap, "%s", b->env.db_root);
+    tc_close(b->tc);
+    b->tc = NULL;
+    test_env_stop_keep(&b->env);
+    char bm[600], marker[600];
+    snprintf(bm, sizeof(bm), "%s/br/t/indexes/flag/000.bm", root);
+    snprintf(marker, sizeof(marker), "%s/br/t/indexes/.bmfix-000", root);
+    ASSERT_EQ_INT(tu_run_cmd("truncate -s 33 '%s'", bm), 0, "corrupt flag shard-0 bitmap");
+    snprintf(bm, sizeof(bm), "%s/br/t/indexes/kind/000.bm", root);
+    ASSERT_EQ_INT(tu_run_cmd("truncate -s 33 '%s'", bm), 0, "corrupt kind shard-0 bitmap");
+    ASSERT_EQ_INT(tu_run_cmd(": > '%s'", marker), 0, "plant the shard-0 marker");
+    br_env_append(root, "export INDEX_TEST_FAIL_NEXT_BUILD=5");
+    br_seam_once(root);
+    int saved_err = br_stderr_capture(root);
+    int started = test_env_start_at(&b->env, root, *port) == 0;
+    br_stderr_restore(saved_err);
+    ASSERT_TRUE(started, "startup OK");
+    if (!started) return -2;             /* caller exits via br_close */
+    if (br_connect(b) != 0) return -2;
+    return 0;
+}
+
+static int test_bmfix_escape_disabled(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    char root[256];
+    int port = 0;
+    int st = br_escape_start(b, root, sizeof(root), &port);
+    if (st != 0) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    ASSERT_TRUE(br_flag_exists(b), "disabled flag written");
+    ASSERT_TRUE(br_repair_marker_exists(b), "markers kept");
+    ASSERT_TRUE(br_log_has(b, "bitmap planning DISABLED"), "escape logged");
+    br_check(b, "reads exact with bitmap planning disabled");
+    char *r = br_explain(b, "[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"}]");
+    ASSERT_NOT_NULL(r, "explain flag eq true");
+    ASSERT_TRUE(r && !strstr(r, "\"index\":\"bitmap\""), "flag explain avoids bitmap");
+    free(r);
+    r = br_explain(b, "[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"b\"}]");
+    ASSERT_NOT_NULL(r, "explain kind eq b");
+    ASSERT_TRUE(r && strstr(r, "\"index\":\"btree\""), "dual-declared kind explains btree");
+    free(r);
+    ASSERT_EQ_INT(br_count(b->tc, "[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"b\"}]"),
+                  500, "kind eq b count exact via btree while flagged");
+
+    br_expect_refusal(b, "{\"mode\":\"insert\",\"dir\":\"br\",\"object\":\"t\","
+                         "\"key\":\"k02000\",\"value\":{\"flag\":true,\"kind\":\"a\",\"n\":2000}}",
+                      "insert refused");
+    br_expect_refusal(b, "{\"mode\":\"update\",\"dir\":\"br\",\"object\":\"t\","
+                         "\"key\":\"k00001\",\"value\":{\"n\":99999}}",
+                      "update refused");
+    br_expect_refusal(b, "{\"mode\":\"delete\",\"dir\":\"br\",\"object\":\"t\","
+                         "\"key\":\"k00002\"}",
+                      "delete refused");
+    br_expect_refusal(b, "{\"mode\":\"bulk-insert\",\"dir\":\"br\",\"object\":\"t\","
+                         "\"records\":[{\"key\":\"k02001\","
+                         "\"value\":{\"flag\":true,\"kind\":\"a\",\"n\":2001}}]}",
+                      "bulk-insert refused");
+    br_expect_refusal(b, "{\"mode\":\"vacuum\",\"dir\":\"br\",\"object\":\"t\"}",
+                      "vacuum refused");
+    br_text_insert_expect_refusal(b, "k02002");
+
+    ASSERT_EQ_INT(br_count(b->tc, "[]"), 1500, "count unchanged after refusals");
+    char *g = br_q(b, "{\"mode\":\"get\",\"dir\":\"br\",\"object\":\"t\",\"key\":\"k02000\"}");
+    ASSERT_NOT_NULL(g, "get k02000");
+    if (g) { br_trim(g); ASSERT_TRUE(strcmp(g, BR_MISSING_GET) == 0, "k02000 missing"); }
+    free(g);
+    g = br_q(b, "{\"mode\":\"get\",\"dir\":\"br\",\"object\":\"t\",\"key\":\"k02002\"}");
+    ASSERT_NOT_NULL(g, "get k02002");
+    if (g) { br_trim(g); ASSERT_TRUE(strcmp(g, BR_MISSING_GET) == 0, "k02002 missing"); }
+    free(g);
+    g = br_q(b, "{\"mode\":\"get\",\"dir\":\"br\",\"object\":\"t\",\"key\":\"k00001\"}");
+    ASSERT_NOT_NULL(g, "get k00001");
+    ASSERT_TRUE(g && strstr(g, "\"n\":1"), "k00001 keeps its old n");
+    free(g);
+    g = br_q(b, "{\"mode\":\"get\",\"dir\":\"br\",\"object\":\"t\",\"key\":\"k00002\"}");
+    ASSERT_NOT_NULL(g, "get k00002");
+    ASSERT_TRUE(g && strstr(g, "\"n\":2"), "k00002 present");
+    free(g);
+
+    ASSERT_EQ_INT(br_count(b->tc, "[{\"field\":\"n\",\"op\":\"gte\",\"value\":0}]"),
+                  1500, "n gte 0 count exact");
+    r = br_explain(b, "[{\"field\":\"n\",\"op\":\"gte\",\"value\":0}]");
+    ASSERT_TRUE(r && strstr(r, "\"index\":\"btree\""), "n gte 0 explains btree");
+    free(r);
+
+    r = br_q(b, "{\"mode\":\"reindex\",\"dir\":\"br\",\"object\":\"t\",\"composites_only\":true}");
+    ASSERT_CONTAINS(r, "\"status\":\"reindexed\"", "composites-only reindex runs");
+    free(r);
+    ASSERT_TRUE(br_flag_exists(b), "composites-only keeps the flag");
+    ASSERT_TRUE(br_repair_marker_exists(b), "composites-only keeps the marker");
+
+    r = br_q(b, "{\"mode\":\"reindex\",\"dir\":\"br\",\"object\":\"t\"}");
+    ASSERT_CONTAINS(r, "\"status\":\"reindexed\"", "full reindex succeeds");
+    free(r);
+    ASSERT_TRUE(br_fault_stage_log(b, "bitmap planning re-enabled"),
+                "re-enabled logged");
+    ASSERT_TRUE(!br_flag_exists(b), "flag cleared by reindex");
+    ASSERT_TRUE(!br_repair_marker_exists(b), "markers cleared by reindex");
+    ASSERT_EQ_INT(br_bulk(b, 2000, 2001), 0, "insert works after heal");
+    br_check(b, "after heal");
+    r = br_explain(b, "[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"}]");
+    ASSERT_TRUE(r && strstr(r, "\"index\":\"bitmap\""), "bitmap plans return after heal");
+    free(r);
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+static int test_bmfix_escape_heals_at_startup(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    char root[256];
+    int port = 0;
+    int st = br_escape_start(b, root, sizeof(root), &port);
+    if (st != 0) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    ASSERT_TRUE(br_flag_exists(b), "disabled flag written");
+    ASSERT_TRUE(br_repair_marker_exists(b), "markers kept");
+    ASSERT_TRUE(br_log_has(b, "bitmap planning DISABLED"), "escape logged");
+    br_check(b, "reads exact with bitmap planning disabled");
+    /* No mutations, no reindex: the next start retries the repair itself. */
+    tc_close(b->tc);
+    b->tc = NULL;
+    test_env_stop_keep(&b->env);
+    br_env_remove_line(root, "INDEX_TEST_FAIL_NEXT_BUILD");
+    br_seam_once(root);
+    int saved_err = br_stderr_capture(root);
+    int started = test_env_start_at(&b->env, root, port) == 0;
+    br_stderr_restore(saved_err);
+    ASSERT_TRUE(started, "startup OK (heal)");
+    if (!started) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    ASSERT_EQ_INT(br_connect(b), 0, "reconnect");
+    ASSERT_TRUE(!br_flag_exists(b), "flag gone after heal at startup");
+    ASSERT_TRUE(!br_repair_marker_exists(b), "markers gone after heal at startup");
+    ASSERT_TRUE(br_log_has(b, "bitmap planning re-enabled"), "re-enabled logged");
+    ASSERT_EQ_INT(br_bulk(b, 2000, 2001), 0, "insert works after heal");
+    br_check(b, "after heal at startup");
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+static int test_bmfix_escape_flag_write_fails(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    if (br_open(b, 0) != 0) { free(b); return 1; }
+    br_seed_1500(b);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", b->env.db_root);
+    tc_close(b->tc);
+    b->tc = NULL;
+    test_env_stop_keep(&b->env);
+    char bm[600], marker[600], flagdir[600];
+    snprintf(bm, sizeof(bm), "%s/br/t/indexes/flag/000.bm", root);
+    snprintf(marker, sizeof(marker), "%s/br/t/indexes/.bmfix-000", root);
+    snprintf(flagdir, sizeof(flagdir), "%s/br/t/indexes/.bmfix-disabled", root);
+    ASSERT_EQ_INT(tu_run_cmd("truncate -s 33 '%s'", bm), 0, "corrupt flag shard-0 bitmap");
+    ASSERT_EQ_INT(tu_run_cmd(": > '%s'", marker), 0, "plant the shard-0 marker");
+    br_env_append(root, "export INDEX_TEST_FAIL_NEXT_BUILD=5");
+    ASSERT_EQ_INT(tu_run_cmd("mkdir '%s'", flagdir), 0, "flag path is a directory");
+    br_seam_once(root);
+    int status = br_spawn_expect_exit(root);
+    ASSERT_TRUE(status >= 0, "daemon exited (not timeout)");
+    ASSERT_TRUE(status != 0, "exit status nonzero");
+    ASSERT_TRUE(br_log_has(b, "could not write the disabled flag"),
+                "flag-write failure logged");
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+static int test_bmfix_flag_without_markers(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    if (br_open(b, 0) != 0) { free(b); return 1; }
+    br_seed_1500(b);
+    int port = b->env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", b->env.db_root);
+    tc_close(b->tc);
+    b->tc = NULL;
+    test_env_stop_keep(&b->env);
+    BrInoSnap before;
+    br_inode_snapshot(&before, root);
+    char flag[600];
+    snprintf(flag, sizeof(flag), "%s/br/t/indexes/.bmfix-disabled", root);
+    ASSERT_EQ_INT(tu_run_cmd(": > '%s'", flag), 0, "plant the stale flag (no markers)");
+    br_seam_once(root);
+    int saved_err = br_stderr_capture(root);
+    int started = test_env_start_at(&b->env, root, port) == 0;
+    br_stderr_restore(saved_err);
+    ASSERT_TRUE(started, "startup OK");
+    if (!started) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    ASSERT_EQ_INT(br_connect(b), 0, "reconnect");
+    ASSERT_TRUE(!br_flag_exists(b), "flag gone");
+    ASSERT_TRUE(br_log_has(b, "stale disabled flag removed"), "stale flag removal logged");
+    BrInoSnap after;
+    br_inode_snapshot(&after, root);
+    char rel[64];
+    for (int s = 0; s < 8; s++) {
+        snprintf(rel, sizeof(rel), "flag/%03d.bm", s);
+        ASSERT_TRUE(br_inode_same(&before, &after, rel), "flag .bm inode unchanged");
+        snprintf(rel, sizeof(rel), "kind/%03d.bm", s);
+        ASSERT_TRUE(br_inode_same(&before, &after, rel), "kind .bm inode unchanged");
+    }
+    for (int i = 0; i < before.n; i++) {
+        if (strncmp(before.e[i].rel, "n/", 2) != 0) continue;
+        ASSERT_TRUE(br_inode_same(&before, &after, before.e[i].rel), "n/ inode unchanged");
+    }
+    ASSERT_EQ_INT(br_bulk(b, 1500, 1550), 0, "insert works");
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+static int test_bmfix_reindex_clears_serving_markers(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    if (br_open(b, 0) != 0) { free(b); return 1; }
+    br_seed_1500(b);
+    ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, SHARD_TEST_BMFIX_COMMIT_SYNC, 100000),
+                  0, "arm: commit msync unconfirmed");
+    ASSERT_EQ_INT(br_bulk(b, 1500, 1750), 0, "fault-window chunk still commits");
+    ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, 0, 0), 0, "disarm");
+    ASSERT_TRUE(br_repair_marker_exists(b), "serving-time marker retained");
+    char *r = br_q(b, "{\"mode\":\"reindex\",\"dir\":\"br\",\"object\":\"t\"}");
+    ASSERT_CONTAINS(r, "\"status\":\"reindexed\"", "full reindex succeeds");
+    free(r);
+    ASSERT_TRUE(!br_repair_marker_exists(b), "reindex cleared the serving-time marker");
+    br_check(b, "after reindex");
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+/* F7a: unclean start with BOTH a KFM2 window marker and a .bmfix marker —
+   startup resolves both (repair before replay) and counts stay exact. The
+   first half doubles as the P1b seam probe: the K-phase fault is armed
+   sticky and one single-row bulk-insert must answer within the client
+   timeout and leave its durable marker behind. */
+static int test_bmfix_unclean_with_kfm2(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    if (br_open(b, 0) != 0) { free(b); return 1; }
+    br_seed_1500(b);
+    /* Probe step 1: commit-sync fault leaves a durable .bmfix marker; the
+       window itself commits and clears its own KFM2 marker (see P1b
+       evidence). */
+    ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, SHARD_TEST_BMFIX_COMMIT_SYNC, 100000),
+                  0, "arm: commit msync unconfirmed");
+    ASSERT_EQ_INT(br_bulk(b, 1500, 1750), 0, "fault-window chunk still commits");
+    ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, 0, 0), 0, "disarm");
+    ASSERT_TRUE(br_repair_marker_exists(b), "bmfix marker retained");
+    /* Probe step 2 (P1b): K-phase fault sticky, single-row bulk answers
+       within the client timeout. Its return value and counters are recorded
+       as evidence only (the pending window rejects the request with a
+       durability-pending error, so br_fault_stage_bulk reports -1/-1). */
+    ASSERT_EQ_INT(test_env_ctl_set_fail_phase(&b->env, SHARD_TEST_PHASE_K, 1, 1),
+                  0, "arm: fail phase K occ 1 sticky");
+    int inserted = -1, errors = -1;
+    int rc = br_fault_stage_bulk(b, 1750, 1751, &inserted, &errors);
+    char lbl[160];
+    snprintf(lbl, sizeof(lbl),
+             "disarm fail phase (probe evidence: bulk rc=%d inserted=%d errors=%d)",
+             rc, inserted, errors);
+    ASSERT_EQ_INT(test_env_ctl_set_fail_phase(&b->env, -1, 0, 0), 0, lbl);
+    b->rows[1750].live = 1;              /* the killed window's row, replayed at startup */
+    int port = b->env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", b->env.db_root);
+    tc_close(b->tc);
+    b->tc = NULL;
+    test_env_kill(&b->env);
+    int km = br_kfm2_marker_count(b);
+    snprintf(lbl, sizeof(lbl), "exactly one KFM2 marker pending after kill (count=%d)", km);
+    ASSERT_TRUE(km == 1, lbl);
+    ASSERT_TRUE(br_repair_marker_exists(b), "bmfix marker still present after kill");
+    br_seam_once(root);
+    int started = test_env_start_at(&b->env, root, port) == 0;
+    ASSERT_TRUE(started, "startup OK");
+    if (!started) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    ASSERT_EQ_INT(br_connect(b), 0, "reconnect");
+    ASSERT_EQ_INT(br_kfm2_marker_count(b), 0, "KFM2 markers replayed and cleared");
+    ASSERT_TRUE(!br_repair_marker_exists(b), "bmfix markers cleared");
+    br_check(b, "after unclean start resolved both");
+    ASSERT_EQ_INT(br_count(b->tc, "[]"), 1751, "count is exact after replay");
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+static int test_bmfix_unclean_repair_fails_with_kfm2(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    if (br_open(b, 0) != 0) { free(b); return 1; }
+    br_seed_1500(b);
+    ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, SHARD_TEST_BMFIX_COMMIT_SYNC, 100000),
+                  0, "arm: commit msync unconfirmed");
+    ASSERT_EQ_INT(br_bulk(b, 1500, 1750), 0, "fault-window chunk still commits");
+    ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, 0, 0), 0, "disarm");
+    ASSERT_TRUE(br_repair_marker_exists(b), "bmfix marker retained");
+    ASSERT_EQ_INT(test_env_ctl_set_fail_phase(&b->env, SHARD_TEST_PHASE_K, 1, 1),
+                  0, "arm: fail phase K occ 1 sticky");
+    int inserted = -1, errors = -1;
+    (void)br_fault_stage_bulk(b, 1750, 1751, &inserted, &errors);
+    ASSERT_EQ_INT(test_env_ctl_set_fail_phase(&b->env, -1, 0, 0), 0, "disarm fail phase");
+    b->rows[1750].live = 1;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", b->env.db_root);
+    tc_close(b->tc);
+    b->tc = NULL;
+    test_env_kill(&b->env);
+    br_env_append(root, "export INDEX_TEST_FAIL_NEXT_BUILD=5");
+    br_seam_once(root);
+    int status = br_spawn_expect_exit(root);
+    ASSERT_TRUE(status >= 0, "daemon exited (not timeout)");
+    ASSERT_TRUE(status != 0, "exit status nonzero");
+    ASSERT_TRUE(br_log_has(b, "with pending commit markers; startup refused"),
+                "pending-KFM2 refusal logged");
+    ASSERT_TRUE(!br_flag_exists(b), "no disabled flag written");
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+/* Shard ids beyond one byte: a 512-shard object whose marker names shard
+   300 (hex 12c) must repair exactly that shard. The packed selection array
+   in build_bitmap_pass must hold full shard ids, not truncated bytes. */
+static int test_bmfix_repair_shard_300(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc");
+    if (!b) return 1;
+    memset(b, 0, sizeof(*b));
+    for (int i = 0; i < BR_N; i++) {
+        b->rows[i].flag = (i % 3 == 0) || (i % 7 == 0);
+        b->rows[i].kind = i % 3;
+    }
+    if (test_env_start(&b->env) != 0) { free(b); return 1; }
+    if (test_env_ctl_set_kf_seams(&b->env, 64, 0) != 0 || br_connect(b) != 0) {
+        test_env_stop(&b->env);
+        free(b);
+        return 1;
+    }
+    char *r = br_q(b, "{\"mode\":\"add-dir\",\"dir\":\"br\"}");
+    free(r);
+    r = br_q(b,
+        "{\"mode\":\"create-object\",\"dir\":\"br\",\"object\":\"t\",\"splits\":512,\"max_key\":16,"
+        "\"fields\":[\"flag:bool\",\"kind:enum(a,b,c)\",\"n:int\"],"
+        "\"indexes\":[\"flag:bitmap\",\"kind:bitmap\",\"n\"]}");
+    ASSERT_CONTAINS(r, "\"status\":\"created\"", "create object (splits 512)");
+    free(r);
+    for (int from = 0; from < 500; from += 250)
+        ASSERT_EQ_INT(br_bulk(b, from, from + 250), 0, "bulk-insert chunk");
+    br_check(b, "after seed");
+    int port = b->env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", b->env.db_root);
+    tc_close(b->tc);
+    b->tc = NULL;
+    test_env_stop_keep(&b->env);
+    char bm[600], marker[600];
+    snprintf(bm, sizeof(bm), "%s/br/t/indexes/flag/12c.bm", root);
+    snprintf(marker, sizeof(marker), "%s/br/t/indexes/.bmfix-12c", root);
+    ASSERT_TRUE(tu_file_exists(bm), "flag shard-300 bitmap exists");
+    ASSERT_EQ_INT(tu_run_cmd("truncate -s 33 '%s'", bm), 0, "corrupt flag shard-300 bitmap");
+    ASSERT_EQ_INT(tu_run_cmd(": > '%s'", marker), 0, "plant the shard-300 marker");
+    /* Snapshot AFTER planting the damage: "changed" then means exactly
+       "replaced by the repair", never "ctime moved by my own truncate". */
+    BrInoSnap before;
+    br_inode_snapshot(&before, root);
+    br_seam_once(root);
+    int saved_err = br_stderr_capture(root);
+    int started = test_env_start_at(&b->env, root, port) == 0;
+    br_stderr_restore(saved_err);
+    ASSERT_TRUE(started, "startup OK");
+    if (!started) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    ASSERT_EQ_INT(br_connect(b), 0, "reconnect");
+    ASSERT_TRUE(!br_repair_marker_exists(b), "marker gone");
+    br_check(b, "after shard-300 repair");
+    BrInoSnap after;
+    br_inode_snapshot(&after, root);
+    ASSERT_TRUE(!br_inode_same(&before, &after, "flag/12c.bm"), "flag/12c.bm inode changed");
+    ASSERT_TRUE(!br_inode_same(&before, &after, "kind/12c.bm"), "kind/12c.bm inode changed");
+    for (int i = 0; i < before.n; i++) {
+        if (strcmp(before.e[i].rel, "flag/12c.bm") == 0 ||
+            strcmp(before.e[i].rel, "kind/12c.bm") == 0)
+            continue;
+        ASSERT_TRUE(br_inode_same(&before, &after, before.e[i].rel),
+                    "no other shard's index file changed");
+    }
+    br_close(b);
+    free(b);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
 TEST_REGISTER("test-bitmap-resplit-bulk", test_bitmap_resplit_bulk)
 TEST_REGISTER("test-bitmap-resplit-legacy", test_bitmap_resplit_legacy)
 TEST_REGISTER("test-bitmap-resplit-single", test_bitmap_resplit_single)
@@ -649,3 +1413,13 @@ TEST_REGISTER("test-bitmap-resplit-fault-commit-clean", test_bitmap_resplit_faul
 TEST_REGISTER("test-bitmap-resplit-fault-commit-unclean", test_bitmap_resplit_fault_commit_unclean)
 TEST_REGISTER("test-bitmap-resplit-chain", test_bitmap_resplit_chain)
 TEST_REGISTER("test-bitmap-resplit-corrupt-bitmap", test_bitmap_resplit_corrupt_bitmap)
+TEST_REGISTER("test-bmfix-repair-shard-scoped", test_bmfix_repair_shard_scoped)
+TEST_REGISTER("test-bmfix-repair-bad-marker-name", test_bmfix_repair_bad_marker_name)
+TEST_REGISTER("test-bmfix-escape-disabled", test_bmfix_escape_disabled)
+TEST_REGISTER("test-bmfix-escape-heals-at-startup", test_bmfix_escape_heals_at_startup)
+TEST_REGISTER("test-bmfix-escape-flag-write-fails", test_bmfix_escape_flag_write_fails)
+TEST_REGISTER("test-bmfix-flag-without-markers", test_bmfix_flag_without_markers)
+TEST_REGISTER("test-bmfix-reindex-clears-serving-markers", test_bmfix_reindex_clears_serving_markers)
+TEST_REGISTER("test-bmfix-unclean-with-kfm2", test_bmfix_unclean_with_kfm2)
+TEST_REGISTER("test-bmfix-unclean-repair-fails-with-kfm2", test_bmfix_unclean_repair_fails_with_kfm2)
+TEST_REGISTER("test-bmfix-repair-shard-300", test_bmfix_repair_shard_300)

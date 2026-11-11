@@ -395,13 +395,42 @@ void req_bitmap_file_path(char *out, size_t outlen,
                           const char *field, int shard_idx);
 
 /* Bitmap-remap crash markers (<data_dir>/indexes/.bmfix-NNN, see slotcask.c).
-   pending: 1 if any marker exists, 0 if none, -1 on I/O error.
-   clear: remove every marker and every leftover "<NNN>.bm.remap" temporary
-   (call only after the object's indexes were rebuilt). 0 / -1. */
-int  slotcask_bmfix_pending(const char *data_dir);
+   marked_shards: count the pending markers, optionally filling a per-shard
+   selection mask (out_mask NULL = count only; splits <= 0 with a mask set
+   leaves the mask untouched). `.bmfix-disabled` is never a marker.
+   A 1-8-lowercase-hex suffix below splits selects that shard; any other
+   `.bmfix-*` name selects every shard. Returns the count (0 = none),
+   -1 on opendir/readdir error, 0 for a missing indexes/ dir.
+   clear: remove every marker (never the escape flag) and every leftover
+   "<NNN>.bm.remap" temporary (call only after the object's indexes were
+   rebuilt). 0 / -1. */
+int  slotcask_bmfix_marked_shards(const char *data_dir, int splits,
+                                  uint8_t *out_mask);
 int  slotcask_bmfix_clear(const char *data_dir);
 /* Remove leftover "<NNN>.bm.remap" temporaries only (startup, no marker). 0 / -1. */
 int  slotcask_bmfix_sweep(const char *data_dir);
+
+/* Escape flag (<data_dir>/indexes/.bmfix-disabled, empty file): written by
+   startup when the bitmap repair failed and no KFM2 commit marker is
+   pending; while present the object serves with bitmap planning disabled
+   and record mutations refused until `reindex` heals it.
+   exists: 1 / 0 / -1 on error. write: create/truncate + fsync file and
+   indexes/ dir, 0 / -1 (errno preserved). remove: unlink + fsync dir;
+   ENOENT is 0 with *removed = 0; *removed = 1 when a file was unlinked
+   (removed may be NULL). */
+int  slotcask_bmfix_disabled_exists(const char *data_dir);
+int  slotcask_bmfix_disabled_write(const char *data_dir);
+int  slotcask_bmfix_disabled_remove(const char *data_dir, int *removed);
+/* Sticky process-wide gate (never cleared within a process): 0 = no object
+   anywhere is disabled, so the check is one relaxed load with no disk
+   access; otherwise the per-object flag's existence. -1 (unreadable flag)
+   counts as disabled — a stuck flag only keeps the object read-only with
+   bitmaps off, which is always correct. Saves/restores errno. */
+extern _Atomic int g_bmfix_any_disabled;
+int  slotcask_bmfix_object_disabled(const char *eff_root, const char *object);
+/* fsync a directory file itself (open O_RDONLY|O_DIRECTORY, fsync).
+   0 / -1 with errno preserved. */
+int  fsync_dir(const char *dir_path);
 
 /* ============================================================ Two-phase bulk fetch
  *

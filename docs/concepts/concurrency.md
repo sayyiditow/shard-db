@@ -101,8 +101,13 @@ keep their real errno.
 
 **Checked retirement before a corrupt skip.** A keyfile rebuild
 (`kf_bmfix_prepare`, under the shard's kf write lock, bitmaps in canonical
-path order) may skip a corrupt bitmap and leave it to the startup rebuild
-(`.bmfix-NNN` kept). It now does so only after retiring that path's cache
+path order) may skip a corrupt bitmap and leave it to the startup repair
+(`.bmfix-NNN` kept; `bmfix_recover_all` rebuilds only the named shards'
+bitmaps from kf + segments, and on repair failure with no pending KFM2
+commit marker writes `.bmfix-disabled` and serves the object with bitmap
+planning disabled and mutations refused until a full `reindex` heals it —
+only a repair failure with pending KFM2 markers still refuses startup).
+It now does so only after retiring that path's cache
 entry with `bm_cache_invalidate_checked`:
 
 - open failed: only an `EUCLEAN` open is skip-eligible (the on-disk corruption

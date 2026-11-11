@@ -738,6 +738,17 @@ int cmd_restore(const char *db_root, const char *object,
         if (stat(src_sub, &st) == 0) cprf(src_sub, dst_sub);
     }
 
+    /* The restored indexes/ replaces this object's flag/marker state with
+       the backup's: a backup taken while bitmap planning was disabled
+       re-arms the escape here (reads fall back, writes refused) until a
+       full reindex heals it. -1 (unreadable flag) counts as present. */
+    if (slotcask_bmfix_disabled_exists(obj_dir) != 0) {
+        atomic_store(&g_bmfix_any_disabled, 1);
+        LOG_WARN(LOG_SUB_CONFIG,
+                 "RESTORE %s/%s: restored object has bitmap planning disabled; run reindex",
+                 db_root, object);
+    }
+
     objlock_wrunlock(db_root, object);
 
     OUT("{\"status\":\"restored\",\"object\":\"%s\",\"from\":\"%s\"}\n", object, from);

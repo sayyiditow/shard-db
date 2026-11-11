@@ -22,6 +22,7 @@ Clients should match on the `error` string, not on the full message.
 | `query_timeout` | Query exceeded `TIMEOUT` (db.env) or per-request `timeout_ms`. | Add filters, add an index, raise the timeout. |
 | `query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor` | Query intermediate buffers crossed `QUERY_BUFFER_MB`. | Narrow `criteria`, add `limit`, or stream via `fetch` + cursor. |
 | `durability outcome pending; do not retry blindly` | The server durably published an indexed mutation marker but could not synchronously converge it. | Do not retry the mutation. The retained marker blocks later writes on that shard until synchronous replay or startup recovery completes. |
+| `object writes disabled: bitmap repair failed at startup; run reindex` | The object's bitmap repair failed at startup and the escape flag (`indexes/.bmfix-disabled`) is set: reads fall back to btree or scan, but every record mutation and every schema/maintenance mode (insert/update/delete/bulk-*, add-field, edit-field, rename-field, remove-field, add-index, remove-index, vacuum, truncate) is refused up front. | Run a full (non-composites-only) `reindex` — it repairs, clears the flag and re-enables writes. |
 
 ### Validation
 

@@ -65,10 +65,10 @@ _Atomic size_t g_shard_test_kf_max_slots;
 _Atomic int g_shard_test_bmfix_fault_mode;
 _Atomic int g_shard_test_bmfix_fault_count;
 _Atomic int g_shard_test_bmlock_log;
-long g_shard_test_fail_phase = -1;
-long g_shard_test_fail_occurrence;
+_Atomic long g_shard_test_fail_phase = -1;
+_Atomic long g_shard_test_fail_occurrence;
 int  g_shard_test_fail_postlink;
-int  g_shard_test_fail_sticky;
+_Atomic int  g_shard_test_fail_sticky;
 _Atomic int g_shard_test_pause_phase = -1;
 _Atomic int g_shard_test_pause_occurrence = 1;
 _Atomic int g_shard_test_pause_hits;
@@ -1115,7 +1115,11 @@ static void writer_gate_unlock(SlotcaskDb *db, int kf_shard) {
     pthread_mutex_unlock(&db->writer_gates[kf_shard]);
 }
 
-static int fsync_dir(const char *dir_path) {
+/* fsync a directory file itself (not its parent). Shared with the bmfix
+   startup repair (embedded.c) and cmd_reindex's repair branch (index.c),
+   which durably publish the <obj>/data/kf directory before clearing the
+   repair markers. */
+int fsync_dir(const char *dir_path) {
     int dfd = open(dir_path, O_RDONLY | O_DIRECTORY);
     if (dfd < 0) return -1;
     int rc = fsync(dfd);
@@ -2264,7 +2268,11 @@ static int kf_bmfix_fault(int mode) {
                 failure aborts the whole rebuild with the old kf and bitmaps
                 untouched.
      marker   - durable <obj>/indexes/.bmfix-<shard>; from here a crash is
-                repaired at startup by a full reindex of the object.
+                repaired at startup by rebuilding only the named shard(s)'
+                bitmaps (bitmap_rebuild_shards_durable; any other .bmfix-*
+                name selects every shard) — and if that repair fails, the
+                object is served with bitmap planning disabled until a full
+                reindex heals it.
      (kf rename happens in kfcache_resplit_locked)
      commit   - copy each staged image over its live mapping in place and msync
                 it (bm_slotmap_apply: nothing in it can fail except the msync).
@@ -2284,7 +2292,7 @@ typedef struct {
     char          indexes_dir[PATH_MAX];
     char          marker[PATH_MAX];     /* "" until the marker is in place */
     int           marker_preexisting;   /* marker came from an earlier failure: never removed here */
-    int           keep_marker;          /* a corrupt bitmap was skipped: only startup may clear it */
+    int           keep_marker;          /* a corrupt bitmap was skipped: only startup or a full reindex may clear it */
     int           skipped;              /* corrupt bitmaps left for the startup rebuild */
 } KfBmFix;
 
@@ -11706,19 +11714,117 @@ int slotcask_compact_segs(SlotcaskDb *db, int *out_dropped) {
     return 0;
 }
 
-int slotcask_bmfix_pending(const char *data_dir) {
+/* Count the pending bitmap-remap repair markers under <data_dir>/indexes,
+   optionally filling a per-shard selection mask. `.bmfix-disabled` (the
+   escape flag) is never a marker. A marker whose suffix is 1-8 lowercase
+   hex digits naming a shard below `splits` selects that one shard; any
+   other `.bmfix-*` name (stray, hand-created, or out-of-range) selects
+   every shard — a stray file must not recreate the startup trap, and
+   rebuilding all bitmaps is still correct. out_mask == NULL (any splits)
+   only counts. Returns the marker count (0 = none), or -1 on
+   opendir/readdir error (ENOENT of indexes/ = 0 markers). */
+int slotcask_bmfix_marked_shards(const char *data_dir, int splits,
+                                 uint8_t *out_mask) {
     char idx[PATH_MAX];
     int n = snprintf(idx, sizeof(idx), "%s/indexes", data_dir);
     if (n < 0 || (size_t)n >= sizeof(idx)) return -1;
     DIR *d = opendir(idx);
     if (!d) return errno == ENOENT ? 0 : -1;
     int found = 0;
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (strncmp(de->d_name, ".bmfix-", 7) == 0) { found = 1; break; }
+    int scan_ok = 1;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(d);
+        if (!de) {
+            if (errno != 0) scan_ok = 0;
+            break;
+        }
+        if (strncmp(de->d_name, ".bmfix-", 7) != 0) continue;
+        if (strcmp(de->d_name, ".bmfix-disabled") == 0) continue;
+        found++;
+        if (!out_mask) continue;
+        const char *sfx = de->d_name + 7;
+        size_t sl = strlen(sfx);
+        unsigned long v = 0;
+        int strict = (sl >= 1 && sl <= 8);
+        for (size_t i = 0; strict && i < sl; i++) {
+            char c = sfx[i];
+            if (c < '0' || (c > '9' && c < 'a') || c > 'f') { strict = 0; break; }
+            v = v * 16 + (unsigned long)(c <= '9' ? c - '0' : c - 'a' + 10);
+        }
+        if (strict && splits > 0 && v < (unsigned long)splits)
+            out_mask[v] = 1;
+        else
+            for (int s = 0; s < splits; s++) out_mask[s] = 1;
     }
     closedir(d);
+    if (!scan_ok) return -1;
     return found;
+}
+
+/* ---- Escape flag (.bmfix-disabled) helpers ------------------------------
+   When the startup bitmap repair fails and no KFM2 commit marker is
+   pending, startup writes this flag and serves the object with bitmap
+   planning disabled until `reindex` repairs it. Empty regular file at
+   <data_dir>/indexes/.bmfix-disabled. */
+
+int slotcask_bmfix_disabled_exists(const char *data_dir) {
+    char p[PATH_MAX];
+    int n = snprintf(p, sizeof(p), "%s/indexes/.bmfix-disabled", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(p)) return -1;
+    if (access(p, F_OK) == 0) return 1;
+    return errno == ENOENT ? 0 : -1;
+}
+
+int slotcask_bmfix_disabled_write(const char *data_dir) {
+    char p[PATH_MAX], idx[PATH_MAX];
+    int n = snprintf(p, sizeof(p), "%s/indexes/.bmfix-disabled", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(p)) return -1;
+    n = snprintf(idx, sizeof(idx), "%s/indexes", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(idx)) return -1;
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    int rc = 0;
+    if (fsync(fd) != 0 && rc == 0) rc = -1;
+    if (close(fd) != 0 && rc == 0) rc = -1;
+    if (rc == 0 && fsync_dir(idx) != 0) rc = -1;
+    return rc;
+}
+
+int slotcask_bmfix_disabled_remove(const char *data_dir, int *removed) {
+    char p[PATH_MAX], idx[PATH_MAX];
+    if (removed) *removed = 0;
+    int n = snprintf(p, sizeof(p), "%s/indexes/.bmfix-disabled", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(p)) return -1;
+    n = snprintf(idx, sizeof(idx), "%s/indexes", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(idx)) return -1;
+    if (unlink(p) != 0) {
+        if (errno == ENOENT) return 0;      /* nothing to remove: *removed stays 0 */
+        return -1;
+    }
+    if (removed) *removed = 1;
+    if (fsync_dir(idx) != 0) return -1;
+    return 0;
+}
+
+/* Process-wide sticky "some object has bitmap planning disabled" gate,
+   set by bmfix_recover_all at startup and by cmd_restore when a restored
+   backup carries the flag. Never cleared within a process: while 0,
+   slotcask_bmfix_object_disabled is one relaxed load with no disk access. */
+_Atomic int g_bmfix_any_disabled;
+
+int slotcask_bmfix_object_disabled(const char *eff_root, const char *object) {
+    if (atomic_load_explicit(&g_bmfix_any_disabled, memory_order_relaxed) == 0)
+        return 0;
+    char data_dir[PATH_MAX];
+    int n = snprintf(data_dir, sizeof(data_dir), "%s/%s", eff_root, object);
+    if (n < 0 || (size_t)n >= sizeof(data_dir)) return 1;
+    /* Never change errno for callers using `errno ? errno : EIO` or
+       `errno = 0; ...; if (errno)` conventions around their own syscalls. */
+    int saved = errno;
+    int f = slotcask_bmfix_disabled_exists(data_dir);
+    errno = saved;
+    return f < 0 ? 1 : f;
 }
 
 static int bmfix_unlink_remaps(const char *idx) {
@@ -11768,6 +11874,7 @@ int slotcask_bmfix_clear(const char *data_dir) {
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (strncmp(de->d_name, ".bmfix-", 7) != 0) continue;
+        if (strcmp(de->d_name, ".bmfix-disabled") == 0) continue;
         char p[PATH_MAX];
         n = snprintf(p, sizeof(p), "%s/%s", idx, de->d_name);
         if (n < 0 || (size_t)n >= sizeof(p)) { rc = -1; continue; }

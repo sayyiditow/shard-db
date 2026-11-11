@@ -45,10 +45,15 @@ typedef enum {
 } ShardTestPhase;
 
 extern long g_shard_test_sync_counts[SHARD_TEST_PHASE_COUNT];
-extern long g_shard_test_fail_phase;       /* -1 = disabled */
-extern long g_shard_test_fail_occurrence;  /* 1-based */
+/* _Atomic: the control-channel thread re-arms these while request threads
+ * are inside shard_test_note_sync — plain globals are a data race TSan
+ * correctly flags (test controls, not engine state). Plain lvalue
+ * reads/writes of an _Atomic long/int are seq_cst atomic operations, so
+ * existing call sites stay valid unchanged. */
+extern _Atomic long g_shard_test_fail_phase;       /* -1 = disabled */
+extern _Atomic long g_shard_test_fail_occurrence;  /* 1-based */
 extern int  g_shard_test_fail_postlink;    /* M: fail after link() (pending) */
-extern int  g_shard_test_fail_sticky;      /* fail every hit >= occurrence,
+extern _Atomic int  g_shard_test_fail_sticky; /* fail every hit >= occurrence,
                                              * not just the one exact match --
                                              * simulates a persistent fault
                                              * (e.g. disk full) that also
@@ -173,12 +178,13 @@ static inline int shard_test_note_sync(int phase) {
     /* concurrent Kf windows on different shards note-sync in parallel */
     long n = __atomic_add_fetch(&g_shard_test_sync_counts[phase], 1,
                                 __ATOMIC_RELAXED);
-    if (g_shard_test_fail_phase == (long)phase &&
-        g_shard_test_fail_occurrence > 0) {
-        if (n == g_shard_test_fail_occurrence)
+    long armed_phase = atomic_load(&g_shard_test_fail_phase);
+    long armed_occ = atomic_load(&g_shard_test_fail_occurrence);
+    if (armed_phase == (long)phase && armed_occ > 0) {
+        if (n == armed_occ)
             return 1;
-        if (g_shard_test_fail_sticky &&
-            g_shard_test_sync_counts[phase] > g_shard_test_fail_occurrence)
+        if (atomic_load(&g_shard_test_fail_sticky) &&
+            n > armed_occ)
             return 1;
     }
     return 0;

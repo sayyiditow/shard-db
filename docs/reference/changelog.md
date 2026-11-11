@@ -6,6 +6,36 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**A pending bitmap-remap marker never blocks startup; shard-scoped repair with a read-only escape.**
+`bmfix_recover_all` used to answer any `<obj>/indexes/.bmfix-NNN` marker with a full strict reindex
+of every btree, trigram and bitmap index on every shard, refusing startup on any failure — the same
+failure then repeated on every later start, with cost growing with the object rather than the damage.
+Startup now rebuilds only the named shards' bitmaps for every bitmap field
+(`bitmap_rebuild_shards_durable`, temp files + `bm_publish_replace`; a 1–8 lowercase-hex suffix below
+the object's splits names the shards, any other `.bmfix-*` name selects all of them). If that repair
+or the marker cleanup fails and no KFM2 commit marker is pending for the object, startup durably
+writes `indexes/.bmfix-disabled` and serves the object with bitmap planning disabled: reads fall back
+to btree or full scan (planner and dispatcher skip bitmap entries for the object), every record
+mutation and every schema/maintenance mode (add-field, edit-field, rename-field, remove-field,
+add-index, remove-index, vacuum, truncate; insert/update/delete/bulk-*) is refused up front with
+`{"error":"object writes disabled: bitmap repair failed at startup; run reindex"}` (text fast path:
+`Error: object writes disabled: bitmap repair failed at startup; run reindex`), and background
+auto-vacuum/auto-reshard skip the object; `put-file`, `delete-file`, `sequence`, `backup`, `restore`,
+`reindex` and `drop-object` stay allowed. A full (non-composites-only) `reindex` of a flagged or
+marked object now runs the strict durable rebuild and clears the markers and the flag (a
+composites-only reindex leaves repair state untouched) — this includes serving-time `.bmfix` markers
+left after a logged commit failure, which previously only startup could clear. A later start retries
+the repair first, and success there also clears both; a stale flag with no markers is removed at
+startup; a flagged object heals without operator action. Startup still refuses in exactly these
+cases: the repair fails while KFM2 commit markers are pending for the object (replaying the window
+into the torn bitmap would recreate the trap), the disabled flag cannot be written, the marker
+directory cannot be read, or the schema of a marked object cannot be loaded. An older binary
+treats `.bmfix-disabled` as a `.bmfix-` marker: it runs one full strict reindex and deletes the
+file — benign when the rebuild is complete, but if that reindex fails, the older binary refuses
+startup (its pre-escape behaviour). `restore` replaces the object's flag/marker state
+with the backup's and re-arms the escape when the backup carried the flag. No wire, CLI, config or
+record/index format change.
+
 - Bitmap candidate collections prefer 8,192 actual slots within the request
   budget and recover actual concurrent insertion overflow through a complete
   record scan with the original deadline; bitmap read and allocation-budget

@@ -1438,6 +1438,13 @@ int reindex_object_checked_ex(const char *eff_root, const char *object,
 int reindex_object_durable_checked_ex(const char *eff_root, const char *object,
                                       int composites_only, int *out_count,
                                       int *out_errno);
+/* Rebuild ONLY the selected shards' bitmaps for every bitmap field
+   (bmfix startup repair + cmd_reindex's healing path). only_shards is
+   NULL (all shards) or splits bytes with nonzero = rebuild that shard.
+   Caller holds objlock_wrlock. 0 on success (or no bitmap fields);
+   -1 with *out_errno on failure, durability-unconfirmed included. */
+int bitmap_rebuild_shards_durable(const char *eff_root, const char *object,
+                                  const uint8_t *only_shards, int *out_errno);
 int cmd_remove_index(const char *db_root, const char *object, const char *field);
 int cmd_remove_indexes(const char *db_root, const char *object, const char *fields_json);
 

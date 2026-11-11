@@ -95,6 +95,12 @@ int test_env_ctl_set_bmlock_log(TestEnv *env, int on);
    find-flush gate hook); 0 releases the gate and disarms. Test support,
    not a configuration knob. */
 int test_env_ctl_set_bmks_race(TestEnv *env, int stage);
+/* Window-coordinator fault injection: fail the `occurrence`-th durable-sync
+   barrier of `phase` (ShardTestPhase; -1 disarms; sticky=1 fails every hit
+   >= occurrence). Sent via the daemon's test-control channel; sticky is
+   armed before the phase and cleared after the disarm. */
+int test_env_ctl_set_fail_phase(TestEnv *env, int phase, int occurrence,
+                                int sticky);
 /* Fault injection: force the daemon's update-error JSON escape to fail
    (static-fallback emission). fail=0 disarms. Requires a test-server
    daemon (test_control_fd >= 0). */

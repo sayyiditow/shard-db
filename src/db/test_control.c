@@ -49,6 +49,8 @@ enum {
 #define TEST_HOOK_SET_GLOBALS_BMFIX_FAULT 2
 #define TEST_HOOK_SET_GLOBALS_BMLOCK_LOG 3
 #define TEST_HOOK_SET_GLOBALS_BMKS_RACE 4
+#define TEST_HOOK_SET_GLOBALS_FAIL_PHASE 5
+#define TEST_HOOK_SET_GLOBALS_FAIL_STICKY 6
 
 typedef struct {
     uint32_t kind;   /* INSTALL..REACHED; SET_GLOBALS=6 */
@@ -269,6 +271,28 @@ static void *test_control_thread_main(void *arg) {
                     atomic_store(&g_shard_test_bmks_stage, 0);
                     atomic_store(&g_shard_test_bmks_gate, 1);
                 }
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_FAIL_PHASE) {
+                /* a = window-coordinator fail phase ((long)(int64_t)a so
+                   -1 round-trips through the uint64 field), b = 1-based
+                   occurrence. Arm order matters: zero the per-phase
+                   counters first (occurrence is counted from the arm,
+                   matching the workers' __atomic_add_fetch), then
+                   occurrence, then phase — a worker that sees the armed
+                   phase must already see the occurrence. Disarm stores
+                   phase first so workers stop failing before anything
+                   else moves. */
+                long fail_phase = (long)(int64_t)msg.a;
+                if (fail_phase >= 0) {
+                    for (int i = 0; i < SHARD_TEST_PHASE_COUNT; i++)
+                        __atomic_store_n(&g_shard_test_sync_counts[i], 0,
+                                         __ATOMIC_RELAXED);
+                    atomic_store(&g_shard_test_fail_occurrence, (long)msg.b);
+                    atomic_store(&g_shard_test_fail_phase, fail_phase);
+                } else {
+                    atomic_store(&g_shard_test_fail_phase, fail_phase);
+                }
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_FAIL_STICKY) {
+                atomic_store(&g_shard_test_fail_sticky, msg.a ? 1 : 0);
             } else {
                 atomic_store(&g_shard_test_kf_initial_slots, (size_t)msg.a);
                 atomic_store(&g_shard_test_kf_max_slots, (size_t)msg.b);

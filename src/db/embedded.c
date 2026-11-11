@@ -945,48 +945,201 @@ static int layout_migration_run(const char *db_root) {
 /* A keyfile rebuild interrupted between its keyfile rename and its bitmap
    publication (or whose bitmap publication failed and was logged) leaves
    <obj>/indexes/.bmfix-NNN. Bitmap bits are kf slot numbers, so those bitmaps
-   may name old slots: rebuild the object's indexes from kf + segments (pure
-   function of durable state) with the strict reindex used by the BTRI
-   migration, then drop the markers. On the unclean path it runs BEFORE the
-   KFM2 replay, like the BTRI migration (replay then applies pending windows
-   to the rebuilt indexes): a torn bitmap must not be written by replay. It
-   also removes leftover "<NNN>.bm.remap" temporaries of every object. */
+   may name old slots. The marker name selects the affected shard(s): a
+   1-8-lowercase-hex suffix below the object's split count repairs just that
+   shard's bitmaps (every bitmap field); any other `.bmfix-*` name repairs
+   all of them. The rebuild goes through bitmap_rebuild_shards_durable
+   (temp files + bm_publish_replace, from kf + segments — btrees and
+   trigrams are never touched) under the object's write lock.
+
+   A pending marker must never stop the daemon from starting. If the repair
+   (or the marker cleanup) fails and the object has no pending KFM2 commit
+   marker, startup writes <obj>/indexes/.bmfix-disabled and serves the
+   object with bitmap planning disabled: reads fall back to btree or scan,
+   every record mutation and every mode_is_schema mutation is refused up
+   front, and a full `reindex` repairs and re-enables. Only an unreadable
+   marker directory, an unloadable schema for a marked object, a failed
+   flag write, or a failed repair with pending KFM2 markers (replaying a
+   window into a torn bitmap would recreate the trap) refuses startup. A
+   flag with no markers left is stale (writes were refused the whole time,
+   so the bitmaps are complete) and is removed. On the unclean path this
+   runs BEFORE the KFM2 replay (replay then applies pending windows to the
+   repaired bitmaps). It also removes leftover "<NNN>.bm.remap" temporaries
+   of every object. */
 static int bmfix_recover_all(const char *db_root) {
     StartupSchemaEntry *ents = NULL;
     size_t cnt = 0;
     if (startup_read_schema(db_root, &ents, &cnt) != 0) return -1;
+    int any_flagged = 0;
     for (size_t i = 0; i < cnt; i++) {
         char eff_root[PATH_MAX], data_dir[PATH_MAX];
         snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, ents[i].dir);
         snprintf(data_dir, sizeof(data_dir), "%s/%s/%s", db_root, ents[i].dir, ents[i].object);
-        int pending = slotcask_bmfix_pending(data_dir);
-        if (pending < 0) { free(ents); return -1; }
-        if (!pending) {
-            (void)slotcask_bmfix_sweep(data_dir);   /* best effort: only disk space */
-            continue;
-        }
-        LOG_WARN(LOG_SUB_REINDEX, "BMFIX-RECOVER %s/%s: interrupted bitmap remap; rebuilding indexes",
-                 ents[i].dir, ents[i].object);
-        if (objlock_wrlock(eff_root, ents[i].object) != 0) { free(ents); return -1; }
-        int n = 0, eno = 0;
-        int rc = reindex_object_durable_checked_ex(eff_root, ents[i].object, 0, &n, &eno);
-        objlock_wrunlock(eff_root, ents[i].object);
-        if (rc != 0) {
+        int n = slotcask_bmfix_marked_shards(data_dir, 0, NULL);
+        if (n < 0) {
             LOG_ERROR(LOG_SUB_REINDEX,
-                      "BMFIX-RECOVER %s/%s: reindex failed (errno=%d); startup refused, retried next start",
-                      ents[i].dir, ents[i].object, eno);
-            free(ents);
-            return -1;
-        }
-        if (slotcask_bmfix_clear(data_dir) != 0) {
-            LOG_ERROR(LOG_SUB_REINDEX,
-                      "BMFIX-RECOVER %s/%s: could not remove the repair markers (errno=%d); startup refused, retried next start",
+                      "BMFIX-RECOVER %s/%s: cannot scan repair markers (errno=%d); startup refused",
                       ents[i].dir, ents[i].object, errno);
             free(ents);
             return -1;
         }
+        int flagged = slotcask_bmfix_disabled_exists(data_dir);
+        if (flagged < 0) {
+            /* A stuck flag only keeps the object read-only with bitmaps
+               off — always correct. Refusing would recreate the trap.
+               But a pending KFM2 window would be replayed past a repair
+               that was never attempted, into possibly-torn bitmaps:
+               refuse like the repair-failed-with-KFM2 case. */
+            if (object_has_pending_markers(data_dir) != 0) {
+                LOG_ERROR(LOG_SUB_REINDEX,
+                          "BMFIX-RECOVER %s/%s: cannot read disabled flag (errno=%d) "
+                          "with pending commit markers; startup refused",
+                          ents[i].dir, ents[i].object, errno);
+                free(ents);
+                return -1;
+            }
+            LOG_WARN(LOG_SUB_REINDEX,
+                     "BMFIX-RECOVER %s/%s: cannot read disabled flag (errno=%d); "
+                     "treating object as disabled; repair not attempted",
+                     ents[i].dir, ents[i].object, errno);
+            any_flagged = 1;
+            continue;
+        }
+        if (n == 0) {
+            (void)slotcask_bmfix_sweep(data_dir);   /* best effort: only disk space */
+            if (flagged) {
+                int removed = 0;
+                if (objlock_wrlock(eff_root, ents[i].object) != 0) {
+                    LOG_ERROR(LOG_SUB_REINDEX,
+                              "BMFIX-RECOVER %s/%s: objlock_wrlock failed; startup refused",
+                              ents[i].dir, ents[i].object);
+                    free(ents);
+                    return -1;
+                }
+                int rmrc = slotcask_bmfix_disabled_remove(data_dir, &removed);
+                objlock_wrunlock(eff_root, ents[i].object);
+                if (rmrc == 0 && removed) {
+                    LOG_WARN(LOG_SUB_REINDEX,
+                             "BMFIX-RECOVER %s/%s: stale disabled flag removed (no markers)",
+                             ents[i].dir, ents[i].object);
+                } else if (rmrc != 0) {
+                    LOG_WARN(LOG_SUB_REINDEX,
+                             "BMFIX-RECOVER %s/%s: could not remove stale disabled flag "
+                             "(errno=%d); object stays disabled until reindex",
+                             ents[i].dir, ents[i].object, errno);
+                    any_flagged = 1;
+                }
+            }
+            continue;
+        }
+        /* n > 0: repair exactly the named shards' bitmaps. */
+        Schema sch = load_schema(eff_root, ents[i].object);
+        if (sch.splits <= 0) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: cannot load schema (splits=%d); startup refused",
+                      ents[i].dir, ents[i].object, sch.splits);
+            free(ents);
+            return -1;
+        }
+        uint8_t *mask = calloc((size_t)sch.splits, 1);
+        if (!mask) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: out of memory (%d splits); startup refused",
+                      ents[i].dir, ents[i].object, sch.splits);
+            free(ents);
+            return -1;
+        }
+        int selected = 0;
+        if (slotcask_bmfix_marked_shards(data_dir, sch.splits, mask) < 0) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: cannot scan repair markers (errno=%d); startup refused",
+                      ents[i].dir, ents[i].object, errno);
+            free(mask);
+            free(ents);
+            return -1;
+        }
+        for (int s = 0; s < sch.splits; s++)
+            if (mask[s]) selected++;
+        if (objlock_wrlock(eff_root, ents[i].object) != 0) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: objlock_wrlock failed; startup refused",
+                      ents[i].dir, ents[i].object);
+            free(mask);
+            free(ents);
+            return -1;
+        }
+        LOG_WARN(LOG_SUB_REINDEX,
+                 "BMFIX-RECOVER %s/%s: interrupted bitmap remap; bitmap rebuild of %d shard(s)",
+                 ents[i].dir, ents[i].object, selected);
+        int eno = 0;
+        int rc = bitmap_rebuild_shards_durable(eff_root, ents[i].object, mask, &eno);
+        if (rc == 0) {
+            /* Durably publish the kf directory before the markers may be
+               cleared: the rebuilt bitmaps are a function of the kf state
+               the repair just walked, and a marker cleared ahead of the
+               directory entry being durable could lose the repair on
+               power loss. A failed fsync counts as a repair failure. */
+            char kf_dir[PATH_MAX];
+            snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+            if (fsync_dir(kf_dir) != 0) rc = -1;
+        }
+        if (rc == 0)
+            rc = slotcask_bmfix_clear(data_dir);
+        if (rc != 0) {
+            /* Capture errno immediately: every later call may overwrite it. */
+            int E = rc < 0 && eno != 0 ? eno : errno;
+            /* Escape decision: refuse only when replaying a pending KFM2
+               window would write into the torn bitmap. */
+            if (object_has_pending_markers(data_dir) != 0) {
+                LOG_ERROR(LOG_SUB_REINDEX,
+                          "BMFIX-RECOVER %s/%s: repair failed (errno=%d) with pending "
+                          "commit markers; startup refused",
+                          ents[i].dir, ents[i].object, E);
+                objlock_wrunlock(eff_root, ents[i].object);
+                free(mask);
+                free(ents);
+                return -1;
+            }
+            if (slotcask_bmfix_disabled_write(data_dir) != 0) {
+                LOG_ERROR(LOG_SUB_REINDEX,
+                          "BMFIX-RECOVER %s/%s: could not write the disabled flag "
+                          "(errno=%d); startup refused",
+                          ents[i].dir, ents[i].object, errno);
+                objlock_wrunlock(eff_root, ents[i].object);
+                free(mask);
+                free(ents);
+                return -1;
+            }
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: bitmap planning DISABLED (repair failed, "
+                      "errno=%d); reads fall back, writes refused; run reindex",
+                      ents[i].dir, ents[i].object, E);
+            objlock_wrunlock(eff_root, ents[i].object);
+            any_flagged = 1;
+            free(mask);
+            continue;
+        }
+        int removed = 0;
+        int rmrc = slotcask_bmfix_disabled_remove(data_dir, &removed);
+        if (rmrc != 0) {
+            /* Markers are already gone and the bitmaps are complete; only
+               the flag removal failed. Writes stay refused until reindex. */
+            LOG_WARN(LOG_SUB_REINDEX,
+                     "BMFIX-RECOVER %s/%s: repair succeeded but disabled flag could not "
+                     "be removed (errno=%d); object stays disabled until reindex",
+                     ents[i].dir, ents[i].object, errno);
+            any_flagged = 1;
+        } else if (removed) {
+            LOG_WARN(LOG_SUB_REINDEX,
+                     "BMFIX-RECOVER %s/%s: repair succeeded; bitmap planning re-enabled",
+                     ents[i].dir, ents[i].object);
+        }
+        objlock_wrunlock(eff_root, ents[i].object);
+        free(mask);
     }
     free(ents);
+    if (any_flagged)
+        atomic_store(&g_bmfix_any_disabled, 1);
     return 0;
 }
 

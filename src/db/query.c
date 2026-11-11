@@ -3959,7 +3959,13 @@ int field_has_index_type(const char *db_root, const char *object,
     int n = load_index_fields(db_root, object, fields, MAX_FIELDS);
     int n2 = load_index_types(db_root, object, types, MAX_FIELDS);
     int count = n < n2 ? n : n2;
+    /* A bitmap-disabled object plans no bitmap: while the escape flag is
+       set the .bm files may still name old kf slots (bmfix repair failed
+       at startup), so bitmap entries don't count until reindex heals. */
+    int bitmap_gated = want == IT_BITMAP &&
+                       slotcask_bmfix_object_disabled(db_root, object);
     for (int i = 0; i < count; i++) {
+        if (bitmap_gated && types[i] == IT_BITMAP) continue;
         if (types[i] == want && strcmp(fields[i], field) == 0) return 1;
     }
     return 0;
@@ -3998,7 +4004,11 @@ static int op_allows_trigram_starts(enum SearchOp op) {
 #define TG_PREFER_BTREE_LEN 6
 
 /* Resolve a field's IndexType from the cached index.conf. Linear scan
-   over the cached arrays — cheap for the planner hot path. */
+   over the cached arrays — cheap for the planner hot path. A bitmap
+   entry is skipped while the object's bitmap planning is disabled
+   (defense in depth behind field_has_index_type's gate): the gated
+   planner has already chosen btree for such fields, so the default
+   IT_BTREE keeps those callers consistent. */
 enum IndexType field_index_type(const char *db_root, const char *object,
                                        const char *field) {
     char fields[MAX_FIELDS][256];
@@ -4006,7 +4016,9 @@ enum IndexType field_index_type(const char *db_root, const char *object,
     int n = load_index_fields(db_root, object, fields, MAX_FIELDS);
     int n2 = load_index_types(db_root, object, types, MAX_FIELDS);
     int count = n < n2 ? n : n2;
+    int bitmap_gated = slotcask_bmfix_object_disabled(db_root, object);
     for (int i = 0; i < count; i++) {
+        if (bitmap_gated && types[i] == IT_BITMAP) continue;
         if (strcmp(fields[i], field) == 0) return types[i];
     }
     return IT_BTREE;

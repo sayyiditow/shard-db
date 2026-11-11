@@ -1625,6 +1625,24 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             return;
         }
     }
+    /* Bitmap-escape gate: while the object's repair flag is set, refuse
+       every record mutation and every schema/maintenance mode up front —
+       before any segment, marker or kf change — so a failed write can
+       never leave a pending window that would replay into the damaged
+       bitmap at the next start. put-file/delete-file/sequence never touch
+       record indexes and stay allowed, as do reads, reindex, drop-object
+       and restore (the repair's own escape hatches). */
+    if ((mode_is_schema(mode) || mode_is_write(mode)) &&
+        strcasecmp(mode, "put-file") != 0 && strcasecmp(mode, "delete-file") != 0 &&
+        strcasecmp(mode, "sequence") != 0 &&
+        slotcask_bmfix_object_disabled(db_root, object)) {
+        OUT("{\"error\":\"object writes disabled: bitmap repair failed at startup; run reindex\"}\n");
+        if (took_wrlock) objlock_wrunlock(db_root, object);
+        else objlock_rdunlock(db_root, object);
+        free(guard_json);
+        free(mode); free(dir); free(object);
+        return;
+    }
     if (took_wrlock && g_db && g_schema_wrlock_test_delay_ms > 0) {
         /* Synchronous marker: unlike LOG_INFO (written by the async log
            thread), its presence proves the test delay has started and has
@@ -2506,6 +2524,22 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
         }
     }
 
+    /* Bitmap-escape gate (text path): the same up-front refusal as the JSON
+       dispatch. The closed set of text-path record mutations is insert,
+       delete, bulk-insert, bulk-delete (there is no text update); sequence,
+       put-file, get-file-path and restore stay allowed. */
+    if (!fast_restore &&
+        (fast_wr || strcasecmp(cmd, "insert") == 0 ||
+         strcasecmp(cmd, "delete") == 0 ||
+         strcasecmp(cmd, "bulk-insert") == 0 ||
+         strcasecmp(cmd, "bulk-delete") == 0) &&
+        slotcask_bmfix_object_disabled(eff_root, object)) {
+        OUT("Error: object writes disabled: bitmap repair failed at startup; run reindex\n");
+        if (fast_wr) objlock_wrunlock(eff_root, object);
+        else if (fast_rd) objlock_rdunlock(eff_root, object);
+        goto timing;
+    }
+
     if (strcasecmp(cmd, "get") == 0) {
         cmd_get(eff_root, object, arg1, strlen(arg1));
     } else if (strcasecmp(cmd, "insert") == 0) {
@@ -3223,6 +3257,9 @@ typedef struct { int vacuumed; } AutoVacuumSweepCtx;
 static void auto_vacuum_sweep_one(const char *dir_name, const char *eff,
                                     const char *obj_name, void *ctx_) {
     AutoVacuumSweepCtx *ctx = (AutoVacuumSweepCtx *)ctx_;
+    /* A bitmap-escape object must never be vacuumed: the rebuild would
+       write the damaged bitmaps. First check before any work (silent). */
+    if (slotcask_bmfix_object_disabled(eff, obj_name)) return;
     int count = get_live_count(eff, obj_name);
     int deleted = get_deleted_count(eff, obj_name);
     int total = count + deleted;
@@ -3240,6 +3277,15 @@ static void auto_vacuum_sweep_one(const char *dir_name, const char *eff,
     uint64_t obj_t0 = now_ms();
     if (objlock_wrlock(eff, obj_name) != 0) {
         LOG_ERROR(LOG_SUB_VACUUM, "AUTO-VACUUM %s/%s: objlock_wrlock failed; skipping", dir_name, obj_name);
+        return;
+    }
+    /* Re-check under the lock: the flag can appear while this sweep
+       waited (e.g. restore of a backup carrying it). */
+    if (slotcask_bmfix_object_disabled(eff, obj_name)) {
+        objlock_wrunlock(eff, obj_name);
+        LOG_WARN(LOG_SUB_VACUUM,
+                 "auto-vacuum: skipping %s/%s (bitmap repair pending)",
+                 dir_name, obj_name);
         return;
     }
     int vacuum_rc = cmd_vacuum(eff, obj_name, 0, 0);
@@ -3343,6 +3389,9 @@ typedef struct { int reshaped; } AutoReshardSweepCtx;
 static void auto_reshard_sweep_one(const char *dir_name, const char *eff,
                                     const char *obj_name, void *ctx_) {
     AutoReshardSweepCtx *ctx = (AutoReshardSweepCtx *)ctx_;
+    /* A bitmap-escape object must never be resharded: the rebuild would
+       write the damaged bitmaps. First check before any work (silent). */
+    if (slotcask_bmfix_object_disabled(eff, obj_name)) return;
     Schema sch = load_schema(eff, obj_name);
     if (sch.splits <= 0) return;  /* mid-create or dropped between the stat() probe and here */
     long long live = get_live_count_ll_for_schema(eff, obj_name, &sch);
@@ -3356,6 +3405,15 @@ static void auto_reshard_sweep_one(const char *dir_name, const char *eff,
     uint64_t obj_t0 = now_ms();
     if (objlock_wrlock(eff, obj_name) != 0) {
         LOG_ERROR(LOG_SUB_VACUUM, "AUTO-RESHARD %s/%s: objlock_wrlock failed; skipping", dir_name, obj_name);
+        return;
+    }
+    /* Re-check under the lock: the flag can appear while this sweep
+       waited (e.g. restore of a backup carrying it). */
+    if (slotcask_bmfix_object_disabled(eff, obj_name)) {
+        objlock_wrunlock(eff, obj_name);
+        LOG_WARN(LOG_SUB_VACUUM,
+                 "auto-reshard: skipping %s/%s (bitmap repair pending)",
+                 dir_name, obj_name);
         return;
     }
     int rc = cmd_vacuum(eff, obj_name, 0, target);

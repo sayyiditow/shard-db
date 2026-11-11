@@ -2092,7 +2092,8 @@ int index_rebuild_temp_sweep(const char *db_root) {
 /* Forward decls — full definitions live near the multi-index builder. */
 index_build_result build_bitmap_pass(const char *db_root, const char *object,
                       const Schema *sch, TypedSchema *ts,
-                      const char *field, uint32_t max_values, int force);
+                      const char *field, uint32_t max_values, int force,
+                      const uint8_t *only_shards);
 index_build_result build_trigram_pass(const char *db_root, const char *object,
                        const Schema *sch, TypedSchema *ts,
                        const char *field, int force);
@@ -2186,7 +2187,7 @@ int cmd_add_index(const char *db_root, const char *object,
     index_build_result build_result;
     if (type == IT_BITMAP) {
         build_result = build_bitmap_pass(db_root, object, &sch, ts, eff,
-                                         max_values, force);
+                                         max_values, force, NULL);
     } else if (type == IT_TRIGRAM) {
         build_result = build_trigram_pass(db_root, object, &sch, ts, eff, force);
     } else {
@@ -3123,13 +3124,33 @@ static void *bm_shard_walk_worker(void *arg) {
 
 index_build_result build_bitmap_pass(const char *db_root, const char *object,
                       const Schema *sch, TypedSchema *ts,
-                      const char *field, uint32_t max_values, int force) {
+                      const char *field, uint32_t max_values, int force,
+                      const uint8_t *only_shards) {
     (void)force;
     if (!ts) return index_build_failed(0);
     int fi = typed_field_index(ts, field);
     if (fi < 0) return index_build_failed(0);
     const TypedField *f = &ts->fields[fi];
     int bool_fastpath = (f->type == FT_BOOL);
+
+    /* Pack the selected shards densely (only_shards[s] nonzero = rebuild
+       shard s) so parallel_for walks only those. NULL rebuilds every shard.
+       The packed ids are int: shard ids reach MAX_SPLITS (4096), so a byte
+       array would silently truncate them (shard 300 rebuilt as 44). */
+    int nsel = 0;
+    int *sel = NULL;
+    if (only_shards) {
+        sel = malloc((size_t)sch->splits * sizeof(int));
+        if (!sel) return index_build_failed(errno);
+        for (int s = 0; s < sch->splits; s++)
+            if (only_shards[s]) sel[nsel++] = s;
+        if (nsel == 0) {
+            free(sel);
+            return index_build_ok();     /* nothing selected: no-op */
+        }
+    } else {
+        nsel = sch->splits;
+    }
 
     /* Build banner — matches BUILD-BTREE / BUILD-TRIGRAM pattern so
        operators can grep one prefix and see every index-build event.
@@ -3138,16 +3159,19 @@ index_build_result build_bitmap_pass(const char *db_root, const char *object,
        left 3 of 8 shards empty for stories' bitmaps but produced no
        log to spot it from. */
     LOG_WARN(LOG_SUB_BITMAP,
-        "BUILD-BITMAP %s/%s/%s: %d shards, max_values=%u, bool_fastpath=%d",
-        db_root, object, field, sch->splits, max_values, bool_fastpath);
+        "BUILD-BITMAP %s/%s/%s: %d shards%s, max_values=%u, bool_fastpath=%d",
+        db_root, object, field, nsel, only_shards ? " (partial)" : "",
+        max_values, bool_fastpath);
 
     /* Sibling temporaries require the field directory to exist. A first-time
        bitmap build has no live shard whose creation would have made it yet. */
     char first_target[PATH_MAX];
     char field_dir[PATH_MAX];
     bm_build_path(first_target, sizeof(first_target), db_root, object, field, 0);
-    if (parent_dir_copy(first_target, field_dir, sizeof(field_dir)) != 0)
+    if (parent_dir_copy(first_target, field_dir, sizeof(field_dir)) != 0) {
+        free(sel);
         return index_build_failed(errno);
+    }
     mkdirp(field_dir);
 
     /* Open the slotcask db for this object and walk every kf shard. */
@@ -3158,6 +3182,7 @@ index_build_result build_bitmap_pass(const char *db_root, const char *object,
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_BITMAP, "build_bitmap_pass: slotcask_registry_get failed for %s/%s/%s", db_root, object, field);
+        free(sel);
         return index_build_failed(0);
     }
 
@@ -3166,39 +3191,42 @@ index_build_result build_bitmap_pass(const char *db_root, const char *object,
        directly into the mmap'd file. Zero file contention; no memory
        accumulation (mmap is the persistent store). Matches the
        phase-1-parallel shape used by btree/trigram. */
-    BmShardWalkArg *args = calloc((size_t)sch->splits, sizeof(BmShardWalkArg));
+    BmShardWalkArg *args = calloc((size_t)nsel, sizeof(BmShardWalkArg));
     if (!args) {
-        LOG_ERROR(LOG_SUB_BITMAP, "build_bitmap_pass: malloc failed for %d BmShardWalkArg entries (%s/%s/%s)", sch->splits, db_root, object, field);
+        LOG_ERROR(LOG_SUB_BITMAP, "build_bitmap_pass: malloc failed for %d BmShardWalkArg entries (%s/%s/%s)", nsel, db_root, object, field);
+        free(sel);
         return index_build_failed(0);
     }
-    for (int s = 0; s < sch->splits; s++) {
-        bm_build_path(args[s].target_path, sizeof(args[s].target_path),
+    for (int i = 0; i < nsel; i++) {
+        int s = only_shards ? sel[i] : i;
+        bm_build_path(args[i].target_path, sizeof(args[i].target_path),
                       db_root, object, field, s);
-        args[s].kf_shard       = s;
-        args[s].fi             = fi;
-        args[s].bool_fastpath  = bool_fastpath;
-        args[s].max_values     = max_values;
-        args[s].ts             = ts;
-        args[s].sdb            = sdb;
+        args[i].kf_shard       = s;
+        args[i].fi             = fi;
+        args[i].bool_fastpath  = bool_fastpath;
+        args[i].max_values     = max_values;
+        args[i].ts             = ts;
+        args[i].sdb            = sdb;
     }
-    parallel_for(bm_shard_walk_worker, args, sch->splits, sizeof(BmShardWalkArg));
+    parallel_for(bm_shard_walk_worker, args, nsel, sizeof(BmShardWalkArg));
 
     index_build_result result = index_build_ok();
-    for (int s = 0; s < sch->splits; s++) {
-        if (args[s].result.status == INDEX_BUILD_FAILED) {
-            int saved_errno = args[s].saved_errno ? args[s].saved_errno : EIO;
-            for (int i = 0; i < sch->splits; i++)
-                if (args[i].tmp_path[0]) unlink(args[i].tmp_path);
+    for (int i = 0; i < nsel; i++) {
+        if (args[i].result.status == INDEX_BUILD_FAILED) {
+            int saved_errno = args[i].saved_errno ? args[i].saved_errno : EIO;
+            for (int j = 0; j < nsel; j++)
+                if (args[j].tmp_path[0]) unlink(args[j].tmp_path);
             free(args);
+            free(sel);
             return index_build_failed(saved_errno);
         }
     }
-    for (int s = 0; s < sch->splits; s++) {
-        bm_publish_result publish = bm_publish_replace(args[s].target_path,
-                                                      args[s].tmp_path);
+    for (int i = 0; i < nsel; i++) {
+        bm_publish_result publish = bm_publish_replace(args[i].target_path,
+                                                      args[i].tmp_path);
         if (publish == BM_PUBLISH_PRE_RENAME_FAILED) {
-            for (int i = s; i < sch->splits; i++)
-                if (args[i].tmp_path[0]) unlink(args[i].tmp_path);
+            for (int j = i; j < nsel; j++)
+                if (args[j].tmp_path[0]) unlink(args[j].tmp_path);
             result = index_build_failed(0);
             break;
         }
@@ -3206,6 +3234,7 @@ index_build_result build_bitmap_pass(const char *db_root, const char *object,
             result.status = INDEX_BUILD_DURABILITY_UNCONFIRMED;
     }
     free(args);
+    free(sel);
     return result;
 }
 
@@ -4663,6 +4692,45 @@ static void reindex_cleanup_obsolete(const char *eff_root, const char *object,
     }
 }
 
+/* Resolve one index.conf line per the canonical rules — parse_index_spec
+   plus the auto-promotion (idx_should_auto_bitmap, 2-byte enum cap 65535) —
+   into (type, cap, compositeness, effective name). Single source of truth
+   shared by reindex_object_checked_impl's descriptor loop and
+   bitmap_rebuild_shards_durable's bitmap-field scan, so the full reindex
+   and the bmfix shard-scoped repair can never disagree about which fields
+   are bitmaps. A malformed line preserves the bare btree default. */
+static void index_conf_line_resolve(const char *line, const TypedSchema *ts,
+                                    enum IndexType *t_out, uint32_t *mv_out,
+                                    int *composite_out, char *name_out,
+                                    size_t name_cap) {
+    ParsedIndexSpec ps;
+    enum IndexType t = IT_BTREE;
+    uint32_t max_values = 0;
+    int is_composite = 0;
+    const char *eff_name = line;
+    if (parse_index_spec(line, &ps) == 0) {
+        t = ps.type;
+        max_values = ps.max_values;
+        is_composite = ps.is_composite;
+        eff_name = ps.name;
+        if (!ps.is_composite) {
+            int fi_t = typed_field_index(ts, ps.name);
+            if (fi_t >= 0 && idx_should_auto_bitmap(ps.had_explicit_type,
+                                                    ts->fields[fi_t].type)) {
+                t = IT_BITMAP;
+                if (ts->fields[fi_t].type == FT_ENUM &&
+                    ts->fields[fi_t].enum_width == 2 && max_values == 0)
+                    max_values = 65535;
+            }
+        }
+    }
+    *t_out = t;
+    *mv_out = max_values;
+    *composite_out = is_composite;
+    strncpy(name_out, eff_name, name_cap - 1);
+    name_out[name_cap - 1] = '\0';
+}
+
 /* Rebuild every index for one object: read index.conf for the field list,
    publish replacement shards, then remove type-specific obsolete files in a single
    kf-scan via build_indexes_streaming_multi (one pass, all fields).
@@ -4750,28 +4818,12 @@ static int reindex_object_checked_impl(const char *eff_root, const char *object,
 
     for (int i = 0; i < nf; i++) {
         MFFieldDesc *d = &descs[n_desc];
-        ParsedIndexSpec ps;
         enum IndexType t = IT_BTREE;
         uint32_t max_values = 0;
         int is_composite = 0;
-        const char *eff_name = field_specs[i];
-
-        if (parse_index_spec(field_specs[i], &ps) == 0) {
-            t = ps.type;
-            max_values = ps.max_values;
-            is_composite = ps.is_composite;
-            eff_name = ps.name;
-            if (!ps.is_composite) {
-                int fi_t = typed_field_index(ts, ps.name);
-                if (fi_t >= 0 && idx_should_auto_bitmap(ps.had_explicit_type,
-                                                        ts->fields[fi_t].type)) {
-                    t = IT_BITMAP;
-                    if (ts->fields[fi_t].type == FT_ENUM &&
-                        ts->fields[fi_t].enum_width == 2 && max_values == 0)
-                        max_values = 65535;
-                }
-            }
-        }
+        char eff_name[256];
+        index_conf_line_resolve(field_specs[i], ts, &t, &max_values,
+                                &is_composite, eff_name, sizeof(eff_name));
 
         strncpy(d->name, eff_name, 255); d->name[255] = '\0';
         d->bm_max_values = max_values;
@@ -4850,6 +4902,84 @@ int reindex_object_durable_checked_ex(const char *eff_root, const char *object,
                                       int *out_errno) {
     return reindex_object_checked_impl(eff_root, object, composites_only,
                                        out_count, out_errno, 1);
+}
+
+/* Rebuild ONLY the selected shards' bitmaps for every bitmap field — the
+   bmfix startup repair and cmd_reindex's healing path (a pending .bmfix
+   marker names kf shards whose bitmaps may still use old slot numbers;
+   rebuilding the bitmaps from kf + segments restores coherence without
+   touching any btree or trigram). Bitmap fields are resolved from
+   index.conf with reindex_object_checked_impl's exact rules (shared
+   index_conf_line_resolve helper). Caller must hold objlock_wrlock.
+   Returns 0 on success (including "no bitmap fields"); -1 with *out_errno
+   (build errno, else EIO) when any field's rebuild fails — including a
+   durability-unconfirmed publication. */
+int bitmap_rebuild_shards_durable(const char *eff_root, const char *object,
+                                  const uint8_t *only_shards, int *out_errno) {
+    if (out_errno) *out_errno = 0;
+#ifdef TEST_BUILD
+    {
+        int injected = atomic_load_explicit(&g_index_test_fail_next_build,
+                                            memory_order_acquire);
+        if (injected != 0) {
+            atomic_store_explicit(&g_index_test_fail_next_build, 0,
+                                  memory_order_release);
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: test seam failing bitmap rebuild (errno=%d)",
+                      eff_root, object, injected);
+            if (out_errno) *out_errno = injected;
+            return -1;
+        }
+    }
+#endif
+    Schema sch = load_schema(eff_root, object);
+    if (sch.splits <= 0 || sch.streams <= 0) {
+        if (out_errno) *out_errno = EINVAL;
+        return -1;
+    }
+    TypedSchema *ts = load_typed_schema(eff_root, object);
+    if (!ts) {
+        if (out_errno) *out_errno = EINVAL;
+        return -1;
+    }
+    char ic_path[PATH_MAX];
+    snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf",
+             eff_root, object);
+    FILE *ic = fopen(ic_path, "r");
+    if (!ic) {
+        if (errno == ENOENT) return 0;      /* no index.conf = no bitmap fields */
+        if (out_errno) *out_errno = errno;
+        return -1;
+    }
+    char line[512];
+    int rc = 0;
+    while (fgets(line, sizeof(line), ic)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (!line[0] || line[0] == '#') continue;
+        if (strchr(line, '+')) continue;    /* composites are btree-only */
+        enum IndexType t = IT_BTREE;
+        uint32_t max_values = 0;
+        int is_composite = 0;
+        char name[256];
+        index_conf_line_resolve(line, ts, &t, &max_values, &is_composite,
+                                name, sizeof(name));
+        if (t != IT_BITMAP) continue;
+        index_build_result r = build_bitmap_pass(eff_root, object, &sch, ts,
+                                                 name, max_values, 0,
+                                                 only_shards);
+        if (r.status != INDEX_BUILD_OK) {
+            int e = r.error_errno ? r.error_errno : EIO;
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: bitmap rebuild failed for field %s "
+                      "(status %d, errno %d)", eff_root, object, name,
+                      (int)r.status, e);
+            if (out_errno) *out_errno = e;
+            rc = -1;
+            break;
+        }
+    }
+    fclose(ic);
+    return rc;
 }
 
 int reindex_object(const char *eff_root, const char *object,
@@ -4941,9 +5071,57 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
             objects_failed++;
             continue;
         }
+        /* A pending repair marker or escape flag (startup repair failed, or
+           a serving-time commit left a .bmfix marker) requires the strict
+           durable rebuild so the repair state is only cleared once every
+           shard is durably published; a composites-only reindex must leave
+           it untouched. -1 from either scan counts as pending. */
+        char data_dir[PATH_MAX];
+        snprintf(data_dir, sizeof(data_dir), "%s/%s", eff_root, obj);
+        int repair_pending =
+            slotcask_bmfix_marked_shards(data_dir, 0, NULL) != 0 ||
+            slotcask_bmfix_disabled_exists(data_dir) != 0;
         int n = 0;
-        int rebuild_rc = reindex_object_checked(eff_root, obj,
+        int rebuild_rc;
+        if (repair_pending && !composites_only) {
+            int eno = 0;
+            int removed = 0;
+            rebuild_rc = reindex_object_durable_checked_ex(eff_root, obj,
+                                                           composites_only,
+                                                           &n, &eno);
+            if (rebuild_rc == 0) {
+                /* Durably publish the kf directory before the repair
+                   markers may be cleared (same rule as the startup
+                   repair). A failed fsync counts as a repair failure:
+                   the markers stay and the object counts as failed. */
+                char kf_dir[PATH_MAX];
+                snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+                if (fsync_dir(kf_dir) != 0) rebuild_rc = -1;
+            }
+            if (rebuild_rc == 0) rebuild_rc = slotcask_bmfix_clear(data_dir);
+            if (rebuild_rc == 0)
+                rebuild_rc = slotcask_bmfix_disabled_remove(data_dir, &removed);
+            if (rebuild_rc == 0) {
+                LOG_WARN(LOG_SUB_REINDEX,
+                         "REINDEX %s/%s: bitmap repair markers cleared%s",
+                         dir, obj,
+                         removed ? "; bitmap planning re-enabled" : "");
+            } else {
+                int E = eno ? eno : errno;
+                LOG_WARN(LOG_SUB_REINDEX,
+                         "REINDEX %s/%s: bitmap repair state not cleared (errno=%d); "
+                         "markers and flag left in place",
+                         dir, obj, E);
+            }
+        } else {
+            rebuild_rc = reindex_object_checked(eff_root, obj,
                                                 composites_only, &n);
+            if (repair_pending) {
+                LOG_WARN(LOG_SUB_REINDEX,
+                         "REINDEX %s/%s: composites-only reindex leaves bitmap repair pending",
+                         dir, obj);
+            }
+        }
         objlock_wrunlock(eff_root, obj);
         if (rebuild_rc != 0) {
             objects_failed++;

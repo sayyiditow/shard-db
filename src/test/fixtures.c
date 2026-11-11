@@ -1076,6 +1076,22 @@ int test_env_ctl_set_bmks_race(TestEnv *env, int stage) {
     return ctl_set_globals(env, 4, (uint64_t)stage, 0);
 }
 
+int test_env_ctl_set_fail_phase(TestEnv *env, int phase, int occurrence,
+                                int sticky) {
+    /* phase 5 = TEST_HOOK_SET_GLOBALS_FAIL_PHASE, phase 6 =
+     * TEST_HOOK_SET_GLOBALS_FAIL_STICKY (test_control.c). phase -1
+     * disarms; the sticky bit is sent first when arming (so the armed
+     * phase already sees the right stickiness) and cleared after
+     * disarming. The daemon-side handler rounds phase through
+     * (int64_t), so -1 arrives as -1. */
+    if (phase >= 0 && sticky &&
+        ctl_set_globals(env, 6, 1, 0) != 0) return -1;
+    if (ctl_set_globals(env, 5, (uint64_t)(int64_t)phase,
+                        (uint64_t)occurrence) != 0) return -1;
+    if (phase < 0 && ctl_set_globals(env, 6, 0, 0) != 0) return -1;
+    return 0;
+}
+
 int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
     /* phase 1 = TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL (test_control.c). */
     return ctl_set_globals(env, 1, (uint64_t)(fail ? 1 : 0), 0);
