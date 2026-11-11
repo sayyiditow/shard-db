@@ -247,7 +247,7 @@ Two different writers hashing to the same stream contend on `rotation_lock` brie
 Layered on top of the per-shard locks. Every JSON request gets classified:
 
 - **Normal ops** (all CRUD, queries, bulk ops) → `objlock_rdlock()`. Many concurrent.
-- **Schema mutations** (`add-field`, `remove-field`, `rename-field`, `vacuum --compact`, `vacuum --splits`, `truncate`, `add-index`, `remove-index`) → `objlock_wrlock()`. Blocks everyone; held only for the duration of the rebuild.
+- **Schema mutations** (`add-field`, `remove-field`, `rename-field`, `vacuum --compact`, `vacuum --splits`, `truncate`, `add-index`, `remove-index`) and `backup` → `objlock_wrlock()`. Blocks everyone; held only for the duration of the rebuild. `backup` holds it for the whole copy.
 
 `add-index`/`remove-index` take `objlock_wrlock()` (not `objlock_rdlock()`, despite mutating rather than restructuring schema) because both `unlink()` and rebuild index files in place — the same pattern `vacuum`/`truncate` use. Without the exclusive lock, a concurrent insert's on-the-fly index maintenance can land on the same file mid-rebuild and either get silently discarded or corrupt the B-tree pages being written (fixed in 2026.07.1 — see [changelog](../reference/changelog.md#202671)).
 

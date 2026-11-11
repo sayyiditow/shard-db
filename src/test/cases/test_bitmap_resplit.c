@@ -1174,6 +1174,27 @@ static int test_bmfix_escape_disabled(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+/* Pin (green before and after the fix): backup stays allowed on an object
+   the bitmap-escape refusal flags as disabled — an operator wants a backup
+   BEFORE reindex. Load-bearing by mutation: adding
+   backup to mode_is_schema without the two gate exemptions turns both
+   backup assertions red. */
+static int test_bmfix_backup_allowed_when_disabled(void) {
+    Br *b = calloc(1, sizeof(*b));
+    ASSERT_NOT_NULL(b, "alloc"); if(!b) return 1;
+    char root[256]; int port = 0;
+    int st = br_escape_start(b, root, sizeof(root), &port);
+    if (st != 0) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    ASSERT_TRUE(br_flag_exists(b), "object is flagged disabled");            /* non-vacuity */
+    br_expect_refusal(b, "{\"mode\":\"vacuum\",\"dir\":\"br\",\"object\":\"t\"}", "vacuum still refused while flagged");
+    char *r = br_q(b, "{\"mode\":\"backup\",\"dir\":\"br\",\"object\":\"t\"}");
+    ASSERT_CONTAINS(r, "\"status\":\"backed_up\"", "JSON backup allowed on a flagged object"); free(r);
+    r = br_q(b, "%s", "backup" "\x1F" "br" "\x1F" "t");   /* text path; concatenation after each \x1F */
+    ASSERT_CONTAINS(r, "\"status\":\"backed_up\"", "text backup allowed on a flagged object"); free(r);
+    ASSERT_TRUE(br_flag_exists(b), "flag untouched by backup");
+    br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0;
+}
+
 static int test_bmfix_escape_heals_at_startup(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
@@ -1774,6 +1795,7 @@ TEST_REGISTER("test-bitmap-resplit-corrupt-bitmap", test_bitmap_resplit_corrupt_
 TEST_REGISTER("test-bmfix-repair-shard-scoped", test_bmfix_repair_shard_scoped)
 TEST_REGISTER("test-bmfix-repair-bad-marker-name", test_bmfix_repair_bad_marker_name)
 TEST_REGISTER("test-bmfix-escape-disabled", test_bmfix_escape_disabled)
+TEST_REGISTER("test-bmfix-backup-allowed-when-disabled", test_bmfix_backup_allowed_when_disabled)
 TEST_REGISTER("test-bmfix-escape-heals-at-startup", test_bmfix_escape_heals_at_startup)
 TEST_REGISTER("test-bmfix-escape-flag-write-fails", test_bmfix_escape_flag_write_fails)
 TEST_REGISTER("test-bmfix-flag-without-markers", test_bmfix_flag_without_markers)

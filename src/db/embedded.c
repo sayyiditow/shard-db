@@ -956,7 +956,8 @@ static int layout_migration_run(const char *db_root) {
    (or the marker cleanup) fails and the object has no pending KFM2 commit
    marker, startup writes <obj>/indexes/.bmfix-disabled and serves the
    object with bitmap planning disabled: reads fall back to btree or scan,
-   every record mutation and every mode_is_schema mutation is refused up
+   every record mutation and every mode_is_schema mutation (except backup,
+   a read-only copy an operator wants before reindex) is refused up
    front, and a full `reindex` repairs and re-enables. Only an unreadable
    marker directory, an unloadable schema for a marked object, a failed
    flag write, or a failed repair with pending KFM2 markers (replaying a

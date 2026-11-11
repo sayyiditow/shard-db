@@ -310,6 +310,20 @@ See [cas.md](../query-protocol/cas.md) for the full semantics and
 [concurrency.md](../concepts/concurrency.md) for the writer-reservation
 cost model.
 
+**`backup` takes the object's exclusive lock.** `backup` used to run under the object's
+shared read lock like ordinary reads, so a backup of a live object could capture a
+half-finished commit window, a mid-resplit keyfile, a `.bmfix-NNN` bitmap-repair marker
+or a half-written `metadata/sequences/<name>` file, and `restore` would copy all of that
+back. `backup` now holds the object's `objlock_wrlock` for the whole copy, exactly like
+`vacuum`/`truncate`: every request on that object — reads included — waits until the
+copy finishes, and `./shard-db stop` waits for a running backup (it is counted in
+`in_flight_writes`). This fences the copy against every concurrent operation, so no live
+write, resplit, repair marker or `sequence` update can be captured. Backup stays allowed
+on a bitmap-disabled object (the `.bmfix-disabled` flag and any markers in `indexes/`
+are copied verbatim, and `restore` re-arms the escape until `reindex`); backups taken by
+releases before this change were not fenced — if one was taken on a live object, run
+`reindex` after restoring it. No wire, CLI, config or on-disk change.
+
 ## 2026.09.2
 
 Calendar `datetime` storage widens from 6 to 7 bytes (int32 BE `yyyyMMdd` +

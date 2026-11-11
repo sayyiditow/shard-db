@@ -425,15 +425,15 @@ Response: `{"count":N,"orphaned":M}`.
 
 ## backup
 
-Copies the object's `data/`, `indexes/`, `metadata/`, and `files/` directories into a timestamped snapshot under the same root.
+Copies the object's `data/`, `indexes/`, and `metadata/` directories into a timestamped snapshot under the same root.
 
 ```json
 {"mode":"backup","dir":"<dir>","object":"<obj>"}
 ```
 
-Response: `{"status":"backed_up","path":"<dir>/<obj>.backup-20260418T153012"}`.
+Response: `{"status":"backed_up","path":"<db_root>/<dir>/<obj>/backup/<timestamp>"}` (e.g. `.../t/backup/20260418_153012`).
 
-Snapshot is a point-in-time copy — in-flight writes after the copy starts may or may not be included. For consistent production backups, pause writes first (or accept best-effort consistency).
+Backup holds the object's exclusive lock for the whole copy — every request on that object (reads and writes) waits until it finishes, so the copy cannot observe a write, resplit, bitmap-repair marker or `sequence` update in flight.
 
 ## Lock model summary
 
@@ -443,7 +443,8 @@ Snapshot is a point-in-time copy — in-flight writes after the copy starts may 
 | `rename-field` | `objlock_wrlock` | Same. |
 | `truncate` | `objlock_wrlock` | Same. |
 | `add-index`, `remove-index` | `objlock_wrlock` | Same — both unlink()+rebuild index files in place; needs exclusivity against concurrent on-the-fly index writes (2026.07.1). |
-| `backup`, `recount` | `objlock_rdlock` | Only schema mutations. |
+| `backup` | `objlock_wrlock` | All other ops on this object (reads + writes). |
+| `recount` | `objlock_rdlock` | Only schema mutations. |
 | Normal CRUD / queries | `objlock_rdlock` | Only schema mutations. |
 
 Held only for the rebuild duration. For multi-second rebuilds, clients see temporarily-blocked queries; consider running these in a maintenance window.

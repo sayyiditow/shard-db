@@ -650,7 +650,7 @@ int load_db_root(char *out, size_t outlen) {
         } else if (strncmp(p, "SCHEMA_WRLOCK_TEST_DELAY_MS=", 28) == 0) {
             /* Test-only knob (widens dispatch_json_query's schema-mode
                objlock_wrlock-held window and publishes a synchronous marker
-               for the NQL-vs-JSON lock-contention regression test). Not a
+               for the NQL-vs-JSON lock-contention and backup-fence regression tests). Not a
                documented production setting — do not add to
                configuration.md. */
             int n = atoi(p + 28);

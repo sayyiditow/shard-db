@@ -54,7 +54,8 @@ static int mode_is_write(const char *m) {
    discarded or corrupt the pages bt_stream_build_add is writing.
    Exclusive wrlock here serialises against that, same as
    vacuum/truncate/reindex already do for the identical unlink+rebuild
-   pattern. */
+   pattern. backup takes the exclusive object lock so the copy cannot
+   observe a write, resplit, repair marker or sequence update in flight. */
 static int mode_is_schema(const char *m) {
     if (!m) return 0;
     return strcasecmp(m, "rename-field") == 0 || strcasecmp(m, "remove-field") == 0 ||
@@ -62,6 +63,7 @@ static int mode_is_schema(const char *m) {
            strcasecmp(m, "vacuum") == 0 ||
            strcasecmp(m, "truncate") == 0 ||
            strcasecmp(m, "add-index") == 0 || strcasecmp(m, "remove-index") == 0 ||
+           strcasecmp(m, "backup") == 0 ||
             0;
 }
 
@@ -1630,11 +1632,13 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
        before any segment, marker or kf change — so a failed write can
        never leave a pending window that would replay into the damaged
        bitmap at the next start. put-file/delete-file/sequence never touch
-       record indexes and stay allowed, as do reads, reindex, drop-object
-       and restore (the repair's own escape hatches). */
+       record indexes and stay allowed, as do reads, reindex, drop-object,
+       restore and backup (backup is a read-only copy an operator wants
+       before reindex). */
     if ((mode_is_schema(mode) || mode_is_write(mode)) &&
         strcasecmp(mode, "put-file") != 0 && strcasecmp(mode, "delete-file") != 0 &&
         strcasecmp(mode, "sequence") != 0 &&
+        strcasecmp(mode, "backup") != 0 &&
         slotcask_bmfix_object_disabled(db_root, object)) {
         OUT("{\"error\":\"object writes disabled: bitmap repair failed at startup; run reindex\"}\n");
         if (took_wrlock) objlock_wrunlock(db_root, object);
@@ -2527,8 +2531,8 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     /* Bitmap-escape gate (text path): the same up-front refusal as the JSON
        dispatch. The closed set of text-path record mutations is insert,
        delete, bulk-insert, bulk-delete (there is no text update); sequence,
-       put-file, get-file-path and restore stay allowed. */
-    if (!fast_restore &&
+       put-file, get-file-path, restore and backup stay allowed. */
+    if (!fast_restore && strcasecmp(cmd, "backup") != 0 &&
         (fast_wr || strcasecmp(cmd, "insert") == 0 ||
          strcasecmp(cmd, "delete") == 0 ||
          strcasecmp(cmd, "bulk-insert") == 0 ||

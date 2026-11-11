@@ -18,17 +18,17 @@ Or via JSON:
 
 ### What it copies
 
-Everything for that object: `data/` (kf + streams), `indexes/`, `files/`, `fields.conf`, and an `object.json` manifest carrying the splits/max_key/storage_version/streams the operator would need to recreate the object from scratch. Destination is a timestamped subdirectory under the object's own `backup/` directory:
+Everything for that object: `data/` (kf + streams), `indexes/`, `metadata/`, `fields.conf`, and an `object.json` manifest carrying the splits/max_key/storage_version/streams the operator would need to recreate the object from scratch. The per-object file store (`files/`, written by `put-file`) is **not** copied. Destination is a timestamped subdirectory under the object's own `backup/` directory:
 
 ```
-$DB_ROOT/<dir>/<obj>/backup/20260418-153012/
-  object.json          # schema manifest (splits, max_key, storage_version, streams, fields)
+$DB_ROOT/<dir>/<obj>/backup/20260418_153012/
+  object.json          # schema manifest (splits, max_key, storage_version, streams, layout)
   fields.conf
   data/
     kf/
     streams/
   indexes/
-  files/
+  metadata/
 ```
 
 ### When to use
@@ -39,7 +39,7 @@ $DB_ROOT/<dir>/<obj>/backup/20260418-153012/
 
 ### Consistency
 
-Copy happens under a read lock, so concurrent reads see a consistent view. Writes during the copy **may or may not** be included — it's "recent" but not a fenced snapshot. For strict point-in-time, pause writes first or use filesystem snapshots.
+`backup` holds the object's **exclusive lock for the whole copy** — every request on that object, reads included, waits until the backup finishes, so the copy cannot observe a write, resplit, bitmap-repair marker or `sequence` update in flight. Backup waits for in-flight operations to drain exactly as `vacuum` does and, because the object lock is a default-attribute (reader-preferring on glibc) rwlock, may itself wait a long time under continuous overlapping traffic — quiesce clients on busy objects (requests parked behind the backup occupy their dispatcher workers, as behind `vacuum`). `./shard-db stop` waits for a running backup like it waits for writes. Requests waiting behind the backup are not subject to the per-request `timeout_ms` while queued (same as behind `vacuum`), so clients with short I/O timeouts (shard-cli included) may time out and should retry. An object already flagged bitmap-disabled is copied as-is (flag and markers included) and `restore` re-arms the escape until `reindex`. Backups taken by releases before this change were not fenced — if one was taken on a live object, run `reindex` after restoring it. Filesystem snapshots remain the recommendation for very large or always-busy objects.
 
 ### Restore
 
@@ -50,7 +50,7 @@ Use the `restore` mode (shipped 2026.05.1):
   "mode":"restore",
   "dir":"<dir>",
   "object":"<obj>",
-  "from":"20260418-153012",
+  "from":"20260418_153012",
   "force":true
 }'
 ```
