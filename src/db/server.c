@@ -308,7 +308,7 @@ static AdminLevel mode_admin_level(const char *mode) {
         if (strcmp(mode, srv[i]) == 0) return ADMIN_SERVER;
     if (strcmp(mode, "create-object") == 0) return ADMIN_TENANT;
     static const char *obj[] = {
-        "truncate", "vacuum", "backup", "recount",
+        "truncate", "vacuum", "backup", "restore", "recount",
         "add-field", "edit-field", "remove-field", "rename-field",
         "add-index", "remove-index",
         "drop-object",
@@ -487,6 +487,49 @@ static void save_tokens_conf_full(const char *db_root,
         save_token_line(f, i);
     }
     fclose(f);
+}
+
+/* After a successful restore: add the backup's object tokens (if the backup
+   carries a tokens.conf) to the running token store and rewrite the object's
+   live tokens.conf from the store, like add-token. A token string that is
+   already present (in any scope) is left exactly as it is, nothing is ever
+   removed, and the scope is always (dir, object), so a restored file can
+   never grant access beyond the restored object or change an existing token. */
+static void restore_merge_object_tokens(const char *raw_db_root, const char *dir,
+                                        const char *object, const char *from) {
+    if (!dir || !object || !from || !from[0]) return;
+    if (!is_valid_dir(dir) || !is_valid_object(object)) return;
+    if (strchr(from, '/') || strstr(from, "..")) return;
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s/%s/backup/%s/tokens.conf",
+                     raw_db_root, dir, object, from);
+    if (n < 0 || (size_t)n >= sizeof(path)) return;
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);  /* no symlinks, never block on a FIFO */
+    if (fd < 0) return;
+    struct stat tst;
+    if (fstat(fd, &tst) != 0 || !S_ISREG(tst.st_mode)) { close(fd); return; }
+    FILE *f = fdopen(fd, "r");
+    if (!f) { close(fd); return; }
+    token_store_init();
+    int added = 0, skipped_present = 0, skipped_full = 0;
+    pthread_mutex_lock(&g_token_lock);
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n\r")] = '\0';
+        char *p = line; while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#') continue;
+        char tokbuf[256]; uint8_t perm;
+        if (!parse_token_line(p, tokbuf, sizeof(tokbuf), &perm)) continue;
+        if (token_find_slot(tokbuf) >= 0) { skipped_present++; continue; }
+        if (g_token_count >= g_token_cap) { skipped_full++; continue; }
+        token_set_add_full(tokbuf, dir, object, perm);
+        added++;
+    }
+    fclose(f);
+    if (added > 0) save_tokens_conf_full(raw_db_root, dir, object);   /* no rewrite when nothing was added */
+    pthread_mutex_unlock(&g_token_lock);
+    LOG_AUDIT(LOG_SUB_AUTH, "AUTH restore-tokens scope=%s/%s from=%s added=%d present=%d full=%d",
+              dir, object, from, added, skipped_present, skipped_full);
 }
 
 /* ========== Auto-key dispatch helpers ==========
@@ -1520,7 +1563,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         build_effective_root(db_root_eff, sizeof(db_root_eff), dir);
         char *fromv = json_obj_strdup(&req, "from");
         int force = json_obj_is_true(&req, "force");
-        cmd_restore(db_root_eff, object, fromv, force);
+        if (cmd_restore(db_root_eff, object, fromv, force) == 0) restore_merge_object_tokens(raw_db_root, dir, object, fromv);
         free(fromv);
         free(mode); free(dir); free(object);
         return;
@@ -2570,6 +2613,7 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
     } else if (strcasecmp(cmd, "backup") == 0) {
         cmd_backup(eff_root, object);
     } else if (strcasecmp(cmd, "restore") == 0) {
+        /* The text path has no authentication and deliberately does not merge restored tokens (JSON restore does). */
         /* restore\tobj\tfrom[\t--force] */
         int force = (arg2[0] && strcmp(arg2, "--force") == 0);
         cmd_restore(eff_root, object, arg1[0] ? arg1 : NULL, force);

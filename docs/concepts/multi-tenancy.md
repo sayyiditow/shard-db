@@ -106,6 +106,8 @@ $DB_ROOT/
       ...
 ```
 
+`backup` copies an object's `tokens.conf` (as `0600`) and `restore` adds the backup's tokens to the running token set — existing tokens are never changed — so a restored object keeps its access; `restore` itself requires an `rwx` token covering the object (the table above is accurate).
+
 Objects are identified by the **pair** `(dir, object)`. Two tenants can each have an `invoices` object with completely different schemas — they're isolated directories.
 
 ## Validation

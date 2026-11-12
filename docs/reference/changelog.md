@@ -324,6 +324,34 @@ are copied verbatim, and `restore` re-arms the escape until `reindex`); backups 
 releases before this change were not fenced — if one was taken on a live object, run
 `reindex` after restoring it. No wire, CLI, config or on-disk change.
 
+**`backup`/`restore` now cover `files/` and the object's `tokens.conf`.** A backup of an
+object is now enough to restore the same object — records, indexes, sequences, stored
+files **and access tokens** — into another database later: `backup` also copies the
+object's `files/` directory (the `put-file` store) and its `tokens.conf` (the copy is
+created with mode `0600` — it holds token secrets; protecting the backup directory
+remains the operator's responsibility), and writes a `"files":1` marker into
+`object.json`. Behaviour changes: backups are larger and the copy under the object's
+exclusive lock grows with the stored-file volume; `restore` replaces live `files/` for
+backups carrying the marker only (refusing without `force` when live `files/` is
+non-empty) and leaves `files/` untouched for backups taken before this change. On the
+JSON protocol a successful `restore` now **adds** the backup's object tokens to the
+running token store immediately (no restart) and rewrites the object's `tokens.conf`
+from the store, like `add-token`: it adds only tokens that are not already present
+(any scope) — an existing token's scope or perm is never changed — and never removes
+anything, so a token revoked after the backup returns if the backup contains it, live
+tokens absent from the backup are kept, and a full token table (`TOKEN_CAP`) skips the
+remaining tokens and logs it. **Security fix:** on the JSON protocol `restore` is now
+an object-admin mode — it requires an `rwx` token whose scope covers the object, as
+`multi-tenancy.md` has always documented. Previously `restore` was treated as a plain
+read-allowed mode, so any token covering the object, even read-only, could run it
+(wiping the object with `force:true`); with the token merge it could also have injected
+tokens into the auth store. Clients that used `r`/`rw` tokens to restore must switch
+to an `rwx` token (they now get `{"error":"auth failed"}`). The legacy text-wire
+protocol remains unauthenticated, as before — it never restores tokens (a text-path
+restore leaves the object's live `tokens.conf` and the running token set untouched;
+use the JSON `restore` to bring tokens back). No wire, CLI or config change; `object.json` gains `"files":1` (older
+binaries ignore it).
+
 ## 2026.09.2
 
 Calendar `datetime` storage widens from 6 to 7 bytes (int32 BE `yyyyMMdd` +

@@ -281,6 +281,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_embedded_bg_threads.c \
     src/test/cases/test_read_objlock_contention.c \
     src/test/cases/test_backup_objlock.c \
+    src/test/cases/test_backup_files.c \
+    src/test/cases/test_restore_tokens.c \
     src/test/cases/test_shard_stats_hint.c \
     src/test/cases/test_startup_validator.c \
     src/test/cases/test_index_splits_curve.c \

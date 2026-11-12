@@ -1,6 +1,7 @@
 /* src/test/cases/test_backup_objlock.c
  * Fenced backup: `backup` is a plain recursive logical copy of data/,
- * indexes/ and metadata/ (plus fields.conf + an object.json manifest), so a
+ * indexes/, metadata/ and files/ (plus fields.conf + tokens.conf + an
+ * object.json manifest), so a
  * backup that runs while anything else is in flight on the object could
  * capture a half-finished commit window, a mid-resplit keyfile, a
  * `.bmfix-NNN` bitmap-repair marker or a half-written

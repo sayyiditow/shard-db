@@ -411,9 +411,10 @@ int cmd_backup(const char *db_root, const char *object) {
     snprintf(bak_dir, sizeof(bak_dir), "%s/%s/backup/%s", db_root, object, ts);
     mkdirp(bak_dir);
 
-    /* Recursively copy data/, indexes/, and metadata/. v2 stores
-       kf shards + segments under the same data/ umbrella, so a single
-       cprf("data") captures both layouts. */
+    /* Recursively copy data/, indexes/, and metadata/ (files/ and
+       tokens.conf follow below). v2 stores kf shards + segments under
+       the same data/ umbrella, so a single cprf("data") captures both
+       layouts. */
     Schema sch = load_schema(db_root, object);
     char src_sub[PATH_MAX], dst_sub[PATH_MAX];
     const char *subs[] = { "data", "indexes", "metadata" };
@@ -422,6 +423,18 @@ int cmd_backup(const char *db_root, const char *object) {
         snprintf(dst_sub, sizeof(dst_sub), "%s/%s", bak_dir, subs[i]);
         cprf(src_sub, dst_sub);
     }
+
+    /* files/ (put-file store) is part of the object; copy it as-is. cprf
+       returns silently when the source does not exist. */
+    snprintf(src_sub, sizeof(src_sub), "%s/files", src_dir);
+    snprintf(dst_sub, sizeof(dst_sub), "%s/files", bak_dir);
+    cprf(src_sub, dst_sub);
+
+    /* The object's access tokens travel with it. They are secrets: the copy
+       is 0600 regardless of the source mode. A missing file is fine. */
+    snprintf(src_sub, sizeof(src_sub), "%s/tokens.conf", src_dir);
+    snprintf(dst_sub, sizeof(dst_sub), "%s/tokens.conf", bak_dir);
+    if (access(src_sub, F_OK) == 0) copy_file(src_sub, dst_sub, 0600);
 
     /* Schema capture — make the backup directory self-contained. fields.conf
        has the typed-field layout; object.json carries splits + max_key (which
@@ -438,7 +451,7 @@ int cmd_backup(const char *db_root, const char *object) {
     if (mf) {
         /* storage_version slot kept in the backup metadata for forward
            compatibility — every object the daemon writes is v2. */
-        fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":2,\"streams\":%d,\"layout\":\"%s\"}\n",
+        fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":2,\"streams\":%d,\"layout\":\"%s\",\"files\":1}\n",
                 sch.splits, sch.max_key, sch.streams,
                 sch.packed_layout ? "packed" : "legacy");
         fclose(mf);
@@ -524,10 +537,27 @@ static int ensure_schema_conf_line(const char *db_root, const char *object,
     return 0;
 }
 
+/* 1 when the backup's object.json carries "files":1 (written by backups
+   taken with files/ support); 0 for older backups or unreadable manifests. */
+static int backup_manifest_has_files(const char *meta_path) {
+    FILE *f = fopen(meta_path, "r");
+    if (!f) return 0;
+    char buf[256] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    int err = ferror(f);
+    fclose(f);
+    if (err) return 0;
+    buf[n] = '\0';
+    return strstr(buf, "\"files\":1") != NULL;
+}
+
 /* ========== RESTORE ==========
    Symmetric to backup: copies data/ + indexes/ + metadata/ + fields.conf
-   from `<obj>/backup/<from>` over the live tree, and ensures the
-   schema.conf line is in place from object.json.
+   (plus files/ when the backup's object.json carries "files":1) from
+   `<obj>/backup/<from>` over the live tree, and ensures the
+   schema.conf line is in place from object.json. The backup's
+   tokens.conf is not applied here — the JSON dispatcher merges those
+   tokens into the running store after cmd_restore succeeds.
    Refuses if any live state would conflict, unless force=1. Holds the
    object's write lock for the whole operation; invalidates the slotcask
    registry + bt cache + idx cache + schema caches before the swap so the
@@ -556,6 +586,12 @@ int cmd_restore(const char *db_root, const char *object,
         return 1;
     }
 
+    /* Does the backup govern files/? (meta_src is declared later, so a
+       dedicated path variable here.) */
+    char fmeta[PATH_MAX];
+    snprintf(fmeta, sizeof(fmeta), "%s/object.json", src_dir);
+    int bak_files = backup_manifest_has_files(fmeta);
+
     const char *subs[] = { "data", "indexes", "metadata" };
     char src_sub[PATH_MAX], dst_sub[PATH_MAX];
 
@@ -583,6 +619,31 @@ int cmd_restore(const char *db_root, const char *object,
                         subs[i]);
                     return 1;
                 }
+            }
+        }
+    }
+
+    /* Same refusal for files/ when the backup governs it. This runs before
+       the later layout/schema/fields.conf refusals, so in the rare state
+       where only files/ is non-empty it answers the files error first, and
+       nothing is mutated before it. */
+    if (bak_files && !force) {
+        char files_probe[PATH_MAX];
+        snprintf(files_probe, sizeof(files_probe), "%s/files", obj_dir);
+        DIR *d = opendir(files_probe);
+        if (d) {
+            struct dirent *e; int empty = 1;
+            while ((e = readdir(d))) {
+                if (e->d_name[0] == '.' &&
+                    (e->d_name[1] == '\0' ||
+                     (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
+                empty = 0; break;
+            }
+            closedir(d);
+            if (!empty) {
+                objlock_wrunlock(db_root, object);
+                OUT("{\"error\":\"files/ is not empty (use force=true to overwrite)\"}\n");
+                return 1;
             }
         }
     }
@@ -735,6 +796,16 @@ int cmd_restore(const char *db_root, const char *object,
         snprintf(dst_sub, sizeof(dst_sub), "%s/%s", obj_dir, subs[i]);
         rmrf(dst_sub);
         snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, subs[i]);
+        if (stat(src_sub, &st) == 0) cprf(src_sub, dst_sub);
+    }
+
+    /* files/ follows the same wipe-and-copy pattern when the backup
+       governs it ("files":1 in its manifest). Older backups leave live
+       files/ untouched. */
+    if (bak_files) {
+        snprintf(dst_sub, sizeof(dst_sub), "%s/files", obj_dir);
+        rmrf(dst_sub);
+        snprintf(src_sub, sizeof(src_sub), "%s/files", src_dir);
         if (stat(src_sub, &st) == 0) cprf(src_sub, dst_sub);
     }
 

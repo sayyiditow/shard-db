@@ -425,7 +425,7 @@ Response: `{"count":N,"orphaned":M}`.
 
 ## backup
 
-Copies the object's `data/`, `indexes/`, and `metadata/` directories into a timestamped snapshot under the same root.
+Copies the object's `data/`, `indexes/`, `metadata/`, and `files/` directories plus its `tokens.conf` into a timestamped snapshot under the same root (the backup's `tokens.conf` copy is created `0600`). Restore rules — including the `files/` replace semantics and the live token merge — are documented in [docs/operations/backup.md](../operations/backup.md).
 
 ```json
 {"mode":"backup","dir":"<dir>","object":"<obj>"}
