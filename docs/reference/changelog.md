@@ -352,6 +352,8 @@ restore leaves the object's live `tokens.conf` and the running token set untouch
 use the JSON `restore` to bring tokens back). No wire, CLI or config change; `object.json` gains `"files":1` (older
 binaries ignore it).
 
+**Unordered indexed finds fetch only the record batches a page needs.** Small pages over OR/intersection/trigram/prepared-bitmap candidates (and single-leaf finds with joins, `format:"rows"` or a large offset) now fetch 1,024-candidate batches until the page is full instead of fetching every candidate first, and hold one batch of record copies under `QUERY_BUFFER_MB` (halved on overflow). Behaviour changes: a single record larger than `QUERY_BUFFER_MB` now fails the query (raise `QUERY_BUFFER_MB` if such records must be returned), and allocation failures on this path (batch setup, record copies, an error the fetch call returns) and a missing storage handle now fail the query (unterminated response, as for other mid-stream record errors) instead of returning an empty or shorter page. Records the storage layer cannot read during the fetch — or whose lookup buffers cannot be allocated — are still skipped, as before. Order and membership of pages are unchanged; no wire, CLI, config or on-disk change.
+
 ## 2026.09.2
 
 Calendar `datetime` storage widens from 6 to 7 bytes (int32 BE `yyyyMMdd` +

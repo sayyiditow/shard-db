@@ -519,7 +519,7 @@ Set `TIMEOUT=<seconds>` in db.env for a global default, or pass `"timeout_ms":N`
 
 ## Per-query memory cap
 
-`QUERY_BUFFER_MB` (default 256) caps the intermediate buffers any single query can hold. Checked at every collection site (ordered find buffer, aggregate hash tables, OR KeySet, AND-intersection KeySets, bulk-delete/update key list, btree hash collection). When exceeded → `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}`. Prevents one bad query from monopolising RAM. Pair with whole-process containment (`MemoryMax=`, cgroup `memory.max`) as a backstop.
+`QUERY_BUFFER_MB` (default 256) caps the intermediate buffers any single query can hold. Checked at every collection site (ordered find buffer, aggregate hash tables, OR KeySet, AND-intersection KeySets, bulk-delete/update key list, btree hash collection, indexed-find record batches). When exceeded → `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}`, except at the indexed-find record batch: a batch that does not fit is retried at half size, and a single record larger than the budget fails the query mid-stream (unterminated response, no error object). Prevents one bad query from monopolising RAM. Pair with whole-process containment (`MemoryMax=`, cgroup `memory.max`) as a backstop.
 
 ## Crash consistency
 

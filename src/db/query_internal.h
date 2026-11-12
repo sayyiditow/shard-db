@@ -66,6 +66,34 @@ KeySet *query_test_candidate_keyset_alloc(size_t m, size_t *out_slots);
  * before the caller's recovery decision. Reports consumption count. */
 void query_test_agg_topn_arm_deadline_trap(int max_wait_ms);
 unsigned query_test_agg_topn_deadline_trap_consumed(void);
+/* keyset_emit_find counters and one-shot fault seams (query.c).
+   kef_test_arm(seam, n): fire on the n-th hit after arming (n >= 1);
+   KEF_SEAM_BUDGET instead sets the record-copy budget in bytes (0 = default).
+   SETUP_ALLOC: the call's first scratch allocation fails (ENOMEM).
+   COPY_ALLOC: a record-copy allocation fails (ENOMEM).
+   FETCH: a fetch attempt is not issued and reports -1/EIO.
+   JOIN: a join resolution reports -1/EIO.  REGISTRY: the registry lookup
+   yields NULL/EIO.  TIMEOUT: after a fetch attempt returns, the deadline is
+   marked timed out.  Counters are process-wide; kef_test_reset() zeroes
+   them and disarms every seam. */
+enum { KEF_SEAM_SETUP_ALLOC = 1, KEF_SEAM_COPY_ALLOC, KEF_SEAM_FETCH, KEF_SEAM_JOIN,
+       KEF_SEAM_REGISTRY, KEF_SEAM_TIMEOUT, KEF_SEAM_BUDGET, KEF_SEAM_COUNT };
+typedef struct {
+    long calls, fetch_calls, fetch_hashes, copies, copy_bytes,
+         live_copies, live_bytes, peak_bytes;
+} KefTestStats;
+void kef_test_reset(void);
+void kef_test_arm(int seam, long arg);
+void kef_test_stats(KefTestStats *out);
+/* Runs keyset_emit_find (use_reference = 0) or the retained previous
+   whole-candidate-set implementation (use_reference = 1) on `ks`, writing rows (no envelope) to
+   `out`. eff_root = <db_root>/<dir>; object is bare. criteria_json/
+   excluded_csv/format/join_json may be NULL. Returns the function's rc with
+   its errno; -1/EINVAL for bad arguments or criteria/join setup. */
+int keyset_emit_find_for_test(const char *eff_root, const char *object, KeySet *ks,
+        const char *criteria_json, const char *excluded_csv, int offset, int limit,
+        const char *format, const char *join_json, uint32_t timeout_ms,
+        int use_reference, FILE *out);
 #endif
 
 /* Prototypes for helpers shared across the query_*.c translation units.

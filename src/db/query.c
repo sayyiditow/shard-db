@@ -5864,14 +5864,290 @@ KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
    2026-05-07 — superseded by RecordRef + read_record_ref/release_record_ref in
    the storage-version-agnostic dispatch helpers above.) */
 
-/* Emit records matching `tree` by iterating a KeySet built from the OR branch.
-   Honours offset/limit at emit time. Excluded keys, joins, projections, and
-   rows_fmt all mirror the behaviour of idx_find_parallel / adv_search_cb.
-   Returns the number of rows printed. */
-/* Walk a pre-built KeySet, fetch each record, optionally re-match against a
-   tree, and emit per the requested format. Used by both OR-union and AND-
-   intersection paths (the difference is just how the KeySet was built and
-   whether rematch is needed). Caller owns the KeySet lifecycle. */
+/* ---- keyset_emit_find test counters and fault seams (TEST_BUILD only) ---- */
+#ifdef TEST_BUILD
+static struct {
+    _Atomic long calls, fetch_calls, fetch_hashes, copies, copy_bytes,
+                 live_copies, live_bytes, peak_bytes;
+} g_kef_stats;
+static _Atomic long g_kef_seam_at[KEF_SEAM_COUNT];   /* 0 = disarmed; n = fire on the n-th hit */
+static _Atomic long g_kef_seam_hits[KEF_SEAM_COUNT];
+static _Atomic long g_kef_budget_override;           /* > 0: record-copy budget in bytes */
+
+void kef_test_reset(void) {
+    atomic_store(&g_kef_stats.calls, 0);       atomic_store(&g_kef_stats.fetch_calls, 0);
+    atomic_store(&g_kef_stats.fetch_hashes, 0); atomic_store(&g_kef_stats.copies, 0);
+    atomic_store(&g_kef_stats.copy_bytes, 0);  atomic_store(&g_kef_stats.live_copies, 0);
+    atomic_store(&g_kef_stats.live_bytes, 0);  atomic_store(&g_kef_stats.peak_bytes, 0);
+    for (int i = 0; i < KEF_SEAM_COUNT; i++) {
+        atomic_store(&g_kef_seam_at[i], 0); atomic_store(&g_kef_seam_hits[i], 0);
+    }
+    atomic_store(&g_kef_budget_override, 0);
+}
+void kef_test_arm(int seam, long arg) {
+    if (seam == KEF_SEAM_BUDGET) { atomic_store(&g_kef_budget_override, arg); return; }
+    if (seam <= 0 || seam >= KEF_SEAM_COUNT) return;
+    atomic_store(&g_kef_seam_hits[seam], 0);
+    atomic_store(&g_kef_seam_at[seam], arg);
+}
+void kef_test_stats(KefTestStats *o) {
+    o->calls = atomic_load(&g_kef_stats.calls);             o->fetch_calls = atomic_load(&g_kef_stats.fetch_calls);
+    o->fetch_hashes = atomic_load(&g_kef_stats.fetch_hashes); o->copies = atomic_load(&g_kef_stats.copies);
+    o->copy_bytes = atomic_load(&g_kef_stats.copy_bytes);   o->live_copies = atomic_load(&g_kef_stats.live_copies);
+    o->live_bytes = atomic_load(&g_kef_stats.live_bytes);   o->peak_bytes = atomic_load(&g_kef_stats.peak_bytes);
+}
+static int kef_seam_take(int seam) {
+    long at = atomic_load(&g_kef_seam_at[seam]);
+    if (at <= 0) return 0;
+    long hit = atomic_fetch_add(&g_kef_seam_hits[seam], 1) + 1;
+    if (hit != at) return 0;
+    atomic_store(&g_kef_seam_at[seam], 0);              /* one-shot */
+    return 1;
+}
+static void kef_stat_copy(size_t bytes) {
+    atomic_fetch_add(&g_kef_stats.copies, 1);
+    atomic_fetch_add(&g_kef_stats.copy_bytes, (long)bytes);
+    atomic_fetch_add(&g_kef_stats.live_copies, 1);
+    long now = atomic_fetch_add(&g_kef_stats.live_bytes, (long)bytes) + (long)bytes;
+    long peak = atomic_load(&g_kef_stats.peak_bytes);
+    while (peak < now && !atomic_compare_exchange_weak(&g_kef_stats.peak_bytes, &peak, now)) {}
+}
+static void kef_stat_release(size_t bytes) {
+    atomic_fetch_sub(&g_kef_stats.live_copies, 1);
+    atomic_fetch_sub(&g_kef_stats.live_bytes, (long)bytes);
+}
+#define KEF_SEAM(s)          kef_seam_take(s)
+#define KEF_STAT_ADD(f, v)   ((void)atomic_fetch_add(&g_kef_stats.f, (long)(v)))
+#define KEF_STAT_COPY(b)     kef_stat_copy(b)
+#define KEF_STAT_RELEASE(b)  kef_stat_release(b)
+#else
+#define KEF_SEAM(s)          0
+#define KEF_STAT_ADD(f, v)   ((void)0)
+#define KEF_STAT_COPY(b)     ((void)0)
+#define KEF_STAT_RELEASE(b)  ((void)0)
+#endif
+
+#define KEF_BATCH 1024
+_Static_assert(KEF_BATCH <= 65536, "KefSortEnt.idx is uint16_t");
+
+typedef struct { uint8_t hash[16]; uint16_t idx; } KefSortEnt;
+
+/* One reusable fetch batch. Candidate slots 0..n-1 are in KeySet bucket order. */
+typedef struct {
+    uint8_t      hashes[KEF_BATCH][16];
+    KefSortEnt   sorted[KEF_BATCH];     /* same hashes sorted, for kef_batch_cb's lookup */
+    uint8_t     *rec[KEF_BATCH];        /* owned copy: key bytes then value bytes */
+    size_t       klen[KEF_BATCH];
+    size_t       vlen[KEF_BATCH];
+    uint8_t      hdr2[KEF_BATCH];
+    uint8_t      found[KEF_BATCH];
+    size_t       n;
+    KeySetBudget budget;                /* live record-copy bytes of this batch */
+    _Atomic int  error;                 /* first callback failure: ENOBUFS or ENOMEM */
+} KefBatch;
+
+static int kef_sort_cmp(const void *a, const void *b) {
+    return memcmp(((const KefSortEnt *)a)->hash, ((const KefSortEnt *)b)->hash, 16);
+}
+
+static void kef_set_error(KefBatch *b, int e) {
+    int expect = 0;
+    atomic_compare_exchange_strong(&b->error, &expect, e);
+}
+
+static size_t kef_copy_budget(void) {
+#ifdef TEST_BUILD
+    long o = atomic_load(&g_kef_budget_override);
+    if (o > 0) return (size_t)o;
+#endif
+    return g_query_buffer_max_bytes;
+}
+
+/* Fetch callback. Runs on fetch-pool threads, possibly concurrently for
+   different kf shards: every candidate owns its slot and shared state is
+   atomic. A hash repeats only within one partition (one thread), so the
+   found[] repeat check needs no lock. Copies the borrowed record; never
+   re-enters slotcask/btree (a kf reader is held). */
+static int kef_batch_cb(const uint8_t hash16[16], const void *key, size_t klen,
+                        const void *value, size_t vlen, uint8_t hdr2, void *ctx_ptr) {
+    KefBatch *b = (KefBatch *)ctx_ptr;
+    if (atomic_load_explicit(&b->error, memory_order_relaxed)) return 1;
+    size_t lo = 0, hi = b->n, slot = SIZE_MAX;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int c = memcmp(hash16, b->sorted[mid].hash, 16);
+        if (c == 0) { slot = b->sorted[mid].idx; break; }
+        if (c < 0) hi = mid; else lo = mid + 1;
+    }
+    if (slot == SIZE_MAX || b->found[slot]) return 0;   /* not ours, or a repeat: first copy wins */
+    if (vlen > SIZE_MAX - klen) { kef_set_error(b, ENOBUFS); return 1; }
+    size_t bytes = klen + vlen;
+    if (keyset_budget_reserve(&b->budget, bytes) != 0) { kef_set_error(b, ENOBUFS); return 1; }
+    uint8_t *p = KEF_SEAM(KEF_SEAM_COPY_ALLOC) ? NULL : malloc(bytes ? bytes : 1);
+    if (!p) { keyset_budget_release(&b->budget, bytes); kef_set_error(b, ENOMEM); return 1; }
+    if (klen) memcpy(p, key, klen);
+    if (vlen) memcpy(p + klen, value, vlen);
+    b->rec[slot] = p; b->klen[slot] = klen; b->vlen[slot] = vlen; b->hdr2[slot] = hdr2;
+    b->found[slot] = 1;
+    KEF_STAT_COPY(bytes);
+    return 0;
+}
+
+/* Free this batch's copies and reset it for the next collection. */
+static void kef_batch_release(KefBatch *b) {
+    for (size_t i = 0; i < b->n; i++) {
+        if (b->rec[i]) {
+            size_t bytes = b->klen[i] + b->vlen[i];
+            KEF_STAT_RELEASE(bytes);
+            keyset_budget_release(&b->budget, bytes);
+            free(b->rec[i]);
+            b->rec[i] = NULL;
+        }
+        b->found[i] = 0;
+    }
+    b->n = 0;
+    atomic_store_explicit(&b->error, 0, memory_order_relaxed);
+}
+
+/* Walk a pre-built KeySet in bucket order, one fetch batch at a time: fetch
+   up to KEF_BATCH candidates, filter (exclusions, rematch, joins), paginate
+   and emit them, free the batch, and fetch the next batch only while the
+   page is not full. Holds at most one batch of record copies, charged to
+   QUERY_BUFFER_MB; a batch that does not fit is retried at half size, and a
+   single record over the budget fails with ENOBUFS. Returns rows printed, or
+   -1 with errno on any fetch/allocation/record/join/emit failure (rows
+   already printed stay printed). A deadline stop returns the rows printed.
+   Used by the OR-union, AND-intersection, trigram, prepared-bitmap and
+   indexed-leaf find paths; caller owns the KeySet. */
+static int keyset_emit_find(const char *db_root, const char *object,
+                            const Schema *sch, KeySet *ks,
+                            CriteriaNode *tree_for_rematch,  /* NULL = skip */
+                            ExcludedKeys *excluded, int offset, int limit,
+                            const char **proj_fields, int proj_count,
+                            FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
+                            JoinSpec *joins, int njoins, QueryDeadline *dl) {
+    KEF_STAT_ADD(calls, 1);
+    int need_rematch = (tree_for_rematch != NULL);
+    CriteriaNode *tree = tree_for_rematch;
+
+    size_t cursor = 0;                       /* next KeySet bucket to collect from */
+    while (cursor < ks->cap && ks->state[cursor] != 2) cursor++;
+    if (cursor == ks->cap) return 0;         /* no candidate: no allocation, no registry */
+
+    KefBatch *bt = KEF_SEAM(KEF_SEAM_SETUP_ALLOC) ? NULL : calloc(1, sizeof(*bt));
+    if (!bt) { errno = ENOMEM; return -1; }
+    bt->budget.limit = kef_copy_budget();
+
+    SlotcaskSchemaInfo sinfo = {
+        .splits = sch->splits, .slot_size = sch->slot_size,
+        .streams = sch->streams,
+    };
+    errno = 0;
+    SlotcaskDb *sdb SDB_REG_REF = KEF_SEAM(KEF_SEAM_REGISTRY)
+        ? (errno = EIO, (SlotcaskDb *)NULL)
+        : slotcask_registry_get(db_root, object, &sinfo);
+    if (!sdb) { int e = errno ? errno : EIO; free(bt); errno = e; return -1; }
+
+    const Schema *kschema = fs && fs->auto_key != AK_NONE ? &fs->auto_key_schema_snapshot : NULL;
+    size_t batch_cap = KEF_BATCH;            /* halved on budget overflow; never grows back */
+    int printed = 0, count = 0, dl_counter = 0, error = 0, stop = 0;
+
+    while (!stop && !error && cursor < ks->cap) {
+        if (dl && dl->timeout_ms &&
+            atomic_load_explicit(&dl->timed_out, memory_order_relaxed)) break;
+        size_t next = cursor;
+        bt->n = 0;
+        while (next < ks->cap && bt->n < batch_cap) {
+            if (ks->state[next] == 2) {
+                memcpy(bt->hashes[bt->n], ks->keys[next], 16);
+                memcpy(bt->sorted[bt->n].hash, ks->keys[next], 16);
+                bt->sorted[bt->n].idx = (uint16_t)bt->n;
+                bt->n++;
+            }
+            next++;
+        }
+        if (bt->n == 0) break;               /* only empty buckets remain */
+        qsort(bt->sorted, bt->n, sizeof(bt->sorted[0]), kef_sort_cmp);
+
+        KEF_STAT_ADD(fetch_calls, 1);
+        KEF_STAT_ADD(fetch_hashes, bt->n);
+        int frc;
+        if (KEF_SEAM(KEF_SEAM_FETCH)) { errno = EIO; frc = -1; }
+        else {
+            errno = 0;
+            frc = slotcask_bulk_resolve_and_fetch(sdb, (const uint8_t (*)[16])bt->hashes,
+                                                  bt->n, bt, kef_batch_cb);
+        }
+        int ferr = errno;
+        if (KEF_SEAM(KEF_SEAM_TIMEOUT) && dl)
+            atomic_store_explicit(&dl->timed_out, 1, memory_order_relaxed);
+
+        int cerr = atomic_load_explicit(&bt->error, memory_order_relaxed);
+        size_t used = bt->n;
+        if (cerr == ENOBUFS && used > 1) {   /* copies do not fit: retry these candidates at half size */
+            kef_batch_release(bt);
+            batch_cap = used / 2;
+            continue;
+        }
+        if (cerr || frc < 0) {
+            error = cerr ? cerr : (ferr ? ferr : EIO);
+            kef_batch_release(bt);
+            break;
+        }
+        cursor = next;
+
+        for (size_t i = 0; i < bt->n; i++) {
+            if (limit > 0 && printed >= limit) { stop = 1; break; }
+            if (query_deadline_tick(dl, &dl_counter)) { stop = 1; break; }
+            if (!bt->found[i]) continue;
+            char keybuf[1100];
+            if (format_wire_key(kschema, (const char *)bt->rec[i], bt->klen[i],
+                                keybuf, sizeof(keybuf)) < 0) { error = EILSEQ; break; }
+            if (is_excluded(excluded, keybuf)) continue;
+            const uint8_t *raw = bt->rec[i] + bt->klen[i];
+            size_t value_len = bt->vlen[i];
+            uint8_t hdr2 = bt->hdr2[i];
+            int matched = 1;
+            if (need_rematch &&
+                criteria_match_tree_checked(raw, value_len, tree, fs, hdr2, &matched)) {
+                error = errno ? errno : EILSEQ; break;
+            }
+            if (!matched) continue;
+            RecordRef *refs = NULL; int dropped = 0;
+            size_t charge = (size_t)njoins * sizeof(*refs);
+            if (njoins) {
+                if (charge > g_query_buffer_max_bytes) { error = ENOBUFS; break; }
+                refs = calloc((size_t)njoins, sizeof(*refs));
+                if (!refs) { error = ENOMEM; break; }
+                for (int j = 0; j < njoins; j++) {
+                    int found = KEF_SEAM(KEF_SEAM_JOIN) ? (errno = EIO, -1)
+                        : resolve_join_record(&joins[j], db_root, fs->ts, raw, value_len, hdr2,
+                                              g_query_buffer_max_bytes - charge, &refs[j]);
+                    if (found < 0) { error = errno ? errno : EILSEQ; break; }
+                    if (!found && joins[j].type == JOIN_INNER) { dropped = 1; break; }
+                }
+            }
+            if (!error && !dropped && ++count > offset) {
+                if (typed_query_emit_row(g_out ? g_out : stdout, keybuf, strlen(keybuf), raw,
+                        value_len, hdr2, fs, proj_fields, proj_count, rows_fmt, dict_fmt,
+                        csv_delim, printed > 0, joins, njoins, refs,
+                        g_query_buffer_max_bytes - charge))
+                    error = errno ? errno : EILSEQ;
+                else printed++;
+            }
+            if (refs) { for (int j = 0; j < njoins; j++) release_record_ref(&refs[j]); free(refs); }
+            if (error) break;
+        }
+        if (limit > 0 && printed >= limit) stop = 1;
+        kef_batch_release(bt);
+    }
+    free(bt);
+    if (error) { errno = error; return -1; }
+    return printed;
+}
+
+#ifdef TEST_BUILD
+/* TEST_BUILD only: the previous whole-candidate-set implementation, kept verbatim as the differential reference for test_kef_batches.c. */
 
 typedef struct {
     uint8_t (*hashes)[16];
@@ -5880,13 +6156,13 @@ typedef struct {
     uint8_t **vals; size_t *vlens;
     uint8_t *hdr2s;             /* per-record generation byte */
     int     *found;
-} KefFetchCtx;
+} KefRefFetchCtx;
 
-static int kef_fetch_cb(const uint8_t hash16[16],
+static int kef_ref_fetch_cb(const uint8_t hash16[16],
                          const void *key, size_t klen,
                          const void *value, size_t vlen,
                          uint8_t hdr2, void *ctx_ptr) {
-    KefFetchCtx *c = (KefFetchCtx *)ctx_ptr;
+    KefRefFetchCtx *c = (KefRefFetchCtx *)ctx_ptr;
     for (size_t i = 0; i < c->n; i++) {
         if (memcmp(hash16, c->hashes[i], 16) == 0) {
             c->keys[i] = malloc(klen);
@@ -5901,7 +6177,7 @@ static int kef_fetch_cb(const uint8_t hash16[16],
     return 0;
 }
 
-static int keyset_emit_find(const char *db_root, const char *object,
+static int keyset_emit_find_reference(const char *db_root, const char *object,
                             const Schema *sch, KeySet *ks,
                             CriteriaNode *tree_for_rematch,  /* NULL = skip */
                             ExcludedKeys *excluded, int offset, int limit,
@@ -5963,20 +6239,20 @@ static int keyset_emit_find(const char *db_root, const char *object,
         return 0;
     }
 
-    KefFetchCtx fctx = { hashes, n_fetch, fkeys, fklens, fvals, fvlens, fhdr2s, ffound };
+    KefRefFetchCtx fctx = { hashes, n_fetch, fkeys, fklens, fvals, fvlens, fhdr2s, ffound };
 
-#define KEF_BATCH 1024
+#define KEF_REF_BATCH 1024
     {
         size_t processed = 0;
         while (processed < n_fetch) {
             size_t batch = n_fetch - processed;
-            if (batch > KEF_BATCH) batch = KEF_BATCH;
+            if (batch > KEF_REF_BATCH) batch = KEF_REF_BATCH;
             slotcask_bulk_resolve_and_fetch(sdb, hashes + processed,
-                                             batch, &fctx, kef_fetch_cb);
+                                             batch, &fctx, kef_ref_fetch_cb);
             processed += batch;
         }
     }
-#undef KEF_BATCH
+#undef KEF_REF_BATCH
 
     /* Phase 2: sequential emit using fetched records. */
     int error=0;
@@ -6031,6 +6307,57 @@ static int keyset_emit_find(const char *db_root, const char *object,
     if(error){errno=error;return -1;}
     return printed;
 }
+#endif
+
+#ifdef TEST_BUILD
+int keyset_emit_find_for_test(const char *eff_root, const char *object, KeySet *ks,
+        const char *criteria_json, const char *excluded_csv, int offset, int limit,
+        const char *format, const char *join_json, uint32_t timeout_ms,
+        int use_reference, FILE *out) {
+    if (!eff_root || !object || !ks || !out) { errno = EINVAL; return -1; }
+    FILE *saved = g_out;
+    g_out = out;                       /* setup errors printed via OUT land in `out`, not the TAP stream */
+    Schema sch = load_schema(eff_root, object);
+    FieldSchema fs;
+    init_field_schema(&fs, eff_root, object);
+    CriteriaNode *tree = NULL;
+    if (criteria_json) {
+        const char *perr = NULL;
+        char verr[256];
+        tree = parse_criteria_tree(criteria_json, &perr);
+        if (perr || !tree ||
+            validate_criteria_tree_fields(tree, fs.ts, verr, sizeof(verr)) < 0 ||
+            compile_criteria_tree_checked(tree, fs.ts, NULL, 0)) {
+            free_criteria_tree(tree); g_out = saved; errno = EINVAL; return -1;
+        }
+    }
+    JoinSpec *joins = NULL; int njoins = 0;
+    if (join_json && (parse_joins_json(join_json, &joins, &njoins) < 0 ||
+                      resolve_joins(joins, njoins, eff_root, object, &fs) < 0)) {
+        free_joins(joins, njoins); free_criteria_tree(tree); g_out = saved; errno = EINVAL; return -1;
+    }
+    ExcludedKeys excluded = parse_excluded_keys(excluded_csv);
+    int rows_fmt = format && strcmp(format, "rows") == 0;
+    int dict_fmt = format && strcmp(format, "dict") == 0;
+    char csv_delim = (format && strcmp(format, "csv") == 0) ? ',' : 0;
+    QueryDeadline dl = { now_ms_coarse(), timeout_ms, 0 };
+    if (objlock_rdlock(eff_root, object) != 0) {
+        free_excluded(&excluded); free_joins(joins, njoins); free_criteria_tree(tree);
+        g_out = saved; errno = ENOMEM; return -1;
+    }
+    int rc = use_reference
+        ? keyset_emit_find_reference(eff_root, object, &sch, ks, tree, &excluded, offset, limit,
+                                     NULL, 0, &fs, rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl)
+        : keyset_emit_find(eff_root, object, &sch, ks, tree, &excluded, offset, limit,
+                           NULL, 0, &fs, rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl);
+    int e = errno;
+    g_out = saved;
+    objlock_rdunlock(eff_root, object);
+    free_excluded(&excluded); free_joins(joins, njoins); free_criteria_tree(tree);
+    errno = e;
+    return rc;
+}
+#endif
 
 /* OR index-union find: build KeySet from indexed-OR children, then emit. */
 static int keyset_find_from_or(const char *db_root, const char *object,
@@ -10785,11 +11112,12 @@ find_ordered_fallback: ;
                materialise), no rows_fmt (table envelope), no csv_delim
                (header row).  Those cases fall through to the keyset path. */
             if (pc->op == OP_STARTS_WITH && !has_joins && !rows_fmt && !csv_delim) {
-                find_via_trigram_starts_with(
+                int trc = find_via_trigram_starts_with(
                     db_root, object, &sch,
                     (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                     pc, tree, &excluded, offset, limit,
                     proj_fields, proj_count, dict_fmt, &dl);
+                if (trc < 0) { free_excluded(&excluded); free_joins(joins, njoins); return -1; }
                 /* Close the envelope opened above and return. */
                 if (dict_fmt)
                     OUT(want_total ? "},\"total\":null}\n" : "}\n");

@@ -364,6 +364,10 @@ Ordered/cursor paths keep their ordered walk with full record filtering and
 disable bitmap candidate probes for the remainder of the request. This can
 require more scanning; it does not add snapshot isolation or lift memory limits.
 
+## Unordered indexed pages
+
+Unordered finds served from an index candidate set (OR unions, AND intersections, trigram matches, prepared bitmap candidates, and a single indexed leaf when the request has a `join`, `format:"rows"`, or `offset + limit` above 1,000) fetch candidate records in batches of up to 1,024 in candidate order. Each batch is filtered (remaining criteria, `excludedKeys`, inner joins) and paginated before the next is fetched, and fetching stops once `offset + limit` rows have qualified — so a page whose rows are found early reads only the batches it needs, while rare survivors or a large `offset` can still read every candidate. The index walk that collects candidates is unchanged. One batch of record copies counts against `QUERY_BUFFER_MB`; a batch that does not fit is retried at half size, and a single record larger than the budget fails the query — raise `QUERY_BUFFER_MB` (and the server's memory) if records that large must be returned. Page membership and order are unchanged on quiescent data. Allocation failures (batch setup, record copies, an error the fetch call returns), a missing storage handle and join failures fail the query instead of returning a shorter page, and, like other record errors after the response has started, leave the response unterminated. Records the storage layer itself cannot read during the fetch (for example a keyfile or segment that cannot be opened) — or whose lookup buffers cannot be allocated — are still skipped, as before.
+
 ## Indexed vs full-scan
 
 The planner picks an index automatically. Rules of thumb:
