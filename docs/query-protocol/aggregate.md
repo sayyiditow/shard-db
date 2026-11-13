@@ -39,9 +39,10 @@ Required: `mode`, `dir`, `object`, `aggregates`.
 | `group_by` | array of field names | none | Grouping keys. Omit for whole-table aggregation. |
 | `aggregates` | array | required | List of aggregate specs (see below). Max 32. |
 | `having` | array | none | Filter groups after aggregation. Same shape as `criteria`, but fields are aggregate **aliases** (or group-by fields). |
-| `order_by` | string | none | Sort groups by this alias (or group-by field). |
+| `order_by` | string | none | Sort groups by this alias (or group-by field). Groups with equal sort values are ordered by group value ascending (numeric order for numbers, byte order for text, declaration order for enum, address order for IPs, time order for dates/timestamps), NULL group last, field by field; the direction does not flip this tie order. |
 | `order` | `"asc"` / `"desc"` | `"asc"` | Sort direction. |
 | `limit` | int | `GLOBAL_LIMIT` | Max groups returned. |
+| `total` | bool | false | Wrap the result as `{"rows":[...],"total":<distinct groups before limit>}`. |
 | `explain` | bool | false | Return the query plan without executing. See [explain](explain.md). |
 
 ## Explain mode
@@ -204,7 +205,7 @@ buckets that silently miss that shard's records.
 
 - **Whole-table, no criteria** — O(N) scan of every record. Parallelized across shards.
 - **With criteria** — same as [`find`](find.md): indexed candidate scan + per-record typed comparison.
-- **With `group_by`** — accumulates into a hash table keyed by group values; final sort + limit. Per-worker hash tables fold into a global table at the end (lock-free hot path).
+- **With `group_by`** — accumulates into a hash table keyed by group values; final sort + limit. Per-worker hash tables fold into a global table at the end (lock-free hot path) — except eligible count-ranked top-N requests, which stream (see Streaming top-N).
 - **AND of indexed leaves** — uses the same `PRIMARY_INTERSECT` planner branch as `find`/`count`: each leaf's btree walks into a `KeySet`, the sets intersect, and aggregation streams the survivors only. Order-of-magnitude wins when the intersection is far smaller than any single leaf's candidate set. See [find → AND index intersection](find.md#and-index-intersection).
 - **NEQ algebraic shortcut** — `count(neq X)` is rewritten internally as `count(*) - count(eq X)`, turning a near-everything scan into two cheap counts. Applies inside `aggregate` too when the only criterion on an indexed field is `neq`.
 
@@ -283,6 +284,10 @@ The planner paths from [find](find.md#execution-paths) apply here too — when t
   '' \
   '[{"field":"n","op":"gte","value":"100"}]'
 ```
+
+## Streaming top-N
+
+When the request has a single btree-indexed `group_by` field, `order_by` naming a `count(*)` alias, `limit` 1–10000, no `having`, not `format:"csv"`, criteria fully answerable from indexes, and every aggregate is `count(*)`, `count(<group field>)` (not on varchar/date/datetime/datetimems/time/uuid, whose `count` excludes unset values), or `sum/avg/min/max(<group field>)` (not `sum`/`avg` on `float`/`double`), the aggregate streams the group field's index and keeps only the top `limit` groups in memory; results (values, ties, `total`) are identical to the general path, except that a midnight `time` group is labelled `""` by the general path's record-scan route but `"00:00:00"` from the index (pre-existing; it only arises when the general path cannot use the index); anything else uses the general path; counts above 2^53 rows per group are outside the exact range of the ranking.
 
 ## Limitations
 

@@ -418,6 +418,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_nql_joins.c \
     src/test/cases/test_util.c \
     src/test/cases/test_agg_topn_stream.c \
+    src/test/cases/test_agg_topn_exact.c \
     src/test/cases/test_find_orderby_selective.c \
     src/test/cases/test_planner_trigram_selectivity.c \
     src/test/cases/test_cardinality_estimate.c \

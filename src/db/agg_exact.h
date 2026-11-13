@@ -80,6 +80,13 @@ int  agg_key_double(const AggNumSpec *sp, const uint8_t *key, size_t klen,
                     double *out);
 int  agg_num_merge(AggNum *dst, const AggNum *src, AggClass cls, AggEnv *e);
 
+/* n holds exactly one offered value v (has = 1, sum = v). Makes sum equal to
+   `times` offers of v (times >= 1); min/max/has unchanged. INT: checked
+   multiply; DEC: double-and-add (every partial sum is at most |v * times|, so
+   it overflows exactly when the offers would). FLT: EINVAL (floating sums
+   depend on addition order). 0 ok / -1 errno. */
+int  agg_num_repeat(AggNum *n, AggClass cls, int64_t times, AggEnv *e);
+
 void agg_value_init(AggValue *v);
 void agg_value_release(AggValue *v);
 void agg_value_from_count(AggValue *v, int64_t count);

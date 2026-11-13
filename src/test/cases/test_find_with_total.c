@@ -985,11 +985,12 @@ static int test_agg_total_nogroup(void) {
 }
 TEST_REGISTER("test-agg-total-nogroup", test_agg_total_nogroup)
 
-/* ---- aggregate streaming top-N + total: total=null (documented fallback) - */
+/* ---- aggregate streaming top-N + total: exact distinct-group count ------- */
 /* eligible_for_topn_stream requires: single group_by, order_by an agg alias,
    limit > 0.  Insert 200 records with 20 distinct tags (10 each), then
    aggregate count() group_by=tag order_by=cnt desc limit=3 total=true.
-   The streaming path doesn't materialise a full group table → total=null. */
+   The streaming path reports the exact group count (200 rows, tag = t%02d
+   of i % 20 → 20 groups). */
 static int test_agg_total_streaming_topn(void) {
     TestEnv env = {0};
     TestClient *tc = setup_obj(&env, "at_sn",
@@ -1020,7 +1021,7 @@ static int test_agg_total_streaming_topn(void) {
     ASSERT_NOT_NULL(resp, "agg streaming topN → response not null");
     ASSERT_CONTAINS(resp, "\"rows\"", "agg streaming topN → rows key present");
     int total = extract_total(resp);
-    ASSERT_EQ_INT(total, -999, "agg streaming topN → total = null (documented fallback)");
+    ASSERT_EQ_INT(total, 20, "agg streaming topN → total = exact distinct-tag count (20)");
     int nrows = count_agg_rows(resp);
     ASSERT_EQ_INT(nrows, 3, "agg streaming topN → rows length = 3 (limit)");
     free(resp);

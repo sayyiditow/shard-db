@@ -501,23 +501,30 @@ TOPN_VIS int topn_heap_size(void *hp) {
     return hp ? ((TopNHeap *)hp)->size : 0;
 }
 
-/* For top-N (desc): heap is a MIN-heap on metric → root is smallest kept.
- *   new beats root iff new.metric > root.metric.
- * For bottom-N (asc): MAX-heap → root is largest kept.
- *   new beats root iff new.metric < root.metric. */
-static int topn_metric_beats(const TopNHeap *h, double a, double b) {
-    return h->order_desc ? (a > b) : (a < b);
+/* 1 when a ranks worse than b. The heap root is the worst kept entry. Lower
+   count is worse for top-N (higher for bottom-N); on equal counts the larger
+   group key is worse, so ties at the limit keep the smallest group values
+   (NULL key 0x01 sorts last) — the hash path's tie order. */
+static int topn_worse(const TopNHeap *h, double am, const char *ak, size_t al,
+                      double bm, const char *bk, size_t bl) {
+    if (am != bm) return h->order_desc ? am < bm : am > bm;
+    size_t n = al < bl ? al : bl;
+    int c = n ? memcmp(ak, bk, n) : 0;
+    if (c) return c > 0;
+    return al > bl;
 }
+#define TOPN_E_WORSE(h, x, y) topn_worse((h), (x)->metric, (x)->group_key, (x)->group_key_len, \
+                                         (y)->metric, (y)->group_key, (y)->group_key_len)
 
 /* Standard sift-down — children at 2i, 2i+1. "Worse" = closer to root in
  * inverted-heap terms. */
 static void topn_sift_down(TopNHeap *h, int i) {
     for (;;) {
         int l = 2 * i, r = 2 * i + 1, worst = i;
-        if (l <= h->size && topn_metric_beats(h, h->entries[worst].metric,
-                                              h->entries[l].metric)) worst = l;
-        if (r <= h->size && topn_metric_beats(h, h->entries[worst].metric,
-                                              h->entries[r].metric)) worst = r;
+        if (l <= h->size && TOPN_E_WORSE(h, &h->entries[l], &h->entries[worst]))
+            worst = l;
+        if (r <= h->size && TOPN_E_WORSE(h, &h->entries[r], &h->entries[worst]))
+            worst = r;
         if (worst == i) return;
         TopNHeapEntry tmp = h->entries[i];
         h->entries[i] = h->entries[worst];
@@ -529,7 +536,7 @@ static void topn_sift_down(TopNHeap *h, int i) {
 static void topn_sift_up(TopNHeap *h, int i) {
     while (i > 1) {
         int p = i / 2;
-        if (topn_metric_beats(h, h->entries[p].metric, h->entries[i].metric)) {
+        if (TOPN_E_WORSE(h, &h->entries[i], &h->entries[p])) {
             TopNHeapEntry tmp = h->entries[i];
             h->entries[i] = h->entries[p];
             h->entries[p] = tmp;
@@ -560,8 +567,9 @@ TOPN_VIS int topn_heap_offer(void *hp, double metric,
         topn_sift_up(h, h->size);
         return 1;
     }
-    /* Full — compare against root. */
-    if (!topn_metric_beats(h, metric, h->entries[1].metric)) return 0;
+    /* Full — accept only when the root is worse than the candidate. */
+    if (!topn_worse(h, h->entries[1].metric, h->entries[1].group_key,
+                    h->entries[1].group_key_len, metric, gk, gklen)) return 0;
     free(h->entries[1].group_key);
     h->entries[1].metric = metric;
     h->entries[1].count = count;
@@ -693,6 +701,8 @@ static AggCell *agg_cells_alloc(size_t, _Atomic size_t *, size_t);
 static void agg_cells_free(AggCell *, int);
 static void agg_cells_dispose(AggCell *, size_t);
 static int agg_cell_count(AggCell *, int64_t);
+static int agg_cell_from_num(const AggNumSpec *, const AggNum *, enum AggFn,
+                             int64_t, AggCell *);
 static int agg_cell_text(AggCell *, const char *, size_t, int);
 static void agg_cell_emit_json(const AggCell *);
 
@@ -749,6 +759,7 @@ typedef struct {
     double       current_max;
     int          current_min_set;
     int          current_max_set;
+    int64_t      groups;       /* distinct groups finalized (for total) */
 
     const AggSpec    *specs;
     int               nspecs;
@@ -780,10 +791,15 @@ static double topn_metric_from_state(const TopNWalkCtx *c) {
 
 static void topn_finalize_run(TopNWalkCtx *c) {
     if (!c->current_key) return;
+    c->groups++;
     double metric = topn_metric_from_state(c);
     TopNHeap *h = (TopNHeap *)c->heap;
     int was_full = h && h->size >= h->cap;
-    int beats = was_full && topn_metric_beats(h, metric, h->entries[1].metric);
+    int beats = was_full && topn_worse(h, h->entries[1].metric,
+                                       h->entries[1].group_key,
+                                       h->entries[1].group_key_len,
+                                       metric, c->current_key,
+                                       c->current_key_len);
     if (!topn_heap_offer(c->heap, metric,
                          c->current_key, c->current_key_len,
                          c->current_count, c->current_sum,
@@ -886,7 +902,12 @@ static int topn_walk_cb(const char *enc_val, size_t enc_val_len,
 #define TOPN_RUN_VIS static
 #endif
 
-TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
+#ifdef TEST_BUILD
+static _Atomic long g_topn_runs, g_topn_declines, g_topn_forced, g_topn_repeats;
+static _Atomic int  g_topn_force_decline;
+static _Atomic long g_topn_fail_repeat_at, g_topn_repeat_hits;
+#endif
+static int agg_run_topn_stream_impl(const char *db_root, const char *object,
                                       const Schema *sch, FieldSchema *fs,
                                       const AggSpec *specs, int nspecs,
                                       const char *group_by_field,
@@ -907,10 +928,32 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
     }
     if (order_spec_idx < 0) return -1;
 
-    /* The stream has only one row-count state, not per-field present counts.
-       All value/presence-dependent specs use the exact hash executor (D7). */
-    for (int i = 0; i < nspecs; i++)
-        if (specs[i].fn != AGG_COUNT || specs[i].field[0]) return -2;
+    /* Count-ranked streams with exact extras: the ranking spec is count(*);
+       every other spec is count(*), count(group field) or sum/avg/min/max of
+       the group field, whose exact values follow from the group value and its
+       row count (rendered per winner below). Anything else uses the exact
+       hash executor. */
+    if (specs[order_spec_idx].fn != AGG_COUNT || specs[order_spec_idx].field[0]) return -2;
+    {
+        const TypedField *gtf = resolve_idx_field(fs->ts, group_by_field);
+        AggNumSpec gns = {0};
+        int gnum = gtf && gtf->type != FT_BOOL &&
+            agg_num_spec_for(fs->ts, (size_t)(gtf - fs->ts->fields), &gns);
+        for (int i = 0; i < nspecs; i++) {
+            const AggSpec *s = &specs[i];
+            if (s->fn == AGG_COUNT) {
+                if (s->field[0] && strcmp(s->field, group_by_field) != 0) return -2;
+                /* count(g) skips encoded unset markers ("" varchar, zero
+                   calendar, midnight time, zero uuid) on the hash path; a
+                   group key alone cannot tell, so these types decline. */
+                if (s->field[0] && (!gtf || agg_count_inspects_presence(gtf->type))) return -2;
+                continue;
+            }
+            if (strcmp(s->field, group_by_field) != 0) return -2;
+            if (!gnum || !agg_index_exact(&gns)) return -2;
+            if (gns.cls == AGC_FLT && (s->fn == AGG_SUM || s->fn == AGG_AVG)) return -2;
+        }
+    }
 
     void *heap = topn_heap_new(limit, order_desc);
     if (!heap) return -1;
@@ -1098,6 +1141,8 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
         (4 * sizeof(double) + sizeof(int64_t) + sizeof(char *) + sizeof(size_t));
     for (int i = 0; i < n; i++) live += gklens[i] + 1;
     _Atomic size_t render_bytes = live;
+    AggEnv renv;
+    agg_env_init(&renv, &render_bytes, g_query_buffer_max_bytes);
     AggCell *cellv = agg_cells_alloc((size_t)n * (size_t)nspecs,
                                      &render_bytes, g_query_buffer_max_bytes);
     int rerr = cellv ? 0 : (errno ? errno : ENOMEM);
@@ -1120,9 +1165,44 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
             if (len < 0) rerr = errno ? errno : EILSEQ;
             else if (agg_cell_text(&labels[i], label, (size_t)len, 1)) rerr = errno;
         }
-        for (int j = 0; j < nspecs && !rerr; j++)
-            if (agg_cell_count(&cellv[(size_t)i * nspecs + j], counts[i]))
+        int null_group = raw_len && raw[0] == 0x01;
+        AggNum num;
+        memset(&num, 0, sizeof num);
+        int64_t present = 0;
+        int have_num = 0;
+        for (int j = 0; j < nspecs && !rerr; j++) {
+            const AggSpec *s = &specs[j];
+            AggCell *cell = &cellv[(size_t)i * nspecs + j];
+            if (s->fn == AGG_COUNT) {
+                int64_t v = (s->field[0] && null_group) ? 0 : counts[i];
+                if (agg_cell_count(cell, v)) rerr = errno ? errno : ENOMEM;
+                continue;
+            }
+            if (!have_num && !null_group) {
+                int r = agg_num_offer_key(&ctx.gb_spec, raw, raw_len, &num, &renv);
+                if (r < 0) { rerr = errno ? errno : EILSEQ; break; }
+                if (r == 1) {
+                    present = counts[i];
+                    if (ctx.gb_spec.cls != AGC_FLT) {
+#ifdef TEST_BUILD
+                        atomic_fetch_add(&g_topn_repeats, 1);
+                        long at = atomic_load(&g_topn_fail_repeat_at);
+                        if (at > 0 && atomic_fetch_add(&g_topn_repeat_hits, 1) + 1 == at) {
+                            atomic_store(&g_topn_fail_repeat_at, 0);
+                            rerr = ENOMEM; break;
+                        }
+#endif
+                        if (agg_num_repeat(&num, ctx.gb_spec.cls, counts[i], &renv)) {
+                            rerr = errno ? errno : ENOMEM; break;
+                        }
+                    }
+                }
+                have_num = 1;
+            }
+            if (agg_cell_from_num(&ctx.gb_spec, &num, s->fn, present, cell))
                 rerr = errno ? errno : ENOMEM;
+        }
+        agg_num_release(&num, ctx.gb_spec.cls, &renv);
     }
     if (rerr) {
         agg_cells_dispose(labels, (size_t)n);
@@ -1130,6 +1210,7 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
         for (int i = 0; i < n; i++) free(gkeys[i]);
         free(metrics); free(gkeys); free(gklens);
         free(counts); free(sums); free(mins); free(maxs);
+        agg_env_free(&renv);
         agg_report_error(rerr);
         return -3; /* one complete error response already emitted */
     }
@@ -1146,11 +1227,49 @@ TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
         free(gkeys[i]);
     }
     agg_cells_dispose(labels, (size_t)n);
-    agg_cells_dispose(cellv, (size_t)n * nspecs);    OUT(want_total ? "],\"total\":null}\n" : "]\n");
+    agg_cells_dispose(cellv, (size_t)n * nspecs);
+    if (want_total) OUT("],\"total\":%lld}\n", (long long)ctx.groups); else OUT("]\n");
+    agg_env_free(&renv);
 
     free(metrics); free(gkeys); free(gklens);
     free(counts); free(sums); free(mins); free(maxs);
     return 0;
+}
+#ifdef TEST_BUILD
+void agg_topn_test_reset(void) {
+    atomic_store(&g_topn_runs, 0); atomic_store(&g_topn_declines, 0);
+    atomic_store(&g_topn_forced, 0); atomic_store(&g_topn_repeats, 0);
+    atomic_store(&g_topn_force_decline, 0);
+    atomic_store(&g_topn_fail_repeat_at, 0); atomic_store(&g_topn_repeat_hits, 0);
+}
+void agg_topn_test_force_decline(int on) { atomic_store(&g_topn_force_decline, on); }
+void agg_topn_test_fail_repeat(long nth) {
+    atomic_store(&g_topn_repeat_hits, 0); atomic_store(&g_topn_fail_repeat_at, nth);
+}
+void agg_topn_test_stats(long *runs, long *declines, long *forced, long *repeats) {
+    *runs = atomic_load(&g_topn_runs); *declines = atomic_load(&g_topn_declines);
+    *forced = atomic_load(&g_topn_forced); *repeats = atomic_load(&g_topn_repeats);
+}
+#endif
+TOPN_RUN_VIS int agg_run_topn_stream(const char *db_root, const char *object,
+                                      const Schema *sch, FieldSchema *fs,
+                                      const AggSpec *specs, int nspecs,
+                                      const char *group_by_field,
+                                      const char *order_by_alias,
+                                      int order_desc, int limit,
+                                      CriteriaNode *tree, QueryDeadline *dl,
+                                      int want_total, int *out_capacity) {
+#ifdef TEST_BUILD
+    if (atomic_load(&g_topn_force_decline)) { atomic_fetch_add(&g_topn_forced, 1); return -2; }
+#endif
+    int rc = agg_run_topn_stream_impl(db_root, object, sch, fs, specs, nspecs,
+                                      group_by_field, order_by_alias, order_desc,
+                                      limit, tree, dl, want_total, out_capacity);
+#ifdef TEST_BUILD
+    if (rc == 0) atomic_fetch_add(&g_topn_runs, 1);
+    else if (rc == -2) atomic_fetch_add(&g_topn_declines, 1);
+#endif
+    return rc;
 }
 
 typedef struct {
@@ -3504,6 +3623,8 @@ typedef struct {
     AggResult  r;        /* aggregate alias, or numeric group label */
     int        use_label;/* text group field: compare group_vals with strcmp */
     int        desc;     /* sort direction, per row (no shared state) */
+    uint8_t   *tie;      /* tie key, built only for runs of equal rows */
+    size_t     tie_len;
 } AggSortRow;
 
 static int agg_sort_row_cmp(const void *pa, const void *pb) {
@@ -3521,8 +3642,112 @@ static int agg_sort_row_cmp(const void *pa, const void *pb) {
     return x->desc ? -cmp : cmp;
 }
 
+/* Always large enough: group labels are at most BT_MAX_VAL_LEN (544) bytes on
+   every route (record scans cap them at 511), and the longest key such a label
+   encodes to is the label itself (varchar); a decimal is 7 + 2 bytes per
+   base-10000 limb (<= 281), fixed widths <= 16. So an encodable label never
+   falls into the 0x01 fallback tier for lack of room. */
+#define AGG_TIE_KEY_CAP 1024
+/* Tie key of one bucket, per group field: an index-encodable value as
+   [0x00][u32 BE len][index-key bytes] (encode_criterion_value_checked:
+   numeric order for numbers, bytes for text, declaration order for enum,
+   address bytes for IPs). For ipv4/ipv6/uuid/date/datetime/datetimems/time an
+   empty or all-'0' label that does not encode is the type's zero/unset value
+   (labelled "" or "00000000" by the hash path), which is the smallest stored
+   value and the first index key: it gets [0x00][len 0], sorting before every other value as
+   on the stream. Any other label that does not encode (or a field without a
+   typed definition) is [0x01][u32 BE len][label bytes], after every value;
+   NULL is [0x02], last. Never fails on data: only ENOMEM returns -1. */
+static int agg_tie_key_build(const AggCtx *ctx, const AggBucket *b,
+                             uint8_t **out, size_t *out_len) {
+    size_t cap = 64, len = 0;
+    uint8_t *buf = malloc(cap);
+    if (!buf) { errno = ENOMEM; return -1; }
+    for (int g = 0; g < ctx->ngroups; g++) {
+        uint8_t key[AGG_TIE_KEY_CAP];
+        const uint8_t *src = NULL;
+        size_t kl = 0;
+        uint8_t tag = 0x02;
+        if (!(b->group_nulls && b->group_nulls[g])) {
+            const char *v = b->group_vals[g];
+            size_t vl = strlen(v);
+            const TypedField *tf = ctx->group_tfs[g];
+            int rc = 0;
+            if (tf && ctx->fs) {
+                errno = 0;
+                rc = encode_criterion_value_checked(ctx->fs->ts, tf, v, vl, key, sizeof key, &kl);
+                if (rc < 0 && errno == ENOMEM) { free(buf); return -1; }
+            }
+            if (rc == 1) { tag = 0x00; src = key; }
+            else if (tf && (vl == 0 || strspn(v, "0") == vl) &&
+                     (tf->type == FT_IPV4 || tf->type == FT_IPV6 || tf->type == FT_UUID ||
+                            tf->type == FT_DATE || tf->type == FT_DATETIME ||
+                            tf->type == FT_DATETIMEMS || tf->type == FT_TIME)) {
+                tag = 0x00; src = key; kl = 0;          /* zero/unset value: smallest key */
+            }
+            else { tag = 0x01; src = (const uint8_t *)v; kl = vl; }
+        }
+        size_t need = len + 1 + (tag == 0x02 ? 0 : 4 + kl);
+        if (need > cap) {
+            while (cap < need) cap *= 2;
+            uint8_t *nb = realloc(buf, cap);
+            if (!nb) { free(buf); errno = ENOMEM; return -1; }
+            buf = nb;
+        }
+        buf[len++] = tag;
+        if (tag == 0x02) continue;
+        buf[len++] = (uint8_t)(kl >> 24); buf[len++] = (uint8_t)(kl >> 16);
+        buf[len++] = (uint8_t)(kl >> 8);  buf[len++] = (uint8_t)kl;
+        if (kl) memcpy(buf + len, src, kl);
+        len += kl;
+    }
+    uint8_t *exact = realloc(buf, len ? len : 1);   /* charge == allocation */
+    *out = exact ? exact : buf; *out_len = len;
+    return 0;
+}
+static int agg_tie_cmp(const uint8_t *a, size_t al, const uint8_t *b, size_t bl) {
+    size_t i = 0, j = 0;
+    while (i < al && j < bl) {
+        uint8_t ta = a[i++], tb = b[j++];
+        if (ta != tb) return ta < tb ? -1 : 1;
+        if (ta == 0x02) continue;
+        size_t la = ((size_t)a[i] << 24) | ((size_t)a[i+1] << 16) | ((size_t)a[i+2] << 8) | a[i+3];
+        size_t lb = ((size_t)b[j] << 24) | ((size_t)b[j+1] << 16) | ((size_t)b[j+2] << 8) | b[j+3];
+        i += 4; j += 4;
+        int c = agg_text_cmp((const char *)a + i, la, (const char *)b + j, lb);
+        if (c) return c;
+        i += la; j += lb;
+    }
+    return (i < al) - (j < bl);
+}
+/* Never flipped by the sort direction. */
+static int agg_tie_row_cmp(const void *pa, const void *pb) {
+    const AggSortRow *x = *(const AggSortRow *const *)pa;
+    const AggSortRow *y = *(const AggSortRow *const *)pb;
+    return agg_tie_cmp(x->tie, x->tie_len, y->tie, y->tie_len);
+}
+/* Re-sort one run of equal rows by tie key; keys are charged to the query
+   budget while the run is sorted and released afterwards. */
+static int agg_sort_tie_run(const AggCtx *ctx, AggSortRow **run, int m) {
+    size_t charged = 0;
+    int rc = 0;
+    for (int i = 0; i < m && !rc; i++) {
+        if (agg_tie_key_build(ctx, run[i]->b, &run[i]->tie, &run[i]->tie_len)) { rc = -1; break; }
+        charged += run[i]->tie_len;
+        if (ctx->shared_buffer_bytes &&
+            atomic_fetch_add(ctx->shared_buffer_bytes, run[i]->tie_len) + run[i]->tie_len
+                > g_query_buffer_max_bytes) { errno = ENOBUFS; rc = -1; }
+    }
+    if (!rc) qsort(run, (size_t)m, sizeof *run, agg_tie_row_cmp);
+    int e = errno;
+    for (int i = 0; i < m; i++) { free(run[i]->tie); run[i]->tie = NULL; run[i]->tie_len = 0; }
+    if (ctx->shared_buffer_bytes && charged) atomic_fetch_sub(ctx->shared_buffer_bytes, charged);
+    if (rc) errno = e;
+    return rc;
+}
+
 static int agg_sort_buckets(const AggCtx *ctx, AggBucket **buckets, int n,
-                            const char *order_by, int order_desc) {
+                            const char *order_by, int order_desc, int limit) {
     if (n < 2) return 0;
     AggSortRow *rows = calloc((size_t)n, sizeof *rows);
     AggSortRow **ptrs = malloc((size_t)n * sizeof *ptrs);
@@ -3547,7 +3772,13 @@ static int agg_sort_buckets(const AggCtx *ctx, AggBucket **buckets, int n,
     }
     if (!rc) {
         qsort(ptrs, (size_t)n, sizeof *ptrs, agg_sort_row_cmp);
-        for (int i = 0; i < n; i++) buckets[i] = ptrs[i]->b;
+        for (int s = 0; s < n && s < limit && !rc; ) {   /* runs starting past the limit are cut anyway */
+            int e = s + 1;
+            while (e < n && agg_sort_row_cmp(&ptrs[s], &ptrs[e]) == 0) e++;
+            if (e - s > 1 && agg_sort_tie_run(ctx, ptrs + s, e - s)) rc = -1;
+            s = e;
+        }
+        if (!rc) for (int i = 0; i < n; i++) buckets[i] = ptrs[i]->b;
     }
     int e = errno;
     for (int i = 0; i < n; i++) agg_result_release(&rows[i].r);
@@ -6865,7 +7096,8 @@ igb_skip:
             free(buckets);
             return -1;
         }
-        if (agg_sort_buckets(&ctx, buckets, nbuckets, order_by, order_desc)) {
+        int eff_limit = limit > 0 ? limit : g_global_limit;
+        if (agg_sort_buckets(&ctx, buckets, nbuckets, order_by, order_desc, eff_limit)) {
             int e = errno;
             free(buckets); free_criteria(having, nhaving); agg_free(&ctx);
             return agg_report_error(e);

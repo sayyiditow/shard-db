@@ -6,6 +6,17 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**Count-ranked top-N aggregates stream again with exact extras; tie order is defined.**
+A top-N aggregate ranked by `count(*)` that also asks for `count(g)`, `sum/avg/min/max(g)` on the
+group field (numeric, index-exact; not `sum`/`avg` over `float`/`double`, and not `count(g)` on
+varchar/date/datetime/datetimems/time/uuid) streams the group-field index in O(limit) memory again,
+computing the exact extras per winner from the group value and its count, byte-identical to the
+exact hash path. Aggregate tie order is now defined on both paths: groups with equal `order_by`
+values sort by group value ascending in the field's index order, NULL group last, field by field,
+never flipped by the direction — tied groups that previously came out in an unspecified
+(hash-table / heap-position) order now come out in this order. The stream's `"total"` is now the
+exact distinct-group count instead of `null`. No wire/CLI/config/on-disk change.
+
 **A pending bitmap-remap marker never blocks startup; shard-scoped repair with a read-only escape.**
 `bmfix_recover_all` used to answer any `<obj>/indexes/.bmfix-NNN` marker with a full strict reindex
 of every btree, trigram and bitmap index on every shard, refusing startup on any failure — the same

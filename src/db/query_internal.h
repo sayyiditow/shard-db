@@ -94,6 +94,14 @@ int keyset_emit_find_for_test(const char *eff_root, const char *object, KeySet *
         const char *criteria_json, const char *excluded_csv, int offset, int limit,
         const char *format, const char *join_json, uint32_t timeout_ms,
         int use_reference, FILE *out);
+/* Streaming top-N aggregate counters and seams (query_aggregate.c).
+   runs: stream answered (rc 0); declines: stream fell back (-2) on its own;
+   forced: force_decline made it fall back; repeats: exact states scaled for
+   selected groups. fail_repeat(n): the n-th repeat reports ENOMEM. */
+void agg_topn_test_reset(void);
+void agg_topn_test_force_decline(int on);
+void agg_topn_test_fail_repeat(long nth);
+void agg_topn_test_stats(long *runs, long *declines, long *forced, long *repeats);
 #endif
 
 /* Prototypes for helpers shared across the query_*.c translation units.

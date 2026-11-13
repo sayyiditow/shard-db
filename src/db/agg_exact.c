@@ -310,6 +310,38 @@ int agg_num_merge(AggNum *dst, const AggNum *src, AggClass cls, AggEnv *e) {
     }
 }
 
+int agg_num_repeat(AggNum *n, AggClass cls, int64_t times, AggEnv *e) {
+    if (!n || !n->has || times < 1) return fail(EINVAL);
+    if (cls == AGC_FLT) return fail(EINVAL);
+    if (times == 1) return 0;
+    if (cls == AGC_INT) {
+        agg_i128 s;
+        if (__builtin_mul_overflow(n->u.i.sum, (agg_i128)times, &s)) return fail(ERANGE);
+        n->u.i.sum = s;
+        return 0;
+    }
+    if (cls != AGC_DEC) return fail(EINVAL);
+    dec_t base, acc;
+    dec_init(&base); dec_init(&acc);
+    int rc = slot_copy(e, &base, &n->u.d.sum);
+    int have = 0;
+    uint64_t t = (uint64_t)times;
+    while (!rc && t) {
+        if (t & 1) {
+            rc = have ? slot_add(e, &acc, &base) : slot_copy(e, &acc, &base);
+            have = 1;
+        }
+        t >>= 1;
+        if (!rc && t) rc = slot_add(e, &base, &base);
+    }
+    if (!rc) rc = slot_copy(e, &n->u.d.sum, &acc);
+    int err = errno;
+    uncharge(e, dec_bytes(&base) + dec_bytes(&acc));
+    dec_free(&base); dec_free(&acc);
+    if (rc) { errno = err; return -1; }
+    return 0;
+}
+
 void agg_value_init(AggValue *v) { memset(v, 0, sizeof *v); }
 void agg_value_release(AggValue *v) { dec_free(&v->own); memset(v, 0, sizeof *v); }
 void agg_value_from_count(AggValue *v, int64_t c) {

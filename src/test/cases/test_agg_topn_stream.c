@@ -638,6 +638,7 @@ static int test_topn_stream_bitmap_postfilter_bounded(void) {
     ASSERT_TRUE(resp != NULL, "bitmap-criteria aggregate response");
     if (!resp) { tc_close(tc); test_env_stop(&env); return 1; }
 
+    if (!SAFE_STRSTR(resp, "\"n\":40000")) TAP_DIAG("# bitmap-postfilter response: %.400s\n", resp ? resp : "(null)");
     ASSERT_TRUE(SAFE_STRSTR(resp, "\"n\":40000") != NULL,
                 "g0 count is the FILTERED active=true count (40000)");
     ASSERT_TRUE(SAFE_STRSTR(resp, "\"n\":45000") == NULL,
