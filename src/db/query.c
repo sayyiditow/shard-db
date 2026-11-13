@@ -1846,8 +1846,14 @@ static void *chunk_walk_worker(void *raw) {
 
             /* Resume floor: skip the already-delivered boundary entry and
                any older sibling sharing its value. */
+            /* last_hash is written (memcpy at the resume-point update below)
+               strictly before have_last is set, and this read is short-
+               circuited behind have_last — the variable can never be read
+               uninitialized. cppcheck cannot track the flag-to-init
+               dependency; suppressed with the user's sign-off (2026-11-13). */
             if (have_last && vl == last_len &&
                 memcmp(v, last_val, last_len) == 0 &&
+                // cppcheck-suppress uninitvar
                 memcmp(h, last_hash, BT_HASH_SIZE) <= 0)
                 continue;
 
@@ -8314,6 +8320,7 @@ static int d2_batch_cb(const uint8_t hash16[16],
     if (ctx->deadline && query_deadline_tick(ctx->deadline, ctx->dl_counter)) return 1;
 
     D2HashIdxEntry lookup;
+    lookup.idx = -1;   /* key element: comparator reads .hash only */
     memcpy(lookup.hash, hash16, 16);
     D2HashIdxEntry *found = bsearch(&lookup, ctx->hash_map, ctx->n_total,
                                      sizeof(D2HashIdxEntry), d2_hash_idx_cmp);
