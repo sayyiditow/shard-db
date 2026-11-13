@@ -35,6 +35,13 @@
 #define PORT_RESERVE_TTL_MS 5000
 #define PORT_RESERVE_MAX    64
 
+/* wait_daemon_ready budget for daemon spawns and restarts (both callers
+   keep this deliberately equal). 90s: sanitizer builds and the 2026-11
+   startup layout migration provably exceed the old 30s on loaded CI
+   runners; on the dev workstation a normal start is ready in <2s, so
+   the raise only binds on genuinely slow hosts. */
+#define FIXTURE_READY_WAIT_MS 90000
+
 typedef struct { int fd; struct timespec claimed; } PortReservation;
 static PortReservation g_port_reservations[PORT_RESERVE_MAX];
 static int g_port_reservation_count = 0;
@@ -553,8 +560,12 @@ respawn:;
     /* Sanitizer builds make daemon startup much slower (TSan especially,
        ~5-15x); a full-parallel run-all burst of concurrent daemon spawns
        widens this further. Match test_env_start_at's restart-path wait,
-       which already accounts for this. */
-    if (wait_daemon_ready(env->port, 30000, env->daemon_pid) != 0) {
+       which already accounts for this. 90s: the 2026-11 packed-layout
+       branch's startup migration (first start over a pre-migration root)
+       provably exceeds 30s on loaded 4-vCPU CI runners (layout-migration
+       finance acceptance leg); the budget only binds when a host is that
+       slow, so a genuinely hung daemon still costs at most one wait. */
+    if (wait_daemon_ready(env->port, FIXTURE_READY_WAIT_MS, env->daemon_pid) != 0) {
         fprintf(stderr,
             "wait_daemon_ready: timeout on port %d (last_step=%d errno=%d %s)\n",
             env->port, g_wait_last_step, g_wait_last_errno,
@@ -760,10 +771,11 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
 
     /* Restarting an existing database runs shared crash-recovery evidence
        checks (marker/sidecar replay, clean-lifecycle verification) before
-       serving.  Sanitizer builds make that recovery path much slower;
-       allow the restart helper to wait for the daemon to become ready
-       without weakening the production startup path. */
-    if (wait_daemon_ready(env->port, 30000, env->daemon_pid) != 0) {
+       serving.  Sanitizer builds make that recovery path much slower, and
+       a version-bump first start runs the whole-object layout migration;
+       both provably exceed 30s on loaded CI runners. The wait does not
+       weaken the production startup path. */
+    if (wait_daemon_ready(env->port, FIXTURE_READY_WAIT_MS, env->daemon_pid) != 0) {
         (void)fixture_kill_reap(&env->daemon_pid);
         if (env->test_control_fd > 0) {
             close(env->test_control_fd);

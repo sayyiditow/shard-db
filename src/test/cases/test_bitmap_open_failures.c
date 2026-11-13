@@ -104,7 +104,7 @@
  *
  * Every potentially-blocking child runs in its own process group under a
  * monotonic watchdog with a lifeline guard, exact-PID kill/reap and progress
- * stages; daemon fixtures run under a 150 s work budget + 30 s cleanup
+ * stages; daemon fixtures run under a 600 s work budget + 30 s cleanup
  * reserve with the fixtures' opt-in startup deadline. */
 #include "test_runner.h"
 #include "test_assert.h"
@@ -139,7 +139,11 @@
 
 #define BMF_UNIT_CHILD_TIMEOUT_MS 30000
 #define BMF_POLL_SLICE_MS         50
-#define BMF_WORK_BUDGET_MS        150000
+/* 600s: the 105k-row race fixtures provably exceed 150s on loaded
+   4-vCPU CI runners (2026-11-13 x86_64 leg killed 6 children at the
+   old 150s budget); on the dev workstation the heaviest child uses
+   <5s, so the raise only binds on genuinely slow hosts. */
+#define BMF_WORK_BUDGET_MS        600000
 #define BMF_CLEANUP_RESERVE_MS    30000
 
 static __thread int bmf_stage_fd = -1;

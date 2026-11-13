@@ -21,7 +21,13 @@ typedef struct { TestEnv env; TestClient *tc; } Lr;
 static int lr_open(Lr *p) {
     memset(p, 0, sizeof(*p));
     if (test_env_start(&p->env) != 0) return -1;
-    TestClientCfg cfg = { .port = p->env.port, .io_timeout_ms = 60000 };
+    TestClientCfg cfg = { .port = p->env.port, .io_timeout_ms = 300000 };
+    /* 300s: schema-mutation recomposes (add-field/edit-field/compact
+       over 6000 rows) provably exceed the old 60s under ASan/TSan on
+       loaded CI runners; an expired read then desyncs the shared
+       connection (late response read as the next response) and
+       cascades into false bitmap-mismatch failures. Only binds on
+       slow hosts; the run-all watchdog still bounds genuine hangs. */
     p->tc = tc_connect(&cfg);
     if (!p->tc) { test_env_stop(&p->env); return -1; }
     char *r = NULL;
