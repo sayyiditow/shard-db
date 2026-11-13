@@ -8,6 +8,7 @@
  * bounded-memory rejection and the allocation-fault loop.
  */
 #include "test_runner.h"
+#include "bappend.h"
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
@@ -202,24 +203,24 @@ static void ar_longkey(const char *obj, int indexed) {
 static void ar_combined_key(void) {
     char req[12000], value[501], groups[256]; size_t o = 0, g = 0;
     memset(value, 'x', 500); value[500] = 0;
-    o += (size_t)snprintf(req + o, sizeof req - o,
+    o = tappendf(req, sizeof req, o,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"r3combo\","
         "\"splits\":8,\"max_key\":16,\"fields\":[");
     for (int i = 0; i < 9; i++)
-        o += (size_t)snprintf(req + o, sizeof req - o, "%s\"v%d:varchar:500\"", i ? "," : "", i);
+        o = tappendf(req, sizeof req, o, "%s\"v%d:varchar:500\"", i ? "," : "", i);
     snprintf(req + o, sizeof req - o, "]}");
     char *r = ar_req(req);
     ASSERT_TRUE(r && !strstr(r, "\"error\""), "combined-key fixture created"); shard_db_free_result(r);
     o = (size_t)snprintf(req, sizeof req,
         "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"r3combo\",\"key\":\"k\",\"value\":{");
     for (int i = 0; i < 9; i++)
-        o += (size_t)snprintf(req + o, sizeof req - o, "%s\"v%d\":\"%s\"", i ? "," : "", i, value);
+        o = tappendf(req, sizeof req, o, "%s\"v%d\":\"%s\"", i ? "," : "", i, value);
     snprintf(req + o, sizeof req - o, "}}");
     r = ar_req(req);
     ASSERT_TRUE(r && !strstr(r, "\"error\""), "combined-key row inserted"); shard_db_free_result(r);
-    g += (size_t)snprintf(groups + g, sizeof groups - g, ",\"group_by\":[");
+    g = tappendf(groups, sizeof groups, g, ",\"group_by\":[");
     for (int i = 0; i < 9; i++)
-        g += (size_t)snprintf(groups + g, sizeof groups - g, "%s\"v%d\"", i ? "," : "", i);
+        g = tappendf(groups, sizeof groups, g, "%s\"v%d\"", i ? "," : "", i);
     snprintf(groups + g, sizeof groups - g, "]");
     ar_expect("r3combo", groups, "{\"fn\":\"count\",\"alias\":\"c\"}",
         "{\"error\":\"group_by value exceeds aggregate key limit (511 bytes per value, 4096 bytes per composite key) or contains NUL\"}",
@@ -309,10 +310,10 @@ static int ar_limits_run(void) {
                "\"splits\":8,\"max_key\":16,\"fields\":[\"l:long\"]}");
     shard_db_free_result(r);
     char *big = malloc(400000); size_t o = 0;
-    o += (size_t)snprintf(big + o, 400000 - o,
+    o = tappendf(big, 400000, o,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"r3many\",\"records\":[");
     for (int i = 0; i < 3000; i++)
-        o += (size_t)snprintf(big + o, 400000 - o, "%s{\"key\":\"k%d\",\"value\":{\"l\":%d}}",
+        o = tappendf(big, 400000, o, "%s{\"key\":\"k%d\",\"value\":{\"l\":%d}}",
                               i ? "," : "", i, i);
     snprintf(big + o, 400000 - o, "]}");
     r = ar_req(big); shard_db_free_result(r); free(big);
@@ -331,10 +332,10 @@ static int ar_limits_run(void) {
                "\"fields\":[\"g:varchar:16\",\"v:long\"],\"indexes\":[\"g\",\"v\"]}");
     ASSERT_TRUE(r && !strstr(r, "\"error\""), "vs budget fixture"); shard_db_free_result(r);
     char *vsrows = malloc(64 * 3200); size_t vo = 0;
-    vo += (size_t)snprintf(vsrows + vo, (size_t)(64 * 3200) - vo,
+    vo = tappendf(vsrows, (size_t)(64 * 3200), vo,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"r3bvs\",\"records\":[");
     for (int i = 0; i < 3000; i++)
-        vo += (size_t)snprintf(vsrows + vo, (size_t)(64 * 3200) - vo,
+        vo = tappendf(vsrows, (size_t)(64 * 3200), vo,
             "%s{\"key\":\"k%d\",\"value\":{\"g\":\"g%d\",\"v\":%d}}",
             i ? "," : "", i, i, i);
     snprintf(vsrows + vo, (size_t)(64 * 3200) - vo, "]}");
@@ -369,10 +370,10 @@ static int ar_limits_run(void) {
                "\"indexes\":[\"s:bitmap\"]}");
     ASSERT_TRUE(r && !strstr(r, "\"error\""), "bitmap budget fixture"); shard_db_free_result(r);
     char *bmrows = malloc(64 * 3200); size_t bo = 0;
-    bo += (size_t)snprintf(bmrows + bo, (size_t)(64 * 3200) - bo,
+    bo = tappendf(bmrows, (size_t)(64 * 3200), bo,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"r3bbm\",\"records\":[");
     for (int i = 0; i < 3000; i++)
-        bo += (size_t)snprintf(bmrows + bo, (size_t)(64 * 3200) - bo,
+        bo = tappendf(bmrows, (size_t)(64 * 3200), bo,
             "%s{\"key\":\"k%d\",\"value\":{\"s\":\"s%d\"}}",
             i ? "," : "", i, i % 200);
     snprintf(bmrows + bo, (size_t)(64 * 3200) - bo, "]}");

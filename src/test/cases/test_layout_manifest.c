@@ -1,4 +1,5 @@
 #include "test_runner.h"
+#include "bappend.h"
 #include "test_assert.h"
 #include "fixtures.h"
 #include "test_client.h"
@@ -373,7 +374,7 @@ static int test_loader_packed_edge_cases(void) {
         char body[4096];
         size_t o = 0;
         for (int i = 0; i < 300 && o + 16 < sizeof(body); i++)
-            o += (size_t)snprintf(body + o, sizeof(body) - o, "f%d:int\n", i);
+            o = tappendf(body, sizeof(body), o, "f%d:int\n", i);
         ASSERT_EQ_INT(lm_write_fields(&m, body), 0, "300 fields");
         ASSERT_EQ_INT(lm_schema_append(&m, ":layout=packed"), 0, "token");
         ASSERT_EQ_INT(test_env_start_at(&env, m.db_root, m.port), 0, "start");
@@ -1043,7 +1044,7 @@ static int lm_build_finance(LmRoot *m, TestEnv *env) {
         for (int j = 0; j < LM_FIN_CHUNK; j++) {
             int i = chunk * LM_FIN_CHUNK + j + 1;
             long long whole = (i % 11 == 0) ? -(long long)i : i;
-            len += (size_t)snprintf(bulk + len, cap - len,
+            len = tappendf(bulk, cap, len,
                 "%s{\"key\":\"f%05d\",\"value\":{\"amt\":\"%s%lld.%04d\",\"cur\":\"%d.%04d\","
                 "\"scaled2\":\"%d.%02d\",\"note\":\"memo %d\",\"qty\":%d,"
                 "\"d\":\"2026%02d%02d\",\"flag\":%s}}",

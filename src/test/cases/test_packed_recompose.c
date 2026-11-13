@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #endif
 #include "test_runner.h"
+#include "bappend.h"
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
@@ -268,7 +269,7 @@ static int test_packed_add_field_atomic(void) {
     /* limits: 255 fields + 1 ok, one more refused (tombstones count toward 256) */
     char fields[8192] = "[";
     size_t off = 1;
-    for (int i = 0; i < 255; i++) off += (size_t)snprintf(fields + off, sizeof(fields) - off, "%s\"c%d:int\"", i ? "," : "", i);
+    for (int i = 0; i < 255; i++) off = tappendf(fields, sizeof(fields), off, "%s\"c%d:int\"", i ? "," : "", i);
     snprintf(fields + off, sizeof(fields) - off, "]");
     pr_create(&p, "wide", fields, "[]");
     pr_expect(pr_q(&p, "{\"mode\":\"add-field\",\"dir\":\"default\",\"object\":\"wide\",\"fields\":[\"c255:int\"]}"),
@@ -371,7 +372,7 @@ static int test_packed_edit_field_fixed(void) {
     if (pr_open(&p) != 0) return 1;
     char enums[4096] = "[\"i:int\",\"s:short\",\"f:float\",\"e:enum(a,b,c)\",\"big:enum(";
     size_t off = strlen(enums);
-    for (int i = 0; i < 256; i++) off += (size_t)snprintf(enums + off, sizeof(enums) - off, "%sv%d", i ? "," : "", i);
+    for (int i = 0; i < 256; i++) off = tappendf(enums, sizeof(enums), off, "%sv%d", i ? "," : "", i);
     snprintf(enums + off, sizeof(enums) - off, ")\"]");
     pr_create(&p, "o", enums, "[\"i\"]");
     pr_ins(&p, "o", "k1", "{\"i\":-200,\"s\":300,\"f\":3.25,\"e\":\"c\",\"big\":\"v255\"}");
@@ -393,7 +394,7 @@ static int test_packed_edit_field_fixed(void) {
     /* enum 256 -> 257 values: 1B -> 2B widen rebuild */
     char wide[4096] = "{\"mode\":\"edit-field\",\"dir\":\"default\",\"object\":\"o\",\"fields\":[\"big:enum(";
     off = strlen(wide);
-    for (int i = 0; i < 257; i++) off += (size_t)snprintf(wide + off, sizeof(wide) - off, "%sv%d", i ? "," : "", i);
+    for (int i = 0; i < 257; i++) off = tappendf(wide, sizeof(wide), off, "%sv%d", i ? "," : "", i);
     snprintf(wide + off, sizeof(wide) - off, ")\"]}");
     pr_expect(pr_q(&p, "%s", wide), "\"rebuilt\":true", "enum 1B -> 2B widen rebuilds");
     g = pr_get(&p, "o", "k1");
@@ -486,7 +487,7 @@ static int test_packed_bitmap_collision_growth(void) {
     if (!req) { pr_close(&p); return 1; }
     size_t n = (size_t)snprintf(req, cap, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"o\",\"records\":{");
     for (int i = 0; i < PR_BM_ROWS; i++)
-        n += (size_t)snprintf(req + n, cap - n, "%s\"r%05d\":{\"kind\":\"c%d\",\"kind2\":\"c%d\",\"a\":%d}",
+        n = tappendf(req, cap, n, "%s\"r%05d\":{\"kind\":\"c%d\",\"kind2\":\"c%d\",\"a\":%d}",
                               i ? "," : "", i, i % 4, i % 4, i);
     snprintf(req + n, cap - n, "}}");
     char *r = NULL;

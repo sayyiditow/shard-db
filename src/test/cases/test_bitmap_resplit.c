@@ -5,6 +5,7 @@
    tier shrunk to 64 slots/shard so growth happens while earlier rows' bits
    already exist. Each case runs in its own daemon and tmpdir. */
 #include "test_runner.h"
+#include "bappend.h"
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
@@ -98,7 +99,7 @@ static int br_bulk_tc(Br *b, TestClient *tc, int from, int to) {
     size_t n = (size_t)snprintf(req, cap,
         "{\"mode\":\"bulk-insert\",\"dir\":\"br\",\"object\":\"t\",\"records\":[");
     for (int i = from; i < to; i++) {
-        n += (size_t)snprintf(req + n, cap - n,
+        n = tappendf(req, cap, n,
             "%s{\"key\":\"k%05d\",\"value\":{\"flag\":%s,\"kind\":\"%s\",\"n\":%d}}",
             i > from ? "," : "", i, b->rows[i].flag ? "true" : "false",
             br_kind[b->rows[i].kind], i);
@@ -460,7 +461,7 @@ static int br_fault_stage_bulk(Br *b, int from, int to, int *inserted, int *erro
     size_t n = (size_t)snprintf(req, cap,
         "{\"mode\":\"bulk-insert\",\"dir\":\"br\",\"object\":\"t\",\"records\":[");
     for (int i = from; i < to; i++)
-        n += (size_t)snprintf(req + n, cap - n,
+        n = tappendf(req, cap, n,
             "%s{\"key\":\"k%05d\",\"value\":{\"flag\":%s,\"kind\":\"%s\",\"n\":%d}}",
             i > from ? "," : "", i, b->rows[i].flag ? "true" : "false",
             br_kind[b->rows[i].kind], i);

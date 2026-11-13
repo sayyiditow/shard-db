@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #endif
 #include "test_runner.h"
+#include "bappend.h"
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
@@ -716,7 +717,7 @@ static int pk_bitmap_after_indexes_run(int pause_wait_ms, int expect_pause_reach
         if (!bulk) { tc_close(tc); test_env_stop(&env); return 1; }
         size_t n = (size_t)snprintf(bulk, cap, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"bmc\",\"records\":{");
         for (int i = 0; i < 2400; i++)
-            n += (size_t)snprintf(bulk + n, cap - n, "%s\"r%05d\":{\"kind\":\"c%d\",\"kind2\":\"c%d\"}", i ? "," : "", i, i % 4, i % 4);
+            n = tappendf(bulk, cap, n, "%s\"r%05d\":{\"kind\":\"c%d\",\"kind2\":\"c%d\"}", i ? "," : "", i, i % 4, i % 4);
         snprintf(bulk + n, cap - n, "}}");
         tc_request(tc, bulk, &resp);
         ASSERT_CONTAINS(resp, "inserted", "bulk insert fixture rows");

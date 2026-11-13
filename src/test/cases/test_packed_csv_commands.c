@@ -2,6 +2,7 @@
 #define _XOPEN_SOURCE 700
 #include "test_runner.h"
 #include "test_assert.h"
+#include "bappend.h"
 #include "packed_csv_command.h"
 #include <errno.h>
 #include <ftw.h>
@@ -103,7 +104,7 @@ static void c_auto(void){
     ASSERT_EQ_INT(rc,0,"UUID multi-get");ASSERT_TRUE(text&&strstr(text,"00112233-4455-6677-8899-aabbccddeeff,1.0000000000,,"),"UUID storage lookup and display");free(text);
     char escaped[256];size_t pos=0;escaped[pos++]='[';escaped[pos++]='"';
     const char *uuid_text="00112233-4455-6677-8899-aabbccddeeff";
-    for(size_t i=0;i<strlen(uuid_text);i++)pos+=(size_t)snprintf(escaped+pos,sizeof(escaped)-pos,"\\u%04x",(unsigned char)uuid_text[i]);
+    for(size_t i=0;i<strlen(uuid_text);i++)pos=tappendf(escaped,sizeof(escaped),pos,"\\u%04x",(unsigned char)uuid_text[i]);
     escaped[pos++]='"';escaped[pos++]=']';escaped[pos]=0;
     text=c_call(&f,1,escaped,NULL,NULL,0,10,0,4096,',',&rc);
     ASSERT_EQ_INT(rc,0,"escaped UUID uses text bound rather than binary width");

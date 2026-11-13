@@ -3,6 +3,7 @@
    union and scan routes). Guards the R2 review items: candidate verification
    after a bitmap/btree primary, and candidate caps before verification. */
 #include "test_runner.h"
+#include "bappend.h"
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
@@ -128,7 +129,7 @@ static int test_predicate_equivalence_run(void) {
         for (int j = 0; j < 1000; j++) {
             const PeRow *row = &pe_rows[base + j];
             long long a = row->amt < 0 ? -row->amt : row->amt;
-            len += (size_t)snprintf(bulk + len, cap - len,
+            len = tappendf(bulk, cap, len,
                 "%s{\"key\":\"e%05d\",\"value\":{\"amt\":\"%s%lld.%04lld\",\"flag\":%s,"
                 "\"kind\":\"%s\",\"qty\":%d}}", j ? "," : "", base + j + 1,
                 row->amt < 0 ? "-" : "", a / 10000, a % 10000,
@@ -149,7 +150,7 @@ static int test_predicate_equivalence_run(void) {
         "{\"mode\":\"bulk-delete\",\"dir\":\"pe\",\"object\":\"t\",\"keys\":[");
     for (int i = 0; i < 300; i++) {
         int idx = i * 7 + 1;                       /* deterministic spread */
-        dl += (size_t)snprintf(del + dl, sizeof(del) - dl, "%s\"e%05d\"", i ? "," : "", idx);
+        dl = tappendf(del, sizeof(del), dl, "%s\"e%05d\"", i ? "," : "", idx);
         pe_rows[idx - 1].live = 0;
     }
     snprintf(del + dl, sizeof(del) - dl, "]}");

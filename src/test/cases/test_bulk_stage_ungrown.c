@@ -6,6 +6,7 @@
    and the bitmap-remap prepare fault puts growth on its 5 s back-off.
    Each case runs in its own daemon and tmpdir. */
 #include "test_runner.h"
+#include "bappend.h"
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
@@ -86,7 +87,7 @@ static int bsu_bulk_all(Bsu *b, int *out_inserted, int *out_errors) {
     size_t n = (size_t)snprintf(req, cap,
         "{\"mode\":\"bulk-insert\",\"dir\":\"bsu\",\"object\":\"t\",\"records\":[");
     for (int i = 0; i < BSU_N; i++)
-        n += (size_t)snprintf(req + n, cap - n,
+        n = tappendf(req, cap, n,
             "%s{\"key\":\"k%05d\",\"value\":{\"flag\":%s,\"n\":%d}}",
             i ? "," : "", i, i % 2 ? "false" : "true", i);
     snprintf(req + n, cap - n, "]}");
@@ -211,7 +212,7 @@ static int test_bulk_stage_delete_ungrown(void) {
         size_t n = (size_t)snprintf(q, cap,
             "{\"mode\":\"bulk-delete\",\"dir\":\"bsu\",\"object\":\"t\",\"keys\":[");
         for (int i = 0; i < BSU_N; i++)
-            n += (size_t)snprintf(q + n, cap - n, "%s\"k%05d\"", i ? "," : "", i);
+            n = tappendf(q, cap, n, "%s\"k%05d\"", i ? "," : "", i);
         snprintf(q + n, cap - n, "]}");
         char *resp = NULL;
         ASSERT_EQ_INT(tc_request(b->tc, q, &resp), 0, "bulk delete transport");

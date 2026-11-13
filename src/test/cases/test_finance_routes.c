@@ -3,6 +3,7 @@
    order in both directions, bulk delete + vacuum compact, exact aggregate,
    backup/restore and a clean restart. Textual comparison throughout. */
 #include "test_runner.h"
+#include "bappend.h"
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
@@ -170,7 +171,7 @@ static int test_finance_routes_run(void) {
     size_t len = (size_t)snprintf(bulk, cap,
         "{\"mode\":\"bulk-insert\",\"dir\":\"fin\",\"object\":\"ledger\",\"records\":[");
     for (int i = 0; i < FR_N; i++)
-        len += (size_t)snprintf(bulk + len, cap - len,
+        len = tappendf(bulk, cap, len,
             "%s{\"key\":\"r%04d\",\"value\":{\"amt\":\"%s\",\"bare\":\"%s\",\"cur\":\"%s\","
             "\"note\":\"note-%d\"}}", i ? "," : "", i + 1, fr_rows[i].amt,
             fr_rows[i].bare, fr_rows[i].cur, i + 1);
@@ -213,7 +214,7 @@ static int test_finance_routes_run(void) {
         "{\"mode\":\"bulk-delete\",\"dir\":\"fin\",\"object\":\"ledger\",\"keys\":[");
     int first = 1;
     for (int i = 2; i < FR_N; i += 3) {
-        dl += (size_t)snprintf(del + dl, sizeof(del) - dl, "%s\"r%04d\"", first ? "" : ",", i + 1);
+        dl = tappendf(del, sizeof(del), dl, "%s\"r%04d\"", first ? "" : ",", i + 1);
         first = 0;
     }
     snprintf(del + dl, sizeof(del) - dl, "]}");

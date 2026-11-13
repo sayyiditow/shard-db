@@ -23,6 +23,7 @@
 #define _GNU_SOURCE
 #endif
 #include "test_runner.h"
+#include "bappend.h"
 #include "test_assert.h"
 #include "fixtures.h"
 #include "../db/types.h"
@@ -170,13 +171,13 @@ static int kef_fix_build(KefFix *f, const char *obj, int splits, int ncand,
         kef_ord_key(f, ord, kb);
         const char *rv = refv ? refv(ord) : "zz";
         snprintf(refjson, sizeof(refjson), rv ? "\"%s\"" : "null", rv ? rv : "");
-        p += (size_t)snprintf(body + p, cap - p,
+        p = tappendf(body, cap, p,
                               "%s{\"key\":\"%s\",\"value\":{\"n\":%d,\"tag\":\"hot\",\"ref\":%s}}",
                               first ? "" : ",", kb, nval ? nval(ord) : 1, refjson);
         first = 0;
         nins++;
     }
-    p += (size_t)snprintf(body + p, cap - p, "]}");
+    p = tappendf(body, cap, p, "]}");
     tu_pdb_request(f->db, body, &resp);
     snprintf(msg, sizeof(msg), "setup: %s bulk insert", obj);
     snprintf(needle, sizeof(needle), "\"inserted\":%d", nins);
@@ -200,10 +201,10 @@ static int kef_fix_build(KefFix *f, const char *obj, int splits, int ncand,
         for (int ord = 0; ord < ncand; ord++) {
             if (!kind || kind(ord) != 2) continue;
             kef_ord_key(f, ord, kb);
-            dp += (size_t)snprintf(del + dp, dcap - dp, "%s\"%s\"", dfirst ? "" : ",", kb);
+            dp = tappendf(del, dcap, dp, "%s\"%s\"", dfirst ? "" : ",", kb);
             dfirst = 0;
         }
-        dp += (size_t)snprintf(del + dp, dcap - dp, "]}");
+        dp = tappendf(del, dcap, dp, "]}");
         tu_pdb_request(f->db, del, &resp);
         snprintf(msg, sizeof(msg), "setup: %s bulk delete", obj);
         snprintf(needle, sizeof(needle), "\"deleted\":%d", ndel);
@@ -410,7 +411,7 @@ static int test_kef_exclusions_joins_run(void) {
         excl[0] = '\0';
         for (int o = 0; o <= 1023; o++) {
             kef_ord_key(&f, o, kb);
-            p += (size_t)snprintf(excl + p, cap - p, "%s%s", o ? "," : "", kb);
+            p = tappendf(excl, cap, p, "%s%s", o ? "," : "", kb);
         }
     }
 
@@ -669,7 +670,7 @@ static int test_kef_differential_run(void) {
         excl_head[0] = '\0';
         for (int o = 0; o <= 99; o++) {
             kef_ord_key(&f, o, kb);
-            p += (size_t)snprintf(excl_head + p, cap - p, "%s%s", o ? "," : "", kb);
+            p = tappendf(excl_head, cap, p, "%s%s", o ? "," : "", kb);
         }
     }
 
@@ -866,9 +867,9 @@ static int test_kef_trigram_starts_error_run(void) {
                                     "{\"mode\":\"bulk-insert\",\"dir\":\"default\","
                                     "\"object\":\"kft\",\"records\":[");
         for (int i = 0; i < 50; i++)
-            p += (size_t)snprintf(body + p, sizeof(body) - p, "%s{\"key\":\"t%02d\","
+            p = tappendf(body, sizeof(body), p, "%s{\"key\":\"t%02d\","
                                   "\"value\":{\"name\":\"abcdef%02d\"}}", i ? "," : "", i, i);
-        p += (size_t)snprintf(body + p, sizeof(body) - p, "]}");
+        p = tappendf(body, sizeof(body), p, "]}");
         tu_pdb_request(f.db, body, &resp);
         ASSERT_TRUE(resp && strstr(resp, "\"inserted\":50") != NULL, "setup: kft bulk insert");
         if (!resp || strstr(resp, "\"inserted\":50") == NULL) { shard_db_free_result(resp); resp = NULL; goto cleanup; }

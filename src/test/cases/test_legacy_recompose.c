@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #endif
 #include "test_runner.h"
+#include "bappend.h"
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
@@ -117,7 +118,7 @@ static int test_legacy_bitmap_collision_growth(void) {
     if (!req) { lr_close(&p); return 1; }
     size_t n = (size_t)snprintf(req, cap, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"o\",\"records\":{");
     for (int i = 0; i < LR_BM_ROWS; i++)
-        n += (size_t)snprintf(req + n, cap - n, "%s\"r%05d\":{\"kind\":\"c%d\",\"kind2\":\"c%d\",\"a\":%d}",
+        n = tappendf(req, cap, n, "%s\"r%05d\":{\"kind\":\"c%d\",\"kind2\":\"c%d\",\"a\":%d}",
                               i ? "," : "", i, i % 4, i % 4, i);
     snprintf(req + n, cap - n, "}}");
     char *r = NULL;

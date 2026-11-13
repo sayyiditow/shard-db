@@ -39,6 +39,9 @@
  *
  * Every potentially-blocking child runs under a monotonic watchdog with
  * exact-PID kill/reap and progress stages; no broad pkill anywhere. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "test_runner.h"
 #include "test_assert.h"
 #include "fixtures.h"
@@ -48,6 +51,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <ftw.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -63,6 +67,86 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+
+/* CodeQL remediation (2026-11 PR #385): the fixture-cleanup and evidence
+   paths used to shell out through system(); every command argument derived
+   (via tmpdir templates) from the environment, which CodeQL flags as
+   command injection. Everything below is plain C: recursive remove via
+   nftw, log dumps via readdir+fread, marker scans via opendir. */
+
+static int bcl_rm_entry(const char *p, const struct stat *st, int type, struct FTW *f) {
+    (void)st; (void)type; (void)f; return remove(p);
+}
+static int bcl_rmrf(const char *path) {
+    if (!path || !path[0]) return -1;
+    errno = 0;
+    int rc = nftw(path, bcl_rm_entry, 32, FTW_DEPTH | FTW_PHYS);
+    if (rc != 0) {
+        /* rm -rf semantics: a tree that is already gone (test_env_stop also
+           removes parts of it) is not an error. */
+        struct stat st;
+        if (lstat(path, &st) != 0 && errno == ENOENT) rc = 0;
+    }
+    return rc;
+}
+/* Failure-evidence dump: names <base>/logs and prints the first 20 lines of
+   the captured stderr file (the old `ls -la ... ; cat ... | head -20`). */
+static void bcl_dump_failure_evidence(const char *base, const char *cap_path) {
+    TAP_DIAG("# logs dump:");
+    char sub[PATH_MAX];
+    if (base && snprintf(sub, sizeof(sub), "%s/logs", base) > 0) {
+        DIR *d = opendir(sub);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)))
+                TAP_DIAG("#   %s/%s", sub, e->d_name);
+            closedir(d);
+        } else {
+            TAP_DIAG("#   (no logs dir at %s)", sub);
+        }
+    }
+    if (cap_path && cap_path[0]) {
+        FILE *f = fopen(cap_path, "r");
+        if (!f) { TAP_DIAG("# == captured stderr: (unreadable: %s)", cap_path); return; }
+        TAP_DIAG("# == captured stderr:");
+        char line[512];
+        int n = 0;
+        while (n < 20 && fgets(line, sizeof(line), f)) { TAP_DIAG("#   %s", line); n++; }
+        fclose(f);
+    }
+}
+/* 1 = no .bmfix-* marker or *.bm.remap temporary under <obj>/indexes (the
+   old `test -z "$(find ... -name '.bmfix-*' -o -name '*.bm.remap')"`. */
+static int bcl_indexes_clean_of_txn_artifacts(const char *obj_dir) {
+    char idx[PATH_MAX];
+    if (snprintf(idx, sizeof(idx), "%s/indexes", obj_dir) >= (int)sizeof(idx))
+        return -1;
+    DIR *d = opendir(idx);
+    if (!d) return -1;
+    struct dirent *e;
+    int clean = 1;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char sub[PATH_MAX];
+        if (snprintf(sub, sizeof(sub), "%s/%s", idx, e->d_name) >= (int)sizeof(sub))
+            continue;
+        struct stat st;
+        if (stat(sub, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        DIR *sd = opendir(sub);
+        if (!sd) continue;
+        struct dirent *se;
+        while ((se = readdir(sd))) {
+            if (strncmp(se->d_name, ".bmfix-", 7) == 0)
+                clean = 0;
+            size_t len = strlen(se->d_name);
+            if (len > 6 && strcmp(se->d_name + len - 6, ".remap") == 0)
+                clean = 0;
+        }
+        closedir(sd);
+    }
+    closedir(d);
+    return clean ? 0 : 1;
+}
 #include <time.h>
 #include <unistd.h>
 
@@ -402,9 +486,7 @@ static int test_bitmap_cache_selfhold_run(void) {
     ASSERT_EQ_INT(r.timed_out, 0,
                   "17th writer open fails promptly (no endless eviction retry)");
     ASSERT_EQ_INT(r.exit_code, 0, "selfhold child passed all checks");
-    char cmd[300];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", bcl_sh.dir);
-    ASSERT_EQ_INT(system(cmd), 0, "selfhold fixture cleanup");
+    ASSERT_EQ_INT(bcl_rmrf(bcl_sh.dir), 0, "selfhold fixture cleanup");
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
@@ -935,9 +1017,7 @@ static int test_bitmap_cache_lock_errors_run(void) {
         ASSERT_EQ_INT(r.timed_out, 0, "matrix child finished within the bound");
         ASSERT_EQ_INT(r.exit_code, 0, desc);
     }
-    char cmd[300];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", bcl_mx_dir);
-    ASSERT_EQ_INT(system(cmd), 0, "matrix fixture cleanup");
+    ASSERT_EQ_INT(bcl_rmrf(bcl_mx_dir), 0, "matrix fixture cleanup");
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
@@ -1139,9 +1219,7 @@ static int test_bitmap_cache_contention_run(void) {
     ASSERT_EQ_INT(ran, 1, "contention child ran (watchdog infrastructure)");
     ASSERT_EQ_INT(r.timed_out, 0, "contention child finished within the bound");
     ASSERT_EQ_INT(r.exit_code, 0, "contention child passed all checks");
-    char cmd[300];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", bcl_mx_dir);
-    ASSERT_EQ_INT(system(cmd), 0, "contention fixture cleanup");
+    ASSERT_EQ_INT(bcl_rmrf(bcl_mx_dir), 0, "contention fixture cleanup");
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
@@ -2254,13 +2332,16 @@ static int bcl_v_snapshot(const char *root, int shard, BclSnapshot *s) {
     memset(s, 0, sizeof(*s));
     char kfp[1024];
     bcl_v_kf_path(kfp, sizeof(kfp), root, shard);
-    struct stat st;
-    if (stat(kfp, &st) != 0) return -1;
-    s->kf_size = st.st_size;
-    s->kf_inode = st.st_ino;
-    if (s->kf_size < 24) return -1;
+    /* Open before stat-ing (CodeQL TOCTOU): fstat pins the identity of the
+       file actually read, so a concurrent swap cannot validate one inode
+       and read another. */
     int fd = open(kfp, O_RDONLY);
     if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return -1; }
+    s->kf_size = st.st_size;
+    s->kf_inode = st.st_ino;
+    if (s->kf_size < 24) { close(fd); return -1; }
     if (pread(fd, s->kf_hdr, 24, 0) != 24) { close(fd); return -1; }
     s->kf_slots = (size_t)(s->kf_size - 24) / 24;
     s->kf_id = malloc(s->kf_slots * 17);
@@ -2326,12 +2407,13 @@ static int bcl_v_find_target_shard(const char *root, int *out_populated) {
     for (int shard = 0; shard < BCL_V_SPLITS; shard++) {
         char kfp[1024];
         bcl_v_kf_path(kfp, sizeof(kfp), root, shard);
-        struct stat st;
-        if (stat(kfp, &st) != 0) continue;
-        if (st.st_size < 24) continue;
-        unsigned char hdr[24];
+        /* Open before stat-ing (CodeQL TOCTOU), same rationale as
+           bcl_v_snapshot. */
         int fd = open(kfp, O_RDONLY);
         if (fd < 0) continue;
+        struct stat st;
+        if (fstat(fd, &st) != 0 || st.st_size < 24) { close(fd); continue; }
+        unsigned char hdr[24];
         if (pread(fd, hdr, 24, 0) != 24) { close(fd); continue; }
         close(fd);
         if (bcl_v_kf_total(hdr) == 0) continue;
@@ -2400,8 +2482,13 @@ static int bcl_v_log_grep_since(const char *base, const BclLogMark *m,
         if (len < 5 || strcmp(e->d_name + len - 4, ".log") != 0) continue;
         char p[700];
         snprintf(p, sizeof(p), "%s/%s", dir, e->d_name);
+        /* Open before stat-ing (CodeQL TOCTOU): st then describes the file
+           actually read, so the saved inode/size mark can never validate a
+           path that has since been replaced. */
+        int lfd = open(p, O_RDONLY);
+        if (lfd < 0) continue;
         struct stat st;
-        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (fstat(lfd, &st) != 0 || !S_ISREG(st.st_mode)) { close(lfd); continue; }
         off_t start = 0;
         for (int i = 0; i < m->n; i++) {
             if (strcmp(m->names[i], e->d_name) == 0) {
@@ -2410,8 +2497,8 @@ static int bcl_v_log_grep_since(const char *base, const BclLogMark *m,
                 break;   /* rotated/truncated file: rescan from 0 */
             }
         }
-        FILE *f = fopen(p, "r");
-        if (!f) continue;
+        FILE *f = fdopen(lfd, "r");
+        if (!f) { close(lfd); continue; }
         size_t cap = 65536, got = 0;
         char *buf = malloc(cap);
         int failure = 0;
@@ -2595,13 +2682,7 @@ static int test_bitmap_cache_selfhold_vacuum_run(void) {
         }
         if (seam_ok != 1) {
             /* Failure evidence: dump the captured startup output. */
-            char cmd[900];
-            snprintf(cmd, sizeof(cmd),
-                     "ls -la %s/logs 2>/dev/null; echo == captured stderr:; "
-                     "cat %s 2>/dev/null | head -20",
-                     bcl_v_base, cap_path);
-            TAP_DIAG("# logs dump:\n");
-            ASSERT_EQ_INT(system(cmd), 0, "logs dump (failure evidence)");
+            bcl_dump_failure_evidence(bcl_v_base, cap_path);
         }
         ASSERT_EQ_INT(seam_ok, 1,
                       "startup diagnostic shows cap16/slots32/threshold16");
@@ -2684,11 +2765,11 @@ static int test_bitmap_cache_selfhold_vacuum_run(void) {
     BCL_BUDGET_GATE("post-refusal checks");
     /* Phase 3 — after refusal: nothing published, everything intact. */
     {
-        char cmd[1200];
-        snprintf(cmd, sizeof(cmd),
-                 "test -z \"$(find %s/%s/%s/indexes -name '.bmfix-*' -o -name '*.bm.remap' 2>/dev/null)\"",
+        char obj_dir_chk[PATH_MAX];
+        snprintf(obj_dir_chk, sizeof(obj_dir_chk), "%s/%s/%s",
                  bcl_v_root, BCL_V_DIR, BCL_V_OBJECT);
-        ASSERT_EQ_INT(system(cmd), 0, "no bmfix markers or remap temporaries after refusal");
+        ASSERT_EQ_INT(bcl_indexes_clean_of_txn_artifacts(obj_dir_chk), 0,
+                      "no bmfix markers or remap temporaries after refusal");
     }
     {
         BclSnapshot snap2;
@@ -2792,9 +2873,7 @@ cleanup:
     if (bcl_v_env.daemon_pid > 0)
         test_env_stop(&bcl_v_env);
     if (bcl_v_base[0]) {
-        char cmd[700];
-        snprintf(cmd, sizeof(cmd), "rm -rf %s", bcl_v_base);
-        ASSERT_EQ_INT(system(cmd), 0, "vacuum fixture cleanup (own tmp tree)");
+        ASSERT_EQ_INT(bcl_rmrf(bcl_v_base), 0, "vacuum fixture cleanup (own tmp tree)");
     }
     bcl_v_snapshot_free(&snap1);
     test_fixture_set_start_deadline_ms(prev_deadline);
@@ -2965,9 +3044,10 @@ out:
     if (env.db_root[0]) {
         const char *slash = strrchr(env.db_root, '/');
         if (slash && slash != env.db_root) {
-            char cmd[600];
-            snprintf(cmd, sizeof(cmd), "rm -rf %.*s", (int)(slash - env.db_root), env.db_root);
-            (void)system(cmd);
+            char base_dir[PATH_MAX];
+            snprintf(base_dir, sizeof(base_dir), "%.*s",
+                     (int)(slash - env.db_root), env.db_root);
+            (void)bcl_rmrf(base_dir);
         }
     }
     test_fixture_set_start_deadline_ms(prev);
@@ -2987,9 +3067,10 @@ static int bcl_fw_legacy_child(void) {
     if (env.db_root[0]) {
         const char *slash = strrchr(env.db_root, '/');
         if (slash && slash != env.db_root) {
-            char cmd[600];
-            snprintf(cmd, sizeof(cmd), "rm -rf %.*s", (int)(slash - env.db_root), env.db_root);
-            if (system(cmd) != 0) return 12;
+            char base_dir[PATH_MAX];
+            snprintf(base_dir, sizeof(base_dir), "%.*s",
+                     (int)(slash - env.db_root), env.db_root);
+            if (bcl_rmrf(base_dir) != 0) return 12;
         }
     }
     return rc == 0 ? 0 : 11;
@@ -3201,9 +3282,7 @@ static int test_bitmap_cache_harness_errors_run(void) {
     }
     ASSERT_TRUE(refused, "watchdog terminates parked descendant listener");
     ASSERT_EQ_INT(bcl_harness_owner_death(), 0, "enclosing owner death terminates private helpers");
-    char cmd[300];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", bcl_mx_dir);
-    ASSERT_EQ_INT(system(cmd), 0, "harness fixture cleanup");
+    ASSERT_EQ_INT(bcl_rmrf(bcl_mx_dir), 0, "harness fixture cleanup");
     return t_ctx->failed > 0 ? 1 : 0;
 }
 

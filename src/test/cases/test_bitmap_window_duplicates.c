@@ -18,6 +18,7 @@
    and close, which is the whole mechanism. Runs in its own daemon and
    tmpdir. */
 #include "test_runner.h"
+#include "bappend.h"
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
@@ -57,7 +58,7 @@ static int bwd_bulk(Bwd *b, int from, int to) {
     size_t n = (size_t)snprintf(req, cap,
         "{\"mode\":\"bulk-insert\",\"dir\":\"bwd\",\"object\":\"t\",\"records\":[");
     for (int i = from; i < to; i++) {
-        n += (size_t)snprintf(req + n, cap - n,
+        n = tappendf(req, cap, n,
             "%s{\"key\":\"k%05d\",\"value\":{\"flag\":%s,\"kind\":\"%s\",\"n\":%d}}",
             i > from ? "," : "", i, b->flag[i] ? "true" : "false",
             b->kind[i] == 0 ? "a" : b->kind[i] == 1 ? "b" : "c", i);

@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE 700
 #include "test_runner.h"
 #include "test_assert.h"
+#include "bappend.h"
 #include "typed_row.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -37,7 +38,7 @@ static void c_cells(void){
     char all[256],expected[1600];size_t pos=0;
     for(int i=0;i<256;i++){
         all[i]=(char)i;
-        if(i<32||i==127)pos+=(size_t)snprintf(expected+pos,sizeof(expected)-pos,"\\u00%02x",i);
+        if(i<32||i==127)pos=tappendf(expected,sizeof(expected),pos,"\\u00%02x",i);
         else if(i=='\\'){expected[pos++]='\\';expected[pos++]='\\';}
         else if(i=='"'){expected[pos++]='"';expected[pos++]='"';}
         else expected[pos++]=(char)i;
