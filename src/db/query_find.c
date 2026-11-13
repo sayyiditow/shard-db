@@ -2171,7 +2171,12 @@ static int rebuild_bitmap_indexes(const char *db_root, const char *object,
         /* A stale spec for a field that no longer exists is not ours to
            rebuild (cmd_add_indexes would refuse the whole request). */
         if (!ps.is_composite && typed_field_index(ts, ps.name) < 0) continue;
-        if (n >= MAX_FIELDS || strchr(line, '"') || strchr(line, '\\')) { rc = -1; break; }
+        /* pos is bounded by construction (MAX_FIELDS appends of at most
+           sizeof(line) bytes each never reach cap), but re-check it here so
+           `cap - pos` cannot underflow if a size above ever changes — and so
+           the size argument is not seen as derived-from-return-value. */
+        if (n >= MAX_FIELDS || pos + sizeof(line) + 4 > cap ||
+            strchr(line, '"') || strchr(line, '\\')) { rc = -1; break; }
         pos += (size_t)snprintf(json + pos, cap - pos, "%s\"%s\"", n ? "," : "", line);
         n++;
     }
