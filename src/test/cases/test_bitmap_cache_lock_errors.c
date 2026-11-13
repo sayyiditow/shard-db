@@ -26,8 +26,9 @@
  *                                        bitmap bytes unchanged, and full
  *                                        recovery after an ordinary-capacity
  *                                        restart. Runs under a 150 s work
- *                                        budget + 30 s cleanup reserve with
- *                                        the fixtures' opt-in startup deadline.
+ *                                        budget (600 s in sanitizer builds)
+ *                                        + 30 s cleanup reserve with the
+ *                                        fixtures' opt-in startup deadline.
  *   test-bitmap-cache-fixture-watchdog — deterministic proof of the opt-in
  *                                        readiness watchdog: a parking stub is
  *                                        bounded by an absolute deadline, an
@@ -67,12 +68,21 @@
 
 /* ───────────────────────── child runner + stages ───────────────────────── */
 
-#define BCL_UNIT_CHILD_TIMEOUT_MS 30000
+/* Sanitizer builds widen the time limits (as test_runner.c widens its
+ * per-case watchdog to 1200 s): under TSan the post-vacuum CRUD child alone
+ * runs past 30 s and a light vacuum past 3 s, on CPU, with no lock wait. */
+#if defined(BUILD_TSAN) || defined(BUILD_ASAN)
+#define BCL_SAN_WIDE 1
+#else
+#define BCL_SAN_WIDE 0
+#endif
+#define BCL_UNIT_CHILD_TIMEOUT_MS (BCL_SAN_WIDE ? 120000 : 30000)
 #define BCL_POLL_SLICE_MS         50
 
-/* Integration budget: 150 s of work, then up to 30 s reserved for cleanup;
- * the external wrapper allows 240 s. */
-#define BCL_WORK_BUDGET_MS     150000
+/* Integration budget: 150 s of work (600 s in sanitizer builds), then up to
+ * 30 s reserved for cleanup; both fit the runner's per-case watchdog
+ * (180 s, or 1200 s in sanitizer builds). */
+#define BCL_WORK_BUDGET_MS     (BCL_SAN_WIDE ? 600000 : 150000)
 #define BCL_CLEANUP_RESERVE_MS 30000
 
 static __thread int bcl_stage_fd = -1;
@@ -1712,7 +1722,7 @@ static int bcl_v_parser_selfcheck_child(void) {
 #define BCL_V_FIELDS   40
 #define BCL_V_ROWS     400
 #define BCL_V_SPLITS   8
-#define BCL_V_IO_MS    3000
+#define BCL_V_IO_MS    (BCL_SAN_WIDE ? 30000 : 3000)
 
 static TestEnv bcl_v_env;
 static TestClient *bcl_v_tc;

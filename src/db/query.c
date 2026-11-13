@@ -1368,7 +1368,7 @@ static void *shard_count_worker(void *arg) {
          * count-gap test can queue a mutation writer on this shard before
          * the batch fetch re-acquires the same kfcache entry. One-shot:
          * disarmed on first hit so every later count passes through. */
-        slotcask_test_count_gap_park();
+        slotcask_test_count_gap_park(1);
 #endif
     }
 
@@ -1383,6 +1383,25 @@ static void *shard_count_worker(void *arg) {
         kfcache_release(&kh);
         memset(&kh, 0, sizeof(kh));
     }
+    /* The bitmap readers must die with it: pass 2 never reads them, and
+     * the batch fetch takes kf readers. Holding a shard's bitmap readers
+     * while waiting on its kf lock inverts the kf -> bitmap order bulk
+     * insert uses (kf writer, then the window's bitmap writers), and the
+     * two deadlock on the same shard. */
+    {
+        BitmapShard *held[MAX_INTERSECT_LEAVES] = {0};
+        for (int b = 0; b < sc->n_bm_postfilter; b++) held[b] = (BitmapShard *)sc->bm_handles[b];
+        bm_close_many(held, sc->n_bm_postfilter);
+        for (int b = 0; b < sc->n_bm_postfilter; b++) sc->bm_handles[b] = NULL;
+    }
+
+#ifdef TEST_BUILD
+    /* Regression seam (count/bulk-insert lock order): parks the worker
+     * after the probe reader is gone, right before the batch fetch takes
+     * kf readers again, so a test can queue a bulk insert on this shard
+     * (kf writer, then bitmap writer) inside that window. */
+    if (shard_id >= 0) slotcask_test_count_gap_park(2);
+#endif
 
     /* Pass 2: batch fetch all needs-fetch entries */
     if (n_need_fetch > 0) {
@@ -5236,7 +5255,7 @@ KeySet *build_keyset_from_leaf_ck(const char *db_root, const char *object,
 #ifdef TEST_BUILD
         /* Armed countdown (atomic): the worker whose tick reaches 0 sees
            the allocation fail with ENOMEM. */
-        if (g_keyset_leaf_test_fail_alloc > 0 &&
+        if (__atomic_load_n(&g_keyset_leaf_test_fail_alloc, __ATOMIC_ACQUIRE) > 0 &&
             __atomic_sub_fetch(&g_keyset_leaf_test_fail_alloc, 1,
                                __ATOMIC_ACQ_REL) == 0) {
             errno = ENOMEM;

@@ -6,6 +6,13 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**Fix: a bitmap-filtered count no longer deadlocks with a concurrent bulk insert.**
+An indexed `count` with bitmap post-filters kept the shard's bitmap read locks while its record fetch
+took that shard's keyfile lock again, the reverse of the keyfile-then-bitmap order bulk insert uses.
+A bulk insert on the same shard in that window hung both requests (and every later writer on the
+shard). The count now releases its bitmap locks together with its keyfile probe lock before the
+fetch. No wire/CLI/config/on-disk change.
+
 **Count-ranked top-N aggregates stream again with exact extras; tie order is defined.**
 A top-N aggregate ranked by `count(*)` that also asks for `count(g)`, `sum/avg/min/max(g)` on the
 group field (numeric, index-exact; not `sum`/`avg` over `float`/`double`, and not `count(g)` on

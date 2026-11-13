@@ -1413,8 +1413,13 @@ static int bmf_saturation_child(void) {
     BMF_CHECK(errno == EBUSY, 8, "saturation failure must report EBUSY");
     bmf_stage("17th-rejected");
 
-    bm_close(held[0]);
-    held[0] = NULL;
+    /* Release the most recently opened handle: the retry reuses its cache
+       slot (and that slot's rwlock) while held[0..14] stay held — the same
+       relative order they were taken in. Releasing held[0] instead makes
+       TSan see the reused slot lock re-taken after locks it preceded (a
+       lock-order false positive: one thread, readers only). */
+    bm_close(held[15]);
+    held[15] = NULL;
     bm17 = bm_open(path17, 0, 0, 0, 0, 0);
     BMF_CHECK(bm17 != NULL, 9, "retry after release must succeed");
     BMF_CHECK(bm_handle_cached(bm17) == 1, 10, "post-release retry must be cached");
@@ -1423,7 +1428,7 @@ static int bmf_saturation_child(void) {
     bm_close(bm17);
     bmf_stage("retry-cached-ok");
 
-    for (int i = 1; i < 16; i++)
+    for (int i = 0; i < 15; i++)
         if (held[i]) bm_close(held[i]);
     bmf_child_cache_teardown();
     bmf_rmtree_flat(base);

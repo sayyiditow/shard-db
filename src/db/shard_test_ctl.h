@@ -113,7 +113,10 @@ extern _Atomic int g_shard_test_count_gap_hit;
    test_control.c, which installs the hook that talks to the runner. */
 typedef void (*shard_db_test_count_gap_fn)(void *ctx);
 void shard_db_test_set_count_gap_hook(shard_db_test_count_gap_fn fn, void *ctx);
-void slotcask_test_count_gap_park(void);
+/* site 1 = after pass-1 with the probe reader held (INSTALL kind 1);
+   site 2 = after the probe reader is released, before the pass-2 batch
+   fetch (INSTALL kind 4). g_shard_test_count_gap holds the armed site. */
+void slotcask_test_count_gap_park(int site);
 /* Guard-check park hook (conditional-writes F2, control-channel kind 3 /
    REACHED phase 4): parks a guarded write AFTER its guard check passed —
    the caller holds shared objlock and every writer gate there — so a

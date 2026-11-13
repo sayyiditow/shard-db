@@ -37,11 +37,14 @@ enum {
 
 /* INSTALL message phase selects which daemon-side hook to arm.
    0 = legacy slotcask after-old hook; 1 = count-worker pass-1 gap;
-   2 = find-flush gate (batch-fetch park). */
+   2 = find-flush gate (batch-fetch park); 3 = guard check;
+   4 = count-worker gap after the probe reader is released. Both count
+   gaps report REACHED phase 2. */
 #define TEST_HOOK_KIND_AFTER_OLD 0
 #define TEST_HOOK_KIND_COUNT_GAP 1
 #define TEST_HOOK_KIND_FIND_FLUSH_GATE 2
 #define TEST_HOOK_KIND_GUARD_CHECK 3
+#define TEST_HOOK_KIND_COUNT_GAP_LATE 4
 /* TEST_HOOK_SET_GLOBALS phase selectors (runner-side wrappers in
    fixtures.c duplicate these by convention). */
 #define TEST_HOOK_SET_GLOBALS_KF_SEAMS 0
@@ -233,8 +236,11 @@ static void *test_control_thread_main(void *arg) {
 
         switch (msg.kind) {
         case TEST_HOOK_INSTALL:
-            if (msg.phase == TEST_HOOK_KIND_COUNT_GAP) {
-                atomic_store(&g_shard_test_count_gap, 1);
+            if (msg.phase == TEST_HOOK_KIND_COUNT_GAP ||
+                msg.phase == TEST_HOOK_KIND_COUNT_GAP_LATE) {
+                /* the armed value is the park site (1 or 2) */
+                atomic_store(&g_shard_test_count_gap,
+                             msg.phase == TEST_HOOK_KIND_COUNT_GAP ? 1 : 2);
                 atomic_store(&g_shard_test_count_gap_hit, 0);
                 shard_db_test_set_count_gap_hook(test_control_count_gap_block,
                                                  c);

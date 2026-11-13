@@ -29,7 +29,11 @@ bitmap rebuild use the same acquisition order.
 Opening the bitmap first is forbidden even for read/read nesting. A concurrent
 CRUD writer can hold the kfcache wrlock while waiting for the bitmap wrlock; a
 reader holding the bitmap rdlock while waiting for the kfcache rdlock would
-complete an AB-BA deadlock.
+complete an AB-BA deadlock. The same holds after releasing a kfcache lock: a
+path that dropped its kfcache entry must drop its bitmap handles too before it
+takes any kfcache lock again. The indexed count with bitmap post-filters
+(`shard_count_worker`) releases its pass-1 kf probe reader and its bitmap
+readers together before the pass-2 record fetch, which takes kf readers.
 
 Keyfile rebuilds (growth resplit, vacuum compaction) follow the same order: `kfcache_resplit_locked` holds the kf entry wrlock and takes each affected bitmap shard's wrlock, applying the slot-remapped images in place, so no reader can observe a new keyfile with old bitmap bits.
 

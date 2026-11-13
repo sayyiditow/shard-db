@@ -101,8 +101,8 @@ void shard_db_test_set_count_gap_hook(shard_db_test_count_gap_fn fn,
     pthread_mutex_unlock(&g_count_gap_hook_lock);
 }
 
-void slotcask_test_count_gap_park(void) {
-    if (!atomic_load(&g_shard_test_count_gap) ||
+void slotcask_test_count_gap_park(int site) {
+    if (atomic_load(&g_shard_test_count_gap) != site ||
         atomic_fetch_add(&g_shard_test_count_gap_hit, 1) != 0)
         return;
     atomic_store(&g_shard_test_count_gap, 0); /* one-shot: disarm on hit */
