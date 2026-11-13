@@ -2249,10 +2249,21 @@ int rebuild_object_v2(const char *db_root, const char *object,
             }
         }
     }
-    RebuildTxn *txn = rebuild_txn_begin(
-        db_root, object, old_sch->splits, old_sch->streams,
-        splits_changed ||
-        (finalize && finalize->indexes_may_change));
+    /* indexes_may_change must be durable from BEGIN, not from the first
+       explicit index write: the walk re-inserts every record into a fresh
+       keyfile whose shards grow in place (small initial tier), and every
+       kf growth runs kfcache_resplit_locked, which remaps the object's
+       live .bm files to the new slot numbering. A crash (or txn_fail)
+       before rebuild_bitmap_indexes runs would otherwise roll the kf back
+       while leaving those remapped bitmaps in place — recovery skipped
+       the rebuild against the restored keyfile and finds via bitmap
+       returned wrong rows (found via SIGKILL-during-walk repro: meta
+       showed indexes_may_change=0, .bm 000/001 already remapped, kf
+       restored byte-identical, post-recovery bitmap finds short).
+       Recovery cost is paid only on the abort path, where a full reindex
+       of the restored object is cheap relative to the rebuild itself. */
+    RebuildTxn *txn = rebuild_txn_begin(db_root, object,
+                                        old_sch->splits, old_sch->streams, 1);
     if (!txn) {
         OUT("{\"error\":\"Failed to begin rebuild transaction\"}\n");
         return 1;

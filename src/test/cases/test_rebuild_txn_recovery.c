@@ -670,7 +670,20 @@ static int append_kf_seam_config(const char *db_root, int slots) {
     return fclose(f);
 }
 
-static int test_pk_bitmap_after_indexes(void) {
+/* Shared body of the packed-bitmap crash tests. pause_wait_ms selects where
+   the SIGKILL lands:
+   - 60000: wait for the after-indexes pause marker (the designated crash
+     point the transaction guards with its own durable evidence), then kill.
+   - short (10): deliberately mistime the wait so the kill lands while the
+     rebuild walk is still running — BEFORE rebuild_bitmap_indexes has
+     durably recorded indexes_may_change. Regression window for the
+     walk-time kf-growth bitmap remap: growth (kfcache_resplit_locked)
+     rewrites the live .bm files against the NEW keyfile numbering, and a
+     rollback without a recorded indexes_may_change used to restore the
+     keyfile but skip the index rebuild, leaving stale bitmaps (bitmap
+     finds short by hundreds of rows). expect_pause_reached distinguishes
+     the two kill policies for assertion 14. */
+static int pk_bitmap_after_indexes_run(int pause_wait_ms, int expect_pause_reached) {
     TestEnv env = {0};
     if (test_env_start(&env) != 0) return 1;
     int saved_port = env.port;
@@ -733,14 +746,22 @@ static int test_pk_bitmap_after_indexes(void) {
     ASSERT_TRUE(child > 0, "spawn request");
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker), "%s/default/bmc/.rebuild-test-after-indexes.active", root);
-    ASSERT_EQ_INT(wait_for_path(marker, 60000), 0, "rebuild reaches the post-index pause");
+    int pause_rc = wait_for_path(marker, pause_wait_ms);
+    if (expect_pause_reached)
+        ASSERT_EQ_INT(pause_rc, 0, "rebuild reaches the post-index pause");
     test_env_kill(&env);
     unlink(marker);
     if (child > 0) waitpid(child, NULL, 0);
     ASSERT_EQ_INT(test_env_start_at(&env, root, saved_port), 0, "restart recovers");
     if (env.daemon_pid > 0) {
         char *conf1 = tu_read_file(fpath);
-        ASSERT_TRUE(conf0 && conf1 && strcmp(conf0, conf1) == 0, "rollback restores fields.conf");
+        /* The early kill can land after the commit point on a fast host: the
+           transaction then completed and fields.conf legitimately carries the
+           added field. Both outcomes must leave every bitmap consistent with
+           the served keyfile and every row intact. */
+        ASSERT_TRUE(conf0 && conf1 &&
+                    (strcmp(conf0, conf1) == 0 || strstr(conf1, "extra:int")),
+                    "fields.conf is either rolled back or committed");
         for (int c = 0; c < 4; c++) {
             char v[8]; snprintf(v, sizeof(v), "c%d", c);
             ASSERT_EQ_INT(bitmap_count(&env, "kind", v), base[c], "bitmap rebuilt against the restored keyfile");
@@ -750,6 +771,18 @@ static int test_pk_bitmap_after_indexes(void) {
     }
     free(conf0);
     return t_ctx->failed > 0 ? 1 : 0;
+}
+
+static int test_pk_bitmap_after_indexes(void) {
+    return pk_bitmap_after_indexes_run(60000, 1);
+}
+
+/* SIGKILL during the rebuild walk, before rebuild_bitmap_indexes records
+   indexes_may_change — the exact window where the walk's kf-growth remap
+   leaves live .bm files at the new slot numbering while the meta still
+   promises the indexes never changed. */
+static int test_pk_bitmap_before_index_flag(void) {
+    return pk_bitmap_after_indexes_run(10, 0);
 }
 
 #define PACKED_CRASH(name, op, phase) \
@@ -790,3 +823,4 @@ TEST_REGISTER("test-rebuild-txn-packed-compact-after-walk", test_pk_compact_walk
 TEST_REGISTER("test-rebuild-txn-packed-compact-after-metadata", test_pk_compact_meta)
 TEST_REGISTER("test-rebuild-txn-packed-compact-after-commit", test_pk_compact_commit)
 TEST_REGISTER("test-rebuild-txn-packed-bitmap-after-indexes", test_pk_bitmap_after_indexes)
+TEST_REGISTER("test-rebuild-txn-packed-bitmap-before-index-flag", test_pk_bitmap_before_index_flag)
