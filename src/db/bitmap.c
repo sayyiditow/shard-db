@@ -34,6 +34,12 @@ static void bm_lock_order_trace(const char *path, char op) {
 #endif
 #include <errno.h>
 
+/* Linux exposes EUCLEAN for detected on-disk corruption; Darwin does not.
+   Same alias as slotcask.c — bitmap metadata corruption reports as EIO. */
+#ifndef EUCLEAN
+#define EUCLEAN EIO
+#endif
+
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
@@ -1495,8 +1501,13 @@ int bm_slotmap_stage(BitmapShard *bm, const char *tmp_path, BmSlotmapStage *st) 
     if (len > bm->mmap_size) {
         /* Reserve the blocks now: a later store into a sparse hole could
            otherwise fault with SIGBUS on ENOSPC at apply time. Filesystems
-           without fallocate fall back to a plain extend. */
+           without fallocate fall back to a plain extend. macOS has no
+           posix_fallocate at all and takes the same plain extend. */
+#if defined(__APPLE__)
+        int fr = EOPNOTSUPP;
+#else
         int fr = posix_fallocate(bm->fd, 0, (off_t)len);
+#endif
         if (fr != 0 && fr != EOPNOTSUPP && fr != EINVAL) {
             munmap(src, len);
             errno = fr;
