@@ -135,6 +135,12 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Linux exposes EUCLEAN for detected on-disk corruption; Darwin does not
+   (same alias as slotcask.c and bitmap.c). */
+#ifndef EUCLEAN
+#define EUCLEAN EIO
+#endif
+
 /* ───────────────────────── child runner + stages ───────────────────────── */
 
 #define BMF_UNIT_CHILD_TIMEOUT_MS 30000

@@ -34,7 +34,25 @@
    below the production 5000 so unmodified code still fails the upper
    assertion; the held-window guard 2000 leaves >= 1500 ms of runway for
    the held 512-record request. */
-#define BR_BACKOFF_MS 3500
+/* The seam and the window margins scale under sanitizer builds: TSan/ASan
+   inflate per-request wall time 10-40x on loaded CI runners, which eats the
+   fixed 1200 ms margin the release bounds rely on. Release builds keep the
+   strict bounds — the 4700 ms ceiling must stay below the production 5000 ms
+   back-off so an unmodified back-off still fails the assertion. Under
+   sanitizers the seam is raised ABOVE production instead: an ignored-seam
+   daemon retries at ~production+latency and fails the waited >= seam bound,
+   so every negative case stays detected. */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define BR_BACKOFF_MS    9000   /* seam: above the production 5000 ms */
+#define BR_WINDOW_MS    30000   /* hang guard, absorbs sanitizer latency */
+#define BR_REQ_MARGIN    9000   /* one faulted bulk request + checks */
+#define BR_SEQ_MARGIN   11000   /* two sequential requests + checks */
+#else
+#define BR_BACKOFF_MS    3500
+#define BR_WINDOW_MS     4700   /* < production 5000: unmodified code must fail */
+#define BR_REQ_MARGIN    1000
+#define BR_SEQ_MARGIN    2000
+#endif
 
 typedef struct { int flag; int kind; int live; } BrRow;
 static const char *const br_kind[] = { "a", "b", "c" };
@@ -512,10 +530,10 @@ static int test_bitmap_resplit_fault_prepare(void) {
     ASSERT_EQ_INT(inserted, 0, "no record committed from rejected stages");
     ASSERT_EQ_INT(errors, 512, "every submitted record was rejected");
     long t_fail = br_now_ms();
-    ASSERT_TRUE(t_fail - t_req0 < 1000, "the faulted request left most of the back-off window");
+    ASSERT_TRUE(t_fail - t_req0 < BR_REQ_MARGIN, "the faulted request left most of the back-off window");
     ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, 0, 0), 0, "disarm");
     long t_disarm = br_now_ms();
-    ASSERT_TRUE(t_disarm - t_req0 < 2000,
+    ASSERT_TRUE(t_disarm - t_req0 < BR_SEQ_MARGIN,
                 "test is still inside the back-off window at the held-back-off check");
     ASSERT_EQ_INT(br_fault_stage_bulk(b, 220, 732, &inserted, &errors), 1,
                   "back-off still holds growth after the fault is disarmed");
@@ -535,7 +553,7 @@ static int test_bitmap_resplit_fault_prepare(void) {
        code (>= 5000 from t_req0) must still fail this assertion. */
     long waited = br_now_ms() - t_req0;
     ASSERT_TRUE(waited >= BR_BACKOFF_MS, "growth stayed held for the seam interval");
-    ASSERT_TRUE(waited < 4700, "retry succeeded within the shortened back-off window");
+    ASSERT_TRUE(waited < BR_WINDOW_MS, "retry succeeded within the shortened back-off window");
     ASSERT_EQ_INT(br_count(b->tc, "[]"), 732, "all rejected keys present after retry");
     br_check(b, "after retrying rejected keys");
     for (int from = 732; from < 1500; from += 170) {
@@ -570,10 +588,10 @@ static int test_bitmap_resplit_fault_rename(void) {
     ASSERT_EQ_INT(inserted, 0, "no record committed from rejected stages");
     ASSERT_EQ_INT(errors, 512, "every submitted record was rejected");
     long t_fail = br_now_ms();
-    ASSERT_TRUE(t_fail - t_req0 < 1000, "the faulted request left most of the back-off window");
+    ASSERT_TRUE(t_fail - t_req0 < BR_REQ_MARGIN, "the faulted request left most of the back-off window");
     ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, 0, 0), 0, "disarm");
     long t_disarm = br_now_ms();
-    ASSERT_TRUE(t_disarm - t_req0 < 2000,
+    ASSERT_TRUE(t_disarm - t_req0 < BR_SEQ_MARGIN,
                 "test is still inside the back-off window at the held-back-off check");
     ASSERT_EQ_INT(br_fault_stage_bulk(b, 220, 732, &inserted, &errors), 1,
                   "back-off still holds growth after the fault is disarmed");
@@ -589,7 +607,7 @@ static int test_bitmap_resplit_fault_rename(void) {
        same margin rules. */
     long waited = br_now_ms() - t_req0;
     ASSERT_TRUE(waited >= BR_BACKOFF_MS, "growth stayed held for the seam interval");
-    ASSERT_TRUE(waited < 4700, "retry succeeded within the shortened back-off window");
+    ASSERT_TRUE(waited < BR_WINDOW_MS, "retry succeeded within the shortened back-off window");
     ASSERT_EQ_INT(br_count(b->tc, "[]"), 732, "all rejected keys present after retry");
     br_check(b, "after retrying rejected keys");
     for (int from = 732; from < 1500; from += 170) {
@@ -836,6 +854,14 @@ static void br_seed_1500(Br *b) {
 typedef struct { char rel[24]; ino_t ino; struct timespec ctim; } BrInoEnt;
 typedef struct { BrInoEnt e[BR_INO_MAX]; int n; } BrInoSnap;
 
+/* ctime as a timespec: Darwin names the member st_ctimespec. */
+static struct timespec br_st_ctim(const struct stat *st) {
+#if defined(__APPLE__)
+    return st->st_ctimespec;
+#else
+    return st->st_ctim;
+#endif
+}
 static void br_ino_scan(BrInoSnap *s, const char *dir, const char *relprefix) {
     DIR *d = opendir(dir);
     if (!d) return;
@@ -848,7 +874,7 @@ static void br_ino_scan(BrInoSnap *s, const char *dir, const char *relprefix) {
         BrInoEnt *e = &s->e[s->n++];
         snprintf(e->rel, sizeof(e->rel), "%s/%s", relprefix, de->d_name);
         e->ino = st.st_ino;
-        e->ctim = st.st_ctim;
+        e->ctim = br_st_ctim(&st);
     }
     closedir(d);
 }

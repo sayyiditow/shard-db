@@ -37,6 +37,30 @@ static int sg_is_err(const char *resp) { return resp && strstr(resp, "\"error\""
 
 static void sg_free(char *r) { shard_db_free_result(r); }
 
+/* Formerly GCC nested functions inside sg_criteria/sg_update; clang (macOS)
+   rejects the extension. They capture nothing — file-scope statics over
+   sg_req/sg_free are equivalent. */
+static long count_of(const char *crit) {
+    char q[512], *cr;
+    snprintf(q, sizeof q,
+             "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"sg\",\"criteria\":%s}",
+             crit);
+    cr = sg_req(q);
+    long v = cr ? strtol(cr, NULL, 10) : -1;
+    sg_free(cr);
+    return v;
+}
+static long count_on(const char *obj, const char *crit) {
+    char q[512], *cr;
+    snprintf(q, sizeof q,
+             "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"%s\",\"criteria\":%s}",
+             obj, crit);
+    cr = sg_req(q);
+    long v = cr ? strtol(cr, NULL, 10) : -1;
+    sg_free(cr);
+    return v;
+}
+
 /* Insert one single-field record, then read it back and assert the rendered
  * fragment. want_err != NULL → the insert must fail with that fragment and
  * the record must not exist. Otherwise assert insert succeeded and get
@@ -299,16 +323,6 @@ static void sg_bulk_routes(void) {
    (asserted as 0-rows here, flipped to error there). */
 static void sg_criteria(void) {
     char req[512];
-    long count_of(const char *crit) {
-        char q[512], *cr;
-        snprintf(q, sizeof q,
-                 "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"sg\",\"criteria\":%s}",
-                 crit);
-        cr = sg_req(q);
-        long v = cr ? strtol(cr, NULL, 10) : -1;
-        sg_free(cr);
-        return v;
-    }
     /* invalid literals error with the same field-named message as writes. */
     char *r = sg_req("{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"sg\","
                      "\"criteria\":[{\"field\":\"d\",\"op\":\"eq\",\"value\":\"2024-02-30\"}]}");
@@ -515,16 +529,6 @@ static void sg_indexed_vs_scan(void) {
               "{\"key\":\"f\",\"value\":{\"b\":\"no\",\"e\":\"green\"}}]}");
         ASSERT_TRUE(r && !strstr(r, "some_records_dropped"), "twin rows insert");
         sg_free(r);
-    }
-    long count_on(const char *obj, const char *crit) {
-        char q[512], *cr;
-        snprintf(q, sizeof q,
-                 "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"%s\",\"criteria\":%s}",
-                 obj, crit);
-        cr = sg_req(q);
-        long v = cr ? strtol(cr, NULL, 10) : -1;
-        sg_free(cr);
-        return v;
     }
     struct { const char *crit; const char *label; } qs[] = {
         {"[{\"field\":\"b\",\"op\":\"eq\",\"value\":\"yes\"}]",  "eq yes"},

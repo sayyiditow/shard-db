@@ -1,4 +1,7 @@
 #define _XOPEN_SOURCE 700
+/* Darwin: keep the BSD surface (mkdtemp, funopen) visible despite the
+   strict-POSIX _XOPEN_SOURCE above; the macro is inert elsewhere. */
+#define _DARWIN_C_SOURCE
 #include "test_runner.h"
 #include "test_assert.h"
 #include "typed_row.h"
