@@ -2769,12 +2769,13 @@ static int test_bitmap_cache_selfhold_vacuum_run(void) {
             int poll_ms = 5000;
             if (bcl_budget_anchor && bcl_work_remaining_ms() < poll_ms)
                 poll_ms = (int)bcl_work_remaining_ms();
+            int diag_ok = 1;
 #if !defined(__APPLE__)
             /* Apple's pthread_rwlock does not reproduce glibc's self-held
                blocking-wrlock EDEADLK (it may grant the recursion), so the
                drop-wait acquisition diagnostic is Linux-semantics; the rest
                of the case still runs there. */
-            int diag_ok = bcl_v_log_poll(bcl_v_base, &mark2, acquire_needle, poll_ms);
+            diag_ok = bcl_v_log_poll(bcl_v_base, &mark2, acquire_needle, poll_ms);
             ASSERT_EQ_INT(diag_ok, 1,
                           "drop-wait acquisition diagnostic logged (EDEADLK)");
 #else
