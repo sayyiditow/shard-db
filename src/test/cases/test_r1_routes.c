@@ -145,8 +145,26 @@ static void r_schema_routes(void){
     tc_request(client,"{\"mode\":\"create-object\",\"dir\":\"r1\",\"object\":\"wronglayout\",\"declaration_layout\":\"packed\",\"fields\":[\"x:numeric:26,10\"]}",&response);
     ASSERT_CONTAINS(response,"\"status\":\"created\"","packed declaration creates a packed object (R5)");free(response);
     tc_request(client,"{\"mode\":\"describe-object\",\"dir\":\"r1\",\"object\":\"wronglayout\"}",&response);
-    ASSERT_CONTAINS(response,"\"declaration_layout\":\"packed\"","packed object never described as legacy");free(response);
-    tc_request(client,"{\"mode\":\"create-object\",\"dir\":\"r1\",\"object\":\"streamloss\",\"declaration_layout\":\"packed\",\"streams\":3,\"fields\":[\"x:int\"]}",&response);
+    ASSERT_CONTAINS(response,"\"declaration_layout\":\"packed\"","packed object never described as legacy");
+    /* The explicit-streams refusal is host-relative: the request is refused
+       when it differs from slotcask_streams_for_nproc(), not because any
+       fixed value is illegal. Read the host count back from the describe
+       response and ask for one more — the old hard-coded "3" was the LEGAL
+       host count on 3-vCPU macOS runners, so the create legitimately
+       succeeded there. */
+    long host_streams = -1;
+    {
+        const char *sp = response ? strstr(response, "\"streams\":") : NULL;
+        if (sp) host_streams = strtol(sp + strlen("\"streams\":"), NULL, 10);
+    }
+    ASSERT_TRUE(host_streams > 0, "describe reports the host stream count");
+    free(response);
+    char streamloss_req[512];
+    snprintf(streamloss_req, sizeof streamloss_req,
+             "{\"mode\":\"create-object\",\"dir\":\"r1\",\"object\":\"streamloss\","
+             "\"declaration_layout\":\"packed\",\"streams\":%ld,\"fields\":[\"x:int\"]}",
+             host_streams + 1);
+    tc_request(client,streamloss_req,&response);
     ASSERT_CONTAINS(response,"\"error\"","unsupported imported stream count never silently replaced");free(response);
     tc_close(client);test_env_stop(&env);
 }

@@ -771,7 +771,11 @@ static void br_env_append(const char *root, const char *line) {
                   0, "append db.env knob");
 }
 static void br_env_remove_line(const char *root, const char *pattern) {
-    ASSERT_EQ_INT(tu_run_cmd("sed -i '/%s/d' \"$(dirname '%s')/db.env\"", pattern, root),
+    /* GNU `sed -i 'cmd' file` has no BSD equivalent (BSD -i takes the
+       suffix argument the pattern would occupy). grep -v + mv is portable;
+       db.env always keeps other lines so grep exits 0. */
+    ASSERT_EQ_INT(tu_run_cmd("grep -v '%s' \"$(dirname '%s')/db.env\" > \"$(dirname '%s')/db.env.tmp\" && mv \"$(dirname '%s')/db.env.tmp\" \"$(dirname '%s')/db.env\"",
+                             pattern, root, root, root, root),
                   0, "remove db.env knob");
 }
 
@@ -1517,7 +1521,8 @@ static int test_bmfix_test_knobs_independent(void) {
     tc_close(b->tc);
     b->tc = NULL;
     test_env_stop_keep(&b->env);
-    ASSERT_EQ_INT(tu_run_cmd("sed -i '/INDEX_TEST_FAIL_NEXT_BUILD/d' \"$(dirname '%s')/db.env\"", root),
+    ASSERT_EQ_INT(tu_run_cmd("grep -v INDEX_TEST_FAIL_NEXT_BUILD \"$(dirname '%s')/db.env\" > \"$(dirname '%s')/db.env.tmp\" && mv \"$(dirname '%s')/db.env.tmp\" \"$(dirname '%s')/db.env\"",
+                             root, root, root, root),
                   0, "remove the build-knob line from db.env");
     br_env_append(root, "export BMFIX_REPAIR_TEST_FAIL_NEXT=5");
     br_seam_once(root);
