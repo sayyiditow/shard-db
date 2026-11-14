@@ -904,6 +904,11 @@ static void sg_packed(void) {
         }
         free(bytes);
     }
+    /* parse_field_type allocated the enum values ("red/green/blue" names +
+       array); release them like every other packed fixture teardown, or the
+       ASan gate reports a 39-byte leak (previously masked from LSan's
+       conservative stack scan by a stale frame pointer). */
+    for (int i = 0; i < ts->nfields; i++) free_enum_values(&ts->fields[i]);
     free(ts);
 }
 
