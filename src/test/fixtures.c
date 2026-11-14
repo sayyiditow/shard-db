@@ -39,8 +39,15 @@
    keep this deliberately equal). 90s: sanitizer builds and the 2026-11
    startup layout migration provably exceed the old 30s on loaded CI
    runners; on the dev workstation a normal start is ready in <2s, so
-   the raise only binds on genuinely slow hosts. */
+   the raise only binds on genuinely slow hosts. Sanitizer builds get
+   240s: the TSan migration startup (reindex of the whole fixture behind
+   TSan instrumentation) exceeded even 90s on a loaded runner while
+   measuring 8-9s locally. Guard form mirrors test_auto_reshard.c. */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define FIXTURE_READY_WAIT_MS 240000
+#else
 #define FIXTURE_READY_WAIT_MS 90000
+#endif
 
 typedef struct { int fd; struct timespec claimed; } PortReservation;
 static PortReservation g_port_reservations[PORT_RESERVE_MAX];
