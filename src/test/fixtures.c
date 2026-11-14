@@ -36,17 +36,19 @@
 #define PORT_RESERVE_MAX    64
 
 /* wait_daemon_ready budget for daemon spawns and restarts (both callers
-   keep this deliberately equal). 90s: sanitizer builds and the 2026-11
-   startup layout migration provably exceed the old 30s on loaded CI
-   runners; on the dev workstation a normal start is ready in <2s, so
-   the raise only binds on genuinely slow hosts. Sanitizer builds get
-   240s: the TSan migration startup (reindex of the whole fixture behind
-   TSan instrumentation) exceeded even 90s on a loaded runner while
-   measuring 8-9s locally. Guard form mirrors test_auto_reshard.c. */
+   keep this deliberately equal). Each raise tracks an observed expiry on
+   loaded CI runners, where a first start over a pre-migration root runs
+   the whole-object layout migration (full reindex) before serving: 30s
+   expired on 2026-11-13 (x86_64), 90s expired again on 2026-11-14 at the
+   same runner class. On the dev workstation a normal start is ready in
+   <2s, so the budget only binds on genuinely slow hosts. Sanitizer
+   builds get 240s: the TSan migration startup exceeded 90s on a loaded
+   runner while measuring 8-9s locally. Guard form mirrors
+   test_auto_reshard.c. */
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define FIXTURE_READY_WAIT_MS 240000
 #else
-#define FIXTURE_READY_WAIT_MS 90000
+#define FIXTURE_READY_WAIT_MS 180000
 #endif
 
 typedef struct { int fd; struct timespec claimed; } PortReservation;

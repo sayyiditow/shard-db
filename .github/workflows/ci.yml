@@ -17,10 +17,11 @@ jobs:
   build-and-test:
     name: Build & test (${{ matrix.os }} ${{ matrix.arch }})
     runs-on: ${{ matrix.runs-on }}
-    # 35m: the suite measured 25m+ on a loaded ubuntu-x86_64 runner with the
-    # slow-test exclusions already applied (the job was killed at exactly
-    # 25m on 2026-11-13); arm64 finishes in ~12m.
-    timeout-minutes: 35
+    # 50m: the x86_64 suite keeps needing more than each raise on loaded
+    # ubuntu-latest runners (killed at exactly 25m on 2026-11-13, at exactly
+    # 35m on 2026-11-14 with 613/685 case summaries printed at 32m -> full
+    # run ~36-43m at the observed pace); arm64 finishes in ~12m.
+    timeout-minutes: 50
     env:
       # test-runner-parallel's own nested run-all spawns a --jobs 4
       # sub-run internally, unrelated to the --jobs 2 outer setting below.

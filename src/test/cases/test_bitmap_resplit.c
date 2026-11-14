@@ -76,7 +76,13 @@ static char *br_q(Br *b, const char *fmt, ...) {
 }
 
 static int br_connect(Br *b) {
-    TestClientCfg cfg = { .port = b->env.port, .io_timeout_ms = 120000 };
+    TestClientCfg cfg = { .port = b->env.port, .io_timeout_ms = 300000 };
+    /* 300s: whole-object maintenance ops (reindex, startup repair) run
+       behind this client; under TSan on a loaded runner one case's
+       three reindexes pushed the last past the old 120s read
+       deadline (2026-11-14: case total 107s on CI, ~10s locally) and
+       the expired read returned NULL, failing the "reindex ignores
+       the repair knob" assertion. Only binds on slow hosts. */
     b->tc = tc_connect(&cfg);
     return b->tc ? 0 : -1;
 }
@@ -366,7 +372,13 @@ static int test_bitmap_resplit_marker_recovery(void) {
 typedef struct { int port; _Atomic int stop; int errors; int reads; int reversed; } BrReader;
 static void *br_reader_main(void *arg) {
     BrReader *rd = arg;
-    TestClientCfg cfg = { .port = rd->port, .io_timeout_ms = 120000 };
+    TestClientCfg cfg = { .port = rd->port, .io_timeout_ms = 300000 };
+    /* 300s: whole-object maintenance ops (reindex, startup repair) run
+       behind this client; under TSan on a loaded runner one case's
+       three reindexes pushed the last past the old 120s read
+       deadline (2026-11-14: case total 107s on CI, ~10s locally) and
+       the expired read returned NULL, failing the "reindex ignores
+       the repair knob" assertion. Only binds on slow hosts. */
     TestClient *tc = tc_connect(&cfg);
     if (!tc) { rd->errors++; return NULL; }
     const char *fwd = "[{\"field\":\"flag\",\"op\":\"eq\",\"value\":\"true\"},"
@@ -660,7 +672,13 @@ static int test_bitmap_resplit_fault_commit_unclean(void) { return br_run_fault_
 typedef struct { Br *b; int port; int from; int to; int rc; } BrChainArg;
 static void *br_chain_main(void *arg) {
     BrChainArg *a = arg;
-    TestClientCfg cfg = { .port = a->port, .io_timeout_ms = 120000 };
+    TestClientCfg cfg = { .port = a->port, .io_timeout_ms = 300000 };
+    /* 300s: whole-object maintenance ops (reindex, startup repair) run
+       behind this client; under TSan on a loaded runner one case's
+       three reindexes pushed the last past the old 120s read
+       deadline (2026-11-14: case total 107s on CI, ~10s locally) and
+       the expired read returned NULL, failing the "reindex ignores
+       the repair knob" assertion. Only binds on slow hosts. */
     TestClient *tc = tc_connect(&cfg);
     if (!tc) { a->rc = -1; return NULL; }
     for (int from = a->from; from < a->to; from += 150)
