@@ -351,7 +351,12 @@ static int test_bitmap_resplit_marker_recovery(void) {
     snprintf(marker, sizeof(marker), "%s/br/t/indexes/.bmfix-000", root);
     ASSERT_TRUE(tu_file_exists(bm), "flag shard-0 bitmap exists");
     /* bool bitmap: 32-byte header + 6-byte dict, bitmaps_off aligned to 40 */
-    ASSERT_EQ_INT(tu_run_cmd("sz=$(stat -c%%s '%s'); dd if=/dev/zero of='%s' bs=1 seek=40 "
+    /* `wc -c` is portable; GNU-only `stat -c%s` fails on BSD/macOS, leaving
+       sz empty so count=-40, which BSD dd wraps to a huge unsigned count
+       (runaway write until the watchdog). The `[ -gt 40 ]` guard keeps any
+       future size failure from reaching dd. */
+    ASSERT_EQ_INT(tu_run_cmd("sz=$(wc -c < '%s' | tr -d ' '); [ \"$sz\" -gt 40 ] && "
+                             "dd if=/dev/zero of='%s' bs=1 seek=40 "
                              "count=$((sz-40)) conv=notrunc 2>/dev/null", bm, bm), 0, "zero the bitmap body");
     ASSERT_EQ_INT(tu_run_cmd(": > '%s'", marker), 0, "plant the marker");
     br_persist_seam(root);
