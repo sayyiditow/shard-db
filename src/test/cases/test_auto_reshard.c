@@ -103,10 +103,92 @@ static int append_requestf(char *buf, size_t cap, size_t *off,
    correctness check (did it reshape / reach the right target) is unchanged
    either way. */
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
-#define RESHARD_WAIT_SCALE 6
+#define RESHARD_WAIT_SCALE 10
 #else
 #define RESHARD_WAIT_SCALE 3
 #endif
+
+/* Writes this file's fixture db.env. reshard_enable toggles in two phases:
+   seeding runs with AUTO_RESHARD_ENABLE=0 because the engine's reshard
+   sweep fires ONCE PER CALENDAR DAY (auto_reshard_thread's last_run_date
+   guard) about 5s after thread start — under sanitizer-slowed seeding the
+   sweep would otherwise see objects still below their reshape band, mark
+   the day consumed, and never run again, so no wait budget could ever be
+   long enough (found under ASan). The
+   phase-2 restart (enable=1) is a fresh daemon with a fresh daily guard,
+   so its one sweep runs against fully-seeded objects. throttle_ms <= 0
+   omits AUTO_RESHARD_THROTTLE_MS. */
+static void ar_write_env(const char *base, const char *db_root, int port,
+                         int hour, int enable, int throttle_ms) {
+    char env_path[300];
+    snprintf(env_path, sizeof(env_path), "%s/db.env", base);
+    FILE *f = fopen(env_path, "w");
+    if (!f) return;
+    fprintf(f,
+        "export DB_ROOT=\"%s\"\n"
+        "export PORT=%d\n"
+        "export TIMEOUT=0\n"
+        "export LOG_DIR=\"%s/logs\"\n"
+        "export LOG_LEVEL=3\n"
+        "export THREADS=2\n"
+        "export FCACHE_MAX=4096\n"
+        "export TLS_ENABLE=0\n"
+        "export AUTO_RESHARD_ENABLE=%d\n"
+        "export AUTO_RESHARD_HOUR=%d\n",
+        db_root, port, base, enable, hour);
+    if (throttle_ms > 0)
+        fprintf(f, "export AUTO_RESHARD_THROTTLE_MS=%d\n", throttle_ms);
+    fclose(f);
+}
+
+/* fork/exec + readiness probe for the fixture daemon. Returns 1 when the
+   daemon answers db-dirs; *out_pid receives the child pid for
+   test_env_stop_keep. Deliberately non-asserting: both phase starts'
+   results are combined into the case's single existing ready assertion so
+   the green-path assertion count is unchanged. */
+static int ar_start_daemon(const char *base, int port, pid_t *out_pid) {
+    char shard_db_abs[PATH_MAX];
+    const char *sdb_rel = "./build/bin/shard-db";
+    if (access(sdb_rel, X_OK) != 0) sdb_rel = "./shard-db";
+    if (!realpath(sdb_rel, shard_db_abs)) return 0;
+    pid_t pid = fork();
+    if (pid < 0) return 0;
+    if (pid == 0) {
+        chdir(base);
+        execl(shard_db_abs, shard_db_abs, "server", (char *)NULL);
+        _exit(127);
+    }
+    *out_pid = pid;
+    for (int i = 0; i < 200; i++) {
+        TestClientCfg pc = { .port = port, .connect_timeout_ms = 200 };
+        TestClient *probe = tc_connect(&pc);
+        if (probe) {
+            char *r = NULL;
+            if (tc_request(probe, "{\"mode\":\"db-dirs\"}", &r) == 0 && r) {
+                free(r); tc_close(probe); return 1;
+            }
+            free(r); tc_close(probe);
+        }
+        struct timespec ts = { 0, 50 * 1000000L }; nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+/* Re-read the local hour for the phase-2 restart: seeding plus the stop can
+   cross the top of the hour, and the sweep only fires when the wall-clock
+   hour equals AUTO_RESHARD_HOUR. If under 90s remain, sleep past the
+   boundary so the freshly read hour has headroom for the 5s startup grace. */
+static void ar_refresh_hour(struct tm *tmv) {
+    time_t now = time(NULL);
+    localtime_r(&now, tmv);
+    int left = (59 - tmv->tm_min) * 60 + (60 - tmv->tm_sec);
+    if (left < 90) {
+        struct timespec b = { left + 2, 0 };
+        nanosleep(&b, NULL);
+        now = time(NULL);
+        localtime_r(&now, tmv);
+    }
+}
 
 /* Poll `<base>/logs/<date_str>-info.log` for a line containing `tag`. LOG_WARN
    is level 2, which open_log_for_level() (config.c) routes to -info.log
@@ -203,56 +285,14 @@ static int test_auto_reshard_run(void) {
     char date_str[16];
     strftime(date_str, sizeof(date_str), "%Y-%m-%d", &tmv);
 
-    char env_path[300]; snprintf(env_path, sizeof(env_path), "%s/db.env", base);
-    FILE *f = fopen(env_path, "w");
-    if (!f) { ASSERT_TRUE(0, "open db.env"); tu_run_cmd("rm -rf %s", base); return 1; }
-    fprintf(f,
-        "export DB_ROOT=\"%s\"\n"
-        "export PORT=%d\n"
-        "export TIMEOUT=0\n"
-        "export LOG_DIR=\"%s/logs\"\n"
-"export LOG_LEVEL=3\n"
-            "export THREADS=2\n"
-            "export FCACHE_MAX=4096\n"
-            "export TLS_ENABLE=0\n"
-        "export AUTO_RESHARD_ENABLE=1\n"
-        "export AUTO_RESHARD_HOUR=%d\n",
-        db_root, port, base, tmv.tm_hour);
-    fclose(f);
-
-    char shard_db_abs[PATH_MAX];
-    const char *sdb_rel = "./build/bin/shard-db";
-    if (access(sdb_rel, X_OK) != 0) sdb_rel = "./shard-db";
-    if (!realpath(sdb_rel, shard_db_abs)) {
-        ASSERT_TRUE(0, "shard-db not found"); tu_run_cmd("rm -rf %s", base); return 1;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) { ASSERT_TRUE(0, "fork"); tu_run_cmd("rm -rf %s", base); return 1; }
-    if (pid == 0) {
-        chdir(base);
-        execl(shard_db_abs, shard_db_abs, "server", (char *)NULL);
-        _exit(127);
-    }
-    TestEnv env = { .port = port, .daemon_pid = pid };
+    /* Phase 1: reshard disabled — see ar_write_env for why the seeding
+       daemon must not have the (once-per-day) sweep armed. */
+    ar_write_env(base, db_root, port, tmv.tm_hour, 0, 0);
+    pid_t ar_pid = -1;
+    int ready1 = ar_start_daemon(base, port, &ar_pid);
+    TestEnv env = { .port = port, .daemon_pid = ar_pid };
     snprintf(env.db_root, sizeof(env.db_root), "%s", db_root);
-
-    /* Wait until ready. */
-    int ready = 0;
-    for (int i = 0; i < 100; i++) {
-        TestClientCfg pc = { .port = port, .connect_timeout_ms = 200 };
-        TestClient *probe = tc_connect(&pc);
-        if (probe) {
-            char *r = NULL;
-            if (tc_request(probe, "{\"mode\":\"db-dirs\"}", &r) == 0 && r) {
-                ready = 1; free(r); tc_close(probe); break;
-            }
-            free(r); tc_close(probe);
-        }
-        struct timespec ts = { 0, 50 * 1000000L }; nanosleep(&ts, NULL);
-    }
-    ASSERT_TRUE(ready, "daemon ready with AUTO_RESHARD_ENABLE=1");
-    if (!ready) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
+    if (!ready1) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     /* io_timeout_ms is generous: this client's later count/describe-object
        requests can queue behind the reshard rebuild's and the writer
@@ -263,7 +303,7 @@ static int test_auto_reshard_run(void) {
        persistent connection. */
     TestClientCfg cfg = { .port = port, .io_timeout_ms = 600000 };
     TestClient *tc = tc_connect(&cfg);
-    ASSERT_NOT_NULL(tc, "connect");
+    ASSERT_NOT_NULL(tc, "connect (seeding phase)");
     if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
@@ -357,6 +397,25 @@ static int test_auto_reshard_run(void) {
     tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"default\",\"object\":\"grown\"}", &resp);
     ASSERT_CONTAINS(resp, "\"splits\":8", "grown starts at splits=8");
     free(resp); resp = NULL;
+
+    /* Phase 2: clean stop, then restart with the sweep armed. This fresh
+       daemon's once-per-day guard is empty, so its first hour-matching
+       tick (5s startup grace + 1s tick) runs against the fully-seeded
+       objects — the sweep can no longer race the seeding. */
+    tc_close(tc);
+    test_env_stop_keep(&env);
+    ar_refresh_hour(&tmv);
+    strftime(date_str, sizeof(date_str), "%Y-%m-%d", &tmv);
+    ar_write_env(base, db_root, port, tmv.tm_hour, 1, 0);
+    pid_t ar_pid2 = -1;
+    int ready2 = ar_start_daemon(base, port, &ar_pid2);
+    env = (TestEnv){ .port = port, .daemon_pid = ar_pid2 };
+    snprintf(env.db_root, sizeof(env.db_root), "%s", db_root);
+    ASSERT_TRUE(ready1 && ready2, "daemon ready with AUTO_RESHARD_ENABLE=1");
+    if (!(ready1 && ready2)) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
+    tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     /* Wait for the thread's first hour-matching tick. auto_reshard_thread
        sleeps 5s on startup (Task 3) before its first wall-clock check,
@@ -555,62 +614,14 @@ static int test_auto_reshard_throttle_run(void) {
         localtime_r(&now, &tmv);
     }
 
-    char env_path[300]; snprintf(env_path, sizeof(env_path), "%s/db.env", base);
-    FILE *f = fopen(env_path, "w");
-    if (!f) { ASSERT_TRUE(0, "open db.env"); tu_run_cmd("rm -rf %s", base); return 1; }
-    fprintf(f,
-        "export DB_ROOT=\"%s\"\n"
-        "export PORT=%d\n"
-        "export TIMEOUT=0\n"
-        "export LOG_DIR=\"%s/logs\"\n"
-"export LOG_LEVEL=3\n"
-            "export THREADS=2\n"
-            "export FCACHE_MAX=4096\n"
-            "export TLS_ENABLE=0\n"
-        "export AUTO_RESHARD_ENABLE=1\n"
-        "export AUTO_RESHARD_HOUR=%d\n"
-        "export AUTO_RESHARD_THROTTLE_MS=3000\n",
-        db_root, port, base, tmv.tm_hour);
-    fclose(f);
-
-    char shard_db_abs[PATH_MAX];
-    const char *sdb_rel = "./build/bin/shard-db";
-    if (access(sdb_rel, X_OK) != 0) sdb_rel = "./shard-db";
-    if (!realpath(sdb_rel, shard_db_abs)) {
-        ASSERT_TRUE(0, "shard-db not found"); tu_run_cmd("rm -rf %s", base); return 1;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) { ASSERT_TRUE(0, "fork"); tu_run_cmd("rm -rf %s", base); return 1; }
-    if (pid == 0) {
-        chdir(base);
-        execl(shard_db_abs, shard_db_abs, "server", (char *)NULL);
-        _exit(127);
-    }
-    TestEnv env = { .port = port, .daemon_pid = pid };
+    /* Phase 1: reshard disabled — see ar_write_env for why the seeding
+       daemon must not have the (once-per-day) sweep armed. */
+    ar_write_env(base, db_root, port, tmv.tm_hour, 0, 3000);
+    pid_t ar_pid = -1;
+    int ready1 = ar_start_daemon(base, port, &ar_pid);
+    TestEnv env = { .port = port, .daemon_pid = ar_pid };
     snprintf(env.db_root, sizeof(env.db_root), "%s", db_root);
-
-    int ready = 0;
-    for (int i = 0; i < 100; i++) {
-        TestClientCfg pc = { .port = port, .connect_timeout_ms = 200 };
-        TestClient *probe = tc_connect(&pc);
-        if (probe) {
-            char *r = NULL;
-            if (tc_request(probe, "{\"mode\":\"db-dirs\"}", &r) == 0 && r) {
-                ready = 1; free(r); tc_close(probe); break;
-            }
-            free(r); tc_close(probe);
-        }
-        struct timespec ts = { 0, 50 * 1000000L }; nanosleep(&ts, NULL);
-    }
-    ASSERT_TRUE(ready, "daemon ready with AUTO_RESHARD_THROTTLE_MS=3000");
-    if (!ready) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
-
-    /* Captured before the (up to ~40s) reshard-wait section below so the
-       log-file date lookup is right even if that wait straddles midnight
-       (the log file is named by the date the line was WRITTEN, not the
-       date the test happens to check it). */
-    time_t reshard_start_ts = time(NULL);
+    if (!ready1) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     /* io_timeout_ms is generous: this client's later count/describe-object
        requests can queue behind the reshard rebuild's and the writer
@@ -621,7 +632,7 @@ static int test_auto_reshard_throttle_run(void) {
        persistent connection. */
     TestClientCfg cfg = { .port = port, .io_timeout_ms = 600000 };
     TestClient *tc = tc_connect(&cfg);
-    ASSERT_NOT_NULL(tc, "connect");
+    ASSERT_NOT_NULL(tc, "connect (seeding phase)");
     if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     char *resp = NULL;
@@ -676,6 +687,30 @@ static int test_auto_reshard_throttle_run(void) {
         free(bulk);
         ASSERT_TRUE(all_ok, "grown_* seeded with 1,050,000 real records");
     }
+
+    /* Phase 2: clean stop, restart with the sweep armed (see ar_write_env).
+       This fresh daemon's once-per-day guard is empty, so its single sweep
+       runs against the fully-seeded objects. */
+    tc_close(tc);
+    test_env_stop_keep(&env);
+    ar_refresh_hour(&tmv);
+    ar_write_env(base, db_root, port, tmv.tm_hour, 1, 3000);
+    pid_t ar_pid2 = -1;
+    int ready2 = ar_start_daemon(base, port, &ar_pid2);
+    env = (TestEnv){ .port = port, .daemon_pid = ar_pid2 };
+    snprintf(env.db_root, sizeof(env.db_root), "%s", db_root);
+    ASSERT_TRUE(ready1 && ready2, "daemon ready with AUTO_RESHARD_THROTTLE_MS=3000");
+    if (!(ready1 && ready2)) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
+
+    /* Captured before the reshard-wait section below so the log-file date
+       lookup is right even if that wait straddles midnight (the log file is
+       named by the date the line was WRITTEN, not the date the test happens
+       to check it). */
+    time_t reshard_start_ts = time(NULL);
+
+    tc = tc_connect(&cfg);
+    ASSERT_NOT_NULL(tc, "connect");
+    if (!tc) { test_env_stop_keep(&env); tu_run_cmd("rm -rf %s", base); return 1; }
 
     /* Wait for both to reshape (generous budget: two reshards plus a 3s
        throttle gap between them, on top of the usual 5s startup delay). */

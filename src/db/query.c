@@ -1,3 +1,4 @@
+#include "typed_index.h"
 #include "types.h"
 #include "slotcask.h"
 #include "simd.h"
@@ -5,12 +6,241 @@
 #include "trigram.h"
 #include "io_direct.h"
 #include "query_internal.h"
+#include "typed_index.h"
+#include "typed_row.h"
 #include <math.h>
 #include <dirent.h>
+/* Bitmap-KeySet race seam stage ids: plain identifiers in all builds; the
+ * seam functions below are TEST_BUILD-only (see query_internal.h). */
+#define BMKS_RACE_EQ         1
+#define BMKS_RACE_GENERIC    2
+#define BMKS_RACE_COMPLEMENT 3
+#define BMKS_RACE_OR         4
+
 #ifdef TEST_BUILD
+static void bm_defer_gate_park(void);   /* defined with the find-flush gate */
+
 #include <stdatomic.h>
 #include "shard_test_ctl.h"
 #include "test_control.h"
+
+/* Bitmap-KeySet race seam (TEST_BUILD only, inert in production builds):
+ * a one-shot barrier parked between a bitmap candidate builder's sizing
+ * pass and its enumeration pass so a concurrent writer can add matches
+ * that overflow the already-allocated KeySet. Arming is per calling thread
+ * with an explicit stage id, so only that thread's own build consumes the
+ * barrier; the coordination state (parked flag, gate, observation counters)
+ * is process-visible so the test's writer thread can observe the park and
+ * release it. No production code path reads any of this state. */
+
+/* Daemon-side arm (control channel SET_GLOBALS phase 4; see shard_test_ctl.h).
+ * A stage armed here is consumed once by the next matching build on any
+ * thread; the gate is released via the same channel or the test hook. */
+_Atomic int g_shard_test_bmks_stage;
+_Atomic int g_shard_test_bmks_gate;
+
+static __thread _Atomic int bm_ks_race_armed;   /* BMKS_RACE_* stage or 0 */
+
+static _Atomic int      bm_ks_race_reached;     /* barrier consumed */
+static _Atomic int      bm_ks_race_gate;        /* 0 = parked, 1 = released */
+static _Atomic int      bm_ks_race_gate_opened; /* gate released for this run */
+static _Atomic unsigned bm_ks_race_cap;         /* KeySet cap behind barrier */
+static _Atomic unsigned bm_ks_race_sized;       /* sizing-pass estimate */
+static _Atomic unsigned bm_ks_race_fail_inserts;
+
+int query_bm_test_arm_keyset_race(int stage) {
+    if (stage <= 0) return -1;
+    atomic_store(&bm_ks_race_armed, stage);
+    atomic_store(&bm_ks_race_reached, 0);
+    atomic_store(&bm_ks_race_gate, 0);
+    atomic_store(&bm_ks_race_gate_opened, 0);
+    atomic_store(&bm_ks_race_cap, 0);
+    atomic_store(&bm_ks_race_sized, 0);
+    atomic_store(&bm_ks_race_fail_inserts, 0);
+    return 0;
+}
+
+void query_bm_test_race_open_gate(void) {
+    atomic_store(&bm_ks_race_gate, 1);
+    atomic_store(&bm_ks_race_gate_opened, 1);
+}
+
+int query_bm_test_race_reached(void) {
+    return atomic_load(&bm_ks_race_reached);
+}
+
+int query_bm_test_race_gate_opened(void) {
+    return atomic_load(&bm_ks_race_gate_opened);
+}
+
+unsigned query_bm_test_race_allocated_cap(void) {
+    return atomic_load(&bm_ks_race_cap);
+}
+
+unsigned query_bm_test_race_sized_total(void) {
+    return atomic_load(&bm_ks_race_sized);
+}
+
+unsigned query_bm_test_race_insert_fails(void) {
+    return atomic_load(&bm_ks_race_fail_inserts);
+}
+
+void query_bm_test_race_reset(void) {
+    atomic_store(&bm_ks_race_armed, 0);
+    atomic_store(&bm_ks_race_gate, 0);
+}
+
+/* Barrier call site: consume the armed stage, publish the sizing result
+ * and the allocated capacity, then poll the gate (bounded; the test's
+ * child watchdog is the outer bound). One-shot: disarms itself. */
+static void bm_ks_race_barrier(int stage, size_t sized_total, size_t cap) {
+    int global_armed = atomic_load(&g_shard_test_bmks_stage) == stage;
+    int local_armed = atomic_load(&bm_ks_race_armed) == stage;
+    if (!local_armed && !global_armed) return;
+    atomic_store(&bm_ks_race_sized, (unsigned)sized_total);
+    atomic_store(&bm_ks_race_cap, (unsigned)cap);
+    atomic_store(&bm_ks_race_reached, 1);
+    if (global_armed) {
+        atomic_store(&g_shard_test_bmks_stage, 0);   /* one-shot */
+        LOG_WARN(LOG_SUB_QUERY,
+                 "BMKS-BARRIER-REACHED stage=%d sized=%zu cap=%u",
+                 stage, sized_total, (unsigned)cap);
+        /* The find-flush gate hook blocks until the test releases it; its
+         * return IS the release for the daemon path (no second wait). */
+        bm_defer_gate_park();
+        return;
+    }
+    for (int i = 0; i < 40000; i++) {          /* bounded park (~120 s max) */
+        if (atomic_load_explicit(&bm_ks_race_gate, memory_order_acquire) ||
+            atomic_load_explicit(&g_shard_test_bmks_gate,
+                                 memory_order_acquire))
+            break;
+        struct timespec ts = { 0, 3 * 1000 * 1000L };
+        nanosleep(&ts, NULL);
+    }
+    atomic_store(&bm_ks_race_armed, 0);
+    atomic_store(&bm_ks_race_gate, 0);
+}
+
+/* Observation seams are thread-local and request-scoped in test builds:
+ * per-thread counters for candidate allocation sizing, actual insertion
+ * overflows (keyset_insert == -1 in a bitmap collector), whole-record
+ * capacity fallback recoveries, and the last prepared-find budget peak.
+ * Arming happens on the thread that runs the query. */
+static __thread struct {
+    unsigned last_alloc_slots;
+    unsigned overflow_hits;
+    unsigned fallbacks;
+    unsigned last_budget_peak;
+    int      observing;
+} bm_ks_test_stats;
+
+static __thread char bm_ks_parallel_field[256];
+static __thread int bm_ks_parallel_stage;
+static __thread char bm_ks_parallel_fault_field[256];
+static __thread int bm_ks_parallel_fault_site;
+static __thread int bm_ks_parallel_fault_error;
+static __thread unsigned bm_ks_parallel_stats[6];
+
+int query_test_parallel_candidate_race(const char *field, int stage) {
+    if (stage == 0) {
+        bm_ks_parallel_stage = 0;
+        bm_ks_parallel_field[0] = '\0';
+        return 0;
+    }
+    if (!field || strlen(field) >= sizeof(bm_ks_parallel_field) ||
+        stage < BMKS_RACE_EQ || stage > BMKS_RACE_OR)
+        return -1;
+    if (query_bm_test_arm_keyset_race(stage) != 0) return -1;
+    atomic_store(&bm_ks_race_armed, 0);
+    snprintf(bm_ks_parallel_field, sizeof(bm_ks_parallel_field), "%s", field);
+    bm_ks_parallel_stage = stage;
+    memset(bm_ks_parallel_stats, 0, sizeof(bm_ks_parallel_stats));
+    return 0;
+}
+
+int query_test_parallel_candidate_fault(const char *field, int site, int error) {
+    if (error == 0) { bm_ks_parallel_fault_error = 0; return 0; }
+    if (!field || strlen(field) >= sizeof(bm_ks_parallel_fault_field) ||
+        site < 0 || site >= BM_TEST_LOCK_SITE_COUNT)
+        return -1;
+    snprintf(bm_ks_parallel_fault_field, sizeof(bm_ks_parallel_fault_field), "%s", field);
+    bm_ks_parallel_fault_site = site;
+    bm_ks_parallel_fault_error = error;
+    return 0;
+}
+
+void query_test_parallel_candidate_stats(unsigned *workers, unsigned *joined,
+                                         unsigned *capacity, unsigned *hard,
+                                         unsigned *offthread, unsigned *consumed) {
+    if (workers) *workers = bm_ks_parallel_stats[0];
+    if (joined) *joined = bm_ks_parallel_stats[1];
+    if (capacity) *capacity = bm_ks_parallel_stats[2];
+    if (hard) *hard = bm_ks_parallel_stats[3];
+    if (offthread) *offthread = bm_ks_parallel_stats[4];
+    if (consumed) *consumed = bm_ks_parallel_stats[5];
+}
+
+void query_test_candidate_observe(int on) {
+    memset(&bm_ks_test_stats, 0, sizeof(bm_ks_test_stats));
+    bm_ks_test_stats.observing = on;
+}
+void query_test_candidate_stats(unsigned *last_slots, unsigned *overflow_hits,
+                                unsigned *fallbacks, unsigned *budget_peak) {
+    if (last_slots) *last_slots = bm_ks_test_stats.last_alloc_slots;
+    if (overflow_hits) *overflow_hits = bm_ks_test_stats.overflow_hits;
+    if (fallbacks) *fallbacks = bm_ks_test_stats.fallbacks;
+    if (budget_peak) *budget_peak = bm_ks_test_stats.last_budget_peak;
+}
+#define BMKS_STAT_OVERFLOW() do { if (bm_ks_test_stats.observing) \
+        bm_ks_test_stats.overflow_hits++; } while (0)
+#define BMKS_STAT_FALLBACK(kind) do { \
+        if (bm_ks_test_stats.observing) bm_ks_test_stats.fallbacks++; \
+        if (bm_ks_test_stats.observing || atomic_load(&g_shard_test_bmlock_log)) \
+            LOG_WARN(LOG_SUB_QUERY, \
+                     "candidate capacity exceeded after concurrent growth; " \
+                     "recovering from full record scan (%s)", kind); \
+    } while (0)
+#define BMKS_STAT_ALLOC(slots) do { if (bm_ks_test_stats.observing) \
+        bm_ks_test_stats.last_alloc_slots = (unsigned)(slots); } while (0)
+#define BMKS_STAT_BUDGET_PEAK(pk) do { if (bm_ks_test_stats.observing) \
+        bm_ks_test_stats.last_budget_peak = (unsigned)(pk); } while (0)
+
+static inline int bm_ks_counted_insert(KeySet *ks, const uint8_t *hash) {
+    int rc = keyset_insert(ks, hash);
+    if (rc < 0) {
+        atomic_fetch_add_explicit(&bm_ks_race_fail_inserts, 1,
+                                  memory_order_relaxed);
+        BMKS_STAT_OVERFLOW();
+    }
+    return rc;
+}
+
+/* TEST_BUILD override for a prepared find's request budget limit (0 = the
+ * query-buffer default). Thread-local: scoped to the calling request. */
+static __thread size_t bm_ks_test_budget_limit;
+void query_test_prepared_budget_limit(size_t limit) {
+    bm_ks_test_budget_limit = limit;
+}
+size_t query_test_prepared_budget_limit_value(void) {
+    return bm_ks_test_budget_limit;
+}
+
+void query_test_candidate_fallback_note(const char *kind) {
+    BMKS_STAT_FALLBACK(kind);
+}
+#else
+#define BMKS_STAT_FALLBACK(kind) ((void)0)
+static inline void bm_ks_race_barrier(int stage, size_t sized_total,
+                                      size_t cap) {
+    (void)stage; (void)sized_total; (void)cap;
+}
+static inline int bm_ks_counted_insert(KeySet *ks, const uint8_t *hash) {
+    return keyset_insert(ks, hash);
+}
+static inline size_t query_test_prepared_budget_limit_value(void) {
+    return 0;
+}
 #endif
 
 /* ========== ADVANCED SEARCH (multi-criteria, all operators) ========== */
@@ -46,26 +276,26 @@ int match_criterion_vlen(const char *val, size_t vlen,
     if (!val && c->op != OP_NOT_EXISTS && c->op != OP_EXISTS) return 0;
     switch (c->op) {
     case OP_ENDS_WITH: {
-        size_t cl = strlen(c->value);
+        size_t cl = strlen(search_criterion_value(c));
         if (vlen < cl) return 0;
-        return memcmp(val + vlen - cl, c->value, cl) == 0;
+        return memcmp(val + vlen - cl, search_criterion_value(c), cl) == 0;
     }
     case OP_STARTS_WITH: {
-        size_t cl = strlen(c->value);
+        size_t cl = strlen(search_criterion_value(c));
         if (vlen < cl) return 0;
-        return memcmp(val, c->value, cl) == 0;
+        return memcmp(val, search_criterion_value(c), cl) == 0;
     }
     case OP_CONTAINS: {
-        size_t cl = strlen(c->value);
+        size_t cl = strlen(search_criterion_value(c));
         if (cl == 0) return 1;
         if (vlen < cl) return 0;
-        return memmem(val, vlen, c->value, cl) != NULL;
+        return memmem(val, vlen, search_criterion_value(c), cl) != NULL;
     }
     case OP_NOT_CONTAINS: {
-        size_t cl = strlen(c->value);
+        size_t cl = strlen(search_criterion_value(c));
         if (cl == 0) return 0;
         if (vlen < cl) return 1;
-        return memmem(val, vlen, c->value, cl) == NULL;
+        return memmem(val, vlen, search_criterion_value(c), cl) == NULL;
     }
     default:
         return match_criterion(val, c);
@@ -81,35 +311,35 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
         case OP_NOT_EXISTS:
             return val_str == NULL;
         case OP_EQUAL:
-            return strcmp(val_str, c->value) == 0;
+            return strcmp(val_str, search_criterion_value(c)) == 0;
         case OP_NOT_EQUAL:
-            return strcmp(val_str, c->value) != 0;
+            return strcmp(val_str, search_criterion_value(c)) != 0;
         case OP_LESS:
-            if (is_number(val_str) && is_number(c->value))
-                return atof(val_str) < atof(c->value);
-            return strcmp(val_str, c->value) < 0;
+            if (is_number(val_str) && is_number(search_criterion_value(c)))
+                return atof(val_str) < atof(search_criterion_value(c));
+            return strcmp(val_str, search_criterion_value(c)) < 0;
         case OP_GREATER:
-            if (is_number(val_str) && is_number(c->value))
-                return atof(val_str) > atof(c->value);
-            return strcmp(val_str, c->value) > 0;
+            if (is_number(val_str) && is_number(search_criterion_value(c)))
+                return atof(val_str) > atof(search_criterion_value(c));
+            return strcmp(val_str, search_criterion_value(c)) > 0;
         case OP_LESS_EQ:
-            if (is_number(val_str) && is_number(c->value))
-                return atof(val_str) <= atof(c->value);
-            return strcmp(val_str, c->value) <= 0;
+            if (is_number(val_str) && is_number(search_criterion_value(c)))
+                return atof(val_str) <= atof(search_criterion_value(c));
+            return strcmp(val_str, search_criterion_value(c)) <= 0;
         case OP_GREATER_EQ:
-            if (is_number(val_str) && is_number(c->value))
-                return atof(val_str) >= atof(c->value);
-            return strcmp(val_str, c->value) >= 0;
+            if (is_number(val_str) && is_number(search_criterion_value(c)))
+                return atof(val_str) >= atof(search_criterion_value(c));
+            return strcmp(val_str, search_criterion_value(c)) >= 0;
         case OP_BETWEEN:
-            if (is_number(val_str) && is_number(c->value) && is_number(c->value2)) {
+            if (is_number(val_str) && is_number(search_criterion_value(c)) && is_number(search_criterion_value2(c))) {
                 double v = atof(val_str);
-                int lo = c->min_exclusive ? (v > atof(c->value)) : (v >= atof(c->value));
-                int hi = c->max_exclusive ? (v < atof(c->value2)) : (v <= atof(c->value2));
+                int lo = c->min_exclusive ? (v > atof(search_criterion_value(c))) : (v >= atof(search_criterion_value(c)));
+                int hi = c->max_exclusive ? (v < atof(search_criterion_value2(c))) : (v <= atof(search_criterion_value2(c)));
                 return lo && hi;
             }
             {
-                int rl = strcmp(val_str, c->value);
-                int rh = strcmp(val_str, c->value2);
+                int rl = strcmp(val_str, search_criterion_value(c));
+                int rh = strcmp(val_str, search_criterion_value2(c));
                 int lo = c->min_exclusive ? (rl >  0) : (rl >= 0);
                 int hi = c->max_exclusive ? (rh <  0) : (rh <= 0);
                 return lo && hi;
@@ -117,7 +347,7 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
         case OP_LIKE: {
             /* SQL-style LIKE with `%` wildcard (no `_`). Case-sensitive —
                use `ilike` for case-insensitive. */
-            const char *pat = c->value;
+            const char *pat = search_criterion_value(c);
             if (pat[0] == '%' && pat[strlen(pat)-1] == '%') {
                 char sub[MAX_LINE];
                 snprintf(sub, sizeof(sub), "%s", pat + 1);
@@ -136,21 +366,21 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
             return !match_criterion(val_str, &tmp);
         }
         case OP_CONTAINS:
-            return strstr(val_str, c->value) != NULL;
+            return strstr(val_str, search_criterion_value(c)) != NULL;
         case OP_NOT_CONTAINS:
-            return strstr(val_str, c->value) == NULL;
+            return strstr(val_str, search_criterion_value(c)) == NULL;
         case OP_STARTS_WITH:
-            return strncmp(val_str, c->value, strlen(c->value)) == 0;
+            return strncmp(val_str, search_criterion_value(c), strlen(search_criterion_value(c))) == 0;
         case OP_ENDS_WITH: {
-            size_t vl = strlen(val_str), cl = strlen(c->value);
+            size_t vl = strlen(val_str), cl = strlen(search_criterion_value(c));
             if (vl < cl) return 0;
-            return strcmp(val_str + vl - cl, c->value) == 0;
+            return strcmp(val_str + vl - cl, search_criterion_value(c)) == 0;
         }
         /* Case-insensitive variants (ASCII tolower). Indexed paths fall
            through to the default full-scan branch in btree_dispatch and
            filter per entry in the callbacks below. */
         case OP_ILIKE: {
-            const char *pat = c->value;
+            const char *pat = search_criterion_value(c);
             if (pat[0] == '%' && pat[strlen(pat)-1] == '%') {
                 char sub[MAX_LINE];
                 snprintf(sub, sizeof(sub), "%s", pat + 1);
@@ -169,15 +399,15 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
             return !match_criterion(val_str, &tmp);
         }
         case OP_ICONTAINS:
-            return strcasestr(val_str, c->value) != NULL;
+            return strcasestr(val_str, search_criterion_value(c)) != NULL;
         case OP_INOT_CONTAINS:
-            return strcasestr(val_str, c->value) == NULL;
+            return strcasestr(val_str, search_criterion_value(c)) == NULL;
         case OP_ISTARTS_WITH:
-            return strncasecmp(val_str, c->value, strlen(c->value)) == 0;
+            return strncasecmp(val_str, search_criterion_value(c), strlen(search_criterion_value(c))) == 0;
         case OP_IENDS_WITH: {
-            size_t vl = strlen(val_str), cl = strlen(c->value);
+            size_t vl = strlen(val_str), cl = strlen(search_criterion_value(c));
             if (vl < cl) return 0;
-            return strcasecmp(val_str + vl - cl, c->value) == 0;
+            return strcasecmp(val_str + vl - cl, search_criterion_value(c)) == 0;
         }
         case OP_IN:
             for (int i = 0; i < c->in_count; i++)
@@ -199,11 +429,11 @@ int match_criterion(const char *val_str, const SearchCriterion *c) {
                 static __thread regex_t  re_cached;
                 static __thread char     pat_cached[1024];
                 static __thread int      pat_compiled = 0;
-                if (!pat_compiled || strcmp(pat_cached, c->value) != 0) {
+                if (!pat_compiled || strcmp(pat_cached, search_criterion_value(c)) != 0) {
                     if (pat_compiled) { regfree(&re_cached); pat_compiled = 0; }
-                    if (regcomp(&re_cached, c->value, REG_EXTENDED | REG_NOSUB) != 0)
+                    if (regcomp(&re_cached, search_criterion_value(c), REG_EXTENDED | REG_NOSUB) != 0)
                         return c->op == OP_REGEX ? 0 : 1;
-                    strncpy(pat_cached, c->value, sizeof(pat_cached) - 1);
+                    strncpy(pat_cached, search_criterion_value(c), sizeof(pat_cached) - 1);
                     pat_cached[sizeof(pat_cached) - 1] = '\0';
                     pat_compiled = 1;
                 }
@@ -275,19 +505,8 @@ int collect_hash_cb(const char *val, size_t vlen, const uint8_t *hash16, void *c
     if (cc->primary_crit && op_is_length(cc->primary_crit->op)) {
         if (!match_length_vlen(vlen, cc->primary_crit)) return 0;
     } else if (cc->check_primary && cc->primary_crit) {
-        char tmp[1028];
-        int matched;
-        if (cc->tf) {
-            int dlen = decode_idx_to_buf(cc->tf, (const uint8_t*)val, vlen,
-                                          tmp, sizeof(tmp), 0);
-            if (dlen <= 0) return 0;
-            matched = match_criterion(tmp, cc->primary_crit);
-        } else {
-            size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
-            memcpy(tmp, val, cl); tmp[cl] = '\0';
-            matched = match_criterion_vlen(tmp, cl, cc->primary_crit);
-        }
-        if (!matched) return 0;
+        if (!idx_candidate_admits(cc->tf, val, vlen, cc->primary_crit))
+            return 0;
     }
 
     /* Atomic slot allocation. Beyond cap or the caller-supplied early-stop
@@ -322,19 +541,8 @@ int stream_keyset_cb(const char *val, size_t vlen, const uint8_t *hash16, void *
     if (sk->primary_crit && op_is_length(sk->primary_crit->op)) {
         if (!match_length_vlen(vlen, sk->primary_crit)) return 0;
     } else if (sk->check_primary && sk->primary_crit) {
-        char tmp[1028];
-        int matched;
-        if (sk->tf) {
-            int dlen = decode_idx_to_buf(sk->tf, (const uint8_t*)val, vlen,
-                                          tmp, sizeof(tmp), 0);
-            if (dlen <= 0) return 0;
-            matched = match_criterion(tmp, sk->primary_crit);
-        } else {
-            size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
-            memcpy(tmp, val, cl); tmp[cl] = '\0';
-            matched = match_criterion_vlen(tmp, cl, sk->primary_crit);
-        }
-        if (!matched) return 0;
+        if (!idx_candidate_admits(sk->tf, val, vlen, sk->primary_crit))
+            return 0;
     }
     (void)val;
     if (keyset_insert(sk->ks, hash16) < 0) {
@@ -357,8 +565,54 @@ const TypedField *resolve_idx_field(const TypedSchema *ts, const char *field) {
 
 /* Encode a criterion value for index lookup. If tf is NULL (composite index
    or unknown field), returns the text as raw bytes. Otherwise emits
-   memcmp-sortable bytes matching what the write side stored. Output written
+   memcmp-sortable bytes matching what the write side stored. Libc-parsed
+   scalar fields require a complete NUL-terminated spelling (val[vlen] == 0);
+   raw and varchar values retain their explicit-span contract. Output written
    into caller's buf; *out_len set. */
+int encode_criterion_value_checked(const TypedSchema *ts,const TypedField *field,
+    const char *text,size_t len,uint8_t *out,size_t cap,size_t *out_len){
+    if(!out_len){errno=EINVAL;return -1;}*out_len=0;
+    if(!text||!out){errno=EINVAL;return -1;}
+    if(!field){if(len>cap){errno=ENOBUFS;return -1;}if(len)memcpy(out,text,len);*out_len=len;return 1;}
+    if(!ts){errno=EINVAL;return -1;}
+    int index=-1;for(int i=0;i<ts->nfields;i++)if(field==&ts->fields[i]){index=i;break;}
+    if(index<0){errno=EINVAL;return -1;}
+    return typed_index_text_key_into(ts,(size_t)index,text,len,out,cap,out_len);
+}
+/* Legacy fixture compatibility; production producers use the checked schema API. */
+static int bitmap_text_key_alloc(const TypedSchema *ts,const TypedField *tf,
+    const char *text,size_t text_len,size_t budget,uint8_t **out,size_t *len){
+    *out=NULL;*len=0;
+    int field=-1;
+    if(tf){if(!ts){errno=EINVAL;return -1;}field=typed_field_index(ts,tf->name);
+        if(field<0){errno=EINVAL;return -1;}}
+    size_t need=text_len;
+    int rc=tf?typed_index_text_key_into(ts,(size_t)field,text,text_len,NULL,0,&need):1;
+    if(rc!=1)return rc;
+    if(need>UINT16_MAX||need>budget){errno=ENOBUFS;return -1;}
+    uint8_t *buf=malloc(need?need:1);
+    if(!buf){errno=ENOMEM;return -1;}
+    if(tf)rc=typed_index_text_key_into(ts,(size_t)field,text,text_len,buf,need,&need);
+    else if(need)memcpy(buf,text,need);
+    if(rc!=1){free(buf);return rc;}
+    *out=buf;*len=need;return 1;
+}
+static int bitmap_literal_fits(const TypedSchema *ts,const SearchCriterion *c,size_t cap){
+    if(!ts||!c)return 0;
+    int field=typed_field_index(ts,c->field);
+    if(field<0)return 0;
+    int count=c->op==OP_IN?c->in_count:1;
+    for(int i=0;i<count;i++){
+        const char *text=c->op==OP_IN?c->in_values[i]:search_criterion_value(c);
+        size_t n=0;
+        if(typed_index_text_key_into(ts,(size_t)field,text,strlen(text),NULL,0,&n)!=1||n==0||n>cap)return 0;
+    }
+    return 1;
+}
+static void bitmap_values_clear(uint8_t **values,int count){
+    if(values){for(int i=0;i<count;i++)free(values[i]);free(values);}
+}
+
 void encode_criterion_value(const TypedField *tf,
                                    const char *val, size_t vlen,
                                    uint8_t *buf, size_t *out_len) {
@@ -376,7 +630,7 @@ void encode_criterion_value(const TypedField *tf,
         *out_len = n;
         return;
     }
-    encode_field_for_index(tf, val, vlen, buf, out_len);
+    encode_field_text_for_index(tf, val, vlen, buf, out_len);
 }
 
 /* Ops where btree_dispatch falls through to the default full-leaf scan
@@ -405,6 +659,36 @@ int op_is_length(enum SearchOp op) {
            op == OP_LEN_LESS || op == OP_LEN_GREATER ||
            op == OP_LEN_LESS_EQ || op == OP_LEN_GREATER_EQ ||
            op == OP_LEN_BETWEEN;
+}
+
+/* Sound tier-0 candidate pre-filter (§2.4.2). Returns 1 to admit the leaf
+   entry to per-record verification, 0 to reject it. A reject requires an
+   exactly-decoded mismatch: raw/composite keys and varchar leaves (both
+   record generations) carry the exact text bytes, so a 0-byte payload is
+   the empty string, not a zero-marker. Everything the legacy decoder
+   cannot render exactly admits instead — packed-numeric decimal_order
+   payloads (the 1-byte zero marker and odd limb widths; legacy numeric is
+   exactly 8 bytes per typed_index_fixed_width) and zero-shaped fixed
+   values (all-zero uuid/ipv4/ipv6 decode as legacy-missing) reach the
+   generation-correct record check, which is authoritative. The pre-filter
+   only bounds candidate fetches; it never decides existence. */
+int idx_candidate_admits(const TypedField *tf, const char *payload,
+                         size_t plen, const SearchCriterion *c) {
+    if (!c) return 1;
+    char tmp[1028];
+    if (!tf || tf->type == FT_VARCHAR) {
+        size_t cl = plen < sizeof(tmp) - 1 ? plen : sizeof(tmp) - 1;
+        memcpy(tmp, payload, cl);
+        tmp[cl] = '\0';
+        return match_criterion_vlen(tmp, cl, c);
+    }
+    if (tf->type == FT_NUMERIC && plen != 8)
+        return 1; /* decimal_order payload: record check decides */
+    int dlen = decode_idx_to_buf(tf, (const uint8_t *)payload, plen,
+                                 tmp, sizeof(tmp), 0);
+    if (dlen <= 0)
+        return 1; /* zero-shaped/short payload: record check decides */
+    return match_criterion(tmp, c);
 }
 
 /* Length match against the btree entry's vlen — exact even when the value
@@ -455,10 +739,13 @@ typedef struct BmShardWalkArg {
     void        *ctx;
     SlotcaskDb  *sdb;
     int         *stop_flag;     /* manipulated via __atomic_* */
+    int          error;         /* worker-owned; read after parallel_for_io */
 } BmShardWalkArg;
 
 /* Walk a single shard's bitmap for `value`, emitting cb(value, vlen, hash)
-   per live matching slot. */
+   per live matching slot. Returns 1 when cb signalled stop, 0 when the shard
+   was walked completely (or is logically empty), -1 with errno on a hard
+   bitmap read failure. */
 int bitmap_emit_for_shard(const char *db_root, const char *object,
                                  const char *field, int shard_idx,
                                  const uint8_t *value, size_t vlen,
@@ -482,6 +769,9 @@ typedef struct BmGenericShardArg {
     void             *ctx;
     SlotcaskDb       *sdb;
     int              *stop_flag;
+    const TypedSchema *schema;
+    size_t             budget;
+    int                error; /* worker-owned; read after parallel_for_io */
 } BmGenericShardArg;
 static void *bm_generic_shard_worker(void *arg);
 
@@ -552,17 +842,18 @@ static void btree_idx_full_leaf_scan_o_direct(
     free(args);
 }
 
-void btree_dispatch(const char *db_root, const char *object,
+int btree_dispatch_schema_checked(const TypedSchema *literal_schema,const char *db_root, const char *object,
                            const char *field, int splits,
                            SearchCriterion *pc, const TypedField *tf,
                            bt_result_cb cb, void *ctx) {
+
     if (field_index_type(db_root, object, field) == IT_BITMAP) {
         Schema sc = load_schema(db_root, object);
         SlotcaskSchemaInfo info = {
             .splits = sc.splits, .slot_size = sc.slot_size, .streams = sc.streams,
         };
         SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
-        if (!sdb) return;
+        if (!sdb) return -1;
 
         if (pc->op == OP_EQUAL || pc->op == OP_IN) {
             /* Fast path. For OP_IN we loop once per value, parallel-fanning
@@ -571,30 +862,41 @@ void btree_dispatch(const char *db_root, const char *object,
                stop_flag is shared across all per-value parallel_for
                invocations so an early-stop (e.g. find's limit) propagates. */
             int n_vals = (pc->op == OP_EQUAL) ? 1 : pc->in_count;
-            if (n_vals <= 0) return;
+            if (n_vals <= 0) return 0;
 
             int stop_flag = 0;
             BmShardWalkArg *args = malloc((size_t)splits * sizeof(BmShardWalkArg));
-            if (!args) return;
+            if (!args) return -1;
 
             for (int vi = 0; vi < n_vals; vi++) {
                 if (__atomic_load_n(&stop_flag, __ATOMIC_RELAXED)) break;
-                uint8_t valbuf[1032];
-                size_t  vallen = 0;
-                const char *raw = (pc->op == OP_EQUAL) ? pc->value : pc->in_values[vi];
-                encode_criterion_value(tf, raw, strlen(raw), valbuf, &vallen);
-                if (vallen == 0) continue;
+                uint8_t *valbuf = NULL;
+                size_t vallen = 0;
+                const char *raw = (pc->op == OP_EQUAL) ? search_criterion_value(pc) : pc->in_values[vi];
+                int present=bitmap_text_key_alloc(literal_schema,tf,raw,strlen(raw),
+                    g_query_buffer_max_bytes,&valbuf,&vallen);
+                if(present<0){free(args);return -1;}
+                if(present==0){free(valbuf);continue;}
                 for (int s = 0; s < splits; s++) {
                     args[s] = (BmShardWalkArg){
                         .db_root = db_root, .object = object, .field = field,
                         .shard_idx = s, .value = valbuf, .vlen = vallen,
-                        .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag
+                        .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag,
+                        .error = 0
                     };
                 }
                 parallel_for_io(bm_shard_walk_worker, args, splits, sizeof(BmShardWalkArg));
+                free(valbuf);
+                /* Every worker joined: a hard read failure on any shard —
+                   even after other shards produced candidates — fails the
+                   whole dispatch rather than yielding a partial set. */
+                int error = 0;
+                for (int s = 0; s < splits; s++)
+                    if (args[s].error && !error) error = args[s].error;
+                if (error) { free(args); errno = error; return -1; }
             }
             free(args);
-            return;
+            return 0;
         }
 
         /* Generic dict-scan path: any other op (range, LIKE, CONTAINS,
@@ -608,17 +910,22 @@ void btree_dispatch(const char *db_root, const char *object,
         int stop_flag = 0;
         BmGenericShardArg *gargs =
             malloc((size_t)splits * sizeof(BmGenericShardArg));
-        if (!gargs) return;
+        if (!gargs) return -1;
         for (int s = 0; s < splits; s++) {
             gargs[s] = (BmGenericShardArg){
                 .db_root = db_root, .object = object, .field = field,
                 .shard_idx = s, .crit = pc, .tf = tf,
-                .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag
+                .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag,
+                .schema = literal_schema,
+                .budget = g_query_buffer_max_bytes / (size_t)(splits > 0 ? splits : 1)
             };
         }
         parallel_for_io(bm_generic_shard_worker, gargs, splits, sizeof(BmGenericShardArg));
+        int error = 0;
+        for (int i = 0; i < splits; i++) if (gargs[i].error) error = gargs[i].error;
         free(gargs);
-        return;
+        if (error) { errno = error; return -1; }
+        return 0;
     }
 
     /* Stack buffers for encoded key bytes. Max fixed-type output is 8 B;
@@ -629,36 +936,36 @@ void btree_dispatch(const char *db_root, const char *object,
 
     switch (pc->op) {
         case OP_EQUAL:
-            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             btree_idx_search(db_root, object, field, splits,
                              (const char *)buf1, len1, cb, ctx);
             break;
         case OP_GREATER_EQ:
-            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             btree_idx_range(db_root, object, field, splits,
                             (const char *)buf1, len1,
                             "\xff\xff\xff\xff", 4, cb, ctx);
             break;
         case OP_GREATER:
-            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             btree_idx_range_ex(db_root, object, field, splits,
                                (const char *)buf1, len1, 1,
                                "\xff\xff\xff\xff", 4, 0, cb, ctx);
             break;
         case OP_LESS_EQ:
-            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             btree_idx_range(db_root, object, field, splits,
                             "", 0, (const char *)buf1, len1, cb, ctx);
             break;
         case OP_LESS:
-            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             btree_idx_range_ex(db_root, object, field, splits,
                                "", 0, 0,
                                (const char *)buf1, len1, 1, cb, ctx);
             break;
         case OP_BETWEEN:
-            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
-            encode_criterion_value(tf, pc->value2, strlen(pc->value2), buf2, &len2);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value2(pc),strlen(search_criterion_value2(pc)),buf2,sizeof(buf2),&len2)<0){return -1;}
             if (pc->min_exclusive || pc->max_exclusive) {
                 btree_idx_range_ex(db_root, object, field, splits,
                                    (const char *)buf1, len1, pc->min_exclusive,
@@ -672,8 +979,7 @@ void btree_dispatch(const char *db_root, const char *object,
             break;
         case OP_IN:
             for (int iv = 0; iv < pc->in_count; iv++) {
-                encode_criterion_value(tf, pc->in_values[iv],
-                                       strlen(pc->in_values[iv]), buf1, &len1);
+                if(encode_criterion_value_checked(literal_schema,tf,pc->in_values[iv],strlen(pc->in_values[iv]),buf1,sizeof(buf1),&len1)<0){return -1;}
                 btree_idx_search(db_root, object, field, splits,
                                  (const char *)buf1, len1, cb, ctx);
             }
@@ -685,10 +991,11 @@ void btree_dispatch(const char *db_root, const char *object,
             int raw_prefix = (!tf || tf->type == FT_VARCHAR);
             size_t plen;
             if (raw_prefix) {
-                plen = strlen(pc->value);
-                memcpy(buf1, pc->value, plen);
+                plen = search_criterion_value_len(pc);
+                if(plen>sizeof(buf1)||plen>sizeof(buf2)-4){errno=ENOBUFS;return -1;}
+                memcpy(buf1, search_criterion_value(pc), plen);
             } else {
-                encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &plen);
+                if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&plen)<0){return -1;}
             }
             memcpy(buf2, buf1, plen);
             memset(buf2 + plen, 0xff, 4);
@@ -704,11 +1011,11 @@ void btree_dispatch(const char *db_root, const char *object,
                  "foo%"  (trail) → prefix range, same as OP_STARTS_WITH.
                  "%foo"  (lead)  → suffix match — no shortcut, full leaf scan.
                  "%foo%" (both)  → substring — no shortcut, full leaf scan.
-               compile_one already classified this into pc->value's % placement;
+               compile_one already classified this into search_criterion_value(pc)'s % placement;
                we re-derive here because btree_dispatch sees only SearchCriterion.
                Callbacks still apply check_primary; for LK_EXACT/LK_PREFIX that's
                a redundant per-entry confirm but cheap. */
-            const char *pat = pc->value;
+            const char *pat = search_criterion_value(pc);
             size_t pl = strlen(pat);
             int lead = (pl >= 1 && pat[0] == '%');
             int trail = (pl >= 1 && pat[pl-1] == '%');
@@ -716,7 +1023,7 @@ void btree_dispatch(const char *db_root, const char *object,
 
             if (!lead && !trail && raw_prefix) {
                 /* Exact byte match — point lookup. */
-                encode_criterion_value(tf, pat, pl, buf1, &len1);
+                if(encode_criterion_value_checked(literal_schema,tf,pat,pl,buf1,sizeof(buf1),&len1)<0){return -1;}
                 btree_idx_search(db_root, object, field, splits,
                                  (const char *)buf1, len1, cb, ctx);
                 break;
@@ -724,6 +1031,7 @@ void btree_dispatch(const char *db_root, const char *object,
             if (!lead && trail && raw_prefix) {
                 /* "foo%" — strip trailing % and use prefix range scan. */
                 size_t needle_len = pl - 1;
+                if(needle_len>sizeof(buf1)||needle_len>sizeof(buf2)-4){errno=ENOBUFS;return -1;}
                 memcpy(buf1, pat, needle_len);
                 memcpy(buf2, buf1, needle_len);
                 memset(buf2 + needle_len, 0xff, 4);
@@ -747,15 +1055,14 @@ void btree_dispatch(const char *db_root, const char *object,
                applies to FT_BOOL; every other type has too large a domain
                to enumerate "everything except X" cheaply. */
             if (tf && tf->type == FT_BOOL) {
-                int is_true = (pc->value[0] == 't' || pc->value[0] == 'T' ||
-                               pc->value[0] == '1');
+                int is_true = scalar_bool_value(search_criterion_value(pc));
                 uint8_t inv[1] = { (uint8_t)(is_true ? 0 : 1) };
                 btree_idx_search(db_root, object, field, splits,
                                  (const char *)inv, 1, cb, ctx);
                 break;
             }
             /* General case: two exclusive ranges covering everything except X. */
-            encode_criterion_value(tf, pc->value, strlen(pc->value), buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             btree_idx_range_ex(db_root, object, field, splits,
                                "", 0, 0,
                                (const char *)buf1, len1, 1, cb, ctx);
@@ -771,11 +1078,21 @@ void btree_dispatch(const char *db_root, const char *object,
                                               cb, ctx);
             break;
     }
+    return 0;
 }
 
 /* Lightweight counting callback — no hash storage, just increments counter.
    Used by count mode. For single criterion: pure index counter.
    For multi-criteria: fetches record inline to verify all criteria. */
+int btree_dispatch_checked(const char *root,const char *object,const char *field,int splits,
+    SearchCriterion *criterion,const TypedField *typed,bt_result_cb callback,void *ctx){
+    return btree_dispatch_schema_checked(load_typed_schema(root,object),root,object,field,splits,criterion,typed,callback,ctx);
+}
+void btree_dispatch(const char *root,const char *object,const char *field,int splits,
+    SearchCriterion *criterion,const TypedField *typed,bt_result_cb callback,void *ctx){
+    (void)btree_dispatch_checked(root,object,field,splits,criterion,typed,callback,ctx);
+}
+
 /* IdxCountCtx is now in query_internal.h */
 
 /* Single-criterion inline counter. No record fetch — btree visit = match.
@@ -821,19 +1138,8 @@ int idx_count_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx)
     if (ic->primary_crit && op_is_length(ic->primary_crit->op)) {
         if (!match_length_vlen(vlen, ic->primary_crit)) return 0;
     } else if (ic->check_primary && ic->primary_crit) {
-        char tmp[1028];
-        int matched;
-        if (ic->tf) {
-            int dlen = decode_idx_to_buf(ic->tf, (const uint8_t*)val, vlen,
-                                          tmp, sizeof(tmp), 0);
-            if (dlen <= 0) return 0;
-            matched = match_criterion(tmp, ic->primary_crit);
-        } else {
-            size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
-            memcpy(tmp, val, cl); tmp[cl] = '\0';
-            matched = match_criterion_vlen(tmp, cl, ic->primary_crit);
-        }
-        if (!matched) return 0;
+        if (!idx_candidate_admits(ic->tf, val, vlen, ic->primary_crit))
+            return 0;
     }
     idx_count_local.pending++;
     /* Cap residency so a freak query (millions of matches in one shard
@@ -877,11 +1183,10 @@ typedef struct {
     QueryDeadline *deadline;
     int dl_counter;
     size_t count;           /* result: matches in this shard */
+    int predicate_error;
 
-    /* Bitmap post-filter shortcut (populated by parallel_indexed_count) */
+    /* Bitmap rejection prefilters (populated by parallel_indexed_count) */
     int n_bm_postfilter;                              // number of bitmap eq/in post-filter leaves
-    int all_postfilters_are_bm;                       // 1 = Case A1 (index-only), 0 = Case A2 or none
-    int no_bm_shortcut;                               // 1 = prevent all_postfilters_are_bm shortcut (trigram primary)
     SearchCriterion *bm_criteria[MAX_INTERSECT_LEAVES]; // bitmap post-filter SearchCriterion*
     uint8_t          bm_val[MAX_INTERSECT_LEAVES][1024]; // pre-encoded value for OP_EQUAL
     size_t           bm_vlen[MAX_INTERSECT_LEAVES];
@@ -906,7 +1211,9 @@ static int count_batch_cb(const uint8_t hash[16],
     (void)hash; (void)key; (void)klen;
     CountBatchCbCtx *c = (CountBatchCbCtx *)ctx_ptr;
     if (query_deadline_tick(c->sc->deadline, &c->sc->dl_counter)) return 1;
-    if (criteria_match_tree((const uint8_t *)value, vlen, c->sc->tree, c->sc->fs, hdr2)) {
+    int matched=0;
+    if(criteria_match_tree_checked(value,vlen,c->sc->tree,c->sc->fs,hdr2,&matched)){__atomic_store_n(&c->sc->predicate_error,errno?errno:EILSEQ,__ATOMIC_RELAXED);return 1;}
+    if (matched) {
         __atomic_add_fetch(c->local, 1, __ATOMIC_RELAXED);
     }
     return 0;
@@ -914,7 +1221,7 @@ static int count_batch_cb(const uint8_t hash[16],
 
 static void *shard_count_worker(void *arg) {
     ShardCountCtx *sc = (ShardCountCtx *)arg;
-    if (sc->entry_count == 0) return NULL;
+    if (__atomic_load_n(&sc->predicate_error,__ATOMIC_RELAXED) || sc->entry_count == 0) return NULL;
 
     /* Pre-open bitmap shards and KF handle for this worker's shard group.
      * All entries in this group share the same hash[0..1] → same data shard. */
@@ -940,11 +1247,19 @@ static void *shard_count_worker(void *arg) {
                 sdb = NULL;  // disable KF probe if acquire fails
             }
         }
-        for (int b = 0; b < sc->n_bm_postfilter; b++) {
-            char bp[PATH_MAX];
-            bm_build_path(bp, sizeof(bp), sc->db_root, sc->object,
-                          sc->bm_criteria[b]->field, shard_id);
-            sc->bm_handles[b] = bm_open(bp, 0, 0, 0, 0, 0);
+        {
+            /* Several bitmaps held at once: canonical lock order. If any
+               cannot be opened all are left NULL (record-fetch fallback). */
+            char bps[MAX_INTERSECT_LEAVES][PATH_MAX];
+            const char *bpp[MAX_INTERSECT_LEAVES];
+            BitmapShard *opened[MAX_INTERSECT_LEAVES] = {0};
+            for (int b = 0; b < sc->n_bm_postfilter; b++) {
+                bm_build_path(bps[b], sizeof(bps[b]), sc->db_root, sc->object,
+                              sc->bm_criteria[b]->field, shard_id);
+                bpp[b] = bps[b];
+            }
+            if (bm_open_many_ro(bpp, sc->n_bm_postfilter, opened) == 0)
+                for (int b = 0; b < sc->n_bm_postfilter; b++) sc->bm_handles[b] = opened[b];
         }
     }
 
@@ -1035,11 +1350,9 @@ static void *shard_count_worker(void *arg) {
                 n_need_fetch++;
             } else if (!bm_pass) {
                 continue;  /* bitmap rejection: skip */
-            } else if (sc->all_postfilters_are_bm) {
-                local++;  /* index-only count, no record fetch */
-                continue;
             } else {
-                /* Bitmaps passed, non-bitmap post-filters need record fetch */
+                /* Bitmaps only reject candidates. Verify the complete tree,
+                   including the primary predicate, against the live record. */
                 memcpy(resolved[n_need_fetch].hash, sc->entries[ei].hash, 16);
                 resolved[n_need_fetch].sid = found_sid;
                 resolved[n_need_fetch].fid = found_fid;
@@ -1055,7 +1368,7 @@ static void *shard_count_worker(void *arg) {
          * count-gap test can queue a mutation writer on this shard before
          * the batch fetch re-acquires the same kfcache entry. One-shot:
          * disarmed on first hit so every later count passes through. */
-        slotcask_test_count_gap_park();
+        slotcask_test_count_gap_park(1);
 #endif
     }
 
@@ -1070,6 +1383,25 @@ static void *shard_count_worker(void *arg) {
         kfcache_release(&kh);
         memset(&kh, 0, sizeof(kh));
     }
+    /* The bitmap readers must die with it: pass 2 never reads them, and
+     * the batch fetch takes kf readers. Holding a shard's bitmap readers
+     * while waiting on its kf lock inverts the kf -> bitmap order bulk
+     * insert uses (kf writer, then the window's bitmap writers), and the
+     * two deadlock on the same shard. */
+    {
+        BitmapShard *held[MAX_INTERSECT_LEAVES] = {0};
+        for (int b = 0; b < sc->n_bm_postfilter; b++) held[b] = (BitmapShard *)sc->bm_handles[b];
+        bm_close_many(held, sc->n_bm_postfilter);
+        for (int b = 0; b < sc->n_bm_postfilter; b++) sc->bm_handles[b] = NULL;
+    }
+
+#ifdef TEST_BUILD
+    /* Regression seam (count/bulk-insert lock order): parks the worker
+     * after the probe reader is gone, right before the batch fetch takes
+     * kf readers again, so a test can queue a bulk insert on this shard
+     * (kf writer, then bitmap writer) inside that window. */
+    if (shard_id >= 0) slotcask_test_count_gap_park(2);
+#endif
 
     /* Pass 2: batch fetch all needs-fetch entries */
     if (n_need_fetch > 0) {
@@ -1102,8 +1434,11 @@ static void *shard_count_worker(void *arg) {
 cleanup:
     /* Close pre-opened handles */
     if (kh.map) kfcache_release(&kh);
-    for (int b = 0; b < sc->n_bm_postfilter; b++) {
-        if (sc->bm_handles[b]) bm_close((BitmapShard *)sc->bm_handles[b]);
+    {
+        BitmapShard *held[MAX_INTERSECT_LEAVES] = {0};
+        for (int b = 0; b < sc->n_bm_postfilter; b++) held[b] = (BitmapShard *)sc->bm_handles[b];
+        bm_close_many(held, sc->n_bm_postfilter);
+        for (int b = 0; b < sc->n_bm_postfilter; b++) sc->bm_handles[b] = NULL;
     }
 
     sc->count = local;
@@ -1118,7 +1453,6 @@ static void classify_bm_postfilters(ShardCountCtx *ctx,
                                      const char *object,
                                      FieldSchema *fs) {
     ctx->n_bm_postfilter = 0;
-    ctx->all_postfilters_are_bm = 0;
     if (!fp || fp->n_postfilter == 0) return;
 
     int n_bm = 0;
@@ -1127,12 +1461,14 @@ static void classify_bm_postfilters(ShardCountCtx *ctx,
         if (pick_index_for_leaf(db_root, object, c) != IT_BITMAP) continue;
         if (c->op != OP_EQUAL && c->op != OP_IN) continue;
         if (n_bm >= MAX_INTERSECT_LEAVES) break;
+        /* Large dictionary keys remain primary-index eligible; only this
+           optional inline postfilter is limited by its existing stack arrays. */
+        if (!bitmap_literal_fits(fs->ts,c,sizeof(ctx->bm_val[0]))) continue;
 
         ctx->bm_criteria[n_bm] = c;
         const TypedField *tf = resolve_idx_field(fs->ts, c->field);
         if (c->op == OP_EQUAL) {
-            encode_criterion_value(tf, c->value, strlen(c->value),
-                                    ctx->bm_val[n_bm], &ctx->bm_vlen[n_bm]);
+            if(encode_criterion_value_checked(fs->ts,tf,search_criterion_value(c),strlen(search_criterion_value(c)),ctx->bm_val[n_bm],sizeof(ctx->bm_val[n_bm]),&ctx->bm_vlen[n_bm])<0){ctx->predicate_error=errno?errno:EILSEQ;return;}
             ctx->bm_in_count[n_bm] = 0;
             n_bm++;
         } else if (c->in_count <= 8) {
@@ -1140,9 +1476,7 @@ static void classify_bm_postfilters(ShardCountCtx *ctx,
             int nc = c->in_count;
             ctx->bm_in_count[n_bm] = nc;
             for (int v = 0; v < nc; v++) {
-                encode_criterion_value(tf, c->in_values[v], strlen(c->in_values[v]),
-                                        ctx->bm_in_vals[n_bm][v],
-                                        &ctx->bm_in_vlens[n_bm][v]);
+                if(encode_criterion_value_checked(fs->ts,tf,c->in_values[v],strlen(c->in_values[v]),ctx->bm_in_vals[n_bm][v],sizeof(ctx->bm_in_vals[n_bm][v]),&ctx->bm_in_vlens[n_bm][v])<0){ctx->predicate_error=errno?errno:EILSEQ;return;}
             }
             n_bm++;
             continue;
@@ -1154,8 +1488,6 @@ static void classify_bm_postfilters(ShardCountCtx *ctx,
         }
     }
     ctx->n_bm_postfilter = n_bm;
-    ctx->all_postfilters_are_bm = (n_bm > 0 && n_bm == fp->n_postfilter);
-    if (ctx->no_bm_shortcut) ctx->all_postfilters_are_bm = 0;
 }
 
 /* Orchestrate parallel indexed count: qsort by shard, fan out per-shard workers. */
@@ -1163,8 +1495,7 @@ static size_t parallel_indexed_count(const char *db_root, const char *object,
                                      const Schema *sch, CollectedHash *batch,
                                      int batch_count, CriteriaNode *tree,
                                      FieldSchema *fs, QueryDeadline *dl,
-                                     const FilterPlan *fp,
-                                     int no_bm_shortcut) {
+                                     const FilterPlan *fp) {
     int group_starts[1024], group_sizes[1024];
     int nshard_groups = shard_group_batch(batch, batch_count, group_starts, group_sizes, 1024);
 
@@ -1179,8 +1510,6 @@ static size_t parallel_indexed_count(const char *db_root, const char *object,
         workers[g].fs = fs;
         workers[g].deadline = dl;
         classify_bm_postfilters(&workers[g], fp, db_root, object, fs);
-        workers[g].no_bm_shortcut = no_bm_shortcut;
-        if (no_bm_shortcut) workers[g].all_postfilters_are_bm = 0;
     }
 
     if (batch_count < 1024 || nshard_groups <= 2) {
@@ -1190,8 +1519,10 @@ static size_t parallel_indexed_count(const char *db_root, const char *object,
     }
 
     size_t total = 0;
-    for (int g = 0; g < nshard_groups; g++) total += workers[g].count;
+    int error=0;
+    for(int g=0;g<nshard_groups;g++){total+=workers[g].count;int pe=__atomic_load_n(&workers[g].predicate_error,__ATOMIC_RELAXED);if(pe)error=pe;}
     free(workers);
+    if(error){errno=error;return SIZE_MAX;}
     return total;
 }
 
@@ -1212,29 +1543,23 @@ static int idx_find_parallel(const char *db_root, const char *object, const Sche
                              int offset, int limit, const char **proj_fields, int proj_count,
                              FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
                              JoinSpec *joins, int njoins, QueryDeadline *dl) {
-    /* Collection cap heuristic:
-       - No joins, or all-LEFT joins: every collected hash emits at most one row,
-         so we can safely cap at offset+limit.
-       - Any INNER join: records may drop, so we must collect unbounded and
-         apply limit at emission time. */
-    int all_left_or_none = 1;
-    for (int i = 0; i < njoins; i++)
-        if (joins[i].type != JOIN_LEFT) { all_left_or_none = 0; break; }
-    int collect_target = (limit > 0 && all_left_or_none) ? offset + limit : 0;
+    /* Index entries are candidates: record verification, exclusions and
+       joins can still reject them. Apply offset/limit only after matching
+       in keyset_emit_find; the collector's query-memory cap still applies. */
     CollectCtx cc;
     collect_ctx_init(&cc);
     cc.splits = sch->splits;
-    cc.collect_cap = collect_target;
+    cc.collect_cap = 0;
     cc.primary_crit = primary_crit;
     cc.check_primary = check_primary;
     cc.deadline = dl;
     cc.tf = resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field);
 
     (void)primary_idx_path; /* path now derived per-shard inside btree_idx_*; arg kept for API stability */
-    btree_dispatch(db_root, object, primary_crit->field, sch->splits,
+    if(btree_dispatch_schema_checked(fs?fs->ts:NULL,db_root, object, primary_crit->field, sch->splits,
                    primary_crit,
                    resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field),
-                   collect_hash_cb, &cc);
+                   collect_hash_cb, &cc)<0){collect_ctx_destroy(&cc);return -1;}
 
     if (cc.budget_exceeded) { collect_ctx_destroy(&cc); return -2; }
     if (cc.count == 0)      { collect_ctx_destroy(&cc); return 0; }
@@ -1319,9 +1644,10 @@ void shard_db_test_set_find_flush_gate_hook(shard_db_test_gate_fn fn,
 }
 
 /* Called inside batch_buf_flush_copy on the legacy collector (kf+bitmap
-   handles still held when the bitmap walk drove the flush) and, after
-   the deferred collector lands, inside bm_defer_drain_if_armed (no
-   handles held). */
+   handles still held when the bitmap walk drove the flush), inside
+   bm_defer_drain_if_armed (no handles held), and before each record fetch
+   of the prepared small-limit bitmap iterator (no handles held: candidates
+   were prepared and every bitmap handle released before emission). */
 static void bm_defer_gate_park(void) {
     if (!atomic_load(&g_shard_test_find_flush_gate)) return;
     int expected = 0;
@@ -1520,8 +1846,14 @@ static void *chunk_walk_worker(void *raw) {
 
             /* Resume floor: skip the already-delivered boundary entry and
                any older sibling sharing its value. */
+            /* last_hash is written (memcpy at the resume-point update below)
+               strictly before have_last is set, and this read is short-
+               circuited behind have_last — the variable can never be read
+               uninitialized. cppcheck cannot track the flag-to-init
+               dependency; suppressed with the user's sign-off (2026-11-13). */
             if (have_last && vl == last_len &&
                 memcmp(v, last_val, last_len) == 0 &&
+                // cppcheck-suppress uninitvar
                 memcmp(h, last_hash, BT_HASH_SIZE) <= 0)
                 continue;
 
@@ -1570,14 +1902,16 @@ static void chunk_walk_fanout(const ChunkShared *sh_tmpl,
        5-byte form btree.c's desc-iterator accepts, and it clamps below
        the NULL tier automatically. Resume bounds inside chunk_walk_worker
        reuse stored keys (already tiered) and bypass this path. */
+    /* A nonnull raw zero-length bound is the present empty payload and
+       becomes the one-byte value-tier key. NULL alone means unbounded. */
     char lo_tiered[BT_MAX_VAL_LEN], hi_tiered[BT_MAX_VAL_LEN];
     size_t lo_t = 0, hi_t = 0;
-    if (lo && lo_len) {
+    if (lo) {
         lo_t = (lo_len + 1 > sizeof(lo_tiered)) ? sizeof(lo_tiered) : lo_len + 1;
         lo_tiered[0] = 0x00;
         memcpy(lo_tiered + 1, lo, lo_t - 1);
     }
-    if (hi && hi_len) {
+    if (hi) {
         hi_t = (hi_len + 1 > sizeof(hi_tiered)) ? sizeof(hi_tiered) : hi_len + 1;
         hi_tiered[0] = 0x00;
         memcpy(hi_tiered + 1, hi, hi_t - 1);
@@ -1655,6 +1989,7 @@ typedef struct {
     pthread_mutex_t   lock;
     int               passed;     /* records that passed both filters */
     int               printed;    /* records actually emitted */
+    int predicate_error;
     int               stop;       /* atomic — set when printed >= limit */
 
     /* Deferred-collector budget (bitmap-routed fallback): per-query cap
@@ -1681,53 +2016,21 @@ static int stream_find_record_cb(const uint8_t hash16[16],
 
     if (is_excluded(sc->excluded, keybuf)) return 0;
 
-    if (!criteria_match_tree(value, vlen, sc->tree, sc->fs, hdr2)) return 0;
+    int matched=0;
+    if(criteria_match_tree_checked(value,vlen,sc->tree,sc->fs,hdr2,&matched)){
+        pthread_mutex_lock(&sc->lock);sc->predicate_error=errno?errno:EILSEQ;pthread_mutex_unlock(&sc->lock);return 1;}
+    if(!matched)return 0;
 
     pthread_mutex_lock(&sc->lock);
     int my_seq = ++sc->passed;
     int will_emit = (my_seq > sc->offset &&
                      (sc->limit <= 0 || sc->printed < sc->limit));
-    if (will_emit) {
-        const uint8_t *raw = (const uint8_t *)value;
-        if (sc->csv_delim) {
-            csv_emit_row(keybuf, raw, (uint32_t)vlen,
-                          sc->proj_count > 0 ? sc->proj_fields : NULL,
-                          sc->proj_count, sc->fs, sc->csv_delim, hdr2);
-        } else if (sc->dict_fmt) {
-            OUT("%s\"%s\":", sc->printed ? "," : "", keybuf);
-            if (sc->proj_count > 0) {
-                OUT("{");
-                int first = 1;
-                for (int j = 0; j < sc->proj_count; j++) {
-                    char *pv = json_projected_field((const char *)raw, (uint32_t)vlen,
-                                             sc->proj_fields[j], sc->fs, hdr2);
-                    if (!pv) continue;
-                    OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[j], pv);
-                    first = 0;
-                    free(pv);
-                }
-                OUT("}");
-            } else {
-                char *v = decode_value((const char *)raw, (uint32_t)vlen, sc->fs, hdr2);
-                OUT("%s", v);
-                free(v);
-            }
-        } else if (sc->proj_count > 0) {
-            OUT("%s{\"key\":\"%s\",\"value\":{", sc->printed ? "," : "", keybuf);
-            int first = 1;
-            for (int j = 0; j < sc->proj_count; j++) {
-                char *pv = json_projected_field((const char *)raw, (uint32_t)vlen,
-                                         sc->proj_fields[j], sc->fs, hdr2);
-                if (!pv) continue;
-                OUT("%s\"%s\":%s", first ? "" : ",", sc->proj_fields[j], pv);
-                first = 0;
-                free(pv);
-            }
-            OUT("}}");
-        } else {
-            char *v = decode_value((const char *)raw, (uint32_t)vlen, sc->fs, hdr2);
-            OUT("%s{\"key\":\"%s\",\"value\":%s}", sc->printed ? "," : "", keybuf, v);
-            free(v);
+    if(will_emit){
+        if(typed_query_emit_row(g_out?g_out:stdout,keybuf,strlen(keybuf),value,vlen,hdr2,sc->fs,
+            sc->proj_fields,sc->proj_count,sc->rows_fmt,sc->dict_fmt,sc->csv_delim,sc->printed>0,
+            NULL,0,NULL,g_query_buffer_max_bytes)){
+            sc->predicate_error=errno?errno:EILSEQ;
+            pthread_mutex_unlock(&sc->lock);return 1;
         }
         sc->printed++;
     }
@@ -1744,19 +2047,8 @@ static int stream_primary_check(StreamFindCtx *sc,
     if (sc->primary_crit && op_is_length(sc->primary_crit->op)) {
         if (!match_length_vlen(vlen, sc->primary_crit)) return 0;
     } else if (sc->check_primary && sc->primary_crit) {
-        char tmp[1028];
-        int matched;
-        if (sc->tf) {
-            int dlen = decode_idx_to_buf(sc->tf, (const uint8_t*)val, vlen,
-                                          tmp, sizeof(tmp), 0);
-            if (dlen <= 0) return 0;
-            matched = match_criterion(tmp, sc->primary_crit);
-        } else {
-            size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
-            memcpy(tmp, val, cl); tmp[cl] = '\0';
-            matched = match_criterion_vlen(tmp, cl, sc->primary_crit);
-        }
-        if (!matched) return 0;
+        if (!idx_candidate_admits(sc->tf, val, vlen, sc->primary_crit))
+            return 0;
     }
     return 1;
 }
@@ -1868,20 +2160,7 @@ static int stream_primary_filter(const char *val, size_t vlen, void *raw_ctx) {
     if (!sc->primary_crit || !sc->check_primary) return 1;
     if (op_is_length(sc->primary_crit->op))
         return match_length_vlen(vlen, sc->primary_crit) ? 1 : 0;
-
-    char tmp[1028];
-    int matched;
-    if (sc->tf) {
-        int dlen = decode_idx_to_buf(sc->tf, (const uint8_t *)val, vlen,
-                                     tmp, sizeof(tmp), 0);
-        if (dlen <= 0) return 0;
-        matched = match_criterion(tmp, sc->primary_crit);
-    } else {
-        size_t cl = vlen < sizeof(tmp) - 1 ? vlen : sizeof(tmp) - 1;
-        memcpy(tmp, val, cl); tmp[cl] = '\0';
-        matched = match_criterion_vlen(tmp, cl, sc->primary_crit);
-    }
-    return matched ? 1 : 0;
+    return idx_candidate_admits(sc->tf, val, vlen, sc->primary_crit) ? 1 : 0;
 }
 
 /* Chunked-resumable driver for btree-backed primary leaves. Replicates the
@@ -1893,10 +2172,11 @@ static int stream_primary_filter(const char *val, size_t vlen, void *raw_ctx) {
  * (they hold kf+bitmap handles across the emit) and get the deferred
  * collector instead — see idx_find_streaming. Returns 1 when the op was
  * driven here, 0 when the caller must use the legacy path. */
-static int chunked_stream_dispatch(ChunkShared *sh,
+static int chunked_stream_dispatch(const TypedSchema *literal_schema,ChunkShared *sh,
                                    const char *db_root, const char *object,
                                    const char *field, int splits,
                                    SearchCriterion *pc, const TypedField *tf) {
+
     uint8_t buf1[1032], buf2[1032];
     size_t len1 = 0, len2 = 0;
 
@@ -1910,45 +2190,47 @@ static int chunked_stream_dispatch(ChunkShared *sh,
 
     switch (pc->op) {
         case OP_EQUAL:
-            encode_criterion_value(tf, pc->value, strlen(pc->value),
-                                   buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             if (len1 == 0) return 0;
             memcpy(buf2, buf1, len1);
             memset(buf2 + len1, 0xff, 4);
             CHUNK_GO(buf1, len1, 0, buf2, len1 + 4, 0);
         case OP_GREATER_EQ:
-            encode_criterion_value(tf, pc->value, strlen(pc->value),
-                                   buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             if (len1 == 0) return 0;
             CHUNK_GO(buf1, len1, 0, CHUNK_HI_SENTINEL, 4, 0);
         case OP_GREATER:
-            encode_criterion_value(tf, pc->value, strlen(pc->value),
-                                   buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             if (len1 == 0) return 0;
             CHUNK_GO(buf1, len1, 1, CHUNK_HI_SENTINEL, 4, 0);
         case OP_LESS_EQ:
-            encode_criterion_value(tf, pc->value, strlen(pc->value),
-                                   buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             if (len1 == 0) return 0;
             CHUNK_GO("", 0, 0, buf1, len1, 0);
         case OP_LESS:
-            encode_criterion_value(tf, pc->value, strlen(pc->value),
-                                   buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             if (len1 == 0) return 0;
             CHUNK_GO("", 0, 0, buf1, len1, 1);
         case OP_BETWEEN:
-            encode_criterion_value(tf, pc->value, strlen(pc->value),
-                                   buf1, &len1);
-            encode_criterion_value(tf, pc->value2, strlen(pc->value2),
-                                   buf2, &len2);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value2(pc),strlen(search_criterion_value2(pc)),buf2,sizeof(buf2),&len2)<0){return -1;}
             if (len1 == 0 || len2 == 0) return 0;
             CHUNK_GO(buf1, len1, pc->min_exclusive,
                      buf2, len2, pc->max_exclusive);
         case OP_IN:
             for (int iv = 0; iv < pc->in_count; iv++) {
-                encode_criterion_value(tf, pc->in_values[iv],
-                                       strlen(pc->in_values[iv]), buf1, &len1);
-                if (len1 == 0) continue;
+                int present=encode_criterion_value_checked(literal_schema,tf,
+                    pc->in_values[iv],strlen(pc->in_values[iv]),buf1,sizeof(buf1),&len1);
+                if(present<0)return -1;
+                if(present==0)continue;
+                if(len1==0){
+                    /* Present empty varchar has the exact stored key [0x00].
+                       Keep the resumable worker path: no B-tree-held fetch. */
+                    chunk_walk_fanout(sh,db_root,object,field,splits,
+                                      "",0,0,"",0,0);
+                    if(sh->stop&&__atomic_load_n(sh->stop,__ATOMIC_ACQUIRE))return 1;
+                    continue;
+                }
                 memcpy(buf2, buf1, len1);
                 memset(buf2 + len1, 0xff, 4);
                 if (iv == pc->in_count - 1)
@@ -1965,11 +2247,11 @@ static int chunked_stream_dispatch(ChunkShared *sh,
             int raw_prefix = (!tf || tf->type == FT_VARCHAR);
             size_t plen;
             if (raw_prefix) {
-                plen = strlen(pc->value);
-                memcpy(buf1, pc->value, plen);
+                plen = search_criterion_value_len(pc);
+                if(plen>sizeof(buf1)||plen>sizeof(buf2)-4){errno=ENOBUFS;return -1;}
+                memcpy(buf1, search_criterion_value(pc), plen);
             } else {
-                encode_criterion_value(tf, pc->value, strlen(pc->value),
-                                       buf1, &plen);
+                if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&plen)<0){return -1;}
             }
             if (plen == 0) return 0;
             memcpy(buf2, buf1, plen);
@@ -1977,13 +2259,13 @@ static int chunked_stream_dispatch(ChunkShared *sh,
             CHUNK_GO(buf1, plen, 0, buf2, plen + 4, 0);
         }
         case OP_LIKE: {
-            const char *pat = pc->value;
+            const char *pat = search_criterion_value(pc);
             size_t pl = strlen(pat);
             int lead = (pl >= 1 && pat[0] == '%');
             int trail = (pl >= 1 && pat[pl-1] == '%');
             int raw_prefix = (!tf || tf->type == FT_VARCHAR);
             if (!lead && !trail && raw_prefix) {
-                encode_criterion_value(tf, pat, pl, buf1, &len1);
+                if(encode_criterion_value_checked(literal_schema,tf,pat,pl,buf1,sizeof(buf1),&len1)<0){return -1;}
                 if (len1 == 0) return 0;
                 memcpy(buf2, buf1, len1);
                 memset(buf2 + len1, 0xff, 4);
@@ -1991,6 +2273,7 @@ static int chunked_stream_dispatch(ChunkShared *sh,
             }
             if (!lead && trail && raw_prefix) {
                 size_t needle_len = pl - 1;
+                if(needle_len>sizeof(buf1)||needle_len>sizeof(buf2)-4){errno=ENOBUFS;return -1;}
                 memcpy(buf1, pat, needle_len);
                 memcpy(buf2, buf1, needle_len);
                 memset(buf2 + needle_len, 0xff, 4);
@@ -2000,15 +2283,13 @@ static int chunked_stream_dispatch(ChunkShared *sh,
         }
         case OP_NOT_EQUAL:
             if (tf && tf->type == FT_BOOL) {
-                int is_true = (pc->value[0] == 't' || pc->value[0] == 'T' ||
-                               pc->value[0] == '1');
+                int is_true = scalar_bool_value(search_criterion_value(pc));
                 uint8_t inv[1] = { (uint8_t)(is_true ? 0 : 1) };
                 memcpy(buf2, inv, 1);
                 memset(buf2 + 1, 0xff, 4);
                 CHUNK_GO(inv, 1, 0, buf2, 5, 0);
             }
-            encode_criterion_value(tf, pc->value, strlen(pc->value),
-                                   buf1, &len1);
+            if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             if (len1 == 0) return 0;
             chunk_walk_fanout(sh, db_root, object, field, splits,
                               "", 0, 0, (const char *)buf1, len1, 1);
@@ -2084,13 +2365,14 @@ static int idx_find_streaming(const char *db_root, const char *object,
         sh.fctx = &sc;
         sh.cap = chunk_cap_for(sc.bfb.pending_cap,
                                index_splits_for(sch->splits));
-        int driven = chunked_stream_dispatch(&sh, db_root, object,
+        int driven = chunked_stream_dispatch(fs?fs->ts:NULL,&sh, db_root, object,
                                              primary_crit->field,
                                              sch->splits, primary_crit,
                                              sc.tf);
-        if (!driven) {
-            btree_dispatch(db_root, object, primary_crit->field, sch->splits,
-                            primary_crit, sc.tf, stream_find_cb, &sc);
+        if(driven<0)sc.predicate_error=errno?errno:EILSEQ;
+        else if (!driven) {
+            if(btree_dispatch_schema_checked(fs?fs->ts:NULL,db_root, object, primary_crit->field, sch->splits,
+                            primary_crit, sc.tf, stream_find_cb, &sc)<0){sc.predicate_error=errno?errno:EILSEQ;}
         }
     } else {
         /* IT_BITMAP branches hold kf(S)+bitmap(S) across the emit, so the
@@ -2102,14 +2384,137 @@ static int idx_find_streaming(const char *db_root, const char *object,
          * releases the handles. O_DIRECT leaf-scan branches (btree
          * primaries the chunked dispatcher didn't drive) hold no handles
          * and keep the inline-flush collector on the !driven path. */
-        btree_dispatch(db_root, object, primary_crit->field, sch->splits,
+        if(btree_dispatch_schema_checked(fs?fs->ts:NULL,db_root, object, primary_crit->field, sch->splits,
                         primary_crit,
                         resolve_idx_field(fs ? fs->ts : NULL, primary_crit->field),
-                        stream_find_defer_cb, &sc);
+                        stream_find_defer_cb, &sc)<0){sc.predicate_error=errno?errno:EILSEQ;}
     }
 
     batch_buf_destroy(&sc.bfb);
     pthread_mutex_destroy(&sc.lock);
+    if(sc.predicate_error){errno=sc.predicate_error;return -1;}
+    return sc.printed;
+}
+
+/* ========== Prepared small-limit bitmap find iterator ==========
+   Serves the former small-limit streaming shapes (no joins, no rows
+   envelope, no ordering, offset+limit <= 1000) after their bitmap-dependent
+   candidates were prepared before the response envelope. Walks the prepared
+   KeySet and fetches one record at a time: the deadline is checked before
+   every fetch, at most one RecordRef is live, and iteration stops as soon as
+   the requested rows are emitted, the deadline expires, or a hard error is
+   recorded. Row matching, exclusions and pagination are exactly
+   stream_find_record_cb's. Not a batching optimization. */
+
+#ifdef TEST_BUILD
+/* Request-thread observer: armed on the thread that runs the find, it
+   counts prepared-iterator invocations, record fetches and live RecordRefs
+   (current and peak). */
+static __thread struct {
+    int      armed;
+    unsigned calls, fetches, live, peak_live;
+} prep_stream_obs;
+
+void query_test_prepared_stream_observe(int on) {
+    memset(&prep_stream_obs, 0, sizeof(prep_stream_obs));
+    prep_stream_obs.armed = on;
+}
+
+void query_test_prepared_stream_stats(unsigned *calls, unsigned *fetches,
+                                      unsigned *live, unsigned *peak_live) {
+    if (calls) *calls = prep_stream_obs.calls;
+    if (fetches) *fetches = prep_stream_obs.fetches;
+    if (live) *live = prep_stream_obs.live;
+    if (peak_live) *peak_live = prep_stream_obs.peak_live;
+}
+#define PREP_OBS_CALL()  do { if (prep_stream_obs.armed) prep_stream_obs.calls++; } while (0)
+#define PREP_OBS_ACQUIRE() do { if (prep_stream_obs.armed) { \
+        prep_stream_obs.fetches++; prep_stream_obs.live++; \
+        if (prep_stream_obs.live > prep_stream_obs.peak_live) \
+            prep_stream_obs.peak_live = prep_stream_obs.live; } } while (0)
+#define PREP_OBS_RELEASE() do { if (prep_stream_obs.armed && prep_stream_obs.live) \
+        prep_stream_obs.live--; } while (0)
+#else
+#define PREP_OBS_CALL()    ((void)0)
+#define PREP_OBS_ACQUIRE() ((void)0)
+#define PREP_OBS_RELEASE() ((void)0)
+#endif
+
+/* Unamortized deadline check (query_deadline_tick samples every 1024). */
+static int prepared_deadline_expired(QueryDeadline *dl) {
+    if (!dl || dl->timeout_ms == 0) return 0;
+    if (atomic_load_explicit(&dl->timed_out, memory_order_relaxed)) return 1;
+    if (now_ms_coarse() - dl->t0_ms > (uint64_t)dl->timeout_ms) {
+        atomic_store_explicit(&dl->timed_out, 1, memory_order_relaxed);
+        return 1;
+    }
+    return 0;
+}
+
+typedef struct {
+    StreamFindCtx *sc;
+    const char    *db_root;
+    const char    *object;
+    const Schema  *sch;
+    QueryDeadline *dl;
+} PreparedStreamIter;
+
+static int prepared_stream_iter_cb(const uint8_t hash[16], void *raw) {
+    PreparedStreamIter *it = (PreparedStreamIter *)raw;
+    StreamFindCtx *sc = it->sc;
+    if (__atomic_load_n(&sc->stop, __ATOMIC_ACQUIRE) || sc->predicate_error)
+        return 1;
+    if (prepared_deadline_expired(it->dl)) return 1;
+#ifdef TEST_BUILD
+    bm_defer_gate_park();   /* parks before a fetch with NO handles held */
+#endif
+    RecordRef ref;
+    PREP_OBS_ACQUIRE();
+    int rr = read_record_ref(it->db_root, it->object, it->sch, hash, &ref);
+    int rc = 0;
+    /* A candidate whose record is gone keeps the existing validation
+       semantics: it simply does not match. */
+    if (rr == 0)
+        rc = stream_find_record_cb(hash, ref.key, ref.klen, ref.val, ref.vlen,
+                                   ref.hdr2, sc);
+    release_record_ref(&ref);
+    PREP_OBS_RELEASE();
+    return rc != 0 ? 1 : 0;
+}
+
+static int prepared_bitmap_find_stream(const char *db_root, const char *object,
+                                       const Schema *sch, KeySet *ks,
+                                       CriteriaNode *tree,
+                                       ExcludedKeys *excluded,
+                                       int offset, int limit,
+                                       const char **proj_fields, int proj_count,
+                                       FieldSchema *fs,
+                                       int rows_fmt, int dict_fmt, char csv_delim,
+                                       QueryDeadline *dl) {
+    PREP_OBS_CALL();
+    StreamFindCtx sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.db_root = db_root;
+    sc.object = object;
+    sc.sch = sch;
+    sc.tree = tree;
+    sc.fs = fs;
+    sc.excluded = excluded;
+    sc.proj_fields = proj_fields;
+    sc.proj_count = proj_count;
+    sc.rows_fmt = rows_fmt;
+    sc.dict_fmt = dict_fmt;
+    sc.csv_delim = csv_delim;
+    sc.offset = offset;
+    sc.limit = limit;
+    sc.deadline = dl;
+    sc.parent_out = g_out;
+    int mrc = pthread_mutex_init(&sc.lock, NULL);
+    if (mrc != 0) { errno = mrc; return -1; }
+    PreparedStreamIter it = { &sc, db_root, object, sch, dl };
+    if (ks) keyset_iter(ks, prepared_stream_iter_cb, &it);
+    pthread_mutex_destroy(&sc.lock);
+    if (sc.predicate_error) { errno = sc.predicate_error; return -1; }
     return sc.printed;
 }
 
@@ -2157,6 +2562,7 @@ typedef struct {
     int            dl_counter;
     FILE          *parent_out;    /* caller's socket stream */
     pthread_mutex_t lock;          /* guards printed/skip_remaining in batch path */
+    int predicate_error;
 } CompositePrefixCtx;
 
 #ifdef TEST_BUILD
@@ -2233,10 +2639,11 @@ static int composite_prefix_cb(const char *val, size_t vlen,
 
     /* Post-filter: apply the full criteria tree (seed leaf trivially passes
        since we're inside its prefix; any extra AND leaves still need checking). */
-    if (c->tree && !criteria_match_tree(raw, value_len, c->tree, c->fs, rr.hdr2)) {
-        release_record_ref(&rr);
-        return 0;
-    }
+    int matched=0;
+    if(criteria_match_tree_checked(raw,value_len,c->tree,c->fs,rr.hdr2,&matched)){
+        int error=errno?errno:EILSEQ;release_record_ref(&rr);
+        pthread_mutex_lock(&c->lock);c->predicate_error=error;pthread_mutex_unlock(&c->lock);return -1;}
+    if(!matched){release_record_ref(&rr);return 0;}
 
     /* Offset skip-after-match */
     if (c->skip_remaining > 0) {
@@ -2250,42 +2657,11 @@ static int composite_prefix_cb(const char *val, size_t vlen,
     char key_buf[1100];
     format_query_wire_key(c->fs, key_start, rr.klen, key_buf);
 
-    if (c->dict_fmt) {
-        OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
-        if (c->proj_count > 0) {
-            OUT("{");
-            int first = 1;
-            for (int i = 0; i < c->proj_count; i++) {
-                char *pv = json_projected_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs, rr.hdr2);
-                if (!pv) continue;
-                OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
-                first = 0;
-                free(pv);
-            }
-            OUT("}");
-        } else {
-            char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
-            OUT("%s", dv ? dv : "{}");
-            free(dv);
-        }
-    } else if (c->proj_count > 0) {
-        OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
-        int first = 1;
-        for (int i = 0; i < c->proj_count; i++) {
-            char *pv = json_projected_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs, rr.hdr2);
-            if (!pv) continue;
-            OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
-            first = 0;
-            free(pv);
-        }
-        OUT("}}");
-    } else {
-        char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
-        OUT("%s{\"key\":\"%s\",\"value\":%s}",
-            c->printed ? "," : "", key_buf, dv ? dv : "{}");
-        free(dv);
+    if(typed_query_emit_row(g_out?g_out:stdout,key_buf,strlen(key_buf),raw,value_len,rr.hdr2,c->fs,
+        c->proj_fields,c->proj_count,0,c->dict_fmt,0,c->printed>0,NULL,0,NULL,g_query_buffer_max_bytes)){
+        c->predicate_error=errno?errno:EILSEQ;
+        release_record_ref(&rr);
+        return -1;
     }
 
     c->printed++;
@@ -2307,7 +2683,10 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
         if (is_excluded(c->excluded, keybuf)) return 0;
     }
 
-    if (c->tree && !criteria_match_tree(value, vlen, c->tree, c->fs, hdr2)) return 0;
+    int matched=0;
+    if(criteria_match_tree_checked(value,vlen,c->tree,c->fs,hdr2,&matched)){
+        pthread_mutex_lock(&c->lock);c->predicate_error=errno?errno:EILSEQ;pthread_mutex_unlock(&c->lock);return 1;}
+    if(!matched)return 0;
 
     pthread_mutex_lock(&c->lock);
     if (c->skip_remaining > 0) {
@@ -2319,42 +2698,11 @@ static int composite_prefix_record_cb(const uint8_t hash16[16],
     char key_buf[1100];
     format_query_wire_key(c->fs, key, klen, key_buf);
 
-    if (c->dict_fmt) {
-        OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
-        if (c->proj_count > 0) {
-            OUT("{");
-            int first = 1;
-            for (int i = 0; i < c->proj_count; i++) {
-                char *pv = json_projected_field((const char *)value, (uint32_t)vlen,
-                                        c->proj_fields[i], c->fs, hdr2);
-                if (!pv) continue;
-                OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
-                first = 0;
-                free(pv);
-            }
-            OUT("}");
-        } else {
-            char *dv = decode_value((const char *)value, (uint32_t)vlen, c->fs, hdr2);
-            OUT("%s", dv ? dv : "{}");
-            free(dv);
-        }
-    } else if (c->proj_count > 0) {
-        OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
-        int first = 1;
-        for (int i = 0; i < c->proj_count; i++) {
-            char *pv = json_projected_field((const char *)value, (uint32_t)vlen,
-                                    c->proj_fields[i], c->fs, hdr2);
-            if (!pv) continue;
-            OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
-            first = 0;
-            free(pv);
-        }
-        OUT("}}");
-    } else {
-        char *dv = decode_value((const char *)value, (uint32_t)vlen, c->fs, hdr2);
-        OUT("%s{\"key\":\"%s\",\"value\":%s}",
-            c->printed ? "," : "", key_buf, dv ? dv : "{}");
-        free(dv);
+    if(typed_query_emit_row(g_out?g_out:stdout,key_buf,strlen(key_buf),value,vlen,hdr2,c->fs,
+        c->proj_fields,c->proj_count,0,c->dict_fmt,0,c->printed>0,NULL,0,NULL,g_query_buffer_max_bytes)){
+        c->predicate_error=errno?errno:EILSEQ;
+        pthread_mutex_unlock(&c->lock);
+        return 1;
     }
 
     c->printed++;
@@ -2377,272 +2725,113 @@ typedef struct {
 /* D1 executor entry point.  seed is the equality leaf on the prefix field
    (e.g. by="alice"); order_by is the sort field (e.g. "time").
    Returns number of rows emitted (≥0) or -1 on deadline. */
-static int find_via_composite_prefix(const char *db_root, const char *object,
-                                     const Schema *sch, FieldSchema *fs,
-                                     SearchCriterion *seed,
-                                     const char *order_by,
-                                     int order_desc,
-                                     SearchCriterion *order_range,   /* NULL = whole-prefix walk */
-                                     CriteriaNode *tree,
-                                     ExcludedKeys *excluded,
-                                     int offset, int limit,
-                                     const char **proj_fields, int proj_count,
-                                     int dict_fmt,
-                                     QueryDeadline *dl)
-{
-    /* Composite index name = <seed_field>+<order_by>. */
+static int composite_order_bound(const TypedSchema *ts,int field,const char *text,
+ size_t len,uint8_t *out,size_t *outlen){
+    *outlen=0;size_t need=0;
+    int rc=typed_index_text_key_into(ts,(size_t)field,text,len,NULL,0,&need);
+    if(rc<0&&errno==EDOM)return 0;
+    if(rc!=1)return rc;
+    if(need>543)return 0;
+    return typed_index_text_key_into(ts,(size_t)field,text,len,out,543,outlen);
+}
+/* Bounds contain all inter-component tiers but omit the first tier, which
+   the ordered-index wrapper supplies. -2 means exact-scan fallback. */
+static int composite_prefix_bounds(FieldSchema *fs,const SearchCriterion *seed,
+ const char *seed_text,size_t seed_len,const char *order_by,const SearchCriterion *range,
+ uint8_t lo[544],size_t *lo_len,int *lo_excl,uint8_t hi[544],size_t *hi_len,int *hi_excl){
+    *lo_len=*hi_len=0;*lo_excl=0;*hi_excl=1;
+    if(!fs||!fs->ts){errno=EINVAL;return -1;}
+    int sf=typed_field_index(fs->ts,seed->field),of=typed_field_index(fs->ts,order_by);
+    if(sf<0||of<0){errno=EINVAL;return -1;}
+    size_t prefix=0;
+    int rc=typed_index_text_component_key_into(fs->ts,(size_t)sf,seed_text,seed_len,1,NULL,0,&prefix);
+    if(rc<0&&(errno==EDOM||errno==E2BIG))return -2;
+    if(rc!=1)return rc<0?-1:-2;
+    size_t width=0;int fixed=typed_index_fixed_width(fs->ts,(size_t)of,&width);
+    if(fixed<0)return -1;
+    size_t minimum_suffix=1+(fixed?width:0);
+    if(prefix>543||minimum_suffix>543-prefix){errno=E2BIG;return -2;}
+    if(typed_index_text_component_key_into(fs->ts,(size_t)sf,seed_text,seed_len,1,lo,543,&prefix)!=1)return -1;
+    *lo_len=prefix;
+    /* Strict byte successor bounds every key beginning with the complete
+       component. All-ff legacy prefixes use an open upper bound. */
+    size_t at=prefix;
+    while(at&&lo[at-1]==255)at--;
+    if(at){memcpy(hi,lo,at);hi[at-1]++;*hi_len=at;}
+    if(range){
+        const char *texts[2]={NULL,NULL};size_t sizes[2]={0,0};int excl[2]={0,0};
+        switch(range->op){
+        case OP_GREATER:excl[0]=1;/* fall through */
+        case OP_GREATER_EQ:texts[0]=search_criterion_value(range);sizes[0]=search_criterion_value_len(range);break;
+        case OP_LESS:excl[1]=1;/* fall through */
+        case OP_LESS_EQ:texts[1]=search_criterion_value(range);sizes[1]=search_criterion_value_len(range);break;
+        case OP_EQUAL:texts[0]=texts[1]=search_criterion_value(range);sizes[0]=sizes[1]=search_criterion_value_len(range);break;
+        case OP_BETWEEN:texts[0]=search_criterion_value(range);sizes[0]=search_criterion_value_len(range);
+            texts[1]=search_criterion_value2(range);sizes[1]=search_criterion_value2_len(range);
+            excl[0]=range->min_exclusive;excl[1]=range->max_exclusive;break;
+        default:break;
+        }
+        for(int side=0;side<2;side++)if(texts[side]){
+            uint8_t encoded[544];size_t n=0;
+            rc=composite_order_bound(fs->ts,of,texts[side],sizes[side],encoded,&n);
+            if(rc<0)return -1;
+            if(rc!=1||n>543-prefix-1)continue;
+            uint8_t *dst=side?hi:lo;
+            memcpy(dst,lo,prefix);dst[prefix]=0;memcpy(dst+prefix+1,encoded,n);
+            if(side){*hi_len=prefix+1+n;*hi_excl=excl[side];}
+            else {*lo_len=prefix+1+n;*lo_excl=excl[side];}
+        }
+    }
+    return 0;
+}
+static int find_via_composite_prefix(const char *db_root,const char *object,
+ const Schema *sch,FieldSchema *fs,SearchCriterion *seed,const char *order_by,int order_desc,
+ SearchCriterion *order_range,CriteriaNode *tree,ExcludedKeys *excluded,int offset,int limit,
+ const char **proj_fields,int proj_count,int dict_fmt,QueryDeadline *dl){
     char composite_field[256];
-    snprintf(composite_field, sizeof(composite_field), "%s+%s",
-             seed->field, order_by);
-
-    /* (C). OP_IN: k-way merge across per-value composite prefix ranges.
-     * Each IN value gets its own bounded sub-range; per-shard BtRangeIters
-     * from all values are merged in a single heap so the emitted stream is
-     * globally ordered by (encoded_value ‖ encoded_order_by). */
-    if (seed->op == OP_IN && seed->in_count > 0) {
-        int nv = seed->in_count;
-        int ns = index_splits_for(sch->splits);
-        int total = ns * nv;
-        BtOrderedRangeSpec *ranges = calloc((size_t)total, sizeof(*ranges));
-        CompositeRangeStorage *range_storage =
-            calloc((size_t)total, sizeof(*range_storage));
-        if (!ranges || !range_storage) {
-            free(ranges);
-            free(range_storage);
-            return 0;
-        }
-
-        const TypedField *seed_tf = resolve_idx_field(fs ? fs->ts : NULL, seed->field);
-
-        int ci = 0;
-        for (int iv = 0; iv < nv; iv++) {
-            uint8_t lo[1024 + 8]; size_t len_lo = 0;
-            encode_criterion_value(seed_tf, seed->in_values[iv],
-                                   strlen(seed->in_values[iv]), lo, &len_lo);
-            size_t pfx = len_lo;
-            uint8_t hi[1024 + 8];
-            memcpy(hi, lo, len_lo);
-            size_t len_hi;
-            if (len_lo > 0 && (!seed_tf || len_lo < (size_t)seed_tf->size)) {
-                int pos = (int)len_lo - 1;
-                while (pos >= 0 && lo[pos] == 0xff) pos--;
-                if (pos >= 0) {
-                    memcpy(hi, lo, (size_t)pos);
-                    hi[pos] = lo[pos] + 1;
-                    len_hi = (size_t)pos + 1;
-                } else {
-                    memcpy(hi, lo, len_lo);
-                    hi[len_lo] = 0x00;
-                    len_hi = len_lo + 1;
-                }
-            } else {
-                memset(hi + len_lo, 0xff, 4);
-                len_hi = len_lo + 4;
-            }
-            int min_excl = 0, max_excl = 0;
-
-            /* order_range fold */
-            if (order_range) {
-                const TypedField *ord_tf = resolve_idx_field(fs ? fs->ts : NULL, order_by);
-                const char *lowv = NULL; int low_excl = 0;
-                const char *highv = NULL; int high_excl = 0;
-                switch (order_range->op) {
-                    case OP_GREATER_EQ: lowv = order_range->value; break;
-                    case OP_GREATER:    lowv = order_range->value; low_excl = 1; break;
-                    case OP_LESS_EQ:    highv = order_range->value; break;
-                    case OP_LESS:       highv = order_range->value; high_excl = 1; break;
-                    case OP_EQUAL:      lowv = highv = order_range->value; break;
-                    case OP_BETWEEN:
-                        lowv  = order_range->value;  low_excl  = order_range->min_exclusive;
-                        highv = order_range->value2; high_excl = order_range->max_exclusive;
-                        break;
-                    default: break;
-                }
-                if (lowv) {
-                    uint8_t enc[1024]; size_t el = 0;
-                    encode_criterion_value(ord_tf, lowv, strlen(lowv), enc, &el);
-                    /* BTRI: the appended component needs its tier byte
-                       ([t1][v1][t2][v2], §2.4.2) — see the single-value
-                       fold below for the missed-range rationale. */
-                    if (pfx + 1 + el <= sizeof(lo)) {
-                        lo[pfx] = 0x00;
-                        memcpy(lo + pfx + 1, enc, el); len_lo = pfx + 1 + el;
-                        min_excl = low_excl;
-                    }
-                }
-                if (highv) {
-                    uint8_t enc[1024]; size_t el = 0;
-                    encode_criterion_value(ord_tf, highv, strlen(highv), enc, &el);
-                    if (pfx + 1 + el <= sizeof(hi)) {
-                        hi[pfx] = 0x00;
-                        memcpy(hi + pfx + 1, enc, el); len_hi = pfx + 1 + el;
-                        max_excl = high_excl;
-                    }
-                }
-            }
-
-            for (int s = 0; s < ns; s++) {
-                CompositeRangeStorage *storage = &range_storage[ci];
-                build_idx_path(storage->path, sizeof(storage->path),
-                               db_root, object, composite_field, s);
-                /* BTRI: this walk calls btree_walk_ordered_ranges directly
-                   — no tier-prefixing wrapper — so every bound needs its
-                   own leading tier byte to compare against stored
-                   [0x00][payload…] keys. */
-                storage->lo[0] = 0x00;
-                memcpy(storage->lo + 1, lo, len_lo);
-                storage->lo_len = len_lo + 1;
-                storage->hi[0] = 0x00;
-                memcpy(storage->hi + 1, hi, len_hi);
-                storage->hi_len = len_hi + 1;
-
-                ranges[ci].path = storage->path;
-                ranges[ci].min_val = (const char *)storage->lo;
-                ranges[ci].min_len = storage->lo_len;
-                ranges[ci].min_exclusive = min_excl;
-                ranges[ci].max_val = (const char *)storage->hi;
-                ranges[ci].max_len = storage->hi_len;
-                ranges[ci].max_exclusive = max_excl;
-                ranges[ci].tie_id = iv;
-                ci++;
-            }
-        }
-
-        CompositePrefixCtx ctx;
-        memset(&ctx, 0, sizeof(ctx));
-        ctx.db_root = db_root; ctx.object = object; ctx.sch = sch; ctx.fs = fs;
-        ctx.tree = tree; ctx.excluded = excluded;
-        ctx.proj_fields = proj_fields; ctx.proj_count = proj_count;
-        ctx.dict_fmt = dict_fmt;
-        ctx.skip_remaining = (offset > 0) ? offset : 0;
-        ctx.limit = (limit > 0)  ? limit  : INT_MAX;
-        ctx.dl = dl; ctx.dl_counter = 0; ctx.parent_out = g_out;
-        pthread_mutex_init(&ctx.lock, NULL);
-
-        btree_walk_ordered_ranges(ranges, (size_t)ci, order_desc,
-                                  composite_prefix_cb, &ctx);
-
-        pthread_mutex_destroy(&ctx.lock);
-        free(ranges);
-        free(range_storage);
-        return ctx.printed;
+    int written=snprintf(composite_field,sizeof(composite_field),"%s+%s",seed->field,order_by);
+    if(written<0||(size_t)written>=sizeof(composite_field)){errno=EINVAL;return -1;}
+    int nv=seed->op==OP_IN?seed->in_count:1;
+    if(nv<1)return 0;
+    int ns=index_splits_for(sch->splits);
+    BtOrderedRangeSpec *ranges=NULL;CompositeRangeStorage *storage=NULL;
+    size_t count=(size_t)nv*(size_t)ns;
+    int merge_ranges=seed->op==OP_IN;
+    if(merge_ranges){
+        if(count>g_query_buffer_max_bytes/(sizeof(*ranges)+sizeof(*storage))){errno=ENOBUFS;return -1;}
+        ranges=calloc(count,sizeof(*ranges));storage=calloc(count,sizeof(*storage));
+        if(!ranges||!storage){free(ranges);free(storage);errno=ENOMEM;return -1;}
     }
-
-    /* (single-value). Seed prefix = encode(seed value). */
-    uint8_t buf_lo_sv[1024 + 8];
-    size_t  len_lo_sv = 0;
-    const TypedField *seed_tf_sv = resolve_idx_field(fs ? fs->ts : NULL, seed->field);
-    encode_criterion_value(seed_tf_sv, seed->value, strlen(seed->value), buf_lo_sv, &len_lo_sv);
-    size_t pfx_len = len_lo_sv;
-
-    /* 2. Upper bound: byte-successor of the seed prefix.
-       For fixed-width types: append 0xff bytes (original STARTS_WITH idiom).
-       For variable-length encodings (VARCHAR or raw bytes): increment the last
-       byte < 0xff, or append 0x00 if all 0xff, producing a tight exclusive
-       bound.  The old 0xff*4 approach creates an over-wide range for
-       variable-length keys because shorter prefix + 0xff can let non-matching
-       values through.  Detected by comparing the encoded length to the field's
-       fixed storage size (seed_tf_sv->size); when they match, the encoding is
-       fixed-width; when encoded < size or seed_tf_sv is NULL (raw), it's
-       variable-length. */
-    uint8_t buf_hi[1024 + 8];
-    memcpy(buf_hi, buf_lo_sv, len_lo_sv);
-    size_t len_hi;
-    if (len_lo_sv > 0 && (!seed_tf_sv || len_lo_sv < (size_t)seed_tf_sv->size)) {
-        int pos = (int)len_lo_sv - 1;
-        while (pos >= 0 && buf_lo_sv[pos] == 0xff) pos--;
-        if (pos >= 0) {
-            memcpy(buf_hi, buf_lo_sv, (size_t)pos);
-            buf_hi[pos] = buf_lo_sv[pos] + 1;
-            len_hi = (size_t)pos + 1;
-        } else {
-            memcpy(buf_hi, buf_lo_sv, len_lo_sv);
-            buf_hi[len_lo_sv] = 0x00;
-            len_hi = len_lo_sv + 1;
-        }
-    } else {
-        memset(buf_hi + len_lo_sv, 0xff, 4);
-        len_hi = len_lo_sv + 4;
-    }
-    int min_excl = 0, max_excl = 0;
-
-    /* 2b. If an order_by range/eq leaf is present (EQ seed only — guaranteed
-       by the planner), append its encoded value(s) to the seed prefix so the
-       btree seeks to T instead of walking the whole prefix and post-filtering.
-       Composite key = encode(seed) ‖ encode(order_by); appending encode(T)
-       after the (fixed-for-EQ) seed prefix is the exact seek point. */
-    if (order_range) {
-        const TypedField *ord_tf = resolve_idx_field(fs ? fs->ts : NULL, order_by);
-        /* low bound: >=, >, BETWEEN-low, or == */
-        const char *lowv = NULL; int low_excl = 0;
-        const char *highv = NULL; int high_excl = 0;
-        switch (order_range->op) {
-            case OP_GREATER_EQ: lowv = order_range->value; break;
-            case OP_GREATER:    lowv = order_range->value; low_excl = 1; break;
-            case OP_LESS_EQ:    highv = order_range->value; break;
-            case OP_LESS:       highv = order_range->value; high_excl = 1; break;
-            case OP_EQUAL:      lowv = highv = order_range->value; break;
-            case OP_BETWEEN:
-                lowv  = order_range->value;  low_excl  = order_range->min_exclusive;
-                highv = order_range->value2; high_excl = order_range->max_exclusive;
-                break;
-            default: break;   /* leave whole-prefix bounds */
-        }
-        if (lowv) {
-            uint8_t enc[1024]; size_t el = 0;
-            encode_criterion_value(ord_tf, lowv, strlen(lowv), enc, &el);
-            /* BTRI composite keys interleave a tier byte before EVERY
-               component ([t1][v1][t2][v2], §2.4.2) — the appended order_by
-               encoding needs its own 0x00 or the seek's payload byte
-               compares against stored tier bytes and the range misses. */
-            if (pfx_len + 1 + el <= sizeof(buf_lo_sv)) {
-                buf_lo_sv[pfx_len] = 0x00;
-                memcpy(buf_lo_sv + pfx_len + 1, enc, el);
-                len_lo_sv = pfx_len + 1 + el;
-                min_excl = low_excl;
-            }
-        }
-        if (highv) {
-            uint8_t enc[1024]; size_t el = 0;
-            encode_criterion_value(ord_tf, highv, strlen(highv), enc, &el);
-            if (pfx_len + 1 + el <= sizeof(buf_hi)) {
-                buf_hi[pfx_len] = 0x00;
-                memcpy(buf_hi + pfx_len + 1, enc, el);
-                len_hi = pfx_len + 1 + el;
-                max_excl = high_excl;
-            }
+    uint8_t single_lo[544],single_hi[544];size_t single_ll=0,single_hl=0;
+    int single_le=0,single_he=0;
+    for(int v=0;v<nv;v++){
+        const char *text=seed->op==OP_IN?seed->in_values[v]:search_criterion_value(seed);
+        size_t len=seed->op==OP_IN?strlen(text):search_criterion_value_len(seed);
+        uint8_t lo[544],hi[544];size_t ll=0,hl=0;int le=0,he=0;
+        int rc=composite_prefix_bounds(fs,seed,text,len,order_by,order_range,lo,&ll,&le,hi,&hl,&he);
+        if(rc){free(ranges);free(storage);return rc;}
+        if(!merge_ranges){memcpy(single_lo,lo,ll);memcpy(single_hi,hi,hl);single_ll=ll;single_hl=hl;single_le=le;single_he=he;}
+        else for(int shard=0;shard<ns;shard++){
+            size_t i=(size_t)v*(size_t)ns+(size_t)shard;
+            build_idx_path(storage[i].path,sizeof(storage[i].path),db_root,object,composite_field,shard);
+            storage[i].lo[0]=0;memcpy(storage[i].lo+1,lo,ll);storage[i].lo_len=ll+1;
+            if(hl){storage[i].hi[0]=0;memcpy(storage[i].hi+1,hi,hl);storage[i].hi_len=hl+1;}
+            ranges[i]=(BtOrderedRangeSpec){.path=storage[i].path,.min_val=(const char*)storage[i].lo,
+                .min_len=storage[i].lo_len,.min_exclusive=le,
+                .max_val=hl?(const char*)storage[i].hi:NULL,.max_len=hl?storage[i].hi_len:0,
+                .max_exclusive=he,.tie_id=v};
         }
     }
-
-    /* 4. Set up the callback context. */
-    CompositePrefixCtx ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.db_root        = db_root;
-    ctx.object         = object;
-    ctx.sch            = sch;
-    ctx.fs             = fs;
-    ctx.tree           = tree;
-    ctx.excluded       = excluded;
-    ctx.proj_fields    = proj_fields;
-    ctx.proj_count     = proj_count;
-    ctx.dict_fmt       = dict_fmt;
-    ctx.skip_remaining = (offset > 0) ? offset : 0;
-    ctx.limit          = (limit > 0)  ? limit  : INT_MAX;
-    ctx.printed        = 0;
-    ctx.dl             = dl;
-    ctx.dl_counter     = 0;
-    ctx.parent_out     = g_out;
-    pthread_mutex_init(&ctx.lock, NULL);
-
-    /* 5. Walk the composite btree.  The k-way merge across index shards
-          delivers entries already sorted by (encoded_a || encoded_b) in
-          the requested direction — asc or desc. */
-    btree_idx_walk_ordered(db_root, object, composite_field, sch->splits,
-                           (const char *)buf_lo_sv, len_lo_sv, min_excl,
-                           (const char *)buf_hi, len_hi, max_excl,
-                           order_desc, composite_prefix_cb, &ctx);
-
-    pthread_mutex_destroy(&ctx.lock);
+    CompositePrefixCtx ctx={0};ctx.db_root=db_root;ctx.object=object;ctx.sch=sch;ctx.fs=fs;
+    ctx.tree=tree;ctx.excluded=excluded;ctx.proj_fields=proj_fields;ctx.proj_count=proj_count;
+    ctx.dict_fmt=dict_fmt;ctx.skip_remaining=offset>0?offset:0;ctx.limit=limit>0?limit:INT_MAX;
+    ctx.dl=dl;ctx.parent_out=g_out;pthread_mutex_init(&ctx.lock,NULL);
+    if(!merge_ranges)btree_idx_walk_ordered(db_root,object,composite_field,sch->splits,
+        (const char*)single_lo,single_ll,single_le,single_hl?(const char*)single_hi:NULL,single_hl,single_he,
+        order_desc,composite_prefix_cb,&ctx);
+    else btree_walk_ordered_ranges(ranges,count,order_desc,composite_prefix_cb,&ctx);
+    pthread_mutex_destroy(&ctx.lock);free(ranges);free(storage);
+    if(ctx.predicate_error){errno=ctx.predicate_error;return -1;}
     return ctx.printed;
 }
 
@@ -2655,59 +2844,55 @@ static int find_via_composite_prefix(const char *db_root, const char *object,
 
 /* collect_and_leaves is declared in query_internal.h */
 
-void order_walk_bounds(CriteriaNode *tree, FieldSchema *fs,
-                       const char *order_by, OrderWalkBounds *b) {
-    memset(b, 0, sizeof(*b));
-    /* defaults: lo = "" (len 0), hi = 4 x 0xff */
-    memset(b->hi, 0xff, 4); b->hi_len = 4;
-    if (!order_by || !order_by[0]) return;
-
-    const TypedField *tf = resolve_idx_field(fs ? fs->ts : NULL, order_by);
-    if (!tf) return;
-
+static int order_bound_cmp(const uint8_t *a,size_t an,const uint8_t *b,size_t bn){
+    size_t n=an<bn?an:bn;int c=memcmp(a,b,n);return c?c:(an>bn)-(an<bn);
+}
+int order_walk_bounds_checked(CriteriaNode *tree,FieldSchema *fs,
+ const char *order_by,OrderWalkBounds *bounds){
+    memset(bounds,0,sizeof(*bounds));memset(bounds->hi,255,4);bounds->hi_len=4;
+    if(!order_by||!fs||!fs->ts)return 0;
+    int field=typed_field_index(fs->ts,order_by);if(field<0)return 0;
     SearchCriterion *leaves[MAX_INTERSECT_LEAVES];
-    int nL = collect_and_leaves(tree, leaves, MAX_INTERSECT_LEAVES);
-    for (int i = 0; i < nL; i++) {
-        if (strcmp(leaves[i]->field, order_by) != 0) continue;
-        const char *lowv = NULL;  int low_excl = 0;
-        const char *highv = NULL; int high_excl = 0;
-        switch (leaves[i]->op) {
-            case OP_GREATER_EQ: lowv = leaves[i]->value; break;
-            case OP_GREATER:    lowv = leaves[i]->value; low_excl = 1; break;
-            case OP_LESS_EQ:    highv = leaves[i]->value; break;
-            case OP_LESS:       highv = leaves[i]->value; high_excl = 1; break;
-            case OP_EQUAL:      lowv = highv = leaves[i]->value; break;
-            case OP_BETWEEN:
-                lowv  = leaves[i]->value;  low_excl  = leaves[i]->min_exclusive;
-                highv = leaves[i]->value2; high_excl = leaves[i]->max_exclusive;
-                break;
-            default: break;   /* not a range/eq op → no bound */
+    int count=collect_and_leaves(tree,leaves,MAX_INTERSECT_LEAVES);
+    for(int i=0;i<count;i++){
+        SearchCriterion *leaf=leaves[i];if(strcmp(leaf->field,order_by))continue;
+        const char *texts[2]={NULL,NULL};size_t sizes[2]={0,0};int exclusive[2]={0,0};
+        switch(leaf->op){
+        case OP_GREATER:exclusive[0]=1;/* fall through */
+        case OP_GREATER_EQ:texts[0]=search_criterion_value(leaf);sizes[0]=search_criterion_value_len(leaf);break;
+        case OP_LESS:exclusive[1]=1;/* fall through */
+        case OP_LESS_EQ:texts[1]=search_criterion_value(leaf);sizes[1]=search_criterion_value_len(leaf);break;
+        case OP_EQUAL:texts[0]=texts[1]=search_criterion_value(leaf);sizes[0]=sizes[1]=search_criterion_value_len(leaf);break;
+        case OP_BETWEEN:texts[0]=search_criterion_value(leaf);sizes[0]=search_criterion_value_len(leaf);
+            texts[1]=search_criterion_value2(leaf);sizes[1]=search_criterion_value2_len(leaf);
+            exclusive[0]=leaf->min_exclusive;exclusive[1]=leaf->max_exclusive;break;
+        default:break;
         }
-        if (lowv) {
-            uint8_t enc[1024]; size_t el = 0;
-            encode_criterion_value(tf, lowv, strlen(lowv), enc, &el);
-            /* Keep the TIGHTEST lower bound (largest encoded value). First one
-             * always wins over the "" default. memcmp is valid because the
-             * index encoding is order-preserving. */
-            if (el > 0 && (!b->has_lo ||
-                           el > b->lo_len ||
-                           (el == b->lo_len && memcmp(enc, b->lo, el) > 0))) {
-                memcpy(b->lo, enc, el); b->lo_len = el; b->lo_excl = low_excl;
-                b->has_lo = 1;
+        for(int side=0;side<2;side++)if(texts[side]){
+            size_t need=0;errno=0;
+            int rc=typed_index_text_key_into(fs->ts,(size_t)field,texts[side],sizes[side],NULL,0,&need);
+            if(rc<0){if(errno==EDOM)continue;return -1;}
+            /* Unknown enum or valid bound beyond the ordered admission
+               domain is an omitted optimization. Exact postfilter remains. */
+            if(rc==0||need>544)continue;
+            uint8_t key[544];size_t len=0;
+            if(typed_index_text_key_into(fs->ts,(size_t)field,texts[side],sizes[side],key,sizeof(key),&len)!=1)return -1;
+            if(side==0){
+                int cmp=order_bound_cmp(key,len,bounds->lo,bounds->lo_len);
+                if(!bounds->has_lo||cmp>0||(cmp==0&&exclusive[0])){
+                    memcpy(bounds->lo,key,len);bounds->lo_len=len;bounds->lo_excl=exclusive[0];bounds->has_lo=1;
+                }
+            }else {
+                int cmp=order_bound_cmp(key,len,bounds->hi,bounds->hi_len);
+                if(!bounds->has_hi||cmp<0||(cmp==0&&exclusive[1])){
+                    memcpy(bounds->hi,key,len);bounds->hi_len=len;bounds->hi_excl=exclusive[1];bounds->has_hi=1;
+                }
             }
         }
-        if (highv) {
-            uint8_t enc[1024]; size_t el = 0;
-            encode_criterion_value(tf, highv, strlen(highv), enc, &el);
-            /* Keep the TIGHTEST upper bound (smallest encoded value). */
-            if (el > 0 && (!b->has_hi ||
-                           el < b->hi_len ||
-                           (el == b->hi_len && memcmp(enc, b->hi, el) < 0))) {
-                memcpy(b->hi, enc, el); b->hi_len = el; b->hi_excl = high_excl;
-                b->has_hi = 1;
-            }
-        }
-    }
+    }return 0;
+}
+void order_walk_bounds(CriteriaNode *tree,FieldSchema *fs,const char *order_by,OrderWalkBounds *bounds){
+    (void)order_walk_bounds_checked(tree,fs,order_by,bounds);
 }
 
 /* Forward declarations (defined later in this file). */
@@ -2780,6 +2965,7 @@ static int find_via_composite_key(const char *db_root, const char *object,
     }
 
     pthread_mutex_destroy(&ctx.lock);
+    if(ctx.predicate_error){errno=ctx.predicate_error;return -1;}
     return ctx.printed;
 }
 
@@ -2821,6 +3007,7 @@ typedef struct {
     QueryDeadline *dl;
     int            dl_counter;
     FILE          *parent_out;
+    int predicate_error;
 } OrderIndexWalkCtx;
 
 #ifdef TEST_BUILD
@@ -2871,10 +3058,10 @@ static int order_index_walk_cb(const char *val, size_t vlen,
 
     /* Post-filter: apply the FULL criteria tree — unlike D1 nothing is
        guaranteed to match by the walk range alone. */
-    if (c->tree && !criteria_match_tree(raw, value_len, c->tree, c->fs, rr.hdr2)) {
-        release_record_ref(&rr);
-        return 0;
-    }
+    int matched=0;
+    if(criteria_match_tree_checked(raw,value_len,c->tree,c->fs,rr.hdr2,&matched)){
+        c->predicate_error=errno?errno:EILSEQ;release_record_ref(&rr);return -1;}
+    if(!matched){release_record_ref(&rr);return 0;}
 
     /* Offset skip-after-match. */
     if (c->skip_remaining > 0) {
@@ -2888,42 +3075,11 @@ static int order_index_walk_cb(const char *val, size_t vlen,
     char key_buf[1100];
     format_query_wire_key(c->fs, key_start, rr.klen, key_buf);
 
-    if (c->dict_fmt) {
-        OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
-        if (c->proj_count > 0) {
-            OUT("{");
-            int first = 1;
-            for (int i = 0; i < c->proj_count; i++) {
-                char *pv = json_projected_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs, rr.hdr2);
-                if (!pv) continue;
-                OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
-                first = 0;
-                free(pv);
-            }
-            OUT("}");
-        } else {
-            char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
-            OUT("%s", dv ? dv : "{}");
-            free(dv);
-        }
-    } else if (c->proj_count > 0) {
-        OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
-        int first = 1;
-        for (int i = 0; i < c->proj_count; i++) {
-            char *pv = json_projected_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs, rr.hdr2);
-            if (!pv) continue;
-            OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
-            first = 0;
-            free(pv);
-        }
-        OUT("}}");
-    } else {
-        char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
-        OUT("%s{\"key\":\"%s\",\"value\":%s}",
-            c->printed ? "," : "", key_buf, dv ? dv : "{}");
-        free(dv);
+    if(typed_query_emit_row(g_out?g_out:stdout,key_buf,strlen(key_buf),raw,value_len,rr.hdr2,c->fs,
+        c->proj_fields,c->proj_count,0,c->dict_fmt,0,c->printed>0,NULL,0,NULL,g_query_buffer_max_bytes)){
+        c->predicate_error=errno?errno:EILSEQ;
+        release_record_ref(&rr);
+        return -1;
     }
 
     c->printed++;
@@ -2953,7 +3109,7 @@ static int find_via_order_index_walk(const char *db_root, const char *object,
        legacy \xff*4 sentinel would ride btree_idx_walk_ordered's [0x00]
        prefix and clamp the walk below the NULL tier. */
     OrderWalkBounds owb;
-    order_walk_bounds(tree, fs, order_by, &owb);
+    if(order_walk_bounds_checked(tree,fs,order_by,&owb))return -1;
     const char *lo = owb.has_lo ? (const char *)owb.lo : NULL;
     size_t      lo_len  = owb.has_lo ? owb.lo_len  : 0;
     int         lo_excl = owb.has_lo ? owb.lo_excl : 0;
@@ -2989,6 +3145,7 @@ static int find_via_order_index_walk(const char *db_root, const char *object,
                            hi, hi_len, hi_excl,
                            order_desc, order_index_walk_cb, &ctx);
 
+    if(ctx.predicate_error){errno=ctx.predicate_error;return -1;}
     return ctx.printed;
 }
 
@@ -3172,30 +3329,191 @@ static int bm_emit_cb(uint32_t slot, void *ctx) {
 typedef struct {
     SearchCriterion  *crit;
     const TypedField *tf;
-    uint8_t  vals[BM_DICT_MATCH_CAP][1024];
+    const TypedSchema *schema;
+    uint8_t *vals[BM_DICT_MATCH_CAP];
     size_t   vlens[BM_DICT_MATCH_CAP];
-    int      n_match;
+    size_t   bytes, budget;
+    int      n_match, error;
 } BmDictMatchCtx;
 
-static int bm_dict_match_cb(const uint8_t *value, size_t vlen, void *ctx) {
-    BmDictMatchCtx *m = (BmDictMatchCtx *)ctx;
+static void bm_dict_match_clear(BmDictMatchCtx *m) {
+    for (int i = 0; i < m->n_match; i++) free(m->vals[i]);
+    m->n_match = 0;
+    m->bytes = 0;
+}
+
+/* Numeric dictionary entries carry sortable index payloads, never packed
+ * record descriptors or display text. Validate their canonical shape before
+ * comparing. This does not decode or rewrite the engine's dictionary. */
+static int bm_numeric_payload_valid(const TypedSchema *ts,
+                                    const uint8_t *v, size_t n) {
+    if (!ts->packed.nfields) return n == 8;
+    if (n == 1) return v[0] == 1;
+    if (n < 9 || !(n & 1) || (v[0] != 0 && v[0] != 2)) return 0;
+    unsigned mask = v[0] == 0 ? 255u : 0u;
+    if ((v[n-2] ^ mask) || (v[n-1] ^ mask)) return 0;
+    for (size_t i = 5; i + 2 < n; i += 2) {
+        unsigned limb = ((unsigned)(v[i] ^ mask) << 8) | (v[i+1] ^ mask);
+        if (limb < 1 || limb > 10000) return 0;
+        if ((i == 5 || i + 4 == n) && limb == 1) return 0;
+    }
+    return 1;
+}
+
+static int bm_numeric_literal_cmp(BmDictMatchCtx *m, const uint8_t *v,
+                                  size_t n, const char *text, size_t text_n,
+                                  int *cmp) {
+    int field = typed_field_index(m->schema, m->crit->field);
+    size_t need = 0;
+    if (field < 0) { errno = EINVAL; return -1; }
+    int rc = typed_index_text_key_into(m->schema, (size_t)field,
+                                      text, text_n, NULL, 0, &need);
+    if (rc != 1) { if (!errno) errno = EINVAL; return -1; }
+    if (need > m->budget - m->bytes) { errno = ENOBUFS; return -1; }
+    uint8_t *key = malloc(need ? need : 1);
+    if (!key) { errno = ENOMEM; return -1; }
+    rc = typed_index_text_key_into(m->schema, (size_t)field, text, text_n,
+                                   key, need, &need);
+    if (rc != 1) { free(key); if (!errno) errno = EINVAL; return -1; }
+    size_t common = n < need ? n : need;
+    int c = memcmp(v, key, common);
+    *cmp = c ? c : (n > need) - (n < need);
+    free(key);
+    return 0;
+}
+
+static int bm_numeric_dict_match(BmDictMatchCtx *m, const uint8_t *v,
+                                 size_t n, int *matched) {
     SearchCriterion *c = m->crit;
-    int matched;
+    *matched = 0;
+    int valid=m->schema!=NULL;
+    if(valid&&m->tf->type==FT_ENUM){
+        valid=n==(size_t)m->tf->enum_width&&(n==1||n==2);
+        if(valid){unsigned e=n==2?((unsigned)v[0]<<8)|v[1]:v[0];
+            valid=e<(unsigned)m->tf->n_enum_values;}
+    }else if(valid)valid=bm_numeric_payload_valid(m->schema,v,n);
+    if(!valid){errno=EILSEQ;return -1;}
+    if (c->op == OP_EXISTS) { *matched = 1; return 0; }
+    if (c->op == OP_IN || c->op == OP_NOT_IN) {
+        int found = 0;
+        for (int i = 0; i < c->in_count; i++) {
+            int cmp;
+            if (bm_numeric_literal_cmp(m, v, n, c->in_values[i],
+                                       strlen(c->in_values[i]), &cmp)) return -1;
+            if (!cmp) { found = 1; break; }
+        }
+        *matched = c->op == OP_IN ? found : !found;
+        return 0;
+    }
+    int cmp;
+    if (bm_numeric_literal_cmp(m, v, n, search_criterion_value(c),
+                               search_criterion_value_len(c), &cmp)) return -1;
+    switch (c->op) {
+    case OP_EQUAL: *matched = cmp == 0; return 0;
+    case OP_NOT_EQUAL: *matched = cmp != 0; return 0;
+    case OP_LESS: *matched = cmp < 0; return 0;
+    case OP_LESS_EQ: *matched = cmp <= 0; return 0;
+    case OP_GREATER: *matched = cmp > 0; return 0;
+    case OP_GREATER_EQ: *matched = cmp >= 0; return 0;
+    case OP_BETWEEN: {
+        int hi;
+        if (bm_numeric_literal_cmp(m, v, n, search_criterion_value2(c),
+                                   search_criterion_value2_len(c), &hi)) return -1;
+        *matched = (c->min_exclusive ? cmp > 0 : cmp >= 0) &&
+                   (c->max_exclusive ? hi < 0 : hi <= 0);
+        return 0;
+    }
+    default: errno = EINVAL; return -1;
+    }
+}
+
+static int bm_varchar_dict_match(const uint8_t *value,size_t n,
+                                  const SearchCriterion *c,int *matched){
+    const char *text=search_criterion_value(c);
+    int cmp=order_bound_cmp(value,n,(const uint8_t*)text,search_criterion_value_len(c));
+    switch(c->op){
+    case OP_EQUAL:*matched=cmp==0;return 1;
+    case OP_NOT_EQUAL:*matched=cmp!=0;return 1;
+    case OP_LESS:*matched=cmp<0;return 1;
+    case OP_LESS_EQ:*matched=cmp<=0;return 1;
+    case OP_GREATER:*matched=cmp>0;return 1;
+    case OP_GREATER_EQ:*matched=cmp>=0;return 1;
+    case OP_BETWEEN:{int hi=order_bound_cmp(value,n,(const uint8_t*)search_criterion_value2(c),search_criterion_value2_len(c));
+        *matched=(c->min_exclusive?cmp>0:cmp>=0)&&(c->max_exclusive?hi<0:hi<=0);return 1;}
+    case OP_IN:case OP_NOT_IN:{
+        int found=0;
+        for(int i=0;i<c->in_count;i++) {
+            if(!order_bound_cmp(value,n,(const uint8_t*)c->in_values[i],strlen(c->in_values[i]))) {
+                found=1;
+                break;
+            }
+        }
+        *matched=c->op==OP_IN?found:!found;
+        return 1;
+    }
+    default:return 0;
+    }
+}
+
+static int bm_dict_match_cb(const uint8_t *value, size_t vlen, void *ctx) {
+    BmDictMatchCtx *m = ctx;
+    SearchCriterion *c = m->crit;
+    int matched = 0;
+    if (m->error) return 1;
     if (op_is_length(c->op)) {
         matched = match_length_vlen(vlen, c);
+    } else if (m->tf && (m->tf->type == FT_NUMERIC||m->tf->type == FT_ENUM)) {
+        if (bm_numeric_dict_match(m, value, vlen, &matched)) goto failed;
+    } else if (m->tf && m->tf->type==FT_VARCHAR &&
+               bm_varchar_dict_match(value,vlen,c,&matched)) {
+        /* Length-aware byte comparison already produced the result. */
     } else {
-        char buf[512];
-        int dlen = decode_idx_to_buf(m->tf, value, vlen, buf, sizeof(buf), 0);
-        if (dlen <= 0) return 0;
-        matched = match_criterion(buf, c);
+        if (vlen == SIZE_MAX) { errno = ENOBUFS; goto failed; }
+        size_t cap = vlen + 1 > 512 ? vlen + 1 : 512;
+        if (cap > m->budget - m->bytes) { errno = ENOBUFS; goto failed; }
+        char *buf = malloc(cap);
+        if (!buf) { errno = ENOMEM; goto failed; }
+        int dlen;
+        if (!m->tf || m->tf->type == FT_VARCHAR) {
+            memcpy(buf, value, vlen); buf[vlen] = 0;
+            dlen = (int)vlen;
+        } else {
+            dlen = decode_idx_to_buf(m->tf, value, vlen, buf, cap, 0);
+        }
+        if (dlen < 0 || (size_t)dlen >= cap) {
+            free(buf); errno = EILSEQ; goto failed;
+        }
+        matched = match_criterion_vlen(buf, (size_t)dlen, c);
+        free(buf);
     }
-    if (matched && m->n_match < BM_DICT_MATCH_CAP &&
-        vlen <= sizeof(m->vals[0])) {
-        memcpy(m->vals[m->n_match], value, vlen);
-        m->vlens[m->n_match] = vlen;
-        m->n_match++;
+    if (matched) {
+        if (m->n_match == BM_DICT_MATCH_CAP || vlen > m->budget - m->bytes) {
+            errno = ENOBUFS; goto failed;
+        }
+        uint8_t *copy = malloc(vlen ? vlen : 1);
+        if (!copy) { errno = ENOMEM; goto failed; }
+        memcpy(copy, value, vlen);
+        m->vals[m->n_match] = copy;
+        m->vlens[m->n_match++] = vlen;
+        m->bytes += vlen;
     }
     return 0;
+failed:
+    m->error = errno ? errno : EILSEQ;
+    return 1;
+}
+
+/* Reader open for a bitmap read consumer. 0 = handle opened; 1 = the shard's
+   file does not exist (never written: logically empty, not an error); -1 =
+   hard read failure with errno set (corruption, acquisition error,
+   admission exhaustion, I/O). */
+static int bm_open_read(const char *path, BitmapShard **out) {
+    errno = 0;
+    *out = bm_open(path, 0, 0, 0, 0, 0 /* reader */);
+    if (*out) return 0;
+    if (errno == ENOENT) return 1;
+    if (errno == 0) errno = EIO;
+    return -1;
 }
 
 /* Walk a single shard's bitmap dict-scan style. Returns 1 if cb
@@ -3205,7 +3523,9 @@ static int bitmap_emit_generic_for_shard(const char *db_root, const char *object
                                           SearchCriterion *crit,
                                           const TypedField *tf,
                                           bt_result_cb cb, void *ctx,
-                                          SlotcaskDb *sdb) {
+                                          SlotcaskDb *sdb,
+                                          const TypedSchema *schema,
+                                          size_t budget) {
     char kfp[PATH_MAX];
     slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, shard_idx);
     SlotcaskKfHandle kh;
@@ -3214,17 +3534,24 @@ static int bitmap_emit_generic_for_shard(const char *db_root, const char *object
 
     char bp[1024];
     bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
-    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-    if (!bm) {
+    BitmapShard *bm = NULL;
+    int orc = bm_open_read(bp, &bm);
+    if (orc != 0) {
+        int saved = errno;
         kfcache_release(&kh);
+        if (orc < 0) { errno = saved; return -1; }
         return 0;
     }
 
-    BmDictMatchCtx m = { .crit = crit, .tf = tf, .n_match = 0 };
+    BmDictMatchCtx m = { .crit = crit, .tf = tf, .schema = schema,
+                         .budget = budget };
     bm_iter_values(bm, bm_dict_match_cb, &m);
-    if (m.n_match == 0) {
+    if (m.error || m.n_match == 0) {
+        int error = m.error;
+        bm_dict_match_clear(&m);
         bm_close(bm);
         kfcache_release(&kh);
+        if (error) { errno = error; return -1; }
         return 0;
     }
 
@@ -3237,6 +3564,7 @@ static int bitmap_emit_generic_for_shard(const char *db_root, const char *object
     }
     idx_count_cb_flush_thread();
 
+    bm_dict_match_clear(&m);
     bm_close(bm);
     kfcache_release(&kh);
     return stop;
@@ -3252,7 +3580,9 @@ static void *bm_generic_shard_worker(void *arg) {
     int stopped = bitmap_emit_generic_for_shard(a->db_root, a->object,
                                                  a->field, a->shard_idx,
                                                  a->crit, a->tf,
-                                                 a->cb, a->ctx, a->sdb);
+                                                 a->cb, a->ctx, a->sdb,
+                                                 a->schema, a->budget);
+    if (stopped < 0) a->error = errno ? errno : EILSEQ;
     bm_defer_drain_if_armed(a->cb, a->sdb);
     if (stopped && a->stop_flag) {
         __atomic_store_n(a->stop_flag, 1, __ATOMIC_RELAXED);
@@ -3261,13 +3591,28 @@ static void *bm_generic_shard_worker(void *arg) {
 }
 
 /* bt_result_cb adapter for the generic dict-scan → KeySet path.
-   Inserts each emitted hash into the keyset, respects deadline. */
-typedef struct { KeySet *ks; QueryDeadline *dl; } BmKsEmitCtx;
+   Inserts each emitted hash into the keyset, respects deadline. A full
+   KeySet is a capacity failure: it is recorded (ENOBUFS) and stops the walk;
+   the caller discards the whole collection. */
+typedef struct {
+    KeySet *ks;
+    QueryDeadline *dl;
+    int error;                  /* errno diagnostic */
+    CandidateBuildFailure reason;
+} BmKsEmitCtx;
 static int bm_ks_insert_cb(const char *v, size_t vl, const uint8_t *h, void *c) {
     (void)v; (void)vl;
     BmKsEmitCtx *kc = (BmKsEmitCtx *)c;
-    if (kc->dl && kc->dl->timed_out) return -1;
-    keyset_insert(kc->ks, h);
+    if (kc->reason != CBF_NONE) return -1;
+    if (kc->dl && kc->dl->timed_out) {
+        kc->reason = CBF_TIMEOUT;
+        return -1;
+    }
+    if (bm_ks_counted_insert(kc->ks, h) < 0) {
+        kc->reason = CBF_INSERT_CAPACITY;
+        kc->error = ENOBUFS;
+        return -1;
+    }
     return 0;
 }
 
@@ -3285,21 +3630,34 @@ typedef struct {
     int               shard_idx;
     SearchCriterion  *crit;
     const TypedField *tf;
+    const TypedSchema *schema;
+    size_t            budget;
     size_t            count;
+    int               error; /* worker-owned; read after dispatch */
 } BmPopcountGenericShardArg;
 
 static void *bm_popcount_generic_shard_worker(void *raw) {
     BmPopcountGenericShardArg *a = (BmPopcountGenericShardArg *)raw;
     char bp[1024];
     bm_build_path(bp, sizeof(bp), a->db_root, a->object, a->field, a->shard_idx);
-    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
-    if (!bm) { a->count = 0; return NULL; }
-    BmDictMatchCtx m = { .crit = a->crit, .tf = a->tf, .n_match = 0 };
+    a->count = 0;
+    BitmapShard *bm = NULL;
+    int orc = bm_open_read(bp, &bm);
+    if (orc != 0) {
+        if (orc < 0) a->error = errno;
+        return NULL;
+    }
+    BmDictMatchCtx m = { .crit = a->crit, .tf = a->tf,
+                         .schema = a->schema, .budget = a->budget };
     bm_iter_values(bm, bm_dict_match_cb, &m);
     size_t local = 0;
-    for (int i = 0; i < m.n_match; i++) {
-        local += bm_count(bm, m.vals[i], m.vlens[i]);
+    for (int i = 0; !m.error && i < m.n_match; i++) {
+        size_t n = bm_count(bm, m.vals[i], m.vlens[i]);
+        if (n > SIZE_MAX - local) { m.error = EOVERFLOW; break; }
+        local += n;
     }
+    a->error = m.error;
+    bm_dict_match_clear(&m);
     bm_close(bm);
     a->count = local;
     return NULL;
@@ -3308,8 +3666,10 @@ static void *bm_popcount_generic_shard_worker(void *raw) {
 static size_t bm_popcount_generic_for_crit(const char *db_root, const char *object,
                                             const char *field, int splits,
                                             SearchCriterion *crit,
-                                            const TypedField *tf) {
+                                            const TypedField *tf,
+                                            const TypedSchema *schema) {
     if (splits <= 0) return 0;
+    size_t budget = g_query_buffer_max_bytes / (size_t)splits;
     /* Parallelise across data shards — see bm_popcount_one_value for the
      * cold-cache motivation.  Generic path also pays bm_iter_values per
      * shard (small dict scan) so the cost-per-shard is slightly higher
@@ -3321,14 +3681,22 @@ static size_t bm_popcount_generic_for_crit(const char *db_root, const char *obje
         for (int s = 0; s < splits; s++) {
             char bp[1024];
             bm_build_path(bp, sizeof(bp), db_root, object, field, s);
-            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
-            if (!bm) continue;
-            BmDictMatchCtx m = { .crit = crit, .tf = tf, .n_match = 0 };
+            BitmapShard *bm = NULL;
+            int orc = bm_open_read(bp, &bm);
+            if (orc > 0) continue;
+            if (orc < 0) return SIZE_MAX;
+            BmDictMatchCtx m = { .crit = crit, .tf = tf, .schema = schema,
+                                 .budget = budget };
             bm_iter_values(bm, bm_dict_match_cb, &m);
-            for (int i = 0; i < m.n_match; i++) {
-                total += bm_count(bm, m.vals[i], m.vlens[i]);
+            for (int i = 0; !m.error && i < m.n_match; i++) {
+                size_t n = bm_count(bm, m.vals[i], m.vlens[i]);
+                if (n > SIZE_MAX - total) { m.error = EOVERFLOW; break; }
+                total += n;
             }
+            int error = m.error;
+            bm_dict_match_clear(&m);
             bm_close(bm);
+            if (error) { errno = error; return SIZE_MAX; }
         }
         return total;
     }
@@ -3336,13 +3704,20 @@ static size_t bm_popcount_generic_for_crit(const char *db_root, const char *obje
         args[s] = (BmPopcountGenericShardArg){
             .db_root = db_root, .object = object, .field = field,
             .shard_idx = s, .crit = crit, .tf = tf, .count = 0,
+            .schema = schema, .budget = budget, .error = 0,
         };
     }
     parallel_for_io(bm_popcount_generic_shard_worker, args, splits,
                  sizeof(BmPopcountGenericShardArg));
     size_t total = 0;
-    for (int s = 0; s < splits; s++) total += args[s].count;
+    int error = 0;
+    for (int s = 0; s < splits; s++) {
+        if (args[s].error) error = args[s].error;
+        if (args[s].count > SIZE_MAX - total) error = EOVERFLOW;
+        else total += args[s].count;
+    }
     free(args);
+    if (error) { errno = error; return SIZE_MAX; }
     return total;
 }
 
@@ -3360,6 +3735,7 @@ typedef struct {
     const TypedSchema *ts;
     size_t            count;      /* output */
     QueryDeadline    *deadline;
+    int predicate_error;
 } BmIntersectShardArg;
 
 static void *bm_intersect_shard_worker(void *raw) {
@@ -3379,9 +3755,8 @@ static void *bm_intersect_shard_worker(void *raw) {
             LOG_ERROR(LOG_SUB_QUERY, "bm_intersect_shard_worker: resolve_idx_field failed for already-validated indexed field '%s'", a->leaves[i]->field);
             return NULL;
         }
-        encode_criterion_value(tf, a->leaves[i]->value,
-                                strlen(a->leaves[i]->value),
-                                vals[i], &vlens[i]);
+        if(a->leaves[i]->op==OP_EQUAL &&
+           encode_criterion_value_checked(a->ts,tf,search_criterion_value(a->leaves[i]),strlen(search_criterion_value(a->leaves[i])),vals[i],sizeof(vals[i]),&vlens[i])<0){a->predicate_error=errno?errno:EILSEQ;return NULL;}
     }
 
     /* Open all bitmaps for this shard.
@@ -3392,13 +3767,26 @@ static void *bm_intersect_shard_worker(void *raw) {
     uint8_t *merged[MAX_INTERSECT_LEAVES] = {0};
     uint32_t min_stride = UINT32_MAX;
 
-    for (int i = 0; i < a->n_leaves; i++) {
-        char bp[PATH_MAX];
-        bm_build_path(bp, sizeof(bp), a->db_root, a->object,
-                      a->leaves[i]->field, a->shard_idx);
-        bm[i] = bm_open(bp, 0, 0, 0, 0, 0);
-        if (!bm[i]) goto cleanup;
+    {
+        /* All of this shard's bitmaps are held at once: take the locks in the
+           canonical order so a keyfile-rebuild remap (which holds several
+           bitmap write locks) cannot deadlock against this reader. */
+        char bps[MAX_INTERSECT_LEAVES][PATH_MAX];
+        const char *bpp[MAX_INTERSECT_LEAVES];
+        for (int i = 0; i < a->n_leaves; i++) {
+            bm_build_path(bps[i], sizeof(bps[i]), a->db_root, a->object,
+                          a->leaves[i]->field, a->shard_idx);
+            bpp[i] = bps[i];
+        }
+        if (bm_open_many_ro(bpp, a->n_leaves, bm) != 0) {
+            /* A missing AND input makes this shard's intersection logically
+               empty; any other failure is a hard error, never a zero. */
+            if (errno != ENOENT) a->predicate_error = errno ? errno : EIO;
+            goto cleanup;
+        }
+    }
 
+    for (int i = 0; i < a->n_leaves; i++) {
         if (a->leaves[i]->op == OP_EQUAL) {
             uint32_t this_stride = 0;
             bmap_bytes[i] = bm_get_value_bitmap(bm[i], vals[i], vlens[i],
@@ -3411,14 +3799,12 @@ static void *bm_intersect_shard_worker(void *raw) {
             if (!tf) goto cleanup;
             uint32_t stride = bm_stride(bm[i]);
             merged[i] = calloc(1, stride);
-            if (!merged[i]) goto cleanup;
+            if (!merged[i]) { a->predicate_error=ENOMEM; goto cleanup; }
             int any = 0;
             for (int v = 0; v < a->leaves[i]->in_count; v++) {
                 uint8_t enc[1024];
                 size_t elen;
-                encode_criterion_value(tf, a->leaves[i]->in_values[v],
-                                       strlen(a->leaves[i]->in_values[v]),
-                                       enc, &elen);
+                if(encode_criterion_value_checked(a->ts,tf,a->leaves[i]->in_values[v],strlen(a->leaves[i]->in_values[v]),enc,sizeof(enc),&elen)<0){a->predicate_error=errno?errno:EILSEQ;goto cleanup;}
                 uint32_t vs;
                 const uint8_t *vmap = bm_get_value_bitmap(bm[i], enc, elen, &vs);
                 if (vmap) {
@@ -3449,10 +3835,8 @@ static void *bm_intersect_shard_worker(void *raw) {
     a->count = local;
 
 cleanup:
-    for (int i = 0; i < a->n_leaves; i++) {
-        if (bm[i]) bm_close(bm[i]);
-        free(merged[i]);
-    }
+    bm_close_many(bm, a->n_leaves);
+    for (int i = 0; i < a->n_leaves; i++) free(merged[i]);
     return NULL;
 }
 
@@ -3475,6 +3859,7 @@ static size_t bm_popcount_intersect(const char *db_root, const char *object,
                                        .n_leaves = n_leaves, .ts = ts,
                                        .count = 0, .deadline = dl };
             bm_intersect_shard_worker(&a);
+            if(a.predicate_error){errno=a.predicate_error;return SIZE_MAX;}
             total += a.count;
         }
         return total;
@@ -3491,16 +3876,19 @@ static size_t bm_popcount_intersect(const char *db_root, const char *object,
                   sizeof(BmIntersectShardArg));
 
     size_t total = 0;
-    for (int s = 0; s < splits && (!dl || !dl->timed_out); s++)
-        total += args[s].count;
+    int error=0;
+    for (int s = 0; s < splits && (!dl || !dl->timed_out); s++){
+        total += args[s].count;if(args[s].predicate_error)error=args[s].predicate_error;}
     free(args);
+    if(error){errno=error;return SIZE_MAX;}
     return (!dl || !dl->timed_out) ? total : 0;
 }
 
-/* Walk a single shard's bitmap for `value`, emitting cb per live
-   matching slot. Returns 1 if cb signalled stop (limit reached), so
-   the outer shard loop can short-circuit and skip the remaining
-   kf_acquire + bm_open syscalls. */
+/* Walk a single shard's bitmap for `value`, emitting cb per live matching
+   slot. Returns 1 if cb signalled stop (limit reached) so the outer shard
+   loop can short-circuit, 0 when the shard was walked completely or is
+   logically empty (no keyfile/bitmap file yet), -1 with errno preserved
+   across the keyfile release on a hard bitmap read failure. */
 int bitmap_emit_for_shard(const char *db_root, const char *object,
                                  const char *field, int shard_idx,
                                  const uint8_t *value, size_t vlen,
@@ -3513,9 +3901,12 @@ int bitmap_emit_for_shard(const char *db_root, const char *object,
 
     char bp[1024];
     bm_build_path(bp, sizeof(bp), db_root, object, field, shard_idx);
-    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-    if (!bm) {
+    BitmapShard *bm = NULL;
+    int orc = bm_open_read(bp, &bm);
+    if (orc != 0) {
+        int saved = errno;
         kfcache_release(&kh);
+        if (orc < 0) { errno = saved; return -1; }
         return 0;
     }
 
@@ -3526,12 +3917,13 @@ int bitmap_emit_for_shard(const char *db_root, const char *object,
 
     bm_close(bm);
     kfcache_release(&kh);
-    return ec.stop;
+    return ec.stop ? 1 : 0;
 }
 
 /* parallel_for worker for shard fan-out. Checks the shared stop flag
    before doing any I/O so a peer's limit-hit propagates immediately.
-   On a cb-driven stop, raises the flag so subsequent peers also bail. */
+   On a cb-driven stop, raises the flag so subsequent peers also bail; a
+   hard read failure is recorded in the worker-owned error slot. */
 static void *bm_shard_walk_worker(void *arg) {
     BmShardWalkArg *a = (BmShardWalkArg *)arg;
     if (a->stop_flag && __atomic_load_n(a->stop_flag, __ATOMIC_RELAXED)) {
@@ -3540,8 +3932,9 @@ static void *bm_shard_walk_worker(void *arg) {
     int stopped = bitmap_emit_for_shard(a->db_root, a->object, a->field,
                                         a->shard_idx, a->value, a->vlen,
                                         a->cb, a->ctx, a->sdb);
+    if (stopped < 0) a->error = errno ? errno : EIO;
     bm_defer_drain_if_armed(a->cb, a->sdb);
-    if (stopped && a->stop_flag) {
+    if (stopped > 0 && a->stop_flag) {
         __atomic_store_n(a->stop_flag, 1, __ATOMIC_RELAXED);
     }
     return NULL;
@@ -3555,15 +3948,27 @@ typedef struct {
     size_t           kf_capacity;
     KeySet          *ks;
     QueryDeadline   *dl;
+    int              error;   /* errno diagnostic (ENOBUFS on capacity) */
+    CandidateBuildFailure reason;
 } BmCollectCtx;
 
 static int bm_collect_to_keyset_cb(uint32_t slot, void *ctx) {
     BmCollectCtx *c = (BmCollectCtx *)ctx;
-    if (c->dl && c->dl->timed_out) return 1;
+    if (c->reason != CBF_NONE) return 1;
+    if (c->dl && c->dl->timed_out) {
+        c->reason = CBF_TIMEOUT;
+        return 1;
+    }
     if (slot >= c->kf_capacity) return 0;
     SlotcaskKfEntry *e = &c->kf_map[slot];
     if (e->flag != 1) return 0;
-    keyset_insert(c->ks, e->hash);
+    if (bm_ks_counted_insert(c->ks, e->hash) < 0) {
+        /* Actual keyset_insert -1: insertion capacity, never a truncated
+           successful set. ENOBUFS stays as the errno diagnostic. */
+        c->reason = CBF_INSERT_CAPACITY;
+        c->error = ENOBUFS;
+        return 1;
+    }
     return 0;
 }
 
@@ -3579,7 +3984,13 @@ int field_has_index_type(const char *db_root, const char *object,
     int n = load_index_fields(db_root, object, fields, MAX_FIELDS);
     int n2 = load_index_types(db_root, object, types, MAX_FIELDS);
     int count = n < n2 ? n : n2;
+    /* A bitmap-disabled object plans no bitmap: while the escape flag is
+       set the .bm files may still name old kf slots (bmfix repair failed
+       at startup), so bitmap entries don't count until reindex heals. */
+    int bitmap_gated = want == IT_BITMAP &&
+                       slotcask_bmfix_object_disabled(db_root, object);
     for (int i = 0; i < count; i++) {
+        if (bitmap_gated && types[i] == IT_BITMAP) continue;
         if (types[i] == want && strcmp(fields[i], field) == 0) return 1;
     }
     return 0;
@@ -3618,7 +4029,11 @@ static int op_allows_trigram_starts(enum SearchOp op) {
 #define TG_PREFER_BTREE_LEN 6
 
 /* Resolve a field's IndexType from the cached index.conf. Linear scan
-   over the cached arrays — cheap for the planner hot path. */
+   over the cached arrays — cheap for the planner hot path. A bitmap
+   entry is skipped while the object's bitmap planning is disabled
+   (defense in depth behind field_has_index_type's gate): the gated
+   planner has already chosen btree for such fields, so the default
+   IT_BTREE keeps those callers consistent. */
 enum IndexType field_index_type(const char *db_root, const char *object,
                                        const char *field) {
     char fields[MAX_FIELDS][256];
@@ -3626,7 +4041,9 @@ enum IndexType field_index_type(const char *db_root, const char *object,
     int n = load_index_fields(db_root, object, fields, MAX_FIELDS);
     int n2 = load_index_types(db_root, object, types, MAX_FIELDS);
     int count = n < n2 ? n : n2;
+    int bitmap_gated = slotcask_bmfix_object_disabled(db_root, object);
     for (int i = 0; i < count; i++) {
+        if (bitmap_gated && types[i] == IT_BITMAP) continue;
         if (strcmp(fields[i], field) == 0) return types[i];
     }
     return IT_BTREE;
@@ -3658,9 +4075,64 @@ enum IndexType field_index_type(const char *db_root, const char *object,
  *        on a btree-only field — btree-leaf scan still beats full scan).
  *      * Else → -1.
  *  - All other ops: bitmap preferred when present, then btree, else -1. */
-int pick_index_for_leaf(const char *db_root, const char *object,
+int search_criterion_indexable(const TypedSchema *ts,const SearchCriterion *c){
+    if(!ts||!c)return 0;
+    int field=typed_field_index(ts,c->field);
+    if(field<0)return 1;
+    enum FieldType type=ts->fields[field].type;
+    if(type!=FT_NUMERIC&&type!=FT_ENUM)return 1;
+    /* Only encoded comparisons are answered from numeric/enum dictionaries.
+       Enum BETWEEN and display predicates are unsupported by the typed matcher. */
+    if(c->op!=OP_EQUAL&&c->op!=OP_NOT_EQUAL&&c->op!=OP_LESS&&c->op!=OP_GREATER&&
+       c->op!=OP_LESS_EQ&&c->op!=OP_GREATER_EQ&&c->op!=OP_IN&&
+       !(c->op==OP_BETWEEN&&type==FT_NUMERIC)&&
+       !(c->op==OP_NOT_IN&&type==FT_ENUM)&&
+       c->op!=OP_EXISTS&&c->op!=OP_NOT_EXISTS&&
+       !(c->op>=OP_EQ_FIELD&&c->op<=OP_GTE_FIELD))return 0;
+    if(c->op==OP_EXISTS||c->op==OP_NOT_EXISTS||
+       (c->op>=OP_EQ_FIELD&&c->op<=OP_GTE_FIELD)||
+       (c->op>=OP_LEN_EQ&&c->op<=OP_LEN_BETWEEN))return 1;
+    size_t len=0;
+    if(c->op==OP_IN||c->op==OP_NOT_IN){
+        for(int i=0;i<c->in_count;i++)
+            if(typed_index_text_key_into(ts,(size_t)field,c->in_values[i],
+                 strlen(c->in_values[i]),NULL,0,&len)!=1)return 0;
+        return 1;
+    }
+    if(typed_index_text_key_into(ts,(size_t)field,search_criterion_value(c),
+         search_criterion_value_len(c),NULL,0,&len)!=1)return 0;
+    return c->op!=OP_BETWEEN||
+        typed_index_text_key_into(ts,(size_t)field,search_criterion_value2(c),
+          search_criterion_value2_len(c),NULL,0,&len)==1;
+}
+/* This cap belongs to ordered-bound destinations only. Bitmap dictionary
+ * keys have a uint16 length and trigram patterns are not ordered keys. */
+static int ordered_criterion_fits(const TypedSchema *ts,const SearchCriterion *c){
+    if(!ts)return 0;
+    int field=typed_field_index(ts,c->field);
+    if(field<0)return 1;
+    if(ts->fields[field].type!=FT_VARCHAR&&ts->fields[field].type!=FT_NUMERIC)return 1;
+    size_t len=0;
+    if(c->op==OP_EXISTS||c->op==OP_NOT_EXISTS||op_is_length(c->op))return 1;
+    /* Only these dispatch branches form literal bounds. Other operators
+       retain their full-leaf producer regardless of pattern length. */
+    if(c->op!=OP_EQUAL&&c->op!=OP_NOT_EQUAL&&c->op!=OP_LESS&&c->op!=OP_GREATER&&
+       c->op!=OP_LESS_EQ&&c->op!=OP_GREATER_EQ&&c->op!=OP_BETWEEN&&
+       c->op!=OP_IN&&c->op!=OP_STARTS_WITH&&c->op!=OP_LIKE)return 1;
+    if(c->op==OP_LIKE&&search_criterion_value_len(c)&&search_criterion_value(c)[0]=='%')return 1;
+    if(c->op==OP_IN||c->op==OP_NOT_IN){
+        for(int i=0;i<c->in_count;i++)
+            if(typed_index_text_key_into(ts,(size_t)field,c->in_values[i],strlen(c->in_values[i]),NULL,0,&len)!=1||len>543)return 0;
+        return 1;
+    }
+    if(typed_index_text_key_into(ts,(size_t)field,search_criterion_value(c),search_criterion_value_len(c),NULL,0,&len)!=1||len>543)return 0;
+    return c->op!=OP_BETWEEN||
+        (typed_index_text_key_into(ts,(size_t)field,search_criterion_value2(c),search_criterion_value2_len(c),NULL,0,&len)==1&&len<=543);
+}
+int pick_index_for_leaf_schema(const TypedSchema *literal_schema,const char *db_root, const char *object,
                                const SearchCriterion *c) {
     if (!c || !c->field[0]) return -1;
+    if(!search_criterion_indexable(literal_schema,c))return -1;
     if (c->op == OP_NOT_EXISTS) return -1;
     if (c->op == OP_EQ_FIELD || c->op == OP_NEQ_FIELD ||
         c->op == OP_LT_FIELD || c->op == OP_GT_FIELD ||
@@ -3672,7 +4144,8 @@ int pick_index_for_leaf(const char *db_root, const char *object,
         if (fi < 0 || ts->fields[fi].type != FT_VARCHAR) return -1;
     }
     Schema sch = load_schema(db_root, object);
-    int has_btree   = field_has_index_type(db_root, object, c->field, IT_BTREE);
+    int has_btree   = field_has_index_type(db_root, object, c->field, IT_BTREE) &&
+                      ordered_criterion_fits(literal_schema,c);
     int has_bitmap  = field_has_index_type(db_root, object, c->field, IT_BITMAP);
     int has_trigram = field_has_index_type(db_root, object, c->field, IT_TRIGRAM);
 
@@ -3688,7 +4161,7 @@ int pick_index_for_leaf(const char *db_root, const char *object,
     }
 
     if (op_prefers_trigram(c->op)) {
-        size_t plen = strlen(c->value);
+        size_t plen = strlen(search_criterion_value(c));
         if (has_btree && plen < TG_PREFER_BTREE_LEN) {
             return btree_idx_exists(db_root, object, c->field, sch.splits)
                    ? IT_BTREE : -1;
@@ -3705,7 +4178,7 @@ int pick_index_for_leaf(const char *db_root, const char *object,
      * Shorter prefixes (<3 chars) cannot form any trigram, so they fall
      * through to full scan (-1). */
     if (op_allows_trigram_starts(c->op)) {
-        size_t plen = strlen(c->value);
+        size_t plen = strlen(search_criterion_value(c));
         if (has_btree && btree_idx_exists(db_root, object, c->field, sch.splits))
             return IT_BTREE;
         if (has_trigram && plen >= 3) return IT_TRIGRAM;
@@ -3715,6 +4188,10 @@ int pick_index_for_leaf(const char *db_root, const char *object,
     if (has_btree && btree_idx_exists(db_root, object, c->field, sch.splits))
         return IT_BTREE;
     return -1;
+}
+
+int pick_index_for_leaf(const char *root,const char *object,const SearchCriterion *criterion){
+    return pick_index_for_leaf_schema(load_typed_schema(root,object),root,object,criterion);
 }
 
 /* Sum bm_count for a single encoded value across every data shard.
@@ -3730,19 +4207,27 @@ typedef struct {
     const uint8_t *value;
     size_t         vlen;
     size_t         count;   /* output — this worker's contribution */
+    int            error;   /* worker-owned; hard read failure errno */
 } BmPopcountShardArg;
 
 static void *bm_popcount_one_shard_worker(void *raw) {
     BmPopcountShardArg *a = (BmPopcountShardArg *)raw;
     char bp[1024];
     bm_build_path(bp, sizeof(bp), a->db_root, a->object, a->field, a->shard_idx);
-    BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-    if (!bm) { a->count = 0; return NULL; }
+    a->count = 0;
+    BitmapShard *bm = NULL;
+    int orc = bm_open_read(bp, &bm);
+    if (orc != 0) {
+        if (orc < 0) a->error = errno;
+        return NULL;
+    }
     a->count = bm_count(bm, a->value, a->vlen);
     bm_close(bm);
     return NULL;
 }
 
+/* SIZE_MAX with errno on a hard bitmap read failure; a shard whose file
+   does not exist contributes zero. */
 size_t bm_popcount_one_value(const char *db_root, const char *object,
                                      const char *field, int splits,
                                      const uint8_t *value, size_t vlen) {
@@ -3759,8 +4244,10 @@ size_t bm_popcount_one_value(const char *db_root, const char *object,
         for (int s = 0; s < splits; s++) {
             char bp[1024];
             bm_build_path(bp, sizeof(bp), db_root, object, field, s);
-            BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0);
-            if (!bm) continue;
+            BitmapShard *bm = NULL;
+            int orc = bm_open_read(bp, &bm);
+            if (orc > 0) continue;
+            if (orc < 0) return SIZE_MAX;
             total += bm_count(bm, value, vlen);
             bm_close(bm);
         }
@@ -3770,43 +4257,47 @@ size_t bm_popcount_one_value(const char *db_root, const char *object,
         args[s] = (BmPopcountShardArg){
             .db_root = db_root, .object = object, .field = field,
             .shard_idx = s, .value = value, .vlen = vlen, .count = 0,
+            .error = 0,
         };
     }
     parallel_for_io(bm_popcount_one_shard_worker, args, splits, sizeof(BmPopcountShardArg));
     size_t total = 0;
-    for (int s = 0; s < splits; s++) total += args[s].count;
+    int error = 0;
+    for (int s = 0; s < splits; s++) {
+        if (args[s].error && !error) error = args[s].error;
+        total += args[s].count;
+    }
     free(args);
+    if (error) { errno = error; return SIZE_MAX; }
     return total;
 }
 
 /* Total bitmap match count for an OP_EQUAL / OP_IN criterion.
    Per-value bitmaps are disjoint by construction (each record's value
    sets exactly one bit across the per-value maps), so summing across
-   the IN values gives the exact match count without dedup. */
-static size_t bm_popcount_for_crit(const char *db_root, const char *object,
-                                    int splits, const SearchCriterion *crit,
-                                    const TypedField *tf) {
-    if (!crit) return 0;
-    uint8_t v[1024];
-    size_t  vl = 0;
-    if (crit->op == OP_EQUAL) {
-        encode_criterion_value(tf, crit->value, strlen(crit->value), v, &vl);
-        if (vl == 0) return 0;
-        return bm_popcount_one_value(db_root, object, crit->field, splits, v, vl);
+   the IN values gives the exact match count without dedup. SIZE_MAX with
+   errno on a hard read failure. */
+static size_t bm_popcount_for_crit(const char *db_root,const char *object,
+    int splits,const SearchCriterion *crit,const TypedField *tf){
+    const TypedSchema *ts=load_typed_schema(db_root,object);
+    if(!crit)return 0;
+    int count=crit->op==OP_EQUAL?1:crit->op==OP_IN?crit->in_count:0;
+    size_t total=0;
+    for(int i=0;i<count;i++){
+        const char *text=crit->op==OP_EQUAL?search_criterion_value(crit):crit->in_values[i];
+        size_t text_len=crit->op==OP_EQUAL?search_criterion_value_len(crit):strlen(text);
+        uint8_t *key=NULL;size_t len=0;
+        int rc=bitmap_text_key_alloc(ts,tf,text,text_len,g_query_buffer_max_bytes,&key,&len);
+        if(rc<0)return SIZE_MAX;
+        if(rc==0){free(key);continue;}
+        size_t n=bm_popcount_one_value(db_root,object,crit->field,splits,key,len);
+        int saved=errno;
+        free(key);
+        if(n==SIZE_MAX){errno=saved;return SIZE_MAX;}
+        if(n>SIZE_MAX-total){errno=EOVERFLOW;return SIZE_MAX;}
+        total+=n;
     }
-    if (crit->op == OP_IN) {
-        size_t total = 0;
-        for (int i = 0; i < crit->in_count; i++) {
-            vl = 0;
-            encode_criterion_value(tf, crit->in_values[i],
-                                   strlen(crit->in_values[i]), v, &vl);
-            if (vl == 0) continue;
-            total += bm_popcount_one_value(db_root, object, crit->field,
-                                            splits, v, vl);
-        }
-        return total;
-    }
-    return 0;
+    return total;
 }
 
 /* Walk every data shard's bitmap shard for the matching value, lift each
@@ -3822,11 +4313,100 @@ static size_t bm_popcount_for_crit(const char *db_root, const char *object,
    12.5M matches). We now popcount across all shards first (cheap —
    bm_count is a byte popcount) to size the keyset exactly, mirroring
    the btree path's leaf_capacity_hint behaviour. */
+/* Allocate a bitmap candidate KeySet. With a request budget the exact
+   charge is reserved (NULL/ENOBUFS when it does not fit — a hard error for
+   prepared find); without one the exact charge is checked against the
+   per-query buffer and an over-budget set is the deliberate fallback (NULL
+   with errno 0). Allocation failure is NULL with errno set. */
+/* Checked-build exit: records the reason and normalizes errno so callers
+ * can branch on reason alone (INSERT_CAPACITY keeps ENOBUFS as the
+ * diagnostic; deliberate budget/empty/timeout exits present errno 0; hard
+ * failures keep their errno). */
+static KeySet *bm_build_fail(CandidateBuildOut *out, CandidateBuildFailure r,
+                             int err) {
+    out->reason = r;
+    out->saved_errno = err;
+    switch (r) {
+    case CBF_INSERT_CAPACITY: errno = ENOBUFS; break;
+    case CBF_HARD:            errno = err ? err : EIO; break;
+    case CBF_BUDGET:          errno = err; break;
+    default:                  errno = 0; break;
+    }
+    return NULL;
+}
+
+/* Candidate KeySet allocation for the bitmap sizing-pass count m:
+ * preferred actual slots = next_power_of_two(max(8192, 2*m)) — approved
+ * headroom for growth between sizing and enumeration, not a measured
+ * optimum or a guarantee against sustained growth. keyset_new doubles its
+ * hint, so the preferred hint is max(4096, m), never the slot count.
+ * Without a budget the preferred exact charge must fit the per-query cap;
+ * if only the floor exceeds it, ordinary sizing is tried once. With a
+ * budget the atomic reservation decides: a preferred refusal solely for
+ * lack of budget permits one ordinary attempt. ENOMEM or sizing-overflow
+ * failures are never retried at the other size. Callers pass the initial
+ * sizing-pass count m unchanged (no 1024 substitution). */
+static KeySet *bm_candidate_keyset_new(size_t initial_matches,
+                                       KeySetBudget *budget,
+                                       const char *who) {
+    size_t preferred_hint = initial_matches > 4096 ? initial_matches : 4096;
+    size_t preferred_bytes = 0, ordinary_bytes = 0;
+    if (keyset_allocation_bytes(preferred_hint, &preferred_bytes) != 0 ||
+        keyset_allocation_bytes(initial_matches, &ordinary_bytes) != 0)
+        return NULL;
+
+    KeySet *ks = NULL;
+    size_t chosen_hint = preferred_hint;
+    if (budget) {
+        ks = keyset_new_budgeted(preferred_hint, budget);
+        if (!ks && errno == ENOBUFS && ordinary_bytes != preferred_bytes) {
+            chosen_hint = initial_matches;
+            ks = keyset_new_budgeted(chosen_hint, budget);
+        }
+    } else {
+        if (preferred_bytes > g_query_buffer_max_bytes) {
+            if (ordinary_bytes > g_query_buffer_max_bytes) {
+                LOG_WARN(LOG_SUB_QUERY,
+                         "%s: keyset for estimate %zu exceeds query buffer cap %zu",
+                         who, initial_matches, g_query_buffer_max_bytes);
+                errno = 0;
+                return NULL;
+            }
+            chosen_hint = initial_matches;
+        }
+        ks = keyset_new(chosen_hint);
+    }
+    if (!ks) { if (!errno) errno = ENOMEM; return NULL; }
+#ifdef TEST_BUILD
+    BMKS_STAT_ALLOC(ks->cap);
+    if (atomic_load(&g_shard_test_bmlock_log))
+        LOG_WARN(LOG_SUB_QUERY,
+                 "BMKS-CANDIDATE-ALLOC slots=%zu hint=%zu preferred=%d budget=%d",
+                 ks->cap, chosen_hint, chosen_hint == preferred_hint, budget != NULL);
+#endif
+    return ks;
+}
+
+#ifdef TEST_BUILD
+KeySet *query_test_candidate_keyset_alloc(size_t m, size_t *out_slots) {
+    KeySet *ks = bm_candidate_keyset_new(m, NULL, "query_test_candidate_keyset_alloc");
+    if (ks && out_slots) *out_slots = ks->cap;
+    if (!ks && out_slots) *out_slots = 0;
+    return ks;
+}
+#endif
+
 static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
                                         int splits,
                                         const SearchCriterion *leaf,
                                         const TypedField *tf,
-                                        QueryDeadline *dl) {
+                                        QueryDeadline *dl,
+                                        const TypedSchema *literal_schema,
+                                        KeySetBudget *budget,
+                                        CandidateBuildOut *out) {
+    cb_out_init(out);
+    errno = 0;
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
     /* Bitmap serves eq and IN through the fast value-walk; everything
        else (range, LIKE, CONTAINS, REGEX, len_X, exists, i-variants,
        NEQ, NOT_IN) goes through the generic dict-scan path below —
@@ -3839,35 +4419,54 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
         };
         SlotcaskDb *sdb_g SDB_REG_REF = slotcask_registry_get(db_root, object, &info_g);
         if (!sdb_g) {
+            int saved = errno ? errno : EIO;
             LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_from_bitmap: slotcask_registry_get failed for %s/%s", db_root, object);
-            return NULL;
+            return bm_build_fail(out, CBF_HARD, saved);
         }
 
         size_t tot_g = bm_popcount_generic_for_crit(db_root, object,
                                                      leaf->field, splits,
-                                                     (SearchCriterion *)leaf, tf);
+                                                     (SearchCriterion *)leaf, tf,
+                                                     literal_schema);
+        if (tot_g == SIZE_MAX)
+            return bm_build_fail(out, CBF_HARD, errno);
 
-        size_t ks_bytes_est_g = (tot_g ? tot_g : 1024)
-                                * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
-        if (ks_bytes_est_g > g_query_buffer_max_bytes) {
-            LOG_WARN(LOG_SUB_QUERY, "build_keyset_from_bitmap: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes_est_g, g_query_buffer_max_bytes);
-            return NULL;
-        }
-
-        KeySet *ks_g = keyset_new(tot_g > 0 ? tot_g : 1024);
+        KeySet *ks_g = bm_candidate_keyset_new(tot_g, budget,
+                                               "build_keyset_from_bitmap");
         if (!ks_g) {
-            LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_bitmap: keyset_new(%zu) failed", tot_g > 0 ? tot_g : 1024);
-            return NULL;
+            int saved = errno;
+            return bm_build_fail(out, !saved || saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                 saved);
         }
+        bm_ks_race_barrier(BMKS_RACE_GENERIC, tot_g, ks_g->cap);
 
-        BmKsEmitCtx kec = { ks_g, dl };
+        BmKsEmitCtx kec = { ks_g, dl, 0, CBF_NONE };
         for (int s = 0; s < splits; s++) {
-            if (dl && dl->timed_out) { keyset_free(ks_g); return NULL; }
-            bitmap_emit_generic_for_shard(db_root, object, leaf->field, s,
+            if (dl && dl->timed_out) {
+                keyset_free(ks_g);
+                return bm_build_fail(out, CBF_TIMEOUT, 0);
+            }
+            if (bitmap_emit_generic_for_shard(db_root, object, leaf->field, s,
                                            (SearchCriterion *)leaf, tf,
-                                           bm_ks_insert_cb, &kec, sdb_g);
+                                           bm_ks_insert_cb, &kec, sdb_g,
+                                           literal_schema,
+                                           g_query_buffer_max_bytes / (size_t)(splits > 0 ? splits : 1)) < 0) {
+                int saved = errno;
+                keyset_free(ks_g);
+                return bm_build_fail(out, CBF_HARD, saved);
+            }
+            /* The callback stop is not an error channel: check the
+               recorded reason explicitly (hard beats capacity). */
+            if (kec.reason != CBF_NONE) {
+                CandidateBuildFailure r = kec.reason;
+                keyset_free(ks_g);
+                return bm_build_fail(out, r, kec.error);
+            }
         }
-        if (dl && dl->timed_out) { keyset_free(ks_g); return NULL; }
+        if (dl && dl->timed_out) {
+            keyset_free(ks_g);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
         return ks_g;
     }
 
@@ -3876,21 +4475,30 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
        for OP_IN. Bool/byte/numeric values all fit in <= 8B; even
        varchar bitmaps (future enum-text) cap at 1024 here. */
     int n_vals = (leaf->op == OP_EQUAL) ? 1 : leaf->in_count;
-    if (n_vals <= 0) return NULL;
-    uint8_t (*vals)[1024] = calloc((size_t)n_vals, sizeof(*vals));
+    if (n_vals <= 0) return bm_build_fail(out, CBF_NONE, 0);
+    uint8_t **vals = calloc((size_t)n_vals, sizeof(*vals));
     size_t *vlens = calloc((size_t)n_vals, sizeof(*vlens));
     if (!vals || !vlens) {
+        int saved = errno ? errno : ENOMEM;
         LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_bitmap: calloc failed for n_vals=%d", n_vals);
-        free(vals); free(vlens); return NULL;
+        bitmap_values_clear(vals,n_vals); free(vlens);
+        return bm_build_fail(out, CBF_HARD, saved);
     }
     if (leaf->op == OP_EQUAL) {
-        encode_criterion_value(tf, leaf->value, strlen(leaf->value),
-                               vals[0], &vlens[0]);
+        if(bitmap_text_key_alloc(literal_schema,tf,search_criterion_value(leaf),search_criterion_value_len(leaf),
+             g_query_buffer_max_bytes/(size_t)n_vals,&vals[0],&vlens[0])<0){
+            int saved = errno ? errno : EILSEQ;
+            bitmap_values_clear(vals,n_vals);free(vlens);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
     } else {
         for (int i = 0; i < n_vals; i++) {
-            encode_criterion_value(tf, leaf->in_values[i],
-                                   strlen(leaf->in_values[i]),
-                                   vals[i], &vlens[i]);
+            if(bitmap_text_key_alloc(literal_schema,tf,leaf->in_values[i],strlen(leaf->in_values[i]),
+                 g_query_buffer_max_bytes/(size_t)n_vals,&vals[i],&vlens[i])<0){
+                int saved = errno ? errno : EILSEQ;
+                bitmap_values_clear(vals,n_vals);free(vlens);
+                return bm_build_fail(out, CBF_HARD, saved);
+            }
         }
     }
     /* Drop any zero-length encodings (e.g. NULL/empty); they'd cause
@@ -3898,14 +4506,17 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
        keeps the inner loop branchless. */
     int n_kept = 0;
     for (int i = 0; i < n_vals; i++) {
-        if (vlens[i] == 0) continue;
+        if (vals[i] == NULL) continue; /* rc==0, distinct from a present empty key */
         if (n_kept != i) {
-            memcpy(vals[n_kept], vals[i], vlens[i]);
+            vals[n_kept]=vals[i]; vals[i]=NULL;
             vlens[n_kept] = vlens[i];
         }
         n_kept++;
     }
-    if (n_kept == 0) { free(vals); free(vlens); return NULL; }
+    if (n_kept == 0) {
+        bitmap_values_clear(vals,n_vals); free(vlens);
+        return bm_build_fail(out, CBF_NONE, 0);   /* deliberate empty */
+    }
 
     /* Need a slotcask handle to read kf entries. */
     Schema sc = load_schema(db_root, object);
@@ -3914,8 +4525,10 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
     };
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
+        int saved = errno ? errno : EIO;
         LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_from_bitmap: slotcask_registry_get failed for %s/%s", db_root, object);
-        free(vals); free(vlens); return NULL;
+        bitmap_values_clear(vals,n_vals); free(vlens);
+        return bm_build_fail(out, CBF_HARD, saved);
     }
 
     /* Pass A: sum bm_count across every (shard × value). Each bm_count
@@ -3925,35 +4538,39 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
        exact match cardinality even for IN. */
     size_t total_matches = 0;
     for (int s = 0; s < splits; s++) {
-        if (dl && dl->timed_out) {
-            free(vals); free(vlens); return NULL;
+        if (candidate_deadline_expired(dl)) {
+            bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
         }
         char bp[1024];
         bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) continue;
+        BitmapShard *bm = NULL;
+        int orc = bm_open_read(bp, &bm);
+        if (orc > 0) continue;             /* never-written shard: empty */
+        if (orc < 0) {
+            int saved = errno;
+            bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
         for (int i = 0; i < n_kept; i++) {
             total_matches += bm_count(bm, vals[i], vlens[i]);
         }
         bm_close(bm);
     }
 
-    /* Budget check: keyset_new rounds up to next_pow2(hint*2); each slot
-       is keys[16] + state[4] = 20 B. Match the btree path's guard so
-       monster keysets (e.g. 50%-selective bitmap on a billion-row table)
-       fall through to scan instead of OOM-ing the daemon. */
-    size_t ks_bytes_est = (total_matches ? total_matches : 1024)
-                           * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
-    if (ks_bytes_est > g_query_buffer_max_bytes) {
-        LOG_WARN(LOG_SUB_QUERY, "build_keyset_from_bitmap: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes_est, g_query_buffer_max_bytes);
-        free(vals); free(vlens); return NULL;
-    }
-
-    KeySet *ks = keyset_new(total_matches > 0 ? total_matches : 1024);
+    /* Exact admission: the actual rounded keys + state arrays (not a hint
+       estimate) are charged before allocation, so monster keysets fall
+       through to scan (or fail a budgeted request) instead of being
+       admitted over the per-query cap. */
+    KeySet *ks = bm_candidate_keyset_new(total_matches,
+                                         budget, "build_keyset_from_bitmap");
     if (!ks) {
-        LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_bitmap: keyset_new(%zu) failed", total_matches > 0 ? total_matches : 1024);
-        free(vals); free(vlens); return NULL;
+        int saved = errno;
+        bitmap_values_clear(vals,n_vals); free(vlens);
+        return bm_build_fail(out, !saved || saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                 saved);
     }
+    bm_ks_race_barrier(BMKS_RACE_EQ, total_matches, ks->cap);
 
     /* Pass B: walk the bitmaps and lift matching hashes via kf lookup.
        Serial across shards — the inserts themselves run lock-free
@@ -3964,34 +4581,53 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
        impossible (values are distinct → bitmaps disjoint) so no extra
        check needed. */
     for (int s = 0; s < splits; s++) {
-        if (dl && dl->timed_out) {
-            keyset_free(ks); free(vals); free(vlens); return NULL;
+        if (candidate_deadline_expired(dl)) {
+            keyset_free(ks); bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
         }
 
         char kfp[PATH_MAX];
         slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, s);
         SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0)
-            continue;
+        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
+            int saved = errno ? errno : EIO;
+            if (saved == ENOENT) continue;
+            keyset_free(ks); bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
 
         char bp[1024];
         bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) {
+        BitmapShard *bm = NULL;
+        int orc = bm_open_read(bp, &bm);
+        if (orc != 0) {
+            int saved = errno;
             kfcache_release(&kh);
-            continue;
+            if (orc > 0) continue;         /* never-written shard: empty */
+            keyset_free(ks); bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, CBF_HARD, saved);
         }
 
-        BmCollectCtx c = { kh.map, kh.capacity, ks, dl };
-        for (int i = 0; i < n_kept; i++) {
+        BmCollectCtx c = { kh.map, kh.capacity, ks, dl, 0, CBF_NONE };
+        for (int i = 0; i < n_kept && c.reason == CBF_NONE; i++) {
             bm_walk(bm, vals[i], vlens[i], bm_collect_to_keyset_cb, &c);
         }
 
         bm_close(bm);
         kfcache_release(&kh);
+        if (c.reason != CBF_NONE) {
+            /* Matches grew since sizing (capacity) or the deadline hit:
+               discard the whole collection instead of returning a
+               truncated set. */
+            keyset_free(ks); bitmap_values_clear(vals,n_vals); free(vlens);
+            return bm_build_fail(out, c.reason, c.error);
+        }
     }
-    free(vals); free(vlens);
-    if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+    bitmap_values_clear(vals,n_vals); free(vlens);
+    if (dl && dl->timed_out) {
+        keyset_free(ks);
+        return bm_build_fail(out, CBF_TIMEOUT, 0);
+    }
     return ks;
 }
 
@@ -4016,13 +4652,15 @@ typedef struct {
 
 static int bm_complement_value_cb(const uint8_t *value, size_t vlen, void *ctx) {
     BmComplementCtx *cc = (BmComplementCtx *)ctx;
+    if (cc->collect->error) return 1;
     if (cc->collect->dl && cc->collect->dl->timed_out) return 1;
     for (int t = 0; t < cc->nt; t++) {
         if (vlen == cc->tvlens[t] && memcmp(value, cc->tvals[t], vlen) == 0)
             return 0;  /* target value — excluded from the complement */
     }
     bm_walk(cc->bm, value, vlen, bm_collect_to_keyset_cb, cc->collect);
-    return 0;
+    /* A nested failure stops the dictionary iteration too. */
+    return cc->collect->reason != CBF_NONE ? 1 : 0;
 }
 
 static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *object,
@@ -4030,13 +4668,12 @@ static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *o
                                               QueryDeadline *dl,
                                               const uint8_t (*tvals)[1024],
                                               const size_t *tvlens, int nt,
-                                              size_t comp_hint) {
-    size_t ks_bytes_est = (comp_hint ? comp_hint : 1024)
-                           * 2 * (sizeof(uint8_t[16]) + sizeof(uint32_t));
-    if (ks_bytes_est > g_query_buffer_max_bytes) {
-        LOG_WARN(LOG_SUB_QUERY, "build_keyset_bitmap_complement: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes_est, g_query_buffer_max_bytes);
-        return NULL;
-    }
+                                              size_t comp_hint,
+                                              KeySetBudget *budget,
+                                              CandidateBuildOut *out) {
+    cb_out_init(out);
+    errno = 0;
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
 
     Schema sc = load_schema(db_root, object);
     SlotcaskSchemaInfo info = {
@@ -4045,39 +4682,60 @@ static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *o
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "build_keyset_bitmap_complement: slotcask_registry_get failed for %s/%s", db_root, object);
-        return NULL;
+        return bm_build_fail(out, CBF_HARD, errno ? errno : EIO);
     }
 
-    KeySet *ks = keyset_new(comp_hint > 0 ? comp_hint : 1024);
+    KeySet *ks = bm_candidate_keyset_new(comp_hint,
+                                         budget, "build_keyset_bitmap_complement");
     if (!ks) {
-        LOG_ERROR(LOG_SUB_QUERY, "build_keyset_bitmap_complement: keyset_new(%zu) failed", comp_hint > 0 ? comp_hint : 1024);
-        return NULL;
+        int saved = errno;
+        return bm_build_fail(out, !saved || saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                             saved);
     }
+    bm_ks_race_barrier(BMKS_RACE_COMPLEMENT, comp_hint, ks->cap);
 
     for (int s = 0; s < splits; s++) {
-        if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+        if (candidate_deadline_expired(dl)) {
+            keyset_free(ks);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
         char kfp[PATH_MAX];
         slotcask_kf_path(kfp, sizeof(kfp), sdb->data_dir, s);
         SlotcaskKfHandle kh;
-        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0)
-            continue;
+        if (kfcache_acquire(&kh, kfp, sdb->slots_per_shard, 0) != 0) {
+            int saved = errno ? errno : EIO;
+            if (saved == ENOENT) continue;
+            keyset_free(ks);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
 
         char bp[1024];
         bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) {
+        BitmapShard *bm = NULL;
+        int orc = bm_open_read(bp, &bm);
+        if (orc != 0) {
+            int saved = errno;
             kfcache_release(&kh);
-            continue;
+            if (orc > 0) continue;         /* never-written shard: empty */
+            keyset_free(ks);
+            return bm_build_fail(out, CBF_HARD, saved);
         }
 
-        BmCollectCtx c = { kh.map, kh.capacity, ks, dl };
+        BmCollectCtx c = { kh.map, kh.capacity, ks, dl, 0, CBF_NONE };
         BmComplementCtx cc = { bm, tvals, tvlens, nt, &c };
         bm_iter_values(bm, bm_complement_value_cb, &cc);
 
         bm_close(bm);
         kfcache_release(&kh);
+        if (c.reason != CBF_NONE) {
+            keyset_free(ks);
+            return bm_build_fail(out, c.reason, c.error);
+        }
     }
-    if (dl && dl->timed_out) { keyset_free(ks); return NULL; }
+    if (dl && dl->timed_out) {
+        keyset_free(ks);
+        return bm_build_fail(out, CBF_TIMEOUT, 0);
+    }
     return ks;
 }
 
@@ -4086,43 +4744,69 @@ static KeySet *build_keyset_bitmap_complement(const char *db_root, const char *o
  * majority side. *inverted=1 ⇒ the complement was built and the caller counts
  * a row when its hash is NOT in the set. Returns NULL on budget/error so the
  * caller falls back rather than counting unfiltered. */
-KeySet *build_smaller_bitmap_keyset(const char *db_root, const char *object,
-                                           int splits, const SearchCriterion *leaf,
-                                           const TypedField *tf, QueryDeadline *dl,
-                                           int *inverted) {
+KeySet *build_smaller_bitmap_keyset_ck(const char *db_root, const char *object,
+                                              int splits, const SearchCriterion *leaf,
+                                              const TypedField *tf, QueryDeadline *dl,
+                                              int *inverted, KeySetBudget *budget,
+                                              CandidateBuildOut *out) {
+    cb_out_init(out);
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
+    const TypedSchema *literal_schema=load_typed_schema(db_root,object);
     *inverted = 0;
+    errno = 0;
+    if (!bitmap_literal_fits(literal_schema,leaf,1024))
+        return build_keyset_from_bitmap(db_root,object,splits,leaf,tf,dl,literal_schema,budget,out);
     if (!tf || (leaf->op != OP_EQUAL && leaf->op != OP_IN))
-        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl);
+        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema,budget,out);
 
     int n_vals = (leaf->op == OP_EQUAL) ? 1 : leaf->in_count;
     if (n_vals <= 0)
-        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl);
+        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema,budget,out);
 
     uint8_t (*tvals)[1024] = calloc((size_t)n_vals, sizeof(*tvals));
     size_t  *tvlens = calloc((size_t)n_vals, sizeof(*tvlens));
     if (!tvals || !tvlens) {
         LOG_ERROR(LOG_SUB_QUERY, "build_smaller_bitmap_keyset: calloc failed for n_vals=%d", n_vals);
-        free(tvals); free(tvlens); return NULL;
+        int saved = errno ? errno : ENOMEM;
+        free(tvals); free(tvlens);
+        return bm_build_fail(out, CBF_HARD, saved);
     }
     int nt = 0;
     for (int i = 0; i < n_vals; i++) {
-        const char *v = (leaf->op == OP_EQUAL) ? leaf->value : leaf->in_values[i];
-        encode_criterion_value(tf, v, strlen(v), tvals[nt], &tvlens[nt]);
+        const char *v = (leaf->op == OP_EQUAL) ? search_criterion_value(leaf) : leaf->in_values[i];
+        if (encode_criterion_value_checked(literal_schema, tf, v, strlen(v),
+                                             tvals[nt], sizeof(tvals[nt]),
+                                             &tvlens[nt]) < 0) {
+            int saved = errno ? errno : EILSEQ;
+            free(tvals); free(tvlens);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
         if (tvlens[nt] > 0) nt++;
     }
     if (nt == 0) {
         free(tvals); free(tvlens);
-        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl);
+        return build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema,budget,out);
     }
 
-    /* Sum bm_count across shards — cheap stride popcount per (shard, value). */
+    /* Sum bm_count across shards — cheap stride popcount per (shard, value).
+       A hard read failure fails the build: no complement estimate may be
+       derived from a partial count. */
     size_t matches = 0;
     for (int s = 0; s < splits; s++) {
-        if (dl && dl->timed_out) { free(tvals); free(tvlens); return NULL; }
+        if (dl && dl->timed_out) {
+            free(tvals); free(tvlens);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
         char bp[1024];
         bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
-        BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-        if (!bm) continue;
+        BitmapShard *bm = NULL;
+        int orc = bm_open_read(bp, &bm);
+        if (orc > 0) continue;
+        if (orc < 0) {
+            int saved = errno;
+            free(tvals); free(tvlens);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
         for (int i = 0; i < nt; i++) matches += bm_count(bm, tvals[i], tvlens[i]);
         bm_close(bm);
     }
@@ -4131,14 +4815,26 @@ KeySet *build_smaller_bitmap_keyset(const char *db_root, const char *object,
 
     KeySet *ks;
     if (matches <= comp) {
-        ks = build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl);
+        ks = build_keyset_from_bitmap(db_root, object, splits, leaf, tf, dl,literal_schema,budget,out);
     } else {
         ks = build_keyset_bitmap_complement(db_root, object, splits, leaf, dl,
                                             (const uint8_t (*)[1024])tvals,
-                                            tvlens, nt, comp);
+                                            tvlens, nt, comp, budget, out);
         if (ks) *inverted = 1;
     }
     free(tvals); free(tvlens);
+    return ks;
+}
+
+KeySet *build_smaller_bitmap_keyset(const char *db_root, const char *object,
+                                    int splits, const SearchCriterion *leaf,
+                                    const TypedField *tf, QueryDeadline *dl,
+                                    int *inverted) {
+    CandidateBuildOut out;
+    KeySet *ks = build_smaller_bitmap_keyset_ck(db_root, object, splits, leaf,
+                                                tf, dl, inverted, NULL, &out);
+    if (!ks) errno = out.reason == CBF_HARD ? out.saved_errno
+                    : out.reason == CBF_INSERT_CAPACITY ? ENOBUFS : 0;
     return ks;
 }
 
@@ -4149,14 +4845,19 @@ typedef struct {
     KeySet        *ks;
     QueryDeadline *dl;
     int            timed_out;
+    CandidateBuildFailure reason;
 } TgCollectCtx;
 
 static int tg_collect_to_keyset_cb(const char *value, size_t vlen,
                                    const uint8_t hash[16], void *ctx) {
     (void)value; (void)vlen;
     TgCollectCtx *c = (TgCollectCtx *)ctx;
-    if (c->dl && c->dl->timed_out) { c->timed_out = 1; return 1; }
-    keyset_insert(c->ks, hash);
+    if (c->reason != CBF_NONE) return 1;
+    if (c->dl && c->dl->timed_out) { c->timed_out = 1; c->reason = CBF_TIMEOUT; return 1; }
+    if (keyset_insert(c->ks, hash) < 0) {
+        c->reason = CBF_INSERT_CAPACITY;
+        return 1;
+    }
     return 0;
 }
 
@@ -4241,14 +4942,18 @@ typedef struct {
     KeySet        *next;      /* matches accumulate here */
     QueryDeadline *dl;
     int            timed_out;
+    CandidateBuildFailure reason;
 } TgFilterCtx;
 
 static int tg_filter_cb(const char *value, size_t vlen,
                         const uint8_t hash[16], void *ctx) {
     (void)value; (void)vlen;
     TgFilterCtx *c = (TgFilterCtx *)ctx;
-    if (c->dl && c->dl->timed_out) { c->timed_out = 1; return 1; }
-    if (keyset_contains(c->running, hash)) keyset_insert(c->next, hash);
+    if (c->reason != CBF_NONE) return 1;
+    if (c->dl && c->dl->timed_out) { c->timed_out = 1; c->reason = CBF_TIMEOUT; return 1; }
+    if (keyset_contains(c->running, hash)) {
+        if (keyset_insert(c->next, hash) < 0) c->reason = CBF_INSERT_CAPACITY;
+    }
     return 0;
 }
 
@@ -4281,36 +4986,47 @@ static size_t tg_posting_count(const char *db_root, const char *object,
 static KeySet *tg_intersect_streaming(const char *db_root, const char *object,
                                       const char *field, int splits,
                                       const uint8_t trigram[3],
-                                      KeySet *running, QueryDeadline *dl) {
+                                      KeySet *running, QueryDeadline *dl,
+                                      KeySetBudget *budget,
+                                      CandidateBuildOut *out) {
     if (!running || keyset_size(running) == 0) return running;
     int idx_n = index_splits_for(splits);
 
     /* Result size ≤ |running|. Size to fit. */
-    KeySet *next = keyset_new(keyset_size(running));
+    KeySet *next = keyset_new_budgeted(keyset_size(running), budget);
     if (!next) {
+        int saved = errno;
         LOG_ERROR(LOG_SUB_QUERY, "tg_intersect_streaming: keyset_new(%zu) failed", keyset_size(running));
-        keyset_free(running); return NULL;
+        keyset_free(running);
+        return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD, saved);
     }
-    TgFilterCtx c = { running, next, dl, 0 };
+    TgFilterCtx c = { running, next, dl, 0, CBF_NONE };
     for (int s = 0; s < idx_n; s++) {
         char tp[PATH_MAX];
         tg_build_path(tp, sizeof(tp), db_root, object, field, s);
         btree_range(tp, (const char *)trigram, 3,
                     (const char *)trigram, 3,
                     tg_filter_cb, &c);
-        if (c.timed_out) { keyset_free(running); keyset_free(next); return NULL; }
+        if (c.reason != CBF_NONE) {
+            keyset_free(running); keyset_free(next);
+            return bm_build_fail(out, c.reason, 0);
+        }
     }
     keyset_free(running);
     return next;
 }
 
-KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
-                                        int splits,
-                                        const SearchCriterion *leaf,
-                                        QueryDeadline *dl) {
-    if (!leaf) return NULL;
-    size_t plen = strlen(leaf->value);
-    if (plen < 3) return NULL;
+static KeySet *build_keyset_from_trigram_b(const char *db_root, const char *object,
+                                           int splits,
+                                           const SearchCriterion *leaf,
+                                           QueryDeadline *dl,
+                                           KeySetBudget *budget,
+                                           CandidateBuildOut *out) {
+    cb_out_init(out);
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
+    if (!leaf) return bm_build_fail(out, CBF_NONE, 0);
+    size_t plen = strlen(search_criterion_value(leaf));
+    if (plen < 3) return bm_build_fail(out, CBF_NONE, 0);
 
     uint8_t pattern_lc[1024];
     if (plen > sizeof(pattern_lc)) plen = sizeof(pattern_lc);
@@ -4318,13 +5034,13 @@ KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
        OP_CONTAINS and OP_ICONTAINS land on the same posting lists.
        Per-record verify enforces final case-sensitivity. */
     for (size_t i = 0; i < plen; i++) {
-        uint8_t c = (uint8_t)leaf->value[i];
+        uint8_t c = (uint8_t)search_criterion_value(leaf)[i];
         pattern_lc[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
     }
 
     uint8_t trigrams[TG_MAX_DISTINCT][3];
     size_t  n = tg_extract_distinct(pattern_lc, plen, trigrams, TG_MAX_DISTINCT);
-    if (n == 0) return NULL;
+    if (n == 0) return bm_build_fail(out, CBF_NONE, 0);
 
     /* Sort trigrams by posting size ascending — rarest first. The
        seed keyset is the smallest posting list (saves allocation +
@@ -4336,18 +5052,29 @@ KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
     typedef struct { uint8_t tg[3]; size_t count; } TgEntry;
     TgEntry *order = malloc(n * sizeof(TgEntry));
     if (!order) {
+        int saved = errno ? errno : ENOMEM;
         LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_trigram: malloc failed for n=%zu TgEntry", n);
-        return NULL;
+        return bm_build_fail(out, CBF_HARD, saved);
     }
     for (size_t i = 0; i < n; i++) {
         memcpy(order[i].tg, trigrams[i], 3);
         order[i].count = tg_posting_count(db_root, object, leaf->field,
                                           splits, trigrams[i], dl);
-        if (dl && dl->timed_out) { free(order); return NULL; }
+        if (candidate_deadline_expired(dl)) {
+            free(order);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
         /* Any zero-posting trigram → intersection is empty. */
         if (order[i].count == 0) {
+            KeySet *empty = keyset_new_budgeted(16, budget);
+            if (!empty) {
+                int saved = errno;
+                free(order);
+                return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                     saved);
+            }
             free(order);
-            return keyset_new(16);  /* empty */
+            return empty;
         }
     }
     /* Simple insertion sort — n ≤ TG_MAX_DISTINCT (4096) but typically <50. */
@@ -4361,31 +5088,47 @@ KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
     }
 
     /* Seed from rarest trigram — sized exactly to its posting count. */
-    KeySet *acc = keyset_new(order[0].count);
+    KeySet *acc = keyset_new_budgeted(order[0].count, budget);
     if (!acc) {
+        int saved = errno;
         LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_trigram: keyset_new(%zu) failed", (size_t)order[0].count);
-        free(order); return NULL;
+        free(order);
+        return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD, saved);
     }
     int idx_n = index_splits_for(splits);
-    TgCollectCtx cc = { acc, dl, 0 };
+    TgCollectCtx cc = { acc, dl, 0, CBF_NONE };
     for (int s = 0; s < idx_n; s++) {
         char tp[PATH_MAX];
         tg_build_path(tp, sizeof(tp), db_root, object, leaf->field, s);
         btree_range(tp, (const char *)order[0].tg, 3,
                     (const char *)order[0].tg, 3,
                     tg_collect_to_keyset_cb, &cc);
-        if (cc.timed_out) { keyset_free(acc); free(order); return NULL; }
+        if (cc.reason != CBF_NONE) {
+            keyset_free(acc); free(order);
+            return bm_build_fail(out, cc.reason, 0);
+        }
     }
 
     /* Streaming intersect against each subsequent trigram. Early-exit
        once running is empty. */
     for (size_t i = 1; i < n && keyset_size(acc) > 0; i++) {
         acc = tg_intersect_streaming(db_root, object, leaf->field, splits,
-                                     order[i].tg, acc, dl);
+                                     order[i].tg, acc, dl, budget, out);
         if (!acc) { free(order); return NULL; }
     }
     free(order);
     return acc;
+}
+
+KeySet *build_keyset_from_trigram(const char *db_root, const char *object,
+                                  int splits, const SearchCriterion *leaf,
+                                  QueryDeadline *dl) {
+    CandidateBuildOut o;
+    KeySet *ks = build_keyset_from_trigram_b(db_root, object, splits, leaf, dl,
+                                             NULL, &o);
+    if (!ks) errno = o.reason == CBF_HARD ? o.saved_errno
+                    : o.reason == CBF_INSERT_CAPACITY ? ENOBUFS : 0;
+    return ks;
 }
 
 /* ============================================================
@@ -4404,12 +5147,12 @@ static int find_via_trigram_starts_with(const char *db_root, const char *object,
                                         int dict_fmt,
                                         QueryDeadline *dl)
 {
-    size_t plen = strlen(seed->value);
+    size_t plen = strlen(search_criterion_value(seed));
     if (plen < 3) return 0;
 
     uint8_t gram[3];
     for (int i = 0; i < 3; i++) {
-        uint8_t c = (uint8_t)seed->value[i];
+        uint8_t c = (uint8_t)search_criterion_value(seed)[i];
         gram[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
     }
 
@@ -4422,7 +5165,7 @@ static int find_via_trigram_starts_with(const char *db_root, const char *object,
     if (!ks) return 0;
 
     int idx_n = index_splits_for(sch->splits);
-    TgCollectCtx cc = { ks, dl, 0 };
+    TgCollectCtx cc = { .ks = ks, .dl = dl };
     for (int s = 0; s < idx_n; s++) {
         char tp[PATH_MAX];
         tg_build_path(tp, sizeof(tp), db_root, object, seed->field, s);
@@ -4439,10 +5182,25 @@ static int find_via_trigram_starts_with(const char *db_root, const char *object,
     return rc;
 }
 
-KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
-                                      int splits,
-                                      SearchCriterion *leaf,
-                                      QueryDeadline *dl) {
+#ifdef TEST_BUILD
+/* Deterministic allocation-failure injection for per-leaf KeySet builds
+   (same precedent as g_bulk_upd_test_fail_alloc). Atomic arming so the
+   parallel workers cannot race the countdown. */
+static int g_keyset_leaf_test_fail_alloc;
+
+void build_keyset_leaf_test_set_fail_alloc(int fail_n) {
+    __atomic_store_n(&g_keyset_leaf_test_fail_alloc, fail_n, __ATOMIC_RELAXED);
+}
+#endif
+
+KeySet *build_keyset_from_leaf_ck(const char *db_root, const char *object,
+                                  int splits, SearchCriterion *leaf,
+                                  QueryDeadline *dl, KeySetBudget *budget,
+                                  CandidateBuildOut *out) {
+    cb_out_init(out);
+    errno=0;
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
+    if (!leaf) return bm_build_fail(out, CBF_NONE, 0);
     /* Dispatch on the plan-time picker's choice — single index per leaf,
        no runtime cascade between index types.  If the picker says
        IT_TRIGRAM and the trigram builder returns NULL (e.g. transient
@@ -4450,15 +5208,16 @@ KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
        via btree.  The picker has already considered all available
        indexes for this (field, op, pattern-length) tuple. */
     int picked = pick_index_for_leaf(db_root, object, leaf);
-    if (picked < 0) return NULL;
+    if (picked < 0) return bm_build_fail(out, CBF_NONE, 0);   /* not indexed */
     if (picked == IT_TRIGRAM) {
-        return build_keyset_from_trigram(db_root, object, splits, leaf, dl);
+        return build_keyset_from_trigram_b(db_root, object, splits, leaf, dl,
+                                           budget, out);
     }
     if (picked == IT_BITMAP) {
         TypedSchema *ts = load_typed_schema(db_root, object);
         const TypedField *tf = resolve_idx_field(ts, leaf->field);
         return build_keyset_from_bitmap(db_root, object, splits,
-                                        leaf, tf, dl);
+                                        leaf, tf, dl, ts, budget, out);
     }
     /* IT_BTREE — tiered KeySet allocation. Pre-2026-05-25 this function pre-allocated
        a KeySet sized to (file-size hint floored at live count), which on a
@@ -4499,21 +5258,52 @@ KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
     for (int t = 0; t < try_count; t++) {
         /* coverity[tainted_data] CID 1693849: hint is bounded above by
            the budget_max_hint clamp during tier2 derivation. */
-        KeySet *ks = keyset_new(hints[t]);
+#ifdef TEST_BUILD
+        /* Armed countdown (atomic): the worker whose tick reaches 0 sees
+           the allocation fail with ENOMEM. */
+        if (__atomic_load_n(&g_keyset_leaf_test_fail_alloc, __ATOMIC_ACQUIRE) > 0 &&
+            __atomic_sub_fetch(&g_keyset_leaf_test_fail_alloc, 1,
+                               __ATOMIC_ACQ_REL) == 0) {
+            errno = ENOMEM;
+            LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_leaf: injected alloc failure (tier %d)", t);
+            return bm_build_fail(out, CBF_HARD, ENOMEM);
+        }
+#endif
+        KeySet *ks = keyset_new_budgeted(hints[t], budget);
         if (!ks) {
+            int saved = errno;
             LOG_ERROR(LOG_SUB_QUERY, "build_keyset_from_leaf: keyset_new(%zu) failed (tier %d)", hints[t], t);
-            return NULL;
+            return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                 saved);
         }
         IntersectCollectCtx c = { ks, dl, 0, 0 };
-        btree_dispatch(db_root, object, leaf->field, splits,
-                       leaf, tf, intersect_collect_cb, &c);
-        if (dl->timed_out) { keyset_free(ks); return NULL; }
+        if(btree_dispatch_checked(db_root, object, leaf->field, splits,
+                       leaf, tf, intersect_collect_cb, &c)<0){
+            int saved = errno;
+            keyset_free(ks);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
+        if (dl->timed_out) {
+            keyset_free(ks);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
         if (!c.overflowed) return ks;
         keyset_free(ks);
         /* Tier-1 overflowed; loop retries at tier 2.  Tier-2 overflow
-           exits the loop and returns NULL. */
+           exits the loop as a budget-class fallback. */
     }
-    return NULL;
+    return bm_build_fail(out, CBF_BUDGET, 0);
+}
+
+KeySet *build_keyset_from_leaf(const char *db_root, const char *object,
+                               int splits, SearchCriterion *leaf,
+                               QueryDeadline *dl) {
+    CandidateBuildOut o;
+    KeySet *ks = build_keyset_from_leaf_ck(db_root, object, splits, leaf, dl,
+                                          NULL, &o);
+    if (!ks) errno = o.reason == CBF_HARD ? o.saved_errno
+                    : o.reason == CBF_INSERT_CAPACITY ? ENOBUFS : 0;
+    return ks;
 }
 
 /* Below this threshold for the most-selective leaf, fan out the candidates as
@@ -4537,12 +5327,62 @@ typedef struct {
     SearchCriterion  *leaf;
     KeySet          **slot;       /* &per_leaf[my_idx] */
     QueryDeadline    *deadline;
+    KeySetBudget     *budget;     /* request budget (NULL = unbudgeted) */
+#ifdef TEST_BUILD
+    int               test_race_stage;
+    pthread_t         test_owner;
+    int               test_offthread;
+    int               test_fault_site;
+    int               test_fault_error;
+    unsigned          test_fault_consumed;
+#endif
+    CandidateBuildOut worker_out; /* storage; bout points here */
+    CandidateBuildOut *bout;      /* passed to build_keyset_from_leaf_b */
+    int               err;        /* captured errno when slot stayed NULL;
+                                     0 = success or the historical
+                                     budget-fallback NULL. Slots are
+                                     disjoint per worker — no lock. */
 } LeafBuildArg;
 
 static void *leaf_build_worker(void *arg) {
-    LeafBuildArg *a = (LeafBuildArg *)arg;
-    *a->slot = build_keyset_from_leaf(a->db_root, a->object, a->splits,
-                                      a->leaf, a->deadline);
+    LeafBuildArg *a = arg;
+#ifdef TEST_BUILD
+    int previous_stage = atomic_load(&bm_ks_race_armed);
+    if (a->test_race_stage)
+        atomic_store(&bm_ks_race_armed, a->test_race_stage);
+    a->test_offthread = !pthread_equal(pthread_self(), a->test_owner);
+    if (a->test_fault_error) {
+        BmTestLockFaultState previous_faults;
+        bm_test_lock_fault_save(&previous_faults);
+        bm_test_reset_lock_failure();
+        bm_test_fail_lock_next(a->test_fault_site, a->test_fault_error);
+        char path[1024];
+        bm_build_path(path, sizeof(path), a->db_root, a->object, a->leaf->field, 0);
+        BitmapShard *probe = bm_open(path, 0, 0, 0, 0, 0);
+        int saved = errno;
+        a->test_fault_consumed = (unsigned)bm_test_lock_failure_consumed(a->test_fault_site);
+        bm_test_lock_fault_restore(&previous_faults);
+        if (!probe) {
+            *a->slot = bm_build_fail(a->bout, CBF_HARD, saved);
+            a->err = errno;
+            atomic_store(&bm_ks_race_armed, previous_stage);
+            return NULL;
+        }
+        bm_close(probe);
+    }
+#endif
+    errno = 0;
+    *a->slot = build_keyset_from_leaf_ck(a->db_root, a->object, a->splits,
+                                        a->leaf, a->deadline, a->budget,
+                                        a->bout);
+    a->err = *a->slot ? 0 : errno;
+    if (!*a->slot && a->bout->reason == CBF_NONE && a->err) {
+        a->bout->reason = CBF_HARD;
+        a->bout->saved_errno = a->err;
+    }
+#ifdef TEST_BUILD
+    atomic_store(&bm_ks_race_armed, previous_stage);
+#endif
     return NULL;
 }
 
@@ -4592,13 +5432,16 @@ static int intersect_all_cb(const uint8_t hash[16], void *ctx) {
    which beats walking the rest of the leaves in full.
 
    Caller frees the returned KeySet. */
-KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
-                                        int splits,
-                                        SearchCriterion **leaves, int n,
-                                        QueryDeadline *dl,
-                                        int *out_small_primary) {
+KeySet *intersect_indexed_leaves_ck(const char *db_root, const char *object,
+                                    int splits, SearchCriterion **leaves,
+                                    int n, QueryDeadline *dl,
+                                    int *out_small_primary,
+                                    KeySetBudget *budget,
+                                    CandidateBuildOut *out) {
+    cb_out_init(out);
+    errno=0;
     *out_small_primary = 0;
-    if (n < 2) return NULL;
+    if (n < 2) return bm_build_fail(out, CBF_NONE, 0);
 
     /* Parallel build per-leaf KeySets when n > 2. Nested parallel_for is
        structurally safe (work-stealing in parallel.c). For n == 2 the
@@ -4608,11 +5451,18 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
     if (n > 2 && parallel_pool_size() > 0) {
         /* Parallel build per-leaf sets, then walk smallest and keep entries
            present in all others. */
+        /* Per-leaf argument/result arrays are candidate memory too: charged
+           to the request budget before allocation, released with them. */
+        size_t arr_bytes = (size_t)n * (sizeof(KeySet *) + sizeof(LeafBuildArg));
+        if (keyset_budget_reserve(budget, arr_bytes) != 0)
+            return bm_build_fail(out, CBF_BUDGET, errno);
         KeySet **per_leaf = calloc((size_t)n, sizeof(KeySet *));
         LeafBuildArg *args = calloc((size_t)n, sizeof(LeafBuildArg));
         if (!per_leaf || !args) {
             LOG_ERROR(LOG_SUB_QUERY, "intersect_indexed_leaves: calloc failed for n=%d leaves", n);
-            free(per_leaf); free(args); return NULL;
+            int saved = errno ? errno : ENOMEM;
+            free(per_leaf); keyset_budget_release(budget, arr_bytes); free(args);
+            return bm_build_fail(out, CBF_HARD, saved);
         }
         for (int i = 0; i < n; i++) {
             args[i].db_root  = db_root;
@@ -4621,24 +5471,82 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
             args[i].leaf     = leaves[i];
             args[i].slot     = &per_leaf[i];
             args[i].deadline = dl;
+            args[i].budget   = budget;
+            args[i].bout     = &args[i].worker_out;
+#ifdef TEST_BUILD
+            args[i].test_owner = pthread_self();
+            if (bm_ks_parallel_stage &&
+                strcmp(args[i].leaf->field, bm_ks_parallel_field) == 0)
+                args[i].test_race_stage = bm_ks_parallel_stage;
+            if (bm_ks_parallel_fault_error &&
+                strcmp(args[i].leaf->field, bm_ks_parallel_fault_field) == 0) {
+                args[i].test_fault_site = bm_ks_parallel_fault_site;
+                args[i].test_fault_error = bm_ks_parallel_fault_error;
+            }
+#endif
         }
+#ifdef TEST_BUILD
+        int observe_parallel = bm_ks_parallel_stage != 0;
+        bm_ks_parallel_stage = 0;
+        bm_ks_parallel_field[0] = '\0';
+        bm_ks_parallel_fault_error = 0;
+#endif
         parallel_for(leaf_build_worker, args, n, sizeof(LeafBuildArg));
-        free(args);
+#ifdef TEST_BUILD
+        if (observe_parallel) {
+            bm_ks_parallel_stats[0] = (unsigned)n;
+            bm_ks_parallel_stats[1] = (unsigned)n;
+            for (int i = 0; i < n; i++) {
+                bm_ks_parallel_stats[2] += args[i].worker_out.reason == CBF_INSERT_CAPACITY;
+                bm_ks_parallel_stats[3] += args[i].worker_out.reason == CBF_HARD;
+                bm_ks_parallel_stats[4] += args[i].test_offthread;
+                bm_ks_parallel_stats[5] += args[i].test_fault_consumed;
+            }
+        }
+#endif
+        /* Carry the worker's captured errno through the join: the worker
+           thread's thread-local errno dies with it, and losing it made
+           worker allocation failures indistinguishable from an empty
+           intersection for errno-checked callers. The err slots are
+           disjoint per worker — no lock needed. errno stays 0 only for
+           the budget-fallback NULL, the historical scan-fallback signal. */
+        int worker_err = 0;
+        for (int i = 0; i < n; i++)
+            if (!worker_err && args[i].err) worker_err = args[i].err;
 
         if (dl->timed_out) {
+            free(args);
             for (int i = 0; i < n; i++) keyset_free(per_leaf[i]);
-            free(per_leaf);
+            free(per_leaf); keyset_budget_release(budget, arr_bytes);
             return NULL;
         }
         for (int i = 0; i < n; i++) {
             if (!per_leaf[i]) {
-                /* Build failed for this leaf — clean up and bail. */
+                /* Build failed for this leaf — fold the worst reason
+                   (hard beats insertion-capacity beats budget), surface
+                   its errno, clean up, bail. */
+                CandidateBuildFailure r = CBF_NONE;
+                for (int k = 0; k < n; k++) {
+                    CandidateBuildFailure kr = args[k].bout->reason;
+                    if (kr == CBF_HARD || r == CBF_NONE) r = kr;
+                    else if (r != CBF_HARD && kr == CBF_INSERT_CAPACITY)
+                        r = CBF_INSERT_CAPACITY;
+                }
+                int saved = worker_err;
+                for (int k = 0; k < n; k++)
+                    if (args[k].worker_out.reason == r &&
+                        args[k].worker_out.saved_errno) {
+                        saved = args[k].worker_out.saved_errno;
+                        break;
+                    }
+                free(args);
                 for (int k = 0; k < n; k++) keyset_free(per_leaf[k]);
-                free(per_leaf);
-                return NULL;
+                free(per_leaf); keyset_budget_release(budget, arr_bytes);
+                return bm_build_fail(out, r, saved);
             }
         }
 
+        free(args);
         int smallest_i = 0;
         for (int i = 1; i < n; i++) {
             if (keyset_size(per_leaf[i]) < keyset_size(per_leaf[smallest_i]))
@@ -4649,29 +5557,37 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
             *out_small_primary = 1;
             KeySet *result = per_leaf[smallest_i];
             for (int i = 0; i < n; i++) if (i != smallest_i) keyset_free(per_leaf[i]);
-            free(per_leaf);
+            free(per_leaf); keyset_budget_release(budget, arr_bytes);
             return result;
         }
 
-        KeySet *result = keyset_new(keyset_size(per_leaf[smallest_i]));
+        KeySet *result = keyset_new_budgeted(keyset_size(per_leaf[smallest_i]),
+                                             budget);
         if (!result) {
+            int saved = errno;
             LOG_ERROR(LOG_SUB_QUERY, "intersect_indexed_leaves: keyset_new(%zu) failed", keyset_size(per_leaf[smallest_i]));
             for (int i = 0; i < n; i++) keyset_free(per_leaf[i]);
-            free(per_leaf);
-            return NULL;
+            free(per_leaf); keyset_budget_release(budget, arr_bytes);
+            return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                 saved);
         }
         IntersectAllCtx ic = { per_leaf, n, smallest_i, result, dl, 0 };
         keyset_iter(per_leaf[smallest_i], intersect_all_cb, &ic);
 
         for (int i = 0; i < n; i++) keyset_free(per_leaf[i]);
-        free(per_leaf);
+        free(per_leaf); keyset_budget_release(budget, arr_bytes);
         if (dl->timed_out) { keyset_free(result); return NULL; }
         return result;
     }
 
     /* Serial path (n == 2 or pool unavailable). */
-    KeySet *running = build_keyset_from_leaf(db_root, object, splits, leaves[0], dl);
-    if (!running || dl->timed_out) { keyset_free(running); return NULL; }
+    KeySet *running = build_keyset_from_leaf_ck(db_root, object, splits, leaves[0],
+                                               dl, budget, out);
+    if (!running) return NULL;   /* reason and errno already recorded in out */
+    if (dl->timed_out) {
+        keyset_free(running);
+        return bm_build_fail(out, CBF_TIMEOUT, 0);
+    }
 
     /* Small-primary heuristic: skip the second-leaf btree walk; let the
        caller fan out a record-fetch + post-filter pass instead. */
@@ -4686,22 +5602,45 @@ KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
         size_t cur = keyset_size(running);
         if (cur == 0) break;  /* empty intersection — short-circuit */
 
-        KeySet *next = keyset_new(cur);  /* intersection cardinality ≤ |running| */
+        /* Source and result coexist at their combined charge; the superseded
+           running set is freed as soon as the probe finishes. */
+        KeySet *next = keyset_new_budgeted(cur, budget);  /* ≤ |running| */
         if (!next) {
+            int saved = errno;
             LOG_ERROR(LOG_SUB_QUERY, "intersect_indexed_leaves: keyset_new(%zu) failed (serial path)", cur);
-            keyset_free(running); return NULL;
+            keyset_free(running);
+            return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD,
+                                 saved);
         }
 
         IntersectProbeCtx p = { running, next, dl, 0 };
-        btree_dispatch(db_root, object, leaves[i]->field, splits,
+        if(btree_dispatch_checked(db_root, object, leaves[i]->field, splits,
                        leaves[i], resolve_idx_field(ts, leaves[i]->field),
-                       intersect_probe_cb, &p);
+                       intersect_probe_cb, &p)<0){
+            int saved = errno;
+            keyset_free(running); keyset_free(next);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
 
         keyset_free(running);
         running = next;
-        if (dl->timed_out) { keyset_free(running); return NULL; }
+        if (dl->timed_out) {
+            keyset_free(running);
+            return bm_build_fail(out, CBF_TIMEOUT, 0);
+        }
     }
     return running;
+}
+
+KeySet *intersect_indexed_leaves(const char *db_root, const char *object,
+                                 int splits, SearchCriterion **leaves, int n,
+                                 QueryDeadline *dl, int *out_small_primary) {
+    CandidateBuildOut o;
+    KeySet *ks = intersect_indexed_leaves_ck(db_root, object, splits, leaves, n,
+                                            dl, out_small_primary, NULL, &o);
+    if (!ks) errno = o.reason == CBF_HARD ? o.saved_errno
+                    : o.reason == CBF_INSERT_CAPACITY ? ENOBUFS : 0;
+    return ks;
 }
 
 /* Iterate a KeySet, computing shard_id + start_slot from each hash, into a
@@ -4759,6 +5698,8 @@ typedef struct {
        a known offset+limit; left at 0 for count/aggregate or hybrid cases
        that genuinely need every candidate. */
     int target_count;
+    int predicate_error;
+    _Atomic CandidateBuildFailure reason;
 } OrChildWorkerCtx;
 
 /* btree callback — drops every hit into the shared KeySet. Returns -1 to
@@ -4768,9 +5709,18 @@ typedef struct {
 static int or_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, void *ctx) {
     (void)val; (void)vlen;
     OrChildWorkerCtx *w = (OrChildWorkerCtx *)ctx;
-    if (query_deadline_tick(w->deadline, &w->dl_counter)) return -1;
-    if (keyset_insert(w->ks, hash16) < 0) {
+    if (w->reason != CBF_NONE) return -1;
+    if (query_deadline_tick(w->deadline, &w->dl_counter)) {
+        CandidateBuildFailure expected = CBF_NONE;
+        atomic_compare_exchange_strong_explicit(&w->reason, &expected,
+                                                 CBF_TIMEOUT,
+                                                 memory_order_relaxed,
+                                                 memory_order_relaxed);
+        return -1;
+    }
+    if (bm_ks_counted_insert(w->ks, hash16) < 0) {
         LOG_WARN(LOG_SUB_QUERY, "or_collect_cb: destination keyset capacity exhausted");
+        w->reason = CBF_INSERT_CAPACITY;
         return -1;
     }
     if (w->target_count > 0 &&
@@ -4783,10 +5733,13 @@ static int or_collect_cb(const char *val, size_t vlen, const uint8_t *hash16, vo
 static void *or_child_worker(void *arg) {
     OrChildWorkerCtx *w = (OrChildWorkerCtx *)arg;
     TypedSchema *ts = load_typed_schema(w->db_root, w->object);
-    btree_dispatch(w->db_root, w->object, w->leaf->field, w->splits,
+    if(btree_dispatch_checked(w->db_root, w->object, w->leaf->field, w->splits,
                    (SearchCriterion *)w->leaf,
                    resolve_idx_field(ts, w->leaf->field),
-                   or_collect_cb, w);
+                   or_collect_cb, w)<0){
+        w->predicate_error=errno?errno:EILSEQ;
+        w->reason = CBF_HARD;
+    }
     return NULL;
 }
 
@@ -4801,9 +5754,12 @@ static void *or_child_worker(void *arg) {
    be consumed without re-matching against a wider tree (i.e., need_rematch
    is false). For find with limit=N, callers pass N + offset; for count and
    aggregate, callers pass 0 (need every candidate). */
-KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
-                               const CriteriaNode *or_node, QueryDeadline *dl,
-                               int *out_budget_exceeded, int target_count) {
+KeySet *build_or_keyset_ck(const char *db_root, const char *object, int splits,
+                           const CriteriaNode *or_node, QueryDeadline *dl,
+                           int *out_budget_exceeded, int target_count,
+                           KeySetBudget *budget, CandidateBuildOut *out) {
+    cb_out_init(out);
+    errno=0;
     int n = or_node->n_children;
     if (n <= 0) return NULL;
 
@@ -4824,25 +5780,35 @@ KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
     size_t est_total = (size_t)(live_int > 0 ? live_int : 1024);
     if (est_total < 1024) est_total = 1024;
 
-    /* Budget check: KeySet alloc is O(cap_pow2 * 24 bytes) — keys[] + state[].
-       Cap est_total to fit the per-query buffer cap. */
-    size_t ks_cap_guess = est_total * 2; /* keyset_new doubles + rounds up */
-    size_t ks_bytes = ks_cap_guess * (sizeof(uint8_t[16]) + sizeof(uint32_t));
+    size_t ks_bytes = 0;
+    if (keyset_allocation_bytes(est_total, &ks_bytes) != 0)
+        return bm_build_fail(out, CBF_HARD, errno);
     if (ks_bytes > g_query_buffer_max_bytes) {
-        LOG_WARN(LOG_SUB_QUERY, "build_or_keyset: estimated keyset size %zu exceeds query buffer cap %zu", ks_bytes, g_query_buffer_max_bytes);
+        LOG_WARN(LOG_SUB_QUERY,
+                 "build_or_keyset: actual keyset size %zu exceeds query buffer cap %zu",
+                 ks_bytes, g_query_buffer_max_bytes);
         if (out_budget_exceeded) *out_budget_exceeded = 1;
-        return NULL;
+        return bm_build_fail(out, CBF_BUDGET, 0);
     }
-
-    /* coverity[tainted_data] CID 1693838: est_total is bounded above by
-       the explicit g_query_buffer_max_bytes check immediately above. */
-    KeySet *ks = keyset_new(est_total);
+    KeySet *ks = keyset_new_budgeted(est_total, budget);
     if (!ks) {
+        int saved = errno;
         LOG_ERROR(LOG_SUB_QUERY, "build_or_keyset: keyset_new(%zu) failed", est_total);
-        return NULL;
+        return bm_build_fail(out, saved == ENOBUFS ? CBF_BUDGET : CBF_HARD, saved);
     }
 
+    bm_ks_race_barrier(BMKS_RACE_OR, est_total, ks->cap);
+    size_t ctx_bytes = (size_t)n * sizeof(OrChildWorkerCtx);
+    if (keyset_budget_reserve(budget, ctx_bytes) != 0) {
+        keyset_free(ks);
+        return bm_build_fail(out, CBF_BUDGET, ENOBUFS);
+    }
     OrChildWorkerCtx *ctxs = calloc(n, sizeof(OrChildWorkerCtx));
+    if (!ctxs) {
+        keyset_budget_release(budget, ctx_bytes);
+        keyset_free(ks);
+        return bm_build_fail(out, CBF_HARD, ENOMEM);
+    }
     for (int i = 0; i < n; i++) {
         CriteriaNode *c = or_node->children[i];
         ctxs[i].db_root = db_root;
@@ -4852,6 +5818,7 @@ KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
         ctxs[i].ks = ks;
         ctxs[i].deadline = dl;
         ctxs[i].target_count = target_count;
+        atomic_init(&ctxs[i].reason, CBF_NONE);
     }
 
     /* Parallel across OR children via parallel_for. or_child_worker calls
@@ -4879,22 +5846,333 @@ KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
         }
     }
 
+    int error=0;
+    CandidateBuildFailure reason = CBF_NONE;
+    for(int i=0;i<n;i++){
+        if(ctxs[i].predicate_error)error=ctxs[i].predicate_error;
+        /* Hard beats insertion-capacity beats timeout. */
+        CandidateBuildFailure kr = ctxs[i].reason;
+        if (kr == CBF_HARD || reason == CBF_NONE) reason = kr;
+        else if (reason != CBF_HARD && kr == CBF_INSERT_CAPACITY)
+            reason = CBF_INSERT_CAPACITY;
+    }
     free(ctxs);
+    keyset_budget_release(budget, ctx_bytes);
+    if(error){
+        keyset_free(ks);
+        return bm_build_fail(out, reason == CBF_NONE ? CBF_HARD : reason, error);
+    }
+    if (reason != CBF_NONE) {
+        keyset_free(ks);
+        return bm_build_fail(out, reason, 0);
+    }
+    if (dl && dl->timed_out) {
+        keyset_free(ks);
+        return bm_build_fail(out, CBF_TIMEOUT, 0);
+    }
     return ks;
 }
+
+KeySet *build_or_keyset(const char *db_root, const char *object, int splits,
+                        const CriteriaNode *or_node, QueryDeadline *dl,
+                        int *out_budget_exceeded, int target_count) {
+    CandidateBuildOut o;
+    KeySet *ks = build_or_keyset_ck(db_root, object, splits, or_node, dl,
+                                   out_budget_exceeded, target_count, NULL, &o);
+    if (!ks) errno = o.reason == CBF_HARD ? o.saved_errno
+                    : o.reason == CBF_INSERT_CAPACITY ? ENOBUFS : 0;
+    return ks;
+}
+
 
 /* (legacy KeysetRecordRead / read_record_by_hash / release_record_read removed
    2026-05-07 — superseded by RecordRef + read_record_ref/release_record_ref in
    the storage-version-agnostic dispatch helpers above.) */
 
-/* Emit records matching `tree` by iterating a KeySet built from the OR branch.
-   Honours offset/limit at emit time. Excluded keys, joins, projections, and
-   rows_fmt all mirror the behaviour of idx_find_parallel / adv_search_cb.
-   Returns the number of rows printed. */
-/* Walk a pre-built KeySet, fetch each record, optionally re-match against a
-   tree, and emit per the requested format. Used by both OR-union and AND-
-   intersection paths (the difference is just how the KeySet was built and
-   whether rematch is needed). Caller owns the KeySet lifecycle. */
+/* ---- keyset_emit_find test counters and fault seams (TEST_BUILD only) ---- */
+#ifdef TEST_BUILD
+static struct {
+    _Atomic long calls, fetch_calls, fetch_hashes, copies, copy_bytes,
+                 live_copies, live_bytes, peak_bytes;
+} g_kef_stats;
+static _Atomic long g_kef_seam_at[KEF_SEAM_COUNT];   /* 0 = disarmed; n = fire on the n-th hit */
+static _Atomic long g_kef_seam_hits[KEF_SEAM_COUNT];
+static _Atomic long g_kef_budget_override;           /* > 0: record-copy budget in bytes */
+
+void kef_test_reset(void) {
+    atomic_store(&g_kef_stats.calls, 0);       atomic_store(&g_kef_stats.fetch_calls, 0);
+    atomic_store(&g_kef_stats.fetch_hashes, 0); atomic_store(&g_kef_stats.copies, 0);
+    atomic_store(&g_kef_stats.copy_bytes, 0);  atomic_store(&g_kef_stats.live_copies, 0);
+    atomic_store(&g_kef_stats.live_bytes, 0);  atomic_store(&g_kef_stats.peak_bytes, 0);
+    for (int i = 0; i < KEF_SEAM_COUNT; i++) {
+        atomic_store(&g_kef_seam_at[i], 0); atomic_store(&g_kef_seam_hits[i], 0);
+    }
+    atomic_store(&g_kef_budget_override, 0);
+}
+void kef_test_arm(int seam, long arg) {
+    if (seam == KEF_SEAM_BUDGET) { atomic_store(&g_kef_budget_override, arg); return; }
+    if (seam <= 0 || seam >= KEF_SEAM_COUNT) return;
+    atomic_store(&g_kef_seam_hits[seam], 0);
+    atomic_store(&g_kef_seam_at[seam], arg);
+}
+void kef_test_stats(KefTestStats *o) {
+    o->calls = atomic_load(&g_kef_stats.calls);             o->fetch_calls = atomic_load(&g_kef_stats.fetch_calls);
+    o->fetch_hashes = atomic_load(&g_kef_stats.fetch_hashes); o->copies = atomic_load(&g_kef_stats.copies);
+    o->copy_bytes = atomic_load(&g_kef_stats.copy_bytes);   o->live_copies = atomic_load(&g_kef_stats.live_copies);
+    o->live_bytes = atomic_load(&g_kef_stats.live_bytes);   o->peak_bytes = atomic_load(&g_kef_stats.peak_bytes);
+}
+static int kef_seam_take(int seam) {
+    long at = atomic_load(&g_kef_seam_at[seam]);
+    if (at <= 0) return 0;
+    long hit = atomic_fetch_add(&g_kef_seam_hits[seam], 1) + 1;
+    if (hit != at) return 0;
+    atomic_store(&g_kef_seam_at[seam], 0);              /* one-shot */
+    return 1;
+}
+static void kef_stat_copy(size_t bytes) {
+    atomic_fetch_add(&g_kef_stats.copies, 1);
+    atomic_fetch_add(&g_kef_stats.copy_bytes, (long)bytes);
+    atomic_fetch_add(&g_kef_stats.live_copies, 1);
+    long now = atomic_fetch_add(&g_kef_stats.live_bytes, (long)bytes) + (long)bytes;
+    long peak = atomic_load(&g_kef_stats.peak_bytes);
+    while (peak < now && !atomic_compare_exchange_weak(&g_kef_stats.peak_bytes, &peak, now)) {}
+}
+static void kef_stat_release(size_t bytes) {
+    atomic_fetch_sub(&g_kef_stats.live_copies, 1);
+    atomic_fetch_sub(&g_kef_stats.live_bytes, (long)bytes);
+}
+#define KEF_SEAM(s)          kef_seam_take(s)
+#define KEF_STAT_ADD(f, v)   ((void)atomic_fetch_add(&g_kef_stats.f, (long)(v)))
+#define KEF_STAT_COPY(b)     kef_stat_copy(b)
+#define KEF_STAT_RELEASE(b)  kef_stat_release(b)
+#else
+#define KEF_SEAM(s)          0
+#define KEF_STAT_ADD(f, v)   ((void)0)
+#define KEF_STAT_COPY(b)     ((void)0)
+#define KEF_STAT_RELEASE(b)  ((void)0)
+#endif
+
+#define KEF_BATCH 1024
+_Static_assert(KEF_BATCH <= 65536, "KefSortEnt.idx is uint16_t");
+
+typedef struct { uint8_t hash[16]; uint16_t idx; } KefSortEnt;
+
+/* One reusable fetch batch. Candidate slots 0..n-1 are in KeySet bucket order. */
+typedef struct {
+    uint8_t      hashes[KEF_BATCH][16];
+    KefSortEnt   sorted[KEF_BATCH];     /* same hashes sorted, for kef_batch_cb's lookup */
+    uint8_t     *rec[KEF_BATCH];        /* owned copy: key bytes then value bytes */
+    size_t       klen[KEF_BATCH];
+    size_t       vlen[KEF_BATCH];
+    uint8_t      hdr2[KEF_BATCH];
+    uint8_t      found[KEF_BATCH];
+    size_t       n;
+    KeySetBudget budget;                /* live record-copy bytes of this batch */
+    _Atomic int  error;                 /* first callback failure: ENOBUFS or ENOMEM */
+} KefBatch;
+
+static int kef_sort_cmp(const void *a, const void *b) {
+    return memcmp(((const KefSortEnt *)a)->hash, ((const KefSortEnt *)b)->hash, 16);
+}
+
+static void kef_set_error(KefBatch *b, int e) {
+    int expect = 0;
+    atomic_compare_exchange_strong(&b->error, &expect, e);
+}
+
+static size_t kef_copy_budget(void) {
+#ifdef TEST_BUILD
+    long o = atomic_load(&g_kef_budget_override);
+    if (o > 0) return (size_t)o;
+#endif
+    return g_query_buffer_max_bytes;
+}
+
+/* Fetch callback. Runs on fetch-pool threads, possibly concurrently for
+   different kf shards: every candidate owns its slot and shared state is
+   atomic. A hash repeats only within one partition (one thread), so the
+   found[] repeat check needs no lock. Copies the borrowed record; never
+   re-enters slotcask/btree (a kf reader is held). */
+static int kef_batch_cb(const uint8_t hash16[16], const void *key, size_t klen,
+                        const void *value, size_t vlen, uint8_t hdr2, void *ctx_ptr) {
+    KefBatch *b = (KefBatch *)ctx_ptr;
+    if (atomic_load_explicit(&b->error, memory_order_relaxed)) return 1;
+    size_t lo = 0, hi = b->n, slot = SIZE_MAX;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int c = memcmp(hash16, b->sorted[mid].hash, 16);
+        if (c == 0) { slot = b->sorted[mid].idx; break; }
+        if (c < 0) hi = mid; else lo = mid + 1;
+    }
+    if (slot == SIZE_MAX || b->found[slot]) return 0;   /* not ours, or a repeat: first copy wins */
+    if (vlen > SIZE_MAX - klen) { kef_set_error(b, ENOBUFS); return 1; }
+    size_t bytes = klen + vlen;
+    if (keyset_budget_reserve(&b->budget, bytes) != 0) { kef_set_error(b, ENOBUFS); return 1; }
+    uint8_t *p = KEF_SEAM(KEF_SEAM_COPY_ALLOC) ? NULL : malloc(bytes ? bytes : 1);
+    if (!p) { keyset_budget_release(&b->budget, bytes); kef_set_error(b, ENOMEM); return 1; }
+    if (klen) memcpy(p, key, klen);
+    if (vlen) memcpy(p + klen, value, vlen);
+    b->rec[slot] = p; b->klen[slot] = klen; b->vlen[slot] = vlen; b->hdr2[slot] = hdr2;
+    b->found[slot] = 1;
+    KEF_STAT_COPY(bytes);
+    return 0;
+}
+
+/* Free this batch's copies and reset it for the next collection. */
+static void kef_batch_release(KefBatch *b) {
+    for (size_t i = 0; i < b->n; i++) {
+        if (b->rec[i]) {
+            size_t bytes = b->klen[i] + b->vlen[i];
+            KEF_STAT_RELEASE(bytes);
+            keyset_budget_release(&b->budget, bytes);
+            free(b->rec[i]);
+            b->rec[i] = NULL;
+        }
+        b->found[i] = 0;
+    }
+    b->n = 0;
+    atomic_store_explicit(&b->error, 0, memory_order_relaxed);
+}
+
+/* Walk a pre-built KeySet in bucket order, one fetch batch at a time: fetch
+   up to KEF_BATCH candidates, filter (exclusions, rematch, joins), paginate
+   and emit them, free the batch, and fetch the next batch only while the
+   page is not full. Holds at most one batch of record copies, charged to
+   QUERY_BUFFER_MB; a batch that does not fit is retried at half size, and a
+   single record over the budget fails with ENOBUFS. Returns rows printed, or
+   -1 with errno on any fetch/allocation/record/join/emit failure (rows
+   already printed stay printed). A deadline stop returns the rows printed.
+   Used by the OR-union, AND-intersection, trigram, prepared-bitmap and
+   indexed-leaf find paths; caller owns the KeySet. */
+static int keyset_emit_find(const char *db_root, const char *object,
+                            const Schema *sch, KeySet *ks,
+                            CriteriaNode *tree_for_rematch,  /* NULL = skip */
+                            ExcludedKeys *excluded, int offset, int limit,
+                            const char **proj_fields, int proj_count,
+                            FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
+                            JoinSpec *joins, int njoins, QueryDeadline *dl) {
+    KEF_STAT_ADD(calls, 1);
+    int need_rematch = (tree_for_rematch != NULL);
+    CriteriaNode *tree = tree_for_rematch;
+
+    size_t cursor = 0;                       /* next KeySet bucket to collect from */
+    while (cursor < ks->cap && ks->state[cursor] != 2) cursor++;
+    if (cursor == ks->cap) return 0;         /* no candidate: no allocation, no registry */
+
+    KefBatch *bt = KEF_SEAM(KEF_SEAM_SETUP_ALLOC) ? NULL : calloc(1, sizeof(*bt));
+    if (!bt) { errno = ENOMEM; return -1; }
+    bt->budget.limit = kef_copy_budget();
+
+    SlotcaskSchemaInfo sinfo = {
+        .splits = sch->splits, .slot_size = sch->slot_size,
+        .streams = sch->streams,
+    };
+    errno = 0;
+    SlotcaskDb *sdb SDB_REG_REF = KEF_SEAM(KEF_SEAM_REGISTRY)
+        ? (errno = EIO, (SlotcaskDb *)NULL)
+        : slotcask_registry_get(db_root, object, &sinfo);
+    if (!sdb) { int e = errno ? errno : EIO; free(bt); errno = e; return -1; }
+
+    const Schema *kschema = fs && fs->auto_key != AK_NONE ? &fs->auto_key_schema_snapshot : NULL;
+    size_t batch_cap = KEF_BATCH;            /* halved on budget overflow; never grows back */
+    int printed = 0, count = 0, dl_counter = 0, error = 0, stop = 0;
+
+    while (!stop && !error && cursor < ks->cap) {
+        if (dl && dl->timeout_ms &&
+            atomic_load_explicit(&dl->timed_out, memory_order_relaxed)) break;
+        size_t next = cursor;
+        bt->n = 0;
+        while (next < ks->cap && bt->n < batch_cap) {
+            if (ks->state[next] == 2) {
+                memcpy(bt->hashes[bt->n], ks->keys[next], 16);
+                memcpy(bt->sorted[bt->n].hash, ks->keys[next], 16);
+                bt->sorted[bt->n].idx = (uint16_t)bt->n;
+                bt->n++;
+            }
+            next++;
+        }
+        if (bt->n == 0) break;               /* only empty buckets remain */
+        qsort(bt->sorted, bt->n, sizeof(bt->sorted[0]), kef_sort_cmp);
+
+        KEF_STAT_ADD(fetch_calls, 1);
+        KEF_STAT_ADD(fetch_hashes, bt->n);
+        int frc;
+        if (KEF_SEAM(KEF_SEAM_FETCH)) { errno = EIO; frc = -1; }
+        else {
+            errno = 0;
+            frc = slotcask_bulk_resolve_and_fetch(sdb, (const uint8_t (*)[16])bt->hashes,
+                                                  bt->n, bt, kef_batch_cb);
+        }
+        int ferr = errno;
+        if (KEF_SEAM(KEF_SEAM_TIMEOUT) && dl)
+            atomic_store_explicit(&dl->timed_out, 1, memory_order_relaxed);
+
+        int cerr = atomic_load_explicit(&bt->error, memory_order_relaxed);
+        size_t used = bt->n;
+        if (cerr == ENOBUFS && used > 1) {   /* copies do not fit: retry these candidates at half size */
+            kef_batch_release(bt);
+            batch_cap = used / 2;
+            continue;
+        }
+        if (cerr || frc < 0) {
+            error = cerr ? cerr : (ferr ? ferr : EIO);
+            kef_batch_release(bt);
+            break;
+        }
+        cursor = next;
+
+        for (size_t i = 0; i < bt->n; i++) {
+            if (limit > 0 && printed >= limit) { stop = 1; break; }
+            if (query_deadline_tick(dl, &dl_counter)) { stop = 1; break; }
+            if (!bt->found[i]) continue;
+            char keybuf[1100];
+            if (format_wire_key(kschema, (const char *)bt->rec[i], bt->klen[i],
+                                keybuf, sizeof(keybuf)) < 0) { error = EILSEQ; break; }
+            if (is_excluded(excluded, keybuf)) continue;
+            const uint8_t *raw = bt->rec[i] + bt->klen[i];
+            size_t value_len = bt->vlen[i];
+            uint8_t hdr2 = bt->hdr2[i];
+            int matched = 1;
+            if (need_rematch &&
+                criteria_match_tree_checked(raw, value_len, tree, fs, hdr2, &matched)) {
+                error = errno ? errno : EILSEQ; break;
+            }
+            if (!matched) continue;
+            RecordRef *refs = NULL; int dropped = 0;
+            size_t charge = (size_t)njoins * sizeof(*refs);
+            if (njoins) {
+                if (charge > g_query_buffer_max_bytes) { error = ENOBUFS; break; }
+                refs = calloc((size_t)njoins, sizeof(*refs));
+                if (!refs) { error = ENOMEM; break; }
+                for (int j = 0; j < njoins; j++) {
+                    int found = KEF_SEAM(KEF_SEAM_JOIN) ? (errno = EIO, -1)
+                        : resolve_join_record(&joins[j], db_root, fs->ts, raw, value_len, hdr2,
+                                              g_query_buffer_max_bytes - charge, &refs[j]);
+                    if (found < 0) { error = errno ? errno : EILSEQ; break; }
+                    if (!found && joins[j].type == JOIN_INNER) { dropped = 1; break; }
+                }
+            }
+            if (!error && !dropped && ++count > offset) {
+                if (typed_query_emit_row(g_out ? g_out : stdout, keybuf, strlen(keybuf), raw,
+                        value_len, hdr2, fs, proj_fields, proj_count, rows_fmt, dict_fmt,
+                        csv_delim, printed > 0, joins, njoins, refs,
+                        g_query_buffer_max_bytes - charge))
+                    error = errno ? errno : EILSEQ;
+                else printed++;
+            }
+            if (refs) { for (int j = 0; j < njoins; j++) release_record_ref(&refs[j]); free(refs); }
+            if (error) break;
+        }
+        if (limit > 0 && printed >= limit) stop = 1;
+        kef_batch_release(bt);
+    }
+    free(bt);
+    if (error) { errno = error; return -1; }
+    return printed;
+}
+
+#ifdef TEST_BUILD
+/* TEST_BUILD only: the previous whole-candidate-set implementation, kept verbatim as the differential reference for test_kef_batches.c. */
 
 typedef struct {
     uint8_t (*hashes)[16];
@@ -4903,13 +6181,13 @@ typedef struct {
     uint8_t **vals; size_t *vlens;
     uint8_t *hdr2s;             /* per-record generation byte */
     int     *found;
-} KefFetchCtx;
+} KefRefFetchCtx;
 
-static int kef_fetch_cb(const uint8_t hash16[16],
+static int kef_ref_fetch_cb(const uint8_t hash16[16],
                          const void *key, size_t klen,
                          const void *value, size_t vlen,
                          uint8_t hdr2, void *ctx_ptr) {
-    KefFetchCtx *c = (KefFetchCtx *)ctx_ptr;
+    KefRefFetchCtx *c = (KefRefFetchCtx *)ctx_ptr;
     for (size_t i = 0; i < c->n; i++) {
         if (memcmp(hash16, c->hashes[i], 16) == 0) {
             c->keys[i] = malloc(klen);
@@ -4924,7 +6202,7 @@ static int kef_fetch_cb(const uint8_t hash16[16],
     return 0;
 }
 
-static int keyset_emit_find(const char *db_root, const char *object,
+static int keyset_emit_find_reference(const char *db_root, const char *object,
                             const Schema *sch, KeySet *ks,
                             CriteriaNode *tree_for_rematch,  /* NULL = skip */
                             ExcludedKeys *excluded, int offset, int limit,
@@ -4980,189 +6258,67 @@ static int keyset_emit_find(const char *db_root, const char *object,
     uint8_t *fhdr2s = calloc(n_fetch, sizeof(*fhdr2s));
     size_t  *fvlens = calloc(n_fetch, sizeof(*fvlens));
     int     *ffound = calloc(n_fetch, sizeof(*ffound));
-    if (!fkeys || !fklens || !fvals || !fvlens || !ffound) {
+    if (!fkeys || !fklens || !fvals || !fvlens || !fhdr2s || !ffound) {
         free(hashes); free(key_to_fetch);
         free(fkeys); free(fklens); free(fvals); free(fvlens); free(fhdr2s); free(ffound);
         return 0;
     }
 
-    KefFetchCtx fctx = { hashes, n_fetch, fkeys, fklens, fvals, fvlens, fhdr2s, ffound };
+    KefRefFetchCtx fctx = { hashes, n_fetch, fkeys, fklens, fvals, fvlens, fhdr2s, ffound };
 
-#define KEF_BATCH 1024
+#define KEF_REF_BATCH 1024
     {
         size_t processed = 0;
         while (processed < n_fetch) {
             size_t batch = n_fetch - processed;
-            if (batch > KEF_BATCH) batch = KEF_BATCH;
+            if (batch > KEF_REF_BATCH) batch = KEF_REF_BATCH;
             slotcask_bulk_resolve_and_fetch(sdb, hashes + processed,
-                                             batch, &fctx, kef_fetch_cb);
+                                             batch, &fctx, kef_ref_fetch_cb);
             processed += batch;
         }
     }
-#undef KEF_BATCH
+#undef KEF_REF_BATCH
 
     /* Phase 2: sequential emit using fetched records. */
+    int error=0;
     {
-        int count = 0;
-        int dl_counter = 0;
-        for (size_t b = 0; b < ks->cap && (limit <= 0 || printed < limit); b++) {
-            if (query_deadline_tick(dl, &dl_counter)) break;
-            if (ks->state[b] != 2) continue;
-            int fi = key_to_fetch[b];
-            if (fi < 0 || !ffound[fi]) continue;
-
+        int count=0,dl_counter=0;
+        for(size_t b=0;b<ks->cap&&(limit<=0||printed<limit);b++){
+            if(query_deadline_tick(dl,&dl_counter))break;
+            if(ks->state[b]!=2)continue;
+            int fi=key_to_fetch[b];if(fi<0||!ffound[fi])continue;
             char keybuf[1100];
-            {
-                const Schema *sc_p = (fs && fs->auto_key != AK_NONE)
-                                      ? &fs->auto_key_schema_snapshot : NULL;
-                format_wire_key(sc_p, (const char *)fkeys[fi], fklens[fi], keybuf, sizeof(keybuf));
+            const Schema *schema=fs&&fs->auto_key!=AK_NONE?&fs->auto_key_schema_snapshot:NULL;
+            if(format_wire_key(schema,(const char*)fkeys[fi],fklens[fi],keybuf,sizeof(keybuf))<0){error=EILSEQ;break;}
+            if(is_excluded(excluded,keybuf))continue;
+            const uint8_t *raw=fvals[fi];size_t value_len=fvlens[fi];
+            int matched=1;
+            if(need_rematch&&criteria_match_tree_checked(raw,value_len,tree,fs,fhdr2s[fi],&matched)){
+                error=errno?errno:EILSEQ;break;
             }
-
-            if (is_excluded(excluded, keybuf)) continue;
-
-            const uint8_t *raw = fvals[fi];
-            uint32_t value_len = (uint32_t)fvlens[fi];
-            if (need_rematch && !criteria_match_tree(raw, value_len, tree, fs, fhdr2s[fi])) continue;
-
-            {  /* Single-iteration block — no probe loop in the dispatched path. */
-
-                RecordRef *jrr = NULL;
-                const uint8_t **jraws = NULL;
-                int dropped = 0;
-                if (njoins > 0) {
-                    jrr = calloc(njoins, sizeof(RecordRef));
-                    jraws = calloc(njoins, sizeof(const uint8_t *));
-                    if (!jrr || !jraws) {
-                        free(jrr); free(jraws);
-                        jrr = NULL; jraws = NULL;
-                        dropped = 1;
-                    } else {
-                        for (int i = 0; i < njoins; i++) {
-                            char lk[1024];
-                            int llen = extract_local_key(&joins[i], raw, (size_t)value_len,
-                                                         fs ? fs->ts : NULL,
-                                                         fhdr2s[fi], lk, sizeof(lk));
-                            int jfound = 0;
-                            if (llen > 0) {
-                                jfound = lookup_remote(&joins[i], db_root, lk, (size_t)llen,
-                                                       &jrr[i]);
-                                if (jfound) jraws[i] = jrr[i].val;
-                            }
-                            if (!jfound && joins[i].type == JOIN_INNER) { dropped = 1; break; }
-                        }
-                    }
-                }
-
-                if (!dropped) {
-                    count++;
-                    if (count > offset && (limit <= 0 || printed < limit)) {
-                        if (njoins > 0 && csv_delim) {
-                            char buf[16384];
-                            size_t n = build_joined_csv_row(
-                                keybuf, raw, (size_t)value_len, fs, fhdr2s[fi],
-                                proj_count > 0 ? proj_fields : NULL, proj_count,
-                                joins, njoins, jrr, csv_delim,
-                                buf, sizeof(buf));
-                            OUT("%.*s", (int)n, buf);
-                        } else if (njoins > 0) {
-                            char buf[16384];
-                            size_t pos = 0;
-                            SB_APPEND(buf, pos, sizeof(buf), "[\"%s\"", keybuf);
-                            size_t wrote = buf_driver_values(
-                                                raw, (size_t)value_len, fs,
-                                                proj_count > 0 ? proj_fields : NULL,
-                                                proj_count, fhdr2s[fi],
-                                                buf + pos, sizeof(buf) - pos);
-                            pos += wrote;
-                            if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
-                            for (int i = 0; i < njoins; i++) {
-                                if (!jraws[i]) {
-                                    int ncols = joins[i].proj_count > 0
-                                                ? joins[i].proj_count
-                                                : (joins[i].remote_fs.ts
-                                                   ? joins[i].remote_fs.ts->nfields : 0);
-                                    if (joins[i].include_remote_key) ncols++;
-                                    for (int k = 0; k < ncols; k++)
-                                        SB_APPEND(buf, pos, sizeof(buf), ",null");
-                                } else {
-                                    wrote = buf_join_values(&joins[i], jraws[i], jrr[i].vlen,
-                                                            jrr[i].hdr2,
-                                                            buf + pos, sizeof(buf) - pos);
-                                    pos += wrote;
-                                    if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
-                                }
-                            }
-                            SB_APPEND(buf, pos, sizeof(buf), "]");
-                            OUT("%s%s", printed ? "," : "", buf);
-                        } else if (csv_delim) {
-                            csv_emit_row(keybuf, raw, value_len,
-                                         proj_count > 0 ? proj_fields : NULL,
-                                         proj_count, fs, csv_delim, fhdr2s[fi]);
-                        } else if (rows_fmt) {
-                            OUT("%s[\"%s\"", printed ? "," : "", keybuf);
-                            if (proj_count > 0) {
-                                for (int j = 0; j < proj_count; j++) {
-                                    char *pv = json_projected_field((const char *)raw, value_len,
-                                                            proj_fields[j], fs, fhdr2s[fi]);
-                                    OUT(",%s", pv ? pv : "\"\"");
-                                    free(pv);
-                                }
-                            } else if (fs && fs->ts) {
-                                for (int j = 0; j < fs->ts->nfields; j++) {
-                                    if (fs->ts->fields[j].removed) continue;
-                                    char *pv = json_typed_row_cell(fs->ts, raw,
-                                                                   (int)value_len, j,
-                                                                   fhdr2s[fi]);
-                                    OUT(",%s", pv ? pv : "\"\"");
-                                    free(pv);
-                                }
-                            }
-                            OUT("]");
-                        } else if (dict_fmt) {
-                            OUT("%s\"%s\":", printed ? "," : "", keybuf);
-                            if (proj_count > 0) {
-                                OUT("{");
-                                int first = 1;
-                                for (int j = 0; j < proj_count; j++) {
-                                    char *pv = json_projected_field((const char *)raw, value_len,
-                                                            proj_fields[j], fs, fhdr2s[fi]);
-                                    if (!pv) continue;
-                                    OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
-                                    first = 0;
-                                    free(pv);
-                                }
-                                OUT("}");
-                            } else {
-                                char *v = decode_value((const char *)raw, value_len, fs, fhdr2s[fi]);
-                                OUT("%s", v);
-                                free(v);
-                            }
-                        } else if (proj_count > 0) {
-                            OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", keybuf);
-                            int first = 1;
-                            for (int j = 0; j < proj_count; j++) {
-                                char *pv = json_projected_field((const char *)raw, value_len,
-                                                        proj_fields[j], fs, fhdr2s[fi]);
-                                if (!pv) continue;
-                                OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
-                                first = 0;
-                                free(pv);
-                            }
-                            OUT("}}");
-                        } else {
-                            char *v = decode_value((const char *)raw, value_len, fs, fhdr2s[fi]);
-                            OUT("%s{\"key\":\"%s\",\"value\":%s}", printed ? "," : "", keybuf, v);
-                            free(v);
-                        }
-                        printed++;
-                    }
-                }
-
-                if (jrr) {
-                    for (int i = 0; i < njoins; i++) release_record_ref(&jrr[i]);
-                    free(jrr); free(jraws);
+            if(!matched)continue;
+            RecordRef *refs=NULL;int dropped=0;
+            size_t charge=(size_t)njoins*sizeof(*refs);
+            if(njoins){
+                if(charge>g_query_buffer_max_bytes){error=ENOBUFS;break;}
+                refs=calloc((size_t)njoins,sizeof(*refs));
+                if(!refs){error=ENOMEM;break;}
+                for(int i=0;i<njoins;i++){
+                    int found=resolve_join_record(&joins[i],db_root,fs->ts,raw,value_len,
+                        fhdr2s[fi],g_query_buffer_max_bytes-charge,&refs[i]);
+                    if(found<0){error=errno?errno:EILSEQ;break;}
+                    if(!found&&joins[i].type==JOIN_INNER){dropped=1;break;}
                 }
             }
+            if(!error&&!dropped&&++count>offset){
+                if(typed_query_emit_row(g_out?g_out:stdout,keybuf,strlen(keybuf),raw,value_len,
+                    fhdr2s[fi],fs,proj_fields,proj_count,rows_fmt,dict_fmt,csv_delim,
+                    printed>0,joins,njoins,refs,g_query_buffer_max_bytes-charge))
+                    error=errno?errno:EILSEQ;
+                else printed++;
+            }
+            if(refs){for(int i=0;i<njoins;i++)release_record_ref(&refs[i]);free(refs);}
+            if(error)break;
         }
     }
 
@@ -5173,8 +6329,60 @@ static int keyset_emit_find(const char *db_root, const char *object,
     free(hashes); free(key_to_fetch);
     free(fkeys); free(fklens); free(fvals); free(fvlens); free(fhdr2s); free(ffound);
 
+    if(error){errno=error;return -1;}
     return printed;
 }
+#endif
+
+#ifdef TEST_BUILD
+int keyset_emit_find_for_test(const char *eff_root, const char *object, KeySet *ks,
+        const char *criteria_json, const char *excluded_csv, int offset, int limit,
+        const char *format, const char *join_json, uint32_t timeout_ms,
+        int use_reference, FILE *out) {
+    if (!eff_root || !object || !ks || !out) { errno = EINVAL; return -1; }
+    FILE *saved = g_out;
+    g_out = out;                       /* setup errors printed via OUT land in `out`, not the TAP stream */
+    Schema sch = load_schema(eff_root, object);
+    FieldSchema fs;
+    init_field_schema(&fs, eff_root, object);
+    CriteriaNode *tree = NULL;
+    if (criteria_json) {
+        const char *perr = NULL;
+        char verr[256];
+        tree = parse_criteria_tree(criteria_json, &perr);
+        if (perr || !tree ||
+            validate_criteria_tree_fields(tree, fs.ts, verr, sizeof(verr)) < 0 ||
+            compile_criteria_tree_checked(tree, fs.ts, NULL, 0)) {
+            free_criteria_tree(tree); g_out = saved; errno = EINVAL; return -1;
+        }
+    }
+    JoinSpec *joins = NULL; int njoins = 0;
+    if (join_json && (parse_joins_json(join_json, &joins, &njoins) < 0 ||
+                      resolve_joins(joins, njoins, eff_root, object, &fs) < 0)) {
+        free_joins(joins, njoins); free_criteria_tree(tree); g_out = saved; errno = EINVAL; return -1;
+    }
+    ExcludedKeys excluded = parse_excluded_keys(excluded_csv);
+    int rows_fmt = format && strcmp(format, "rows") == 0;
+    int dict_fmt = format && strcmp(format, "dict") == 0;
+    char csv_delim = (format && strcmp(format, "csv") == 0) ? ',' : 0;
+    QueryDeadline dl = { now_ms_coarse(), timeout_ms, 0 };
+    if (objlock_rdlock(eff_root, object) != 0) {
+        free_excluded(&excluded); free_joins(joins, njoins); free_criteria_tree(tree);
+        g_out = saved; errno = ENOMEM; return -1;
+    }
+    int rc = use_reference
+        ? keyset_emit_find_reference(eff_root, object, &sch, ks, tree, &excluded, offset, limit,
+                                     NULL, 0, &fs, rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl)
+        : keyset_emit_find(eff_root, object, &sch, ks, tree, &excluded, offset, limit,
+                           NULL, 0, &fs, rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl);
+    int e = errno;
+    g_out = saved;
+    objlock_rdunlock(eff_root, object);
+    free_excluded(&excluded); free_joins(joins, njoins); free_criteria_tree(tree);
+    errno = e;
+    return rc;
+}
+#endif
 
 /* OR index-union find: build KeySet from indexed-OR children, then emit. */
 static int keyset_find_from_or(const char *db_root, const char *object,
@@ -5204,7 +6412,7 @@ static int keyset_find_from_or(const char *db_root, const char *object,
 
     KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl,
                                  out_budget_exceeded, target);
-    if (!ks) return 0;
+    if (!ks) return errno?-1:0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
     if (out_total) *out_total = keyset_size(ks);
@@ -5235,7 +6443,7 @@ static int keyset_find_from_intersect(const char *db_root, const char *object,
                                           (SearchCriterion **)fp->source_leaves,
                                           fp->n_source, dl,
                                           &small_primary);
-    if (!ks) return 0;
+    if (!ks) return errno?-1:0;
     /* Small primary OR partial intersect: pass the full tree so emit
        re-checks every leaf (including any bitmap/OR/non-rangeable child
        the planner kept out of the intersect) via criteria_match_tree.
@@ -5267,6 +6475,8 @@ typedef struct {
     QueryDeadline *dl;
     int            dl_counter;
     size_t         count;
+    int predicate_errors[MAX_SPLITS];
+    int num_shards;
 } OrCountCtx;
 
 static int or_count_batch_cb(const uint8_t hash16[16],
@@ -5276,22 +6486,61 @@ static int or_count_batch_cb(const uint8_t hash16[16],
     (void)hash16; (void)key; (void)klen;
     OrCountCtx *c = (OrCountCtx *)ctx_ptr;
     if (query_deadline_tick(c->dl, &c->dl_counter)) return 1;
-    if (criteria_match_tree((const uint8_t *)value, vlen, c->tree, c->fs, hdr2))
-        __sync_fetch_and_add(&c->count, 1);
+    int matched=0;
+    if(criteria_match_tree_checked(value,vlen,c->tree,c->fs,hdr2,&matched)){
+        c->predicate_errors[compute_record_shard(hash16,c->num_shards)]=errno?errno:EILSEQ;return 1;}
+    if(matched)__sync_fetch_and_add(&c->count,1);
     return 0;
 }
 
 /* Count records matching `tree` by iterating a KeySet built from the OR branch.
    For pure-OR trees (root IS the or_node), returns |KeySet| directly.
    For hybrid (AND + OR), re-matches each keyed record against the full tree. */
+/* Full-record count with the original compiled tree (recovery for
+ * bitmap candidate insertion-capacity exhaustion). Never a candidate route:
+ * every live record is fetched and matched against the complete tree.
+ * 0 = *out_count valid (dl->timed_out may still be set — callers keep their
+ * existing timeout rendering); -1 = real scan error in errno. */
+int count_full_record_checked(const char *db_root, const char *object,
+                              CriteriaNode *tree, FieldSchema *fs,
+                              const Schema *sch, QueryDeadline *dl,
+                              size_t *out_count) {
+    if (candidate_deadline_expired(dl)) { *out_count = 0; return 0; }
+    SlotcaskSchemaInfo info = {
+        .splits = sch->splits, .slot_size = sch->slot_size,
+        .streams = sch->streams,
+    };
+    SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
+    if (!sdb) { errno = EIO; return -1; }
+    int64_t match_count = 0;
+    /* fast_cc = NULL: the full tree decides every record. */
+    int status = scan_shards_v2_o_direct_match_checked(sdb, fs, NULL, tree,
+                                                       dl, &match_count);
+    if (status) { errno = EILSEQ; return -1; }
+    *out_count = (size_t)match_count;
+    return 0;
+}
+
 static size_t keyset_count_from_or(const char *db_root, const char *object,
                                    const Schema *sch, CriteriaNode *tree,
                                    CriteriaNode *or_node, FieldSchema *fs,
                                    QueryDeadline *dl, int *out_budget_exceeded) {
     /* Count needs the full union — no short-circuit. */
-    KeySet *ks = build_or_keyset(db_root, object, sch->splits, or_node, dl,
-                                 out_budget_exceeded, 0);
-    if (!ks) return 0;
+    CandidateBuildOut cb;
+    KeySet *ks = build_or_keyset_ck(db_root, object, sch->splits, or_node, dl,
+                                    out_budget_exceeded, 0, NULL, &cb);
+    if (!ks && cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+        /* One-shot whole-record recovery. */
+        size_t full = 0;
+        if (count_full_record_checked(db_root, object, tree, fs, sch, dl,
+                                      &full) != 0) {
+            if (!dl->timed_out) return SIZE_MAX;
+            return 0;
+        }
+        BMKS_STAT_FALLBACK("count");
+        return full;
+    }
+    if (!ks) return errno?SIZE_MAX:0;
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
     /* Every union count validates through the record fetch (which
@@ -5314,7 +6563,9 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
                 if (ks->state[b] != 2) continue;
                 RecordRef rr;
                 if (read_record_ref(db_root, object, sch, ks->keys[b], &rr) != 0) continue;
-                if (criteria_match_tree(rr.val, rr.vlen, tree, fs, rr.hdr2)) n++;
+                int matched=0;int status=criteria_match_tree_checked(rr.val,rr.vlen,tree,fs,rr.hdr2,&matched);
+                if(status){int error=errno;release_record_ref(&rr);keyset_free(ks);errno=error;return SIZE_MAX;}
+                if(matched)n++;
                 release_record_ref(&rr);
             }
             keyset_free(ks);
@@ -5342,6 +6593,7 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
         cb_ctx.tree = tree;
         cb_ctx.fs   = fs;
         cb_ctx.dl   = dl;
+        cb_ctx.num_shards=sdb->num_shards;
 
 #define CB_BATCH 1024
         size_t processed = 0;
@@ -5356,6 +6608,7 @@ static size_t keyset_count_from_or(const char *db_root, const char *object,
 
         free(hashes);
         keyset_free(ks);
+        for(int i=0;i<cb_ctx.num_shards;i++)if(cb_ctx.predicate_errors[i]){errno=cb_ctx.predicate_errors[i];return SIZE_MAX;}
         return cb_ctx.count;
     }
 }
@@ -5375,7 +6628,7 @@ void cmd_explain_tree(const char *db_root, const char *object, CriteriaNode *tre
             return;
         }
     }
-    if (tree) compile_criteria_tree(tree, fs.ts);
+    if(compile_criteria_tree_checked(tree,fs.ts,NULL,0)){OUT("{\"error\":\"invalid criteria value\"}\n");return;}
 
     int table_rows = get_live_count(db_root, object);
     FilterPlan fp = plan_filter(tree, db_root, object, &fs, sch.splits,
@@ -5553,39 +6806,17 @@ static int cas_tree_compiled(const CriteriaNode *n) {
 
 /* 1 match, 0 no match, -1 evaluation failure. Regex errors are never
    converted to absence or to a successful negated predicate. */
-int cas_match_tree_checked(const uint8_t *rec, size_t len,
-                            const CriteriaNode *n, FieldSchema *fs,
-                            uint8_t hdr2) {
-    if (!n) return 1;
-    if (n->kind != CNODE_LEAF) {
-        int is_and = n->kind == CNODE_AND;
-        for (int i = 0; i < n->n_children; i++) {
-            int r = cas_match_tree_checked(rec, len, n->children[i], fs, hdr2);
-            if (r < 0) return -1;
-            if (is_and && !r) return 0;
-            if (!is_and && r) return 1;
-        }
-        return is_and ? 1 : 0;
+int cas_match_tree_checked(const uint8_t *rec,size_t len,const CriteriaNode *n,FieldSchema *fs,uint8_t flags){
+    if(n&&n->kind==CNODE_LEAF&&n->compiled&&
+       (n->compiled->op==OP_REGEX||n->compiled->op==OP_NOT_REGEX)&&!n->compiled->re_compiled){errno=EINVAL;return -1;}
+    if(n&&n->kind!=CNODE_LEAF){
+        int is_and=n->kind==CNODE_AND;
+        for(int i=0;i<n->n_children;i++){int m=cas_match_tree_checked(rec,len,n->children[i],fs,flags);
+            if(m<0)return -1;
+            if((is_and&&!m)||(!is_and&&m))return m;}
+        return is_and;
     }
-    const CompiledCriterion *cc = n->compiled;
-    if (!cc) return -1;
-    if (cc->op != OP_REGEX && cc->op != OP_NOT_REGEX)
-        return criteria_match_tree(rec, len, n, fs, hdr2);
-    if (!cc->tf || cc->tf->type != FT_VARCHAR || !cc->re_compiled)
-        return -1;
-    const uint8_t *base, *bm; int bm_bytes; size_t region;
-    if (typed_record_view(rec, len, hdr2, &base, &bm, &bm_bytes, &region))
-        return -1;
-    int idx = (int)(cc->tf - fs->ts->fields);
-    if ((hdr2 & SREC_FLAG_NULLMAP) && typed_field_null(bm, bm_bytes, idx))
-        return 0;
-    const uint8_t *field =
-        (size_t)cc->tf->offset + (size_t)cc->tf->size > region
-            ? g_zero_field_65537 : base + cc->tf->offset;
-    regmatch_t pm = { .rm_so = 0, .rm_eo = varchar_eff_len(field, cc->tf->size) };
-    int rc = regexec(cc->re, (const char *)field + 2, 1, &pm, REG_STARTEND);
-    if (rc != 0 && rc != REG_NOMATCH) return -1;
-    return cc->op == OP_REGEX ? rc == 0 : rc == REG_NOMATCH;
+    int m=0;return criteria_match_tree_checked(rec,len,n,fs,flags,&m)?-1:m;
 }
 
 CriteriaNode *cas_prepare_tree(const char *json, TypedSchema *ts,
@@ -5626,8 +6857,7 @@ CriteriaNode *cas_prepare_tree(const char *json, TypedSchema *ts,
         if (err_buf && err_sz) snprintf(err_buf, err_sz, "empty criteria");
         return NULL;
     }
-    compile_criteria_tree(tree, ts);
-    if (!cas_tree_compiled(tree)) {
+    if (compile_criteria_tree_checked(tree,ts,err_buf,err_sz)||!cas_tree_compiled(tree)) {
         free_criteria_tree(tree);
         if (err_buf && err_sz) snprintf(err_buf, err_sz, "criteria compilation failed");
         return NULL;
@@ -5659,10 +6889,8 @@ static int guard_record(const uint8_t hash[16], const void *key, size_t klen,
     GuardProbe *g = ctx;
     (void)hash;
     if (guard_deadline(g)) return 1;
-    const uint8_t *base, *bm; int bm_bytes; size_t region;
-    if (typed_record_view(value, vlen, hdr2, &base, &bm, &bm_bytes, &region)) {
-        g->failed = 1; return 1;
-    }
+    TypedRowView view;
+    if(typed_row_open(g->fs->ts,value,vlen,hdr2,&view)){g->failed=1;return 1;}
     if (g->key && klen == g->klen && !memcmp(key, g->key, klen)) return 0;
     int matched = cas_match_tree_checked(value, vlen, g->tree, g->fs, hdr2);
     if (matched < 0) { g->failed = 1; return 1; }
@@ -5687,6 +6915,12 @@ static int guard_eq_key(const CriteriaNode *n, uint8_t out[1032], size_t *len) {
     const CompiledCriterion *cc = n->compiled;
     const TypedField *f = cc->tf;
     out[0] = 0;
+    if(f->type==FT_NUMERIC){
+        if(!search_criterion_indexable(cc->schema,&n->leaf))return 0;
+        size_t width=0;int field=(int)(f-cc->schema->fields);
+        if(typed_index_text_key_into(cc->schema,(size_t)field,search_criterion_value(&n->leaf),search_criterion_value_len(&n->leaf),out+1,1031,&width)!=1)return 0;
+        *len=width+1;return 1;
+    }
     if (f->type == FT_VARCHAR) {
         if (cc->s1_len > 1031 || cc->s1_len > (size_t)f->size - 2) return 0;
         memcpy(out + 1, cc->s1, cc->s1_len);
@@ -5847,6 +7081,15 @@ int cas_guard_request(const char *db_root, const char *object,
     return 0;
 }
 
+
+/* Checked idx_count_for_leaf: bitmap/trigram candidate build reasons are
+ * visible to the caller so insertion-capacity can recover without
+ * masquerading as a hard error. */
+size_t idx_count_for_leaf_ck(const char *db_root, const char *object,
+                             const Schema *sch, const FieldSchema *fs,
+                             SearchCriterion *leaf, QueryDeadline *dl,
+                             CandidateBuildOut *out);
+
 static int cmd_count_with_tree(const char *db_root, const char *object,
                                 CriteriaNode *tree) {
     Schema sch = load_schema(db_root, object);
@@ -5860,7 +7103,7 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
             return 1;
         }
     }
-    compile_criteria_tree(tree, fs.ts);
+    if(compile_criteria_tree_checked(tree,fs.ts,NULL,0)){OUT("{\"error\":\"invalid criteria value\"}\n");return 1;}
 
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
@@ -5891,10 +7134,24 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
         const TypedField *pc_tf = resolve_idx_field(fs.ts, pc->field);
 
         if (is_single_leaf) {
-            size_t count = idx_count_for_leaf(db_root, object, &sch,
-                                              &fs, pc, &dl);
+            CandidateBuildOut cb;
+            size_t count = idx_count_for_leaf_ck(db_root, object, &sch,
+                                                 &fs, pc, &dl, &cb);
+            if ((cb.reason == CBF_INSERT_CAPACITY ||
+             (cb.reason == CBF_BUDGET && cb.saved_errno == 0)) &&
+            !candidate_deadline_expired(&dl)) {
+                /* One-shot whole-record recovery. */
+                if (count_full_record_checked(db_root, object, tree, &fs,
+                                              &sch, &dl, &count) != 0 &&
+                    !dl.timed_out) {
+                    OUT("{\"error\":\"invalid typed record\"}\n");
+                    return -1;
+                }
+                BMKS_STAT_FALLBACK("count");
+            }
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-            else OUT("%zu\n", count);
+            else if(count==SIZE_MAX)OUT("{\"error\":\"invalid typed record\"}\n");
+                    else OUT("%zu\n", count);
         } else {
             int picked = pick_index_for_leaf(db_root, object, pc);
             if (picked == IT_TRIGRAM) {
@@ -5906,8 +7163,9 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
                     keyset_to_collected_hashes(tg_ks, sch.splits, &entries, &n);
                     size_t count = parallel_indexed_count(db_root, object, &sch,
                                                           entries, (int)n,
-                                                          tree, &fs, &dl, &fp, 1);
+                                                          tree, &fs, &dl, &fp);
                     if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                    else if(count==SIZE_MAX)OUT("{\"error\":\"invalid typed record\"}\n");
                     else OUT("%zu\n", count);
                     free(entries);
                     keyset_free(tg_ks);
@@ -5924,8 +7182,8 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
             cc.check_primary = check_primary;
             cc.deadline = &dl;
             cc.tf = pc_tf;
-            btree_dispatch(db_root, object, pc->field, sch.splits,
-                           pc, pc_tf, collect_hash_cb, &cc);
+            if(btree_dispatch_checked(db_root, object, pc->field, sch.splits,
+                           pc, pc_tf, collect_hash_cb, &cc)<0){collect_ctx_destroy(&cc);OUT("{\"error\":\"invalid index criterion\"}\n");return -1;}
 
             if (cc.budget_exceeded) {
                 LOG_WARN(LOG_SUB_QUERY, "cmd_count: query buffer cap exceeded");
@@ -5935,9 +7193,10 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
             }
             size_t count = parallel_indexed_count(db_root, object, &sch,
                                                   cc.entries, (int)cc.count,
-                                                  tree, &fs, &dl, &fp, 0);
+                                                  tree, &fs, &dl, &fp);
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-            else OUT("%zu\n", count);
+            else if(count==SIZE_MAX)OUT("{\"error\":\"invalid typed record\"}\n");
+                    else OUT("%zu\n", count);
             collect_ctx_destroy(&cc);
         }
     } else if (fp.kind == FP_INTERSECT) {
@@ -5946,11 +7205,34 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
            record fetch revalidates at the Kf reader. The KeySet is a
            candidate producer, never the answer. */
         int small_primary = 0;
-        KeySet *result = intersect_indexed_leaves(db_root, object, sch.splits,
-                                                  fp.source_leaves, fp.n_source,
-                                                  &dl, &small_primary);
-        if (!result) {
+        CandidateBuildOut cb;
+        KeySet *result = intersect_indexed_leaves_ck(db_root, object, sch.splits,
+                                                     fp.source_leaves, fp.n_source,
+                                                     &dl, &small_primary, NULL, &cb);
+        if (!result && (cb.reason == CBF_INSERT_CAPACITY ||
+                        (cb.reason == CBF_BUDGET && cb.saved_errno == 0)) &&
+            !candidate_deadline_expired(&dl)) {
+            /* One-shot whole-record recovery: never zero for
+               capacity failure. */
+            size_t full = 0;
+            if (count_full_record_checked(db_root, object, tree, &fs, &sch,
+                                          &dl, &full) != 0) {
+                if (!dl.timed_out) {
+                    OUT("{\"error\":\"invalid typed record\"}\n");
+                    return -1;
+                }
+                OUT("{\"error\":\"query_timeout\"}\n");
+                return 0;
+            }
+            if (cb.reason == CBF_INSERT_CAPACITY)
+                BMKS_STAT_FALLBACK("count");
             if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            else OUT("%zu\n", full);
+            return 0;
+        }
+        if (!result) {
+            if(errno)OUT("{\"error\":\"index candidate construction failed\"}\n");
+            else if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("0\n");
         } else {
             CollectedHash *batch = NULL;
@@ -5960,9 +7242,10 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
             if (rc != 0 || batch_count == 0) { free(batch); OUT("0\n"); }
             else {
                 size_t n = parallel_indexed_count(db_root, object, &sch, batch,
-                                                  (int)batch_count, tree, &fs, &dl, &fp, 0);
+                                                  (int)batch_count, tree, &fs, &dl, &fp);
                 free(batch);
                 if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+                else if(n==SIZE_MAX)OUT("{\"error\":\"invalid typed record\"}\n");
                 else OUT("%zu\n", n);
             }
         }
@@ -5972,7 +7255,8 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
                                             &fs, &dl, &budget_exceeded);
         if (budget_exceeded) OUT(QUERY_BUFFER_ERR);
         else if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
-        else OUT("%zu\n", count);
+        else if(count==SIZE_MAX)OUT("{\"error\":\"invalid typed record\"}\n");
+                    else OUT("%zu\n", count);
     } else {
         const CompiledCriterion *fast_cc = NULL;
         if (tree) {
@@ -5989,10 +7273,11 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
         SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
         if (sdb) {
             int64_t match_count = 0;
-            scan_shards_v2_o_direct_match(sdb, &fs, fast_cc,
+            int match_status=scan_shards_v2_o_direct_match_checked(sdb, &fs, fast_cc,
                                             fast_cc ? NULL : tree,
                                             &dl, &match_count);
-            if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
+            if(match_status)OUT("{\"error\":\"invalid typed record\"}\n");
+            else if (dl.timed_out) OUT("{\"error\":\"query_timeout\"}\n");
             else OUT("%lld\n", (long long)match_count);
         } else {
             OUT("{\"error\":\"object not open\"}\n");
@@ -6050,9 +7335,11 @@ int cmd_count_tree(const char *db_root, const char *object, CriteriaNode *tree) 
      IT_TRIGRAM  → trigram KeySet + parallel_indexed_count
      IT_BITMAP   → bm_popcount_for_crit / bm_popcount_generic_for_crit
      IT_BTREE    → btree_dispatch + idx_count_cb  */
-size_t idx_count_for_leaf(const char *db_root, const char *object,
-                          const Schema *sch, const FieldSchema *fs,
-                          SearchCriterion *leaf, QueryDeadline *dl) {
+size_t idx_count_for_leaf_ck(const char *db_root, const char *object,
+                             const Schema *sch, const FieldSchema *fs,
+                             SearchCriterion *leaf, QueryDeadline *dl,
+                             CandidateBuildOut *out) {
+    cb_out_init(out);
     int picked = pick_index_for_leaf(db_root, object, leaf);
     const TypedField *tf = resolve_idx_field(fs->ts, leaf->field);
 
@@ -6065,7 +7352,7 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
        the array pointer itself (not just inner buffers), so it must be
        paired with calloc, never a stack variable. */
     CompiledCriterion *cc = calloc(1, sizeof(CompiledCriterion));
-    compile_one(cc, leaf, fs->ts);
+    if(!cc||compile_one_checked(cc,leaf,fs->ts,NULL,0)){free_compiled_criteria(cc,1);return SIZE_MAX;}
     CriteriaNode leaf_node = { .kind = CNODE_LEAF, .leaf = *leaf,
                                .compiled = cc,
                                .children = NULL, .n_children = 0 };
@@ -6077,17 +7364,51 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
            candidate at the Kf reader — the raw popcount success paths
            are gone. */
         KeySet *ks = (picked == IT_TRIGRAM)
-            ? build_keyset_from_trigram(db_root, object, sch->splits, leaf, dl)
-            : build_keyset_from_bitmap(db_root, object, sch->splits, leaf, tf, dl);
+            ? build_keyset_from_trigram_b(db_root, object, sch->splits, leaf, dl,
+                                          NULL, out)
+            : build_keyset_from_bitmap(db_root, object, sch->splits, leaf, tf, dl,fs->ts,NULL,out);
         if (ks) {
             CollectedHash *entries = NULL;
             size_t n = 0;
             keyset_to_collected_hashes(ks, sch->splits, &entries, &n);
             cnt = parallel_indexed_count(db_root, object, sch,
                                          entries, (int)n,
-                                         &leaf_node, (FieldSchema *)fs, dl, NULL, 1);
+                                         &leaf_node, (FieldSchema *)fs, dl, NULL);
             free(entries);
             keyset_free(ks);
+        } else {
+            if ((out->reason == CBF_INSERT_CAPACITY ||
+                 (out->reason == CBF_BUDGET && out->saved_errno == 0)) &&
+                !candidate_deadline_expired(dl)) {
+                /* Candidate set overflowed after concurrent growth:
+                   recover once from the full record scan with the original
+                   tree and deadline. */
+                size_t full = 0;
+                if (count_full_record_checked(db_root, object, &leaf_node,
+                                              (FieldSchema *)fs, sch, dl,
+                                              &full) != 0) {
+                    int saved = errno;
+                    free_compiled_criteria(cc, 1);
+                    errno = saved;
+                    out->reason = dl->timed_out ? CBF_TIMEOUT : CBF_HARD;
+                    out->saved_errno = saved;
+                    if (!dl->timed_out) return SIZE_MAX;
+                    return 0;   /* timeout: caller renders it */
+                }
+                if (out->reason == CBF_INSERT_CAPACITY)
+                    BMKS_STAT_FALLBACK("count");
+                cb_out_init(out);
+                free_compiled_criteria(cc, 1);
+                return full;
+            }
+            if (out->reason == CBF_HARD) {
+                int saved = out->saved_errno;
+                free_compiled_criteria(cc, 1);
+                errno = saved;
+                return SIZE_MAX;
+            }
+            /* budget / deliberate empty keep their historical behavior */
+            errno = 0;
         }
         free_compiled_criteria(cc, 1);
         return cnt;
@@ -6103,8 +7424,8 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
         col.check_primary = op_needs_check_primary(leaf->op);
         col.deadline = dl;
         col.tf = tf;
-        btree_dispatch(db_root, object, leaf->field, sch->splits,
-                       leaf, tf, collect_hash_cb, &col);
+        if(btree_dispatch_schema_checked(fs?fs->ts:NULL,db_root, object, leaf->field, sch->splits,
+                       leaf, tf, collect_hash_cb, &col)<0){collect_ctx_destroy(&col);free_compiled_criteria(cc,1);return SIZE_MAX;}
         if (col.budget_exceeded) {
             collect_ctx_destroy(&col);
             free_compiled_criteria(cc, 1);
@@ -6112,11 +7433,20 @@ size_t idx_count_for_leaf(const char *db_root, const char *object,
         }
         cnt = parallel_indexed_count(db_root, object, sch,
                                      col.entries, (int)col.count,
-                                     &leaf_node, (FieldSchema *)fs, dl, NULL, 1);
+                                     &leaf_node, (FieldSchema *)fs, dl, NULL);
         collect_ctx_destroy(&col);
     }
     free_compiled_criteria(cc, 1);
     return cnt;
+}
+
+size_t idx_count_for_leaf(const char *db_root, const char *object,
+                          const Schema *sch, const FieldSchema *fs,
+                          SearchCriterion *leaf, QueryDeadline *dl) {
+    CandidateBuildOut o;
+    size_t n = idx_count_for_leaf_ck(db_root, object, sch, fs, leaf, dl, &o);
+    if (n == SIZE_MAX && o.reason != CBF_HARD) errno = 0;
+    return n;
 }
 
 /* find <object> <criteria_json> [offset] [limit] [fields]
@@ -6140,6 +7470,7 @@ typedef struct {
 
 typedef struct {
     int           n;
+    const TypedSchema *schema;
     OrderSpecPart parts[MAX_ORDER_FIELDS];
 } OrderSpec;
 
@@ -6208,6 +7539,7 @@ static int order_spec_resolve(const FieldSchema *fs,
                               OrderSpec *out,
                               const char **err) {
     memset(out, 0, sizeof(*out));
+    out->schema=fs?fs->ts:NULL;
     if (order_by_split(order_by_csv, out->parts,
                        &out->n, err) != 0) return -1;
     for (int i = 0; i < out->n; i++)
@@ -6248,9 +7580,12 @@ static void order_spec_composite_name(const OrderSpec *os,
 }
 
 /* 1 = every non-final part has a fixed-width index encoding. */
-static int order_spec_nonfinal_fixed(const OrderSpec *os) {
-    for (int i = 0; i + 1 < os->n; i++)
-        if (os->parts[i].tf && os->parts[i].tf->type == FT_VARCHAR) return 0;
+static int order_spec_nonfinal_fixed(const OrderSpec *os){
+    for(int i=0;i+1<os->n;i++){
+        size_t width=0;
+        if(!os->schema||os->parts[i].idx<0||
+           typed_index_fixed_width(os->schema,(size_t)os->parts[i].idx,&width)!=1)return 0;
+    }
     return 1;
 }
 
@@ -6317,6 +7652,7 @@ typedef struct {
        which set the flag under oc->lock. */
     _Atomic int budget_exceeded;
     pthread_mutex_t lock;
+    int predicate_error;
 } OrderedCollectCtx;
 
 /* §2.7: typed_field_to_index_key expects the field-region base; record
@@ -6327,35 +7663,6 @@ typedef struct {
    for values, the bare [0x01] byte for NULL — byte-identical to what the
    btree stores, so buffered-sort keys interoperate with the cursor
    resume compare and NULL rows order past values exactly like the index. */
-static void typed_field_to_index_key_rec(const TypedSchema *ts,
-                                         const uint8_t *record,
-                                         size_t record_len, uint8_t hdr2,
-                                         int field_idx,
-                                         uint8_t *out, size_t *out_len) {
-    const uint8_t *fbase = record;
-    size_t region = record_len;
-    const uint8_t *bm = NULL;
-    int bm_bytes = 0;
-    if (hdr2) {
-        if (typed_record_view(record, record_len, hdr2, &fbase, &bm,
-                              &bm_bytes, &region) != 0) {
-            *out_len = 0;
-            return;
-        }
-    }
-    if ((hdr2 & SREC_FLAG_NULLMAP) && field_idx >= 0 &&
-        typed_field_null(bm, bm_bytes, field_idx)) {
-        out[0] = 0x01;
-        *out_len = 1;
-        return;
-    }
-    out[0] = 0x00;
-    size_t blen = 0;
-    typed_field_to_index_key(ts, fbase, region, field_idx,
-                             out + 1, &blen);
-    *out_len = blen + 1;
-}
-
 static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void *ctx) {
     OrderedCollectCtx *oc = (OrderedCollectCtx *)ctx;
     /* coverity[lock_evasion] coverity[missing_lock] intentional fast-skip —
@@ -6377,86 +7684,74 @@ static int ordered_collect_cb(const SlotHeader *hdr, const uint8_t *block, void 
     if (is_excluded(oc->excluded, keybuf)) return 0;
 
     const uint8_t *raw = block + hdr->key_len;
-    if (!criteria_match_tree(raw, hdr->value_len, oc->tree, oc->fs, (uint8_t)(hdr->flag >> 8))) return 0;
+    int matched=0;
+    if(criteria_match_tree_checked(raw,hdr->value_len,oc->tree,oc->fs,(uint8_t)(hdr->flag>>8),&matched)){
+        int error=errno?errno:EILSEQ;pthread_mutex_lock(&oc->lock);oc->predicate_error=error;pthread_mutex_unlock(&oc->lock);return 1;}
+    if(!matched)return 0;
 
-    /* Extract per-part sort keys (see RowSortKey: typed parts use their
-       index-key encoding, the legacy untyped single field its decoded
-       string). */
-    RowSortKey sv[MAX_ORDER_FIELDS];
-    size_t sv_bytes = 0;
-    for (int i = 0; i < MAX_ORDER_FIELDS; i++) {
-        sv[i].key = NULL; sv[i].key_len = 0;
-        sv[i].str = NULL; sv[i].dir = 0;
-    }
-    for (int i = 0; i < oc->nsort; i++) {
-        const OrderSpecPart *p = &oc->ospec->parts[i];
-        sv[i].dir = p->dir;
-        if (oc->fs && oc->fs->ts && p->idx >= 0 && p->tf) {
-            size_t cap = (size_t)p->tf->size > 16 ? (size_t)p->tf->size : 16;
-            sv[i].key = malloc(cap);
-            if (sv[i].key) {
-                typed_field_to_index_key_rec(oc->fs->ts, raw,
-                                             (size_t)hdr->value_len,
-                                             (uint8_t)(hdr->flag >> 8), p->idx,
-                                             sv[i].key, &sv[i].key_len);
-                /* A zero-length key is valid — an empty varchar encodes to
-                   no content bytes — and must compare against non-empty
-                   values, never collapse to the legacy-string path. */
-                sv_bytes += sv[i].key_len;
-            }
-        } else if (i == 0) {
-            /* legacy single-field fallback (untyped/unknown name) */
-            sv[0].str = decode_field((const char *)raw, hdr->value_len,
-                                     oc->order_field_name, oc->fs,
-                                     (uint8_t)(hdr->flag >> 8));
-            if (sv[0].str) sv_bytes += strlen(sv[0].str) + 1;
+    RowSortKey sv[MAX_ORDER_FIELDS]={0};size_t key_needs[MAX_ORDER_FIELDS]={0};
+    size_t rec_len=(size_t)hdr->key_len+hdr->value_len;
+    size_t row_bytes=(size_t)hdr->key_len+1+rec_len;
+    for(int i=0;i<oc->nsort;i++){
+        const OrderSpecPart *part=&oc->ospec->parts[i];sv[i].dir=part->dir;
+        if(oc->fs&&oc->fs->ts&&part->idx>=0&&part->tf){
+            if(typed_index_field_key_into(oc->fs->ts,(size_t)part->idx,raw,
+                hdr->value_len,(uint8_t)(hdr->flag>>8),NULL,0,&key_needs[i])!=1)goto key_error;
+            if(key_needs[i]>g_query_buffer_max_bytes-row_bytes){errno=ENOBUFS;goto key_error;}
+            row_bytes+=key_needs[i];
+        }else if(i==0){
+            sv[i].str=decode_field((const char*)raw,hdr->value_len,
+                    oc->order_field_name,oc->fs,(uint8_t)(hdr->flag>>8));
+            if(!sv[i].str){errno=ENOMEM;goto key_error;}
+            size_t n=strlen(sv[i].str)+1;
+            if(n>g_query_buffer_max_bytes-row_bytes){errno=ENOBUFS;goto key_error;}
+            row_bytes+=n;
         }
     }
-
-    size_t rec_len = (size_t)hdr->key_len + (size_t)hdr->value_len;
-    size_t row_bytes = sizeof(OrderedRow) + hdr->key_len + rec_len + sv_bytes;
-
+    /* Existing collect lock serializes admission and ownership. Measure
+       actual keys first; charge allocated row capacity, not only row count. */
     pthread_mutex_lock(&oc->lock);
-    if (oc->buffer_bytes + row_bytes > g_query_buffer_max_bytes) {
-        oc->budget_exceeded = 1;
-        pthread_mutex_unlock(&oc->lock);
-        row_sort_keys_release(sv);
-        return 1;  /* stop scan */
+    size_t new_cap=oc->cap;
+    if(oc->count>=new_cap)new_cap=new_cap?new_cap*2:256;
+    size_t growth=(new_cap-oc->cap)*sizeof(OrderedRow);
+    if(oc->buffer_bytes>g_query_buffer_max_bytes||
+       growth>g_query_buffer_max_bytes-oc->buffer_bytes||
+       row_bytes>g_query_buffer_max_bytes-oc->buffer_bytes-growth){
+        oc->budget_exceeded=1;pthread_mutex_unlock(&oc->lock);
+        row_sort_keys_release(sv);return 1;
     }
-    oc->buffer_bytes += row_bytes;
-    if (oc->count >= oc->cap) {
-        int new_cap = oc->cap ? oc->cap * 2 : 256;
-        OrderedRow *t = xrealloc_or_free(oc->rows, (size_t)new_cap * sizeof(OrderedRow));
-        if (!t) {
-            oc->rows = NULL;
-            oc->count = 0;
-            oc->cap = 0;
-            oc->budget_exceeded = 1;
-            pthread_mutex_unlock(&oc->lock);
-            row_sort_keys_release(sv);
-            return 1;
-        }
-        oc->rows = t;
-        oc->cap = new_cap;
+    if(new_cap!=oc->cap){
+        OrderedRow *rows=realloc(oc->rows,new_cap*sizeof(*rows));
+        if(!rows){oc->predicate_error=ENOMEM;pthread_mutex_unlock(&oc->lock);row_sort_keys_release(sv);return 1;}
+        oc->rows=rows;oc->cap=new_cap;oc->buffer_bytes+=growth;
     }
-    OrderedRow *r = &oc->rows[oc->count++];
-    r->key_len = hdr->key_len;
-    r->key = malloc(hdr->key_len + 1);
-    memcpy(r->key, block, hdr->key_len);
-    r->key[hdr->key_len] = '\0';
-    r->value_len = hdr->value_len;
-    r->hdr2 = (uint8_t)(hdr->flag >> 8);   /* emit re-decodes with it */
-    r->record = malloc(rec_len);
-    memcpy(r->record, block, rec_len);
-    r->nsort = oc->nsort;
-    for (int i = 0; i < MAX_ORDER_FIELDS; i++) {
-        r->keys[i].key = sv[i].key;
-        r->keys[i].key_len = sv[i].key_len;
-        r->keys[i].str = sv[i].str;
-        r->keys[i].dir = sv[i].dir;
+    OrderedRow candidate={0};
+    candidate.key=malloc((size_t)hdr->key_len+1);candidate.record=malloc(rec_len?rec_len:1);
+    if(!candidate.key||!candidate.record){
+        free(candidate.key);free(candidate.record);oc->predicate_error=ENOMEM;
+        pthread_mutex_unlock(&oc->lock);row_sort_keys_release(sv);return 1;
     }
-    pthread_mutex_unlock(&oc->lock);
-    return 0;
+    for(int i=0;i<oc->nsort;i++)if(key_needs[i]){
+        sv[i].key=malloc(key_needs[i]);
+        if(!sv[i].key){errno=ENOMEM;goto locked_error;}
+        if(typed_index_field_key_into(oc->fs->ts,(size_t)oc->ospec->parts[i].idx,
+             raw,hdr->value_len,(uint8_t)(hdr->flag>>8),sv[i].key,
+             key_needs[i],&sv[i].key_len)!=1)goto locked_error;
+    }
+    memcpy(candidate.key,block,hdr->key_len);candidate.key[hdr->key_len]=0;
+    memcpy(candidate.record,block,rec_len);candidate.key_len=hdr->key_len;
+    candidate.value_len=hdr->value_len;candidate.hdr2=(uint8_t)(hdr->flag>>8);
+    candidate.nsort=oc->nsort;memcpy(candidate.keys,sv,sizeof(sv));
+    oc->rows[oc->count++]=candidate;oc->buffer_bytes+=row_bytes;
+    pthread_mutex_unlock(&oc->lock);return 0;
+ locked_error:
+    oc->predicate_error=errno?errno:EILSEQ;free(candidate.key);free(candidate.record);
+    pthread_mutex_unlock(&oc->lock);row_sort_keys_release(sv);return 1;
+ key_error:{
+    int error=errno?errno:EILSEQ;row_sort_keys_release(sv);
+    pthread_mutex_lock(&oc->lock);oc->predicate_error=error;
+    pthread_mutex_unlock(&oc->lock);return 1;
+ }
 }
 
 static int cmp_row_asc(const void *a, const void *b) {
@@ -6505,10 +7800,10 @@ static int cmp_row_asc(const void *a, const void *b) {
 typedef struct {
     int    present;
     int    nparts;
-    struct { char value[1024]; size_t vlen; } part[MAX_ORDER_FIELDS];
+    struct { char *value; size_t vlen; } part[MAX_ORDER_FIELDS];
     int    part_tier[MAX_ORDER_FIELDS]; /* §2.5: per-field tier byte (v2 tokens) */
     int    version;                     /* 1 = legacy (all tiers 0), 2 = tiered */
-    char   key[1024];        /* primary key string */
+    char   key[1100];        /* primary key wire string */
     size_t klen;
 } FindCursor;
 
@@ -6520,6 +7815,9 @@ typedef struct {
    -1                     — malformed cursor content (error message in *err)
    1                      — cursor key entirely absent (not a cursor query;
                            caller uses the regular find path) */
+static void find_cursor_release(FindCursor *cur){
+    for(int i=0;i<MAX_ORDER_FIELDS;i++){free(cur->part[i].value);cur->part[i].value=NULL;}
+}
 static int parse_cursor_object(const char *cursor_json, const char *order_by,
                                FindCursor *out, const char **err) {
     out->present = 0;
@@ -6576,12 +7874,12 @@ static int parse_cursor_object(const char *cursor_json, const char *order_by,
         char *vv = json_obj_strdup(&c, names[i].name);
         if (!vv) { *err = "cursor missing order_by field value"; return -1; }
         size_t vlen = strlen(vv);
-        if (vlen >= sizeof(out->part[i].value)) {
-            free(vv); *err = "cursor value too long"; return -1;
+        size_t used=0;
+        for(int j=0;j<i;j++)used+=out->part[j].vlen+1;
+        if(vlen>=g_query_buffer_max_bytes||used>g_query_buffer_max_bytes-vlen-1){
+            free(vv);*err="cursor value exceeds query buffer";errno=ENOBUFS;return -1;
         }
-        memcpy(out->part[i].value, vv, vlen + 1);
-        out->part[i].vlen = vlen;
-        free(vv);
+        out->part[i].value=vv;out->part[i].vlen=vlen;
     }
     out->nparts = nparts;
     if (out->version == 2) {
@@ -6686,7 +7984,53 @@ typedef struct {
        set g_out = parent_out unconditionally at entry so OUT() writes
        reach THIS request's socket. */
     FILE          *parent_out;
+    int predicate_error;
 } CursorFindCtx;
+
+static int cursor_capture(CursorFindCtx *c,const uint8_t *raw,size_t len,
+ uint8_t flags,const char *wire,size_t wirelen){
+    if(!c->ospec)return 0;
+    char *values[MAX_ORDER_FIELDS]={0};int tiers[MAX_ORDER_FIELDS]={0};
+    size_t bytes=wirelen+1;
+    if(c->last_key_str)bytes+=strlen(c->last_key_str)+1;
+    for(int i=0;i<MAX_ORDER_FIELDS;i++)if(c->last_value[i])bytes+=strlen(c->last_value[i])+1;
+    if(bytes>g_query_buffer_max_bytes){errno=ENOBUFS;return -1;}
+    char *key=NULL;TypedRowView view;
+    if(!c->fs||!c->fs->ts||typed_row_open(c->fs->ts,raw,len,flags,&view))return -1;
+    for(int i=0;i<c->ospec->n;i++){
+        size_t field=(size_t)c->ospec->parts[i].idx;TypedRowSpan span;
+        if(typed_row_span(&view,field,&span))goto failed;
+        tiers[i]=span.is_null;if(span.is_null)continue;
+        char *text=NULL;size_t n=0;
+        int present=typed_query_named_text(c->fs->ts,raw,len,flags,
+            c->fs->ts->fields[field].name,g_query_buffer_max_bytes-bytes,&text,&n);
+        if(present!=1){if(!errno)errno=EILSEQ;goto failed;}
+        size_t escaped=0;
+        for(size_t j=0;j<n;j++){
+            unsigned char ch=(unsigned char)text[j];
+            size_t add=(ch=='"'||ch=='\\'||ch=='\b'||ch=='\f'||ch=='\n'||ch=='\r'||ch=='\t')?2:ch<32?6:1;
+            if(add>g_query_buffer_max_bytes-escaped){free(text);errno=ENOBUFS;goto failed;}
+            escaped+=add;
+        }
+        /* Both temporary plain text and escaped token are owned together. */
+        if(bytes>g_query_buffer_max_bytes||n+1>g_query_buffer_max_bytes-bytes||
+           escaped+1>g_query_buffer_max_bytes-bytes-(n+1)){
+            free(text);errno=ENOBUFS;goto failed;
+        }
+        values[i]=malloc(escaped+1);
+        if(!values[i]){free(text);errno=ENOMEM;goto failed;}
+        int written=json_escape_into(values[i],escaped,text,n);free(text);
+        if(written<0){errno=EILSEQ;goto failed;}
+        values[i][written]=0;bytes+=escaped+1;
+    }
+    key=malloc(wirelen+1);if(!key){errno=ENOMEM;goto failed;}
+    memcpy(key,wire,wirelen);key[wirelen]=0;
+    for(int i=0;i<MAX_ORDER_FIELDS;i++){
+        free(c->last_value[i]);c->last_value[i]=values[i];c->last_tiers[i]=tiers[i];
+    }
+    free(c->last_key_str);c->last_key_str=key;return 0;
+ failed:{int error=errno?errno:EILSEQ;for(int i=0;i<MAX_ORDER_FIELDS;i++)free(values[i]);free(key);errno=error;return -1;}
+}
 
 static int cursor_find_cb(const char *val, size_t vlen,
                           const uint8_t *hash16,
@@ -6772,10 +8116,10 @@ static int cursor_find_cb(const char *val, size_t vlen,
        stays correct because the btree walk only visits entries that would
        pass a range/eq on the indexed field, and range checks in the tree
        agree with the range in the walk. */
-    if (c->remaining && !criteria_match_tree(raw, value_len, c->remaining, c->fs, rr.hdr2)) {
-        release_record_ref(&rr);
-        return 0;
-    }
+    int matched=0;
+    if(criteria_match_tree_checked(raw,value_len,c->remaining,c->fs,rr.hdr2,&matched)){
+        c->predicate_error=errno?errno:EILSEQ;release_record_ref(&rr);return -1;}
+    if(!matched){release_record_ref(&rr);return 0;}
 
     /* Skip-after-match: criteria matched but we're still inside the offset
        window. Release and decrement; the next match emits. */
@@ -6791,94 +8135,14 @@ static int cursor_find_cb(const char *val, size_t vlen,
     format_query_wire_key(c->fs, key_start, rr.klen, key_buf);
     size_t klen = strlen(key_buf);
 
-    if (c->rows_fmt) {
-        OUT("%s[\"%s\"", c->printed ? "," : "", key_buf);
-        if (c->proj_count > 0) {
-            for (int i = 0; i < c->proj_count; i++) {
-                char *pv = json_projected_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs, rr.hdr2);
-                OUT(",%s", pv ? pv : "\"\"");
-                free(pv);
-            }
-        } else if (c->fs && c->fs->ts) {
-            for (int i = 0; i < c->fs->ts->nfields; i++) {
-                if (c->fs->ts->fields[i].removed) continue;
-                char *pv = json_typed_row_cell(c->fs->ts, raw,
-                                               (int)value_len, i, rr.hdr2);
-                OUT(",%s", pv ? pv : "\"\"");
-                free(pv);
-            }
-        }
-        OUT("]");
-    } else if (c->dict_fmt) {
-        OUT("%s\"%s\":", c->printed ? "," : "", key_buf);
-        if (c->proj_count > 0) {
-            OUT("{");
-            int first = 1;
-            for (int i = 0; i < c->proj_count; i++) {
-                char *pv = json_projected_field((const char *)raw, value_len,
-                                        c->proj_fields[i], c->fs, rr.hdr2);
-                if (!pv) continue;
-                OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
-                first = 0;
-                free(pv);
-            }
-            OUT("}");
-        } else {
-            char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
-            OUT("%s", dv ? dv : "{}");
-            free(dv);
-        }
-    } else if (c->proj_count > 0) {
-        OUT("%s{\"key\":\"%s\",\"value\":{", c->printed ? "," : "", key_buf);
-        int first = 1;
-        for (int i = 0; i < c->proj_count; i++) {
-            char *pv = json_projected_field((const char *)raw, value_len,
-                                    c->proj_fields[i], c->fs, rr.hdr2);
-            if (!pv) continue;
-            OUT("%s\"%s\":%s", first ? "" : ",", c->proj_fields[i], pv);
-            first = 0;
-            free(pv);
-        }
-        OUT("}}");
-    } else {
-        char *dv = decode_value((const char *)raw, value_len, c->fs, rr.hdr2);
-        OUT("%s{\"key\":\"%s\",\"value\":%s}",
-            c->printed ? "," : "", key_buf, dv ? dv : "{}");
-        free(dv);
+    if(cursor_capture(c,raw,value_len,rr.hdr2,key_buf,klen)){
+        c->predicate_error=errno?errno:EILSEQ;release_record_ref(&rr);return -1;
     }
-
-    /* Capture this row's (order_by_value, key) as the next-page cursor. Each
-       emit overwrites, so after the walk the stored pair is the last row
-       emitted — which is exactly what we send back. */
-    for (int i = 0; i < MAX_ORDER_FIELDS; i++) {
-        free(c->last_value[i]);
-        c->last_value[i] = NULL;
+    if(typed_query_emit_row(c->parent_out,key_buf,klen,raw,value_len,rr.hdr2,c->fs,
+         c->proj_fields,c->proj_count,c->rows_fmt,c->dict_fmt,0,c->printed>0,
+         NULL,0,NULL,g_query_buffer_max_bytes)){
+        c->predicate_error=errno?errno:EILSEQ;release_record_ref(&rr);return -1;
     }
-    free(c->last_key_str);
-    /* Decode each part from the fetched record (never from index bytes).
-       c->ospec is NULL only on paths that never emit a token. */
-    if (c->ospec && c->fs && c->fs->ts) {
-        /* §2.5: capture each part's NULL tier from the record bitmap so
-           the v2 token reconstructs the tiered resume key exactly. */
-        const uint8_t *tbm = NULL; int tbm_bytes = 0;
-        if (rr.hdr2 & SREC_FLAG_NULLMAP) {
-            const uint8_t *tbase = NULL; size_t tregion = 0;
-            (void)typed_record_view(raw, value_len, rr.hdr2, &tbase, &tbm,
-                                    &tbm_bytes, &tregion);
-        }
-        for (int i = 0; i < c->ospec->n; i++) {
-            c->last_value[i] = json_escape_field(
-                typed_get_field_str(c->fs->ts, raw, (int)value_len,
-                                    c->ospec->parts[i].idx, rr.hdr2));
-            c->last_tiers[i] =
-                ((rr.hdr2 & SREC_FLAG_NULLMAP) &&
-                 c->ospec->parts[i].idx >= 0 &&
-                 typed_field_null(tbm, tbm_bytes,
-                                  c->ospec->parts[i].idx)) ? 1 : 0;
-        }
-    }
-    c->last_key_str = strndup(key_buf, klen);
 
     c->printed++;
     release_record_ref(&rr);
@@ -6906,10 +8170,79 @@ static int cursor_find_cb(const char *val, size_t vlen,
 
 typedef struct {
     uint8_t hash[16];
-    uint8_t sort_key[1024];   /* typed_field_to_index_key output — memcmp-sortable */
-    size_t  sort_key_len;
+    uint8_t sort_key[1024]; /* inline common case; struct moves stay safe */
+    size_t sort_key_len;
+    uint8_t *owned_sort_key;
+    _Atomic size_t *owned_bytes; /* resource accounting only; no engine gate */
 } SmallPrefilterRow;
 
+
+static const uint8_t *small_row_key(const SmallPrefilterRow *r){
+    return r->owned_sort_key?r->owned_sort_key:r->sort_key;
+}
+static void small_row_release(SmallPrefilterRow *r){
+    if(r->owned_sort_key){
+        free(r->owned_sort_key);
+        atomic_fetch_sub_explicit(r->owned_bytes,r->sort_key_len,memory_order_relaxed);
+    }
+    r->owned_sort_key=NULL;r->owned_bytes=NULL;r->sort_key_len=0;
+}
+static void small_rows_release(SmallPrefilterRow *rows,size_t n){
+    if(!rows)return;
+    for(size_t i=0;i<n;i++)small_row_release(&rows[i]);
+    free(rows);
+}
+static void small_row_move(SmallPrefilterRow *dst,SmallPrefilterRow *src){
+    if(dst==src)return;
+    small_row_release(dst);*dst=*src;
+    src->owned_sort_key=NULL;src->owned_bytes=NULL;src->sort_key_len=0;
+}
+static int sort_bytes_reserve(_Atomic size_t *used,size_t n,size_t limit){
+    size_t old=atomic_load_explicit(used,memory_order_relaxed);
+    do {
+        if(n>limit||old>limit-n){errno=ENOBUFS;return -1;}
+    }while(!atomic_compare_exchange_weak_explicit(used,&old,old+n,
+                 memory_order_relaxed,memory_order_relaxed));
+    return 0;
+}
+static void *sort_array_resize(void *ptr,size_t old_cap,size_t new_cap,
+ _Atomic size_t *used,size_t limit){
+    if(new_cap>SIZE_MAX/sizeof(SmallPrefilterRow)){errno=ENOBUFS;return NULL;}
+    size_t old_bytes=old_cap*sizeof(SmallPrefilterRow),new_bytes=new_cap*sizeof(SmallPrefilterRow);
+    if(sort_bytes_reserve(used,new_bytes-old_bytes,limit))return NULL;
+    void *next=realloc(ptr,new_bytes?new_bytes:1);
+    if(!next){atomic_fetch_sub_explicit(used,new_bytes-old_bytes,memory_order_relaxed);errno=ENOMEM;return NULL;}
+    if(new_bytes>old_bytes)memset((uint8_t*)next+old_bytes,0,new_bytes-old_bytes);
+    return next;
+}
+static void sort_array_free(SmallPrefilterRow *rows,size_t count,size_t cap,
+ _Atomic size_t *used){
+    if(!rows)return;
+    small_rows_release(rows,count);
+    atomic_fetch_sub_explicit(used,cap*sizeof(SmallPrefilterRow),memory_order_relaxed);
+}
+static int small_row_build(SmallPrefilterRow *row,const TypedSchema *ts,
+ const uint8_t *raw,size_t len,uint8_t flags,int field,
+ _Atomic size_t *owned_bytes,size_t overflow_budget){
+    size_t need=0;
+    if(field<0||typed_index_field_key_into(ts,(size_t)field,raw,len,flags,NULL,0,&need)!=1)
+        return -1;
+    if(need<=sizeof(row->sort_key)){
+        if(typed_index_field_key_into(ts,(size_t)field,raw,len,flags,row->sort_key,
+                                       sizeof(row->sort_key),&need)!=1)return -1;
+        row->sort_key_len=need;return 0;
+    }
+    /* Reserve before malloc. Counter follows owned keys through struct
+       moves, sorting, compaction, eviction and final release. */
+    if(sort_bytes_reserve(owned_bytes,need,overflow_budget))return -1;
+    uint8_t *key=malloc(need);
+    if(!key){atomic_fetch_sub_explicit(owned_bytes,need,memory_order_relaxed);errno=ENOMEM;return -1;}
+    size_t actual=0;
+    if(typed_index_field_key_into(ts,(size_t)field,raw,len,flags,key,need,&actual)!=1){
+        int error=errno;free(key);atomic_fetch_sub_explicit(owned_bytes,need,memory_order_relaxed);errno=error;return -1;
+    }
+    row->owned_sort_key=key;row->owned_bytes=owned_bytes;row->sort_key_len=actual;return 0;
+}
 typedef struct {
     SmallPrefilterRow *rows;
     size_t             cap;
@@ -6974,6 +8307,8 @@ typedef struct {
        -1 = unprocessed, 0 = rejected, 1 = passed (sort_key stored in rows[i]). */
     int               *passed;          /* malloc'd per-row flags: 0=reject, 1=pass */
     int               *n_kept;          /* incremented on each pass */
+    _Atomic size_t *sort_owned_bytes;
+    size_t sort_overflow_budget;
 } D2BatchCtx;
 
 static int d2_batch_cb(const uint8_t hash16[16],
@@ -6985,6 +8320,7 @@ static int d2_batch_cb(const uint8_t hash16[16],
     if (ctx->deadline && query_deadline_tick(ctx->deadline, ctx->dl_counter)) return 1;
 
     D2HashIdxEntry lookup;
+    lookup.idx = -1;   /* key element: comparator reads .hash only */
     memcpy(lookup.hash, hash16, 16);
     D2HashIdxEntry *found = bsearch(&lookup, ctx->hash_map, ctx->n_total,
                                      sizeof(D2HashIdxEntry), d2_hash_idx_cmp);
@@ -6994,21 +8330,28 @@ static int d2_batch_cb(const uint8_t hash16[16],
     if (ctx->passed[i]) return 0;  /* already processed (hash collision edge) */
 
     /* Run criteria match tree on this record */
-    if (ctx->tree && !criteria_match_tree((const uint8_t *)value, vlen,
-                                           ctx->tree, ctx->fs, hdr2))
-        return 0;  /* reject — leave passed[i]=0 */
+    int matched=0;
+    if(criteria_match_tree_checked(value,vlen,ctx->tree,ctx->fs,hdr2,&matched)){ctx->passed[i]=-(errno?errno:EILSEQ);return 1;}
+    if(!matched)return 0;
 
     /* Pass: extract sort key at the ORIGINAL row position.
        Compaction happens after all callbacks complete (see call site). */
-    ctx->passed[i] = 1;
-    __sync_fetch_and_add(ctx->n_kept, 1);
-    typed_field_to_index_key_rec(ctx->ts, (const uint8_t *)value, vlen, hdr2,
-                                 ctx->order_field_idx,
-                                 ctx->rows[i].sort_key,
-                                 &ctx->rows[i].sort_key_len);
+    if(small_row_build(&ctx->rows[i],ctx->ts,value,vlen,hdr2,
+                       ctx->order_field_idx,ctx->sort_owned_bytes,
+                       ctx->sort_overflow_budget)){
+        ctx->passed[i]=-(errno?errno:EILSEQ);return 1;
+    }
+    ctx->passed[i]=1;
+    __sync_fetch_and_add(ctx->n_kept,1);
     return 0;
 }
 
+static int sort_request_error(int error){
+    errno=error?error:EILSEQ;
+    if(errno==ENOBUFS)OUT(QUERY_BUFFER_ERR);
+    else OUT("{\"error\":\"ordered query failed: %s\"}\n",strerror(errno));
+    return -1;
+}
 /* Memcmp on the index-encoded sort_key bytes — they're produced by
  * typed_field_to_index_key, which mirrors the btree's storage encoding
  * (varchar = raw bytes, int/long/short/byte = top-bit-flipped BE so
@@ -7023,7 +8366,7 @@ static int small_prefilter_cmp_asc(const void *a, const void *b) {
     const SmallPrefilterRow *ra = a, *rb = b;
     size_t mlen = ra->sort_key_len < rb->sort_key_len
                   ? ra->sort_key_len : rb->sort_key_len;
-    int c = memcmp(ra->sort_key, rb->sort_key, mlen);
+    int c = memcmp(small_row_key(ra), small_row_key(rb), mlen);
     if (c != 0) return c;
     if (ra->sort_key_len < rb->sort_key_len) return -1;
     if (ra->sort_key_len > rb->sort_key_len) return 1;
@@ -7055,6 +8398,9 @@ typedef struct {
     QueryDeadline *deadline;
     int            dl_counter;
     pthread_mutex_t lock;         /* guards results[] growth + append */
+    int predicate_error;
+    _Atomic size_t *sort_owned_bytes;
+    size_t sort_overflow_budget;
 } CursorFetchCtx;
 
 /* cursor_fetch_cb — callback for batch lookup in cursor_fetch_worker.
@@ -7068,33 +8414,29 @@ static int cursor_fetch_cb(const uint8_t hash[16],
     CursorFetchCtx *ctx = (CursorFetchCtx *)ctx_ptr;
     if (query_deadline_tick(ctx->deadline, &ctx->dl_counter)) return 1;
 
-    if (ctx->tree && !criteria_match_tree((const uint8_t *)value, vlen,
-                                           ctx->tree, ctx->fs, hdr2))
-        return 0;
+    int matched=0;
+    if(criteria_match_tree_checked(value,vlen,ctx->tree,ctx->fs,hdr2,&matched)){
+        int error=errno?errno:EILSEQ;pthread_mutex_lock(&ctx->lock);ctx->predicate_error=error;pthread_mutex_unlock(&ctx->lock);return 1;}
+    if(!matched)return 0;
 
-    /* Append to results array */
-    pthread_mutex_lock(&ctx->lock);
-    if (ctx->result_count >= ctx->result_cap) {
-        int new_cap = ctx->result_cap ? ctx->result_cap * 2 : 64;
-        SmallPrefilterRow *t = xrealloc_or_free(ctx->results,
-            (size_t)new_cap * sizeof(SmallPrefilterRow));
-        if (!t) {
-            ctx->results = NULL;
-            ctx->result_count = 0;
-            ctx->result_cap = 0;
-            pthread_mutex_unlock(&ctx->lock);
-            return 1;
-        }
-        ctx->results = t;
-        ctx->result_cap = new_cap;
+    SmallPrefilterRow candidate={0};memcpy(candidate.hash,hash,16);
+    if(small_row_build(&candidate,ctx->ts,value,vlen,hdr2,ctx->order_field_idx,
+                       ctx->sort_owned_bytes,ctx->sort_overflow_budget)){
+        pthread_mutex_lock(&ctx->lock);ctx->predicate_error=errno?errno:EILSEQ;
+        pthread_mutex_unlock(&ctx->lock);return 1;
     }
-    SmallPrefilterRow *row = &ctx->results[ctx->result_count++];
-    memcpy(row->hash, hash, 16);
-    typed_field_to_index_key_rec(ctx->ts, (const uint8_t *)value, vlen, hdr2,
-                                 ctx->order_field_idx,
-                                 row->sort_key, &row->sort_key_len);
-    pthread_mutex_unlock(&ctx->lock);
-    return 0;
+    pthread_mutex_lock(&ctx->lock);
+    if(ctx->result_count>=ctx->result_cap){
+        int new_cap=ctx->result_cap?ctx->result_cap*2:64;
+        SmallPrefilterRow *t=sort_array_resize(ctx->results,(size_t)ctx->result_cap,
+            (size_t)new_cap,ctx->sort_owned_bytes,ctx->sort_overflow_budget);
+        if(!t){ctx->predicate_error=errno?errno:ENOMEM;goto failed;}
+        ctx->results=t;ctx->result_cap=new_cap;
+    }
+    ctx->results[ctx->result_count++]=candidate;
+    pthread_mutex_unlock(&ctx->lock);return 0;
+ failed:
+    pthread_mutex_unlock(&ctx->lock);small_row_release(&candidate);return 1;
 }
 
 static void *cursor_fetch_worker(void *arg) {
@@ -7109,14 +8451,14 @@ static void *cursor_fetch_worker(void *arg) {
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(ctx->db_root, ctx->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "cursor_fetch_worker: slotcask_registry_get failed for %s/%s", ctx->db_root, ctx->object);
-        return NULL;
+        ctx->predicate_error=errno?errno:EIO;return NULL;
     }
 
     /* Extract hashes from entries */
     uint8_t (*hashes)[16] = malloc((size_t)ctx->entry_count * sizeof(*hashes));
     if (!hashes) {
         LOG_ERROR(LOG_SUB_QUERY, "cursor_fetch_worker: malloc failed for entry_count=%d", ctx->entry_count);
-        return NULL;
+        ctx->predicate_error=ENOMEM;return NULL;
     }
     for (int i = 0; i < ctx->entry_count; i++)
         memcpy(hashes[i], ctx->entries[i].hash, 16);
@@ -7125,12 +8467,31 @@ static void *cursor_fetch_worker(void *arg) {
        and parallelizes segment reads across unique segment files. The callback
        fires for each found record while the segcache handle is held. */
     pthread_mutex_init(&ctx->lock, NULL);
-    slotcask_bulk_resolve_and_fetch(sdb, hashes, (size_t)ctx->entry_count,
-                                     ctx, cursor_fetch_cb);
+    if(slotcask_bulk_resolve_and_fetch(sdb,hashes,(size_t)ctx->entry_count,ctx,cursor_fetch_cb)<0&&
+       !ctx->predicate_error)ctx->predicate_error=errno?errno:EIO;
     pthread_mutex_destroy(&ctx->lock);
 
     free(hashes);
     return NULL;
+}
+
+/* One-way request flag: once candidate capacity overflow forced a whole
+ * record fallback, no later stage of the SAME request may rebuild bitmap
+ * candidates (prefilters, probes, totals). Thread-local: one request never
+ * spans threads at the orchestration level; set and cleared strictly inside
+ * cmd_find_do_impl on every exit path. */
+static __thread int bm_find_candidates_disabled;
+static __thread int bm_find_candidates_active;
+typedef struct {
+    int disabled;
+    int active;
+} BmFindScope;
+
+/* Scope guard: the request-scoped flag is always cleared, on every exit
+ * path, when the owning cmd_find_do_impl frame unwinds. */
+static void bm_find_flag_reset(BmFindScope *saved) {
+    bm_find_candidates_disabled = saved->disabled;
+    bm_find_candidates_active = saved->active;
 }
 
 /* Forward declaration — defined further down alongside the other
@@ -7232,6 +8593,9 @@ typedef struct {
     /* Mutex for parallel bulk-fetch callbacks.  Guards heap/fullbuf
        mutations run from concurrent IO pool workers. */
     pthread_mutex_t lock;
+    int predicate_error;
+    _Atomic size_t *sort_owned_bytes;
+    size_t sort_overflow_budget;
 } FetchSortCtx;
 
 /* Heap ordering: root holds the "drop candidate" — the worst entry in
@@ -7265,24 +8629,16 @@ static void d2_topn_sift_up(SmallPrefilterRow *heap, int i, int desc) {
     }
 }
 
-static void d2_topn_push(SmallPrefilterRow *heap, int *n, int cap,
-                      const SmallPrefilterRow *cand, int desc) {
-    if (*n < cap) {
-        heap[*n] = *cand;
-        d2_topn_sift_up(heap, *n, desc);
-        (*n)++;
-        return;
+static void d2_topn_push(SmallPrefilterRow *heap,int *n,int cap,
+ SmallPrefilterRow *cand,int desc){
+    if(*n<cap){heap[*n]=*cand;cand->owned_sort_key=NULL;cand->owned_bytes=NULL;
+        d2_topn_sift_up(heap,*n,desc);(*n)++;return;}
+    if(d2_topn_outranks(&heap[0],cand,desc)){
+        small_row_release(&heap[0]);heap[0]=*cand;
+        cand->owned_sort_key=NULL;cand->owned_bytes=NULL;
+        d2_topn_sift_down(heap,*n,0,desc);
     }
-    /* Heap full: root is the WORST in our kept set (max for ASC, min
-       for DESC).  Replace root when the candidate is BETTER than it —
-       i.e. when root is more root-worthy than candidate (cand "ranks
-       below" root in the heap's drop-priority order).  This is the
-       OPPOSITE direction from sift-up/sift-down, which maintain the
-       invariant that root is the most-drop-worthy entry. */
-    if (d2_topn_outranks(&heap[0], cand, desc)) {
-        heap[0] = *cand;
-        d2_topn_sift_down(heap, *n, 0, desc);
-    }
+    small_row_release(cand);
 }
 
 /* keyset_iter callback: one fetch + filter + heap-push per candidate. */
@@ -7295,8 +8651,10 @@ static int fetch_sort_batch_cb(const uint8_t hash16[16],
     FetchSortCtx *c = (FetchSortCtx *)ctx_ptr;
     if (query_deadline_tick(c->dl, &c->dl_counter)) return 1;
 
-    if (c->tree && !criteria_match_tree((const uint8_t *)value, vlen,
-                                         c->tree, c->fs, hdr2)) return 0;
+    int matched=0;
+    if(criteria_match_tree_checked(value,vlen,c->tree,c->fs,hdr2,&matched)){
+        int error=errno?errno:EILSEQ;pthread_mutex_lock(&c->lock);c->predicate_error=error;pthread_mutex_unlock(&c->lock);return 1;}
+    if(!matched)return 0;
     if (c->excluded && c->excluded->count > 0) {
         char keybuf[1100];
         format_query_wire_key(c->fs, key, klen, keybuf);
@@ -7305,22 +8663,24 @@ static int fetch_sort_batch_cb(const uint8_t hash16[16],
 
     __sync_fetch_and_add(&c->n_matched, 1);
 
-    SmallPrefilterRow cur;
-    memcpy(cur.hash, hash16, 16);
-    typed_field_to_index_key_rec(c->fs->ts, (const uint8_t *)value, vlen, hdr2,
-                                 c->order_field_idx,
-                                 cur.sort_key, &cur.sort_key_len);
+    SmallPrefilterRow cur={0};memcpy(cur.hash,hash16,16);
+    if(small_row_build(&cur,c->fs->ts,value,vlen,hdr2,c->order_field_idx,
+                       c->sort_owned_bytes,c->sort_overflow_budget)){
+        int error=errno?errno:EILSEQ;pthread_mutex_lock(&c->lock);
+        c->predicate_error=error;pthread_mutex_unlock(&c->lock);return 1;
+    }
 
     pthread_mutex_lock(&c->lock);
     if (c->heap_cap > 0) {
         d2_topn_push(c->heap, &c->heap_n, c->heap_cap, &cur, c->desc);
     } else {
-        if (c->full_oom) { pthread_mutex_unlock(&c->lock); return 0; }
+        if (c->full_oom) { pthread_mutex_unlock(&c->lock);small_row_release(&cur);return 1; }
         if (c->full_n == c->full_cap) {
             int new_cap = c->full_cap ? c->full_cap * 2 : 64;
-            SmallPrefilterRow *bigger = realloc(c->fullbuf,
-                                                (size_t)new_cap * sizeof(SmallPrefilterRow));
-            if (!bigger) { c->full_oom = 1; pthread_mutex_unlock(&c->lock); return 0; }
+            SmallPrefilterRow *bigger=sort_array_resize(c->fullbuf,(size_t)c->full_cap,
+                (size_t)new_cap,c->sort_owned_bytes,c->sort_overflow_budget);
+            if(!bigger){c->full_oom=1;c->predicate_error=errno?errno:ENOMEM;
+                pthread_mutex_unlock(&c->lock);small_row_release(&cur);return 1;}
             c->fullbuf = bigger; c->full_cap = new_cap;
         }
         c->fullbuf[c->full_n++] = cur;
@@ -7347,7 +8707,9 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
                                   int offset, int limit,
                                   const char **proj_fields, int proj_count,
                                   int dict_fmt,
-                                  QueryDeadline *dl)
+                                  QueryDeadline *dl,
+                                  KeySet *prebuilt, int have_prebuilt,
+                                  KeySetBudget *budget)
 {
     /* Resolve order_by → typed-field index for typed_field_to_index_key. */
     int order_field_idx = -1;
@@ -7359,36 +8721,56 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
             }
         }
     }
-    if (order_field_idx < 0) return 0;
+    if(order_field_idx<0){keyset_free(prebuilt);errno=EINVAL;return SIZE_MAX;}
 
-    /* Build the candidate KeySet from the planner's source.  NULL or
-       empty → nothing to emit. */
-    KeySet *prefilter_ks = build_keyset_from_plan(fp, db_root, object, sch, dl);
-    if (!prefilter_ks) return 0;
+    /* The candidate KeySet comes from the pre-emission preparation when a
+       bitmap source is involved (ownership transferred; NULL = deadline
+       expired during preparation → nothing to emit), else it is built from
+       the planner's source here. */
+    KeySet *prefilter_ks;
+    if (have_prebuilt) {
+        prefilter_ks = prebuilt;
+        if (!prefilter_ks) return 0;
+    } else {
+        errno=0;
+        prefilter_ks=build_keyset_from_plan(fp,db_root,object,sch,dl);
+        if(!prefilter_ks){if(!errno)errno=EIO;return SIZE_MAX;}
+    }
     if (keyset_size(prefilter_ks) == 0) { keyset_free(prefilter_ks); return 0; }
 
     /* For D1 composite plans where a more-selective non-seed leaf exists,
        replace the broad composite-seed KeySet with a narrow KeySet built
-       from the most-selective leaf. */
+       from the most-selective leaf. The replacement charges the same
+       request budget; the two sets coexist only until the broad one is
+       freed below. On a refused/failing build the broad set stays. */
     if (fp->prefilter_source_leaf &&
         fp->prefilter_card > 0 &&
         fp->prefilter_card < keyset_size(prefilter_ks)) {
-        KeySet *narrow = build_keyset_from_leaf(db_root, object, sch->splits,
-                                                 fp->prefilter_source_leaf, dl);
+        CandidateBuildOut ncb;
+        errno = 0;
+        KeySet *narrow = build_keyset_from_leaf_ck(db_root, object, sch->splits,
+                                                   fp->prefilter_source_leaf,
+                                                   dl, budget, &ncb);
         if (narrow) {
             keyset_free(prefilter_ks);
             prefilter_ks = narrow;
+        } else {
+            errno = 0;   /* keep the already-built broad prefilter */
         }
     }
 
     /* Set up the top-N heap (or fall back to unbounded materialization
        when limit==0). offset is included in the heap capacity so the
        skip is honored after sort. */
+    if(limit>0&&(offset<0||offset>INT_MAX-limit)){
+        keyset_free(prefilter_ks);errno=ENOBUFS;return SIZE_MAX;
+    }
     int M = (limit > 0) ? (offset + limit) : 0;
+    _Atomic size_t sort_owned_bytes=0;
     SmallPrefilterRow *heap = NULL;
     if (M > 0) {
-        heap = calloc((size_t)M, sizeof(SmallPrefilterRow));
-        if (!heap) { keyset_free(prefilter_ks); return 0; }
+        heap=sort_array_resize(NULL,0,(size_t)M,&sort_owned_bytes,g_query_buffer_max_bytes);
+        if (!heap) {int error=errno?errno:ENOMEM;keyset_free(prefilter_ks);errno=error;return SIZE_MAX;}
     }
 
     FetchSortCtx fc;
@@ -7400,6 +8782,7 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
     fc.order_field_idx = order_field_idx;
     fc.tree            = tree;
     fc.excluded        = excluded;
+    fc.sort_owned_bytes=&sort_owned_bytes;fc.sort_overflow_budget=g_query_buffer_max_bytes;
     fc.heap            = heap;
     fc.heap_cap        = M;
     fc.desc            = desc;
@@ -7415,7 +8798,11 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
             .splits = sch->splits, .slot_size = sch->slot_size,
             .streams = sch->streams,
         };
-        SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &sinfo);
+        SlotcaskDb *sdb SDB_REG_REF=slotcask_registry_get(db_root,object,&sinfo);
+        if(!sdb){
+            int error=errno?errno:EIO;keyset_free(prefilter_ks);pthread_mutex_destroy(&fc.lock);
+            sort_array_free(heap,0,(size_t)M,&sort_owned_bytes);errno=error;return SIZE_MAX;
+        }
 #define FS_BATCH 1024
         uint8_t batch[FS_BATCH][16];
         int batch_n = 0;
@@ -7429,19 +8816,24 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
             memcpy(batch[batch_n], prefilter_ks->keys[b], 16);
             batch_n++;
             if (batch_n == FS_BATCH) {
-                slotcask_bulk_resolve_and_fetch(sdb, batch, FS_BATCH,
-                                                 &fc, fetch_sort_batch_cb);
+                if(slotcask_bulk_resolve_and_fetch(sdb,batch,FS_BATCH,&fc,fetch_sort_batch_cb)<0&&
+                   !fc.predicate_error)fc.predicate_error=errno?errno:EIO;
                 batch_n = 0;
             }
         }
         if (batch_n > 0) {
-            slotcask_bulk_resolve_and_fetch(sdb, batch, (size_t)batch_n,
-                                             &fc, fetch_sort_batch_cb);
+            if(slotcask_bulk_resolve_and_fetch(sdb,batch,(size_t)batch_n,&fc,fetch_sort_batch_cb)<0&&
+               !fc.predicate_error)fc.predicate_error=errno?errno:EIO;
         }
         keyset_free(prefilter_ks);
     }
     pthread_mutex_destroy(&fc.lock);
 
+    if(fc.predicate_error){
+        sort_array_free(heap,(size_t)fc.heap_n,(size_t)M,&sort_owned_bytes);
+        sort_array_free(fc.fullbuf,(size_t)fc.full_n,(size_t)fc.full_cap,&sort_owned_bytes);
+        errno=fc.predicate_error;return SIZE_MAX;
+    }
     /* Sort the kept rows.  For the bounded path the heap holds at most
        M ≪ K rows; for the unbounded path it's everything that matched. */
     SmallPrefilterRow *out;
@@ -7478,10 +8870,11 @@ static size_t find_via_fetch_sort(const char *db_root, const char *object,
         if (cursor_find_cb("", 0, out[i].hash, NULL, &cc) < 0) break;
     }
 
-    free(heap);
-    free(fc.fullbuf);
+    sort_array_free(heap,(size_t)fc.heap_n,(size_t)M,&sort_owned_bytes);
+    sort_array_free(fc.fullbuf,(size_t)fc.full_n,(size_t)fc.full_cap,&sort_owned_bytes);
     for (int i = 0; i < MAX_ORDER_FIELDS; i++) free(cc.last_value[i]);
     free(cc.last_key_str);
+    if(cc.predicate_error){errno=cc.predicate_error;return SIZE_MAX;}
     return fc.n_matched;
 }
 
@@ -7525,12 +8918,16 @@ size_t g_ordered_find_keyset_max = 100000;
    table in cmd_find's primary-source switch but isolated so the
    ordered paths can size-check the candidate set and choose
    filter-first vs walk-ordered. */
-static KeySet *build_keyset_from_plan(const FilterPlan *fp,
+static KeySet *build_keyset_from_plan_ck(const FilterPlan *fp,
                                       const char *db_root,
                                       const char *object,
                                       const Schema *sch,
-                                      QueryDeadline *dl) {
-    if (!fp) return NULL;
+                                      QueryDeadline *dl, KeySetBudget *budget,
+                                         CandidateBuildOut *out) {
+    cb_out_init(out);
+    if (candidate_deadline_expired(dl)) return bm_build_fail(out, CBF_TIMEOUT, 0);
+    if (!fp) return bm_build_fail(out, CBF_NONE, 0);
+    if (bm_find_candidates_disabled) return bm_build_fail(out, CBF_NONE, 0);   /* one-way fallback */
     switch (fp->kind) {
     case FP_PRIMARY_LEAF:
     case FP_BITMAP_SMALLER: {
@@ -7557,12 +8954,14 @@ static KeySet *build_keyset_from_plan(const FilterPlan *fp,
             } else {
                 pop = bm_popcount_generic_for_crit(db_root, object,
                                                     leaf->field, sch->splits,
-                                                    leaf, tf);
+                                                    leaf, tf, ts);
             }
-            if (pop > g_ordered_find_keyset_max) return NULL;
+            if (pop == SIZE_MAX) return bm_build_fail(out, CBF_HARD, errno);
+            if (pop > g_ordered_find_keyset_max)
+                return bm_build_fail(out, CBF_NONE, 0);
         }
-        return build_keyset_from_leaf(db_root, object, sch->splits,
-                                      leaf, dl);
+        return build_keyset_from_leaf_ck(db_root, object, sch->splits,
+                                         leaf, dl, budget, out);
     }
     case FP_INTERSECT: {
         /* Broad-set guard (parity with FP_PRIMARY_LEAF above): when every
@@ -7578,7 +8977,8 @@ static KeySet *build_keyset_from_plan(const FilterPlan *fp,
         for (int i = 0; i < fp->n_source; i++) {
             SearchCriterion *lf = fp->source_leaves[i];
             if (!lf || pick_index_for_leaf(db_root, object, lf) != IT_BITMAP ||
-                (lf->op != OP_EQUAL && lf->op != OP_IN)) {
+                (lf->op != OP_EQUAL && lf->op != OP_IN) ||
+                !bitmap_literal_fits(load_typed_schema(db_root,object),lf,1024)) {
                 all_bitmap_eqin = 0;
                 break;
             }
@@ -7588,24 +8988,39 @@ static KeySet *build_keyset_from_plan(const FilterPlan *fp,
             size_t pop = bm_popcount_intersect(db_root, object, sch->splits,
                                                (SearchCriterion **)fp->source_leaves,
                                                fp->n_source, ts, dl);
-            if (pop > g_ordered_find_keyset_max) return NULL;
+            if (pop == SIZE_MAX) return bm_build_fail(out, CBF_HARD, errno);
+            if (pop > g_ordered_find_keyset_max)
+                return bm_build_fail(out, CBF_NONE, 0);
         }
         int small_primary = 0;
-        return intersect_indexed_leaves(db_root, object, sch->splits,
+        return intersect_indexed_leaves_ck(db_root, object, sch->splits,
                                         (SearchCriterion **)fp->source_leaves,
                                         fp->n_source,
-                                        dl, &small_primary);
+                                        dl, &small_primary, budget, out);
     }
     case FP_UNION: {
         int budget_exceeded = 0;
-        return build_or_keyset(db_root, object, sch->splits,
+        return build_or_keyset_ck(db_root, object, sch->splits,
                                fp->or_node, dl,
-                               &budget_exceeded, 0);
+                               &budget_exceeded, 0, budget, out);
     }
     case FP_FULL_SCAN:
     default:
-        return NULL;
+        return bm_build_fail(out, CBF_NONE, 0);
     }
+}
+
+static KeySet *build_keyset_from_plan(const FilterPlan *fp,
+                                      const char *db_root, const char *object,
+                                      const Schema *sch, QueryDeadline *dl) {
+    CandidateBuildOut out;
+    KeySet *ks = build_keyset_from_plan_ck(fp, db_root, object, sch, dl, NULL, &out);
+    if (!ks && out.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+        if (bm_find_candidates_active) bm_find_candidates_disabled = 1;
+        BMKS_STAT_FALLBACK("prefilter");
+        errno = 0;
+    }
+    return ks;
 }
 
 /* SlotcaskScanCb for bulk_delete_phase1_indexed: receives key + value from a
@@ -7623,7 +9038,10 @@ static int bulk_criteria_indexed_cb(const uint8_t hash16[16],
     if (query_deadline_tick(bc->deadline, &bc->dl_counter)) return 0;
 
     /* Re-verify full criteria tree (index may be slightly stale) */
-    if (!criteria_match_tree(value, vlen, bc->tree, bc->fs, hdr2)) return 0;
+    int matched=0;
+    if(criteria_match_tree_checked(value,vlen,bc->tree,bc->fs,hdr2,&matched)){
+        int error=errno?errno:EILSEQ;pthread_mutex_lock(&bc->lock);bc->predicate_error=error;pthread_mutex_unlock(&bc->lock);return 1;}
+    if(!matched)return 0;
 
     char *k = malloc(klen + 1);
     if (!k) return 0;
@@ -7670,6 +9088,10 @@ int bulk_delete_phase1_indexed(const char *db_root, const char *object,
                                        CriteriaNode *tree, int limit,
                                        QueryDeadline *dl,
                                        BulkCriteriaCtx *out_ctx) {
+    BmFindScope bm_flag_guard __attribute__((cleanup(bm_find_flag_reset))) =
+        { bm_find_candidates_disabled, bm_find_candidates_active };
+    bm_find_candidates_disabled = 0;
+    bm_find_candidates_active = 0;
     size_t N = (size_t)get_live_count(db_root, object);
     FilterPlan fp = plan_filter(tree, db_root, object, fs,
                                 sch->splits, N,
@@ -7678,7 +9100,7 @@ int bulk_delete_phase1_indexed(const char *db_root, const char *object,
     if (fp.kind == FP_FULL_SCAN) return 0;
 
     KeySet *ks = build_keyset_from_plan(&fp, db_root, object, sch, dl);
-    if (!ks) return 0;
+    if (!ks) { errno = 0; return 0; }   /* caller falls back to a full scan */
     if (dl->timed_out) { keyset_free(ks); return 0; }
 
     if (keyset_size(ks) == 0) {
@@ -7731,140 +9153,403 @@ int bulk_delete_phase1_indexed(const char *db_root, const char *object,
  * postfilter-bearing plans where the count would need a full recheck). */
 /* hint_ks: when non-NULL and the plan is FP_PRIMARY_LEAF+postfilter, borrow this
    pre-built KeySet instead of re-walking the primary index.  Caller retains ownership. */
+static size_t prepared_count_candidates(const KeySet *ks, CriteriaNode *tree,
+                                        const char *root, const char *object,
+                                        const Schema *sch, FieldSchema *fs,
+                                        QueryDeadline *dl, int *out_null);
+
 static size_t fp_compute_total(const FilterPlan *fp, CriteriaNode *tree,
                                const char *db_root, const char *object,
                                const Schema *sch, FieldSchema *fs,
                                QueryDeadline *dl, int *out_null,
                                KeySet *hint_ks) {
-    (void)tree;
     *out_null = 1;
-    if (!fp || dl->timed_out) return 0;
+    if (!fp || candidate_deadline_expired(dl)) return 0;
+    if (bm_find_candidates_disabled) {
+        size_t total = 0;
+        if (count_full_record_checked(db_root, object, tree, fs, sch, dl,
+                                      &total) != 0)
+            return SIZE_MAX;
+        *out_null = dl->timed_out ? 1 : 0;
+        return total;
+    }
+    CandidateBuildOut cb;
+    cb_out_init(&cb);
+    KeySet *ks = NULL;
+    int owned = 1;
+    int budget_exceeded = 0;
     switch (fp->kind) {
     case FP_INTERSECT: {
         int small_primary = 0;
-        /* Cast away const on the source_leaves array: the function's signature
-         * is SearchCriterion** (mutates nothing in practice; the const is a
-         * caller-side guarantee that's just not threaded into the helper). */
-        SearchCriterion **leaves = (SearchCriterion **)(uintptr_t)fp->source_leaves;
-        KeySet *ks = intersect_indexed_leaves(db_root, object, sch->splits,
-                                              leaves, fp->n_source,
-                                              dl, &small_primary);
-        if (!ks || dl->timed_out) { if (ks) keyset_free(ks); return 0; }
-        size_t n = 0;
-        if (!small_primary && fp->n_postfilter == 0) {
-            /* Clean intersection: KeySet size IS the match count. */
-            n = keyset_size(ks);
-            *out_null = 0;
-        } else {
-            /* small_primary OR n_postfilter > 0 → KeySet is candidates,
-             * not the answer. Walk it, fetch + criteria_match_tree per
-             * record, count matches. Same cost as the explorer's
-             * separate count query; we just consolidate it here. */
-            CollectedHash *entries = NULL;
-            size_t nh = 0;
-            keyset_to_collected_hashes(ks, sch->splits, &entries, &nh);
-            if (entries && tree) {
-                n = parallel_indexed_count(db_root, object, sch,
-                                           entries, (int)nh,
-                                           tree, fs, dl, fp, 0);
-                if (!dl->timed_out) *out_null = 0;
-            } else if (entries && !tree) {
-                /* No tree to verify against → every candidate is a match. */
-                n = nh;
-                *out_null = 0;
-            }
-            free(entries);
-        }
-        keyset_free(ks);
-        return n;
+        ks = intersect_indexed_leaves_ck(db_root, object, sch->splits,
+                                         (SearchCriterion **)fp->source_leaves,
+                                         fp->n_source, dl, &small_primary,
+                                         NULL, &cb);
+        break;
     }
     case FP_PRIMARY_LEAF:
-    case FP_BITMAP_SMALLER: {
-        /* Composite-driven plans (Phase A ordered, Phase B exact) set
-         * kind=PRIMARY_LEAF but source_leaves[0] is only the seed / first
-         * composite sub-field — idx_count_for_leaf would count that leaf
-         * alone and ignore the other pinned fields + siblings, overcounting.
-         * Exact mode always has ≥2 pinned fields; ordered-composite overcounts
-         * only when the criteria tree has siblings beyond the seed leaf. Emit
-         * null total in those cases (rows are still correct; the client can
-         * fire a separate count). */
+    case FP_BITMAP_SMALLER:
         if (fp->order == FP_ORDER_COMPOSITE_EXACT) return 0;
         if (fp->order == FP_ORDER_COMPOSITE && tree && tree->kind != CNODE_LEAF)
             return 0;
         if (fp->n_source == 0) return 0;
-        if (fp->n_postfilter != 0) {
-            /* Count via KeySet + full-tree verify.  Prefer hint_ks (built by
-               cursor path) to avoid re-walking the primary index. */
-            KeySet *ks = hint_ks;
-            int built = 0;
-            if (!ks) {
-                ks = build_keyset_from_leaf(db_root, object, sch->splits,
-                                            fp->source_leaves[0], dl);
-                built = 1;
-            }
-            if (!ks || dl->timed_out) { if (built && ks) keyset_free(ks); return 0; }
-            CollectedHash *entries = NULL; size_t nh = 0;
-            keyset_to_collected_hashes(ks, sch->splits, &entries, &nh);
-            size_t n = 0;
-            if (entries && tree) {
-                int no_bm_shortcut =
-                    (pick_index_for_leaf(db_root, object,
-                                         fp->source_leaves[0])
-                     == IT_TRIGRAM);
-                n = parallel_indexed_count(db_root, object, sch,
-                                           entries, (int)nh,
-                                           tree, fs, dl, fp,
-                                           no_bm_shortcut);
-                if (!dl->timed_out) *out_null = 0;
-            } else if (entries && !tree) {
-                n = nh; *out_null = 0;
-            }
-            free(entries);
-            if (built) keyset_free(ks);
-            return n;
-        }
-        size_t n = idx_count_for_leaf(db_root, object, sch, fs,
-                                      fp->source_leaves[0], dl);
-        if (!dl->timed_out) *out_null = 0;
-        return n;
-    }
-    case FP_UNION: {
-        int budget_exc = 0;
-        KeySet *ks = build_or_keyset(db_root, object, sch->splits,
-                                     fp->or_node, dl, &budget_exc, 0);
-        size_t n = 0;
-        if (ks && !dl->timed_out && !budget_exc) {
-            n = keyset_size(ks);
-            *out_null = 0;
-        }
-        if (ks) keyset_free(ks);
-        return n;
-    }
-    case FP_FULL_SCAN:
+        if (hint_ks) { ks = hint_ks; owned = 0; }
+        else ks = build_keyset_from_leaf_ck(db_root, object, sch->splits,
+                                            fp->source_leaves[0], dl, NULL, &cb);
+        break;
+    case FP_UNION:
+        ks = build_or_keyset_ck(db_root, object, sch->splits, fp->or_node,
+                                dl, &budget_exceeded, 0, NULL, &cb);
+        break;
     default:
-        /* Full-scan count would mean another full scan over the
-         * same data — skip and emit null; caller can fire a separate
-         * count if they really need it for this shape. */
+        return 0;
+    }
+    if (!ks) {
+        if (cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+            if (bm_find_candidates_active) bm_find_candidates_disabled = 1;
+            size_t total = 0;
+            if (count_full_record_checked(db_root, object, tree, fs, sch, dl,
+                                          &total) != 0)
+                return SIZE_MAX;
+            BMKS_STAT_FALLBACK("total");
+            *out_null = dl->timed_out ? 1 : 0;
+            return total;
+        }
+        if (cb.reason == CBF_HARD) {
+            errno = cb.saved_errno ? cb.saved_errno : EIO;
+            return SIZE_MAX;
+        }
+        if (!budget_exceeded && errno && !dl->timed_out) return SIZE_MAX;
+        return 0;
+    }
+    size_t total = prepared_count_candidates(ks, tree, db_root, object,
+                                             sch, fs, dl, out_null);
+    int saved = errno;
+    if (owned) keyset_free(ks);
+    errno = saved;
+    return total;
+}
+
+
+/* ========== Prepared bitmap find sources (pre-emission boundary) ==========
+   A find whose plan reads bitmap sources prepares them — candidate KeySets
+   and any required total that would read bitmaps — before the response
+   envelope, so a bitmap failure is reported as one complete error object
+   instead of after rows. Records are filtered, paginated and emitted
+   afterwards by the existing executors. Not a general output transaction:
+   record/serialization errors after emission keep their existing
+   behavior. */
+typedef enum {
+    PREP_NONE = 0,
+    PREP_STREAM,     /* former small-limit streaming shape: 1-record iterator */
+    PREP_INTERSECT,  /* keyset_emit_find over the intersection candidates */
+    PREP_PRIMARY,    /* keyset_emit_find over the bitmap leaf candidates */
+    PREP_UNION       /* keyset_emit_find over the union candidates */
+} PrepRoute;
+
+typedef struct {
+    PrepRoute    route;
+    KeySet      *ks;              /* positive candidate set; NULL = none */
+    int          small_primary;   /* intersect returned only its smallest leaf */
+    int          need_rematch;    /* emit must re-check the full tree */
+    int          total_ready;     /* response total computed pre-emission */
+    size_t       total;
+    int          total_null;
+    int          d2_ready;        /* D2's required prefilter prepared */
+    KeySet      *d2_prefilter;    /* ownership handed to find_via_fetch_sort */
+    KeySetBudget budget;          /* request-owned candidate budget */
+    int          record_fallback; /* candidate overflow: whole-record mode is
+                                   one-way for the rest of this request */
+} PreparedBitmapFind;
+
+static int find_leaf_is_bitmap(const char *db_root, const char *object,
+                               const SearchCriterion *leaf) {
+    return leaf && pick_index_for_leaf(db_root, object, leaf) == IT_BITMAP;
+}
+
+static int find_plan_reads_bitmap(const FilterPlan *fp, const char *db_root,
+                                  const char *object) {
+    if (!fp) return 0;
+    switch (fp->kind) {
+    case FP_PRIMARY_LEAF:
+    case FP_BITMAP_SMALLER:
+    case FP_INTERSECT:
+        for (int i = 0; i < fp->n_source; i++)
+            if (find_leaf_is_bitmap(db_root, object, fp->source_leaves[i]))
+                return 1;
+        return 0;
+    case FP_UNION:
+        if (!fp->or_node) return 0;
+        for (int i = 0; i < fp->or_node->n_children; i++) {
+            const CriteriaNode *c = fp->or_node->children[i];
+            if (c && c->kind == CNODE_LEAF &&
+                find_leaf_is_bitmap(db_root, object, &c->leaf))
+                return 1;
+        }
+        return 0;
+    default:
         return 0;
     }
 }
 
+static void prepared_find_destroy(PreparedBitmapFind *p) {
+    keyset_free(p->ks);
+    p->ks = NULL;
+    keyset_free(p->d2_prefilter);
+    p->d2_prefilter = NULL;
+}
 
-static int cmd_find_do(const char *db_root, const char *object,
+/* One deterministic error object for a pre-emission failure; candidate
+   memory exhaustion keeps the existing buffer error text. */
+static void prepared_find_report(int err) {
+    if (err == ENOBUFS) OUT(QUERY_BUFFER_ERR);
+    else OUT("{\"error\":\"bitmap index unavailable\"}\n");
+}
+
+/* Response total for an ordered/D-path or tail fallback: the prepared value
+   when the plan's total was computed pre-emission, else the existing
+   fp_compute_total. */
+static size_t prepared_or_fp_total(const PreparedBitmapFind *p,
+                                   const FilterPlan *fp, CriteriaNode *tree,
+                                   const char *db_root, const char *object,
+                                   const Schema *sch, FieldSchema *fs,
+                                   QueryDeadline *dl, int *out_null) {
+    if (p->total_ready) { *out_null = p->total_null; return p->total; }
+    return fp_compute_total(fp, tree, db_root, object, sch, fs, dl, out_null,
+                            NULL);
+}
+
+/* Candidate overflow recovery — discard the prepared candidates, flip
+ * the request into whole-record mode (one-way), and compute any required
+ * total before the envelope with the original deadline. No candidate route
+ * runs again in this request; no new deadline; no snapshot isolation. */
+static int prepared_find_recover(PreparedBitmapFind *p, CriteriaNode *tree,
+                                  const char *db_root, const char *object,
+                                  const Schema *sch, FieldSchema *fs,
+                                  QueryDeadline *dl, int want_total,
+                                  const char *kind) {
+    keyset_free(p->ks);
+    p->ks = NULL;
+    keyset_free(p->d2_prefilter);
+    p->d2_prefilter = NULL;
+    p->d2_ready = 0;
+    p->small_primary = 0;
+    p->route = PREP_NONE;
+    p->need_rematch = 0;
+    p->total_ready = 0;          /* any cached candidate total is invalid */
+    p->total_null = 1;
+    p->record_fallback = 1;
+    BMKS_STAT_FALLBACK(kind);
+    if (want_total && !dl->timed_out) {
+        size_t full = 0;
+        if (count_full_record_checked(db_root, object, tree, fs, sch, dl,
+                                      &full) != 0)
+            return -1;
+        p->total = full;
+        p->total_null = dl->timed_out ? 1 : 0;
+        p->total_ready = 1;
+    }
+    return 0;
+}
+
+/* 0 = prepared (or nothing to prepare); -1 = failure with errno, to be
+   reported before any response byte. A deadline that expires during
+   preparation leaves an empty candidate set (partial-result semantics; no
+   work is restarted). */
+typedef struct {
+    const char *db_root;
+    const char *object;
+    const Schema *sch;
+    FieldSchema *fs;
+    CriteriaNode *tree;
+    QueryDeadline *deadline;
+    int dl_counter;
+    int error;
+    size_t count;
+} PreparedCountCtx;
+
+static int prepared_count_candidate_cb(const uint8_t hash[16], void *raw) {
+    PreparedCountCtx *c = raw;
+    if (candidate_deadline_expired(c->deadline)) return 1;
+    RecordRef rr;
+    if (read_record_ref(c->db_root, c->object, c->sch, hash, &rr) != 0)
+        return 0;
+    int matched = 0;
+    int status = criteria_match_tree_checked(rr.val, rr.vlen, c->tree, c->fs,
+                                             rr.hdr2, &matched);
+    int saved = errno;
+    release_record_ref(&rr);
+    if (status) {
+        c->error = saved ? saved : EILSEQ;
+        return 1;
+    }
+    if (matched) c->count++;
+    return 0;
+}
+
+static size_t prepared_count_candidates(const KeySet *ks, CriteriaNode *tree,
+                                        const char *root, const char *object,
+                                        const Schema *sch, FieldSchema *fs,
+                                        QueryDeadline *dl, int *out_null) {
+    PreparedCountCtx c = { .db_root = root, .object = object, .sch = sch,
+                            .fs = fs, .tree = tree, .deadline = dl };
+    keyset_iter(ks, prepared_count_candidate_cb, &c);
+    if (c.error) { errno = c.error; return SIZE_MAX; }
+    *out_null = dl->timed_out ? 1 : 0;
+    return c.count;
+}
+
+static int prepared_find_prepare(PreparedBitmapFind *p, const FilterPlan *fp,
+                                 CriteriaNode *tree, const char *db_root,
+                                 const char *object, const Schema *sch,
+                                 FieldSchema *fs, QueryDeadline *dl,
+                                 int has_order, int has_joins, int rows_fmt,
+                                 int csv_delim, int njoins, int offset,
+                                 int limit, int want_total,
+                                 const char *order_by) {
+    if (!find_plan_reads_bitmap(fp, db_root, object)) return 0;
+    if (!has_order && fp->order == FP_ORDER_NONE) {
+        int is_leafish = fp->kind == FP_PRIMARY_LEAF ||
+                         fp->kind == FP_BITMAP_SMALLER;
+        int stream = limit > 0 && (offset + limit) <= 1000 && njoins == 0 &&
+                     !rows_fmt &&
+                     (fp->kind == FP_INTERSECT || (is_leafish && tree)) &&
+                     !(is_leafish && fp->n_source > 0 && fp->source_leaves[0] &&
+                       (op_prefers_trigram(fp->source_leaves[0]->op) ||
+                        op_allows_trigram_starts(fp->source_leaves[0]->op)) &&
+                       field_has_index_type(db_root, object,
+                                            fp->source_leaves[0]->field,
+                                            IT_TRIGRAM));
+        errno = 0;
+        if (fp->kind == FP_INTERSECT) {
+            int sp = 0;
+            CandidateBuildOut cb;
+            p->ks = intersect_indexed_leaves_ck(db_root, object, sch->splits,
+                                               (SearchCriterion **)fp->source_leaves,
+                                               fp->n_source, dl, &sp, &p->budget,
+                                               &cb);
+            if (!p->ks && cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+                return prepared_find_recover(p, tree, db_root, object, sch, fs, dl,
+                                      want_total, "intersect");
+            }
+            if (!p->ks && errno && !dl->timed_out) return -1;
+            p->small_primary = sp;
+            p->route = stream ? PREP_STREAM : PREP_INTERSECT;
+            p->need_rematch = stream || sp || fp->n_postfilter > 0;
+        } else if (is_leafish) {
+            SearchCriterion *pc = fp->n_source > 0 ? fp->source_leaves[0] : NULL;
+            if (!find_leaf_is_bitmap(db_root, object, pc)) return 0;
+            CandidateBuildOut cb;
+            p->ks = build_keyset_from_leaf_ck(db_root, object, sch->splits, pc,
+                                             dl, &p->budget, &cb);
+            if (!p->ks && cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+                return prepared_find_recover(p, tree, db_root, object, sch, fs, dl,
+                                      want_total, "primary");
+            }
+            if (!p->ks && errno && !dl->timed_out) return -1;
+            p->route = stream ? PREP_STREAM : PREP_PRIMARY;
+            p->need_rematch = 1;
+        } else if (fp->kind == FP_UNION) {
+            CriteriaNode *or_node = fp->or_node;
+            int rematch_unnecessary =
+                (tree == or_node) || (tree && tree->kind == CNODE_OR) ||
+                (tree && tree->kind == CNODE_AND && tree->n_children == 1 &&
+                 tree->children[0] == or_node);
+            int need_rematch = !rematch_unnecessary;
+            int target = (!want_total && !need_rematch && limit > 0)
+                         ? offset + limit : 0;
+            int budget_exceeded = 0;
+            CandidateBuildOut cb;
+            p->ks = build_or_keyset_ck(db_root, object, sch->splits, or_node, dl,
+                                      &budget_exceeded, target, &p->budget, &cb);
+            if (budget_exceeded) { keyset_free(p->ks); p->ks = NULL; errno = ENOBUFS; return -1; }
+            if (!p->ks && cb.reason == CBF_INSERT_CAPACITY && !candidate_deadline_expired(dl)) {
+                return prepared_find_recover(p, tree, db_root, object, sch, fs, dl,
+                                      want_total, "union");
+            }
+            if (!p->ks && errno && !dl->timed_out) return -1;
+            p->route = PREP_UNION;
+            p->need_rematch = need_rematch;
+        }
+        if (want_total && p->ks && !dl->timed_out) {
+            /* Candidate counts are not match counts: postfilter leaves and
+               rematch shapes leave candidates that the full tree rejects,
+               and raw popcounts are optimization inputs, not validated
+               totals. Validate every candidate against the full tree here,
+               before the envelope, so total:true never reports a count
+               derived from an unverified candidate set. */
+            int tnull = 1;
+            size_t n = prepared_count_candidates(p->ks, tree, db_root, object,
+                                                 sch, fs, dl, &tnull);
+            if (n == SIZE_MAX) return -1;
+            p->total = n;
+            p->total_null = tnull;
+            p->total_ready = 1;
+        }
+        return 0;
+    }
+    /* Ordered paths: D2's prefilter is a required source; the others use
+       only optional probes (whole-record fallback). Their response totals
+       would read bitmap sources after rows, so compute them now. */
+    int d2 = fp->order == FP_ORDER_SORT && !has_joins && !rows_fmt &&
+             !csv_delim && fp->n_source > 0 &&
+             (!order_by || strchr(order_by, ',') == NULL);
+    if (d2) {
+        errno = 0;
+        CandidateBuildOut cb;
+        p->d2_prefilter = build_keyset_from_plan_ck(fp, db_root, object, sch, dl,
+                                                   &p->budget, &cb);
+        if (!p->d2_prefilter && cb.reason == CBF_INSERT_CAPACITY &&
+            !candidate_deadline_expired(dl))
+            return prepared_find_recover(p, tree, db_root, object, sch, fs, dl,
+                                          want_total, "ordered");
+        if (!p->d2_prefilter && !dl->timed_out) {
+            if (!errno) errno = ENOBUFS;   /* no bounded candidate set */
+            return -1;
+        }
+        if (want_total && !p->d2_prefilter && dl->timed_out) {
+            /* The deadline expired before a usable prefilter existed: no
+               rows can be walked and the true match count is unknown.
+               D2's walk-time total is then meaningless, so the close must
+               report null, not a fabricated zero. */
+            p->total_null = 1;
+            p->total_ready = 1;
+        }
+        p->d2_ready = 1;
+    } else if (want_total && !dl->timed_out) {
+        int tnull = 1;
+        size_t n = fp_compute_total(fp, tree, db_root, object, sch, fs, dl,
+                                    &tnull, NULL);
+        if (n == SIZE_MAX) return -1;
+        p->total = n;
+        p->total_null = tnull;
+        p->total_ready = 1;
+    }
+    return 0;
+}
+
+static int cmd_find_do_impl(const char *db_root, const char *object,
                         CriteriaNode *tree,
                         JoinSpec *joins, int njoins,
                         int offset, int limit,
                         const char *proj_str, const char *excluded_csv,
                         const char *format, const char *delimiter,
                         const char *order_by, const char *order_dir,
-                        const char *cursor_json, int want_total) {
+                        const char *cursor_json,int want_total,
+                        const Schema *explicit_schema,const FieldSchema *explicit_fields) {
+    BmFindScope bm_flag_guard __attribute__((cleanup(bm_find_flag_reset))) =
+        { bm_find_candidates_disabled, bm_find_candidates_active };
+    bm_find_candidates_disabled = 0;
+    bm_find_candidates_active = 1;
+    _Atomic size_t sort_owned_bytes=0;
+    int sort_error=0;
     int rows_fmt = (format && strcmp(format, "rows") == 0);
     int dict_fmt = (format && strcmp(format, "dict") == 0);
     char csv_delim = (format && strcmp(format, "csv") == 0) ? parse_csv_delim(delimiter) : 0;
     int has_joins = (njoins > 0);
 
     /* tree is owned by caller — no free_criteria_tree here */
-    Schema sch = load_schema(db_root, object);
+    Schema sch=explicit_schema?*explicit_schema:load_schema(db_root,object);
     char data_dir[PATH_MAX];
     snprintf(data_dir, sizeof(data_dir), "%s/%s/data", db_root, object);
 
@@ -7889,7 +9574,8 @@ static int cmd_find_do(const char *db_root, const char *object,
 
     /* Resolve joins (needs driver FieldSchema to pre-resolve local fields) */
     FieldSchema driver_fs;
-    init_field_schema(&driver_fs, db_root, object);
+    if(explicit_fields)driver_fs=*explicit_fields;
+    else init_field_schema(&driver_fs,db_root,object);
     if (has_joins && resolve_joins(joins, njoins, db_root, object, &driver_fs) < 0) {
         free_joins(joins, njoins);
         free_excluded(&excluded);
@@ -7967,7 +9653,7 @@ static int cmd_find_do(const char *db_root, const char *object,
         order_by = order_norm;
     }
 
-    compile_criteria_tree(tree, driver_fs.ts);
+    if(compile_criteria_tree_checked(tree,driver_fs.ts,NULL,0)){free_joins(joins,njoins);free_excluded(&excluded);OUT("{\"error\":\"invalid criteria value\"}\n");return -1;}
 
 
     /* total+csv is not supported (CSV has no envelope to wrap). */
@@ -7983,7 +9669,7 @@ static int cmd_find_do(const char *db_root, const char *object,
        order_by field's btree directly, skipping the buffer-sort path. */
     if (cursor_json && cursor_json[0]) {
         const char *cerr = NULL;
-        FindCursor cur;
+        FindCursor cur __attribute__((cleanup(find_cursor_release)))={0};
         int cr = parse_cursor_object(cursor_json, order_by, &cur, &cerr);
         if (cr < 0) {
             OUT("{\"error\":\"%s\"}\n", cerr ? cerr : "invalid cursor");
@@ -8061,16 +9747,15 @@ static int cmd_find_do(const char *db_root, const char *object,
             for (int i = 0; i < ospec.n; i++) {
                 if (ospec.parts[i].tf && ospec.parts[i].tf->type == FT_VARCHAR) {
                     char *unesc = NULL; size_t ulen = 0;
-                    if (json_unescape_cstring(cur.part[i].value,
+                    if (json_unescape_string(cur.part[i].value,
                                               cur.part[i].vlen,
                                               &unesc, &ulen) != 0) {
                         OUT("{\"error\":\"cursor order_by value has a malformed JSON escape\"}\n");
                         free_joins(joins, njoins); free_excluded(&excluded);
                         return -1;
                     }
-                    memcpy(cur.part[i].value, unesc, ulen + 1);
-                    cur.part[i].vlen = ulen;
-                    free(unesc);
+                    free(cur.part[i].value);cur.part[i].value=unesc;
+                    cur.part[i].vlen=ulen;
                 }
             }
         }
@@ -8078,55 +9763,44 @@ static int cmd_find_do(const char *db_root, const char *object,
         /* Encode cursor value bytes for walk bounds. If cursor absent (page 1),
            walk from start (ASC) or end (DESC); else walk from cursor position,
            with tiebreak happening inside the callback. */
-        uint8_t cur_value_buf[1024];
-        size_t  cur_value_len = 0;
-        int     has_cur_bytes = 0;
-        if (cur.present) {
-            /* §2.5: interleave a tier byte before each part's encoding —
-               byte-identical to the stored composite key shape
-               ([t1][v1][t2][v2]), so cursor_find_cb's length-aware
-               memcmp + hash16 tiebreak compares tuples exactly and the
-               resume crosses NULL components with no special case. A
-               NULL part carries tier 1 and no payload. Legacy v1 tokens
-               imply tier 0 everywhere. */
-            for (int i = 0; i < ospec.n; i++) {
-                if (cur_value_len + 1 >= sizeof(cur_value_buf)) break;
-                cur_value_buf[cur_value_len++] =
-                    (char)(cur.part_tier[i] ? 0x01 : 0x00);
-                size_t plen = 0;
-                if (!cur.part_tier[i]) {
-                    if (ospec.parts[i].tf) {
-                        encode_field_for_index(ospec.parts[i].tf,
-                                               cur.part[i].value,
-                                               cur.part[i].vlen,
-                                               cur_value_buf + cur_value_len,
-                                               &plen);
-                        if (plen > sizeof(cur_value_buf) - cur_value_len)
-                            plen = sizeof(cur_value_buf) - cur_value_len;
-                    } else {
-                        plen = cur.part[i].vlen;
-                        if (plen > sizeof(cur_value_buf) - cur_value_len)
-                            plen = sizeof(cur_value_buf) - cur_value_len;
-                        memcpy(cur_value_buf + cur_value_len,
-                               cur.part[i].value, plen);
-                    }
-                } else if (ospec.parts[i].tf &&
-                           ospec.parts[i].tf->type != FT_VARCHAR) {
-                    /* §2.4.1: a NULL fixed-width component stores
-                       [0x01] + width zero bytes (canonical NULL padding,
-                       sign-flip NOT applied). The resume tuple must be
-                       byte-identical to the stored key — a bare [0x01]
-                       compares above the padding zeros and below the next
-                       component's tier byte, so cursor_find_cb's
-                       length-aware memcmp would misorder the NULL run. */
-                    plen = (size_t)ospec.parts[i].tf->size;
-                    if (plen > sizeof(cur_value_buf) - cur_value_len)
-                        plen = sizeof(cur_value_buf) - cur_value_len;
-                    memset(cur_value_buf + cur_value_len, 0, plen);
+        uint8_t cur_value_buf[544];size_t cur_value_len=0;int has_cur_bytes=0;
+        if(cur.present){
+            size_t payloads[MAX_ORDER_FIELDS]={0};
+            for(int i=0;i<ospec.n;i++){
+                if(cur.part_tier[i]){
+                    size_t width=0;int fixed=typed_index_fixed_width(driver_fs.ts,(size_t)ospec.parts[i].idx,&width);
+                    if(fixed<0){free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(errno);}
+                    payloads[i]=fixed?width:0;
+                }else {
+                    int present=typed_index_text_key_into(driver_fs.ts,(size_t)ospec.parts[i].idx,
+                        cur.part[i].value,cur.part[i].vlen,NULL,0,&payloads[i]);
+                    if(present<0){free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(errno?errno:EINVAL);}
+                    /* A data-derived probe outside the field's grammar
+                       (legacy zero/invalid stored text) encodes as an empty
+                       component, never an error. */
+                    if(present==0)payloads[i]=0;
                 }
-                cur_value_len += plen;
+                if(payloads[i]>sizeof(cur_value_buf)-cur_value_len-1){
+                    free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(E2BIG);
+                }
+                cur_value_len+=1+payloads[i];
             }
-            has_cur_bytes = 1;
+            size_t pos=0;
+            for(int i=0;i<ospec.n;i++){
+                cur_value_buf[pos++]=(uint8_t)cur.part_tier[i];
+                if(cur.part_tier[i])memset(cur_value_buf+pos,0,payloads[i]);
+                else {
+                    size_t n=0;
+                    if(typed_index_text_key_into(driver_fs.ts,(size_t)ospec.parts[i].idx,
+                         cur.part[i].value,cur.part[i].vlen,cur_value_buf+pos,
+                         sizeof(cur_value_buf)-pos,&n)<0){
+                        free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(errno);
+                    }
+                    /* n==0: out-of-grammar probe (R4) → empty component. */
+                }
+                pos+=payloads[i];
+            }
+            has_cur_bytes=1;
         }
 
         /* Derive cursor hash16 from the primary key for tiebreak. */
@@ -8148,6 +9822,9 @@ static int cmd_find_do(const char *db_root, const char *object,
         KeySet *cursor_prefilter_ks = build_keyset_from_plan(&cursor_fp,
                                                             db_root, object,
                                                             &sch, &cdl);
+        /* Optional probe: any failure (hard or budget) discards the whole
+           optimization and the walk matches full records instead. */
+        if (!cursor_prefilter_ks) errno = 0;
         if (cursor_prefilter_ks &&
             keyset_size(cursor_prefilter_ks) > g_ordered_find_keyset_max) {
             keyset_free(cursor_prefilter_ks);
@@ -8166,6 +9843,34 @@ static int cmd_find_do(const char *db_root, const char *object,
             if (narrow) {
                 keyset_free(cursor_prefilter_ks);
                 cursor_prefilter_ks = narrow;
+            } else {
+                errno = 0;   /* keep the complete broader prefilter */
+            }
+        }
+
+        /* A requested total whose count plan reads bitmap sources is
+           computed before any cursor response byte: a hard bitmap error is
+           reported as one error object, never after the page. */
+        int cursor_total_ready = 0, cursor_total_null = 1;
+        size_t cursor_total = 0;
+        if (want_total) {
+            FilterPlan pre_fp = plan_filter(tree, db_root, object, &driver_fs,
+                                            sch.splits, cursor_N_live,
+                                            NULL, 0 /*fetching*/, 0 /*limit*/);
+            if (find_plan_reads_bitmap(&pre_fp, db_root, object)) {
+                cursor_total = fp_compute_total(&pre_fp, tree, db_root, object,
+                                                &sch, &driver_fs, &cdl,
+                                                &cursor_total_null,
+                                                cursor_prefilter_ks);
+                if (cursor_total == SIZE_MAX) {
+                    int err = errno ? errno : EIO;
+                    keyset_free(cursor_prefilter_ks);
+                    prepared_find_report(err);
+                    free_joins(joins, njoins); free_excluded(&excluded);
+                    errno = err;
+                    return -1;
+                }
+                cursor_total_ready = 1;
             }
         }
 
@@ -8211,7 +9916,7 @@ static int cmd_find_do(const char *db_root, const char *object,
             size_t n_pre = keyset_size(cursor_prefilter_ks);
             struct timespec t1, t2, t3, t4;
             clock_gettime(CLOCK_MONOTONIC, &t1);
-            SmallPrefilterRow *sp_rows = calloc(n_pre, sizeof(SmallPrefilterRow));
+            SmallPrefilterRow *sp_rows=sort_array_resize(NULL,0,n_pre,&sort_owned_bytes,g_query_buffer_max_bytes);
             if (sp_rows) {
                 clock_gettime(CLOCK_MONOTONIC, &t2);
                 int n_kept = 0;
@@ -8242,12 +9947,14 @@ static int cmd_find_do(const char *db_root, const char *object,
                             fc.fs              = &driver_fs;
                             fc.order_field_idx = order_field_idx;
                             fc.ts              = driver_fs.ts;
+                            fc.sort_owned_bytes=&sort_owned_bytes;fc.sort_overflow_budget=g_query_buffer_max_bytes;
                             fc.deadline        = &cdl;
                             cursor_fetch_worker(&fc);
                             for (int r = 0; r < fc.result_count; r++) {
-                                sp_rows[n_kept++] = fc.results[r];
+                                small_row_move(&sp_rows[n_kept++],&fc.results[r]);
                             }
-                            free(fc.results);
+                            if(fc.predicate_error)sort_error=fc.predicate_error;
+                            sort_array_free(fc.results,(size_t)fc.result_count,(size_t)fc.result_cap,&sort_owned_bytes);
                         }
                     } else {
                         /* Parallel: one worker per shard group */
@@ -8264,15 +9971,17 @@ static int cmd_find_do(const char *db_root, const char *object,
                                 workers[g].fs              = &driver_fs;
                                 workers[g].order_field_idx = order_field_idx;
                                 workers[g].ts              = driver_fs.ts;
+                                workers[g].sort_owned_bytes=&sort_owned_bytes;workers[g].sort_overflow_budget=g_query_buffer_max_bytes;
                                 workers[g].deadline        = &cdl;
                             }
                             parallel_for_io(cursor_fetch_worker, workers,
                                          nshard_groups, sizeof(CursorFetchCtx));
                             for (int g = 0; g < nshard_groups; g++) {
                                 for (int r = 0; r < workers[g].result_count; r++) {
-                                    sp_rows[n_kept++] = workers[g].results[r];
+                                    small_row_move(&sp_rows[n_kept++],&workers[g].results[r]);
                                 }
-                                free(workers[g].results);
+                                if(workers[g].predicate_error)sort_error=workers[g].predicate_error;
+                                sort_array_free(workers[g].results,(size_t)workers[g].result_count,(size_t)workers[g].result_cap,&sort_owned_bytes);
                             }
                             free(workers);
                         } else {
@@ -8289,12 +9998,14 @@ static int cmd_find_do(const char *db_root, const char *object,
                                 fc.fs              = &driver_fs;
                                 fc.order_field_idx = order_field_idx;
                                 fc.ts              = driver_fs.ts;
+                            fc.sort_owned_bytes=&sort_owned_bytes;fc.sort_overflow_budget=g_query_buffer_max_bytes;
                                 fc.deadline        = &cdl;
                                 cursor_fetch_worker(&fc);
                                 for (int r = 0; r < fc.result_count; r++) {
-                                    sp_rows[n_kept++] = fc.results[r];
+                                    small_row_move(&sp_rows[n_kept++],&fc.results[r]);
                                 }
-                                free(fc.results);
+                                if(fc.predicate_error)sort_error=fc.predicate_error;
+                            sort_array_free(fc.results,(size_t)fc.result_count,(size_t)fc.result_cap,&sort_owned_bytes);
                             }
                         }
                     }
@@ -8322,24 +10033,15 @@ static int cmd_find_do(const char *db_root, const char *object,
                                 .deadline = &cdl, .dl_counter = &dl_counter,
                                 .hash_map = hmap,
                                 .passed = passed, .n_kept = &n_kept,
+                                .sort_owned_bytes=&sort_owned_bytes,.sort_overflow_budget=g_query_buffer_max_bytes,
                             };
-                            slotcask_bulk_resolve_and_fetch(sdb, hashes,
-                                                             n_pre, &d2_ctx,
-                                                             d2_batch_cb);
-                            if (n_kept > 0) {
+                            if(slotcask_bulk_resolve_and_fetch(sdb,hashes,n_pre,&d2_ctx,d2_batch_cb)<0)
+                                sort_error=errno?errno:EIO;
+                            for(size_t pi=0;pi<n_pre;pi++)if(passed[pi]<0)sort_error=-passed[pi];
+                            if (!sort_error && n_kept > 0) {
                                 int keep = 0;
                                 for (size_t i = 0; i < n_pre; i++) {
-                                    if (passed[i]) {
-                                        if (keep != (int)i)
-                                            memcpy(sp_rows[keep].hash, sp_rows[i].hash, 16);
-                                        if (keep != (int)i) {
-                                            memcpy(sp_rows[keep].sort_key,
-                                                   sp_rows[i].sort_key,
-                                                   sp_rows[i].sort_key_len);
-                                            sp_rows[keep].sort_key_len = sp_rows[i].sort_key_len;
-                                        }
-                                        keep++;
-                                    }
+                                    if(passed[i]>0){small_row_move(&sp_rows[keep++],&sp_rows[i]);}
                                 }
                                 n_kept = keep;
                             }
@@ -8348,28 +10050,30 @@ static int cmd_find_do(const char *db_root, const char *object,
                         free(passed);
                         free(hmap);
                     }
-                    if (n_kept == 0) {
+                    if (!sort_error && n_kept == 0) {
                         for (size_t i = 0; i < n_pre; i++) {
                             RecordRef rr;
                             if (read_record_ref(db_root, object, &sch,
                                                 sp_rows[i].hash, &rr) != 0) continue;
-                            if (tree && !criteria_match_tree((const uint8_t *)rr.val, rr.vlen,
-                                                              tree, &driver_fs, rr.hdr2)) {
-                                release_record_ref(&rr);
-                                continue;
+                            int matched=0;
+                            if(criteria_match_tree_checked(rr.val,rr.vlen,tree,&driver_fs,rr.hdr2,&matched)){
+                                sort_error=errno?errno:EILSEQ;release_record_ref(&rr);break;
                             }
-                            if (n_kept != (int)i)
-                                memcpy(sp_rows[n_kept].hash, sp_rows[i].hash, 16);
-                            typed_field_to_index_key_rec(driver_fs.ts,
-                                                     (const uint8_t *)rr.val,
-                                                     rr.vlen, rr.hdr2,
-                                                     order_field_idx,
-                                                     sp_rows[n_kept].sort_key,
-                                                     &sp_rows[n_kept].sort_key_len);
-                            n_kept++;
+                            if(!matched){release_record_ref(&rr);continue;}
+                            SmallPrefilterRow candidate={0};memcpy(candidate.hash,sp_rows[i].hash,16);
+                            if(small_row_build(&candidate,driver_fs.ts,rr.val,rr.vlen,rr.hdr2,
+                                order_field_idx,&sort_owned_bytes,g_query_buffer_max_bytes)){
+                                sort_error=errno?errno:EILSEQ;release_record_ref(&rr);break;
+                            }
+                            small_row_move(&sp_rows[n_kept++],&candidate);
                             release_record_ref(&rr);
                         }
                     }
+                }
+                if(sort_error){
+                    sort_array_free(sp_rows,n_pre,n_pre,&sort_owned_bytes);
+                    keyset_free(cursor_prefilter_ks);free_joins(joins,njoins);free_excluded(&excluded);
+                    return sort_request_error(sort_error);
                 }
                 clock_gettime(CLOCK_MONOTONIC, &t3);
                 qsort(sp_rows, (size_t)n_kept, sizeof(SmallPrefilterRow),
@@ -8415,12 +10119,20 @@ static int cmd_find_do(const char *db_root, const char *object,
                 cc.parent_out      = g_out;
                 OUT(dict_fmt ? "{\"rows\":{" : "{\"rows\":[");
                 for (int i = 0; i < n_kept; i++) {
-                    if (cursor_find_cb((const char *)sp_rows[i].sort_key,
+                    if (cursor_find_cb((const char *)small_row_key(&sp_rows[i]),
                                        sp_rows[i].sort_key_len,
                                        sp_rows[i].hash, NULL, &cc) < 0) break;
                 }
+                if(cc.predicate_error){
+                    int error=cc.predicate_error;
+                    sort_array_free(sp_rows,n_pre,n_pre,&sort_owned_bytes);
+                    for(int i=0;i<MAX_ORDER_FIELDS;i++)free(cc.last_value[i]);
+            free(cc.last_key_str);
+                    keyset_free(cursor_prefilter_ks);free_joins(joins,njoins);free_excluded(&excluded);
+                    errno=error;return -1;
+                }
                 OUT(dict_fmt ? "}" : "]");
-                if (cc.printed >= limit && cc.last_key_str) {
+                if (!cc.predicate_error && cc.printed >= limit && cc.last_key_str) {
                     int vals_ok = 1;
                     for (int i = 0; i < ospec.n; i++)
                         /* A NULL part (tier 1) has no value string — that
@@ -8450,16 +10162,18 @@ static int cmd_find_do(const char *db_root, const char *object,
                         &driver_fs, sch.splits, cursor_N_live,
                         NULL, 0 /*fetching*/, 0 /*limit*/);
                     int tnull = 1;
-                    size_t ctotal = fp_compute_total(&count_fp, tree, db_root,
-                                                     object, &sch, &driver_fs,
-                                                     &cdl, &tnull,
-                                                     cursor_prefilter_ks);
+                    size_t ctotal = cursor_total_ready ? cursor_total
+                        : fp_compute_total(&count_fp, tree, db_root,
+                                           object, &sch, &driver_fs,
+                                           &cdl, &tnull,
+                                           cursor_prefilter_ks);
+                    if (cursor_total_ready) tnull = cursor_total_null;
                     if (tnull && tree == NULL) { ctotal = cursor_N_live; tnull = 0; }
                     if (tnull) OUT(",\"total\":null");
                     else       OUT(",\"total\":%zu", ctotal);
                 }
                 OUT("}\n");
-                free(sp_rows);
+                sort_array_free(sp_rows,n_pre,n_pre,&sort_owned_bytes);
                 for (int i = 0; i < MAX_ORDER_FIELDS; i++) free(cc.last_value[i]);
                 free(cc.last_key_str);
                 keyset_free(cursor_prefilter_ks);
@@ -8503,7 +10217,10 @@ static int cmd_find_do(const char *db_root, const char *object,
            swaps the inner array for an object. */
         OrderWalkBounds owb;
         if (ospec.n == 1) {
-            order_walk_bounds(tree, &driver_fs, order_by, &owb);
+            if(order_walk_bounds_checked(tree,&driver_fs,order_by,&owb)){
+                int error=errno;keyset_free(cursor_prefilter_ks);
+                free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(error);
+            }
         } else {
             /* Multi-field: walk the composite's full range; range/eq
                bound folding into the walk is single-field only. */
@@ -8556,11 +10273,18 @@ static int cmd_find_do(const char *db_root, const char *object,
                                    hi_b, hi_l, hi_e,
                                    0, cursor_find_cb, &cc);
         }
+        if(cc.predicate_error){
+            int error=cc.predicate_error;
+            if(cursor_prefilter_ks)keyset_free(cursor_prefilter_ks);
+            for(int i=0;i<MAX_ORDER_FIELDS;i++)free(cc.last_value[i]);
+            free(cc.last_key_str);
+            free_joins(joins,njoins);free_excluded(&excluded);errno=error;return -1;
+        }
         OUT(dict_fmt ? "}" : "]");
 
         /* Emit next-page cursor if we actually hit the limit (there might be
            more). If printed < limit the walk drained to the end → null. */
-        if (cc.printed >= limit && cc.last_key_str) {
+        if (!cc.predicate_error && cc.printed >= limit && cc.last_key_str) {
             int vals_ok = 1;
             for (int i = 0; i < ospec.n; i++)
                 /* NULL part (tier 1) carries no value string — see the
@@ -8588,10 +10312,12 @@ static int cmd_find_do(const char *db_root, const char *object,
                 &driver_fs, sch.splits, cursor_N_live,
                 NULL, 0 /*fetching*/, 0 /*limit*/);
             int tnull = 1;
-            size_t ctotal = fp_compute_total(&count_fp, tree, db_root,
-                                             object, &sch, &driver_fs,
-                                             &cdl, &tnull,
-                                             cursor_prefilter_ks);
+            size_t ctotal = cursor_total_ready ? cursor_total
+                : fp_compute_total(&count_fp, tree, db_root,
+                                   object, &sch, &driver_fs,
+                                   &cdl, &tnull,
+                                   cursor_prefilter_ks);
+            if (cursor_total_ready) tnull = cursor_total_null;
             if (tnull && tree == NULL) { ctotal = cursor_N_live; tnull = 0; }
             if (tnull) OUT(",\"total\":null");
             else       OUT(",\"total\":%zu", ctotal);
@@ -8633,6 +10359,33 @@ static int cmd_find_do(const char *db_root, const char *object,
        Populated below for the kinds that can cheaply compute a total. */
     size_t find_total = 0;
     int    find_total_null = 1;
+
+    PreparedBitmapFind prep;
+    memset(&prep, 0, sizeof(prep));
+    {
+        size_t test_limit = query_test_prepared_budget_limit_value();
+        prep.budget.limit = test_limit ? test_limit
+                                       : (size_t)g_query_buffer_max_bytes;
+    }
+    atomic_init(&prep.budget.used, 0);
+    atomic_init(&prep.budget.peak, 0);
+    if (prepared_find_prepare(&prep, &fp, tree, db_root, object, &sch,
+                              (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+                              &dl, (order_by && order_by[0] && !has_joins),
+                              has_joins, rows_fmt, csv_delim != 0, njoins,
+                              offset, limit, want_total, order_by) != 0) {
+        int err = errno ? errno : EIO;
+        prepared_find_destroy(&prep);
+        bm_find_candidates_disabled = prep.record_fallback;
+        prepared_find_report(err);
+        free_excluded(&excluded);
+        free_joins(joins, njoins);
+        errno = err;
+        return -1;   /* guard clears the flag */
+    }
+    bm_find_candidates_disabled = prep.record_fallback;
+    /* Candidate-derived totals are invalid once recovery discarded them;
+       prepared_find_recover already recomputed from the full record scan. */
 
     if (has_joins) {
         /* Joined queries are tabular by default (rows_fmt-style). format=csv
@@ -8685,8 +10438,9 @@ static int cmd_find_do(const char *db_root, const char *object,
             tree, &excluded, offset, limit,
             proj_fields, proj_count, dict_fmt, &dl);
         size_t ex_total = 0; int ex_null = 1;
-        if (want_total) ex_total = fp_compute_total(&fp, tree, db_root, object,
-                                                    &sch, &driver_fs, &dl, &ex_null, NULL);
+        if (want_total) ex_total = prepared_or_fp_total(&prep, &fp, tree, db_root, object,
+                                                    &sch, &driver_fs, &dl, &ex_null);
+        if(ex_total==SIZE_MAX){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (dict_fmt) {
             if (!want_total) OUT("}\n");
             else if (ex_null) OUT("},\"total\":null}\n");
@@ -8704,20 +10458,24 @@ static int cmd_find_do(const char *db_root, const char *object,
         !has_joins && !rows_fmt && !csv_delim && fp.n_source >= 1) {
         int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
                                   strcmp(order_dir, "DESC") == 0));
-        find_via_composite_prefix(
+        int composite_rc=find_via_composite_prefix(
             db_root, object, &sch,
             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
             fp.source_leaves[0], order_by, desc,
             fp.order_range,
             tree, &excluded, offset, limit,
             proj_fields, proj_count, dict_fmt, &dl);
+        if(composite_rc==-2)goto find_ordered_fallback;
+        if(composite_rc<0){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
+
         /* Close the envelope opened above and return.  When want_total,
          * compute the real match count via fp_compute_total (extra walk —
          * same work the client would do firing a separate count; this
          * consolidates it into the find round-trip). */
         size_t d1_total = 0; int d1_null = 1;
-        if (want_total) d1_total = fp_compute_total(&fp, tree, db_root, object,
-                                                    &sch, &driver_fs, &dl, &d1_null, NULL);
+        if (want_total) d1_total = prepared_or_fp_total(&prep, &fp, tree, db_root, object,
+                                                    &sch, &driver_fs, &dl, &d1_null);
+        if(d1_total==SIZE_MAX){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (dict_fmt) {
             if (!want_total) OUT("}\n");
             else if (d1_null) OUT("},\"total\":null}\n");
@@ -8745,17 +10503,18 @@ static int cmd_find_do(const char *db_root, const char *object,
            ordered-collect + in-memory sort path. */
         int desc = (order_dir && (strcmp(order_dir, "desc") == 0 ||
                                   strcmp(order_dir, "DESC") == 0));
-        find_via_order_index_walk(
+        if(find_via_order_index_walk(
             db_root, object, &sch,
             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
             order_by, desc,
             tree, &excluded, offset, limit,
-            proj_fields, proj_count, dict_fmt, &dl);
+            proj_fields, proj_count, dict_fmt, &dl)<0){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         /* Close the envelope opened above and return.  When want_total,
          * compute the real match count via fp_compute_total. */
         size_t d3_total = 0; int d3_null = 1;
-        if (want_total) d3_total = fp_compute_total(&fp, tree, db_root, object,
-                                                    &sch, &driver_fs, &dl, &d3_null, NULL);
+        if (want_total) d3_total = prepared_or_fp_total(&prep, &fp, tree, db_root, object,
+                                                    &sch, &driver_fs, &dl, &d3_null);
+        if(d3_total==SIZE_MAX){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (dict_fmt) {
             if (!want_total) OUT("}\n");
             else if (d3_null) OUT("},\"total\":null}\n");
@@ -8771,6 +10530,7 @@ static int cmd_find_do(const char *db_root, const char *object,
     } else if (fp.order == FP_ORDER_SORT &&
                !has_joins && !rows_fmt && !csv_delim &&
                fp.n_source > 0 &&
+               !prep.record_fallback &&   /* ordered-collect instead */
                (!order_by || strchr(order_by, ',') == NULL)) {
         /* ===== D2: fetch-and-sort with streaming top-N =====
            When plan_filter selected FP_ORDER_SORT the seed leaf's
@@ -8800,12 +10560,19 @@ static int cmd_find_do(const char *db_root, const char *object,
             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
             &fp, order_by, desc,
             tree, &excluded, offset, limit,
-            proj_fields, proj_count, dict_fmt, &dl);
+            proj_fields, proj_count, dict_fmt, &dl,
+            prep.d2_prefilter, prep.d2_ready, &prep.budget);
+        prep.d2_prefilter = NULL;   /* ownership handed off */
+        if(d2_matched==SIZE_MAX){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (dict_fmt) {
             if (!want_total) OUT("}\n");
+            else if (prep.total_ready && prep.total_null)
+                OUT("},\"total\":null}\n");
             else OUT("},\"total\":%zu}\n", d2_matched);
         } else {
             if (!want_total) OUT("]\n");
+            else if (prep.total_ready && prep.total_null)
+                OUT("],\"total\":null}\n");
             else OUT("],\"total\":%zu}\n", d2_matched);
         }
         free_excluded(&excluded);
@@ -8864,6 +10631,9 @@ static int cmd_find_do(const char *db_root, const char *object,
                CSV fallback path doesn't waste a build. */
             KeySet *prefilter_ks = build_keyset_from_plan(&fp, db_root,
                                                          object, &sch, &dl);
+            /* Optional probe: any failure discards the whole optimization
+               and the walk matches full records instead. */
+            if (!prefilter_ks) errno = 0;
             if (prefilter_ks &&
                 keyset_size(prefilter_ks) > g_ordered_find_keyset_max) {
                 keyset_free(prefilter_ks);
@@ -8882,6 +10652,8 @@ static int cmd_find_do(const char *db_root, const char *object,
                 if (narrow) {
                     keyset_free(prefilter_ks);
                     prefilter_ks = narrow;
+                } else {
+                    errno = 0;   /* keep the complete broader prefilter */
                 }
             }
 
@@ -8935,7 +10707,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                                      fp.source_is_bitmap) &&
                     order_tf && driver_fs.ts && order_field_idx >= 0) {
                 size_t n_pre = keyset_size(prefilter_ks);
-                SmallPrefilterRow *rows = calloc(n_pre, sizeof(SmallPrefilterRow));
+                SmallPrefilterRow *rows=sort_array_resize(NULL,0,n_pre,&sort_owned_bytes,g_query_buffer_max_bytes);
                 if (rows) {
                     SmallPrefilterCollect ca = { rows, n_pre, 0 };
                     keyset_iter(prefilter_ks, small_prefilter_collect_cb, &ca);
@@ -8966,24 +10738,16 @@ static int cmd_find_do(const char *db_root, const char *object,
                                 .deadline = &dl, .dl_counter = &dl_counter,
                                 .hash_map = hmap,
                                 .passed = passed, .n_kept = &n_kept,
+                                .sort_owned_bytes=&sort_owned_bytes,.sort_overflow_budget=g_query_buffer_max_bytes,
                             };
-                            slotcask_bulk_resolve_and_fetch(sdb, hashes,
-                                                             n_pre, &d2_ctx,
-                                                             d2_batch_cb);
+                            if(slotcask_bulk_resolve_and_fetch(sdb,hashes,n_pre,&d2_ctx,d2_batch_cb)<0)
+                                sort_error=errno?errno:EIO;
+                            for(size_t pi=0;pi<n_pre;pi++)if(passed[pi]<0)sort_error=-passed[pi];
                         }
-                        if (n_kept > 0 && hashes && passed && hmap) {
+                        if (!sort_error && n_kept > 0 && hashes && passed && hmap) {
                             int keep = 0;
                             for (size_t i = 0; i < n_pre; i++) {
-                                if (passed[i]) {
-                                    if (keep != (int)i)
-                                        memcpy(rows[keep].hash, rows[i].hash, 16);
-                                    if (keep != (int)i) {
-                                        memcpy(rows[keep].sort_key, rows[i].sort_key,
-                                               rows[i].sort_key_len);
-                                        rows[keep].sort_key_len = rows[i].sort_key_len;
-                                    }
-                                    keep++;
-                                }
+                                if(passed[i]>0){small_row_move(&rows[keep++],&rows[i]);}
                             }
                             n_kept = keep;
                         }
@@ -8991,29 +10755,32 @@ static int cmd_find_do(const char *db_root, const char *object,
                         free(passed);
                         free(hmap);
                     }
-                    if (n_kept == 0) {
+                    if (!sort_error && n_kept == 0) {
                         for (size_t i = 0; i < n_pre; i++) {
                             RecordRef rr;
                             if (read_record_ref(db_root, object, &sch,
                                                  rows[i].hash, &rr) != 0) continue;
-                            if (tree && !criteria_match_tree((const uint8_t *)rr.val, rr.vlen,
-                                                               tree, &driver_fs, rr.hdr2)) {
-                                release_record_ref(&rr);
-                                continue;
+                            int matched=0;
+                            if(criteria_match_tree_checked(rr.val,rr.vlen,tree,&driver_fs,rr.hdr2,&matched)){
+                                sort_error=errno?errno:EILSEQ;release_record_ref(&rr);break;
                             }
-                            if (n_kept != (int)i)
-                                memcpy(rows[n_kept].hash, rows[i].hash, 16);
-                            typed_field_to_index_key_rec(driver_fs.ts,
-                                                     (const uint8_t *)rr.val,
-                                                     rr.vlen, rr.hdr2,
-                                                     order_field_idx,
-                                                     rows[n_kept].sort_key,
-                                                     &rows[n_kept].sort_key_len);
-                            n_kept++;
+                            if(!matched){release_record_ref(&rr);continue;}
+                            SmallPrefilterRow candidate={0};memcpy(candidate.hash,rows[i].hash,16);
+                            if(small_row_build(&candidate,driver_fs.ts,rr.val,rr.vlen,rr.hdr2,
+                                order_field_idx,&sort_owned_bytes,g_query_buffer_max_bytes)){
+                                sort_error=errno?errno:EILSEQ;release_record_ref(&rr);break;
+                            }
+                            small_row_move(&rows[n_kept++],&candidate);
                             release_record_ref(&rr);
                         }
                     }
 
+                    if(sort_error){
+                        sort_array_free(rows,n_pre,n_pre,&sort_owned_bytes);keyset_free(prefilter_ks);
+                        OUT(dict_fmt?(want_total?"},\"total\":null}\n":"}\n"):
+                            (want_total?"],\"total\":null}\n":"]\n"));
+                        free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(sort_error);
+                    }
                     qsort(rows, (size_t)n_kept, sizeof(SmallPrefilterRow),
                           desc ? small_prefilter_cmp_desc
                                : small_prefilter_cmp_asc);
@@ -9052,10 +10819,12 @@ static int cmd_find_do(const char *db_root, const char *object,
                         if (cursor_find_cb("", 0, rows[i].hash, NULL, &cc) < 0) break;
                     }
 
-                    free(rows);
+                    sort_array_free(rows,n_pre,n_pre,&sort_owned_bytes);
                     for (int i = 0; i < MAX_ORDER_FIELDS; i++) free(cc.last_value[i]);
                     free(cc.last_key_str);
                     keyset_free(prefilter_ks);
+
+                    if(cc.predicate_error){free_joins(joins,njoins);free_excluded(&excluded);errno=cc.predicate_error;return -1;}
 
                     /* Phase 1d.2: small-prefilter sorted all candidates
                        before emitting, so n_kept is the exact total.
@@ -9102,7 +10871,10 @@ static int cmd_find_do(const char *db_root, const char *object,
 
             {
                 OrderWalkBounds owb;
-                order_walk_bounds(tree, &driver_fs, order_by, &owb);
+                if(order_walk_bounds_checked(tree,&driver_fs,order_by,&owb)){
+                    int error=errno;if(prefilter_ks)keyset_free(prefilter_ks);
+                    free_joins(joins,njoins);free_excluded(&excluded);errno=error;return -1;
+                }
                 /* No keyset cursor on this path (offset_mode) — unbounded
                    sides pass through OPEN so NULL-tier rows join the
                    ordered stream (§2.5). */
@@ -9116,6 +10888,12 @@ static int cmd_find_do(const char *db_root, const char *object,
                                        lo_b, lo_l, lo_e,
                                        hi_b, hi_l, hi_e,
                                        desc, cursor_find_cb, &cc);
+            }
+            if(cc.predicate_error){
+                int error=cc.predicate_error;if(prefilter_ks)keyset_free(prefilter_ks);
+                for(int i=0;i<MAX_ORDER_FIELDS;i++)free(cc.last_value[i]);
+            free(cc.last_key_str);
+                free_joins(joins,njoins);free_excluded(&excluded);errno=error;return -1;
             }
             if (dict_fmt) {
                 if (!want_total) OUT("}\n");
@@ -9140,6 +10918,7 @@ static int cmd_find_do(const char *db_root, const char *object,
         }
     }
 
+find_ordered_fallback: ;
     if (has_order) {
         /* ===== ORDERED FIND — buffered fallback =====
            Reached when order_by isn't indexed, excluded keys are present,
@@ -9162,7 +10941,7 @@ static int cmd_find_do(const char *db_root, const char *object,
 
         scan_dispatch(db_root, object, &sch, data_dir, ordered_collect_cb, &oc);
 
-        if (oc.budget_exceeded) {
+        if (oc.budget_exceeded||oc.predicate_error) {
             LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: query buffer cap exceeded during ordered sort/fetch (object=%s)", object);
             for (size_t i = 0; i < oc.count; i++) {
                 free(oc.rows[i].key); free(oc.rows[i].record);
@@ -9170,85 +10949,27 @@ static int cmd_find_do(const char *db_root, const char *object,
             }
             free(oc.rows);
             pthread_mutex_destroy(&oc.lock);
-            OUT(QUERY_BUFFER_ERR);
-            free_excluded(&excluded);
-            free_joins(joins, njoins);
-            return -1;
+            OUT(dict_fmt?(want_total?"},\"total\":null}\n":"}\n"):
+                (want_total?"],\"total\":null}\n":"]\n"));
+            free_excluded(&excluded);free_joins(joins,njoins);
+            return sort_request_error(oc.predicate_error?oc.predicate_error:ENOBUFS);
         }
 
         if (oc.count > 1)
             qsort(oc.rows, oc.count, sizeof(OrderedRow), cmp_row_asc);
 
-        size_t start = offset > 0 ? (size_t)offset : 0;
-        size_t end = (limit > 0) ? start + (size_t)limit : oc.count;
-        if (end > oc.count) end = oc.count;
-        int printed = 0;
-        for (size_t i = start; i < end; i++) {
-            OrderedRow *r = &oc.rows[i];
-            char wire_key[1100];
-            format_query_wire_key(&driver_fs, (const uint8_t *)r->key,
-                                  r->key_len, wire_key);
-            const uint8_t *val = r->record + r->key_len;
-            if (csv_delim) {
-                csv_emit_row(wire_key, val, r->value_len,
-                             proj_count > 0 ? proj_fields : NULL,
-                             proj_count, &driver_fs, csv_delim, r->hdr2);
-                printed++;
-                continue;
-            }
-            if (rows_fmt) {
-                OUT("%s[\"%s\"", printed ? "," : "", wire_key);
-                if (proj_count > 0) {
-                    for (int j = 0; j < proj_count; j++) {
-                        char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs, r->hdr2);
-                        OUT(",%s", pv ? pv : "\"\"");
-                        free(pv);
-                    }
-                } else if (driver_fs.ts) {
-                    for (int j = 0; j < driver_fs.ts->nfields; j++) {
-                        if (driver_fs.ts->fields[j].removed) continue;
-                        char *pv = json_typed_row_cell(driver_fs.ts,
-                                                       (const uint8_t *)val,
-                                                       (int)r->value_len, j,
-                                                       r->hdr2);
-                        OUT(",%s", pv ? pv : "\"\"");
-                        free(pv);
-                    }
-                }
-                OUT("]");
-            } else if (dict_fmt) {
-                OUT("%s\"%s\":", printed ? "," : "", wire_key);
-                if (proj_count > 0) {
-                    OUT("{");
-                    int first = 1;
-                    for (int j = 0; j < proj_count; j++) {
-                        char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs, r->hdr2);
-                        if (!pv) continue;
-                        OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
-                        first = 0;
-                        free(pv);
-                    }
-                    OUT("}");
-                } else {
-                    char *v = decode_value((const char *)val, r->value_len, &driver_fs, r->hdr2);
-                    OUT("%s", v);
-                    free(v);
-                }
-            } else if (proj_count > 0) {
-                OUT("%s{\"key\":\"%s\",\"value\":{", printed ? "," : "", wire_key);
-                int first = 1;
-                for (int j = 0; j < proj_count; j++) {
-                    char *pv = json_projected_field((const char *)val, r->value_len, proj_fields[j], &driver_fs, r->hdr2);
-                    if (!pv) continue;
-                    OUT("%s\"%s\":%s", first ? "" : ",", proj_fields[j], pv);
-                    first = 0;
-                    free(pv);
-                }
-                OUT("}}");
-            } else {
-                char *v = decode_value((const char *)val, r->value_len, &driver_fs, r->hdr2);
-                OUT("%s{\"key\":\"%s\",\"value\":%s}", printed ? "," : "", wire_key, v);
-                free(v);
+        size_t start=offset>0?(size_t)offset:0;
+        size_t end=limit>0?start+(size_t)limit:oc.count;
+        if(end>oc.count)end=oc.count;
+        int printed=0,emit_error=0;
+        for(size_t i=start;i<end;i++){
+            OrderedRow *r=&oc.rows[i];char wire_key[1100];
+            format_query_wire_key(&driver_fs,(const uint8_t*)r->key,r->key_len,wire_key);
+            const uint8_t *value=r->record+r->key_len;
+            if(typed_query_emit_row(g_out,wire_key,strlen(wire_key),value,r->value_len,r->hdr2,
+                &driver_fs,proj_count>0?proj_fields:NULL,proj_count,rows_fmt,dict_fmt,
+                csv_delim,printed>0,NULL,0,NULL,g_query_buffer_max_bytes)){
+                emit_error=errno?errno:EILSEQ;break;
             }
             printed++;
         }
@@ -9260,6 +10981,79 @@ static int cmd_find_do(const char *db_root, const char *object,
         }
         free(oc.rows);
         pthread_mutex_destroy(&oc.lock);
+        if(emit_error){free_excluded(&excluded);free_joins(joins,njoins);errno=emit_error;return -1;}
+    } else if (prep.route != PREP_NONE && !prep.record_fallback) {
+        /* ===== Prepared bitmap sources (candidates built pre-emission) =====
+           Bitmap reads already happened before the envelope; only record
+           fetch, filtering, pagination and emission remain. The former
+           small-limit streaming shapes fetch one record at a time; the
+           already-buffered shapes keep keyset_emit_find. */
+        FieldSchema *pfs = (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL;
+        int prc = 0;
+        if (prep.ks) {
+            if (prep.route == PREP_STREAM)
+                prc = prepared_bitmap_find_stream(db_root, object, &sch, prep.ks,
+                                                  tree, &excluded, offset, limit,
+                                                  proj_fields, proj_count, pfs,
+                                                  rows_fmt, dict_fmt, csv_delim, &dl);
+            else
+                prc = keyset_emit_find(db_root, object, &sch, prep.ks,
+                                       prep.need_rematch ? tree : NULL,
+                                       &excluded, offset, limit,
+                                       proj_fields, proj_count, pfs,
+                                       rows_fmt, dict_fmt, csv_delim,
+                                       joins, njoins, &dl);
+        }
+        prepared_find_destroy(&prep);
+        if (prc < 0) { free_excluded(&excluded); free_joins(joins, njoins); return -1; }
+        if (want_total && prep.total_ready) {
+            find_total = prep.total;
+            find_total_null = prep.total_null;
+        }
+    } else if (prep.record_fallback) {
+        /* ===== Whole-record recovery (one-way) =====
+           Candidate capacity overflow: run the existing full-record
+           executors with the original criteria, exclusions, joins,
+           projection, offset/limit and formatting. No bitmap candidates,
+           prefilters or probes run again (build_keyset_from_plan refuses);
+           the deadline is the same object; no re-plan into bitmap routes. */
+        FieldSchema *rfs = (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL;
+        const CompiledCriterion *fast_cc = NULL;
+        if (tree) {
+            const CriteriaNode *leaf = NULL;
+            if (tree->kind == CNODE_LEAF) leaf = tree;
+            else if (tree->kind == CNODE_AND && tree->n_children == 1 &&
+                     tree->children[0]->kind == CNODE_LEAF) leaf = tree->children[0];
+            if (leaf && leaf->compiled) fast_cc = leaf->compiled;
+        }
+        AdvSearchCtx rctx = { tree, fast_cc, offset, limit, 0, 0,
+                              proj_fields, proj_count, excluded, rfs,
+                              rows_fmt, dict_fmt, csv_delim,
+                              object, joins, njoins, db_root, &dl, 0,
+                              PTHREAD_MUTEX_INITIALIZER, 0 };
+        int use_streaming = (limit > 0 && limit <= 1000) &&
+                            !has_order;   /* ordered shapes use ordered-collect */
+        if (use_streaming) {
+            SlotcaskSchemaInfo info = {
+                .splits = sch.splits, .slot_size = sch.slot_size,
+                .streams = sch.streams,
+            };
+            SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
+            if (sdb) scan_shards_v2_streaming(sdb, adv_search_cb, &rctx);
+            else scan_dispatch(db_root, object, &sch, data_dir, adv_search_cb, &rctx);
+        } else {
+            scan_dispatch(db_root, object, &sch, data_dir, adv_search_cb, &rctx);
+        }
+        pthread_mutex_destroy(&rctx.lock);
+        if (rctx.predicate_error) {
+            free_excluded(&excluded); free_joins(joins, njoins);
+            errno = rctx.predicate_error; return -1;
+        }
+        if (want_total && prep.total_ready) {
+            find_total = prep.total;
+            find_total_null = prep.total_null;
+        }
+        prepared_find_destroy(&prep);
     } else if (limit > 0 && (offset + limit) <= 1000 && njoins == 0 && !rows_fmt &&
                (fp.kind == FP_INTERSECT ||
                 ((fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) &&
@@ -9289,11 +11083,11 @@ static int cmd_find_do(const char *db_root, const char *object,
             : (fp.n_source > 0 ? fp.source_leaves[0] : NULL);
         if (!primary) goto find_full_scan;
         int check_primary = op_needs_check_primary(primary->op);
-        idx_find_streaming(db_root, object, &sch, primary, check_primary,
+        if(idx_find_streaming(db_root, object, &sch, primary, check_primary,
                            tree, &excluded, offset, limit,
                            proj_fields, proj_count,
                            (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
-                           rows_fmt, dict_fmt, csv_delim, &dl);
+                           rows_fmt, dict_fmt, csv_delim, &dl)<0){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         /* Streaming fast path: compute total after the emit walk.
            FP_PRIMARY_LEAF / FP_BITMAP_SMALLER → idx_count_for_leaf on seed leaf
            gives the exact match count.
@@ -9309,12 +11103,12 @@ static int cmd_find_do(const char *db_root, const char *object,
         }
     } else if (fp.kind == FP_INTERSECT) {
         /* ===== AND INDEX-INTERSECTION FIND ===== */
-        keyset_find_from_intersect(db_root, object, &sch, &fp, tree,
+        if(keyset_find_from_intersect(db_root, object, &sch, &fp, tree,
                                    &excluded, offset, limit,
                                    proj_fields, proj_count,
                                    (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                                    rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl,
-                                   want_total ? &find_total : NULL);
+                                   want_total ? &find_total : NULL)<0){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (want_total && !dl.timed_out) find_total_null = 0;
     } else if (fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) {
         /* ===== INDEXED FIND: collect → group by shard → parallel process ===== */
@@ -9344,11 +11138,12 @@ static int cmd_find_do(const char *db_root, const char *object,
                materialise), no rows_fmt (table envelope), no csv_delim
                (header row).  Those cases fall through to the keyset path. */
             if (pc->op == OP_STARTS_WITH && !has_joins && !rows_fmt && !csv_delim) {
-                find_via_trigram_starts_with(
+                int trc = find_via_trigram_starts_with(
                     db_root, object, &sch,
                     (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                     pc, tree, &excluded, offset, limit,
                     proj_fields, proj_count, dict_fmt, &dl);
+                if (trc < 0) { free_excluded(&excluded); free_joins(joins, njoins); return -1; }
                 /* Close the envelope opened above and return. */
                 if (dict_fmt)
                     OUT(want_total ? "},\"total\":null}\n" : "}\n");
@@ -9402,6 +11197,7 @@ static int cmd_find_do(const char *db_root, const char *object,
         }
 
         find_emit_close:
+        if(rc==-1){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (rc == -2) {
             LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: scan dispatch returned rc=-2 (query buffer cap exceeded, object=%s)", object);
             if (csv_delim) { /* nothing to close */ }
@@ -9415,11 +11211,11 @@ static int cmd_find_do(const char *db_root, const char *object,
     } else if (fp.kind == FP_UNION) {
         /* ===== OR INDEX-UNION FIND ===== */
         int budget_exceeded = 0;
-        keyset_find_from_or(db_root, object, &sch, tree, fp.or_node,
+        if(keyset_find_from_or(db_root, object, &sch, tree, fp.or_node,
                             &excluded, offset, limit, proj_fields, proj_count,
                             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                             rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl, &budget_exceeded,
-                            want_total ? &find_total : NULL);
+                            want_total ? &find_total : NULL)<0){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (!budget_exceeded && want_total && !dl.timed_out) find_total_null = 0;
         if (budget_exceeded) {
             LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: query buffer cap exceeded during OR union (object=%s)", object);
@@ -9451,7 +11247,7 @@ static int cmd_find_do(const char *db_root, const char *object,
                              proj_fields, proj_count, excluded, &driver_fs,
                              rows_fmt, dict_fmt, csv_delim,
                              object, joins, njoins, db_root, &dl, 0,
-                             PTHREAD_MUTEX_INITIALIZER };
+                             PTHREAD_MUTEX_INITIALIZER, 0 };
         /* Limit-bound full scan? Use the streaming walker so cb's stop
            response is per-record. Otherwise the buffered Pass-1 path
            collects refs the limit will never read. Same threshold + form
@@ -9469,8 +11265,10 @@ static int cmd_find_do(const char *db_root, const char *object,
             scan_dispatch(db_root, object, &sch, data_dir, adv_search_cb, &ctx);
         }
         pthread_mutex_destroy(&ctx.lock);
+        if(ctx.predicate_error){free_excluded(&excluded);free_joins(joins,njoins);errno=ctx.predicate_error;return -1;}
     }
 
+    if(find_total==SIZE_MAX){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
     if (csv_delim)
         { /* CSV body already ends with its own \n per row — nothing to close (joined or not) */ }
     else if (want_total) {
@@ -9479,16 +11277,20 @@ static int cmd_find_do(const char *db_root, const char *object,
          * shared fp_compute_total helper. Falls back to null when the
          * plan can't cheaply produce a count (e.g. FP_FULL_SCAN — caller
          * can fire a separate count query for those rare shapes). */
-        if (find_total_null && !dl.timed_out) {
+        if (find_total_null && prep.total_ready) {
+            find_total = prep.total;
+            find_total_null = prep.total_null;
+        } else if (find_total_null && !dl.timed_out) {
             int helper_null = 1;
             size_t n = fp_compute_total(&fp, tree, db_root, object,
                                          &sch, &driver_fs, &dl, &helper_null, NULL);
+            if(n==SIZE_MAX){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
             if (!helper_null) {
                 find_total = n;
                 find_total_null = 0;
             }
         }
-        const char *arr_close = (has_joins || rows_fmt) ? "]}" :
+        const char *arr_close = (has_joins || rows_fmt) ? "]" :
                                  dict_fmt                ? "}"  : "]";
         if (find_total_null)
             OUT("%s,\"total\":null}\n", arr_close);
@@ -9508,6 +11310,23 @@ static int cmd_find_do(const char *db_root, const char *object,
 
     return 0;
 }
+
+static int cmd_find_do(const char *root,const char *object,CriteriaNode *tree,
+ JoinSpec *joins,int njoins,int offset,int limit,const char *proj,const char *excluded,
+ const char *format,const char *delimiter,const char *order_by,const char *order_dir,
+ const char *cursor,int total){
+    return cmd_find_do_impl(root,object,tree,joins,njoins,offset,limit,proj,excluded,
+        format,delimiter,order_by,order_dir,cursor,total,NULL,NULL);
+}
+#ifdef TEST_BUILD
+int cmd_find_with_schema_for_test(const char *root,const char *object,
+ const Schema *schema,const FieldSchema *fields,CriteriaNode *tree,int offset,int limit,
+ const char *format,const char *order_by,const char *order_dir,const char *cursor){
+    if(!schema||!fields||!fields->ts){errno=EINVAL;return -1;}
+    return cmd_find_do_impl(root,object,tree,NULL,0,offset,limit,NULL,NULL,
+        format,NULL,order_by,order_dir,cursor,0,schema,fields);
+}
+#endif
 
 int cmd_find(const char *db_root, const char *object,
                     const char *criteria_json, int offset, int limit,
@@ -9593,6 +11412,9 @@ int composite_prefix_walk_for_test(const char *db_root, const char *object,
     FieldSchema fs;
     init_field_schema(&fs, eff_root, bare);
     if (!fs.ts) { free_criteria_tree(tree); return -1; }
+    if (compile_criteria_tree_checked(tree,fs.ts,NULL,0)) {
+        free_criteria_tree(tree); return -1;
+    }
     size_t N = (size_t)get_live_count(eff_root, bare);
     FilterPlan fp = plan_filter(tree, eff_root, bare, &fs, sc.splits, N,
                                  order_by, 1, limit);
@@ -9607,17 +11429,19 @@ int composite_prefix_walk_for_test(const char *db_root, const char *object,
     ExcludedKeys excluded = {0};
     QueryDeadline dl = { .t0_ms = 0, .timeout_ms = 0, .timed_out = 0 };
     g_order_walk_scanned = 0;
-    find_via_composite_prefix(
+    int result = find_via_composite_prefix(
         eff_root, bare, &sc,
         (fs.ts || fs.nfields > 0) ? &fs : NULL,
         fp.source_leaves[0], order_by, order_desc,
         fp.order_range,
         tree, &excluded, 0, limit,
         NULL, 0, 0, &dl);
+    int error = errno;
     long scanned = g_order_walk_scanned;
     fclose(g_out);
     g_out = saved_out;
     free_criteria_tree(tree);
+    if (result < 0) { errno = error; return result; }
     return (int)scanned;
 }
 
@@ -9650,6 +11474,9 @@ int composite_prefix_bound_for_test(const char *db_root, const char *object,
     FieldSchema fs;
     init_field_schema(&fs, eff_root, bare);
     if (!fs.ts) { free_criteria_tree(tree); return -1; }
+    if (compile_criteria_tree_checked(tree,fs.ts,NULL,0)) {
+        free_criteria_tree(tree); return -1;
+    }
     size_t N = (size_t)get_live_count(eff_root, bare);
     FilterPlan fp = plan_filter(tree, eff_root, bare, &fs, sc.splits, N,
                                  order_by, 1, 0);
@@ -9658,56 +11485,22 @@ int composite_prefix_bound_for_test(const char *db_root, const char *object,
         free_criteria_tree(tree);
         return -2;
     }
-    const TypedField *seed_tf = resolve_idx_field(fs.ts, fp.source_leaves[0]->field);
-    uint8_t buf_lo[1024 + 8];
-    size_t len_lo = 0;
-    encode_criterion_value(seed_tf, fp.source_leaves[0]->value,
-                           strlen(fp.source_leaves[0]->value), buf_lo, &len_lo);
-    uint8_t buf_hi[1024 + 8];
-    memcpy(buf_hi, buf_lo, len_lo);
-    size_t len_hi;
-    int min_excl = 0, max_excl = 0;
-    if (seed_tf && seed_tf->type == FT_VARCHAR && len_lo > 0) {
-        int pos = (int)len_lo - 1;
-        while (pos >= 0 && buf_lo[pos] == 0xff) pos--;
-        if (pos >= 0) {
-            memcpy(buf_hi, buf_lo, (size_t)pos);
-            buf_hi[pos] = buf_lo[pos] + 1;
-            len_hi = (size_t)pos + 1;
-        } else {
-            memcpy(buf_hi, buf_lo, len_lo);
-            buf_hi[len_lo] = 0x00;
-            len_hi = len_lo + 1;
-        }
-    } else {
-        memset(buf_hi + len_lo, 0xff, 4);
-        len_hi = len_lo + 4;
-    }
-    if (fp.order_range) {
-        const TypedField *ord_tf = resolve_idx_field(fs.ts, order_by);
-        const char *highv = NULL; int high_excl = 0;
-        switch (fp.order_range->op) {
-            case OP_LESS_EQ:    highv = fp.order_range->value; break;
-            case OP_LESS:       highv = fp.order_range->value; high_excl = 1; break;
-            case OP_EQUAL:      highv = fp.order_range->value; break;
-            case OP_BETWEEN:    highv = fp.order_range->value2; high_excl = fp.order_range->max_exclusive; break;
-            default: break;
-        }
-        if (highv) {
-            uint8_t enc[1024]; size_t el = 0;
-            encode_criterion_value(ord_tf, highv, strlen(highv), enc, &el);
-            if (len_lo + el <= sizeof(buf_hi)) {
-                memcpy(buf_hi + len_lo, enc, el);
-                len_hi = len_lo + el;
-                max_excl = high_excl;
-            }
-        }
-    }
-    if (out_hi && out_hi_len) { memcpy(out_hi, buf_hi, len_hi); *out_hi_len = len_hi; }
-    if (out_lo && out_lo_len) { memcpy(out_lo, buf_lo, len_lo); *out_lo_len = len_lo; }
-    if (out_min_excl) *out_min_excl = min_excl;
-    if (out_max_excl) *out_max_excl = max_excl;
+    SearchCriterion *seed = fp.source_leaves[0];
+    const char *text = seed->op == OP_IN && seed->in_count > 0
+        ? seed->in_values[0] : search_criterion_value(seed);
+    size_t text_len = seed->op == OP_IN && seed->in_count > 0
+        ? strlen(text) : search_criterion_value_len(seed);
+    uint8_t lo[544], hi[544]; size_t lo_len=0, hi_len=0;
+    int lo_excl=0, hi_excl=0;
+    int rc=composite_prefix_bounds(&fs,seed,text,text_len,order_by,
+                                  fp.order_range,lo,&lo_len,&lo_excl,
+                                  hi,&hi_len,&hi_excl);
+    if(rc){free_criteria_tree(tree);return rc;}
+    if(out_hi&&out_hi_len){memcpy(out_hi,hi,hi_len);*out_hi_len=hi_len;}
+    if(out_lo&&out_lo_len){memcpy(out_lo,lo,lo_len);*out_lo_len=lo_len;}
+    if(out_min_excl)*out_min_excl=lo_excl;
+    if(out_max_excl)*out_max_excl=hi_excl;
     free_criteria_tree(tree);
-    return (int)len_hi;
+    return (int)hi_len;
 }
 #endif

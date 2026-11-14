@@ -55,6 +55,17 @@ File content is the same JSON (either shape — one big object or one big array,
 
 `bulk-insert` is a **true upsert**: if a key already exists, its record is overwritten and any stale index entries pointing at the old value are dropped before the new entry is written. Pass `"if_not_exists": true` to make it idempotent (existing keys are skipped, response includes `"skipped":N`).
 
+An ordered index key must fit the B+ tree's 544-byte encoded-key limit,
+including NULL tiers and every composite component. A standalone varchar
+therefore permits at most 543 content bytes in an ordered index. Insert and
+update validate all affected NEW keys before segment staging. An oversized key
+counts as a failed row; an existing row, its indexes and counts stay unchanged.
+This applies to legacy objects too. Historical oversized values that could not
+have an index entry can still be deleted or updated to an admissible value.
+Unindexed values and bitmap/trigram payloads do not inherit this ordered-key
+limit. Existing durable commit-intent recovery still applies to failures after
+staging; this validation does not add whole-request rollback.
+
 ### Response
 
 ```json
@@ -70,6 +81,8 @@ If any records were rejected (type mismatch, missing required field, etc.):
 ```json
 {"inserted": 9997, "skipped": 0, "errors": 3, "error": "some_records_dropped"}
 ```
+
+A bulk-insert shard stage whose keyfile table cannot be grown (a transient condition — a failed bitmap remap puts that shard's growth on a 5 s back-off, or a resplit hit an I/O error) fails closed: nothing from that stage is committed, other shards' stages are unaffected, and the daemon logs `BULK_STAGE_UNGROWN`. On packed-layout objects (the default) the response carries `errors` and `"error":"some_records_dropped"` for every record of that shard's stage (with `auto_key`, the `keys` array is still appended, in input order, so the failed records can be resent under their keys); bulk-insert is an upsert, so re-sending the request or just the failed records is harmless. Legacy-layout objects without `auto_key` report the same `errors` shape; legacy-layout `auto_key` objects answer `{"status":"bulk-inserted","count":N,...}` without an `errors` member — compare `count` with the number of records sent and retry only the missing ones (re-sending a record whose key was omitted generates a new key).
 
 ### Performance
 

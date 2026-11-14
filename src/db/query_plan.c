@@ -1,3 +1,4 @@
+#include "typed_index.h"
 #include "types.h"
 #include "slotcask.h"
 #include "simd.h"
@@ -5,6 +6,8 @@
 #include "trigram.h"
 #include "io_direct.h"
 #include "query_internal.h"
+#include "typed_row.h"
+#include "scalar_grammar.h"
 #include <math.h>
 #include <dirent.h>
 
@@ -14,11 +17,70 @@
    with the number of grows to skip: each grow site decrements and the
    site that reaches 0 behaves as if realloc returned NULL. 0 = never. */
 static int g_query_plan_test_fail_grow;
+/* A thread-local parser hook cannot affect a concurrently running case. */
+static _Thread_local int g_query_plan_test_fail_in_copy;
+void query_plan_test_set_fail_in_copy(int fail_n) {
+    g_query_plan_test_fail_in_copy = fail_n;
+}
 
 void query_plan_test_set_fail_grow(int fail_n) {
     g_query_plan_test_fail_grow = fail_n;
 }
 #endif
+
+
+typedef struct {size_t used,limit;} CriterionBudget;
+static int criterion_budget_take(CriterionBudget *b,size_t bytes){
+    if(bytes>b->limit-b->used){errno=ENOMEM;return -1;}b->used+=bytes;return 0;
+}
+static size_t criterion_owned_bytes(const SearchCriterion *c){
+    size_t bytes=c->owned_value?c->owned_value_len+1:0;
+    if(c->owned_value2)bytes+=c->owned_value2_len+1;
+    if(c->in_values){bytes+=(size_t)c->in_cap*sizeof(char*);for(int i=0;i<c->in_count;i++)bytes+=strlen(c->in_values[i])+1;}
+    return bytes;
+}
+const char *search_criterion_value(const SearchCriterion *c) { return c->owned_value ? c->owned_value : c->value; }
+const char *search_criterion_value2(const SearchCriterion *c) { return c->owned_value2 ? c->owned_value2 : c->value2; }
+size_t search_criterion_value_len(const SearchCriterion *c) { return c->owned_value_len ? c->owned_value_len : strlen(c->value); }
+size_t search_criterion_value2_len(const SearchCriterion *c) { return c->owned_value2_len ? c->owned_value2_len : strlen(c->value2); }
+int search_criterion_set(SearchCriterion *c,int second,const char *text,size_t n) {
+    if(!c||(!text&&n)||n==SIZE_MAX){errno=EINVAL;return -1;}
+    size_t previous=second?(c->owned_value2?c->owned_value2_len+1:0):(c->owned_value?c->owned_value_len+1:0);
+    size_t retained=criterion_owned_bytes(c)-previous;
+    size_t wanted=n>=sizeof(c->value)?n+1:0;
+    if(retained>g_query_buffer_max_bytes||wanted>g_query_buffer_max_bytes-retained){errno=ENOMEM;return -1;}
+    char *owned=NULL;
+    if(n>=sizeof(c->value)){owned=malloc(n+1);if(!owned)return -1;memcpy(owned,text,n);owned[n]=0;}
+    char **slot=second?&c->owned_value2:&c->owned_value;
+    char *inline_value=second?c->value2:c->value;
+    size_t copied=n<sizeof(c->value)-1?n:sizeof(c->value)-1;
+    if(copied)memmove(inline_value,text,copied);
+    inline_value[copied]=0;
+    free(*slot);*slot=owned;
+    if(second)c->owned_value2_len=n;else c->owned_value_len=n;
+    return 0;
+}
+static int search_criterion_set_budget(SearchCriterion *c,int second,const char *text,size_t n,CriterionBudget *budget){
+    if(n>=sizeof(c->value)&&criterion_budget_take(budget,n+1))return -1;
+    return search_criterion_set(c,second,text,n);
+}
+void search_criterion_clear(SearchCriterion *c){
+    if(!c)return;
+    free(c->owned_value);free(c->owned_value2);
+    for(int i=0;i<c->in_count;i++)free(c->in_values[i]);
+    free(c->in_values);memset(c,0,sizeof(*c));
+}
+int search_criterion_clone(SearchCriterion *dst,const SearchCriterion *src){
+    if(criterion_owned_bytes(src)>g_query_buffer_max_bytes){errno=ENOMEM;return -1;}
+    SearchCriterion c=*src;c.owned_value=c.owned_value2=NULL;c.in_values=NULL;c.in_count=0;c.in_cap=0;
+    if(search_criterion_set(&c,0,search_criterion_value(src),search_criterion_value_len(src))||
+       search_criterion_set(&c,1,search_criterion_value2(src),search_criterion_value2_len(src)))goto fail;
+    if(src->in_count){c.in_values=calloc((size_t)src->in_count,sizeof(char*));if(!c.in_values)goto fail;c.in_cap=src->in_count;
+        for(int i=0;i<src->in_count;i++){c.in_values[i]=strdup(src->in_values[i]);if(!c.in_values[i])goto fail;c.in_count++;}}
+    *dst=c;return 0;
+fail:search_criterion_clear(&c);return -1;
+}
+void search_criterion_move(SearchCriterion *dst,SearchCriterion *src){*dst=*src;memset(src,0,sizeof(*src));}
 
 /* ========== Compiled criteria ========== */
 /* ========== Typed-binary compiled criteria (fast path) ==========
@@ -36,113 +98,46 @@ void query_plan_test_set_fail_grow(int fail_n) {
 /* Case-insensitive substring search moved to src/db/simd.c (simd_memcasemem)
    so the AVX2 path and the scalar fallback share one implementation. */
 
-/* Parse decimal date string "yyyyMMdd" (tolerant of separators) → int32. */
+/* R4 thin wrappers: the strict grammar module is the single parser. These
+   run only after predicate_validate has accepted the literal, or for the
+   unused value2 of non-BETWEEN ops, where failure-to-zero is harmless. */
 static int32_t parse_date_i32(const char *s) {
-    char clean[16]; int ci = 0;
-    for (const char *c = s; *c && ci < 8; c++)
-        if (*c >= '0' && *c <= '9') clean[ci++] = *c;
-    clean[ci] = '\0';
-    return (int32_t)atoi(clean);
+    int32_t d = 0;
+    if (s && sg_date(s, strlen(s), &d)) d = 0;
+    return d;
 }
-
-/* Parse "yyyyMMddHHmmss" (tolerant) → date (int32) + time (uint32 seconds). */
 static void parse_datetime(const char *s, int32_t *out_date, uint32_t *out_time) {
-    char clean[16]; int ci = 0;
-    for (const char *c = s; *c && ci < 14; c++)
-        if (*c >= '0' && *c <= '9') clean[ci++] = *c;
-    while (ci < 14) clean[ci++] = '0';
-    clean[14] = '\0';
-    char dbuf[9]; memcpy(dbuf, clean, 8); dbuf[8] = '\0';
-    *out_date = (int32_t)atoi(dbuf);
-    int hh = (clean[8]-'0')*10 + (clean[9]-'0');
-    int mm = (clean[10]-'0')*10 + (clean[11]-'0');
-    int ss = (clean[12]-'0')*10 + (clean[13]-'0');
-    *out_time = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
+    *out_date = 0; *out_time = 0;
+    if (s) (void)sg_datetime(s, strlen(s), out_date, out_time);
 }
-
-/* Parse "yyyyMMddHHmmssfff" (digit-only, right-zero-padded if short) into
-   a calendar date (int32, yyyyMMdd) and ms-of-day (uint32, 0..86399999). */
 static void parse_datetimems(const char *s, int32_t *out_date, uint32_t *out_ms) {
-    char clean[24]; int ci = 0;
-    for (const char *c = s; *c && ci < 17; c++)
-        if (*c >= '0' && *c <= '9') clean[ci++] = *c;
-    while (ci < 17) clean[ci++] = '0';
-    clean[17] = '\0';
-    char dbuf[9]; memcpy(dbuf, clean, 8); dbuf[8] = '\0';
-    *out_date = (int32_t)atoi(dbuf);
-    int hh = (clean[8]-'0')*10 + (clean[9]-'0');
-    int mm = (clean[10]-'0')*10 + (clean[11]-'0');
-    int ss = (clean[12]-'0')*10 + (clean[13]-'0');
-    int fff = (clean[14]-'0')*100 + (clean[15]-'0')*10 + (clean[16]-'0');
-    *out_ms = (uint32_t)((hh * 3600 + mm * 60 + ss) * 1000 + fff);
+    *out_date = 0; *out_ms = 0;
+    if (s) (void)sg_datetimems(s, strlen(s), out_date, out_ms);
 }
-
-/* Parse decimal string → int64 scaled by 10^scale (matches encode_field FT_NUMERIC). */
-static int64_t parse_numeric_i64(const char *s, int64_t mul) {
-    double dv = atof(s);
-    return (int64_t)(dv * mul + (dv >= 0 ? 0.5 : -0.5));
-}
-
-/* Parse UUID string (32 hex digits, with or without hyphens) → 16 bytes.
-   On malformed input, output is all zeros. */
 static void parse_uuid(const char *s, uint8_t out[16]) {
     memset(out, 0, 16);
-    if (!s) return;
-    int pos = 0;
-    for (const char *c = s; *c && pos < 32; c++) {
-        if (*c == '-') continue;
-        int nibble = -1;
-        if (*c >= '0' && *c <= '9') nibble = *c - '0';
-        else if (*c >= 'a' && *c <= 'f') nibble = *c - 'a' + 10;
-        else if (*c >= 'A' && *c <= 'F') nibble = *c - 'A' + 10;
-        if (nibble < 0) { memset(out, 0, 16); return; }
-        if (pos % 2 == 0) out[pos / 2] = nibble << 4;
-        else out[pos / 2] |= nibble;
-        pos++;
-    }
-    if (pos != 32) { memset(out, 0, 16); }
+    if (s) (void)sg_uuid(s, strlen(s), out);
 }
-
-/* Parse a dotted-quad IPv4 string into 4 raw network-byte-order bytes.
-   Malformed/empty input zero-fills (mirrors parse_uuid's fallback). */
 static void parse_ipv4(const char *s, uint8_t out[4]) {
-    if (!s || !s[0] || inet_pton(AF_INET, s, out) != 1)
-        memset(out, 0, 4);
+    memset(out, 0, 4);
+    if (s) (void)sg_ipv4(s, strlen(s), out);
 }
-
-/* Parse a canonical IPv6 string into 16 raw network-byte-order bytes.
-   Malformed/empty input zero-fills (mirrors parse_ipv4/parse_uuid). */
 static void parse_ipv6(const char *s, uint8_t out[16]) {
-    if (!s || !s[0] || inet_pton(AF_INET6, s, out) != 1)
-        memset(out, 0, 16);
+    memset(out, 0, 16);
+    if (s) (void)sg_ipv6(s, strlen(s), out);
 }
-
-/* Parse "HH:MM:SS" into 3 bytes (seconds since midnight, big-endian) */
 static void parse_time(const char *s, uint8_t out[3]) {
-    /* Parse "HH:MM:SS" query operand into 3 bytes BE. Strict validation
-       (digits + ':' separators + range) matches the FT_TIME encode path in
-       config.c so an out-of-range or malformed criterion can never silently
-       compare against an unrelated wraparound value. Malformed → 0. */
+    uint32_t secs = 0;
     memset(out, 0, 3);
-    if (!s || strlen(s) < 8) return;
-    if (s[2] != ':' || s[5] != ':') return;
-    for (int i = 0; i < 8; i++) {
-        if (i == 2 || i == 5) continue;
-        if (s[i] < '0' || s[i] > '9') return;
+    if (s && sg_time(s, strlen(s), &secs) == 0) {
+        out[0] = (secs >> 16) & 0xFF; out[1] = (secs >> 8) & 0xFF; out[2] = secs & 0xFF;
     }
-    int hh = (s[0]-'0')*10 + (s[1]-'0');
-    int mm = (s[3]-'0')*10 + (s[4]-'0');
-    int ss = (s[6]-'0')*10 + (s[7]-'0');
-    if (hh > 23 || mm > 59 || ss > 59) return;
-    uint32_t secs = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
-    out[0] = (secs >> 16) & 0xFF;
-    out[1] = (secs >> 8) & 0xFF;
-    out[2] = secs & 0xFF;
 }
 
 /* Lowercase duplicate (ASCII). Caller frees. */
 static char *strdup_lower(const char *s, size_t len) {
     char *r = malloc(len + 1);
+    if(!r)return NULL;
     for (size_t i = 0; i < len; i++) {
         char c = s[i];
         if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
@@ -275,25 +270,118 @@ static inline int regex_anchors_match(const CompiledCriterion *cc,
     return 0;
 }
 
-void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
-                        const TypedSchema *ts) {
+static void compiled_one_clear(CompiledCriterion *cc);
+static int predicate_is_field(enum SearchOp op){return op>=OP_EQ_FIELD&&op<=OP_GTE_FIELD;}
+static int predicate_is_length(enum SearchOp op){return op>=OP_LEN_EQ&&op<=OP_LEN_BETWEEN;}
+static int predicate_numeric_comparison(enum SearchOp op){
+    return op==OP_EQUAL||op==OP_NOT_EQUAL||op==OP_LESS||op==OP_GREATER||
+        op==OP_LESS_EQ||op==OP_GREATER_EQ||op==OP_BETWEEN||op==OP_IN||op==OP_NOT_IN;
+}
+static int predicate_has_literal(enum SearchOp op){return op!=OP_EXISTS&&op!=OP_NOT_EXISTS&&!predicate_is_field(op)&&op!=OP_IN&&op!=OP_NOT_IN;}
+static int predicate_validate_value(const SearchCriterion *c,const TypedField *f,const char *s,size_t n,char *err,size_t cap){
+    if(f->type==FT_VARCHAR||f->type==FT_NUMERIC)return 0;
+    /* R4: strict grammar validation applies to comparison ops only.
+       Pattern/substring ops operate on rendered text and stay unvalidated. */
+    if(!predicate_numeric_comparison(c->op))return 0;
+    uint8_t bytes[32];
+    errno=0;int status=encode_json_field_checked(f,s,n,1,bytes,err,cap);
+    if(status&&errno==0)errno=EINVAL;
+    return status;
+}
+static int predicate_validate(const SearchCriterion *c,const TypedField *f,char *err,size_t cap){
+    if(predicate_has_literal(c->op)&&predicate_validate_value(c,f,search_criterion_value(c),search_criterion_value_len(c),err,cap))return -1;
+    if(c->op==OP_BETWEEN&&predicate_validate_value(c,f,search_criterion_value2(c),search_criterion_value2_len(c),err,cap))return -1;
+    if(c->op==OP_IN||c->op==OP_NOT_IN)for(int i=0;i<c->in_count;i++)
+        if(predicate_validate_value(c,f,c->in_values[i],strlen(c->in_values[i]),err,cap))return -1;
+    return 0;
+}
+static int predicate_decimal_parse(const char *s,size_t n,dec_t *out,char *err,size_t cap){
+    dec_status st=dec_parse(s,n,out,err,cap);
+    if(st==DEC_OK)return 0;
+    errno=st==DEC_ERR_NOMEM?ENOMEM:EINVAL;return -1;
+}
+static int predicate_compile_numeric(CompiledCriterion *cc,const SearchCriterion *c,char *err,size_t cap){
+    if(!predicate_numeric_comparison(c->op))return 0;
+    if(c->op==OP_IN||c->op==OP_NOT_IN){
+        cc->in_count=c->in_count;
+        cc->in_numeric=calloc((size_t)c->in_count,sizeof(dec_t));
+        if(c->in_count&&!cc->in_numeric)return -1;
+        for(int i=0;i<c->in_count;i++)if(predicate_decimal_parse(c->in_values[i],strlen(c->in_values[i]),&cc->in_numeric[i],err,cap))return -1;
+    }else{
+        if(predicate_decimal_parse(search_criterion_value(c),search_criterion_value_len(c),&cc->numeric1,err,cap))return -1;
+        if(c->op==OP_BETWEEN&&predicate_decimal_parse(search_criterion_value2(c),search_criterion_value2_len(c),&cc->numeric2,err,cap))return -1;
+    }
+    return 0;
+}
+
+/* Preflight retained raw ownership and all new compiled buffers across the
+ * complete collection before prepare. Decimal workspace uses an input-sized
+ * upper bound; regex library-private allocation remains the existing POSIX
+ * engine's bounded-pattern contract, not a new shared accounting mechanism. */
+static int predicate_compile_charge(const SearchCriterion *c,const TypedSchema *ts,CriterionBudget *b){
+    if(criterion_budget_take(b,criterion_owned_bytes(c))||criterion_budget_take(b,sizeof(CompiledCriterion)))return -1;
+    if(strchr(c->field,'+'))return 0;
+    int index=ts?typed_field_index(ts,c->field):-1;if(index<0)return 0;
+    enum FieldType type=ts->fields[index].type;
+    size_t n=search_criterion_value_len(c),n2=search_criterion_value2_len(c);
+    if(n>SIZE_MAX-n2-2||criterion_budget_take(b,n+n2+2))return -1;
+    if(predicate_is_field(c->op)||predicate_is_length(c->op))return 0;
+    if(c->op==OP_REGEX||c->op==OP_NOT_REGEX)
+        return criterion_budget_take(b,sizeof(regex_t)+MAX_REGEX_ANCHORS*(sizeof(char*)+sizeof(size_t)+MAX_REGEX_ANCHOR_BYTES));
+    if(type==FT_VARCHAR&&(c->op==OP_LIKE||c->op==OP_NOT_LIKE||c->op==OP_ILIKE||c->op==OP_INOT_LIKE||
+        c->op==OP_CONTAINS||c->op==OP_NOT_CONTAINS||c->op==OP_ICONTAINS||c->op==OP_INOT_CONTAINS||
+        c->op==OP_STARTS_WITH||c->op==OP_ENDS_WITH||c->op==OP_ISTARTS_WITH||c->op==OP_IENDS_WITH))
+        if(criterion_budget_take(b,n+1))return -1;
+    if(c->op==OP_IN||c->op==OP_NOT_IN){
+        size_t item=type==FT_NUMERIC?sizeof(dec_t):(type==FT_UUID||type==FT_IPV6)?16:
+            type==FT_IPV4?4:type==FT_TIME?3:sizeof(int64_t);
+        if((size_t)c->in_count>SIZE_MAX/item||criterion_budget_take(b,(size_t)c->in_count*item))return -1;
+        if(type==FT_NUMERIC)for(int i=0;i<c->in_count;i++)
+            if(criterion_budget_take(b,strlen(c->in_values[i])+4))return -1;
+    }else if(type==FT_NUMERIC&&c->op!=OP_EXISTS&&c->op!=OP_NOT_EXISTS){
+        if(criterion_budget_take(b,n+4))return -1;
+        if(c->op==OP_BETWEEN&&criterion_budget_take(b,n2+4))return -1;
+    }
+    return 0;
+}
+static int predicate_tree_charge(const CriteriaNode *node,const TypedSchema *ts,CriterionBudget *b){
+    if(!node)return 0;
+    if(criterion_budget_take(b,sizeof(*node)))return -1;
+    if(node->kind==CNODE_LEAF)return predicate_compile_charge(&node->leaf,ts,b);
+    size_t capacity=(size_t)(node->children_cap>node->n_children?node->children_cap:node->n_children);
+    if(capacity>SIZE_MAX/sizeof(CriteriaNode*)||criterion_budget_take(b,capacity*sizeof(CriteriaNode*)))return -1;
+    for(int i=0;i<node->n_children;i++)if(predicate_tree_charge(node->children[i],ts,b))return -1;
+    return 0;
+}
+
+int compile_one_checked(CompiledCriterion *cc, const SearchCriterion *c,
+                        const TypedSchema *ts, char *err, size_t errsz) {
     memset(cc, 0, sizeof(*cc));
+    cc->schema=ts;
+    if(!c){errno=EINVAL;return -1;}
+    CriterionBudget budget={0,g_query_buffer_max_bytes};
+    if(predicate_compile_charge(c,ts,&budget)){if(err&&errsz)snprintf(err,errsz,"query memory buffer exceeded");return -1;}
+    cc->workspace_budget=budget.limit-budget.used;
     cc->op = c->op;
     cc->raw = c;
 
-    if (strchr(c->field, '+')) { cc->composite = 1; return; }
+    if (strchr(c->field, '+')) { cc->composite = 1; return 0; }
     int idx = ts ? typed_field_index(ts, c->field) : -1;
-    if (idx < 0) { cc->tf = NULL; return; }
+    if (idx < 0) { cc->tf = NULL; return 0; }
     cc->tf = &ts->fields[idx];
     cc->ftype = cc->tf->type;
 
+    if (predicate_validate(c, cc->tf, err, errsz)) return -1;
+    if (cc->ftype==FT_NUMERIC && predicate_compile_numeric(cc,c,err,errsz)) goto fail;
     /* Copy string forms (needed for varchar ops and fallback BETWEEN strings) */
-    cc->s1_len = strlen(c->value);
+    cc->s1_len = search_criterion_value_len(c);
     cc->s1 = malloc(cc->s1_len + 1);
-    memcpy(cc->s1, c->value, cc->s1_len + 1);
-    cc->s2_len = strlen(c->value2);
+            if(!cc->s1) goto fail;
+    memcpy(cc->s1, search_criterion_value(c), cc->s1_len + 1);
+    cc->s2_len = search_criterion_value2_len(c);
     cc->s2 = malloc(cc->s2_len + 1);
-    memcpy(cc->s2, c->value2, cc->s2_len + 1);
+            if(!cc->s2) goto fail;
+    memcpy(cc->s2, search_criterion_value2(c), cc->s2_len + 1);
 
     /* Length ops parse value/value2 as integers regardless of the field's
        native type. Compile time, so the hot path skips strtoll per record. */
@@ -301,12 +389,12 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         cc->op == OP_LEN_LESS || cc->op == OP_LEN_GREATER ||
         cc->op == OP_LEN_LESS_EQ || cc->op == OP_LEN_GREATER_EQ ||
         cc->op == OP_LEN_BETWEEN) {
-        cc->i1 = (int64_t)strtoll(c->value, NULL, 10);
-        cc->i2 = (int64_t)strtoll(c->value2, NULL, 10);
-        return;
+        cc->i1 = (int64_t)strtoll(search_criterion_value(c), NULL, 10);
+        cc->i2 = (int64_t)strtoll(search_criterion_value2(c), NULL, 10);
+        return 0;
     }
 
-    /* Field-vs-field ops: c->value names the RHS sibling field. Resolve to
+    /* Field-vs-field ops: search_criterion_value(c) names the RHS sibling field. Resolve to
        a TypedField pointer and require type match — mismatched types yield
        cc->rhs_tf=NULL, which match_typed treats as "no match" for every
        record (graceful degradation; planner sees the leaf as non-indexable). */
@@ -315,13 +403,13 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         cc->op == OP_LTE_FIELD || cc->op == OP_GTE_FIELD) {
         /* ts is non-NULL here — the early-return at the top of compile_one
            (cc->tf = NULL on idx < 0) only proceeds when ts && idx >= 0. */
-        int rhs_idx = typed_field_index(ts, c->value);
+        int rhs_idx = typed_field_index(ts, search_criterion_value(c));
         if (rhs_idx >= 0) {
             const TypedField *rhs = &ts->fields[rhs_idx];
             if (rhs->type == cc->ftype) cc->rhs_tf = rhs;
             /* else: leave rhs_tf NULL; match returns 0 every time. */
         }
-        return;
+        return 0;
     }
 
     /* Regex ops: compile pattern once with REG_EXTENDED. REG_NOSUB is
@@ -332,15 +420,16 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
        matches OP_REGEX, every record matches OP_NOT_REGEX. */
     if (cc->op == OP_REGEX || cc->op == OP_NOT_REGEX) {
         cc->re = malloc(sizeof(regex_t));
-        if (cc->re && regcomp(cc->re, c->value, REG_EXTENDED) == 0) {
+            if(!cc->re) goto fail;
+        if (cc->re && regcomp(cc->re, search_criterion_value(c), REG_EXTENDED) == 0) {
             cc->re_compiled = 1;
         } else if (cc->re) {
             free(cc->re); cc->re = NULL;
         }
         /* Extract literal anchors for the substring pre-filter. */
-        regex_extract_anchors(c->value, &cc->re_anchors, &cc->re_anchor_lens,
+        regex_extract_anchors(search_criterion_value(c), &cc->re_anchors, &cc->re_anchor_lens,
                               &cc->re_anchor_count);
-        return;
+        return 0;
     }
 
     /* Type-specific parsing of scalar rvalue */
@@ -349,70 +438,67 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
     case FT_TIMESTAMP:   /* Unix epoch ms — same int64 BE encoding as FT_LONG. */
     case FT_INT:
     case FT_SHORT:
-        cc->i1 = (int64_t)strtoll(c->value, NULL, 10);
-        cc->i2 = (int64_t)strtoll(c->value2, NULL, 10);
+        cc->i1 = (int64_t)strtoll(search_criterion_value(c), NULL, 10);
+        cc->i2 = (int64_t)strtoll(search_criterion_value2(c), NULL, 10);
         break;
-    case FT_NUMERIC:
-        cc->i1 = parse_numeric_i64(c->value, cc->tf->numeric_scale_mult);
-        cc->i2 = parse_numeric_i64(c->value2, cc->tf->numeric_scale_mult);
-        break;
+    case FT_NUMERIC: break;
     case FT_DOUBLE:
-        cc->d1 = atof(c->value);
-        cc->d2 = atof(c->value2);
+        cc->d1 = atof(search_criterion_value(c));
+        cc->d2 = atof(search_criterion_value2(c));
         break;
     case FT_FLOAT:
-        cc->d1 = atof(c->value);
-        cc->d2 = atof(c->value2);
+        cc->d1 = (double)strtof(search_criterion_value(c), NULL);
+        cc->d2 = (double)strtof(search_criterion_value2(c), NULL);
         break;
     case FT_BOOL:
-        cc->b1 = (c->value[0] == 't' || c->value[0] == 'T' || c->value[0] == '1') ? 1 : 0;
+        cc->b1 = scalar_bool_value(search_criterion_value(c));
         break;
     case FT_BYTE:
-        cc->b1 = (uint8_t)atoi(c->value);
+        cc->b1 = (uint8_t)atoi(search_criterion_value(c));
         break;
     case FT_DATE:
-        cc->i1 = parse_date_i32(c->value);
-        cc->i2 = parse_date_i32(c->value2);
+        cc->i1 = parse_date_i32(search_criterion_value(c));
+        cc->i2 = parse_date_i32(search_criterion_value2(c));
         break;
     case FT_DATETIME: {
         int32_t d; uint32_t t;
-        parse_datetime(c->value, &d, &t); cc->i1 = d; cc->t1 = t;
-        parse_datetime(c->value2, &d, &t); cc->i2 = d; cc->t2 = t;
+        parse_datetime(search_criterion_value(c), &d, &t); cc->i1 = d; cc->t1 = t;
+        parse_datetime(search_criterion_value2(c), &d, &t); cc->i2 = d; cc->t2 = t;
         break;
     }
     case FT_DATETIMEMS: {
         int32_t d; uint32_t ms;
-        parse_datetimems(c->value, &d, &ms); cc->i1 = d; cc->dm1 = (int32_t)ms;
-        parse_datetimems(c->value2, &d, &ms); cc->i2 = d; cc->dm2 = (int32_t)ms;
+        parse_datetimems(search_criterion_value(c), &d, &ms); cc->i1 = d; cc->dm1 = (int32_t)ms;
+        parse_datetimems(search_criterion_value2(c), &d, &ms); cc->i2 = d; cc->dm2 = (int32_t)ms;
         break;
     }
     case FT_TIME: {
-        if (c->value[0]) {
-            parse_time(c->value, cc->time_val);
+        if (search_criterion_value(c)[0]) {
+            parse_time(search_criterion_value(c), cc->time_val);
         }
-        if (c->value2[0]) {
-            parse_time(c->value2, cc->time_val2);
+        if (search_criterion_value2(c)[0]) {
+            parse_time(search_criterion_value2(c), cc->time_val2);
         }
         break;
     }
     case FT_UUID: {
         /* Parse canonical UUID string to 16 bytes */
-        if (c->value[0]) {
-            parse_uuid(c->value, cc->uuid_bytes);
+        if (search_criterion_value(c)[0]) {
+            parse_uuid(search_criterion_value(c), cc->uuid_bytes);
         }
-        if (c->value2[0]) {
-            parse_uuid(c->value2, cc->uuid_bytes2);
+        if (search_criterion_value2(c)[0]) {
+            parse_uuid(search_criterion_value2(c), cc->uuid_bytes2);
         }
         break;
     }
     case FT_IPV4: {
-        if (c->value[0]) { parse_ipv4(c->value, cc->ipv4_val); }
-        if (c->value2[0]) { parse_ipv4(c->value2, cc->ipv4_val2); }
+        if (search_criterion_value(c)[0]) { parse_ipv4(search_criterion_value(c), cc->ipv4_val); }
+        if (search_criterion_value2(c)[0]) { parse_ipv4(search_criterion_value2(c), cc->ipv4_val2); }
         break;
     }
     case FT_IPV6: {
-        if (c->value[0]) { parse_ipv6(c->value, cc->ipv6_val); }
-        if (c->value2[0]) { parse_ipv6(c->value2, cc->ipv6_val2); }
+        if (search_criterion_value(c)[0]) { parse_ipv6(search_criterion_value(c), cc->ipv6_val); }
+        if (search_criterion_value2(c)[0]) { parse_ipv6(search_criterion_value2(c), cc->ipv6_val2); }
         break;
     }
     case FT_ENUM:
@@ -420,15 +506,15 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
            in the enum's value list. -1 means "no such value" — match_typed
            interprets that as "no record can match this criterion under
            positive ops" (EQ/IN/LT/GT/etc.) and "every record matches under
-           the negation" (NEQ/NOT_IN). The c->value lookup uses
+           the negation" (NEQ/NOT_IN). The search_criterion_value(c) lookup uses
            enum_value_index (linear scan; cold path, n ≤ 65535). */
-        if (cc->tf && c->value[0]) {
-            cc->i1 = (int64_t)enum_value_index(cc->tf, c->value, strlen(c->value));
+        if (cc->tf && search_criterion_value(c)[0]) {
+            cc->i1 = (int64_t)enum_value_index(cc->tf, search_criterion_value(c), strlen(search_criterion_value(c)));
         } else {
             cc->i1 = -1;
         }
-        if (cc->tf && c->value2[0]) {
-            cc->i2 = (int64_t)enum_value_index(cc->tf, c->value2, strlen(c->value2));
+        if (cc->tf && search_criterion_value2(c)[0]) {
+            cc->i2 = (int64_t)enum_value_index(cc->tf, search_criterion_value2(c), strlen(search_criterion_value2(c)));
         } else {
             cc->i2 = -1;
         }
@@ -456,7 +542,7 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
                     cc->op == OP_ISTARTS_WITH || cc->op == OP_IENDS_WITH);
 
     if (cc->ftype == FT_VARCHAR && (is_like_op || is_substr_op)) {
-        const char *pat = c->value;
+        const char *pat = search_criterion_value(c);
         size_t pl = cc->s1_len;
         const char *needle_start = pat;
         size_t needle_len = pl;
@@ -480,8 +566,10 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         cc->needle_len = needle_len;
         if (is_ci_op) {
             cc->needle_lc = strdup_lower(needle_start, needle_len);
+            if(!cc->needle_lc)goto fail;
         } else {
             cc->needle_lc = malloc(needle_len > 0 ? needle_len : 1);
+            if(!cc->needle_lc) goto fail;
             if (needle_len > 0) memcpy(cc->needle_lc, needle_start, needle_len);
         }
     }
@@ -493,36 +581,35 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
         case FT_LONG: case FT_TIMESTAMP: case FT_INT: case FT_SHORT:
         case FT_BOOL: case FT_BYTE:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
+            if(!cc->in_i64) goto fail;
             for (int i = 0; i < c->in_count; i++) {
-                if (cc->ftype == FT_BOOL && (c->in_values[i][0] == 't' ||
-                    c->in_values[i][0] == 'T' || c->in_values[i][0] == '1'))
-                    cc->in_i64[i] = 1;
-                else
-                    cc->in_i64[i] = (int64_t)strtoll(c->in_values[i], NULL, 10);
+                cc->in_i64[i] = cc->ftype == FT_BOOL
+                    ? (int64_t)scalar_bool_value(c->in_values[i])
+                    : (int64_t)strtoll(c->in_values[i], NULL, 10);
             }
             break;
-        case FT_NUMERIC:
-            cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
-            for (int i = 0; i < c->in_count; i++)
-                cc->in_i64[i] = parse_numeric_i64(c->in_values[i], cc->tf->numeric_scale_mult);
-            break;
+        case FT_NUMERIC: break;
         case FT_DOUBLE:
             cc->in_f64 = malloc(sizeof(double) * c->in_count);
+            if(!cc->in_f64) goto fail;
             for (int i = 0; i < c->in_count; i++)
                 cc->in_f64[i] = atof(c->in_values[i]);
             break;
         case FT_FLOAT:
             cc->in_f64 = malloc(sizeof(double) * c->in_count);
+            if(!cc->in_f64) goto fail;
             for (int i = 0; i < c->in_count; i++)
-                cc->in_f64[i] = atof(c->in_values[i]);
+                cc->in_f64[i] = (double)strtof(c->in_values[i], NULL);
             break;
         case FT_DATE:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
+            if(!cc->in_i64) goto fail;
             for (int i = 0; i < c->in_count; i++)
                 cc->in_i64[i] = (int64_t)parse_date_i32(c->in_values[i]);
             break;
         case FT_DATETIME:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
+            if(!cc->in_i64) goto fail;
             for (int i = 0; i < c->in_count; i++) {
                 int32_t d; uint32_t t;
                 parse_datetime(c->in_values[i], &d, &t);
@@ -531,6 +618,7 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
             break;
         case FT_DATETIMEMS:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
+            if(!cc->in_i64) goto fail;
             for (int i = 0; i < c->in_count; i++) {
                 int32_t d; uint32_t ms;
                 parse_datetimems(c->in_values[i], &d, &ms);
@@ -539,26 +627,31 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
             break;
         case FT_TIME:
             cc->in_time = malloc(sizeof(uint8_t[3]) * c->in_count);
+            if(!cc->in_time) goto fail;
             for (int i = 0; i < c->in_count; i++)
                 parse_time(c->in_values[i], cc->in_time[i]);
             break;
         case FT_UUID:
             cc->in_uuid = malloc(sizeof(uint8_t[16]) * c->in_count);
+            if(!cc->in_uuid) goto fail;
             for (int i = 0; i < c->in_count; i++)
                 parse_uuid(c->in_values[i], cc->in_uuid[i]);
             break;
         case FT_IPV4:
             cc->in_ipv4 = malloc(sizeof(uint8_t[4]) * c->in_count);
+            if(!cc->in_ipv4) goto fail;
             for (int i = 0; i < c->in_count; i++)
                 parse_ipv4(c->in_values[i], cc->in_ipv4[i]);
             break;
         case FT_IPV6:
             cc->in_ipv6 = malloc(sizeof(uint8_t[16]) * c->in_count);
+            if(!cc->in_ipv6) goto fail;
             for (int i = 0; i < c->in_count; i++)
                 parse_ipv6(c->in_values[i], cc->in_ipv6[i]);
             break;
         case FT_ENUM:
             cc->in_i64 = malloc(sizeof(int64_t) * c->in_count);
+            if(!cc->in_i64) goto fail;
             for (int i = 0; i < c->in_count; i++)
                 cc->in_i64[i] = (int64_t)enum_value_index(cc->tf,
                                                           c->in_values[i],
@@ -570,67 +663,83 @@ void compile_one(CompiledCriterion *cc, const SearchCriterion *c,
                precompute once here instead of strlen() per record in the
                match loop (match_typed_varchar's OP_IN/OP_NOT_IN cases). */
             cc->in_lens = malloc(sizeof(size_t) * c->in_count);
+            if(!cc->in_lens) goto fail;
             for (int i = 0; i < c->in_count; i++)
                 cc->in_lens[i] = strlen(c->in_values[i]);
             break;
         }
     }
+    return 0;
+fail:
+    { int saved=errno?errno:ENOMEM; compiled_one_clear(cc); errno=saved; }
+    if(err&&errsz)snprintf(err,errsz,"predicate compilation failed");
+    return -1;
+}
+void compile_one(CompiledCriterion *cc,const SearchCriterion *c,const TypedSchema *ts){
+    (void)compile_one_checked(cc,c,ts,NULL,0);
 }
 
 CompiledCriterion *compile_criteria(const SearchCriterion *in, int n,
                                     const TypedSchema *ts) {
     if (n <= 0) return NULL;
+    CriterionBudget budget={0,g_query_buffer_max_bytes};
+    if((size_t)n>SIZE_MAX/sizeof(SearchCriterion)||criterion_budget_take(&budget,(size_t)n*sizeof(SearchCriterion)))return NULL;
+    for(int i=0;i<n;i++)if(predicate_compile_charge(&in[i],ts,&budget))return NULL;
     CompiledCriterion *arr = calloc(n, sizeof(CompiledCriterion));
-    for (int i = 0; i < n; i++) compile_one(&arr[i], &in[i], ts);
+    if(!arr)return NULL;
+    for(int i=0;i<n;i++){if(compile_one_checked(&arr[i],&in[i],ts,NULL,0)){free_compiled_criteria(arr,n);return NULL;}arr[i].workspace_budget=budget.limit-budget.used;}
     return arr;
 }
 
-void free_compiled_criteria(CompiledCriterion *arr, int n) {
-    if (!arr) return;
-    for (int i = 0; i < n; i++) {
-        free(arr[i].s1);
-        free(arr[i].s2);
-        free(arr[i].needle_lc);
-        free(arr[i].in_i64);
-        free(arr[i].in_f64);
-        free(arr[i].in_uuid);
-        free(arr[i].in_time);
-        free(arr[i].in_ipv4);
-        free(arr[i].in_ipv6);
-        free(arr[i].in_lens);
-        if (arr[i].re) {
-            if (arr[i].re_compiled) regfree(arr[i].re);
-            free(arr[i].re);
+static void compiled_one_clear(CompiledCriterion *cc) {
+    dec_free(&cc->numeric1);dec_free(&cc->numeric2);
+    if(cc->in_numeric){for(int j=0;j<cc->in_count;j++)dec_free(&cc->in_numeric[j]);free(cc->in_numeric);}
+        free(cc->s1);
+        free(cc->s2);
+        free(cc->needle_lc);
+        free(cc->in_i64);
+        free(cc->in_f64);
+        free(cc->in_uuid);
+        free(cc->in_time);
+        free(cc->in_ipv4);
+        free(cc->in_ipv6);
+        free(cc->in_lens);
+        if (cc->re) {
+            if (cc->re_compiled) regfree(cc->re);
+            free(cc->re);
         }
-        if (arr[i].re_anchors) {
-            for (int k = 0; k < arr[i].re_anchor_count; k++) {
-                free(arr[i].re_anchors[k]);
+        if (cc->re_anchors) {
+            for (int k = 0; k < cc->re_anchor_count; k++) {
+                free(cc->re_anchors[k]);
             }
-            free(arr[i].re_anchors);
-            free(arr[i].re_anchor_lens);
+            free(cc->re_anchors);
+            free(cc->re_anchor_lens);
         }
-    }
+    memset(cc,0,sizeof(*cc));
+}
+void free_compiled_criteria(CompiledCriterion *arr,int n){
+    if(!arr)return;
+    for(int i=0;i<n;i++)compiled_one_clear(&arr[i]);
     free(arr);
 }
 
 /* Compare varchar field at p (fixed size) against compiled criterion. */
-static int match_typed_varchar(const uint8_t *p, int size,
+static int match_typed_varchar_span(const uint8_t *content, size_t elen,
                                const CompiledCriterion *cc) {
-    int elen = varchar_eff_len(p, size);
-    const char *hay = (const char *)(p + 2);  /* content starts after uint16 prefix */
+    const char *hay = (const char *)content;
     const SearchCriterion *c = cc->raw;
 
     switch (cc->op) {
     case OP_EXISTS: return elen > 0;
     case OP_NOT_EXISTS: return elen == 0;
     case OP_EQUAL:
-        return elen == (int)cc->s1_len && memcmp(hay, cc->s1, elen) == 0;
+        return elen == cc->s1_len && memcmp(hay, cc->s1, elen) == 0;
     case OP_NOT_EQUAL:
-        return !(elen == (int)cc->s1_len && memcmp(hay, cc->s1, elen) == 0);
+        return !(elen == cc->s1_len && memcmp(hay, cc->s1, elen) == 0);
     case OP_LESS: case OP_GREATER: case OP_LESS_EQ: case OP_GREATER_EQ: {
-        size_t n = elen < (int)cc->s1_len ? (size_t)elen : cc->s1_len;
+        size_t n = elen < cc->s1_len ? (size_t)elen : cc->s1_len;
         int r = memcmp(hay, cc->s1, n);
-        if (r == 0) r = (elen < (int)cc->s1_len) ? -1 : (elen > (int)cc->s1_len ? 1 : 0);
+        if (r == 0) r = (elen < cc->s1_len) ? -1 : (elen > cc->s1_len ? 1 : 0);
         switch (cc->op) {
             case OP_LESS: return r < 0;
             case OP_GREATER: return r > 0;
@@ -640,13 +749,13 @@ static int match_typed_varchar(const uint8_t *p, int size,
         }
     }
     case OP_BETWEEN: {
-        size_t n1 = elen < (int)cc->s1_len ? (size_t)elen : cc->s1_len;
+        size_t n1 = elen < cc->s1_len ? (size_t)elen : cc->s1_len;
         int r1 = memcmp(hay, cc->s1, n1);
-        if (r1 == 0) r1 = (elen < (int)cc->s1_len) ? -1 : (elen > (int)cc->s1_len ? 1 : 0);
+        if (r1 == 0) r1 = (elen < cc->s1_len) ? -1 : (elen > cc->s1_len ? 1 : 0);
         if (c->min_exclusive ? (r1 <= 0) : (r1 < 0)) return 0;
-        size_t n2 = elen < (int)cc->s2_len ? (size_t)elen : cc->s2_len;
+        size_t n2 = elen < cc->s2_len ? (size_t)elen : cc->s2_len;
         int r2 = memcmp(hay, cc->s2, n2);
-        if (r2 == 0) r2 = (elen < (int)cc->s2_len) ? -1 : (elen > (int)cc->s2_len ? 1 : 0);
+        if (r2 == 0) r2 = (elen < cc->s2_len) ? -1 : (elen > cc->s2_len ? 1 : 0);
         return c->max_exclusive ? (r2 < 0) : (r2 <= 0);
     }
     /* CS string ops — needle stored raw in cc->needle_lc (despite the
@@ -654,10 +763,10 @@ static int match_typed_varchar(const uint8_t *p, int size,
     case OP_LIKE:
         switch (cc->like_kind) {
         case LK_EXACT:
-            return elen == (int)cc->needle_len &&
+            return elen == cc->needle_len &&
                    memcmp(hay, cc->needle_lc, cc->needle_len) == 0;
         case LK_PREFIX:
-            return elen >= (int)cc->needle_len &&
+            return elen >= cc->needle_len &&
                    memcmp(hay, cc->needle_lc, cc->needle_len) == 0;
         case LK_CONTAINS:
             return simd_memmem(hay, elen, cc->needle_lc, cc->needle_len) != NULL;
@@ -665,25 +774,25 @@ static int match_typed_varchar(const uint8_t *p, int size,
         return 0;
     case OP_NOT_LIKE: {
         CompiledCriterion tmp = *cc; tmp.op = OP_LIKE;
-        return !match_typed_varchar(p, size, &tmp);
+        return !match_typed_varchar_span(content, elen, &tmp);
     }
     case OP_CONTAINS:
         return simd_memmem(hay, elen, cc->needle_lc, cc->needle_len) != NULL;
     case OP_NOT_CONTAINS:
         return simd_memmem(hay, elen, cc->needle_lc, cc->needle_len) == NULL;
     case OP_STARTS_WITH:
-        return elen >= (int)cc->needle_len &&
+        return elen >= cc->needle_len &&
                memcmp(hay, cc->needle_lc, cc->needle_len) == 0;
     case OP_ENDS_WITH:
-        return elen >= (int)cc->needle_len &&
+        return elen >= cc->needle_len &&
                memcmp(hay + elen - cc->needle_len, cc->needle_lc, cc->needle_len) == 0;
     /* CI variants — needle is pre-lowered in compile_one; haystack is
        lowered per char on the hot path. memcasemem fuses both. */
     case OP_ILIKE:
         switch (cc->like_kind) {
         case LK_EXACT: {
-            if (elen != (int)cc->needle_len) return 0;
-            for (int i = 0; i < elen; i++) {
+            if (elen != cc->needle_len) return 0;
+            for (size_t i = 0; i < elen; i++) {
                 char a = hay[i], b = cc->needle_lc[i];
                 if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
                 if (a != b) return 0;
@@ -691,7 +800,7 @@ static int match_typed_varchar(const uint8_t *p, int size,
             return 1;
         }
         case LK_PREFIX:
-            if (elen < (int)cc->needle_len) return 0;
+            if (elen < cc->needle_len) return 0;
             for (size_t i = 0; i < cc->needle_len; i++) {
                 char a = hay[i], b = cc->needle_lc[i];
                 if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
@@ -704,14 +813,14 @@ static int match_typed_varchar(const uint8_t *p, int size,
         return 0;
     case OP_INOT_LIKE: {
         CompiledCriterion tmp = *cc; tmp.op = OP_ILIKE;
-        return !match_typed_varchar(p, size, &tmp);
+        return !match_typed_varchar_span(content, elen, &tmp);
     }
     case OP_ICONTAINS:
         return simd_memcasemem(hay, elen, cc->needle_lc, cc->needle_len) != NULL;
     case OP_INOT_CONTAINS:
         return simd_memcasemem(hay, elen, cc->needle_lc, cc->needle_len) == NULL;
     case OP_ISTARTS_WITH: {
-        if (elen < (int)cc->needle_len) return 0;
+        if (elen < cc->needle_len) return 0;
         for (size_t i = 0; i < cc->needle_len; i++) {
             char a = hay[i], b = cc->needle_lc[i];
             if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
@@ -720,7 +829,7 @@ static int match_typed_varchar(const uint8_t *p, int size,
         return 1;
     }
     case OP_IENDS_WITH: {
-        if (elen < (int)cc->needle_len) return 0;
+        if (elen < cc->needle_len) return 0;
         const char *tail = hay + elen - cc->needle_len;
         for (size_t i = 0; i < cc->needle_len; i++) {
             char a = tail[i], b = cc->needle_lc[i];
@@ -732,22 +841,22 @@ static int match_typed_varchar(const uint8_t *p, int size,
     case OP_IN:
         for (int i = 0; i < c->in_count; i++) {
             size_t vl = cc->in_lens[i];
-            if (elen == (int)vl && memcmp(hay, c->in_values[i], vl) == 0) return 1;
+            if (elen == vl && memcmp(hay, c->in_values[i], vl) == 0) return 1;
         }
         return 0;
     case OP_NOT_IN:
         for (int i = 0; i < c->in_count; i++) {
             size_t vl = cc->in_lens[i];
-            if (elen == (int)vl && memcmp(hay, c->in_values[i], vl) == 0) return 0;
+            if (elen == vl && memcmp(hay, c->in_values[i], vl) == 0) return 0;
         }
         return 1;
-    case OP_LEN_EQ:         return elen == (int)cc->i1;
-    case OP_LEN_NEQ:        return elen != (int)cc->i1;
-    case OP_LEN_LESS:       return elen <  (int)cc->i1;
-    case OP_LEN_GREATER:    return elen >  (int)cc->i1;
-    case OP_LEN_LESS_EQ:    return elen <= (int)cc->i1;
-    case OP_LEN_GREATER_EQ: return elen >= (int)cc->i1;
-    case OP_LEN_BETWEEN:    return elen >= (int)cc->i1 && elen <= (int)cc->i2;
+    case OP_LEN_EQ:         return (int64_t)elen == cc->i1;
+    case OP_LEN_NEQ:        return (int64_t)elen != cc->i1;
+    case OP_LEN_LESS:       return (int64_t)elen <  cc->i1;
+    case OP_LEN_GREATER:    return (int64_t)elen > cc->i1;
+    case OP_LEN_LESS_EQ:    return (int64_t)elen <= cc->i1;
+    case OP_LEN_GREATER_EQ: return (int64_t)elen >= cc->i1;
+    case OP_LEN_BETWEEN:    return (int64_t)elen >= cc->i1 && (int64_t)elen <= cc->i2;
     case OP_REGEX:
     case OP_NOT_REGEX: {
         if (!cc->re_compiled) return cc->op == OP_REGEX ? 0 : 1;
@@ -907,56 +1016,7 @@ static int field_vs_field_match(int cmp, enum SearchOp op) {
    `rec` points at the raw value region of the record (hdr->key_len offset
    into block). Returns 1 on match, 0 otherwise.
    For composite/unknown fields, falls back to decode_field + match_criterion. */
-int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc, FieldSchema *fs,
-                uint8_t hdr2) {
-    if (cc->composite || !cc->tf) {
-        char *attr = decode_field((const char *)rec, data_len, cc->raw->field, fs, hdr2);
-        int r = match_criterion(attr, cc->raw);
-        free(attr);
-        return r;
-    }
-
-    /* Field-vs-field: compare LHS bytes against the sibling RHS field on
-       the same record. cc->rhs_tf is NULL when types didn't match at
-       compile time — every record fails (caller's fault). */
-    if (cc->op == OP_EQ_FIELD || cc->op == OP_NEQ_FIELD ||
-        cc->op == OP_LT_FIELD || cc->op == OP_GT_FIELD ||
-        cc->op == OP_LTE_FIELD || cc->op == OP_GTE_FIELD) {
-        if (!cc->rhs_tf) return 0;
-        const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-        int bm_bytes = 0; size_t region = 0;
-        if (typed_record_view(rec, data_len, hdr2, &fbase, &bm,
-                              &bm_bytes, &region) != 0) return 0;
-        int lhs_idx = (int)(cc->tf - fs->ts->fields);
-        int rhs_idx = (int)(cc->rhs_tf - fs->ts->fields);
-        if ((hdr2 & SREC_FLAG_NULLMAP) &&
-            (typed_field_null(bm, bm_bytes, lhs_idx) ||
-             typed_field_null(bm, bm_bytes, rhs_idx))) return 0;
-        const uint8_t *lhs = ((size_t)cc->tf->offset + (size_t)cc->tf->size > region)
-            ? g_zero_field_65537 : fbase + cc->tf->offset;
-        const uint8_t *rhs = ((size_t)cc->rhs_tf->offset + (size_t)cc->rhs_tf->size > region)
-            ? g_zero_field_65537 : fbase + cc->rhs_tf->offset;
-        int r = cmp_typed_field_pair(lhs, rhs, cc->tf);
-        return field_vs_field_match(r, cc->op);
-    }
-
-    const TypedField *f = cc->tf;
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t region = 0;
-    if (typed_record_view(rec, data_len, hdr2, &fbase, &bm,
-                          &bm_bytes, &region) != 0) return 0;
-    /* NULL field: every value op false; exists/not_exists are the null
-       tests (§2.4.2 truth table). Legacy records keep their semantics. */
-    if (hdr2 & SREC_FLAG_NULLMAP) {
-        int is_null = typed_field_null(bm, bm_bytes, (int)(f - fs->ts->fields));
-        if (cc->op == OP_EXISTS)     return !is_null;
-        if (cc->op == OP_NOT_EXISTS) return is_null;
-        if (is_null) return 0;
-        /* fall through — bit clear ⇒ pure value semantics, no zero gates */
-    }
-    const uint8_t *p = ((size_t)f->offset + (size_t)f->size > region)
-        ? g_zero_field_65537 : fbase + f->offset;
-
+static int match_typed_field(const uint8_t *p,const TypedField *f,const CompiledCriterion *cc,uint8_t hdr2){
     switch (f->type) {
     case FT_NONE:
     case FT_COUNT:      /* sentinel — never a real field type. Listed (rather
@@ -964,7 +1024,7 @@ int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc
                            switch when a new FieldType is added. */
         return 0;
     case FT_VARCHAR:
-        return match_typed_varchar(p, f->size, cc);
+        return match_typed_varchar_span(p+2,(size_t)varchar_eff_len(p,f->size),cc);
     case FT_LONG:
     case FT_TIMESTAMP: {
         int64_t v = ld_be_i64(p);
@@ -1268,6 +1328,59 @@ int match_typed(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc
     return 0;
 }
 
+static int match_typed_legacy(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc, FieldSchema *fs,
+                uint8_t hdr2) {
+    if (cc->composite || !cc->tf) {
+        char *attr = decode_field((const char *)rec, data_len, cc->raw->field, fs, hdr2);
+        int r = match_criterion(attr, cc->raw);
+        free(attr);
+        return r;
+    }
+
+    /* Field-vs-field: compare LHS bytes against the sibling RHS field on
+       the same record. cc->rhs_tf is NULL when types didn't match at
+       compile time — every record fails (caller's fault). */
+    if (cc->op == OP_EQ_FIELD || cc->op == OP_NEQ_FIELD ||
+        cc->op == OP_LT_FIELD || cc->op == OP_GT_FIELD ||
+        cc->op == OP_LTE_FIELD || cc->op == OP_GTE_FIELD) {
+        if (!cc->rhs_tf) return 0;
+        const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
+        int bm_bytes = 0; size_t region = 0;
+        if (typed_record_view(rec, data_len, hdr2, &fbase, &bm,
+                              &bm_bytes, &region) != 0) return 0;
+        int lhs_idx = (int)(cc->tf - fs->ts->fields);
+        int rhs_idx = (int)(cc->rhs_tf - fs->ts->fields);
+        if ((hdr2 & SREC_FLAG_NULLMAP) &&
+            (typed_field_null(bm, bm_bytes, lhs_idx) ||
+             typed_field_null(bm, bm_bytes, rhs_idx))) return 0;
+        const uint8_t *lhs = ((size_t)cc->tf->offset + (size_t)cc->tf->size > region)
+            ? g_zero_field_65537 : fbase + cc->tf->offset;
+        const uint8_t *rhs = ((size_t)cc->rhs_tf->offset + (size_t)cc->rhs_tf->size > region)
+            ? g_zero_field_65537 : fbase + cc->rhs_tf->offset;
+        int r = cmp_typed_field_pair(lhs, rhs, cc->tf);
+        return field_vs_field_match(r, cc->op);
+    }
+
+    const TypedField *f = cc->tf;
+    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
+    int bm_bytes = 0; size_t region = 0;
+    if (typed_record_view(rec, data_len, hdr2, &fbase, &bm,
+                          &bm_bytes, &region) != 0) return 0;
+    /* NULL field: every value op false; exists/not_exists are the null
+       tests (§2.4.2 truth table). Legacy records keep their semantics. */
+    if (hdr2 & SREC_FLAG_NULLMAP) {
+        int is_null = typed_field_null(bm, bm_bytes, (int)(f - fs->ts->fields));
+        if (cc->op == OP_EXISTS)     return !is_null;
+        if (cc->op == OP_NOT_EXISTS) return is_null;
+        if (is_null) return 0;
+        /* fall through — bit clear ⇒ pure value semantics, no zero gates */
+    }
+    const uint8_t *p = ((size_t)f->offset + (size_t)f->size > region)
+        ? g_zero_field_65537 : fbase + f->offset;
+
+    return match_typed_field(p,f,cc,hdr2);
+}
+
 /* ========== Criteria parsers + tree planner ========== */
 /* ========== Reusable criteria parser ========== */
 
@@ -1285,7 +1398,7 @@ static int op_requires_value(enum SearchOp op) {
    missing value for ops that require one, or missing value2 for
    between/len_between).
    On error, c is zeroed. */
-static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
+static int parse_one_criterion(const char *obj_buf, SearchCriterion *c,CriterionBudget *budget) {
     memset(c, 0, sizeof(*c));
 
     JsonObj cobj;
@@ -1319,7 +1432,7 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
        below, so both input shapes are validated and matched identically. */
     if ((c->op == OP_BETWEEN || c->op == OP_LEN_BETWEEN) && !v2 && v && v[0] == '[') {
         const char *ap = v + 1;
-        char parts[2][1024] = {{0}};
+        char *parts[2] = {NULL,NULL};
         int pi = 0;
         while (*ap && pi < 2) {
             while (*ap == ' ' || *ap == '\t' || *ap == '\r' ||
@@ -1347,20 +1460,20 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                                     start[plen - 1] == '\n'))
                     plen--;
                 if (plen == 4 && json_span_is_null(start, 4)) {
-                    free(v); free(v_raw); free(v2);
+                    free(parts[0]);free(parts[1]);free(v);free(v_raw);free(v2);
                     return -1;
                 }
             }
-            if (plen >= sizeof(parts[0])) plen = sizeof(parts[0]) - 1;
-            memcpy(parts[pi], start, plen);
-            parts[pi][plen] = '\0';
+            parts[pi]=strndup(start,plen);
+            if(!parts[pi]){free(parts[0]);free(v);free(v_raw);free(v2);return -1;}
             pi++;
         }
         if (pi == 2 && parts[0][0] && parts[1][0]) {
             free(v);
-            v = strdup(parts[0]);
-            v2 = strdup(parts[1]);
+            v = parts[0];parts[0]=NULL;
+            v2 = parts[1];parts[1]=NULL;
         }
+        free(parts[0]);free(parts[1]);
     }
 
     /* Validate value — required for all ops except exists/not_exists.
@@ -1424,6 +1537,7 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
     }
 
     if (v) {
+        /* Inline compatibility snapshot; final operand ownership below. */
         strncpy(c->value, v, sizeof(c->value) - 1);
         /* LIKE/NOT_LIKE accept '*' as an alias for '%'. Normalize once
            so both the typed and legacy match paths see a single form. */
@@ -1432,7 +1546,9 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
         }
         if (c->op == OP_IN || c->op == OP_NOT_IN) {
             c->in_cap = 64;
+            if(criterion_budget_take(budget,(size_t)c->in_cap*sizeof(char*))){free(v);free(v_raw);free(v2);return -1;}
             c->in_values = malloc(c->in_cap * sizeof(char *));
+            if(!c->in_values){free(v);free(v_raw);free(v2);return -1;}
             const char *ap = v_raw ? v_raw : v;
             if (*ap == '"') ap++;
             if (*ap == '[') {
@@ -1474,7 +1590,7 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                         }
                         memcpy(raw, start, len); raw[len] = '\0';
                         char *val = NULL; size_t ulen = 0;
-                        if (json_unescape_cstring(raw, len, &val, &ulen) != 0) {
+                        if (criterion_budget_take(budget,len+1)||json_unescape_cstring(raw, len, &val, &ulen) != 0) {
                             free(raw);
                             for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
                             free(c->in_values); c->in_values = NULL;
@@ -1482,6 +1598,7 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                             free(v); free(v_raw); free(v2);
                             return -1;
                         }
+                        budget->used-=len-ulen;
                         free(raw);
                         if (c->in_count >= c->in_cap) {
                             int new_cap = c->in_cap * 2;
@@ -1489,9 +1606,9 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                             char **t = (g_query_plan_test_fail_grow > 0 &&
                                         --g_query_plan_test_fail_grow == 0)
                                        ? NULL
-                                       : realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+                                       : (criterion_budget_take(budget,(size_t)(new_cap-c->in_cap)*sizeof(char*))?NULL:realloc(c->in_values, (size_t)new_cap * sizeof(char *)));
 #else
-                            char **t = realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+                            char **t = (criterion_budget_take(budget,(size_t)(new_cap-c->in_cap)*sizeof(char*))?NULL:realloc(c->in_values, (size_t)new_cap * sizeof(char *)));
 #endif
                             if (!t) {
                                 free(val);
@@ -1517,9 +1634,9 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                                 char **t = (g_query_plan_test_fail_grow > 0 &&
                                             --g_query_plan_test_fail_grow == 0)
                                            ? NULL
-                                           : realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+                                           : (criterion_budget_take(budget,(size_t)(new_cap-c->in_cap)*sizeof(char*))?NULL:realloc(c->in_values, (size_t)new_cap * sizeof(char *)));
 #else
-                                char **t = realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+                                char **t = (criterion_budget_take(budget,(size_t)(new_cap-c->in_cap)*sizeof(char*))?NULL:realloc(c->in_values, (size_t)new_cap * sizeof(char *)));
 #endif
                                 if (!t) {
                                     for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
@@ -1531,7 +1648,7 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                                 c->in_values = t;
                                 c->in_cap = new_cap;
                             }
-                            char *val = malloc(len + 1);
+                            char *val = criterion_budget_take(budget,len+1)?NULL:malloc(len + 1);
                             if (!val) {
                                 for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
                                 free(c->in_values); c->in_values = NULL;
@@ -1545,11 +1662,25 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                     }
                 }
             } else {
+#ifdef TEST_BUILD
+                char *iv = g_query_plan_test_fail_in_copy > 0 &&
+                           --g_query_plan_test_fail_in_copy == 0
+                    ? (errno = ENOMEM, (char *)NULL) : strdup(v);
+#else
                 char *iv = strdup(v);
+#endif
+                if (!iv) {
+                    int error = errno ? errno : ENOMEM;
+                    search_criterion_clear(c);
+                    free(v); free(v_raw); free(v2);
+                    errno = error;
+                    return -1;
+                }
                 char *_tok_save = NULL; char *tok = strtok_r(iv, ",", &_tok_save);
                 while (tok) {
                     char *val = NULL; size_t ulen = 0;
-                    if (json_unescape_cstring(tok, strlen(tok), &val, &ulen) != 0) {
+                    size_t token_len=strlen(tok);
+                    if (criterion_budget_take(budget,token_len+1)||json_unescape_cstring(tok, token_len, &val, &ulen) != 0) {
                         free(iv);
                         for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
                         free(c->in_values); c->in_values = NULL;
@@ -1557,15 +1688,16 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                         free(v); free(v_raw); free(v2);
                         return -1;
                     }
+                    budget->used-=token_len-ulen;
                     if (c->in_count >= c->in_cap) {
                         int new_cap = c->in_cap * 2;
 #ifdef TEST_BUILD
                         char **t = (g_query_plan_test_fail_grow > 0 &&
                                     --g_query_plan_test_fail_grow == 0)
                                    ? NULL
-                                   : realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+                                   : (criterion_budget_take(budget,(size_t)(new_cap-c->in_cap)*sizeof(char*))?NULL:realloc(c->in_values, (size_t)new_cap * sizeof(char *)));
 #else
-                        char **t = realloc(c->in_values, (size_t)new_cap * sizeof(char *));
+                        char **t = (criterion_budget_take(budget,(size_t)(new_cap-c->in_cap)*sizeof(char*))?NULL:realloc(c->in_values, (size_t)new_cap * sizeof(char *)));
 #endif
                         if (!t) {
                             for (int i = 0; i < c->in_count; i++) free(c->in_values[i]);
@@ -1585,16 +1717,195 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
                 free(iv);
             }
         }
+        if(c->op==OP_LIKE||c->op==OP_NOT_LIKE)for(char *q=v;*q;q++)if(*q=='*')*q='%';
+        if(search_criterion_set_budget(c,0,v,strlen(v),budget)){free(v);free(v_raw);free(v2);search_criterion_clear(c);return -1;}
         free(v);
     }
     free(v_raw);
-    if (v2) { strncpy(c->value2, v2, sizeof(c->value2) - 1); free(v2); }
+    if(v2){if(search_criterion_set_budget(c,1,v2,strlen(v2),budget)){free(v2);search_criterion_clear(c);return -1;}free(v2);}
     if (op_is_length(c->op)) {
-        c->len_target = strtoll(c->value, NULL, 10);
+        c->len_target = strtoll(search_criterion_value(c), NULL, 10);
         if (c->op == OP_LEN_BETWEEN)
-            c->len_target2 = strtoll(c->value2, NULL, 10);
+            c->len_target2 = strtoll(search_criterion_value2(c), NULL, 10);
     }
     return 0;
+}
+
+static int predicate_span_decimal(const TypedRowView *v,size_t i,const TypedRowSpan *span,dec_t *out){
+    if(v->schema->packed.nfields&&v->schema->packed.fields[i].kind==PKR_NUMERIC){
+        dec_status st=dec_unpack(span->data,span->len,out);
+        if(st==DEC_OK)return 0;
+    errno=st==DEC_ERR_NOMEM?ENOMEM:EILSEQ;return -1;
+    }
+    const uint8_t *data;if(typed_span_read(v->schema,i,span,&data))return -1;
+    const TypedField *f=&v->schema->fields[i];int64_t raw=ld_be_i64(data);
+    uint64_t magnitude=raw<0?(uint64_t)(-(raw+1))+1:(uint64_t)raw;
+    char digits[32],text[128];int n=snprintf(digits,sizeof(digits),"%llu",(unsigned long long)magnitude);
+    int scale=f->numeric_scale;
+    if(scale<0||scale>18||f->numeric_scale_mult<=0){errno=EILSEQ;return -1;}
+    size_t pos=0;if(raw<0)text[pos++]='-';
+    if(scale>=n){text[pos++]='0';if(scale)text[pos++]='.';for(int j=n;j<scale;j++)text[pos++]='0';memcpy(text+pos,digits,(size_t)n);pos+=(size_t)n;}
+    else{size_t whole=(size_t)(n-scale);memcpy(text+pos,digits,whole);pos+=whole;if(scale){text[pos++]='.';memcpy(text+pos,digits+whole,(size_t)scale);pos+=(size_t)scale;}}
+    return predicate_decimal_parse(text,pos,out,NULL,0);
+}
+static int predicate_decimal_match(const dec_t *value,const CompiledCriterion *cc){
+    int cmp=dec_cmp(value,&cc->numeric1);
+    switch(cc->op){
+    case OP_EQUAL:return cmp==0;case OP_NOT_EQUAL:return cmp!=0;
+    case OP_LESS:return cmp<0;case OP_GREATER:return cmp>0;
+    case OP_LESS_EQ:return cmp<=0;case OP_GREATER_EQ:return cmp>=0;
+    case OP_BETWEEN:{int hi=dec_cmp(value,&cc->numeric2);return (cc->raw->min_exclusive?cmp>0:cmp>=0)&&(cc->raw->max_exclusive?hi<0:hi<=0);}
+    case OP_IN:case OP_NOT_IN:{int found=0;for(int i=0;i<cc->in_count;i++)if(!dec_cmp(value,&cc->in_numeric[i])){found=1;break;}return cc->op==OP_IN?found:!found;}
+    default:return 0;
+    }
+}
+static int predicate_bytes_cmp(const uint8_t *a,size_t an,const uint8_t *b,size_t bn){size_t n=an<bn?an:bn;int r=memcmp(a,b,n);return r?r:(an<bn?-1:an>bn);}
+static int predicate_regex_match(const uint8_t *data,size_t len,const CompiledCriterion *cc,int *matched){
+    if(!cc->re_compiled){*matched=cc->op==OP_NOT_REGEX;return 0;}
+    if(cc->re_anchor_count>0&&!regex_anchors_match(cc,(const char*)data,len)){*matched=cc->op==OP_NOT_REGEX;return 0;}
+    regmatch_t pm={.rm_so=0,.rm_eo=(regoff_t)len};
+    int rc=regexec(cc->re,(const char*)data,1,&pm,REG_STARTEND);
+    if(rc&&rc!=REG_NOMATCH){errno=rc==REG_ESPACE?ENOMEM:EILSEQ;return -1;}
+    *matched=cc->op==OP_REGEX?rc==0:rc==REG_NOMATCH;return 0;
+}
+/* Legacy display fallback without unchecked heap allocation or skipped errors.
+ * The view and its borrowed spans stay inside the original callback lifetime. */
+static int predicate_legacy_text_span(const TypedRowView *view,size_t index,
+    const char **text,size_t *len,char fixed[512]){
+    *text=NULL;*len=0;
+    const TypedField *f=&view->schema->fields[index];TypedRowSpan span;
+    if(typed_row_span(view,index,&span))return -1;
+    if(span.is_null||f->removed)return 0;
+    const uint8_t *data;if(typed_span_read(view->schema,index,&span,&data))return -1;
+    if(f->type==FT_VARCHAR){
+        if(f->size<2){errno=EILSEQ;return -1;}
+        size_t n=(size_t)varchar_eff_len(data,f->size);
+        if(!n&&!(view->hdr2&SREC_FLAG_NULLMAP))return 0;
+        *text=(const char*)data+2;*len=strnlen(*text,n);return 0;
+    }
+    if(f->type==FT_ENUM){
+        if(!f->enum_values||f->n_enum_values<=0)return 0;
+        if(f->enum_width==2&&f->size<2){errno=EILSEQ;return -1;}
+        int value=f->enum_width==2?(int)(((uint16_t)data[0]<<8)|data[1]):data[0];
+        *text=value>=0&&value<f->n_enum_values&&f->enum_values[value]?f->enum_values[value]:"";
+        *len=strlen(*text);return 0;
+    }
+    int n=decode_field_to_buf(f,data,fixed,512,(view->hdr2&SREC_FLAG_NULLMAP)!=0);
+    if(n<0||n>=512){errno=EILSEQ;return -1;}
+    if(!n)return 0;
+    *text=fixed;*len=(size_t)n;
+    if(n>=2&&fixed[0]=='"'&&fixed[n-1]=='"'){(*text)++;*len-=2;}
+    return 0;
+}
+static int predicate_legacy_named_text(const TypedRowView *view,const char *name,size_t budget,char **out){
+    *out=NULL;int composite=strchr(name,'+')!=NULL;
+    char names[256];size_t name_len=strnlen(name,sizeof(names));
+    if(name_len==sizeof(names)){errno=E2BIG;return -1;}
+    size_t total=0;
+    for(int pass=0;pass<2;pass++){
+        memcpy(names,name,name_len+1);char *save=NULL,*token=strtok_r(names,"+",&save);size_t pos=0;
+        while(token){int index=typed_field_index(view->schema,token);
+            if(index>=0){char fixed[512];const char *text=NULL;size_t n=0;
+                if(predicate_legacy_text_span(view,(size_t)index,&text,&n,fixed))goto fail;
+                if(text){
+                    if(pass==0){if(n>SIZE_MAX-total-1){errno=EOVERFLOW;goto fail;}total+=n;}
+                    else{if(n)memcpy(*out+pos,text,n);pos+=n;}
+                }
+            }
+            token=strtok_r(NULL,"+",&save);
+        }
+        if(pass==0){
+            if(!total&&composite)return 0;
+            if(!composite&&typed_field_index(view->schema,name)<0)return 0;
+            if(total>=budget){errno=ENOMEM;return -1;}
+            *out=malloc(total+1);if(!*out)return -1;
+        }else (*out)[pos]=0;
+    }
+    return 0;
+fail:free(*out);*out=NULL;return -1;
+}
+
+int match_typed_checked(const uint8_t *rec,size_t len,const CompiledCriterion *cc,FieldSchema *fs,uint8_t flags,int *matched){
+    if(!matched){errno=EINVAL;return -1;}*matched=0;
+    if(!cc||!fs||!fs->ts||!rec){errno=EINVAL;return -1;}
+    size_t workspace=cc->workspace_budget<g_query_buffer_max_bytes?cc->workspace_budget:g_query_buffer_max_bytes;
+    TypedRowView view;if(typed_row_open(fs->ts,rec,len,flags,&view))return -1;
+    if(!cc->tf||cc->composite){
+        if(fs->ts->packed.nfields){size_t textlen=0;errno=0;size_t allowance=typed_packed_render_allowance(fs->ts,rec,len,flags,cc->raw->field,workspace);if(!allowance)return -1;char *text=typed_packed_named_text(fs->ts,rec,len,flags,cc->raw->field,allowance,&textlen);
+            if(!text&&errno)return -1;
+            *matched=match_criterion(text,cc->raw);free(text);return 0;}
+        char *text=NULL;if(predicate_legacy_named_text(&view,cc->raw->field,workspace,&text))return -1;
+        *matched=match_criterion(text,cc->raw);free(text);return 0;
+    }
+    size_t i=(size_t)(cc->tf-fs->ts->fields);TypedRowSpan lhs;
+    if(typed_row_span(&view,i,&lhs))return -1;
+    int nullmap=(flags&SREC_FLAG_NULLMAP)||fs->ts->packed.nfields;
+    if(nullmap){
+        if(cc->op==OP_EXISTS){*matched=!lhs.is_null;return 0;}
+        if(cc->op==OP_NOT_EXISTS){*matched=lhs.is_null;return 0;}
+        if(lhs.is_null)return 0;
+    }
+    if(predicate_is_field(cc->op)){
+        if(!cc->rhs_tf)return 0;
+        size_t j=(size_t)(cc->rhs_tf-fs->ts->fields);TypedRowSpan rhs;
+        if(typed_row_span(&view,j,&rhs))return -1;
+        if(rhs.is_null)return 0;
+        int cmp=0;
+        if(cc->ftype==FT_NUMERIC){
+            if(lhs.len>SIZE_MAX/4||rhs.len>SIZE_MAX/4||lhs.len*4>workspace||rhs.len*4>workspace-lhs.len*4||workspace-lhs.len*4-rhs.len*4<256){errno=ENOMEM;return -1;}
+            dec_t a,b;dec_init(&a);dec_init(&b);
+            int status=predicate_span_decimal(&view,i,&lhs,&a);if(!status)status=predicate_span_decimal(&view,j,&rhs,&b);
+            if(!status)cmp=dec_cmp(&a,&b);
+            dec_free(&a);dec_free(&b);if(status)return -1;
+        }else if(fs->ts->packed.nfields&&cc->ftype==FT_VARCHAR){cmp=predicate_bytes_cmp(lhs.data,lhs.len,rhs.data,rhs.len);}
+        else{const uint8_t *a,*b;if(typed_span_read(fs->ts,i,&lhs,&a)||typed_span_read(fs->ts,j,&rhs,&b))return -1;
+            if(cc->ftype==FT_VARCHAR){cmp=predicate_bytes_cmp(a+2,(size_t)varchar_eff_len(a,cc->tf->size),b+2,(size_t)varchar_eff_len(b,cc->rhs_tf->size));}
+            else cmp=cmp_typed_field_pair(a,b,cc->tf);}
+        *matched=field_vs_field_match(cmp,cc->op);return 0;
+    }
+    if(cc->ftype==FT_NUMERIC&&predicate_numeric_comparison(cc->op)){
+        if(lhs.len>SIZE_MAX/4||lhs.len*4>workspace||workspace-lhs.len*4<128){errno=ENOMEM;return -1;}
+        dec_t value;dec_init(&value);int status=predicate_span_decimal(&view,i,&lhs,&value);
+        if(!status)*matched=predicate_decimal_match(&value,cc);
+        dec_free(&value);return status;
+    }
+    if(cc->ftype==FT_VARCHAR&&(cc->op==OP_REGEX||cc->op==OP_NOT_REGEX)){
+        const uint8_t *data=lhs.data;size_t bytes=lhs.len;
+        if(!fs->ts->packed.nfields){if(typed_span_read(fs->ts,i,&lhs,&data))return -1;bytes=(size_t)varchar_eff_len(data,cc->tf->size);data+=2;}
+        return predicate_regex_match(data,bytes,cc,matched);
+    }
+    if(!fs->ts->packed.nfields){*matched=match_typed_legacy(rec,len,cc,fs,flags);return 0;}
+    if(cc->ftype==FT_VARCHAR){
+        *matched=match_typed_varchar_span(lhs.data,lhs.len,cc);return 0;
+    }
+    *matched=match_typed_field(lhs.data,cc->tf,cc,SREC_FLAG_NULLMAP);return 0;
+}
+int match_typed(const uint8_t *rec,size_t n,const CompiledCriterion *cc,FieldSchema *fs,uint8_t flags){int matched=0;return match_typed_checked(rec,n,cc,fs,flags,&matched)?0:matched;}
+static int compile_criteria_tree_prepare(CriteriaNode *n,const TypedSchema *ts,char *err,size_t cap,size_t remaining){
+    if(!n)return 0;
+    if(n->kind==CNODE_LEAF){
+        if(n->compiled)return 0;
+        CompiledCriterion *cc=calloc(1,sizeof(*cc));if(!cc)return -1;
+        if(compile_one_checked(cc,&n->leaf,ts,err,cap)){free_compiled_criteria(cc,1);return -1;}
+        cc->workspace_budget=remaining;n->compiled=cc;return 0;
+    }
+    for(int i=0;i<n->n_children;i++)if(compile_criteria_tree_prepare(n->children[i],ts,err,cap,remaining))return -1;
+    return 0;
+}
+int compile_criteria_tree_checked(CriteriaNode *n,const TypedSchema *ts,char *err,size_t cap){
+    CriterionBudget budget={0,g_query_buffer_max_bytes};
+    if(predicate_tree_charge(n,ts,&budget)){if(err&&cap)snprintf(err,cap,"query memory buffer exceeded");return -1;}
+    return compile_criteria_tree_prepare(n,ts,err,cap,budget.limit-budget.used);
+}
+int criteria_match_tree_checked(const uint8_t *rec,size_t len,const CriteriaNode *n,FieldSchema *fs,uint8_t flags,int *matched){
+    if(!matched){errno=EINVAL;return -1;}*matched=0;
+    if(!n){*matched=1;return 0;}
+    if(n->kind==CNODE_LEAF){if(!n->compiled){errno=EINVAL;return -1;}return match_typed_checked(rec,len,n->compiled,fs,flags,matched);}
+    if(n->kind!=CNODE_AND&&n->kind!=CNODE_OR){errno=EINVAL;return -1;}
+    for(int i=0;i<n->n_children;i++){int child=0;
+        if(criteria_match_tree_checked(rec,len,n->children[i],fs,flags,&child))return -1;
+        if((n->kind==CNODE_AND&&!child)||(n->kind==CNODE_OR&&child)){*matched=child;return 0;}}
+    *matched=n->kind==CNODE_AND;return 0;
 }
 
 /* Parse criteria from JSON — supports two forms:
@@ -1602,11 +1913,14 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c) {
    Simple form: {"status":"pending","city":"London"}  (all equality)
    Returns heap-allocated array in *out, count in *count. Caller must free_criteria(). */
 int parse_criteria_json(const char *json, SearchCriterion **out, int *count) {
+    CriterionBudget budget={0,g_query_buffer_max_bytes};
     const char *p = json_skip(json);
 
     if (*p == '[') {
         /* Array form — same as old cmd_find inline parser */
+        if(criterion_budget_take(&budget,64*sizeof(SearchCriterion))){*out=NULL;*count=0;return -1;}
         SearchCriterion *criteria = calloc(64, sizeof(SearchCriterion));
+        if(!criteria){*out=NULL;*count=0;return -1;}
         int n = 0;
         p++;
         while (*p && n < 64) {
@@ -1618,12 +1932,10 @@ int parse_criteria_json(const char *json, SearchCriterion **out, int *count) {
             const char *obj_start = p;
             const char *obj_end = json_skip_value(p);
             size_t obj_len = obj_end - obj_start;
-            char obj_buf[MAX_LINE];
-            if (obj_len >= sizeof(obj_buf)) { p = obj_end; continue; }
-            memcpy(obj_buf, obj_start, obj_len);
-            obj_buf[obj_len] = '\0';
-
-            if (parse_one_criterion(obj_buf, &criteria[n]) != 0) {
+            char *obj_buf=strndup(obj_start,obj_len);
+            if(!obj_buf){free_criteria(criteria,n);*out=NULL;*count=0;return -1;}
+            int parsed=parse_one_criterion(obj_buf,&criteria[n],&budget);free(obj_buf);
+            if (parsed != 0) {
                 free_criteria(criteria, n);
                 *out = NULL;
                 *count = 0;
@@ -1632,12 +1944,16 @@ int parse_criteria_json(const char *json, SearchCriterion **out, int *count) {
             n++;
             p = obj_end;
         }
+        if(n>0&&n<64){SearchCriterion *small=realloc(criteria,(size_t)n*sizeof(*criteria));
+            if(!small){free_criteria(criteria,n);*out=NULL;*count=0;return -1;}criteria=small;}
         *out = criteria;
         *count = n;
         return 0;
     } else if (*p == '{') {
         /* Simple equality form: {"field1":"val1","field2":"val2"} */
+        if(criterion_budget_take(&budget,64*sizeof(SearchCriterion))){*out=NULL;*count=0;return -1;}
         SearchCriterion *criteria = calloc(64, sizeof(SearchCriterion));
+        if(!criteria){*out=NULL;*count=0;return -1;}
         int n = 0;
         p++;
         while (*p && n < 64) {
@@ -1679,20 +1995,17 @@ int parse_criteria_json(const char *json, SearchCriterion **out, int *count) {
                     *count = 0;
                     return -1;
                 }
-                size_t copy_len = decoded_len < sizeof(c->value) - 1
-                    ? decoded_len : sizeof(c->value) - 1;
-                memcpy(c->value, decoded, copy_len);
-                c->value[copy_len] = '\0';
+                if(search_criterion_set_budget(c,0,decoded,decoded_len,&budget)){free(decoded);free_criteria(criteria,n+1);*out=NULL;*count=0;return -1;}
                 free(decoded);
             } else {
-                if (vlen > sizeof(c->value) - 1) vlen = sizeof(c->value) - 1;
-                memcpy(c->value, vstart, vlen);
-                c->value[vlen] = '\0';
+                if(search_criterion_set_budget(c,0,vstart,vlen,&budget)){free_criteria(criteria,n+1);*out=NULL;*count=0;return -1;}
             }
 
             n++;
             p = vend;
         }
+        if(n>0&&n<64){SearchCriterion *small=realloc(criteria,(size_t)n*sizeof(*criteria));
+            if(!small){free_criteria(criteria,n);*out=NULL;*count=0;return -1;}criteria=small;}
         *out = criteria;
         *count = n;
         return 0;
@@ -1703,26 +2016,19 @@ int parse_criteria_json(const char *json, SearchCriterion **out, int *count) {
     return -1;
 }
 
-void free_criteria(SearchCriterion *c, int count) {
-    if (!c) return;
-    for (int i = 0; i < count; i++) {
-        if (c[i].in_values) {
-            for (int j = 0; j < c[i].in_count; j++) free(c[i].in_values[j]);
-            free(c[i].in_values);
-        }
-    }
-    free(c);
-}
+void free_criteria(SearchCriterion *c,int count){if(!c)return;for(int i=0;i<count;i++)search_criterion_clear(&c[i]);free(c);}
 
 /* ========== CriteriaNode tree parser (AND/OR composition) ========== */
 
-static CriteriaNode *cnode_new(CriteriaNodeKind kind) {
+static CriteriaNode *cnode_new(CriteriaNodeKind kind,CriterionBudget *budget) {
+    if(criterion_budget_take(budget,sizeof(CriteriaNode)))return NULL;
     CriteriaNode *n = calloc(1, sizeof(CriteriaNode));
     if (n) n->kind = kind;
     return n;
 }
 
-static int cnode_append(CriteriaNode *parent, CriteriaNode *child) {
+static int cnode_append(CriteriaNode *parent, CriteriaNode *child,CriterionBudget *budget) {
+    if(criterion_budget_take(budget,sizeof(CriteriaNode*)))return -1;
     CriteriaNode **nc = realloc(parent->children,
                                 (parent->n_children + 1) * sizeof(CriteriaNode *));
     if (!nc) {
@@ -1730,6 +2036,7 @@ static int cnode_append(CriteriaNode *parent, CriteriaNode *child) {
         return -1;
     }
     parent->children = nc;
+    parent->children_cap=parent->n_children+1;
     parent->children[parent->n_children++] = child;
     return 0;
 }
@@ -1737,10 +2044,7 @@ static int cnode_append(CriteriaNode *parent, CriteriaNode *child) {
 void free_criteria_tree(CriteriaNode *n) {
     if (!n) return;
     if (n->kind == CNODE_LEAF) {
-        if (n->leaf.in_values) {
-            for (int i = 0; i < n->leaf.in_count; i++) free(n->leaf.in_values[i]);
-            free(n->leaf.in_values);
-        }
+        search_criterion_clear(&n->leaf);
         if (n->compiled) {
             free_compiled_criteria(n->compiled, 1);
         }
@@ -1751,66 +2055,35 @@ void free_criteria_tree(CriteriaNode *n) {
     free(n);
 }
 
-void compile_criteria_tree(CriteriaNode *n, const TypedSchema *ts) {
+void compile_criteria_tree(CriteriaNode *n,const TypedSchema *ts){(void)compile_criteria_tree_checked(n,ts,NULL,0);}
+
+/* Invalidate before one checked whole-tree compile. Keeping this as a
+   single compile preserves the tree-wide workspace budget and exposes OOM or
+   invalid operands to the caller instead of retaining an empty compiled leaf. */
+static void invalidate_compiled_criteria_tree(CriteriaNode *n) {
     if (!n) return;
     if (n->kind == CNODE_LEAF) {
-        if (!n->compiled) {
-            n->compiled = calloc(1, sizeof(CompiledCriterion));
-            if (n->compiled) compile_one(n->compiled, &n->leaf, ts);
-        }
+        free_compiled_criteria(n->compiled, 1);
+        n->compiled = NULL;
         return;
     }
-    for (int i = 0; i < n->n_children; i++) compile_criteria_tree(n->children[i], ts);
+    for (int i = 0; i < n->n_children; i++)
+        invalidate_compiled_criteria_tree(n->children[i]);
+}
+int recompile_criteria_tree(CriteriaNode *n, const TypedSchema *ts) {
+    invalidate_compiled_criteria_tree(n);
+    return compile_criteria_tree_checked(n, ts, NULL, 0);
 }
 
-/* Drop cached CompiledCriterion state recursively so the next
-   compile_criteria_tree() call rebuilds from the (possibly mutated)
-   SearchCriterion in each leaf. Used by the NEQ aggregate shortcut when
-   it temporarily flips the leaf's op to OP_EQUAL — without this the
-   compiled cache keeps the original op and match_typed misclassifies
-   every record. */
-void recompile_criteria_tree(CriteriaNode *n, const TypedSchema *ts) {
-    if (!n) return;
-    if (n->kind == CNODE_LEAF) {
-        if (n->compiled) {
-            /* free_compiled_criteria frees inner buffers AND the array
-               allocation, so don't free(n->compiled) again. */
-            free_compiled_criteria(n->compiled, 1);
-            n->compiled = NULL;
-        }
-        n->compiled = calloc(1, sizeof(CompiledCriterion));
-        if (n->compiled) compile_one(n->compiled, &n->leaf, ts);
-        return;
-    }
-    for (int i = 0; i < n->n_children; i++) recompile_criteria_tree(n->children[i], ts);
-}
-
-int criteria_match_tree(const uint8_t *rec, size_t data_len, const CriteriaNode *n, FieldSchema *fs,
-                       uint8_t hdr2) {
-    if (!n) return 1;
-    switch (n->kind) {
-    case CNODE_LEAF:
-        if (!n->compiled) return 0;
-        return match_typed(rec, data_len, n->compiled, fs, hdr2);
-    case CNODE_AND:
-        for (int i = 0; i < n->n_children; i++)
-            if (!criteria_match_tree(rec, data_len, n->children[i], fs, hdr2)) return 0;
-        return 1;
-    case CNODE_OR:
-        for (int i = 0; i < n->n_children; i++)
-            if (criteria_match_tree(rec, data_len, n->children[i], fs, hdr2)) return 1;
-        return 0;
-    }
-    return 0;
-}
+int criteria_match_tree(const uint8_t *rec,size_t len,const CriteriaNode *n,FieldSchema *fs,uint8_t flags){int matched=0;return criteria_match_tree_checked(rec,len,n,fs,flags,&matched)?0:matched;}
 
 /* Forward decl — parse_tree_element and parse_tree_array recurse through each other. */
-static CriteriaNode *parse_tree_element(const char *obj_buf, int depth, const char **err);
+static CriteriaNode *parse_tree_element(const char *obj_buf, int depth, const char **err,CriterionBudget *budget);
 
 /* Parse the children of an array `[elem, elem, ...]` into parent. `arr_p` must
    point at the opening '['. Each element is a leaf or a branch object. */
 static int parse_tree_array(const char *arr_p, CriteriaNode *parent,
-                            int depth, const char **err) {
+                            int depth, const char **err,CriterionBudget *budget) {
     if (depth > MAX_CRITERIA_DEPTH) {
         if (err) *err = "nesting too deep (max 16)";
         return -1;
@@ -1836,11 +2109,11 @@ static int parse_tree_array(const char *arr_p, CriteriaNode *parent,
         memcpy(obj_buf, obj_start, obj_len);
         obj_buf[obj_len] = '\0';
 
-        CriteriaNode *child = parse_tree_element(obj_buf, depth + 1, err);
+        CriteriaNode *child = parse_tree_element(obj_buf, depth + 1, err,budget);
         free(obj_buf);
         if (!child) return -1;
 
-        if (cnode_append(parent, child) != 0) {
+        if (cnode_append(parent, child,budget) != 0) {
             free_criteria_tree(child);
             if (err) *err = "out of memory";
             return -1;
@@ -1853,7 +2126,7 @@ static int parse_tree_array(const char *arr_p, CriteriaNode *parent,
 /* Parse a single element: either a branch `{or:[...]}` / `{and:[...]}` or a leaf
    `{field,op,value,...}`. Returns newly-allocated node or NULL on error. */
 static CriteriaNode *parse_tree_element(const char *obj_buf, int depth,
-                                        const char **err) {
+                                        const char **err,CriterionBudget *budget) {
     if (depth > MAX_CRITERIA_DEPTH) {
         if (err) *err = "nesting too deep (max 16)";
         return NULL;
@@ -1865,7 +2138,7 @@ static CriteriaNode *parse_tree_element(const char *obj_buf, int depth,
     char *and_arr = or_arr ? NULL : json_obj_strdup_raw(&tobj, "and");
 
     if (or_arr || and_arr) {
-        CriteriaNode *n = cnode_new(or_arr ? CNODE_OR : CNODE_AND);
+        CriteriaNode *n = cnode_new(or_arr ? CNODE_OR : CNODE_AND,budget);
         if (!n) {
             LOG_ERROR(LOG_SUB_QUERY, "parse_tree_element: calloc(sizeof(CriteriaNode)) failed for %s node", or_arr ? "OR" : "AND");
             free(or_arr); free(and_arr);
@@ -1873,7 +2146,7 @@ static CriteriaNode *parse_tree_element(const char *obj_buf, int depth,
             return NULL;
         }
         const char *arr = or_arr ? or_arr : and_arr;
-        if (parse_tree_array(arr, n, depth, err) != 0) {
+        if (parse_tree_array(arr, n, depth, err,budget) != 0) {
             free_criteria_tree(n); free(or_arr); free(and_arr);
             return NULL;
         }
@@ -1886,13 +2159,13 @@ static CriteriaNode *parse_tree_element(const char *obj_buf, int depth,
         return n;
     }
 
-    CriteriaNode *n = cnode_new(CNODE_LEAF);
+    CriteriaNode *n = cnode_new(CNODE_LEAF,budget);
     if (!n) {
         LOG_ERROR(LOG_SUB_QUERY, "parse_tree_element: calloc(sizeof(CriteriaNode)) failed for leaf");
         if (err) *err = "out of memory";
         return NULL;
     }
-    if (parse_one_criterion(obj_buf, &n->leaf) != 0) {
+    if (parse_one_criterion(obj_buf, &n->leaf,budget) != 0) {
         free_criteria_tree(n);
         if (err) *err = "invalid criterion: missing field, op or value";
         return NULL;
@@ -1953,22 +2226,21 @@ static void coalesce_same_field_ranges(CriteriaNode *node) {
             int min_excl = (low->leaf.op  == OP_GREATER); /* GT exclusive, GTE inclusive */
             int max_excl = (high->leaf.op == OP_LESS);    /* LT exclusive, LTE inclusive */
 
-            /* Snapshot bounds before mutating either leaf. */
-            char gv[sizeof(a->leaf.value)];
-            char hv[sizeof(a->leaf.value)];
-            strncpy(gv, low->leaf.value,  sizeof(gv) - 1); gv[sizeof(gv) - 1] = '\0';
-            strncpy(hv, high->leaf.value, sizeof(hv) - 1); hv[sizeof(hv) - 1] = '\0';
-
-            /* Rewrite a as BETWEEN(low, high) with the right exclusivity. */
-            a->leaf.op = OP_BETWEEN;
-            strncpy(a->leaf.value,  gv, sizeof(a->leaf.value)  - 1);
-            a->leaf.value[sizeof(a->leaf.value)   - 1] = '\0';
-            strncpy(a->leaf.value2, hv, sizeof(a->leaf.value2) - 1);
-            a->leaf.value2[sizeof(a->leaf.value2) - 1] = '\0';
+            char low_inline[1024],high_inline[1024];
+            memcpy(low_inline,low->leaf.value,sizeof(low_inline));memcpy(high_inline,high->leaf.value,sizeof(high_inline));
+            char *low_owned=low->leaf.owned_value,*high_owned=high->leaf.owned_value;
+            size_t low_len=low->leaf.owned_value_len,high_len=high->leaf.owned_value_len;
+            low->leaf.owned_value=NULL;high->leaf.owned_value=NULL;
+            free(a->leaf.owned_value2);
+            memcpy(a->leaf.value,low_inline,sizeof(low_inline));memcpy(a->leaf.value2,high_inline,sizeof(high_inline));
+            a->leaf.owned_value=low_owned;a->leaf.owned_value2=high_owned;
+            a->leaf.owned_value_len=low_len;a->leaf.owned_value2_len=high_len;
+            a->leaf.op=OP_BETWEEN;
             a->leaf.min_exclusive = min_excl;
             a->leaf.max_exclusive = max_excl;
             /* a's compiled state is stale; null it so planner recompiles on
                first use (compile_criteria_tree is idempotent). */
+            if(a->compiled)free_compiled_criteria(a->compiled,1);
             a->compiled = NULL;
 
             free_criteria_tree(b);
@@ -1985,7 +2257,7 @@ static void coalesce_same_field_ranges(CriteriaNode *node) {
     }
 }
 
-CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
+static CriteriaNode *parse_criteria_tree_budget(const char *json,const char **err,CriterionBudget *budget) {
     if (err) *err = NULL;
     if (!json || !json[0]) return NULL;
 
@@ -1993,13 +2265,13 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
     if (!*p) return NULL;
 
     if (*p == '[') {
-        CriteriaNode *root = cnode_new(CNODE_AND);
+        CriteriaNode *root = cnode_new(CNODE_AND,budget);
         if (!root) {
             LOG_ERROR(LOG_SUB_QUERY, "parse_criteria_tree: calloc(sizeof(CriteriaNode)) failed for AND root");
             if (err) *err = "out of memory";
             return NULL;
         }
-        if (parse_tree_array(p, root, 0, err) != 0) {
+        if (parse_tree_array(p, root, 0, err,budget) != 0) {
             free_criteria_tree(root);
             return NULL;
         }
@@ -2017,14 +2289,14 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
         char *or_arr  = json_obj_strdup_raw(&pobj, "or");
         char *and_arr = or_arr ? NULL : json_obj_strdup_raw(&pobj, "and");
         if (or_arr || and_arr) {
-            CriteriaNode *n = cnode_new(or_arr ? CNODE_OR : CNODE_AND);
+            CriteriaNode *n = cnode_new(or_arr ? CNODE_OR : CNODE_AND,budget);
             if (!n) {
                 LOG_ERROR(LOG_SUB_QUERY, "parse_criteria_tree: calloc(sizeof(CriteriaNode)) failed for %s node", or_arr ? "OR" : "AND");
                 free(or_arr); free(and_arr);
                 if (err) *err = "out of memory";
                 return NULL;
             }
-            if (parse_tree_array(or_arr ? or_arr : and_arr, n, 0, err) != 0) {
+            if (parse_tree_array(or_arr ? or_arr : and_arr, n, 0, err,budget) != 0) {
                 free_criteria_tree(n); free(or_arr); free(and_arr);
                 return NULL;
             }
@@ -2040,13 +2312,13 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
 
         const char *field_v; size_t field_vl;
         if (json_obj_get(&pobj, "field", &field_v, &field_vl)) {
-            CriteriaNode *n = cnode_new(CNODE_LEAF);
+            CriteriaNode *n = cnode_new(CNODE_LEAF,budget);
             if (!n) {
                 LOG_ERROR(LOG_SUB_QUERY, "parse_criteria_tree: calloc(sizeof(CriteriaNode)) failed for leaf");
                 if (err) *err = "out of memory";
                 return NULL;
             }
-            if (parse_one_criterion(p, &n->leaf) != 0) {
+            if (parse_one_criterion(p, &n->leaf,budget) != 0) {
                 free_criteria_tree(n);
                 if (err) *err = "invalid criterion: missing field, op or value";
                 return NULL;
@@ -2056,7 +2328,7 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
 
         /* Simple-equality form `{"k1":"v1","k2":"v2"}` — backward compat.
            Parse k:v pairs as EQ leaves under an implicit AND root. */
-        CriteriaNode *root = cnode_new(CNODE_AND);
+        CriteriaNode *root = cnode_new(CNODE_AND,budget);
         if (!root) {
             LOG_ERROR(LOG_SUB_QUERY, "parse_criteria_tree: calloc(sizeof(CriteriaNode)) failed for AND root (simple-equality form)");
             if (err) *err = "out of memory";
@@ -2088,7 +2360,7 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
             const char *vend = json_skip_value(p);
             size_t vlen = vend - vstart;
 
-            CriteriaNode *leaf = cnode_new(CNODE_LEAF);
+            CriteriaNode *leaf = cnode_new(CNODE_LEAF,budget);
             if (!leaf) {
                 LOG_ERROR(LOG_SUB_QUERY, "parse_criteria_tree: calloc(sizeof(CriteriaNode)) failed for simple-equality leaf");
                 free_criteria_tree(root);
@@ -2109,18 +2381,13 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
                     if (err) *err = "invalid JSON escape in simple criterion value";
                     return NULL;
                 }
-                size_t copy_len = decoded_len < sizeof(leaf->leaf.value) - 1
-                    ? decoded_len : sizeof(leaf->leaf.value) - 1;
-                memcpy(leaf->leaf.value, decoded, copy_len);
-                leaf->leaf.value[copy_len] = '\0';
+                if(search_criterion_set_budget((&leaf->leaf),0,decoded,decoded_len,budget)){free(decoded);free_criteria_tree(leaf);free_criteria_tree(root);if(err)*err="out of memory";return NULL;}
                 free(decoded);
             } else {
-                if (vlen > sizeof(leaf->leaf.value) - 1) vlen = sizeof(leaf->leaf.value) - 1;
-                memcpy(leaf->leaf.value, vstart, vlen);
-                leaf->leaf.value[vlen] = '\0';
+                if(search_criterion_set_budget((&leaf->leaf),0,vstart,vlen,budget)){free_criteria_tree(leaf);free_criteria_tree(root);if(err)*err="out of memory";return NULL;}
             }
 
-            if (cnode_append(root, leaf) != 0) {
+            if (cnode_append(root, leaf,budget) != 0) {
                 free_criteria_tree(leaf); free_criteria_tree(root);
                 if (err) *err = "out of memory";
                 return NULL;
@@ -2134,6 +2401,11 @@ CriteriaNode *parse_criteria_tree(const char *json, const char **err) {
 
     if (err) *err = "criteria must be array or object";
     return NULL;
+}
+
+CriteriaNode *parse_criteria_tree(const char *json,const char **err){
+    CriterionBudget budget={0,g_query_buffer_max_bytes};
+    return parse_criteria_tree_budget(json,err,&budget);
 }
 
 /* ========== Unknown-field validation ==========
@@ -2212,7 +2484,7 @@ int validate_criteria_tree_fields(const CriteriaNode *n,
             case OP_LT_FIELD:  case OP_GT_FIELD:
             case OP_LTE_FIELD: case OP_GTE_FIELD:
                 /* RHS of field-vs-field ops names a second field. */
-                if (validate_field(ts, c->value, "criteria (rhs)",
+                if (validate_field(ts, search_criterion_value(c), "criteria (rhs)",
                                    err, err_sz) < 0) return -1;
                 break;
             default:
@@ -2263,6 +2535,7 @@ static int or_all_children_indexed(const CriteriaNode *or_node,
     for (int i = 0; i < or_node->n_children; i++) {
         CriteriaNode *c = or_node->children[i];
         if (c->kind != CNODE_LEAF) return 0;
+        if(c->compiled&&!search_criterion_indexable(c->compiled->schema,&c->leaf))return 0;
         if (!leaf_is_indexed(&c->leaf, db_root, object, NULL, 0)) return 0;
     }
     return or_node->n_children > 0;
@@ -2446,7 +2719,7 @@ void cmd_explain(const char *db_root, const char *object, const char *criteria_j
             return;
         }
     }
-    if (tree) compile_criteria_tree(tree, fs.ts);
+    if(compile_criteria_tree_checked(tree,fs.ts,NULL,0)){OUT("{\"error\":\"invalid criteria value\"}\n");free_criteria_tree(tree);return;}
 
     /* Get table row count (O(1) metadata lookup) */
     int table_rows = get_live_count(db_root, object);
@@ -2697,19 +2970,29 @@ static int card_count_cb(const char *v, size_t vl, const uint8_t h[16],
 CardEst card_est_leaf(const char *db_root, const char *object,
                              int splits, const SearchCriterion *leaf,
                              const TypedField *tf, size_t cap) {
+    const TypedSchema *literal_schema=load_typed_schema(db_root,object);
     CardEst e = { 0, 0, 0 };
     int it = pick_index_for_leaf(db_root, object, leaf);
     if (it < 0) return e;              /* not indexed -> not estimable */
     e.estimable = 1;
     if (it == IT_BITMAP && (leaf->op == OP_EQUAL || leaf->op == OP_IN)) {
         uint8_t val[1024]; size_t vlen = 0;
-        encode_criterion_value(tf, leaf->value, strlen(leaf->value), val, &vlen);
+        if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(leaf),strlen(search_criterion_value(leaf)),val,sizeof(val),&vlen)<0){e.estimable=0;return e;}
         if (vlen == 0) { e.estimable = 0; return e; }
         for (int s = 0; s < splits; s++) {
             char bp[1024];
             bm_build_path(bp, sizeof(bp), db_root, object, leaf->field, s);
+            errno = 0;
             BitmapShard *bm = bm_open(bp, 0, 0, 0, 0, 0 /* reader */);
-            if (!bm) continue;
+            if (!bm) {
+                /* Never-written shard: zero. Any other failure makes the
+                   estimate unknown — discard the partial sum rather than
+                   under-estimate (estimates are not result answers). */
+                if (errno == ENOENT) continue;
+                e.k = 0;
+                e.estimable = 0;
+                return e;
+            }
             e.k += bm_count(bm, val, vlen);
             bm_close(bm);
         }
@@ -2729,7 +3012,7 @@ CardEst card_est_leaf(const char *db_root, const char *object,
 
         switch (leaf->op) {
             case OP_EQUAL:
-                encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &len1);
+                if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(leaf),strlen(search_criterion_value(leaf)),buf1,sizeof(buf1),&len1)<0){e.estimable=0;return e;}
                 if (len1 == 0) { e.estimable = 0; return e; }
                 btree_idx_walk_ordered(db_root, object, leaf->field, splits,
                                        (const char *)buf1, len1, 0,
@@ -2738,7 +3021,7 @@ CardEst card_est_leaf(const char *db_root, const char *object,
                 break;
 
             case OP_GREATER_EQ:
-                encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &len1);
+                if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(leaf),strlen(search_criterion_value(leaf)),buf1,sizeof(buf1),&len1)<0){e.estimable=0;return e;}
                 if (len1 == 0) { e.estimable = 0; return e; }
                 btree_idx_walk_ordered(db_root, object, leaf->field, splits,
                                        (const char *)buf1, len1, 0,
@@ -2747,7 +3030,7 @@ CardEst card_est_leaf(const char *db_root, const char *object,
                 break;
 
             case OP_GREATER:
-                encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &len1);
+                if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(leaf),strlen(search_criterion_value(leaf)),buf1,sizeof(buf1),&len1)<0){e.estimable=0;return e;}
                 if (len1 == 0) { e.estimable = 0; return e; }
                 btree_idx_walk_ordered(db_root, object, leaf->field, splits,
                                        (const char *)buf1, len1, 1,
@@ -2756,7 +3039,7 @@ CardEst card_est_leaf(const char *db_root, const char *object,
                 break;
 
             case OP_LESS_EQ:
-                encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &len1);
+                if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(leaf),strlen(search_criterion_value(leaf)),buf1,sizeof(buf1),&len1)<0){e.estimable=0;return e;}
                 if (len1 == 0) { e.estimable = 0; return e; }
                 btree_idx_walk_ordered(db_root, object, leaf->field, splits,
                                        "", 0, 0,
@@ -2765,7 +3048,7 @@ CardEst card_est_leaf(const char *db_root, const char *object,
                 break;
 
             case OP_LESS:
-                encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &len1);
+                if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(leaf),strlen(search_criterion_value(leaf)),buf1,sizeof(buf1),&len1)<0){e.estimable=0;return e;}
                 if (len1 == 0) { e.estimable = 0; return e; }
                 btree_idx_walk_ordered(db_root, object, leaf->field, splits,
                                        "", 0, 0,
@@ -2774,8 +3057,8 @@ CardEst card_est_leaf(const char *db_root, const char *object,
                 break;
 
             case OP_BETWEEN:
-                encode_criterion_value(tf, leaf->value,  strlen(leaf->value),  buf1, &len1);
-                encode_criterion_value(tf, leaf->value2, strlen(leaf->value2), buf2, &len2);
+                if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(leaf),strlen(search_criterion_value(leaf)),buf1,sizeof(buf1),&len1)<0){e.estimable=0;return e;}
+                if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value2(leaf),strlen(search_criterion_value2(leaf)),buf2,sizeof(buf2),&len2)<0){e.estimable=0;return e;}
                 if (len1 == 0 || len2 == 0) { e.estimable = 0; return e; }
                 btree_idx_walk_ordered(db_root, object, leaf->field, splits,
                                        (const char *)buf1, len1, leaf->min_exclusive,
@@ -2788,8 +3071,7 @@ CardEst card_est_leaf(const char *db_root, const char *object,
                    is exceeded (cctx.n is shared across all per-value walks). */
                 for (int iv = 0; iv < leaf->in_count; iv++) {
                     if (cctx.n > cap) break;
-                    encode_criterion_value(tf, leaf->in_values[iv],
-                                           strlen(leaf->in_values[iv]), buf1, &len1);
+                    if(encode_criterion_value_checked(literal_schema,tf,leaf->in_values[iv],strlen(leaf->in_values[iv]),buf1,sizeof(buf1),&len1)<0){e.estimable=0;return e;}
                     if (len1 == 0) continue;
                     btree_idx_walk_ordered(db_root, object, leaf->field, splits,
                                            (const char *)buf1, len1, 0,
@@ -2803,10 +3085,18 @@ CardEst card_est_leaf(const char *db_root, const char *object,
                 int raw_prefix = (!tf || tf->type == FT_VARCHAR);
                 size_t plen;
                 if (raw_prefix) {
-                    plen = strlen(leaf->value);
-                    memcpy(buf1, leaf->value, plen);
+                    plen = search_criterion_value_len(leaf);
+                    if (plen > sizeof(buf1) || plen > sizeof(buf2) - 4) {
+                        e.estimable = 0;
+                        return e;
+                    }
+                    memcpy(buf1, search_criterion_value(leaf), plen);
                 } else {
-                    encode_criterion_value(tf, leaf->value, strlen(leaf->value), buf1, &plen);
+                    if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(leaf),strlen(search_criterion_value(leaf)),buf1,sizeof(buf1),&plen)<0){e.estimable=0;return e;}
+                }
+                if (plen > sizeof(buf2) - 4) {
+                    e.estimable = 0;
+                    return e;
                 }
                 memcpy(buf2, buf1, plen);
                 memset(buf2 + plen, 0xff, 4);
@@ -2841,13 +3131,13 @@ CardEst card_est_leaf(const char *db_root, const char *object,
            a subset of records containing each of those grams).
            We lowercase the pattern/prefix to match the index (trigrams are
            stored lowercase — see tg_build_grams / build_keyset_from_trigram). */
-        size_t plen = strlen(leaf->value);
+        size_t plen = strlen(search_criterion_value(leaf));
         if (plen < 3) { e.estimable = 0; return e; }
         if (plen > 1023) plen = 1023;
 
         uint8_t pattern_lc[1024];
         for (size_t i = 0; i < plen; i++) {
-            uint8_t c = (uint8_t)leaf->value[i];
+            uint8_t c = (uint8_t)search_criterion_value(leaf)[i];
             pattern_lc[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
         }
 
@@ -2997,7 +3287,7 @@ static int most_selective_indexed(const char *db_root, const char *object,
     int best = -1;
     size_t budget = selectivity_budget(N);
     for (int i = 0; i < n; i++) {
-        int it = pick_index_for_leaf(db_root, object, leaves[i]);
+        int it = pick_index_for_leaf_schema(fs?fs->ts:NULL,db_root, object, leaves[i]);
         if (it < 0) { est[i] = (CardEst){0,0,0}; continue; }     /* not indexed */
         const TypedField *tf = resolve_idx_field(fs->ts, leaves[i]->field);
         est[i] = card_est_leaf(db_root, object, splits, leaves[i], tf, budget);
@@ -3007,7 +3297,7 @@ static int most_selective_indexed(const char *db_root, const char *object,
          * leaf walks).  When the bitmap has the smaller K and both estimates
          * are reliable, cardinality wins — the primary feeds a prefilter set
          * whose order is irrelevant (always a hash table for D2/D3/count). */
-        int it_best = pick_index_for_leaf(db_root, object, leaves[best]);
+        int it_best = pick_index_for_leaf_schema(fs?fs->ts:NULL,db_root, object, leaves[best]);
         int i_bm = (it == IT_BITMAP), b_bm = (it_best == IT_BITMAP);
         if (i_bm != b_bm) {
             int bm_i  = i_bm ? i : best;
@@ -3071,6 +3361,7 @@ static int find_covering_composite(const char *db_root, const char *object,
     if (!order_by || !order_by[0]) return -1;
     for (int i = 0; i < nL; i++) {
         if (!op_caps(leaves[i]->op).composite_seed) continue;
+        if(!search_criterion_indexable(load_typed_schema(db_root,object),leaves[i]))continue;
         if (composite_index_exists(db_root, object, leaves[i]->field, order_by))
             return i;
     }
@@ -3078,38 +3369,86 @@ static int find_covering_composite(const char *db_root, const char *object,
 }
 
 /* Build the exact composite key for `composite_field` (e.g. "by+time") from
- * eq leaves, in the composite's field order. encode_field_for_index is the
+ * eq leaves, in the composite's field order. encode_field_text_for_index is the
  * same encoder typed_field_to_index_key uses at build time (config.c:1948),
  * so the key is byte-identical to the stored composite key. Returns 1 with
  * *out_len set iff EVERY sub-field is matched by an OP_EQUAL leaf. */
-int build_exact_composite_key(const FieldSchema *fs, const char *composite_field,
-                                     SearchCriterion **leaves, int nL,
-                                     uint8_t *out, size_t *out_len) {
-    char buf[256]; strncpy(buf, composite_field, sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
-    size_t total = 0; char *save = NULL;
-    for (char *sub = strtok_r(buf, "+", &save); sub; sub = strtok_r(NULL, "+", &save)) {
-        SearchCriterion *m = NULL;
-        for (int i = 0; i < nL; i++)
-            if (op_caps(leaves[i]->op).composite_exact && strcmp(leaves[i]->field, sub) == 0) { m = leaves[i]; break; }
-        if (!m) return 0;  /* sub-field not pinned by an eq leaf */
-        const TypedField *tf = resolve_idx_field(fs ? fs->ts : NULL, sub);
-        /* BTRI composite keys interleave a tier byte before EVERY component
-           ([t1][v1][t2][v2], §2.4.1/§2.4.2). The exact-seek consumers
-           (chunk_walk_fanout / btree_idx_search) prefix the FIRST tier
-           themselves, so this builder emits the INTER-component bytes only:
-           [v1][0x00][v2][0x00][v3]. A missing tier makes the seek's payload
-           bytes compare against stored tier bytes and every entry falls
-           outside the range. */
-        if (total > 0) {
-            if (total + 1 >= 1024) return 0;
-            out[total++] = 0x00;
-        }
-        size_t l = 0;
-        encode_field_for_index(tf, m->value, strlen(m->value), out + total, &l);
-        total += l;
+int build_exact_composite_key(const FieldSchema *fs, const char *spec,
+                              SearchCriterion **leaves, int count, uint8_t *out,
+                              size_t *out_len) {
+  if (!out_len) {
+    errno = EINVAL;
+    return 0;
+  }
+  *out_len = 0;
+  if (!fs || !fs->ts || !spec || !out || strnlen(spec,256) >= 256) {
+    errno = EINVAL;
+    return 0;
+  }
+  char names[256];
+  memcpy(names, spec, strlen(spec) + 1);
+  size_t fields[MAX_FIELDS], total = 0;
+  SearchCriterion *parts[MAX_FIELDS];
+  int n = 0;
+  char *p = names;
+  while (*p) {
+    char *next = strchr(p, '+');
+    if (next)
+      *next = 0;
+    if (!*p || n == MAX_FIELDS) {
+      errno = EINVAL;
+      return 0;
     }
-    *out_len = total;
-    return 1;
+    int field = typed_field_index(fs->ts, p);
+    if (field < 0)
+      return 0;
+    SearchCriterion *match = NULL;
+    for (int i = 0; i < count; i++)
+      if (op_caps(leaves[i]->op).composite_exact &&
+          !strcmp(leaves[i]->field, p)) {
+        match = leaves[i];
+        break;
+      }
+    if (!match)
+      return 0;
+    size_t len = 0;
+    int rc = typed_index_text_component_key_into(
+        fs->ts, (size_t)field, search_criterion_value(match),
+        search_criterion_value_len(match), next != NULL, NULL, 0, &len);
+    if (rc != 1)
+      return 0;
+    size_t tier = n ? 1 : 0;
+    /* First tier is added by search/range wrappers: total+1<=544. */
+    if (tier > 543 - total || len > 543 - total - tier) {
+      errno = E2BIG;
+      return 0;
+    }
+    fields[n] = (size_t)field;
+    parts[n] = match;
+    total += tier + len;
+    n++;
+    if (!next)
+      break;
+    p = next + 1;
+    if (!*p) {
+      errno = EINVAL;
+      return 0;
+    }
+  }
+  size_t pos = 0;
+  for (int i = 0; i < n; i++) {
+    if (i)
+      out[pos++] = 0;
+    size_t len = 0;
+    if (typed_index_text_component_key_into(
+            fs->ts, fields[i], search_criterion_value(parts[i]),
+            search_criterion_value_len(parts[i]), i + 1 < n, out + pos,
+            543 - pos, &len) != 1)
+      return 0;
+    pos += len;
+  }
+  *out_len = pos;
+  return n ? 1 : 0;
 }
 
 /* Find a composite index fully covered by eq leaves. Returns its name in
@@ -3367,7 +3706,7 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     prim = -1;
     if (skip_est) {
         for (int i = 0; i < nL; i++) {
-            int it_i = pick_index_for_leaf(db_root, object, leaves[i]);
+            int it_i = pick_index_for_leaf_schema(fs?fs->ts:NULL,db_root, object, leaves[i]);
             if (it_i < 0) { est[i] = (CardEst){0,0,0}; continue; }
             if (it_i == IT_BITMAP) {
                 const TypedField *tf_i = resolve_idx_field(fs->ts, leaves[i]->field);
@@ -3413,7 +3752,7 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     /* prim is always >= 0 when we reach here (normal path); on goto-overlay
        paths prim stays -1 and prim_it/prim_sel keep their safe defaults. */
     if (prim >= 0) {
-        prim_it  = pick_index_for_leaf(db_root, object, leaves[prim]);
+        prim_it  = pick_index_for_leaf_schema(fs?fs->ts:NULL,db_root, object, leaves[prim]);
         prim_sel = leaf_is_selective(est[prim], N);
     }
 
@@ -3424,7 +3763,7 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
     {
         int n_indexed = 0, n_selective = 0, all_bitmap = 1;
         for (int i = 0; i < nL; i++) {
-            int it = pick_index_for_leaf(db_root, object, leaves[i]);
+            int it = pick_index_for_leaf_schema(fs?fs->ts:NULL,db_root, object, leaves[i]);
             if (it < 0) continue;
             n_indexed++;
             if (it != IT_BITMAP) all_bitmap = 0;
@@ -3436,7 +3775,7 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
             if (all_bitmap) {
                 fp.kind = FP_INTERSECT; fp.source_is_bitmap = 1;
                 for (int i = 0; i < nL; i++) {
-                    int it = pick_index_for_leaf(db_root, object, leaves[i]);
+                    int it = pick_index_for_leaf_schema(fs?fs->ts:NULL,db_root, object, leaves[i]);
                     if (it == IT_BITMAP && fp.n_source < MAX_INTERSECT_LEAVES)
                         fp.source_leaves[fp.n_source++] = leaves[i];
                     else if (fp.n_postfilter < MAX_INTERSECT_LEAVES)
@@ -3450,7 +3789,7 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
             if (!fetching && n_selective >= 2) {
                 fp.kind = FP_INTERSECT;
                 for (int i = 0; i < nL; i++) {
-                    int it = pick_index_for_leaf(db_root, object, leaves[i]);
+                    int it = pick_index_for_leaf_schema(fs?fs->ts:NULL,db_root, object, leaves[i]);
                     if (it >= 0 && leaf_is_selective(est[i], N)
                             && fp.n_source < MAX_INTERSECT_LEAVES)
                         fp.source_leaves[fp.n_source++] = leaves[i];
@@ -3474,7 +3813,7 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
                 if (fetching) {
                     fp.kind = FP_INTERSECT;
                     for (int i = 0; i < nL; i++) {
-                        int it = pick_index_for_leaf(db_root, object, leaves[i]);
+                        int it = pick_index_for_leaf_schema(fs?fs->ts:NULL,db_root, object, leaves[i]);
                         if (it >= 0 && fp.n_source < MAX_INTERSECT_LEAVES)
                             fp.source_leaves[fp.n_source++] = leaves[i];
                         else if (fp.n_postfilter < MAX_INTERSECT_LEAVES)
@@ -3567,6 +3906,7 @@ order_overlay:
             if (leaves[cc]->op == OP_EQUAL) {
                 for (int i = 0; i < nL; i++) {
                     if (strcmp(leaves[i]->field, order_by) != 0) continue;
+                    if(!search_criterion_indexable(fs->ts,leaves[i]))continue;
                     enum SearchOp o = leaves[i]->op;
                     if (o == OP_GREATER || o == OP_GREATER_EQ || o == OP_LESS ||
                         o == OP_LESS_EQ || o == OP_BETWEEN || o == OP_EQUAL) {
@@ -3610,7 +3950,7 @@ order_overlay:
 
             if (!skip_composite) {
                 fp.kind             = FP_PRIMARY_LEAF;  /* composite executor requires this */
-                fp.source_is_bitmap = (pick_index_for_leaf(db_root, object, leaves[cc]) == IT_BITMAP);
+                fp.source_is_bitmap = (pick_index_for_leaf_schema(fs?fs->ts:NULL,db_root, object, leaves[cc]) == IT_BITMAP);
                 fp.source_leaves[0] = leaves[cc];
                 fp.n_source         = 1;
                 fp.order            = FP_ORDER_COMPOSITE;

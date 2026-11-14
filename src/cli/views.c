@@ -15,7 +15,7 @@
    Tiny JSON parser
    ============================================================ */
 
-static const char *skip_ws(const char *p) {
+const char *cli_json_skip_ws(const char *p) {
     while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
     return p;
 }
@@ -23,8 +23,8 @@ static const char *skip_ws(const char *p) {
 /* If *p is at a JSON value, advance *p past the entire value (string/number/
    bool/null/object/array). Returns the start byte offset (so caller can copy
    the slice). Updates *p to one past the value. */
-static const char *skip_value(const char **p) {
-    *p = skip_ws(*p);
+const char *cli_json_skip_value(const char **p) {
+    *p = cli_json_skip_ws(*p);
     const char *start = *p;
     if (**p == '"') {
         (*p)++;
@@ -61,13 +61,13 @@ static const char *skip_value(const char **p) {
 /* Find a top-level "key" inside a JSON object string. Returns pointer to the
    value start (just past the colon's whitespace), or NULL. *value_len is set
    to the length of the value's verbatim slice. */
-static const char *json_find_key(const char *json, const char *key, size_t *value_len) {
+const char *cli_json_find_key(const char *json, const char *key, size_t *value_len) {
     size_t klen = strlen(key);
-    const char *p = skip_ws(json);
+    const char *p = cli_json_skip_ws(json);
     if (*p != '{') return NULL;
     p++;
     while (*p) {
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == '}') return NULL;
         if (*p != '"') return NULL;
         p++;
@@ -75,17 +75,17 @@ static const char *json_find_key(const char *json, const char *key, size_t *valu
         while (*p && *p != '"') p++;
         size_t this_klen = p - kstart;
         if (*p == '"') p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p != ':') return NULL;
         p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         const char *vstart = p;
-        skip_value(&p);
+        cli_json_skip_value(&p);
         if (this_klen == klen && memcmp(kstart, key, klen) == 0) {
             *value_len = (size_t)(p - vstart);
             return vstart;
         }
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == ',') p++;
     }
     return NULL;
@@ -134,13 +134,13 @@ static void json_array_iter(const char *vstart, size_t vlen,
     const char *p = vstart + 1;
     const char *end = vstart + vlen - 1; /* points at closing ] */
     while (p < end) {
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (p >= end || *p == ']') break;
         const char *estart = p;
-        skip_value(&p);
+        cli_json_skip_value(&p);
         size_t elen = (size_t)(p - estart);
         if (cb(estart, elen, ctx) != 0) return;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == ',') p++;
     }
 }
@@ -218,7 +218,7 @@ static void iter_array_objs(const char *vstart, size_t vlen,
     if (vlen < 2 || vstart[0] != '[') return;
     const char *p = vstart + 1, *end = vstart + vlen - 1;
     while (p < end) {
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == ']') break;
         if (*p != '{') { p++; continue; }
         const char *ostart = p;
@@ -229,7 +229,7 @@ static void iter_array_objs(const char *vstart, size_t vlen,
             p++;
         }
         cb(ostart, (size_t)(p - ostart), ctx);
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == ',') p++;
     }
 }
@@ -242,10 +242,10 @@ static void source_cb(const char *o, size_t olen, void *ctx) {
     ExplainLines *el = (ExplainLines *)ctx;
     if (el->n >= 64) return;
     size_t fvlen, opvlen, ixvlen, ervlen;
-    const char *f  = json_find_key(o, "field",          &fvlen);
-    const char *op = json_find_key(o, "op",             &opvlen);
-    const char *ix = json_find_key(o, "index",          &ixvlen);
-    const char *er = json_find_key(o, "estimated_rows", &ervlen);
+    const char *f  = cli_json_find_key(o, "field",          &fvlen);
+    const char *op = cli_json_find_key(o, "op",             &opvlen);
+    const char *ix = cli_json_find_key(o, "index",          &ixvlen);
+    const char *er = cli_json_find_key(o, "estimated_rows", &ervlen);
     if (!f) return;
     char fld[64], opc[32], idxc[32], est[32] = "?";
     json_string_into(f,  fvlen,  fld,  sizeof(fld));
@@ -262,8 +262,8 @@ static void postfilter_cb(const char *o, size_t olen, void *ctx) {
     ExplainLines *el = (ExplainLines *)ctx;
     if (el->n >= 64) return;
     size_t fvlen, opvlen;
-    const char *f  = json_find_key(o, "field", &fvlen);
-    const char *op = json_find_key(o, "op",    &opvlen);
+    const char *f  = cli_json_find_key(o, "field", &fvlen);
+    const char *op = cli_json_find_key(o, "op",    &opvlen);
     if (!f) return;
     char fld[64], opc[32];
     json_string_into(f,  fvlen,  fld, sizeof(fld));
@@ -277,8 +277,8 @@ static void hint_cb(const char *o, size_t olen, void *ctx) {
     ExplainLines *el = (ExplainLines *)ctx;
     if (el->n >= 64) return;
     size_t tvlen, rvlen;
-    const char *t = json_find_key(o, "type",   &tvlen);
-    const char *r = json_find_key(o, "reason", &rvlen);
+    const char *t = cli_json_find_key(o, "type",   &tvlen);
+    const char *r = cli_json_find_key(o, "reason", &rvlen);
     if (!t) return;
     char typ[64];
     json_string_into(t, tvlen, typ, sizeof(typ));
@@ -307,20 +307,20 @@ char *format_explain_text(const char *json) {
     size_t vlen;
     const char *v;
 
-    v = json_find_key(json, "plan", &vlen);
+    v = cli_json_find_key(json, "plan", &vlen);
     if (v) { char tmp[64]; json_string_into(v, vlen, tmp, sizeof(tmp));
         SAFE_SNPRINTF(buf, bo, "Plan:  %s\n", tmp); }
 
-    v = json_find_key(json, "order", &vlen);
+    v = cli_json_find_key(json, "order", &vlen);
     if (v) { char tmp[64]; json_string_into(v, vlen, tmp, sizeof(tmp));
         SAFE_SNPRINTF(buf, bo, "Order: %s\n", tmp); }
 
-    v = json_find_key(json, "total_cheap", &vlen);
+    v = cli_json_find_key(json, "total_cheap", &vlen);
     if (v)
         SAFE_SNPRINTF(buf, bo, "Cheap: %s\n",
                        (vlen==4&&memcmp(v,"true",4)==0)?"yes":"no");
 
-    v = json_find_key(json, "table_rows", &vlen);
+    v = cli_json_find_key(json, "table_rows", &vlen);
     if (v) {
         char tmp[32]; size_t n = vlen<31?vlen:31; memcpy(tmp,v,n); tmp[n]=0;
         SAFE_SNPRINTF(buf, bo, "Rows:  %s\n\n", tmp);
@@ -328,7 +328,7 @@ char *format_explain_text(const char *json) {
 
     /* Source */
     SAFE_SNPRINTF(buf, bo, "Source:\n");
-    v = json_find_key(json, "source", &vlen);
+    v = cli_json_find_key(json, "source", &vlen);
     if (v) {
         ExplainLines el = {0};
         iter_array_objs(v, vlen, source_cb, &el);
@@ -338,7 +338,7 @@ char *format_explain_text(const char *json) {
 
     /* Post-filter */
     SAFE_SNPRINTF(buf, bo, "\nPost-filter:\n");
-    v = json_find_key(json, "postfilter", &vlen);
+    v = cli_json_find_key(json, "postfilter", &vlen);
     if (v) {
         ExplainLines el = {0};
         iter_array_objs(v, vlen, postfilter_cb, &el);
@@ -348,7 +348,7 @@ char *format_explain_text(const char *json) {
 
     /* Hints */
     SAFE_SNPRINTF(buf, bo, "\nHints:\n");
-    v = json_find_key(json, "hints", &vlen);
+    v = cli_json_find_key(json, "hints", &vlen);
     if (v) {
         ExplainLines el = {0};
         iter_array_objs(v, vlen, hint_cb, &el);
@@ -421,14 +421,14 @@ void tui_show_object(const char *title, const char *json) {
     /* Pretty-print: walk top-level keys, emit as "key: value" lines. */
     char buf[16384];
     size_t bo = 0;
-    const char *p = skip_ws(json);
+    const char *p = cli_json_skip_ws(json);
     if (*p != '{') {
         tui_show_text(title, json);
         return;
     }
     p++;
     while (*p && bo < sizeof(buf) - 1) {
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == '}' || *p == '\0') break;
         if (*p != '"') break;
         p++;
@@ -436,12 +436,12 @@ void tui_show_object(const char *title, const char *json) {
         while (*p && *p != '"') p++;
         size_t klen = (size_t)(p - kstart);
         if (*p == '"') p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p != ':') break;
         p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         const char *vstart = p;
-        skip_value(&p);
+        cli_json_skip_value(&p);
         size_t vlen = (size_t)(p - vstart);
 
         bo += snprintf(buf + bo, sizeof(buf) - bo, "%-14.*s : ", (int)klen, kstart);
@@ -455,7 +455,7 @@ void tui_show_object(const char *title, const char *json) {
             if (bo < sizeof(buf) - 1) buf[bo++] = '\n';
         }
 
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == ',') p++;
     }
     buf[bo] = '\0';
@@ -511,19 +511,19 @@ static int row_collect_cb(const char *elem, size_t len, void *ctx) {
     const char *p = elem + 1;
     const char *end = elem + len - 1;
     while (p < end) {
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p != '"') break;
         p++;
         const char *kstart = p;
         while (p < end && *p != '"') p++;
         size_t klen = (size_t)(p - kstart);
         if (p < end) p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p != ':') break;
         p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         const char *vstart = p;
-        skip_value(&p);
+        cli_json_skip_value(&p);
         size_t vlen = (size_t)(p - vstart);
 
         if (klen == 5 && memcmp(kstart, "value", 5) == 0 &&
@@ -532,19 +532,19 @@ static int row_collect_cb(const char *elem, size_t len, void *ctx) {
             const char *vp = vstart + 1;
             const char *vend = vstart + vlen - 1;
             while (vp < vend) {
-                vp = skip_ws(vp);
+                vp = cli_json_skip_ws(vp);
                 if (*vp != '"') break;
                 vp++;
                 const char *kk = vp;
                 while (vp < vend && *vp != '"') vp++;
                 size_t kkl = (size_t)(vp - kk);
                 if (vp < vend) vp++;
-                vp = skip_ws(vp);
+                vp = cli_json_skip_ws(vp);
                 if (*vp != ':') break;
                 vp++;
-                vp = skip_ws(vp);
+                vp = cli_json_skip_ws(vp);
                 const char *vv = vp;
-                skip_value(&vp);
+                cli_json_skip_value(&vp);
                 size_t vvl = (size_t)(vp - vv);
                 int col = table_col_index(t, kk, kkl);
                 if (col >= 0) {
@@ -561,7 +561,7 @@ static int row_collect_cb(const char *elem, size_t len, void *ctx) {
                     int w = (int)strlen(cell);
                     if (w > t->widths[col]) t->widths[col] = (w > 32 ? 32 : w);
                 }
-                vp = skip_ws(vp);
+                vp = cli_json_skip_ws(vp);
                 if (*vp == ',') vp++;
             }
         } else {
@@ -581,7 +581,7 @@ static int row_collect_cb(const char *elem, size_t len, void *ctx) {
                 if (w > t->widths[col]) t->widths[col] = (w > 32 ? 32 : w);
             }
         }
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == ',') p++;
     }
     return 0;
@@ -632,10 +632,10 @@ static int row_collect_array_cb(const char *elem, size_t len, void *ctx) {
     const char *end = elem + len - 1;
     int col = 0;
     while (p < end && col < t->ncols) {
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == ']') break;
         const char *vstart = p;
-        skip_value(&p);
+        cli_json_skip_value(&p);
         size_t vlen = (size_t)(p - vstart);
         char *cell;
         if (vlen > 0 && vstart[0] == '"') {
@@ -650,7 +650,7 @@ static int row_collect_array_cb(const char *elem, size_t len, void *ctx) {
         int w = (int)strlen(cell);
         if (w > t->widths[col]) t->widths[col] = (w > 32 ? 32 : w);
         col++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == ',') p++;
     }
     return 0;
@@ -660,20 +660,20 @@ static int row_collect_array_cb(const char *elem, size_t len, void *ctx) {
    JSON object — the signature of a multi-get dict-of-dicts response. */
 static int is_dict_of_dicts(const char *json) {
     if (!json || *json != '{') return 0;
-    const char *p = skip_ws(json + 1);
+    const char *p = cli_json_skip_ws(json + 1);
     while (*p && *p != '}') {
         if (*p != '"') return 0;
         p++;
         while (*p && *p != '"') p++;
         if (*p == '"') p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p != ':') return 0;
         p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         /* skip null entries when deciding */
         if (strncmp(p, "null", 4) == 0) {
             p += 4;
-            p = skip_ws(p);
+            p = cli_json_skip_ws(p);
             if (*p == ',') p++;
             continue;
         }
@@ -690,21 +690,21 @@ static void render_dict_of_dicts(const char *json, Table *t) {
     int key_idx = table_col_index(t, key_col, sizeof(key_col) - 1);
     (void)key_idx;
 
-    const char *p = skip_ws(json + 1);
+    const char *p = cli_json_skip_ws(json + 1);
     while (*p && *p != '}' && t->nrows < MAX_ROWS) {
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p != '"') break;
         p++;
         const char *ks = p;
         while (*p && *p != '"') p++;
         size_t klen = (size_t)(p - ks);
         if (*p == '"') p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p != ':') break;
         p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         const char *vs = p;
-        skip_value(&p);
+        cli_json_skip_value(&p);
         size_t vlen = (size_t)(p - vs);
 
         int row = t->nrows++;
@@ -727,19 +727,19 @@ static void render_dict_of_dicts(const char *json, Table *t) {
             const char *ip = vs + 1;
             const char *iend = vs + vlen - 1;
             while (ip < iend) {
-                ip = skip_ws(ip);
+                ip = cli_json_skip_ws(ip);
                 if (*ip != '"') break;
                 ip++;
                 const char *fks = ip;
                 while (ip < iend && *ip != '"') ip++;
                 size_t fkl = (size_t)(ip - fks);
                 if (ip < iend) ip++;
-                ip = skip_ws(ip);
+                ip = cli_json_skip_ws(ip);
                 if (*ip != ':') break;
                 ip++;
-                ip = skip_ws(ip);
+                ip = cli_json_skip_ws(ip);
                 const char *fvs = ip;
-                skip_value(&ip);
+                cli_json_skip_value(&ip);
                 size_t fvl = (size_t)(ip - fvs);
                 int col = table_col_index(t, fks, fkl);
                 if (col >= 0) {
@@ -756,12 +756,12 @@ static void render_dict_of_dicts(const char *json, Table *t) {
                     int w = (int)strlen(cell);
                     if (w > t->widths[col]) t->widths[col] = (w > 32 ? 32 : w);
                 }
-                ip = skip_ws(ip);
+                ip = cli_json_skip_ws(ip);
                 if (*ip == ',') ip++;
             }
         }
 
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == ',') p++;
     }
 }
@@ -826,19 +826,19 @@ int tui_show_table(const char *title, const char *json) {
 
     if (*json == '{') {
         size_t cols_len, rows_len, res_len;
-        const char *cols_v = json_find_key(json, "columns", &cols_len);
-        const char *rows_v = json_find_key(json, "rows", &rows_len);
-        const char *res_v  = json_find_key(json, "results", &res_len);
+        const char *cols_v = cli_json_find_key(json, "columns", &cols_len);
+        const char *rows_v = cli_json_find_key(json, "rows", &rows_len);
+        const char *res_v  = cli_json_find_key(json, "results", &res_len);
 
         if (cols_v && rows_v) {
             /* Shape 1: explicit columns + array rows. */
             const char *cp = cols_v + 1;
             const char *cend = cols_v + cols_len - 1;
             while (cp < cend && t.ncols < MAX_COLS) {
-                cp = skip_ws(cp);
+                cp = cli_json_skip_ws(cp);
                 if (*cp == ']') break;
                 const char *vstart = cp;
-                skip_value(&cp);
+                cli_json_skip_value(&cp);
                 size_t vlen = (size_t)(cp - vstart);
                 char tmp[64];
                 if (vlen > 0 && vstart[0] == '"')
@@ -848,7 +848,7 @@ int tui_show_table(const char *title, const char *json) {
                 int idx = t.ncols++;
                 snprintf(t.cols[idx], sizeof(t.cols[0]), "%s", tmp);
                 t.widths[idx] = (int)strlen(tmp);
-                cp = skip_ws(cp);
+                cp = cli_json_skip_ws(cp);
                 if (*cp == ',') cp++;
             }
             json_array_iter(rows_v, rows_len, row_collect_array_cb, &t);
@@ -872,9 +872,9 @@ int tui_show_table(const char *title, const char *json) {
             t.widths[0] = 6; t.widths[1] = 5;
             t.ncols = 2;
 
-            const char *p = skip_ws(json) + 1;  /* past leading { */
+            const char *p = cli_json_skip_ws(json) + 1;  /* past leading { */
             while (*p && t.nrows < MAX_ROWS) {
-                p = skip_ws(p);
+                p = cli_json_skip_ws(p);
                 if (*p == '}') break;
                 if (*p != '"') break;
                 p++;
@@ -882,12 +882,12 @@ int tui_show_table(const char *title, const char *json) {
                 while (*p && *p != '"') p++;
                 size_t klen = (size_t)(p - ks);
                 if (*p == '"') p++;
-                p = skip_ws(p);
+                p = cli_json_skip_ws(p);
                 if (*p != ':') break;
                 p++;
-                p = skip_ws(p);
+                p = cli_json_skip_ws(p);
                 const char *vs = p;
-                skip_value(&p);
+                cli_json_skip_value(&p);
                 size_t vlen = (size_t)(p - vs);
 
                 int row = t.nrows++;
@@ -936,7 +936,7 @@ int tui_show_table(const char *title, const char *json) {
                 int w = (int)strlen(t.cells[row][1]);
                 if (w > t.widths[1]) t.widths[1] = (w > 64 ? 64 : w);
 
-                p = skip_ws(p);
+                p = cli_json_skip_ws(p);
                 if (*p == ',') p++;
             }
             rendered = 1;
@@ -1091,11 +1091,11 @@ static int emit_row(StatRow *rows, int n, int max_rows,
 
 static int parse_stats_into(const char *json, StatRow *rows, int max_rows) {
     int n = 0;
-    const char *p = skip_ws(json);
+    const char *p = cli_json_skip_ws(json);
     if (*p != '{') return 0;
     p++;
     while (*p && n < max_rows) {
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == '}') break;
         if (*p != '"') break;
         p++;
@@ -1103,12 +1103,12 @@ static int parse_stats_into(const char *json, StatRow *rows, int max_rows) {
         while (*p && *p != '"') p++;
         size_t klen = (size_t)(p - ks);
         if (*p == '"') p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p != ':') break;
         p++;
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         const char *vs = p;
-        skip_value(&p);
+        cli_json_skip_value(&p);
         size_t vlen = (size_t)(p - vs);
 
         /* Flatten one level of nested object: bt_cache → bt_cache.used,
@@ -1119,7 +1119,7 @@ static int parse_stats_into(const char *json, StatRow *rows, int max_rows) {
             const char *np = vs + 1;
             const char *nend = vs + vlen - 1;
             while (np < nend && n < max_rows) {
-                np = skip_ws(np);
+                np = cli_json_skip_ws(np);
                 if (*np == '}' || np >= nend) break;
                 if (*np != '"') break;
                 np++;
@@ -1127,21 +1127,21 @@ static int parse_stats_into(const char *json, StatRow *rows, int max_rows) {
                 while (np < nend && *np != '"') np++;
                 size_t nklen = (size_t)(np - nks);
                 if (np < nend) np++;
-                np = skip_ws(np);
+                np = cli_json_skip_ws(np);
                 if (*np != ':') break;
                 np++;
-                np = skip_ws(np);
+                np = cli_json_skip_ws(np);
                 const char *nvs = np;
-                skip_value(&np);
+                cli_json_skip_value(&np);
                 size_t nvlen = (size_t)(np - nvs);
                 n = emit_row(rows, n, max_rows, prefix, nks, nklen, nvs, nvlen);
-                np = skip_ws(np);
+                np = cli_json_skip_ws(np);
                 if (*np == ',') np++;
             }
         } else {
             n = emit_row(rows, n, max_rows, NULL, ks, klen, vs, vlen);
         }
-        p = skip_ws(p);
+        p = cli_json_skip_ws(p);
         if (*p == ',') p++;
     }
     return n;
@@ -1233,37 +1233,37 @@ int describe_object(CliConn *c, const char *dir, const char *object, ObjectInfo 
     }
     /* Reject error responses early. */
     size_t vlen;
-    if (json_find_key(resp, "error", &vlen)) { free(resp); return -1; }
+    if (cli_json_find_key(resp, "error", &vlen)) { free(resp); return -1; }
 
     memset(oi, 0, sizeof(*oi));
     snprintf(oi->dir,    sizeof(oi->dir),    "%s", dir);
     snprintf(oi->object, sizeof(oi->object), "%s", object);
 
     const char *v;
-    if ((v = json_find_key(resp, "splits", &vlen)))    oi->splits = atoi(v);
-    if ((v = json_find_key(resp, "max_key", &vlen)))   oi->max_key = atoi(v);
-    if ((v = json_find_key(resp, "max_value", &vlen))) oi->max_value = atoi(v);
-    if ((v = json_find_key(resp, "record_count", &vlen))) oi->record_count = atoi(v);
+    if ((v = cli_json_find_key(resp, "splits", &vlen)))    oi->splits = atoi(v);
+    if ((v = cli_json_find_key(resp, "max_key", &vlen)))   oi->max_key = atoi(v);
+    if ((v = cli_json_find_key(resp, "max_value", &vlen))) oi->max_value = atoi(v);
+    if ((v = cli_json_find_key(resp, "record_count", &vlen))) oi->record_count = atoi(v);
 
     /* fields[] */
-    if ((v = json_find_key(resp, "fields", &vlen)) && vlen > 0 && v[0] == '[') {
+    if ((v = cli_json_find_key(resp, "fields", &vlen)) && vlen > 0 && v[0] == '[') {
         const char *p = v + 1;
         const char *end = v + vlen - 1;
         while (p < end && oi->nfields < MAX_FIELDS_CACHED) {
-            p = skip_ws(p);
+            p = cli_json_skip_ws(p);
             if (*p == ']') break;
             if (*p != '{') break;
             const char *fstart = p;
-            skip_value(&p);
+            cli_json_skip_value(&p);
             size_t flen = (size_t)(p - fstart);
             CachedField *fld = &oi->fields[oi->nfields];
             const char *fv;
             size_t fvlen;
             char tmp[256];
-            if ((fv = json_find_key(fstart, "name", &fvlen))) {
-                /* json_find_key here works because skip_value left fstart..p as
+            if ((fv = cli_json_find_key(fstart, "name", &fvlen))) {
+                /* cli_json_find_key here works because cli_json_skip_value left fstart..p as
                    a complete object; passing fstart with NUL after isn't safe,
-                   but json_find_key only looks for keys, stops at }. Need a
+                   but cli_json_find_key only looks for keys, stops at }. Need a
                    bounded variant — write our own walk below. */
                 (void)fvlen;
             }
@@ -1271,19 +1271,19 @@ int describe_object(CliConn *c, const char *dir, const char *object, ObjectInfo 
             const char *fp = fstart + 1;
             const char *fend = fstart + flen - 1;
             while (fp < fend) {
-                fp = skip_ws(fp);
+                fp = cli_json_skip_ws(fp);
                 if (*fp != '"') break;
                 fp++;
                 const char *kk = fp;
                 while (fp < fend && *fp != '"') fp++;
                 size_t kkl = (size_t)(fp - kk);
                 if (fp < fend) fp++;
-                fp = skip_ws(fp);
+                fp = cli_json_skip_ws(fp);
                 if (*fp != ':') break;
                 fp++;
-                fp = skip_ws(fp);
+                fp = cli_json_skip_ws(fp);
                 const char *vv = fp;
-                skip_value(&fp);
+                cli_json_skip_value(&fp);
                 size_t vvl = (size_t)(fp - vv);
                 if (kkl == 4 && memcmp(kk, "name", 4) == 0)
                     json_string_into(vv, vvl, fld->name, sizeof(fld->name));
@@ -1297,30 +1297,30 @@ int describe_object(CliConn *c, const char *dir, const char *object, ObjectInfo 
                     json_string_into(vv, vvl, tmp, sizeof(tmp));
                     fld->scale = atoi(tmp);
                 }
-                fp = skip_ws(fp);
+                fp = cli_json_skip_ws(fp);
                 if (*fp == ',') fp++;
             }
             oi->nfields++;
-            p = skip_ws(p);
+            p = cli_json_skip_ws(p);
             if (*p == ',') p++;
         }
     }
 
     /* indexes[] (array of strings) */
-    if ((v = json_find_key(resp, "indexes", &vlen)) && vlen > 0 && v[0] == '[') {
+    if ((v = cli_json_find_key(resp, "indexes", &vlen)) && vlen > 0 && v[0] == '[') {
         const char *p = v + 1;
         const char *end = v + vlen - 1;
         while (p < end && oi->nindexes < MAX_FIELDS_CACHED) {
-            p = skip_ws(p);
+            p = cli_json_skip_ws(p);
             if (*p == ']') break;
             const char *estart = p;
-            skip_value(&p);
+            cli_json_skip_value(&p);
             size_t elen = (size_t)(p - estart);
             json_string_into(estart, elen,
                              oi->indexes[oi->nindexes],
                              sizeof(oi->indexes[0]));
             oi->nindexes++;
-            p = skip_ws(p);
+            p = cli_json_skip_ws(p);
             if (*p == ',') p++;
         }
     }

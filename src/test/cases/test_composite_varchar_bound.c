@@ -28,7 +28,7 @@ static int test_composite_varchar_bound_verify(void) {
     tc = tc_connect(&cfg); ASSERT_NOT_NULL(tc, "connect");
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"v\"}", &resp); free(resp); resp=NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"v\",\"object\":\"ob\",\"splits\":8,\"max_key\":16,"
+        "{\"mode\":\"create-object\",\"dir\":\"v\",\"object\":\"ob\",\"declaration_layout\":\"legacy\",\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"name:varchar:16\",\"t:long\"],"
         "\"indexes\":[\"name\",\"t\",\"name+t\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create"); free(resp); resp=NULL;

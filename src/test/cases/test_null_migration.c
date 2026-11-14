@@ -594,6 +594,33 @@ TEST_REGISTER("test-null-migration-c-refuses", test_null_migration_c_refuses)
 
 /* ── (e): durable marker + destamped root → reindex first, replay ──── */
 
+/* Route every replay key to ONE kf shard so the paused bulk has exactly
+   one pipeline chain. The bulk pipeline runs one task per touched kf shard
+   and the win-I pause marker is a single shared filename
+   (.durability-test-win-I.active): with several chains, the SIGKILL —
+   driven by whichever chain reaches win-I first — can land before the
+   OTHER chains publish their durable per-shard markers
+   (<shard>_batch_<batch>_marker.dat), and those windows are then rightly
+   lost (marker = commit point; recovery is forward-replay-only). One chain
+   makes "marker durable → kill mid-apply → replay restores every row"
+   deterministic on any build speed (found under ASan).
+   Hashing uses
+   compute_hash_raw + compute_record_shard (types.h; util.c is linked into
+   the test binary). Writes at most cap-1 bytes; returns 0 on success. */
+static int mig_single_chain_key(int value, int shard, char *out, size_t cap) {
+    char cand[32];
+    for (int s = 0; s < 100000; s++) {
+        snprintf(cand, sizeof(cand), "r%d_%d", value, s);
+        uint8_t hash[16];
+        compute_hash_raw(cand, strlen(cand), hash);
+        if (compute_record_shard(hash, 8) == shard) {
+            snprintf(out, cap, "%s", cand);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static int test_null_migration_e_marker_order(void) {
     MigRoot m;
     mig_root_init(&m);
@@ -610,7 +637,10 @@ static int test_null_migration_e_marker_order(void) {
     /* Run 2: pause the indexed bulk mid-apply — win-I fires inside the
        per-shard index apply, AFTER the chain's markers are published and
        dir-durable. SIGKILL there leaves every durable intent behind with
-       the affected windows not yet fully applied. */
+       the affected windows not yet fully applied. All replay keys live on
+       one kf shard (replay_keys, filled below) so there is exactly one
+       chain — see mig_single_chain_key. */
+    char replay_keys[40][32];
     mig_write_env(&m, "DURABILITY_TEST_PAUSE_PHASE=win-I\n"
                       "DURABILITY_TEST_PAUSE_MS=30000\n");
     ASSERT_EQ_INT(test_env_start_at(&env, m.db_root, m.port), 0,
@@ -618,6 +648,17 @@ static int test_null_migration_e_marker_order(void) {
     tc = mig_connect(m.port);
     ASSERT_NOT_NULL(tc, "connect 2");
     if (tc) {
+        /* All 40 replay keys on one kf shard (see mig_single_chain_key).
+           The anchor shard is whatever "r6" itself hashes to. */
+        uint8_t anchor_hash[16];
+        compute_hash_raw("r6", 2, anchor_hash);
+        int chain_shard = compute_record_shard(anchor_hash, 8);
+        int keys_ok = 1;
+        for (int i = 6; i <= 45; i++)
+            keys_ok &= mig_single_chain_key(i, chain_shard,
+                                            replay_keys[i - 6],
+                                            sizeof(replay_keys[i - 6])) == 0;
+        ASSERT_TRUE(keys_ok, "all 40 replay keys routed to one kf shard");
         /* Send-only: the request parks inside the paused shard chain.
            Track the remaining space explicitly — feeding snprintf's return
            back in lets a (here impossible) truncation underflow the size
@@ -629,7 +670,8 @@ static int test_null_migration_e_marker_order(void) {
         int rem = (int)sizeof(bulk) - off;
         for (int i = 6; i <= 45 && rem > 0; i++) {
             int n = snprintf(bulk + off, (size_t)rem,
-                             "%s\"r%d\":{\"k\":\"%d\"}", i > 6 ? "," : "", i, i);
+                             "%s\"%s\":{\"k\":\"%d\"}", i > 6 ? "," : "",
+                             replay_keys[i - 6], i);
             if (n < 0) break;
             if (n >= rem) n = rem - 1;
             off += n; rem -= n;
@@ -695,9 +737,7 @@ static int test_null_migration_e_marker_order(void) {
                 i);
             ASSERT_EQ_INT(tc_request(tc, req, &r), 0, "eq replayed row");
             ASSERT_NOT_NULL(r, "eq resp");
-            char want[32];
-            snprintf(want, sizeof(want), "r%d", i);
-            ASSERT_TRUE(strstr(r, "\"error\"") == NULL && strstr(r, want),
+            ASSERT_TRUE(strstr(r, "\"error\"") == NULL && strstr(r, replay_keys[i - 6]),
                         "replayed row found via index");
             free(r); r = NULL;
         }

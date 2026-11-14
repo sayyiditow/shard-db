@@ -39,9 +39,10 @@ Required: `mode`, `dir`, `object`, `aggregates`.
 | `group_by` | array of field names | none | Grouping keys. Omit for whole-table aggregation. |
 | `aggregates` | array | required | List of aggregate specs (see below). Max 32. |
 | `having` | array | none | Filter groups after aggregation. Same shape as `criteria`, but fields are aggregate **aliases** (or group-by fields). |
-| `order_by` | string | none | Sort groups by this alias (or group-by field). |
+| `order_by` | string | none | Sort groups by this alias (or group-by field). Groups with equal sort values are ordered by group value ascending (numeric order for numbers, byte order for text, declaration order for enum, address order for IPs, time order for dates/timestamps), NULL group last, field by field; the direction does not flip this tie order. |
 | `order` | `"asc"` / `"desc"` | `"asc"` | Sort direction. |
 | `limit` | int | `GLOBAL_LIMIT` | Max groups returned. |
+| `total` | bool | false | Wrap the result as `{"rows":[...],"total":<distinct groups before limit>}`. |
 | `explain` | bool | false | Return the query plan without executing. See [explain](explain.md). |
 
 ## Explain mode
@@ -66,8 +67,8 @@ Response is a JSON object with `plan`, `order`, `total_cheap`, `table_rows`, `so
 | Function | Needs `field` | Notes |
 |---|---|---|
 | `count` | optional | Without `field`, counts all records. With a concrete field, counts present values; the per-type unset markers (empty varchar, all-zero calendar values, midnight time `00:00:00`, all-zero uuid) are excluded. Numeric zero is a real value and counts. Composite field expressions are rejected. |
-| `sum` | yes | Supports `int`, `long`, `short`, `float`, `double`, `numeric`, `bool`, `byte`, and `timestamp`; result is a JSON number. |
-| `avg` | yes | Same supported types as `sum`; returns `sum / count` as a JSON number. |
+| `sum` | yes | Supports `int`, `long`, `short`, `float`, `double`, `numeric`, `bool`, `byte`, and `timestamp`; integer/decimal results are exact JSON numbers — integer sums stay exact beyond 2⁵³ and decimals keep declared/display scale; float/double retain binary floating-point semantics. |
+| `avg` | yes | Same supported types as `sum`; integer/decimal averages use the PostgreSQL 18 exact result-scale policy (16 significant digits, ties away from zero) and render as an exact JSON number; float averages stay binary floating. No contributing value renders `null` (JSON) on every route, or the CSV cell `0`. |
 | `min` | yes | Numeric types, varchar, and calendar types. Varchar/calendar results are lexicographic text. |
 | `max` | yes | Numeric types, varchar, and calendar types. Varchar/calendar results are lexicographic text. |
 
@@ -130,6 +131,45 @@ identical buckets. Full semantics:
 ]
 ```
 
+### Numeric exactness
+
+- Integer-class and decimal aggregates are computed exactly (no binary
+  floating point); a `sum` of `long` values may exceed 2⁵³ and still prints
+  every digit. Clients must keep the number lexeme intact (a `JSON.parse`
+  loses digits above 2⁵³ — see the npm notes).
+- Decimal results keep scale: bounded `numeric(P,S)` results render at the
+  declared scale (`0.3000`, not `0.3`). An empty group's `sum` is zero at
+  that declared scale; an empty group's `min`/`max` render `null`, as `avg`
+  always has. (Bare-numeric grouping — canonical shortest labels where `1.0`
+  and `1.00` are one group labelled `1` — exists only on packed schemas,
+  which have no production caller yet; it is not reachable on public
+  objects.)
+- `group_by` labels, `order_by` and `having` on numeric fields are exact and
+  numeric (not lexicographic); `timestamp` groups render epoch-millis labels.
+- A group value longer than 511 bytes, a composite key longer than 4096
+  bytes, or a NUL inside either is an explicit error, never a truncated key:
+  `{"error":"group_by value exceeds aggregate key limit (511 bytes per value, 4096 bytes per composite key) or contains NUL"}`.
+- An invalid numeric literal in `having` is a validation error, checked
+  before the operator is validated (so `regex` on a numeric having reports
+  this, not an operator-support error):
+  `{"error":"invalid numeric value 'abc' for having on 's'"}`. Float-class
+  results validate the literal with the same `strtod` rule that evaluates
+  it; integer/decimal results use the canonical number grammar (no
+  surrounding whitespace). A literal like `1e400` is a valid exact decimal
+  but is rejected on a float result as non-finite.
+- `QUERY_BUFFER_MB` covers retained number strings and escaped aggregate
+  text/group values. Exhausting the cap on any route — indexed, streaming,
+  top-N or scan — returns one query-buffer error and no success body
+  (allocation failures likewise never emit a partial success); reduce
+  groups/limit or increase the configured cap. The one documented exception
+  is the bitmap-dictionary deferred collector, which returns its partial
+  result deadline-style.
+- `find`/`count` pre-filters decode `timestamp` index keys to their
+  epoch-millis text and compare with the raw query literal, so non-canonical
+  integer literals (`001254980454000`, `+1254980454000`) still match; all
+  epoch-millisecond values sit below 2⁵³, keeping the range pre-filter's
+  floating-point comparisons exact.
+
 ## `having`
 
 Post-aggregation filter. Fields referenced must be aggregate aliases (or group-by fields):
@@ -153,11 +193,19 @@ scanning: an unknown field returns
 and pattern/length/regex operators on aggregate results return
 `{"error":"aggregate having unsupported for field type <type>"}`.
 
+## Bitmap-source errors
+
+Aggregate group-by paths that read bitmap sources (dictionary discovery,
+group popcounts, slot intersection, hash-bucket emission) treat a
+never-written shard as logically empty but fail the whole aggregate with a
+single error object when a bitmap file cannot be read, instead of emitting
+buckets that silently miss that shard's records.
+
 ## Cost
 
 - **Whole-table, no criteria** — O(N) scan of every record. Parallelized across shards.
 - **With criteria** — same as [`find`](find.md): indexed candidate scan + per-record typed comparison.
-- **With `group_by`** — accumulates into a hash table keyed by group values; final sort + limit. Per-worker hash tables fold into a global table at the end (lock-free hot path).
+- **With `group_by`** — accumulates into a hash table keyed by group values; final sort + limit. Per-worker hash tables fold into a global table at the end (lock-free hot path) — except eligible count-ranked top-N requests, which stream (see Streaming top-N).
 - **AND of indexed leaves** — uses the same `PRIMARY_INTERSECT` planner branch as `find`/`count`: each leaf's btree walks into a `KeySet`, the sets intersect, and aggregation streams the survivors only. Order-of-magnitude wins when the intersection is far smaller than any single leaf's candidate set. See [find → AND index intersection](find.md#and-index-intersection).
 - **NEQ algebraic shortcut** — `count(neq X)` is rewritten internally as `count(*) - count(eq X)`, turning a near-everything scan into two cheap counts. Applies inside `aggregate` too when the only criterion on an indexed field is `neq`.
 
@@ -237,6 +285,10 @@ The planner paths from [find](find.md#execution-paths) apply here too — when t
   '[{"field":"n","op":"gte","value":"100"}]'
 ```
 
+## Streaming top-N
+
+When the request has a single btree-indexed `group_by` field, `order_by` naming a `count(*)` alias, `limit` 1–10000, no `having`, not `format:"csv"`, criteria fully answerable from indexes, and every aggregate is `count(*)`, `count(<group field>)` (not on varchar/date/datetime/datetimems/time/uuid, whose `count` excludes unset values), or `sum/avg/min/max(<group field>)` (not `sum`/`avg` on `float`/`double`), the aggregate streams the group field's index and keeps only the top `limit` groups in memory; results (values, ties, `total`) are identical to the general path, except that a midnight `time` group is labelled `""` by the general path's record-scan route but `"00:00:00"` from the index (pre-existing; it only arises when the general path cannot use the index); anything else uses the general path; counts above 2^53 rows per group are outside the exact range of the ranking.
+
 ## Limitations
 
 - Max **32 aggregates per query** (`MAX_AGG_SPECS`).
@@ -244,3 +296,11 @@ The planner paths from [find](find.md#execution-paths) apply here too — when t
 - No `DISTINCT` — emulate with `group_by` + `count`.
 - No window functions — aggregate against a query, keep state in the app.
 - No nested aggregates.
+
+Bitmap candidate collections prefer 8,192 actual slots within the existing
+request budget, falling back to ordinary estimate-based sizing if only the
+floor does not fit. If concurrent growth exhausts the admitted collection,
+partial candidates are discarded and the complete original criteria run once
+through the full-record scan with the original deadline. Aggregate recovery
+starts with empty groups. Allocation-budget failures and real bitmap read
+errors retain their separate existing policies; they are not insertion overflow.

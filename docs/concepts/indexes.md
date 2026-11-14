@@ -25,10 +25,25 @@ startup before index work begins.
 shard-db ships three index types:
 
 - **B+ tree** (default for every typed field) — prefix-compressed leaves at `<object>/indexes/<field>/<NNN>.idx`. Each field's btree is split into `index_splits_for(splits)` shards — a non-linear fan-out curve (`8→2, 16→4, 32→4, 64→8, 128→16, 256→16, 512→32, 1024→64, 2048→64, 4096→128`) that caps idx file count at high split values without sacrificing read parallelism at moderate splits. Reads fan out across all idx-shards in parallel via the unified worker pool; writes route by record hash to a single shard. Every search operator uses the btree when available (default fallthrough is a full-leaf scan with per-entry criterion check — still cheaper than scanning the data files since leaves are smaller than records).
-- **Bitmap** (opt-in via `"field:bitmap"` or `"field:bitmap(N)"` — for `bool`, `enum`, and low-cardinality `varchar`; a declared *bare* `bool`/`enum` name also promotes to bitmap) — one dense bit per slot, per-distinct-value, at `<object>/indexes/<field>/<NNN>.bm`. The bitmap shards 1:1 with data shards so bit `i` of shard `s` = "slot `i` in data shard `s` has this value". Default cap is 256 distinct values per (shard, field); override with `bitmap(N)` up to 65535. For `enum` fields the cap matches the field's declared domain (256 for 1-byte enums, 65535 for 2-byte enums declared with >256 values). The planner routes `eq` / `in` / `neq` / `not_in` through a popcount-style fast path and every other op through a per-shard dict-scan (≤ cap dict entries iterated, decoded, matched, then the matching value-bitmaps walked). Either way, queries route through the index file — never the data file.
+- **Bitmap** (opt-in via `"field:bitmap"` or `"field:bitmap(N)"` — for `bool`, `enum`, and low-cardinality `varchar`; a declared *bare* `bool`/`enum` name also promotes to bitmap) — one dense bit per slot, per-distinct-value, at `<object>/indexes/<field>/<NNN>.bm`. The bitmap shards 1:1 with data shards so bit `i` of shard `s` = "slot `i` in data shard `s` has this value". Default cap is 256 distinct values per (shard, field); override with `bitmap(N)` up to 65535. For `enum` fields the cap matches the field's declared domain (256 for 1-byte enums, 65535 for 2-byte enums declared with >256 values). The planner routes `eq` / `in` / `neq` / `not_in` through a popcount-style fast path and every other op through a per-shard dict-scan (≤ cap dict entries iterated, decoded, matched, then the matching value-bitmaps walked). Either way, queries route through the index file — never the data file. Bit positions are kf slot numbers, so every keyfile rebuild (growth resplit, `vacuum`) remaps the bits with the entries; `reindex` is not needed after bulk loads.
 - **Trigram** (opt-in via `"field:trigram"` on `varchar`; new in 2026.05.7) — substring index for `contains` and `i_contains` queries. Each record contributes one entry per distinct 3-byte lowercased trigram extracted from the field's value into `<object>/indexes/<field>/<NNN>.tg` (uses the same BTRH btree format as `.idx` so existing infrastructure handles caching, range scans, and reads). Queries extract trigrams from the pattern, look up posting lists per trigram, intersect rarest-first, then per-record verify the substring (kills false positives from order-insensitive trigram matching). When a field has both btree AND trigram, the planner auto-picks btree-leaf scan for short patterns (`< 6` chars — verify cost dominates trigram for non-selective common substrings) and trigram for longer patterns. Build uses external-merge sort: bounded per-worker memory + tight prefix-compressed leaves at any scale (25M, 100M, 1B records).
 
 ## When to add an index
+
+Ordered keys are admitted by their actual encoded length, up to 544 bytes
+including each component's NULL tier. A standalone varchar fits at 543 content
+bytes. A write validates every affected NEW ordered key before staging its
+segment record; a key that does not fit is an error, rather than a successful
+record silently omitted from the index. An index build encountering such a
+live value fails before publishing that shard. The previous complete shard
+remains available, under the publication and durability rules above.
+
+Legacy index bytes retain their existing interpretation. Private packed numeric
+keys use exact canonical decimal ordering, independent of display scale. Public
+packed loading and migration remain inactive until authoritative layout metadata
+and rebuild eligibility are implemented. Ordinary legacy varchar-leading
+composite indexes remain creatable and filterable; fixed-width non-final
+components are an additional cursor eligibility rule, not a creation rule.
 
 Add an index when:
 - You run `find` / `count` / `aggregate` filtered by that field, and
@@ -114,8 +129,8 @@ Safe to call on a non-existent index — returns `{"status":"not_indexed",...}` 
 Given a `criteria` array, the planner picks one of five paths:
 
 - **`PRIMARY_LEAF`** — single indexed AND leaf drives the candidate set; remaining criteria are post-filtered on the records via `match_typed()` (zero-malloc byte compares).
-- **`PRIMARY_INTERSECT`** — pure AND of 2+ indexed leaves on rangeable operators (eq, lt, gt, lte, gte, between, in, starts_with). Walks each leaf's btree into a lock-free hash KeySet, intersects the sets, and skips per-record fetch entirely for `count` and AND-only `aggregate`. Capped at `MAX_INTERSECT_LEAVES = 8` indexed leaves — past that the planner falls back to `PRIMARY_LEAF`.
-- **`PRIMARY_KEYSET`** — pure OR (every child indexed) unions candidate hashes into a KeySet; pure-OR `count` returns `|KeySet|` directly.
+- **`PRIMARY_INTERSECT`** — pure AND of 2+ indexed leaves on rangeable operators (eq, lt, gt, lte, gte, between, in, starts_with). Walks each leaf's btree into a lock-free hash KeySet and intersects the candidate sets. Filtered `count` verifies candidates against live records. Capped at `MAX_INTERSECT_LEAVES = 8` indexed leaves — past that the planner falls back to `PRIMARY_LEAF`.
+- **`PRIMARY_KEYSET`** — pure OR (every child indexed) unions candidate hashes into a KeySet; filtered `count` verifies those candidates against live records.
 - **Hybrid AND+OR** — indexed AND leaf as primary, OR sub-tree as per-record post-filter.
 - **`PRIMARY_NONE`** — no indexable leaf; parallel scan across every kf shard. Each worker probes its shard's slot array, follows live slots into the segcache, runs `match_typed()` on the payload.
 

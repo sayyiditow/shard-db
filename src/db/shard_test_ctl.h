@@ -45,10 +45,15 @@ typedef enum {
 } ShardTestPhase;
 
 extern long g_shard_test_sync_counts[SHARD_TEST_PHASE_COUNT];
-extern long g_shard_test_fail_phase;       /* -1 = disabled */
-extern long g_shard_test_fail_occurrence;  /* 1-based */
+/* _Atomic: the control-channel thread re-arms these while request threads
+ * are inside shard_test_note_sync — plain globals are a data race TSan
+ * correctly flags (test controls, not engine state). Plain lvalue
+ * reads/writes of an _Atomic long/int are seq_cst atomic operations, so
+ * existing call sites stay valid unchanged. */
+extern _Atomic long g_shard_test_fail_phase;       /* -1 = disabled */
+extern _Atomic long g_shard_test_fail_occurrence;  /* 1-based */
 extern int  g_shard_test_fail_postlink;    /* M: fail after link() (pending) */
-extern int  g_shard_test_fail_sticky;      /* fail every hit >= occurrence,
+extern _Atomic int  g_shard_test_fail_sticky; /* fail every hit >= occurrence,
                                              * not just the one exact match --
                                              * simulates a persistent fault
                                              * (e.g. disk full) that also
@@ -59,6 +64,13 @@ extern int  g_shard_test_fail_sticky;      /* fail every hit >= occurrence,
  * flags (test controls, not engine state). Plain lvalue reads/writes of
  * an _Atomic int are seq_cst atomic operations, so all existing call
  * sites stay valid unchanged. */
+/* Bitmap candidate KeySet race barrier (query.c, TEST_BUILD daemon only):
+ * stage>0 arms a one-shot barrier for that builder stage on any thread;
+ * 0 releases the gate and disarms. Pair with the existing find-flush gate
+ * (bm_defer_gate_park) for synchronized milestones. */
+extern _Atomic int g_shard_test_bmks_stage;
+extern _Atomic int g_shard_test_bmks_gate;
+
 extern _Atomic int g_shard_test_pause_phase;      /* -1 = disabled */
 extern _Atomic int g_shard_test_pause_occurrence; /* 1-based */
 extern _Atomic int g_shard_test_pause_hits;
@@ -77,6 +89,13 @@ extern _Atomic long g_shard_test_gate_held_max;
 /* B3b: count of bulk commit-chain coordinator invocations. A solo
    request is 1; a merged pair is 1. */
 extern _Atomic long g_shard_test_bulk_chains;
+/* F9 drift detector (slotcask.c, TEST_BUILD): how often the reservation count
+   was cross-checked against a full scan, how many of those saw a non-empty
+   map, and how many disagreed (count != scan, or the gate's `clear` != scan
+   emptiness). Production builds do not have these. */
+extern _Atomic long g_shard_test_res_checks;
+extern _Atomic long g_shard_test_res_checks_nonempty;
+extern _Atomic long g_shard_test_res_mismatch;
 /* Count-worker pass-1 gap hook (docs/plans/2026-08-27-shard-count-worker-
    nested-kf-read.md Task 1): parks shard_count_worker after pass-1's
    inline KF probe — while the probe reader is still held — so the
@@ -94,7 +113,10 @@ extern _Atomic int g_shard_test_count_gap_hit;
    test_control.c, which installs the hook that talks to the runner. */
 typedef void (*shard_db_test_count_gap_fn)(void *ctx);
 void shard_db_test_set_count_gap_hook(shard_db_test_count_gap_fn fn, void *ctx);
-void slotcask_test_count_gap_park(void);
+/* site 1 = after pass-1 with the probe reader held (INSTALL kind 1);
+   site 2 = after the probe reader is released, before the pass-2 batch
+   fetch (INSTALL kind 4). g_shard_test_count_gap holds the armed site. */
+void slotcask_test_count_gap_park(int site);
 /* Guard-check park hook (conditional-writes F2, control-channel kind 3 /
    REACHED phase 4): parks a guarded write AFTER its guard check passed —
    the caller holds shared objlock and every writer gate there — so a
@@ -115,6 +137,23 @@ extern _Atomic int g_shard_test_find_flush_gate_hit;
  * TEST_BUILD). _Atomic: control-thread writes, request-thread reads. */
 extern _Atomic size_t g_shard_test_kf_initial_slots;
 extern _Atomic size_t g_shard_test_kf_max_slots;
+/* Bitmap-remap fault points (g_shard_test_bmfix_fault_mode values; 0 = disarmed). */
+enum {
+    SHARD_TEST_BMFIX_PREPARE = 1,      /* fail bitmap prepare/stage */
+    SHARD_TEST_BMFIX_COMMIT_SYNC = 2,  /* unconfirmed commit msync */
+    SHARD_TEST_BMFIX_RENAME = 3        /* fail the keyfile rename */
+};
+extern _Atomic int g_shard_test_bmfix_fault_mode;
+extern _Atomic int g_shard_test_bmfix_fault_count;
+/* Growth back-off interval in ms after a bitmap-remap prepare/rename
+   failure (kfcache_resplit_locked's bmfix_retry window). 0 = the
+   production 5000 ms; set via the control channel's SET_GLOBALS
+   selector 7 so fault tests never sleep against a hard-coded
+   constant. */
+extern _Atomic long g_shard_test_bmfix_backoff_ms;
+/* Bitmap lock-order trace (F7b): 1 = cached writer acquire/release
+   events log BMLOCK-ORDER lines (bitmap.c). Inert when 0. */
+extern _Atomic int g_shard_test_bmlock_log;
 /* Fault injection: force the update-error JSON escape to fail so tests
  * can exercise the static-fallback emission (defined in storage.c under
  * TEST_BUILD, set via the control channel's SET_GLOBALS phase 1). */
@@ -140,9 +179,16 @@ static inline void shard_test_ctl_reset(void) {
     atomic_store(&g_shard_test_count_gap_hit, 0);
     atomic_store(&g_shard_test_kf_initial_slots, 0);
     atomic_store(&g_shard_test_kf_max_slots, 0);
+    atomic_store(&g_shard_test_bmfix_fault_mode, 0);
+    atomic_store(&g_shard_test_bmfix_fault_count, 0);
+    atomic_store(&g_shard_test_bmfix_backoff_ms, 0);
+    atomic_store(&g_shard_test_bmlock_log, 0);
     atomic_store(&g_shard_test_json_escape_fail, 0);
     atomic_store(&g_shard_test_gate_held_max, 0);
     atomic_store(&g_shard_test_bulk_chains, 0);
+    atomic_store(&g_shard_test_res_checks, 0);
+    atomic_store(&g_shard_test_res_checks_nonempty, 0);
+    atomic_store(&g_shard_test_res_mismatch, 0);
 }
 
 /* Barrier call: count the sync in `phase`; return 1 when this attempt is
@@ -152,12 +198,13 @@ static inline int shard_test_note_sync(int phase) {
     /* concurrent Kf windows on different shards note-sync in parallel */
     long n = __atomic_add_fetch(&g_shard_test_sync_counts[phase], 1,
                                 __ATOMIC_RELAXED);
-    if (g_shard_test_fail_phase == (long)phase &&
-        g_shard_test_fail_occurrence > 0) {
-        if (n == g_shard_test_fail_occurrence)
+    long armed_phase = atomic_load(&g_shard_test_fail_phase);
+    long armed_occ = atomic_load(&g_shard_test_fail_occurrence);
+    if (armed_phase == (long)phase && armed_occ > 0) {
+        if (n == armed_occ)
             return 1;
-        if (g_shard_test_fail_sticky &&
-            g_shard_test_sync_counts[phase] > g_shard_test_fail_occurrence)
+        if (atomic_load(&g_shard_test_fail_sticky) &&
+            n > armed_occ)
             return 1;
     }
     return 0;

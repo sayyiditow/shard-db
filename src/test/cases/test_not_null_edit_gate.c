@@ -300,7 +300,7 @@ static int test_not_null_edit_gate_run(void) {
     /* === gl: legacy-generation record (hdr2 = 0, long 0 → absent →
            NULL) → refuse; present legacy value → succeed. ========== */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gl\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"gl\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"t:long\"]}", &resp);
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"gl\","

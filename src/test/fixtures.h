@@ -33,6 +33,29 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override);
    Returns the previous value so a specialized case can restore it. */
 int test_fixture_set_jobs(int jobs);
 
+/* Opt-in absolute startup deadline. `wait_daemon_ready`'s
+   readiness loop counts only its 50ms sleeps and excludes the time spent
+   inside tc_connect/tc_request, so a parked or trickling readiness probe is
+   not wall-clock bounded by the legacy path. When a deadline is active for
+   the calling thread, wait_daemon_ready runs its readiness loop in a
+   dedicated probe child and bounds the whole wait by
+   min(now+timeout, deadline), killing/reaping the probe child on expiry.
+   `absolute_monotonic_ms` is a CLOCK_MONOTONIC timestamp (0 disables the
+   override). Returns the previous deadline; a negative input returns -1
+   with errno=EINVAL and leaves the prior deadline unchanged. Thread-local:
+   set it in the thread that owns the TestEnv. */
+int64_t test_fixture_set_start_deadline_ms(int64_t absolute_monotonic_ms);
+
+/* One-shot readiness wait bounded by an explicit absolute monotonic
+   deadline: saves the scoped override, runs the same readiness watchdog
+   (probe child when an override is active), and restores the previous
+   override on all returns. Returns 0 when the daemon answers a db-dirs
+   probe, -1 on failure (errno=ETIMEDOUT when the deadline — already
+   expired or reached — caused the failure). Owns only its readiness probe
+   child; the caller still owns the daemon/stub identified by `pid`. */
+int test_fixture_wait_ready_until(int port, pid_t pid,
+                                  int64_t absolute_monotonic_ms);
+
 /* Stop the daemon (SIGTERM, then SIGKILL if it doesn't exit in 5s) and
    rm -rf the db_root. */
 void test_env_stop(TestEnv *env);
@@ -60,6 +83,29 @@ int test_env_test_hook_clear(TestEnv *env);
    (initial slots at open, test-only growth cap in pre-grow/stage).
    0/0 disarms. Requires a test-server daemon (test_control_fd >= 0). */
 int test_env_ctl_set_kf_seams(TestEnv *env, size_t initial, size_t max);
+/* Bitmap-remap fault injection: mode 1 = fail prepare/stage, 2 = unconfirmed commit msync,
+   3 = fail the keyfile rename; the next `count` hits fire. mode 0 disarms. */
+int test_env_ctl_set_bmfix_fault(TestEnv *env, int mode, int count);
+/* TEST_BUILD diagnostic: arm (on=1) / disarm (on=0) the bitmap lock-order
+   trace in the daemon (BMLOCK-ORDER lines in $LOG_DIR, see bitmap.c). */
+int test_env_ctl_set_bmlock_log(TestEnv *env, int on);
+/* Bitmap candidate race barrier in the TEST_BUILD daemon: stage > 0 arms a
+   one-shot barrier (parks the next matching candidate build after its sizing
+   pass, publishes BMKS-BARRIER-REACHED in the daemon log, and fires the
+   find-flush gate hook); 0 releases the gate and disarms. Test support,
+   not a configuration knob. */
+int test_env_ctl_set_bmks_race(TestEnv *env, int stage);
+/* Window-coordinator fault injection: fail the `occurrence`-th durable-sync
+   barrier of `phase` (ShardTestPhase; -1 disarms; sticky=1 fails every hit
+   >= occurrence). Sent via the daemon's test-control channel; sticky is
+   armed before the phase and cleared after the disarm. */
+int test_env_ctl_set_fail_phase(TestEnv *env, int phase, int occurrence,
+                                int sticky);
+/* Growth back-off seam (F7d): override the daemon's bitmap-remap retry
+   back-off interval (ms) so fault tests never sleep out a hard-coded 5 s.
+   ms <= 0 restores the production default. Requires a test-server daemon
+   (test_control_fd >= 0). */
+int test_env_ctl_set_bmfix_backoff(TestEnv *env, long ms);
 /* Fault injection: force the daemon's update-error JSON escape to fail
    (static-fallback emission). fail=0 disarms. Requires a test-server
    daemon (test_control_fd >= 0). */

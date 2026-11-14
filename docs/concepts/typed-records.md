@@ -45,25 +45,55 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 
 | Type | Spec | On-disk bytes | Notes |
 |---|---|---|---|
-| `varchar` | `name:varchar:N` (N = 1..65535) | `N + 2` | `[uint16 BE length][content]` — content occupies exactly `length` bytes, unused slack padded. |
+| `varchar` | `name:varchar:N` (N = 1..4194304) or bare `name:varchar` | descriptor + content | Packed objects store an 8-byte descriptor plus the content bytes at their **actual length**; the cap is N bytes (bare = 4 MiB, 4 194 304). Legacy objects keep `N + 2` bytes (`[uint16 BE length][content]`, N ≤ 65535). |
 | `int` | `age:int` | 4 | Signed 32-bit, big-endian. Range ±2.1 B. |
 | `long` | `id:long` | 8 | Signed 64-bit, big-endian. |
 | `short` | `flags:short` | 2 | Signed 16-bit, big-endian. Range ±32 k. |
 | `double` | `score:double` | 8 | IEEE 754. |
 | `float` | `weight:float` | 4 | IEEE 754 single-precision. |
-| `bool` | `active:bool` | 1 | `0` = false, `1` = true. |
+| `bool` | `active:bool` | 1 | `0` = false, `1` = true. Wire accepts exactly: `1 t tr tru true y ye yes on` (true) and `0 f fa fal fals false n no of off` (false), in any letter case; `o` alone is ambiguous and rejected. |
 | `byte` | `level:byte` | 1 | Unsigned 8-bit. |
-| `date` | `dob:date` | 4 | `yyyyMMdd` as int32 BE (e.g., `20260418`). |
-| `datetime` | `created:datetime` | 7 | `yyyyMMdd` (int32 BE) + seconds-of-day (uint24 BE, 0..86399). Widened from 6 bytes in 2026.09.2; startup migration rewrites old objects. |
-| `datetimems` | `created_at:datetimems` | 8 | `yyyyMMdd` (int32 BE) + `ms-of-day` (uint32 BE, `0..86399999`). Wire format is the 17-digit string `"yyyyMMddHHmmssfff"`. |
-| `time` | `t:time` | 3 | Seconds-of-day packed as 3 big-endian bytes. Parsed from `HH:MM:SS`. Malformed input encodes 0. |
+| `date` | `dob:date` | 4 | `yyyyMMdd` as int32 BE (e.g., `20260418`). Input: `YYYYMMDD` or `YYYY-MM-DD`, years 1..9999, real Gregorian calendar check. |
+| `datetime` | `created:datetime` | 7 | `yyyyMMdd` (int32 BE) + seconds-of-day (uint24 BE, 0..86399). Widened from 6 bytes in 2026.09.2; startup migration rewrites old objects. Input: `YYYYMMDDHHMMSS`, `YYYY-MM-DD HH:MM:SS` or `YYYY-MM-DDTHH:MM:SS` (HH 0..23, MM/SS 0..59 — no leap second). |
+| `datetimems` | `created_at:datetimems` | 8 | `yyyyMMdd` (int32 BE) + `ms-of-day` (uint32 BE, `0..86399999`). Wire format is the 17-digit string `"yyyyMMddHHmmssfff"`. Input: `YYYYMMDDHHMMSSfff` or `YYYY-MM-DD HH:MM:SS.fff` — exactly 3 fraction digits. |
+| `time` | `t:time` | 3 | Seconds-of-day packed as 3 big-endian bytes. Parsed from `HH:MM:SS` (exactly — `00:00:00`..`23:59:59`, no leap second). Anything else is rejected with a field-named error (R4). |
 | `timestamp` | `created_at:timestamp` | 8 | Unix epoch **milliseconds** as int64 BE. Storage layout is identical to `long`; the type carries the additional semantic that `:auto_create` / `:auto_update` emit `clock_gettime(CLOCK_REALTIME)` in ms. Suitable for API timelines, event ordering, telemetry — anything where `Date.now()`-style values are the lingua franca. Distinct from `datetime` (which is calendar-packed and can't represent pre-1970 / post-9999). Available since 2026.05.6. |
-| `uuid` | `id:uuid` | 16 | Raw 128-bit UUID. Parsed from `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (36 chars). Malformed input encodes 0. |
-| `ipv4` | `addr:ipv4` | 4 | Raw 4-byte IPv4 address, network byte order. Parsed from dotted-quad string (e.g. `192.168.1.1`). Malformed input encodes 0. Byte-lexicographic order matches numeric IPv4 order. |
-| `ipv6` | `addr:ipv6` | 16 | Raw 16-byte IPv6 address, network byte order. Parsed from canonical IPv6 string (e.g. `2001:db8::1`). Malformed input encodes 0. Byte-lexicographic order matches numeric IPv6 order. |
-| `numeric` | `price:numeric:P,S` | 8 | Scaled int64 BE: stored value = value × 10^S. P is total digits (informational), S is scale. |
+| `uuid` | `id:uuid` | 16 | Raw 128-bit UUID. Parsed from 32 hex digits or the 36-char dashed form, optionally wrapped in one `{…}` pair; case-insensitive. Anything else is rejected with a field-named error (R4). |
+| `ipv4` | `addr:ipv4` | 4 | Raw 4-byte IPv4 address, network byte order. Parsed from a dotted-quad string (e.g. `192.168.1.1`); the whole input must parse. Anything else is rejected with a field-named error (R4). Byte-lexicographic order matches numeric IPv4 order. |
+| `ipv6` | `addr:ipv6` | 16 | Raw 16-byte IPv6 address, network byte order. Parsed from a canonical IPv6 string (e.g. `2001:db8::1`); the whole input must parse. Anything else is rejected with a field-named error (R4). Byte-lexicographic order matches numeric IPv6 order. |
+| `numeric` | `price:numeric:P,S` (P ≤ 1000, S −1000..1000) or bare `price:numeric` | descriptor + digits | Packed objects store an exact decimal (8-byte descriptor + 16-byte header + ⌈digits/2⌉ coefficient bytes), parsed exactly (no float) and rounded half-away-from-zero to the declared scale on writes and query literals; bare `numeric` keeps each value's own scale (up to 131 072 integer + 16 383 fractional digits); P is enforced. A value whose integer part exceeds P−S digits is rejected. Legacy objects store a scaled int64 (8 bytes, S ≤ 18). |
 | `currency` | `amount:currency` | 8 | Alias for `numeric:19,4`. |
 | `enum` | `color:enum(red,green,blue)` | 1 or 2 | Declared closed value list. Stored as the value's 0-based byte index; **1 byte** for ≤256 values, **2 bytes BE** for 257–65535. Wire format is the display string (`"red"`); the engine validates against the list on insert. Commas inside enum values aren't supported in v1. Bitmap index is opt-in (declare `color:bitmap`, or the bare field name which promotes to bitmap). Available since 2026.05.7. Value lists share the 65,535-byte field-definition cap (see [limits](../reference/limits.md)) — ≈13k four-char values. |
+
+
+### Strict scalar grammars (R4)
+
+Typed scalars share one strict, length-aware grammar on **every** write route
+(insert, update, bulk JSON, bulk delimited cells, `:default=` literals) and on
+**query comparison literals** (`eq neq lt gt lte gte between in not_in`). A
+value that is not in the grammar is rejected with
+`value for field '<field>' is not a valid <type>: <detail>` — malformed input
+never silently becomes a different value, zero, or NULL.
+
+| Type | Accepted forms (outer ASCII space/tab/newline/CR stripped first) |
+|---|---|
+| `bool` | `1 t tr tru true y ye yes on` / `0 f fa fal fals false n no of off`, any letter case; `o` is ambiguous → error |
+| `date` | `YYYYMMDD` or `YYYY-MM-DD`; year 1..9999; real Gregorian day limits |
+| `datetime` | `YYYYMMDDHHMMSS`, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DDTHH:MM:SS` |
+| `datetimems` | `YYYYMMDDHHMMSSfff` or `YYYY-MM-DD HH:MM:SS.fff` (exactly 3 fraction digits) |
+| `time` | exactly `HH:MM:SS`, `00:00:00`..`23:59:59` |
+| `uuid` | 32 hex digits or 36-char 8-4-4-4-12 dashed; one matching `{…}` pair allowed; case-insensitive |
+| `ipv4` / `ipv6` | whole input accepted by the address parser (v4 ≤ 15, v6 ≤ 45 chars); no truncation |
+
+Explicit JSON `null` still stores NULL. The zero values — nil UUID, `0.0.0.0`,
+`::`, `00:00:00`, midnight, empty varchar — remain real, non-NULL values.
+Pattern/substring operators (`starts ends contains like`, i-variants, regex,
+`len_*`) and `*_field` comparisons operate on rendered text and are **not**
+grammar-validated. Enum query literals are validated like writes (unknown
+member → error). Legacy rows written before R4 are read as-is; only new input
+is validated. Delimited (CSV) empty cells keep their historical zero-fill
+semantics. See the [changelog](../reference/changelog.md) for the breaking
+changes introduced by R4.
 
 ### varchar sizing
 
@@ -76,7 +106,7 @@ Typical patterns:
 - `email:varchar:200`
 - `name:varchar:100`
 - `sku:varchar:32`
-- Notes/freeform: `varchar:1000` up to the 65535 byte ceiling.
+- Notes/freeform: `varchar:1000`, up to the 4 MiB packed ceiling (65535 on legacy-layout objects).
 
 For larger blobs — images, PDFs — store them via [put-file](../query-protocol/files.md) and reference them by filename in a varchar.
 
@@ -85,6 +115,31 @@ For larger blobs — images, PDFs — store them via [put-file](../query-protoco
 - **`double`** — fast, native IEEE 754. Use for rates, scores, physical measurements. Don't use for money.
 - **`numeric:P,S`** — stored as `int64 × 10^S`. Use for money, quantities with exact decimals, anything where `0.1 + 0.2` must equal `0.3`. Accepted and returned as strings: `"1500.75"`.
 - **`currency`** — shortcut for `numeric:19,4` (enough for any real-world currency value).
+
+### Scalar conversion contract (2026.10 Phase 1)
+
+Writes, updates, defaults, bulk rows and numeric query literals validate
+the entire value through one shared exact converter: whole decimal tokens
+for `short`/`int`/`long`/`timestamp`/`byte` (optional sign, no fraction
+or exponent, full range enforced — no wrapping or saturation, `INT64_MIN`
+included), finite `float`/`double` text via `strtof`/`strtod` (non-finite
+spellings, overflow, and nonzero underflow-to-zero rejected; subnormals
+accepted), and exact scaled-decimal `numeric`/`currency` as above. Outer
+ASCII whitespace is stripped once — for the scalar numeric types only;
+quoted JSON strings for those numeric types and `varchar` are JSON-decoded
+exactly once before validation, with escaped NUL rejected. Unquoted JSON
+literals and non-JSON CSV/default literals keep their literal meaning.
+`varchar` and `enum` values are byte-exact after their applicable JSON
+decoding; raw CSV varchar cells preserve their full byte span, including
+embedded NULs. Embedded whitespace, trailing
+junk and hex floats are errors. A numeric literal in a query is converted
+by the same rule as the write, so `0.145` at scale 2 finds the row stored
+from `0.145` (both mean 0.15). Invalid values fail the write with a
+field-specific error — the historic wrap/saturation/zero behaviors are
+gone. `float` output uses 9 and `double` 17 significant digits (exact
+binary round trip), so `3.14` renders as `3.1400000000000001`. Malformed
+calendar/boolean/UUID/IP input keeps its pre-2026.10 behavior until the
+Phase 7 validation layer.
 
 ## Field defaults
 
@@ -185,8 +240,12 @@ Rewriting a legacy record into the nullmap format (bulk-update merge,
 vacuum recompose, schema-mutation rebuilds) follows one rule: an explicit
 null beats the old value; an omitted field carries the old value forward;
 a legacy **absent** marker (field bytes beyond the record region) converts
-to NULL. New fields added by add-field are never NULL — existing records
-read zeros/backfill, never NULL.
+to NULL. On legacy-layout
+objects, fields added by add-field are never NULL — existing records read
+zeros/backfill. On packed objects a new field reads its declared default, or
+NULL if it is nullable and has none (a `:not_null` field with no default is
+refused while the object has records); explicit NULLs in other fields survive
+the rebuild.
 
 ### NOT NULL constraint (`:not_null`, 2026.10.2)
 
@@ -244,7 +303,15 @@ edit-field rules.
 
 Record payloads are encoded by `typed_encode()` (in `config.c`), which packs each field in declaration order. A reader uses `typed_decode()` — also cached per object via `g_typed_cache` — to unpack without re-reading the schema.
 
-No field-separator bytes, no length tags (varchar has its own uint16 length prefix, but nothing separates fields from each other). Position is everything: field `i` starts at the sum of sizes of fields `0..i-1`. This makes `typed_get_field_str(ts, raw, field_index)` a direct memcpy of a known byte range.
+The fixed-field description below is the currently public legacy format.
+The private [whole-record JSON reader bridge](whole-record-readers.md) also
+recognizes explicitly bound packed schemas; it does not activate their loaders,
+projection/query consumers or migration. GET validates and builds its actual
+JSON response before output, with checked allocation/write errors.
+
+**Legacy layout:** no field-separator bytes, no length tags (varchar has its own uint16 length prefix, but nothing separates fields from each other). Position is everything: field `i` starts at the sum of sizes of fields `0..i-1`. This makes `typed_get_field_str(ts, raw, field_index)` a direct memcpy of a known byte range.
+
+**Packed layout (default):** fixed-width scalars sit at fixed offsets; each `varchar`/`numeric` field has an 8-byte descriptor at its fixed offset pointing at its payload, which is stored at its actual length after the fixed region. Readers resolve a field through its descriptor rather than a prefix sum.
 
 ## Schema mutations
 

@@ -1,3 +1,4 @@
+#include "typed_index.h"
 #include "types.h"
 
 #ifdef TEST_BUILD
@@ -38,6 +39,25 @@ void index_test_fail_next_build(int en) {
 }
 #else
 void index_test_fail_next_build(int en) {
+    (void)en;
+}
+#endif
+
+#ifdef TEST_BUILD
+/* One-shot "fail the next bmfix startup bitmap repair" seam (db.env
+   BMFIX_REPAIR_TEST_FAIL_NEXT): consumed ONLY by
+   bitmap_rebuild_shards_durable, so the repair and the checked reindex
+   build can be failed independently (the shared
+   INDEX_TEST_FAIL_NEXT_BUILD knob made the escape cases depend on "no
+   other build ran first"). */
+static _Atomic int g_bmfix_repair_test_fail_next;
+
+void index_test_bmfix_repair_fail_next(int en) {
+    atomic_store_explicit(&g_bmfix_repair_test_fail_next, en > 0 ? en : 0,
+                          memory_order_release);
+}
+#else
+void index_test_bmfix_repair_fail_next(int en) {
     (void)en;
 }
 #endif
@@ -608,18 +628,27 @@ int bitmap_prepare_set_init(BitmapPrepareSet *set, size_t max_entries) {
     return 0;
 }
 
-static BitmapShard *bitmap_prepare_open(const UpdateIdxArg *arg) {
+/* Shared opener: path build + default tier + create + writer handle. The
+   caller decides bool_fastpath (key-length heuristic here, schema-derived
+   for the bulk window preopen). Growing the shard (if kf_slot doesn't fit
+   yet) is deferred to apply time — bm_grow() can fsync+publish a rewritten
+   file, a durable mutation that must not happen during prepare, before any
+   commit-intent marker exists for a record that might still be rejected. */
+static BitmapShard *bitmap_open_shard(const char *db_root, const char *object,
+                                      const char *field, int kf_shard, int splits,
+                                      int bool_fastpath, uint32_t bm_max_values) {
     char path[1024];
-    bitmap_shard_path(path, sizeof(path), arg->db_root, arg->object, arg->field, arg->kf_shard);
+    bitmap_shard_path(path, sizeof(path), db_root, object, field, kf_shard);
+    int slots = (int)slotcask_default_slots_for_splits(splits);
+    return bm_open(path, slots, 1, bool_fastpath, bm_max_values, 1 /* writer */);
+}
+
+static BitmapShard *bitmap_prepare_open(const UpdateIdxArg *arg) {
     int bool_fastpath = 0;
     if (arg->new_key && arg->new_len == 1) bool_fastpath = 1;
     else if (arg->old_key && arg->old_len == 1) bool_fastpath = 1;
-    int slots = (int)slotcask_default_slots_for_splits(arg->splits);
-    /* Growing the shard (if kf_slot doesn't fit yet) is deferred to apply
-       time — bm_grow() can fsync+publish a rewritten file, a durable
-       mutation that must not happen during prepare, before any commit-
-       intent marker exists for a record that might still be rejected. */
-    return bm_open(path, slots, 1, bool_fastpath, arg->bm_max_values, 1 /* writer */);
+    return bitmap_open_shard(arg->db_root, arg->object, arg->field, arg->kf_shard,
+                             arg->splits, bool_fastpath, arg->bm_max_values);
 }
 
 /* Grow bm (if needed) so kf_slot fits, right before the apply-phase set/
@@ -723,25 +752,79 @@ int bitmap_prepare_window_init(BitmapPrepareWindow *win, size_t max_fields, size
     return 0;
 }
 
+/* Lookup only: every (field, kf_shard) pair the window can touch was opened
+   by bitmap_prepare_window_preopen in canonical lock order before the first
+   record was processed. A miss here is a caller bug (unpreopened field),
+   not a lazy open: opening here would take this window's bitmap writer
+   locks in first-use order and deadlock against canonical holders
+   (bm_open_many_ro readers, the keyfile-rebuild remap). */
 static BitmapWindowEntry *bitmap_window_find_or_open(BitmapPrepareWindow *win, const UpdateIdxArg *arg) {
     for (size_t i = 0; i < win->n_entries; i++) {
         BitmapWindowEntry *e = &win->entries[i];
         if (e->kf_shard == arg->kf_shard && strcmp(e->field, arg->field) == 0) return e;
     }
-    if (win->n_entries >= win->cap_entries) return NULL;
-    BitmapShard *bm = bitmap_prepare_open(arg);
-    if (!bm) return NULL;
-    BitmapWindowEntry *e = &win->entries[win->n_entries++];
-    snprintf(e->field, sizeof(e->field), "%s", arg->field);
-    e->kf_shard = arg->kf_shard;
-    e->bm = bm;
-    e->bm_max_values = arg->bm_max_values;
-    e->bool_fastpath = (arg->new_key && arg->new_len == 1) ||
-                       (arg->old_key && arg->old_len == 1);
-    e->pending = NULL;
-    e->npending = 0;
-    e->pending_cap = 0;
-    return e;
+    return NULL;
+}
+
+int bitmap_prepare_window_preopen(BitmapPrepareWindow *win, int kf_shard,
+                                  const BitmapPreopenField *fields, size_t n,
+                                  char *err_field, size_t err_field_len) {
+    if (!win || (!fields && n > 0)) { errno = EINVAL; return -2; }
+    if (n == 0) return 0;
+    if (n > (size_t)win->cap_entries || n > MAX_FIELDS) { errno = EOVERFLOW; return -2; }
+    /* Canonical lock order: ascending <field>/NNN.bm path. One kf shard per
+       window, so ordering by field name via bm_field_lock_cmp is the same
+       order bm_open_many_ro and the keyfile-rebuild remap use. */
+    size_t order[MAX_FIELDS];
+    for (size_t i = 0; i < n; i++) order[i] = i;
+    for (size_t i = 1; i < n; i++) {
+        size_t k = order[i], j = i;
+        while (j > 0 &&
+               bm_field_lock_cmp(fields[order[j - 1]].field, fields[k].field) > 0) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = k;
+    }
+    for (size_t i = 0; i < n; i++) {
+        const BitmapPreopenField *f = &fields[order[i]];
+        /* Composite + bitmap is rejected at create-object; defensive skip,
+           matching the single-insert staging loop. */
+        if (strchr(f->field, '+')) continue;
+        /* Duplicate declarations of the same bitmap field (create-object
+           accepts "indexes":["flag:bitmap","flag:bitmap"]) must open one
+           writer handle, not two: the second wrlock on the same cache
+           entry returns EDEADLK (ignored by the opener) and the two
+           handles unlock the same lock twice at apply. The sort above
+           made duplicates adjacent; only the first occurrence opens. */
+        if (i > 0 &&
+            bm_field_lock_cmp(fields[order[i - 1]].field, f->field) == 0)
+            continue;
+        /* bm_max_values 0: the bulk path's convention — an existing file's
+           header wins; a created file takes the default cap. Identical to
+           the first record-driven open this replaces. */
+        BitmapShard *bm = bitmap_open_shard(win->db_root, win->object, f->field,
+                                            kf_shard, win->splits,
+                                            f->bool_fastpath, 0);
+        if (!bm) {
+            int saved = errno ? errno : EIO;
+            bitmap_prepare_window_abort(win);
+            if (err_field && err_field_len)
+                snprintf(err_field, err_field_len, "%s", f->field);
+            errno = saved;
+            return -2;
+        }
+        BitmapWindowEntry *e = &win->entries[win->n_entries++];
+        snprintf(e->field, sizeof(e->field), "%s", f->field);
+        e->kf_shard = kf_shard;
+        e->bm = bm;
+        e->bm_max_values = 0;
+        e->bool_fastpath = f->bool_fastpath;
+        e->pending = NULL;
+        e->npending = 0;
+        e->pending_cap = 0;
+    }
+    return 0;
 }
 
 int bitmap_prepare_window_add(BitmapPrepareWindow *win, const UpdateIdxArg *arg,
@@ -819,15 +902,29 @@ static BitmapShard *bitmap_window_entry_reopen(BitmapPrepareWindow *win,
 
 int bitmap_prepare_window_apply(BitmapPrepareWindow *win) {
     int rc = 0;
+    /* Reacquire every handle this apply needs BEFORE the op loop, in
+       canonical entry order (preopen installed the entries sorted). The op
+       loop must not reopen lazily: op order is first-use order, so a lazy
+       reopen holds an earlier entry's writer lock while taking a later
+       one's — the exact inversion that deadlocks against canonical
+       bitmap-only readers (docs/concepts/concurrency.md). */
+    unsigned char needed[MAX_FIELDS] = { 0 };
+    for (size_t i = 0; i < win->n_ops; i++) {
+        size_t ei = win->ops[i].entry_idx;
+        if (ei < MAX_FIELDS && ei < win->n_entries) needed[ei] = 1;
+    }
+    for (size_t i = 0; i < win->n_entries && i < MAX_FIELDS; i++) {
+        BitmapWindowEntry *e = &win->entries[i];
+        if (e->bm || !needed[i]) continue;
+        /* Parked by prepare (unpark before the wave boundary): reacquire
+           within this call stack, canonically. */
+        e->bm = bitmap_window_entry_reopen(win, e);
+        if (!e->bm) rc = -1;
+    }
     for (size_t i = 0; i < win->n_ops; i++) {
         BitmapWindowOp *op = &win->ops[i];
         BitmapWindowEntry *e = &win->entries[op->entry_idx];
-        if (!e->bm) {
-            /* Parked by prepare (unpark before the wave boundary):
-               reacquire within this call stack. */
-            e->bm = bitmap_window_entry_reopen(win, e);
-            if (!e->bm) { rc = -1; continue; }
-        }
+        if (!e->bm) { rc = -1; continue; }   /* reopen failed above */
         BitmapShard *bm = (BitmapShard *)e->bm;
         if (!bm) continue;
         if (bitmap_apply_grow_for_slot(bm, op->kf_slot) != 0) {
@@ -1153,6 +1250,48 @@ char *build_composite_value(const char *field_name, const char *json_value) {
     return all_present ? strdup(result) : NULL;
 }
 
+/* Packed rows use the bounded record adapter even on the retained JSON
+   indexing entry point. All keys are prepared before the first index write. */
+static int index_parallel_packed(const char *root,const char *object,int splits,
+ const char *json,const uint8_t hash[16],char fields[][256],int count,
+ const enum IndexType *types,TypedSchema *ts){
+    if(count<0||count>MAX_FIELDS){errno=EINVAL;return -1;}
+    uint8_t *record=NULL;size_t n=0;
+    if(typed_encode_alloc(ts,json,0,NULL,NULL,&record,&n,NULL,0))return -1;
+    uint8_t flags=typed_schema_hdr2(ts);
+    if(typed_index_validate_new(ts,record,n,flags,(const char (*)[256])fields,types,count)){
+        free(record);return -1;
+    }
+    IndexThreadArg args[MAX_FIELDS];uint8_t *owned[MAX_FIELDS]={0};int used=0;
+    int rc=0,cause=0;
+    for(int i=0;i<count;i++){
+        if(types&&types[i]!=IT_BTREE)continue;
+        size_t keylen=0;uint8_t *key=NULL;
+        int present=typed_index_record_alloc(ts,record,n,flags,fields[i],0,544,&key,&keylen);
+        if(present<0){cause=errno;rc=-1;goto done;}
+        if(!present)continue;
+        owned[used]=key;
+        args[used]=(IndexThreadArg){.db_root=root,.object=object,.field=fields[i],
+            .splits=splits,.val=key,.vlen=keylen,.hash16=hash,.out_error=0,.out_errno=0};
+        used++;
+    }
+    parallel_for(index_thread_fn,args,used,sizeof(args[0]));
+    for(int i=0;i<used;i++)if(args[i].out_error&&!rc){rc=-1;cause=args[i].out_errno;}
+    if(used){
+        const char *sync_fields[MAX_FIELDS];enum IndexType sync_types[MAX_FIELDS];
+        for(int i=0;i<used;i++){sync_fields[i]=args[i].field;sync_types[i]=IT_BTREE;}
+        if(index_sync_record_fields(root,object,splits,hash,sync_fields,sync_types,used)){
+            if(!cause)cause=errno;
+            rc=-1;
+        }
+    }
+ done:
+    for(int i=0;i<used;i++)free(owned[i]);
+    free(record);
+    if(rc)errno=cause?cause:EIO;
+    return rc;
+}
+
 int index_parallel(const char *db_root, const char *object, int splits,
                    const char *value, const uint8_t hash16[16],
                    char fields[][256], int nfields,
@@ -1160,6 +1299,8 @@ int index_parallel(const char *db_root, const char *object, int splits,
     if (nfields <= 0) return 0;
 
     TypedSchema *ts = load_typed_schema(db_root, object);
+    if(ts&&ts->packed.nfields)
+        return index_parallel_packed(db_root,object,splits,value,hash16,fields,nfields,types,ts);
 
     /* Collect all unique sub-field names from single + composite indexes */
     const char *unique_keys[MAX_FIELDS * 4];
@@ -1186,31 +1327,25 @@ int index_parallel(const char *db_root, const char *object, int splits,
         }
     }
 
-    char *extracted[MAX_FIELDS * 4];
-    json_get_fields(value, unique_keys, unique_count, extracted);
+    char *extracted[MAX_FIELDS * 4] = {0};
+    enum FieldType extracted_types[MAX_FIELDS * 4];
     for (int j = 0; j < unique_count; j++) {
-        if (!extracted[j]) continue;
         int fidx = ts ? typed_field_index(ts, unique_keys[j]) : -1;
-        if (fidx < 0 || ts->fields[fidx].type != FT_VARCHAR) continue;
-        char *unesc = NULL; size_t ulen = 0;
-        errno = 0;
-        if (json_unescape_cstring(extracted[j], strlen(extracted[j]), &unesc, &ulen) != 0) {
-            /* The record encoder already validated this exact JSON before
-               pre_commit. A later failure can still be OOM; it must abort
-               the pre_commit, never silently omit this index key. */
-            int decode_errno = (errno == ENOMEM) ? ENOMEM : EINVAL;
-            for (int k = 0; k < unique_count; k++) free(extracted[k]);
-            for (int k = 0; k < unique_count; k++) {
-                int is_field = 0;
-                for (int m = 0; m < nfields; m++)
-                    if (unique_keys[k] == fields[m]) { is_field = 1; break; }
-                if (!is_field) free((char *)unique_keys[k]);
-            }
-            errno = decode_errno;
-            return -1;
+        extracted_types[j] = fidx >= 0 ? ts->fields[fidx].type : FT_COUNT;
+    }
+    errno = 0;
+    if (json_get_fields_unescaped(value, unique_keys, unique_count,
+                                  extracted_types, extracted) != 0) {
+        int decode_errno = errno == ENOMEM ? ENOMEM : EINVAL;
+        for (int k = 0; k < unique_count; k++) free(extracted[k]);
+        for (int k = 0; k < unique_count; k++) {
+            int is_field = 0;
+            for (int m = 0; m < nfields; m++)
+                if (unique_keys[k] == fields[m]) { is_field = 1; break; }
+            if (!is_field) free((char *)unique_keys[k]);
         }
-        free(extracted[j]);
-        extracted[j] = unesc;
+        errno = decode_errno;
+        return -1;
     }
 
     IndexThreadArg args[MAX_FIELDS];
@@ -1252,7 +1387,7 @@ int index_parallel(const char *db_root, const char *object, int splits,
                 if (fidx >= 0) {
                     const TypedField *f = &ts->fields[fidx];
                     size_t blen = 0;
-                    encode_field_for_index(f, txt, strlen(txt),
+                    encode_field_text_for_index(f, txt, strlen(txt),
                                             (uint8_t *)result + pos, &blen);
                     if (blen == 0) { all_present = 0; break; }
                     if (pos + (int)blen < (int)sizeof(result)) { pos += (int)blen; }
@@ -1287,7 +1422,7 @@ int index_parallel(const char *db_root, const char *object, int splits,
                     const TypedField *f = &ts->fields[fidx];
                     size_t cap = (size_t)(f->size > 8 ? f->size : 8);
                     key_buf = malloc(cap);
-                    encode_field_for_index(f, txt, strlen(txt), key_buf, &key_len);
+                    encode_field_text_for_index(f, txt, strlen(txt), key_buf, &key_len);
                     if (key_len == 0) { free(key_buf); key_buf = NULL; }
                 } else {
                     /* Unknown to typed schema (e.g. legacy untyped object) —
@@ -1383,216 +1518,28 @@ int cmp_str_numeric(const void *a, const void *b) {
    selects the generation; legacy records never tier-1 (their zero values
    are values — §2.4.2). Returns 1 = key written, 0 = invalid input,
    -1 = capacity (checked BEFORE any write). */
-int build_index_key_from_record_into(const TypedSchema *ts, const uint8_t *record,
-                                      size_t record_len, uint8_t hdr2, const char *spec,
-                                      uint8_t *out, size_t out_cap,
-                                      size_t *out_len) {
-    if (!ts || !record || !spec || !out || !out_len) return 0;
-    *out_len = 0;
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t region = 0;
-    if (typed_record_view(record, record_len, hdr2, &fbase, &bm,
-                          &bm_bytes, &region) != 0) return 0;
-
-    if (strchr(spec, '+')) {
-        char fb[256]; strncpy(fb, spec, 255); fb[255] = '\0';
-        size_t cp = 0;
-        char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-        while (tok) {
-            int fi = typed_field_index(ts, tok);
-            if (fi < 0) return 0;
-            const TypedField *f = &ts->fields[fi];
-            size_t payload = (size_t)f->size;
-            if (f->type == FT_VARCHAR && f->size >= 2) {
-                payload = 0;
-                size_t off = (size_t)f->offset;
-                if (off <= region && (size_t)f->size <= region - off) {
-                    const uint8_t *src = fbase + off;
-                    payload = ((size_t)src[0] << 8) | src[1];
-                    size_t maxc = (size_t)f->size - 2;
-                    if (payload > maxc) payload = maxc;
-                }
-            }
-            int is_null = (hdr2 & SREC_FLAG_NULLMAP) &&
-                          typed_field_null(bm, bm_bytes, fi);
-            if (1 + payload > out_cap - cp) return -1;  /* capacity first */
-            out[cp] = is_null ? 0x01 : 0x00;
-            if (is_null) {
-                memset(out + cp + 1, 0, payload);
-            } else {
-                size_t blen = 0;
-                typed_field_to_index_key(ts, fbase, region, fi,
-                                         out + cp + 1, &blen);
-                if (blen != payload) return 0;
-            }
-            cp += 1 + payload;
-            tok = strtok_r(NULL, "+", &_tok_save);
-        }
-        if (cp == 0) return 0;
-        *out_len = cp;
-        return 1;
-    }
-
-    int fi = typed_field_index(ts, spec);
-    if (fi < 0) return 0;
-    const TypedField *f = &ts->fields[fi];
-    size_t payload = (size_t)f->size;
-    if (f->type == FT_VARCHAR && f->size >= 2) {
-        payload = 0;
-        size_t off = (size_t)f->offset;
-        if (off <= region && (size_t)f->size <= region - off) {
-            const uint8_t *src = fbase + off;
-            payload = ((size_t)src[0] << 8) | src[1];
-            size_t maxc = (size_t)f->size - 2;
-            if (payload > maxc) payload = maxc;
-        }
-    }
-    int is_null = (hdr2 & SREC_FLAG_NULLMAP) &&
-                  typed_field_null(bm, bm_bytes, fi);
-    if (1 + payload > out_cap) return -1;
-    out[0] = is_null ? 0x01 : 0x00;
-    if (is_null) {
-        memset(out + 1, 0, payload);
-    } else {
-        size_t blen = 0;
-        typed_field_to_index_key(ts, fbase, region, fi, out + 1, &blen);
-        if (blen != payload) return 0;
-    }
-    *out_len = 1 + payload;
-    return 1;
+int build_index_key_from_record_into(const TypedSchema *ts,const uint8_t *record,
+ size_t n,uint8_t flags,const char *spec,uint8_t *out,size_t cap,size_t *len){
+ return typed_index_record_key_into(ts,record,n,flags,spec,out,cap,len);
 }
 
 /* Raw-payload variant for BITMAP and TRIGRAM consumers: no tier byte —
    the bitmap dict / .tg key shape is unchanged in BTRI (§2.11). NULL
    fields produce no key (return 0): NULL sets no bitmap bit and
    contributes no trigrams. Legacy records: payload from the record base. */
-int build_index_payload_from_record_into(const TypedSchema *ts, const uint8_t *record,
-                                          size_t record_len, uint8_t hdr2, const char *spec,
-                                          uint8_t *out, size_t out_cap,
-                                          size_t *out_len) {
-    if (!ts || !record || !spec || !out || !out_len) return 0;
-    *out_len = 0;
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t region = 0;
-    if (typed_record_view(record, record_len, hdr2, &fbase, &bm,
-                          &bm_bytes, &region) != 0) {
-        return 0;
-    }
-
-    int fi;
-    if (strchr(spec, '+')) return 0;   /* composite+bitmap rejected upstream */
-    fi = typed_field_index(ts, spec);
-    if (fi < 0) {
-        return 0;
-    }
-    if ((hdr2 & SREC_FLAG_NULLMAP) && typed_field_null(bm, bm_bytes, fi)) {
-        return 0;                       /* NULL: no bitmap bit, no trigrams */
-    }
-    /* Compute the payload length BEFORE the encoder writes: a trigram
-       payload is raw varchar content and can exceed a small out_cap —
-       validating afterwards would already have run off the buffer. Same
-       length-first shape build_index_key_from_record_into uses. */
-    const TypedField *f = &ts->fields[fi];
-    size_t payload = (size_t)f->size;
-    if (f->type == FT_VARCHAR && f->size >= 2) {
-        payload = 0;
-        size_t off = (size_t)f->offset;
-        if (off <= region && (size_t)f->size <= region - off) {
-            const uint8_t *src = fbase + off;
-            payload = ((size_t)src[0] << 8) | src[1];
-            size_t maxc = (size_t)f->size - 2;
-            if (payload > maxc) payload = maxc;
-        }
-    }
-    if (payload == 0) {
-        return 0;              /* empty content: no bitmap bit, no trigrams */
-    }
-    if (payload > out_cap) {
-        /* Capacity, not absence: a 600-byte trigram payload is a real key.
-           Returning 0 here would make an upsert diff see no-key → no-key
-           and silently drop the index update (§2.11). Callers fall back to
-           the allocating wrapper on -1. */
-        return -1;
-    }
-    size_t blen = 0;
-    typed_field_to_index_key(ts, fbase, region, fi, out, &blen);
-    if (blen != payload) {
-        return 0;
-    }
-    *out_len = blen;
-    return 1;
+int build_index_payload_from_record_into(const TypedSchema *ts,const uint8_t *record,
+ size_t n,uint8_t flags,const char *spec,uint8_t *out,size_t cap,size_t *len){
+ return typed_index_record_payload_into(ts,record,n,flags,spec,out,cap,len);
 }
 
-int build_index_payload_from_record(const TypedSchema *ts, const uint8_t *record,
-                                    size_t record_len, uint8_t hdr2, const char *spec,
-                                    uint8_t **out_val, size_t *out_len) {
-    if (!out_val || !out_len) return 0;
-    *out_val = NULL; *out_len = 0;
-    uint8_t stackbuf[512];
-    size_t blen = 0;
-    int rc = build_index_payload_from_record_into(ts, record, record_len, hdr2,
-                                                  spec, stackbuf, sizeof(stackbuf), &blen);
-    if (rc == -1) {
-        /* Payload larger than the staging buffer — a trigram-indexed
-           varchar beyond 510 content bytes. The key exists: rebuild into
-           a heap buffer sized from the field (payload ≤ f->size ≤ 64K),
-           never report it as absent. */
-        if (strchr(spec, '+')) return 0;
-        int fi = typed_field_index(ts, spec);
-        if (fi < 0) return 0;
-        size_t cap = (size_t)ts->fields[fi].size + 1;
-        uint8_t *big = malloc(cap);
-        if (!big) return 0;
-        rc = build_index_payload_from_record_into(ts, record, record_len, hdr2,
-                                                  spec, big, cap, &blen);
-        if (rc != 1) { free(big); return rc == -1 ? 0 : rc; }
-        *out_val = big;
-        *out_len = blen;
-        return 1;
-    }
-    if (rc != 1) return rc;
-    uint8_t *heap = malloc(blen);
-    if (!heap) return 0;
-    memcpy(heap, stackbuf, blen);
-    *out_val = heap;
-    *out_len = blen;
-    return 1;
+int build_index_payload_from_record(const TypedSchema *ts,const uint8_t *record,
+ size_t n,uint8_t flags,const char *spec,uint8_t **out,size_t *len){
+ return typed_index_record_alloc(ts,record,n,flags,spec,1,SIZE_MAX,out,len);
 }
 
-int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
-                                size_t record_len, uint8_t hdr2, const char *spec,
-                                uint8_t **out_val, size_t *out_len) {
-    if (!ts || !record || !spec || !out_val || !out_len) return 0;
-    *out_val = NULL;
-    *out_len = 0;
-    /* Tier-inclusive upper bound: per component 1 tier byte + f->size
-       payload (varchar payload <= size - 2 < size). Checked allocation. */
-    size_t cap = 0;
-    if (strchr(spec, '+')) {
-        char fb[256]; strncpy(fb, spec, 255); fb[255] = '\0';
-        char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-        int comps = 0;
-        while (tok) {
-            int fi = typed_field_index(ts, tok);
-            if (fi < 0) return 0;
-            cap += 1 + (size_t)ts->fields[fi].size;
-            comps++;
-            tok = strtok_r(NULL, "+", &_tok_save);
-        }
-        if (comps == 0 || comps > 16) return 0;
-    } else {
-        int fi = typed_field_index(ts, spec);
-        if (fi < 0) return 0;
-        cap = 1 + (size_t)ts->fields[fi].size;
-    }
-    uint8_t *buf = malloc(cap);
-    size_t blen = 0;
-    int rc = build_index_key_from_record_into(ts, record, record_len, hdr2,
-                                              spec, buf, cap, &blen);
-    if (rc != 1 || blen == 0 || blen > cap) { free(buf); return 0; }
-    *out_val = buf;
-    *out_len = blen;
-    return 1;
+int build_index_key_from_record(const TypedSchema *ts,const uint8_t *record,
+ size_t n,uint8_t flags,const char *spec,uint8_t **out,size_t *len){
+ return typed_index_record_alloc(ts,record,n,flags,spec,0,544,out,len);
 }
 
 /* Build an index key from JSON for a (possibly composite) spec.
@@ -1600,6 +1547,15 @@ int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
 int build_index_key_from_json(const TypedSchema *ts, const char *json,
                               const char *spec,
                               uint8_t **out_val, size_t *out_len) {
+    if(out_val)*out_val=NULL;
+    if(out_len)*out_len=0;
+    if(ts && ts->packed.nfields){
+        if(!out_val||!out_len){errno=EINVAL;return -1;}
+        uint8_t *record=NULL;size_t n=0;
+        if(typed_encode_alloc(ts,json,0,NULL,NULL,&record,&n,NULL,0))return -1;
+        int rc=typed_index_record_alloc(ts,record,n,typed_schema_hdr2(ts),spec,0,544,out_val,out_len);
+        free(record);return rc;
+    }
     if (!json || !spec || !out_val || !out_len) return 0;
     *out_val = NULL;
     *out_len = 0;
@@ -1635,7 +1591,7 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
             if (fi >= 0) {
                 const TypedField *f = &ts->fields[fi];
                 size_t blen = 0;
-                encode_field_for_index(f, vals[i], strlen(vals[i]),
+                encode_field_text_for_index(f, vals[i], strlen(vals[i]),
                                         (uint8_t *)cat + cp, &blen);
                 if (blen == 0) { ok = 0; break; }
                 if (cp + (int)blen < (int)sizeof(cat)) { cp += (int)blen; }
@@ -1655,22 +1611,16 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
         return 1;
     }
 
-    /* Single field — extract text, encode to index bytes. */
-    JsonObj jo;
-    json_parse_object(json, strlen(json), &jo);
+    /* Single field — extract and decode a quoted typed value once. */
     int fi = ts ? typed_field_index(ts, spec) : -1;
-    char *txt;
-    if (fi >= 0 && ts->fields[fi].type == FT_VARCHAR) {
-        const char *v; size_t vl;
-        if (!json_obj_unquoted(&jo, spec, &v, &vl)) return 0;
-        size_t ulen = 0;
-        errno = 0;
-        if (json_unescape_cstring(v, vl, &txt, &ulen) != 0) {
-            if (errno != ENOMEM) errno = EINVAL;
-            return -1;
-        }
-    } else {
-        txt = json_obj_strdup(&jo, spec);
+    enum FieldType text_type = fi >= 0 ? ts->fields[fi].type : FT_COUNT;
+    const char *text_key = spec;
+    char *txt = NULL;
+    errno = 0;
+    if (json_get_fields_unescaped(json, &text_key, 1, &text_type, &txt) != 0) {
+        free(txt);
+        if (errno != ENOMEM) errno = EINVAL;
+        return -1;
     }
     if (!txt || !txt[0]) { free(txt); return 0; }
 
@@ -1679,7 +1629,7 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
         size_t cap = (size_t)(f->size > 8 ? f->size : 8);
         uint8_t *buf = malloc(cap);
         size_t blen = 0;
-        encode_field_for_index(f, txt, strlen(txt), buf, &blen);
+        encode_field_text_for_index(f, txt, strlen(txt), buf, &blen);
         free(txt);
         if (blen == 0) { free(buf); return 0; }
         *out_val = buf;
@@ -2161,7 +2111,8 @@ int index_rebuild_temp_sweep(const char *db_root) {
 /* Forward decls — full definitions live near the multi-index builder. */
 index_build_result build_bitmap_pass(const char *db_root, const char *object,
                       const Schema *sch, TypedSchema *ts,
-                      const char *field, uint32_t max_values, int force);
+                      const char *field, uint32_t max_values, int force,
+                      const uint8_t *only_shards);
 index_build_result build_trigram_pass(const char *db_root, const char *object,
                        const Schema *sch, TypedSchema *ts,
                        const char *field, int force);
@@ -2255,7 +2206,7 @@ int cmd_add_index(const char *db_root, const char *object,
     index_build_result build_result;
     if (type == IT_BITMAP) {
         build_result = build_bitmap_pass(db_root, object, &sch, ts, eff,
-                                         max_values, force);
+                                         max_values, force, NULL);
     } else if (type == IT_TRIGRAM) {
         build_result = build_trigram_pass(db_root, object, &sch, ts, eff, force);
     } else {
@@ -2316,37 +2267,28 @@ static int bm_rebuild_cb(uint32_t slot, const uint8_t hash16[16],
     (void)hash16; (void)key; (void)klen;
     BmRebuildCtx *c = (BmRebuildCtx *)ctx;
     if (c->field_index < 0) return 0;
-    const TypedField *f = &c->ts->fields[c->field_index];
-    /* Field-region view (§2.1): nullmap records slide by the bitmap
-       prefix; trim-short records substitute the shared zero buffer. A
-       NULL field sets no bitmap bit (§2.4.2). */
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t region = 0;
-    if (typed_record_view((const uint8_t *)value, vlen, hdr2,
-                          &fbase, &bm, &bm_bytes, &region) != 0)
-        return 0;
-    if (typed_field_null(bm, bm_bytes, c->field_index)) return 0;
-    const uint8_t *vbase = ((size_t)f->offset + (size_t)f->size > region)
-        ? g_zero_field_65537 : fbase + f->offset;
-    /* Encode via the same path bitmap_update uses on insert. For fixed
-       types the raw stored bytes are already the index-key form;
-       varchar carries a 2-byte length prefix in storage that we need
-       to strip. */
-    uint8_t key_buf[1024];
-    size_t  key_len = 0;
-    if (f->type == FT_VARCHAR) {
-        uint16_t actual_len = ((uint16_t)vbase[0] << 8) | (uint16_t)vbase[1];
-        if (actual_len == 0 || actual_len > sizeof(key_buf)) return 0;
-        memcpy(key_buf, vbase + 2, actual_len);
-        key_len = actual_len;
-    } else {
-        size_t sz = (size_t)f->size;
-        if (sz == 0 || sz > sizeof(key_buf)) return 0;
-        memcpy(key_buf, vbase, sz);
-        key_len = sz;
+    /* Same payload the insert/update path and the seg-scan rebuild feed the
+       bitmap: layout-aware (legacy field region or packed cell), NULL
+       contributes no bit (§2.4.2), numeric dictionaries use the sortable
+       encoding. A malformed row (builder error) fails the build; a row the builder
+       reports as absent/invalid input (rc 0) sets no bit, exactly like the
+       insert path. */
+    uint8_t *payload = NULL; size_t plen = 0;
+    errno = 0;
+    int rc = build_index_payload_from_record(
+        c->ts, (const uint8_t *)value, vlen, hdr2,
+        c->ts->fields[c->field_index].name, &payload, &plen);
+    if (rc < 0) {
+        if (!c->failed) c->saved_errno = errno ? errno : EIO;
+        c->failed = 1;
+        return -1;
     }
-    if (bm_set(c->bm, key_buf, key_len, slot) != 0) {
-        if (!c->failed) c->saved_errno = errno;
+    if (rc == 0) return 0;
+    int set_rc = bm_set(c->bm, payload, plen, slot);
+    int set_errno = errno;
+    free(payload);
+    if (set_rc != 0) {
+        if (!c->failed) c->saved_errno = set_errno;
         c->failed = 1;
         return -1;
     }
@@ -3105,7 +3047,6 @@ typedef struct {
     char         target_path[PATH_MAX];
     char         tmp_path[PATH_MAX];
     int          kf_shard;
-    int          slots_per_shard;
     int          fi;
     int          bool_fastpath;
     uint32_t     max_values;
@@ -3160,7 +3101,10 @@ static void *bm_shard_walk_worker(void *arg) {
         return NULL;
     }
 
-    BitmapShard *bm = bm_open(a->tmp_path, a->slots_per_shard, 1,
+    /* Keyfile shards auto-grow independently of the default tier: size the
+       bitmap at THIS shard's actual capacity (as the seg-scan rebuild does),
+       or a live record above the default tier makes bm_set() fail. */
+    BitmapShard *bm = bm_open(a->tmp_path, (int)kh.capacity, 1,
                               a->bool_fastpath, a->max_values,
                               1 /* writer: reindex bm_set's */);
     if (!bm) {
@@ -3199,13 +3143,33 @@ static void *bm_shard_walk_worker(void *arg) {
 
 index_build_result build_bitmap_pass(const char *db_root, const char *object,
                       const Schema *sch, TypedSchema *ts,
-                      const char *field, uint32_t max_values, int force) {
+                      const char *field, uint32_t max_values, int force,
+                      const uint8_t *only_shards) {
     (void)force;
     if (!ts) return index_build_failed(0);
     int fi = typed_field_index(ts, field);
     if (fi < 0) return index_build_failed(0);
     const TypedField *f = &ts->fields[fi];
     int bool_fastpath = (f->type == FT_BOOL);
+
+    /* Pack the selected shards densely (only_shards[s] nonzero = rebuild
+       shard s) so parallel_for walks only those. NULL rebuilds every shard.
+       The packed ids are int: shard ids reach MAX_SPLITS (4096), so a byte
+       array would silently truncate them (shard 300 rebuilt as 44). */
+    int nsel = 0;
+    int *sel = NULL;
+    if (only_shards) {
+        sel = malloc((size_t)sch->splits * sizeof(int));
+        if (!sel) return index_build_failed(errno);
+        for (int s = 0; s < sch->splits; s++)
+            if (only_shards[s]) sel[nsel++] = s;
+        if (nsel == 0) {
+            free(sel);
+            return index_build_ok();     /* nothing selected: no-op */
+        }
+    } else {
+        nsel = sch->splits;
+    }
 
     /* Build banner — matches BUILD-BTREE / BUILD-TRIGRAM pattern so
        operators can grep one prefix and see every index-build event.
@@ -3214,18 +3178,19 @@ index_build_result build_bitmap_pass(const char *db_root, const char *object,
        left 3 of 8 shards empty for stories' bitmaps but produced no
        log to spot it from. */
     LOG_WARN(LOG_SUB_BITMAP,
-        "BUILD-BITMAP %s/%s/%s: %d shards, max_values=%u, bool_fastpath=%d",
-        db_root, object, field, sch->splits, max_values, bool_fastpath);
-
-    int slots_per_shard = (int)slotcask_default_slots_for_splits(sch->splits);
+        "BUILD-BITMAP %s/%s/%s: %d shards%s, max_values=%u, bool_fastpath=%d",
+        db_root, object, field, nsel, only_shards ? " (partial)" : "",
+        max_values, bool_fastpath);
 
     /* Sibling temporaries require the field directory to exist. A first-time
        bitmap build has no live shard whose creation would have made it yet. */
     char first_target[PATH_MAX];
     char field_dir[PATH_MAX];
     bm_build_path(first_target, sizeof(first_target), db_root, object, field, 0);
-    if (parent_dir_copy(first_target, field_dir, sizeof(field_dir)) != 0)
+    if (parent_dir_copy(first_target, field_dir, sizeof(field_dir)) != 0) {
+        free(sel);
         return index_build_failed(errno);
+    }
     mkdirp(field_dir);
 
     /* Open the slotcask db for this object and walk every kf shard. */
@@ -3236,6 +3201,7 @@ index_build_result build_bitmap_pass(const char *db_root, const char *object,
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(db_root, object, &info);
     if (!sdb) {
         LOG_ERROR(LOG_SUB_BITMAP, "build_bitmap_pass: slotcask_registry_get failed for %s/%s/%s", db_root, object, field);
+        free(sel);
         return index_build_failed(0);
     }
 
@@ -3244,40 +3210,42 @@ index_build_result build_bitmap_pass(const char *db_root, const char *object,
        directly into the mmap'd file. Zero file contention; no memory
        accumulation (mmap is the persistent store). Matches the
        phase-1-parallel shape used by btree/trigram. */
-    BmShardWalkArg *args = calloc((size_t)sch->splits, sizeof(BmShardWalkArg));
+    BmShardWalkArg *args = calloc((size_t)nsel, sizeof(BmShardWalkArg));
     if (!args) {
-        LOG_ERROR(LOG_SUB_BITMAP, "build_bitmap_pass: malloc failed for %d BmShardWalkArg entries (%s/%s/%s)", sch->splits, db_root, object, field);
+        LOG_ERROR(LOG_SUB_BITMAP, "build_bitmap_pass: malloc failed for %d BmShardWalkArg entries (%s/%s/%s)", nsel, db_root, object, field);
+        free(sel);
         return index_build_failed(0);
     }
-    for (int s = 0; s < sch->splits; s++) {
-        bm_build_path(args[s].target_path, sizeof(args[s].target_path),
+    for (int i = 0; i < nsel; i++) {
+        int s = only_shards ? sel[i] : i;
+        bm_build_path(args[i].target_path, sizeof(args[i].target_path),
                       db_root, object, field, s);
-        args[s].kf_shard       = s;
-        args[s].slots_per_shard= slots_per_shard;
-        args[s].fi             = fi;
-        args[s].bool_fastpath  = bool_fastpath;
-        args[s].max_values     = max_values;
-        args[s].ts             = ts;
-        args[s].sdb            = sdb;
+        args[i].kf_shard       = s;
+        args[i].fi             = fi;
+        args[i].bool_fastpath  = bool_fastpath;
+        args[i].max_values     = max_values;
+        args[i].ts             = ts;
+        args[i].sdb            = sdb;
     }
-    parallel_for(bm_shard_walk_worker, args, sch->splits, sizeof(BmShardWalkArg));
+    parallel_for(bm_shard_walk_worker, args, nsel, sizeof(BmShardWalkArg));
 
     index_build_result result = index_build_ok();
-    for (int s = 0; s < sch->splits; s++) {
-        if (args[s].result.status == INDEX_BUILD_FAILED) {
-            int saved_errno = args[s].saved_errno ? args[s].saved_errno : EIO;
-            for (int i = 0; i < sch->splits; i++)
-                if (args[i].tmp_path[0]) unlink(args[i].tmp_path);
+    for (int i = 0; i < nsel; i++) {
+        if (args[i].result.status == INDEX_BUILD_FAILED) {
+            int saved_errno = args[i].saved_errno ? args[i].saved_errno : EIO;
+            for (int j = 0; j < nsel; j++)
+                if (args[j].tmp_path[0]) unlink(args[j].tmp_path);
             free(args);
+            free(sel);
             return index_build_failed(saved_errno);
         }
     }
-    for (int s = 0; s < sch->splits; s++) {
-        bm_publish_result publish = bm_publish_replace(args[s].target_path,
-                                                      args[s].tmp_path);
+    for (int i = 0; i < nsel; i++) {
+        bm_publish_result publish = bm_publish_replace(args[i].target_path,
+                                                      args[i].tmp_path);
         if (publish == BM_PUBLISH_PRE_RENAME_FAILED) {
-            for (int i = s; i < sch->splits; i++)
-                if (args[i].tmp_path[0]) unlink(args[i].tmp_path);
+            for (int j = i; j < nsel; j++)
+                if (args[j].tmp_path[0]) unlink(args[j].tmp_path);
             result = index_build_failed(0);
             break;
         }
@@ -3285,6 +3253,7 @@ index_build_result build_bitmap_pass(const char *db_root, const char *object,
             result.status = INDEX_BUILD_DURABILITY_UNCONFIRMED;
     }
     free(args);
+    free(sel);
     return result;
 }
 
@@ -3849,27 +3818,22 @@ static void mf_append_field(MFWorkerField *f, const MFFieldDesc *d,
                             size_t vlen, uint8_t hdr2,
                             TypedSchema *ts, int splits, int idx_n) {
     if (d->type == STREAM_TRIGRAM) {
-        int tidx = d->field_indices[0];
-        const TypedField *tf = &ts->fields[tidx];
-        if (tf->type != FT_VARCHAR) return;
-        const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-        int bm_bytes = 0; size_t region = 0;
-        if (typed_record_view(value, vlen, hdr2, &fbase, &bm,
-                              &bm_bytes, &region) != 0)
-            return;
-        if ((hdr2 & SREC_FLAG_NULLMAP) && typed_field_null(bm, bm_bytes, tidx))
-            return;   /* NULL: no trigrams */
-        const uint8_t *vb = fbase + tf->offset;
-        uint16_t al = ((uint16_t)vb[0] << 8) | (uint16_t)vb[1];
-        if (al == 0) return;
-        /* al is an on-disk length prefix; clamp it to the field's actual
-           declared content size before using it to read past vb + 2
-           (CID 1696428). */
-        size_t max_content = tf->size > 2 ? (size_t)tf->size - 2 : 0;
-        if ((size_t)al > max_content) al = (uint16_t)max_content;
-        if (al == 0) return;
+        int tidx=d->field_indices[0];
+        TypedRowView view;TypedRowSpan span;const uint8_t *vb=NULL;
+        if(tidx<0||typed_row_open(ts,value,vlen,hdr2,&view)||
+           typed_row_span(&view,(size_t)tidx,&span)) {f->had_error=1;return;}
+        if(span.is_null)return;
+        if(typed_span_read(ts,(size_t)tidx,&span,&vb)){f->had_error=1;return;}
+        size_t al=span.len;
+        if(!ts->packed.nfields){
+            al=((size_t)vb[0]<<8)|vb[1];
+            size_t max=(size_t)ts->fields[tidx].size-2;
+            if(al>max)al=max;
+            vb+=2;
+        }
+        if(!al)return;
         uint8_t tg[TG_MAX_DISTINCT][3];
-        size_t n = tg_extract_distinct(vb + 2, al, tg, TG_MAX_DISTINCT);
+        size_t n = tg_extract_distinct(vb, al, tg, TG_MAX_DISTINCT);
         if (n == 0) return;
         /* Process trigrams in batches to handle n > pairs_cap.
            When reindex builds multiple indexes, per_field_budget is divided
@@ -3911,13 +3875,13 @@ static void mf_append_field(MFWorkerField *f, const MFFieldDesc *d,
        NULL fields produce tier-1 entries. The raw per-component concat
        this replaces also read at unslid offsets for nullmap records. */
     uint8_t kb[4096]; size_t kl = 0;
-    if (build_index_key_from_record_into(ts, value, vlen, hdr2, d->name,
-                                          kb, sizeof(kb), &kl) != 1)
-        return;
-    if (kl == 0 || kl > sizeof(kb)) return;
+    int key_rc=build_index_key_from_record_into(ts,value,vlen,hdr2,d->name,kb,sizeof(kb),&kl);
+    if(key_rc<0){f->had_error=1;return;}
+    if(key_rc==0)return;
+    if(kl==0||kl>544){errno=E2BIG;f->had_error=1;return;}
     if (f->pair_count + 1 > f->pairs_cap || f->arena_used + kl > f->arena_cap)
         mf_flush_field(f, splits, idx_n);
-    if (kl > f->arena_cap || 1 > f->pairs_cap) return;
+    if (kl > f->arena_cap || 1 > f->pairs_cap) {f->had_error=1;return;}
     size_t off = f->arena_used;
     memcpy(f->arena + off, kb, kl);
     f->arena_used += kl;
@@ -4019,7 +3983,7 @@ typedef struct {
     int                seg_start, seg_count;
     _Atomic int       *segs_done; /* progress counter (shared) */
     int                had_error;
-    uint8_t           *padded_value; /* ts->total_size bytes; zero-pads compact VARIABLE records */
+    size_t             payload_budget; /* immutable per-field worker allowance */
 } SegScanWorker;
 
 /* Bitmap spill entry on disk: [u16 kf_shard][u16 vlen][vlen bytes][16B hash].
@@ -4027,6 +3991,7 @@ typedef struct {
 static void bm_spill_append(SpillWriter *bw, int kf_shard,
                             const uint8_t *val, size_t vlen,
                             const uint8_t hash[16], int *had_error) {
+    if(vlen>UINT16_MAX){errno=EOVERFLOW;*had_error=1;return;}
     uint16_t s16 = (uint16_t)kf_shard, l16 = (uint16_t)vlen;
     if (spill_writer_put(bw, &s16, 2) != 0 ||
         spill_writer_put(bw, &l16, 2) != 0 ||
@@ -4035,53 +4000,31 @@ static void bm_spill_append(SpillWriter *bw, int kf_shard,
         *had_error = 1;
 }
 
-static int reindex_seg_cb(const uint8_t *rec, size_t vlen,
-                           const uint8_t hash16[16], void *ctx) {
-    SegScanWorker *w = (SegScanWorker *)ctx;
-    uint16_t klen = (uint16_t)rec[16] | ((uint16_t)rec[17] << 8);
-    const uint8_t *value = rec + 24 + klen;
-    uint8_t hdr2 = rec[19];
-    /* Compact VARIABLE records may be shorter than ts->total_size (trailing
-       zero fields trimmed). Pad to total_size so field access at tf->offset
-       is always safe — fields beyond vlen read back as zero. */
-    if (w->padded_value && vlen < (size_t)w->ts->total_size) {
-        memset(w->padded_value, 0, (size_t)w->ts->total_size);
-        if (vlen > 0) memcpy(w->padded_value, value, vlen);
-        value = w->padded_value;
-        vlen = (size_t)w->ts->total_size;
-    }
-    /* §2.7/§2.10: field bytes sit nullmap_prefix into the record for
-       nullmap generations; resolve once via the record's own view. */
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t region = 0;
-    if (typed_record_view(value, vlen, hdr2, &fbase, &bm,
-                          &bm_bytes, &region) != 0)
-        return 0;   /* corrupt record — rebuild skips it, validation upstream */
-    for (int fi = 0; fi < w->n_fields; fi++) {
-        const MFFieldDesc *d = &w->descs[fi];
-        int null_field = (hdr2 & SREC_FLAG_NULLMAP) &&
-                         typed_field_null(bm, bm_bytes, d->field_indices[0]);
-        if (d->type == MF_BITMAP) {
-            int tidx = d->field_indices[0];
-            if (tidx < 0 || null_field) continue;
-            const TypedField *tf = &w->ts->fields[tidx];
-            const uint8_t *vb = fbase + tf->offset;
-            const uint8_t *bval; size_t blen;
-            if (tf->type == FT_VARCHAR) {
-                uint16_t al = ((uint16_t)vb[0] << 8) | (uint16_t)vb[1];
-                if (al == 0) continue;
-                bval = vb + 2; blen = al;
-            } else {
-                if (tf->size == 0) continue;
-                bval = vb; blen = (size_t)tf->size;
+static int reindex_seg_cb(const uint8_t *rec,size_t vlen,
+ const uint8_t hash16[16],void *ctx){
+    SegScanWorker *w=ctx;
+    uint16_t klen=(uint16_t)rec[16]|((uint16_t)rec[17]<<8);
+    const uint8_t *value=rec+24+klen;uint8_t hdr2=rec[19];
+    /* Packed rows must retain their exact length/descriptors. Legacy
+       shortened rows keep their existing zero-field behavior in RowView. */
+    TypedRowView view;
+    if(typed_row_open(w->ts,value,vlen,hdr2,&view)){w->had_error=1;return 0;}
+    for(int fi=0;fi<w->n_fields;fi++){
+        const MFFieldDesc *d=&w->descs[fi];
+        if(d->type==MF_BITMAP){
+            /* Rebuild dictionary bytes must equal normal mutation/probe
+               payloads. Raw storage differs for signed legacy fields and
+               packed decimals (including display-scale metadata). */
+            uint8_t *payload=NULL;size_t length=0;
+            int rc=typed_index_record_alloc(w->ts,value,vlen,hdr2,d->name,
+                1,w->payload_budget,&payload,&length);
+            if(rc<0){w->had_error=1;continue;}
+            if(rc==1){int shard=compute_record_shard(hash16,w->splits);
+                bm_spill_append(&w->bm_writers[fi],shard,payload,length,hash16,&w->had_error);
             }
-            int kf_shard = compute_record_shard(hash16, w->splits);
-            bm_spill_append(&w->bm_writers[fi], kf_shard, bval, blen,
-                            hash16, &w->had_error);
-            continue;
+            free(payload);continue;
         }
-        mf_append_field(&w->fields[fi], d, hash16, value, vlen, hdr2,
-                        w->ts, w->splits, w->idx_n);
+        mf_append_field(&w->fields[fi],d,hash16,value,vlen,hdr2,w->ts,w->splits,w->idx_n);
     }
     return 0;
 }
@@ -4484,6 +4427,7 @@ static index_build_result seg_seq_build_spills(const char *db_root, const char *
         workers[w].slot_size  = sch->slot_size;
         workers[w].worker_idx = w;
         workers[w].ts         = ts;
+        workers[w].payload_budget=per_field_budget;
         workers[w].n_fields   = n_fields;
         workers[w].descs      = descs;
         workers[w].segs       = segs;
@@ -4493,10 +4437,6 @@ static index_build_result seg_seq_build_spills(const char *db_root, const char *
         workers[w].fields = calloc((size_t)n_fields, sizeof(MFWorkerField));
         workers[w].bm_writers = calloc((size_t)n_fields, sizeof(SpillWriter));
         if (!workers[w].fields || !workers[w].bm_writers) { alloc_ok = 0; break; }
-        if (ts->total_size > 0) {
-            workers[w].padded_value = calloc(1, (size_t)ts->total_size);
-            if (!workers[w].padded_value) { alloc_ok = 0; break; }
-        }
         for (int fi = 0; fi < n_fields; fi++) workers[w].bm_writers[fi].fd = -1;
         for (int fi = 0; fi < n_fields && alloc_ok; fi++) {
             if (descs[fi].type == MF_BITMAP) continue;  /* bitmap → append file, no sort buffers */
@@ -4539,7 +4479,6 @@ static index_build_result seg_seq_build_spills(const char *db_root, const char *
         }
         free(workers[w].fields);
         free(workers[w].bm_writers);
-        free(workers[w].padded_value);
     }
     free(workers);
     free(segs);
@@ -4772,6 +4711,45 @@ static void reindex_cleanup_obsolete(const char *eff_root, const char *object,
     }
 }
 
+/* Resolve one index.conf line per the canonical rules — parse_index_spec
+   plus the auto-promotion (idx_should_auto_bitmap, 2-byte enum cap 65535) —
+   into (type, cap, compositeness, effective name). Single source of truth
+   shared by reindex_object_checked_impl's descriptor loop and
+   bitmap_rebuild_shards_durable's bitmap-field scan, so the full reindex
+   and the bmfix shard-scoped repair can never disagree about which fields
+   are bitmaps. A malformed line preserves the bare btree default. */
+static void index_conf_line_resolve(const char *line, const TypedSchema *ts,
+                                    enum IndexType *t_out, uint32_t *mv_out,
+                                    int *composite_out, char *name_out,
+                                    size_t name_cap) {
+    ParsedIndexSpec ps;
+    enum IndexType t = IT_BTREE;
+    uint32_t max_values = 0;
+    int is_composite = 0;
+    const char *eff_name = line;
+    if (parse_index_spec(line, &ps) == 0) {
+        t = ps.type;
+        max_values = ps.max_values;
+        is_composite = ps.is_composite;
+        eff_name = ps.name;
+        if (!ps.is_composite) {
+            int fi_t = typed_field_index(ts, ps.name);
+            if (fi_t >= 0 && idx_should_auto_bitmap(ps.had_explicit_type,
+                                                    ts->fields[fi_t].type)) {
+                t = IT_BITMAP;
+                if (ts->fields[fi_t].type == FT_ENUM &&
+                    ts->fields[fi_t].enum_width == 2 && max_values == 0)
+                    max_values = 65535;
+            }
+        }
+    }
+    *t_out = t;
+    *mv_out = max_values;
+    *composite_out = is_composite;
+    strncpy(name_out, eff_name, name_cap - 1);
+    name_out[name_cap - 1] = '\0';
+}
+
 /* Rebuild every index for one object: read index.conf for the field list,
    publish replacement shards, then remove type-specific obsolete files in a single
    kf-scan via build_indexes_streaming_multi (one pass, all fields).
@@ -4859,28 +4837,12 @@ static int reindex_object_checked_impl(const char *eff_root, const char *object,
 
     for (int i = 0; i < nf; i++) {
         MFFieldDesc *d = &descs[n_desc];
-        ParsedIndexSpec ps;
         enum IndexType t = IT_BTREE;
         uint32_t max_values = 0;
         int is_composite = 0;
-        const char *eff_name = field_specs[i];
-
-        if (parse_index_spec(field_specs[i], &ps) == 0) {
-            t = ps.type;
-            max_values = ps.max_values;
-            is_composite = ps.is_composite;
-            eff_name = ps.name;
-            if (!ps.is_composite) {
-                int fi_t = typed_field_index(ts, ps.name);
-                if (fi_t >= 0 && idx_should_auto_bitmap(ps.had_explicit_type,
-                                                        ts->fields[fi_t].type)) {
-                    t = IT_BITMAP;
-                    if (ts->fields[fi_t].type == FT_ENUM &&
-                        ts->fields[fi_t].enum_width == 2 && max_values == 0)
-                        max_values = 65535;
-                }
-            }
-        }
+        char eff_name[256];
+        index_conf_line_resolve(field_specs[i], ts, &t, &max_values,
+                                &is_composite, eff_name, sizeof(eff_name));
 
         strncpy(d->name, eff_name, 255); d->name[255] = '\0';
         d->bm_max_values = max_values;
@@ -4959,6 +4921,86 @@ int reindex_object_durable_checked_ex(const char *eff_root, const char *object,
                                       int *out_errno) {
     return reindex_object_checked_impl(eff_root, object, composites_only,
                                        out_count, out_errno, 1);
+}
+
+/* Rebuild ONLY the selected shards' bitmaps for every bitmap field — the
+   bmfix startup repair and cmd_reindex's healing path (a pending .bmfix
+   marker names kf shards whose bitmaps may still use old slot numbers;
+   rebuilding the bitmaps from kf + segments restores coherence without
+   touching any btree or trigram). Bitmap fields are resolved from
+   index.conf with reindex_object_checked_impl's exact rules (shared
+   index_conf_line_resolve helper). Caller must hold objlock_wrlock.
+   Returns 0 on success (including "no bitmap fields"); -1 with *out_errno
+   (build errno, else EIO) when any field's rebuild fails — including a
+   durability-unconfirmed publication. */
+int bitmap_rebuild_shards_durable(const char *eff_root, const char *object,
+                                  const uint8_t *only_shards, int *out_errno) {
+    if (out_errno) *out_errno = 0;
+#ifdef TEST_BUILD
+    /* Consumes the BMFIX_REPAIR_TEST_FAIL_NEXT db.env knob (the repair-only
+       one-shot), never the reindex-build knob. */
+    {
+        int injected = atomic_load_explicit(&g_bmfix_repair_test_fail_next,
+                                            memory_order_acquire);
+        if (injected != 0) {
+            atomic_store_explicit(&g_bmfix_repair_test_fail_next, 0,
+                                  memory_order_release);
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: test seam failing bitmap rebuild (errno=%d)",
+                      eff_root, object, injected);
+            if (out_errno) *out_errno = injected;
+            return -1;
+        }
+    }
+#endif
+    Schema sch = load_schema(eff_root, object);
+    if (sch.splits <= 0 || sch.streams <= 0) {
+        if (out_errno) *out_errno = EINVAL;
+        return -1;
+    }
+    TypedSchema *ts = load_typed_schema(eff_root, object);
+    if (!ts) {
+        if (out_errno) *out_errno = EINVAL;
+        return -1;
+    }
+    char ic_path[PATH_MAX];
+    snprintf(ic_path, sizeof(ic_path), "%s/%s/indexes/index.conf",
+             eff_root, object);
+    FILE *ic = fopen(ic_path, "r");
+    if (!ic) {
+        if (errno == ENOENT) return 0;      /* no index.conf = no bitmap fields */
+        if (out_errno) *out_errno = errno;
+        return -1;
+    }
+    char line[512];
+    int rc = 0;
+    while (fgets(line, sizeof(line), ic)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (!line[0] || line[0] == '#') continue;
+        if (strchr(line, '+')) continue;    /* composites are btree-only */
+        enum IndexType t = IT_BTREE;
+        uint32_t max_values = 0;
+        int is_composite = 0;
+        char name[256];
+        index_conf_line_resolve(line, ts, &t, &max_values, &is_composite,
+                                name, sizeof(name));
+        if (t != IT_BITMAP) continue;
+        index_build_result r = build_bitmap_pass(eff_root, object, &sch, ts,
+                                                 name, max_values, 0,
+                                                 only_shards);
+        if (r.status != INDEX_BUILD_OK) {
+            int e = r.error_errno ? r.error_errno : EIO;
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: bitmap rebuild failed for field %s "
+                      "(status %d, errno %d)", eff_root, object, name,
+                      (int)r.status, e);
+            if (out_errno) *out_errno = e;
+            rc = -1;
+            break;
+        }
+    }
+    fclose(ic);
+    return rc;
 }
 
 int reindex_object(const char *eff_root, const char *object,
@@ -5050,9 +5092,57 @@ int cmd_reindex(const char *db_root, const char *dir_filter, const char *obj_fil
             objects_failed++;
             continue;
         }
+        /* A pending repair marker or escape flag (startup repair failed, or
+           a serving-time commit left a .bmfix marker) requires the strict
+           durable rebuild so the repair state is only cleared once every
+           shard is durably published; a composites-only reindex must leave
+           it untouched. -1 from either scan counts as pending. */
+        char data_dir[PATH_MAX];
+        snprintf(data_dir, sizeof(data_dir), "%s/%s", eff_root, obj);
+        int repair_pending =
+            slotcask_bmfix_marked_shards(data_dir, 0, NULL) != 0 ||
+            slotcask_bmfix_disabled_exists(data_dir) != 0;
         int n = 0;
-        int rebuild_rc = reindex_object_checked(eff_root, obj,
+        int rebuild_rc;
+        if (repair_pending && !composites_only) {
+            int eno = 0;
+            int removed = 0;
+            rebuild_rc = reindex_object_durable_checked_ex(eff_root, obj,
+                                                           composites_only,
+                                                           &n, &eno);
+            if (rebuild_rc == 0) {
+                /* Durably publish the kf directory before the repair
+                   markers may be cleared (same rule as the startup
+                   repair). A failed fsync counts as a repair failure:
+                   the markers stay and the object counts as failed. */
+                char kf_dir[PATH_MAX];
+                snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+                if (fsync_dir(kf_dir) != 0) rebuild_rc = -1;
+            }
+            if (rebuild_rc == 0) rebuild_rc = slotcask_bmfix_clear(data_dir);
+            if (rebuild_rc == 0)
+                rebuild_rc = slotcask_bmfix_disabled_remove(data_dir, &removed);
+            if (rebuild_rc == 0) {
+                LOG_WARN(LOG_SUB_REINDEX,
+                         "REINDEX %s/%s: bitmap repair markers cleared%s",
+                         dir, obj,
+                         removed ? "; bitmap planning re-enabled" : "");
+            } else {
+                int E = eno ? eno : errno;
+                LOG_WARN(LOG_SUB_REINDEX,
+                         "REINDEX %s/%s: bitmap repair state not cleared (errno=%d); "
+                         "markers and flag left in place",
+                         dir, obj, E);
+            }
+        } else {
+            rebuild_rc = reindex_object_checked(eff_root, obj,
                                                 composites_only, &n);
+            if (repair_pending) {
+                LOG_WARN(LOG_SUB_REINDEX,
+                         "REINDEX %s/%s: composites-only reindex leaves bitmap repair pending",
+                         dir, obj);
+            }
+        }
         objlock_wrunlock(eff_root, obj);
         if (rebuild_rc != 0) {
             objects_failed++;

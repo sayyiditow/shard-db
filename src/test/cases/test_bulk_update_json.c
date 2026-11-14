@@ -62,7 +62,7 @@ static int test_bulk_update_json_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"budj_t\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"budj_t\","
         "\"fields\":[\"status:varchar:16\",\"amount:int\",\"note:varchar:32\"],"
         "\"indexes\":[\"status\",\"amount\"],\"splits\":16}", &resp);
     free(resp); resp = NULL;

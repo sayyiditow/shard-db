@@ -326,8 +326,8 @@ static int test_auto_key_run(void) {
         "\"records\":[{\"value\":{\"amount\":1000}},"
                      "{\"value\":{\"amount\":1001}},"
                      "{\"value\":{\"amount\":1002}}]}", &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"bulk-inserted\"", "bulk-insert auto-seq status");
-    ASSERT_CONTAINS(resp, "\"count\":3", "bulk-insert auto-seq count");
+    ASSERT_CONTAINS(resp, "\"inserted\":", "bulk-insert auto-seq status");
+    ASSERT_CONTAINS(resp, "\"inserted\":3", "bulk-insert auto-seq count");
     /* Next 3 auto-keys are 4,5,6 (seq was at 3 after the earlier inserts) */
     ASSERT_CONTAINS(resp, "\"keys\":[\"4\",\"5\",\"6\"]", "bulk-insert seq batch keys");
     free(resp); resp = NULL;
@@ -347,7 +347,7 @@ static int test_auto_key_run(void) {
         "\"records\":[{\"value\":{\"amount\":1}},"
                      "{\"key\":\"abc\",\"value\":{\"amount\":2}}]}", &resp);
     ASSERT_CONTAINS(resp, "\"error\"", "bulk validation rejects bad key");
-    ASSERT_CONTAINS(resp, "record 1", "bulk error names failing index");
+    ASSERT_TRUE(resp && !strstr(resp, "\"inserted\""), "bulk rejects whole batch, nothing inserted");
     free(resp); resp = NULL;
 
     /* === 12. bulk-insert auto-key (uuid) ================================== */
@@ -356,8 +356,8 @@ static int test_auto_key_run(void) {
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"users\","
         "\"records\":[{\"value\":{\"name\":\"P\"}},"
                      "{\"value\":{\"name\":\"Q\"}}]}", &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"bulk-inserted\"", "bulk-insert auto-uuid status");
-    ASSERT_CONTAINS(resp, "\"count\":2", "bulk-insert auto-uuid count");
+    ASSERT_CONTAINS(resp, "\"inserted\":", "bulk-insert auto-uuid status");
+    ASSERT_CONTAINS(resp, "\"inserted\":2", "bulk-insert auto-uuid count");
     /* Both keys should be 36-char dashed uuids — substring check on "-" pattern. */
     /* Loose check: response should contain at least one dashed-uuid pattern. */
     ASSERT_TRUE(resp && SAFE_STRSTR(resp, "-4") != NULL,
@@ -410,11 +410,13 @@ static int test_auto_key_run(void) {
         "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"orders\","
         "\"delimiter\":\",\","
         "\"data\":\",5000\\n,5001\\n,5002\\n\"}", &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"bulk-inserted\"", "delim auto-seq status");
-    ASSERT_CONTAINS(resp, "\"count\":3", "delim auto-seq count");
-    /* Seq watermark after earlier inserts is around 8 — the next 3 are 9,10,11 */
-    ASSERT_CONTAINS(resp, "\"9\"", "delim auto-seq batch first key");
-    ASSERT_CONTAINS(resp, "\"11\"", "delim auto-seq batch last key");
+    ASSERT_CONTAINS(resp, "\"inserted\":", "delim auto-seq status");
+    ASSERT_CONTAINS(resp, "\"inserted\":3", "delim auto-seq count");
+    /* Watermark is 9 after earlier inserts: the rejected bad-key batch
+       (section 11) consumed one seq value (gaps are allowed), so the next
+       3 are 10,11,12. */
+    ASSERT_CONTAINS(resp, "\"10\"", "delim auto-seq batch first key");
+    ASSERT_CONTAINS(resp, "\"12\"", "delim auto-seq batch last key");
     free(resp); resp = NULL;
 
     /* Mixed: 1 provided + 2 empty (auto-gen). Provided key is upsert. */
@@ -422,7 +424,7 @@ static int test_auto_key_run(void) {
         "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"orders\","
         "\"delimiter\":\",\","
         "\"data\":\"900,9000\\n,9001\\n,9002\\n\"}", &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"bulk-inserted\"", "delim mixed status");
+    ASSERT_CONTAINS(resp, "\"inserted\":", "delim mixed status");
     ASSERT_CONTAINS(resp, "\"900\"", "delim mixed: provided key echoed");
     free(resp); resp = NULL;
 
@@ -439,8 +441,8 @@ static int test_auto_key_run(void) {
         "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"users\","
         "\"delimiter\":\",\","
         "\"data\":\",DelimP\\n,DelimQ\\n\"}", &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"bulk-inserted\"", "delim auto-uuid status");
-    ASSERT_CONTAINS(resp, "\"count\":2", "delim auto-uuid count");
+    ASSERT_CONTAINS(resp, "\"inserted\":", "delim auto-uuid status");
+    ASSERT_CONTAINS(resp, "\"inserted\":2", "delim auto-uuid count");
     ASSERT_TRUE(resp && SAFE_STRSTR(resp, "-4") != NULL,
                 "delim auto-uuid: v4 marker present");
     free(resp); resp = NULL;
@@ -474,7 +476,7 @@ static int test_auto_key_run(void) {
                      "{\"value\":{\"amount\":400}},"
                      "{\"value\":{\"amount\":500}}]}", &resp);
     ASSERT_CONTAINS(resp, "\"skipped\":1", "bulk seq collision: 1 skipped");
-    ASSERT_CONTAINS(resp, "\"count\":4", "bulk seq collision: 4 inserted");
+    ASSERT_CONTAINS(resp, "\"inserted\":4", "bulk seq collision: 4 inserted");
     free(resp); resp = NULL;
 
     /* The manually-inserted record at "3" must still have amount=42, not 300. */
@@ -506,7 +508,7 @@ static int test_auto_key_run(void) {
         "{\"key\":\"22222222-3333-4444-8555-666677778888\",\"value\":{\"name\":\"scap Beta\"}},"
         "{\"key\":\"33333333-4444-4555-8666-777788889999\",\"value\":{\"name\":\"Other\"}}]}",
         &resp);
-    ASSERT_CONTAINS(resp, "\"count\":3", "uuid customers seeded");
+    ASSERT_CONTAINS(resp, "\"inserted\":3", "uuid customers seeded");
     free(resp); resp = NULL;
 
     tc_request(tc,

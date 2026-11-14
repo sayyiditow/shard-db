@@ -31,7 +31,7 @@ static int test_bulk_update_json_oom_run(void) {
     tu_pdb_request(db, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     shard_db_free_result(resp); resp = NULL;
     tu_pdb_request(db,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"buo_t\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"buo_t\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"v:varchar:64\"]}", &resp);
     shard_db_free_result(resp); resp = NULL;
 

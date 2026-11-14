@@ -43,7 +43,10 @@ concurrency:
 jobs:
   cppcheck:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20m was cancelled twice on the 2026-11 branch bumps (big new TUs:
+    # typed/packed layer + fixture-heavy test files) with cppcheck still
+    # scanning; 30m covers the current tree with a cold cache.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

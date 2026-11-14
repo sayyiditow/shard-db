@@ -18,18 +18,28 @@ Or via JSON:
 
 ### What it copies
 
-Everything for that object: `data/` (kf + streams), `indexes/`, `files/`, `fields.conf`, and an `object.json` manifest carrying the splits/max_key/storage_version/streams the operator would need to recreate the object from scratch. Destination is a timestamped subdirectory under the object's own `backup/` directory:
+Everything for that object: `data/` (kf + streams), `indexes/`, `metadata/`, `files/` (the stored files written by `put-file`), the object's `tokens.conf`, `fields.conf`, and an `object.json` manifest carrying the splits/max_key/storage_version/streams the operator would need to recreate the object from scratch (plus a `"files":1` marker — see Restore below). A backup is therefore enough to recreate the same object — records, indexes, sequences, stored files and access tokens — in another database later (the object directory must exist there first, and the backup folder goes inside it, as `restore` requires). Destination is a timestamped subdirectory under the object's own `backup/` directory:
 
 ```
-$DB_ROOT/<dir>/<obj>/backup/20260418-153012/
-  object.json          # schema manifest (splits, max_key, storage_version, streams, fields)
+$DB_ROOT/<dir>/<obj>/backup/20260418_153012/
+  object.json          # schema manifest (splits, max_key, storage_version, streams, layout, files)
   fields.conf
+  tokens.conf          # the object's access tokens (copied 0600)
   data/
     kf/
     streams/
   indexes/
-  files/
+  metadata/
+  files/               # put-file store (absent if the object has no stored files)
 ```
+
+`tokens.conf` holds token secrets in plaintext — the backup copy is created with mode `0600`, but protecting the backup directory itself is the operator's responsibility. Backup runs under the object's exclusive lock and the copy time now grows with the stored-file volume, so backups of objects holding large stored files take correspondingly longer.
+
+### Known windows (files/)
+
+- `copy_file`/`cprf` errors are not reported: a backup whose `files/` copy partly failed (ENOSPC/EIO) still carries the `"files":1` marker, and a later `restore --force` wipes live `files/` and copies back the partial set.
+- If an operator pruned `<backup>/files/` but kept the manifest, `restore --force` wipes live `files/` and copies nothing back.
+- If a `restore --force` crashes after wiping live `files/` but before the copy completes, live `files/` stays empty (or partial) until `restore --force` is re-run; the backup itself is intact.
 
 ### When to use
 
@@ -39,7 +49,7 @@ $DB_ROOT/<dir>/<obj>/backup/20260418-153012/
 
 ### Consistency
 
-Copy happens under a read lock, so concurrent reads see a consistent view. Writes during the copy **may or may not** be included — it's "recent" but not a fenced snapshot. For strict point-in-time, pause writes first or use filesystem snapshots.
+`backup` holds the object's **exclusive lock for the whole copy** — every request on that object, reads included, waits until the backup finishes, so the copy cannot observe a write, resplit, bitmap-repair marker or `sequence` update in flight. Backup waits for in-flight operations to drain exactly as `vacuum` does and, because the object lock is a default-attribute (reader-preferring on glibc) rwlock, may itself wait a long time under continuous overlapping traffic — quiesce clients on busy objects (requests parked behind the backup occupy their dispatcher workers, as behind `vacuum`). `./shard-db stop` waits for a running backup like it waits for writes. Requests waiting behind the backup are not subject to the per-request `timeout_ms` while queued (same as behind `vacuum`), so clients with short I/O timeouts (shard-cli included) may time out and should retry. An object already flagged bitmap-disabled is copied as-is (flag and markers included) and `restore` re-arms the escape until `reindex`. Backups taken by releases before this change were not fenced — if one was taken on a live object, run `reindex` after restoring it. Filesystem snapshots remain the recommendation for very large or always-busy objects.
 
 ### Restore
 
@@ -50,13 +60,16 @@ Use the `restore` mode (shipped 2026.05.1):
   "mode":"restore",
   "dir":"<dir>",
   "object":"<obj>",
-  "from":"20260418-153012",
+  "from":"20260418_153012",
   "force":true
 }'
 ```
 
 - `from` is the timestamp directory name under `<obj>/backup/`.
 - `force:true` is required if the live object isn't empty — without it `restore` refuses to overwrite live data and tells you to pass `force=true` to proceed.
+- **Stored files (`files/`):** a backup carrying the `"files":1` manifest marker replaces the live `files/` directory (with `force`, after the same non-empty refusal as `data/`); a backup taken before files support (no marker) leaves live `files/` untouched.
+- **Tokens:** restore **adds** the backup's object tokens to the running daemon immediately (no restart) and rewrites the object's `tokens.conf`. It adds only tokens that are not already present — an existing token is never changed — and never removes any. Consequence: a token revoked after the backup was taken comes back if the backup contains it. Live tokens absent from the backup are kept. The object's `tokens.conf` is rewritten from the in-memory token set, so hand edits made after startup are lost — same as `add-token`. A full token table (`TOKEN_CAP`) makes the merge skip the remaining tokens and log it. This merge runs on the JSON protocol only.
+- **Authorization:** `restore` requires an object-admin (`rwx`) token whose scope covers the object on the JSON protocol. The legacy text-wire protocol has no authentication at all (pre-existing), never restores tokens (a text-path restore leaves the object's `tokens.conf` and the running token set untouched — use the JSON `restore` to bring tokens back), and is not covered by that requirement.
 - The schema in the backup's `object.json` is reconciled with `schema.conf` and `fields.conf`. If the live versions were deleted (operator wiped metadata), restore recreates them from the backup manifest.
 - Caches are invalidated post-restore so subsequent reads see the restored state — no daemon restart required.
 
@@ -70,6 +83,7 @@ Errors you might see:
 
 - `{"error":"backup not found ..."}` — bad `from` value.
 - `{"error":"invalid from ..."}` — `from` contained `/`, `..`, or other unsafe characters.
+- `{"error":"files/ is not empty (use force=true to overwrite)"}` — the backup governs `files/` and live `files/` is non-empty; pass `force:true` to overwrite.
 - `{"error":"refusing to overwrite non-empty live object; pass force=true to proceed"}` — exactly that.
 
 ## 2. Filesystem snapshots

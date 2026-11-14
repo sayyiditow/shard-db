@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -33,6 +34,20 @@
    for every daemon-backed case. */
 #define PORT_RESERVE_TTL_MS 5000
 #define PORT_RESERVE_MAX    64
+
+/* wait_daemon_ready budget for daemon spawns and restarts (both callers
+   keep this deliberately equal). 90s: sanitizer builds and the 2026-11
+   startup layout migration provably exceed the old 30s on loaded CI
+   runners; on the dev workstation a normal start is ready in <2s, so
+   the raise only binds on genuinely slow hosts. Sanitizer builds get
+   240s: the TSan migration startup (reindex of the whole fixture behind
+   TSan instrumentation) exceeded even 90s on a loaded runner while
+   measuring 8-9s locally. Guard form mirrors test_auto_reshard.c. */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define FIXTURE_READY_WAIT_MS 240000
+#else
+#define FIXTURE_READY_WAIT_MS 90000
+#endif
 
 typedef struct { int fd; struct timespec claimed; } PortReservation;
 static PortReservation g_port_reservations[PORT_RESERVE_MAX];
@@ -107,6 +122,33 @@ static int sleep_ms(int ms) {
     return nanosleep(&ts, NULL);
 }
 
+/* ── Opt-in absolute startup deadline ──────────────────────
+   The legacy readiness loop below counts only its 50ms sleeps; the time
+   inside tc_connect/tc_request is unbounded, so a parked or trickling
+   readiness target would hang the daemon owner. With a deadline active,
+   wait_daemon_ready runs the loop body in a probe child and bounds the
+   whole wait by min(now+timeout, deadline). Thread-local: only the thread
+   that owns the TestEnv opts in; 0 disables. */
+static __thread int64_t g_start_deadline_ms;
+
+static int64_t fixture_now_monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+int64_t test_fixture_set_start_deadline_ms(int64_t absolute_monotonic_ms) {
+    if (absolute_monotonic_ms < 0) { errno = EINVAL; return -1; }
+    int64_t prev = g_start_deadline_ms;
+    g_start_deadline_ms = absolute_monotonic_ms;
+    return prev;
+}
+
+static int fixture_deadline_expired(void) {
+    return g_start_deadline_ms != 0 &&
+           fixture_now_monotonic_ms() >= g_start_deadline_ms;
+}
+
 /* The fixture-generated db.env is machine-written and tiny: replace its
    `export PORT=` line for the bind-race respawn in test_env_start_ex. */
 static int fixture_rewrite_port(const char *env_path, int new_port) {
@@ -150,10 +192,51 @@ static int fixture_pool_size(void) {
     return g_test_jobs <= 4 ? 4 : 2;
 }
 
-static int wait_daemon_ready(int port, int timeout_ms) {
+static pid_t fixture_waitpid(pid_t pid, int *status, int options) {
+    pid_t rc;
+    do { rc = waitpid(pid, status, options); } while (rc < 0 && errno == EINTR);
+    return rc;
+}
+
+static int fixture_kill_reap(pid_t *owned) {
+    if (*owned <= 0) return 0;
+    pid_t pid = *owned;
+    pid_t rc = fixture_waitpid(pid, NULL, WNOHANG);
+    if (rc == pid) { *owned = -1; return 0; }
+    if (rc < 0) {
+        if (errno == ECHILD) *owned = -1;
+        return -1;
+    }
+    kill(pid, SIGKILL);
+    rc = fixture_waitpid(pid, NULL, 0);
+    if (rc == pid) { *owned = -1; return 0; }
+    /* ECHILD means ownership is already gone; never signal that PID again. */
+    if (rc < 0 && errno == ECHILD) *owned = -1;
+    return -1;
+}
+
+/* Fixed-size diagnostic result carried from the readiness probe child back
+   to the daemon-owning parent (last_step: 1=connect 2=request 3=exited 4=bounded). */
+typedef struct { int last_step; int last_errno; } WaitReadyDiag;
+
+/* The original readiness body. `diag` (optional) mirrors g_wait_last_* so
+   the deadline-bounded path can relay them from its probe child. Never
+   forks; callers own any recursion policy. */
+static int wait_daemon_ready_impl(int port, int timeout_ms, pid_t pid,
+                                  WaitReadyDiag *diag) {
     int waited = 0;
     int last_step = 0, last_errno = 0;
     while (waited < timeout_ms) {
+        /* A daemon that already exited (e.g. startup refusal) can never
+           become ready: stop waiting without reaping it, so callers still
+           see the exit status via their own waitpid. */
+        siginfo_t si;
+        memset(&si, 0, sizeof(si));
+        if (pid > 0 && waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+            si.si_pid == pid) {
+            last_step = 3; last_errno = 0;
+            break;
+        }
         TestClientCfg cfg = { .port = port, .connect_timeout_ms = 200 };
         TestClient *tc = tc_connect(&cfg);
         if (!tc) {
@@ -171,7 +254,107 @@ static int wait_daemon_ready(int port, int timeout_ms) {
     }
     g_wait_last_step = last_step;
     g_wait_last_errno = last_errno;
+    if (diag) { diag->last_step = last_step; diag->last_errno = last_errno; }
     return -1;
+}
+
+/* Deadline-bounded readiness wait: the loop body (including its blocking
+   tc_connect/tc_request calls) runs in a dedicated probe child; this
+   parent-side monitor bounds the whole wait by
+   min(now+timeout_ms, g_start_deadline_ms) using nonblocking reads,
+   poll and fixture_waitpid(WNOHANG), and kills/reaps the exact probe PID on
+   expiry. The probe child never re-enters this wrapper. */
+static int wait_daemon_ready_bounded(int port, int timeout_ms, pid_t pid) {
+    int pfd[2];
+    if (pipe(pfd) != 0) {
+        g_wait_last_step = 4; g_wait_last_errno = errno;
+        return -1;
+    }
+    pid_t probe = fork();
+    if (probe < 0) {
+        close(pfd[0]); close(pfd[1]);
+        g_wait_last_step = 4; g_wait_last_errno = errno;
+        return -1;
+    }
+    if (probe == 0) {
+        close(pfd[0]);
+        WaitReadyDiag d = { .last_step = 0, .last_errno = 0 };
+        int rc = wait_daemon_ready_impl(port, timeout_ms, pid, &d);
+        ssize_t w = write(pfd[1], &d, sizeof(d));
+        (void)w;
+        close(pfd[1]);
+        _exit(rc == 0 ? 0 : 1);
+    }
+    close(pfd[1]);
+    int64_t deadline = fixture_now_monotonic_ms() + timeout_ms;
+    if (g_start_deadline_ms != 0 && g_start_deadline_ms < deadline)
+        deadline = g_start_deadline_ms;
+
+    WaitReadyDiag d = { .last_step = 0, .last_errno = 0 };
+    int have_diag = 0, status = 0, outcome = 0;   /* 0=timeout 1=reaped -1=monitor error */
+    int monitor_errno = 0;
+    if (fcntl(pfd[0], F_SETFL, O_NONBLOCK) != 0) {
+        outcome = -1; monitor_errno = errno;
+    }
+    for (; outcome != -1;) {
+        struct pollfd p = { .fd = pfd[0], .events = POLLIN, .revents = 0 };
+        int pr = poll(&p, 1, 50);
+        if (pr < 0 && errno != EINTR) { outcome = -1; monitor_errno = errno; break; }
+        if (pr > 0) {
+            ssize_t n = read(pfd[0], (char *)&d, sizeof(d));
+            if ((size_t)n == sizeof(d)) have_diag = 1;
+        }
+        pid_t r = fixture_waitpid(probe, &status, WNOHANG);
+        if (r == probe) { outcome = 1; break; }
+        if (r < 0) { outcome = -1; monitor_errno = errno; break; }
+        if (fixture_now_monotonic_ms() >= deadline) { outcome = 0; break; }
+    }
+    if (outcome != 1 && monitor_errno != ECHILD) {
+        kill(probe, SIGKILL);
+        if (fixture_waitpid(probe, &status, 0) != probe) {
+            outcome = -1; monitor_errno = errno;
+        }
+    }
+    close(pfd[0]);
+    if (outcome == -1) {
+        g_wait_last_step = 4;
+        g_wait_last_errno = monitor_errno ? monitor_errno : EIO;
+        return -1;
+    }
+    if (outcome == 0) {
+        g_wait_last_step = 4;
+        g_wait_last_errno = ETIMEDOUT;
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
+    /* Probe child reported failure: prefer its diagnostic; a missing one
+       gets the defined timeout result. */
+    g_wait_last_step = have_diag ? d.last_step : 4;
+    g_wait_last_errno = have_diag ? d.last_errno : ETIMEDOUT;
+    return -1;
+}
+
+static int wait_daemon_ready(int port, int timeout_ms, pid_t pid) {
+    if (g_start_deadline_ms != 0)
+        return wait_daemon_ready_bounded(port, timeout_ms, pid);
+    return wait_daemon_ready_impl(port, timeout_ms, pid, NULL);
+}
+
+int test_fixture_wait_ready_until(int port, pid_t pid,
+                                  int64_t absolute_monotonic_ms) {
+    if (absolute_monotonic_ms <= 0) { errno = EINVAL; return -1; }
+    /* An already expired deadline never launches a probe. */
+    if (absolute_monotonic_ms <= fixture_now_monotonic_ms()) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    int64_t prev = test_fixture_set_start_deadline_ms(absolute_monotonic_ms);
+    int rc = wait_daemon_ready_bounded(port, 30000, pid);
+    if (rc != 0 && g_wait_last_step == 4 && g_wait_last_errno == ETIMEDOUT)
+        errno = ETIMEDOUT;
+    test_fixture_set_start_deadline_ms(prev);
+    return rc;
 }
 
 /* Dump the captured daemon log file to stderr, then unlink. Called on
@@ -320,6 +503,18 @@ int test_env_start_ex(TestEnv *env, const char *qbuf_mb_override) {
     int is_test_server = (strstr(binary_abs, "/shard-db-test-server") != NULL);
     int spawn_attempt = 0;
 respawn:;
+    /* The absolute startup deadline is never reset — including across the
+       bind-conflict respawn below. */
+    if (fixture_deadline_expired()) {
+        if (env->test_control_fd > 0) {
+            close(env->test_control_fd);
+            env->test_control_fd = -1;
+        }
+        g_wait_last_step = 4;
+        g_wait_last_errno = ETIMEDOUT;
+        fprintf(stderr, "test_env_start_ex: startup work deadline expired before spawn\n");
+        return -1;
+    }
     /* Inherited anonymous Unix socketpair control channel for the TEST_BUILD
        daemon: the child keeps its endpoint across exec and invokes the test
        server as `server --test-control-fd <fd>`; the parent side lives in
@@ -372,18 +567,23 @@ respawn:;
     /* Sanitizer builds make daemon startup much slower (TSan especially,
        ~5-15x); a full-parallel run-all burst of concurrent daemon spawns
        widens this further. Match test_env_start_at's restart-path wait,
-       which already accounts for this. */
-    if (wait_daemon_ready(env->port, 30000) != 0) {
+       which already accounts for this. 90s: the 2026-11 packed-layout
+       branch's startup migration (first start over a pre-migration root)
+       provably exceeds 30s on loaded 4-vCPU CI runners (layout-migration
+       finance acceptance leg); the budget only binds when a host is that
+       slow, so a genuinely hung daemon still costs at most one wait. */
+    if (wait_daemon_ready(env->port, FIXTURE_READY_WAIT_MS, env->daemon_pid) != 0) {
         fprintf(stderr,
             "wait_daemon_ready: timeout on port %d (last_step=%d errno=%d %s)\n",
             env->port, g_wait_last_step, g_wait_last_errno,
             strerror(g_wait_last_errno));
         /* Check whether daemon process is still alive — if it crashed,
-           waitpid(WNOHANG) returns >0; if alive, returns 0. */
+           fixture_waitpid(WNOHANG) returns >0; if alive, returns 0. */
         int wstatus = 0;
-        pid_t r = waitpid(pid, &wstatus, WNOHANG);
+        pid_t r = fixture_waitpid(pid, &wstatus, WNOHANG);
         int bind_conflict = 0;
         if (r == pid) {
+            env->daemon_pid = -1;
             fprintf(stderr, "daemon pid=%d exited before ready: status=0x%x\n",
                     (int)pid, wstatus);
             /* Decide the respawn from the daemon's own log, not the
@@ -397,12 +597,12 @@ respawn:;
                 bind_conflict = strstr(lbuf, "Address already in use") != NULL;
             }
         } else {
+            if (r < 0 && errno == ECHILD) env->daemon_pid = -1;
             fprintf(stderr, "daemon pid=%d still running but not responsive\n",
                     (int)pid);
         }
         dump_daemon_log(dlog);
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0);
+        (void)fixture_kill_reap(&env->daemon_pid);
         if (env->test_control_fd > 0) {
             close(env->test_control_fd);
             env->test_control_fd = -1;
@@ -420,6 +620,17 @@ respawn:;
                 goto respawn;
             }
         }
+        return -1;
+    }
+    if (fixture_deadline_expired()) {
+        (void)fixture_kill_reap(&env->daemon_pid);
+        if (env->test_control_fd > 0) {
+            close(env->test_control_fd);
+            env->test_control_fd = -1;
+        }
+        g_wait_last_step = 4;
+        g_wait_last_errno = ETIMEDOUT;
+        fprintf(stderr, "test_env_start_ex: startup work deadline expired after readiness\n");
         return -1;
     }
     return 0;
@@ -527,6 +738,19 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
         child_ctl_fd = sv[1];
     }
 
+    /* Absolute-deadline discipline: checked before the spawn (an expired
+       deadline never starts a daemon) and again after readiness. */
+    if (fixture_deadline_expired()) {
+        if (env->test_control_fd > 0) {
+            close(env->test_control_fd);
+            env->test_control_fd = -1;
+        }
+        if (child_ctl_fd >= 0) close(child_ctl_fd);
+        g_wait_last_step = 4;
+        g_wait_last_errno = ETIMEDOUT;
+        fprintf(stderr, "test_env_start_at: startup work deadline expired before spawn\n");
+        return -1;
+    }
     pid_t pid = fork();
     if (pid < 0) {
         if (env->test_control_fd > 0) {
@@ -554,16 +778,27 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
 
     /* Restarting an existing database runs shared crash-recovery evidence
        checks (marker/sidecar replay, clean-lifecycle verification) before
-       serving.  Sanitizer builds make that recovery path much slower;
-       allow the restart helper to wait for the daemon to become ready
-       without weakening the production startup path. */
-    if (wait_daemon_ready(env->port, 30000) != 0) {
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0);
+       serving.  Sanitizer builds make that recovery path much slower, and
+       a version-bump first start runs the whole-object layout migration;
+       both provably exceed 30s on loaded CI runners. The wait does not
+       weaken the production startup path. */
+    if (wait_daemon_ready(env->port, FIXTURE_READY_WAIT_MS, env->daemon_pid) != 0) {
+        (void)fixture_kill_reap(&env->daemon_pid);
         if (env->test_control_fd > 0) {
             close(env->test_control_fd);
             env->test_control_fd = -1;
         }
+        return -1;
+    }
+    if (fixture_deadline_expired()) {
+        (void)fixture_kill_reap(&env->daemon_pid);
+        if (env->test_control_fd > 0) {
+            close(env->test_control_fd);
+            env->test_control_fd = -1;
+        }
+        g_wait_last_step = 4;
+        g_wait_last_errno = ETIMEDOUT;
+        fprintf(stderr, "test_env_start_at: startup work deadline expired after readiness\n");
         return -1;
     }
     return 0;
@@ -571,9 +806,7 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
 
 void test_env_kill(TestEnv *env) {
     if (!env || env->daemon_pid <= 0) return;
-    kill(env->daemon_pid, SIGKILL);
-    waitpid(env->daemon_pid, NULL, 0);
-    env->daemon_pid = -1;
+    if (fixture_kill_reap(&env->daemon_pid) != 0 && env->daemon_pid > 0) return;
     if (env->test_control_fd > 0) {
         close(env->test_control_fd);
         env->test_control_fd = -1;
@@ -586,18 +819,19 @@ void test_env_kill(TestEnv *env) {
    before exit, but the data tree must survive the bench process. */
 void test_env_stop_keep(TestEnv *env) {
     if (!env || env->daemon_pid <= 0) return;
-    kill(env->daemon_pid, SIGTERM);
-    int reaped = 0;
-    for (int i = 0; i < 50; i++) {
-        if (waitpid(env->daemon_pid, NULL, WNOHANG) == env->daemon_pid) {
+    pid_t initial = fixture_waitpid(env->daemon_pid, NULL, WNOHANG);
+    int reaped = initial == env->daemon_pid || (initial < 0 && errno == ECHILD);
+    if (!reaped) kill(env->daemon_pid, SIGTERM);
+    for (int i = 0; !reaped && i < 50; i++) {
+        pid_t reaped_pid = fixture_waitpid(env->daemon_pid, NULL, WNOHANG);
+        if (reaped_pid == env->daemon_pid || (reaped_pid < 0 && errno == ECHILD)) {
             reaped = 1;
             break;
         }
         sleep_ms(100);
     }
     if (!reaped) {
-        kill(env->daemon_pid, SIGKILL);
-        waitpid(env->daemon_pid, NULL, 0);
+        if (fixture_kill_reap(&env->daemon_pid) != 0 && env->daemon_pid > 0) return;
     }
     env->daemon_pid = -1;
     if (env->test_control_fd > 0) {
@@ -609,19 +843,19 @@ void test_env_stop_keep(TestEnv *env) {
 
 void test_env_stop(TestEnv *env) {
     if (!env || env->daemon_pid <= 0) return;
-    kill(env->daemon_pid, SIGTERM);
-    /* Give it 5s to drain. */
-    int reaped = 0;
-    for (int i = 0; i < 50; i++) {
-        if (waitpid(env->daemon_pid, NULL, WNOHANG) == env->daemon_pid) {
+    pid_t initial = fixture_waitpid(env->daemon_pid, NULL, WNOHANG);
+    int reaped = initial == env->daemon_pid || (initial < 0 && errno == ECHILD);
+    if (!reaped) kill(env->daemon_pid, SIGTERM);
+    for (int i = 0; !reaped && i < 50; i++) {
+        pid_t reaped_pid = fixture_waitpid(env->daemon_pid, NULL, WNOHANG);
+        if (reaped_pid == env->daemon_pid || (reaped_pid < 0 && errno == ECHILD)) {
             reaped = 1;
             break;
         }
         sleep_ms(100);
     }
     if (!reaped) {
-        kill(env->daemon_pid, SIGKILL);
-        waitpid(env->daemon_pid, NULL, 0);
+        if (fixture_kill_reap(&env->daemon_pid) != 0 && env->daemon_pid > 0) return;
     }
     env->daemon_pid = -1;
     if (env->test_control_fd > 0) {
@@ -833,18 +1067,58 @@ int test_env_ctl_set_kf_seams(TestEnv *env, size_t initial, size_t max) {
     return 0;
 }
 
-int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
+static int ctl_set_globals(TestEnv *env, int phase, uint64_t a, uint64_t b) {
     if (!env || env->test_control_fd < 0) return -1;
-    /* phase 1 = TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL (test_control.c). */
     TestHookMessage msg = { .kind = TEST_HOOK_SET_GLOBALS,
-                            .phase = 1, .a = (uint64_t)(fail ? 1 : 0) };
+                            .phase = phase, .a = a, .b = b };
     if (test_hook_write_full(env->test_control_fd, &msg, sizeof(msg)) != 0)
         return -1;
     TestHookMessage rep = {0};
     if (test_hook_read_full(env->test_control_fd, &rep, sizeof(rep)) != 0)
         return -1;
-    if (rep.kind != TEST_HOOK_ACK) return -1;
+    return rep.kind == TEST_HOOK_ACK ? 0 : -1;
+}
+
+int test_env_ctl_set_bmfix_fault(TestEnv *env, int mode, int count) {
+    /* phase 2 = TEST_HOOK_SET_GLOBALS_BMFIX_FAULT (test_control.c). */
+    return ctl_set_globals(env, 2, (uint64_t)mode, (uint64_t)count);
+}
+
+int test_env_ctl_set_bmlock_log(TestEnv *env, int on) {
+    /* phase 3 = TEST_HOOK_SET_GLOBALS_BMLOCK_LOG (test_control.c). */
+    return ctl_set_globals(env, 3, (uint64_t)(on ? 1 : 0), 0);
+}
+
+int test_env_ctl_set_bmks_race(TestEnv *env, int stage) {
+    /* stage > 0 arms the one-shot barrier; 0 releases the gate + disarms.
+     * phase 4 = TEST_HOOK_SET_GLOBALS_BMKS_RACE (test_control.c). */
+    return ctl_set_globals(env, 4, (uint64_t)stage, 0);
+}
+
+int test_env_ctl_set_fail_phase(TestEnv *env, int phase, int occurrence,
+                                int sticky) {
+    /* phase 5 = TEST_HOOK_SET_GLOBALS_FAIL_PHASE, phase 6 =
+     * TEST_HOOK_SET_GLOBALS_FAIL_STICKY (test_control.c). phase -1
+     * disarms; the sticky bit is sent first when arming (so the armed
+     * phase already sees the right stickiness) and cleared after
+     * disarming. The daemon-side handler rounds phase through
+     * (int64_t), so -1 arrives as -1. */
+    if (phase >= 0 && sticky &&
+        ctl_set_globals(env, 6, 1, 0) != 0) return -1;
+    if (ctl_set_globals(env, 5, (uint64_t)(int64_t)phase,
+                        (uint64_t)occurrence) != 0) return -1;
+    if (phase < 0 && ctl_set_globals(env, 6, 0, 0) != 0) return -1;
     return 0;
+}
+
+int test_env_ctl_set_bmfix_backoff(TestEnv *env, long ms) {
+    /* phase 7 = TEST_HOOK_SET_GLOBALS_BMFIX_BACKOFF (test_control.c). */
+    return ctl_set_globals(env, 7, (uint64_t)(int64_t)ms, 0);
+}
+
+int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
+    /* phase 1 = TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL (test_control.c). */
+    return ctl_set_globals(env, 1, (uint64_t)(fail ? 1 : 0), 0);
 }
 
 int test_env_test_hook_wait(TestEnv *env, int *out_phase) {

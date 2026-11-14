@@ -140,8 +140,8 @@ static int test_agg_walk_fetch_check_run(void) {
         "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"wfc_t\","
         "\"criteria\":[{\"field\":\"age\",\"op\":\"gt\",\"value\":\"500\"}],"
         "\"aggregates\":[{\"fn\":\"min\",\"field\":\"age\"}]}", &resp);
-    ASSERT_TRUE(extract_field(resp, "min_age", buf, sizeof(buf)) && strcmp(buf, "0") == 0,
-                "empty result yields 0");
+    ASSERT_TRUE(resp && strstr(resp, "\"min_age\":null") != NULL,
+                "empty result yields null (Task 8)");
     free(resp); resp = NULL;
 
     /* Varchar agg field — falls through to agg_run_plan. min(name) on

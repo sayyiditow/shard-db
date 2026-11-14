@@ -22,6 +22,7 @@ Clients should match on the `error` string, not on the full message.
 | `query_timeout` | Query exceeded `TIMEOUT` (db.env) or per-request `timeout_ms`. | Add filters, add an index, raise the timeout. |
 | `query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor` | Query intermediate buffers crossed `QUERY_BUFFER_MB`. | Narrow `criteria`, add `limit`, or stream via `fetch` + cursor. |
 | `durability outcome pending; do not retry blindly` | The server durably published an indexed mutation marker but could not synchronously converge it. | Do not retry the mutation. The retained marker blocks later writes on that shard until synchronous replay or startup recovery completes. |
+| `object writes disabled: bitmap repair failed at startup; run reindex` | The object's bitmap repair failed at startup and the escape flag (`indexes/.bmfix-disabled`) is set: reads fall back to btree or scan, but every record mutation and every schema/maintenance mode (insert/update/delete/bulk-*, add-field, edit-field, rename-field, remove-field, add-index, remove-index, vacuum, truncate) is refused up front. | Run a full (non-composites-only) `reindex` — it repairs, clears the flag and re-enables writes. |
 
 ### Validation
 
@@ -34,6 +35,12 @@ Clients should match on the `error` string, not on the full message.
 | `fields array is empty` | Empty `fields` array in `create-object` or batch ops. | Provide at least one element. |
 | `invalid field type: "<spec>"` | Unknown type or malformed size. | Check spelling; see [Typed records](../concepts/typed-records.md). |
 | `invalid field name (no :, +, /, spaces)` | Reserved character in field name. | Use `[a-zA-Z0-9_-]`. |
+| `default for field '<f>' cannot be stored: <reason>` | Packed `add-field`: a literal / `seq` / `uuid()` / `random(N)` default is not representable in the field's declared type. | Fix the default or the field type. |
+| `random(N) requires 1 <= N <= 256` | `random(N)` outside 1..256 on a packed `add-field`. | Use `1 ≤ N ≤ 256`. |
+| `Sequence values do not fit field: <reason>` | The reserved `seq` range's last value overflows the field. The range stays consumed. | Use a wider type. |
+| `Pre-flight failed on field [<f>]: key '<k>': <reason>` | Packed `edit-field`: an existing row does not fit the new declaration (nothing changed). | Widen the declaration or fix the row. |
+| `compact refused: every field is tombstoned; …` | `vacuum compact` would leave no field. | Keep or re-add a field first. |
+| `Rebuild walk failed: field '<f>' key '<k>': <reason>` | Packed rebuild aborted mid-walk; original data restored. | Read the reason. |
 | `Invalid field name: <name>` | Same, from `remove-field`. | Fix the name. |
 | `max_key N exceeds ceiling 1024` | `create-object` with a too-large `max_key`. | Use ≤ 1024 (UUIDs fit in 36B). |
 | `too many fields (max 256)` | Schema exceeded `MAX_FIELDS`. | Consolidate or drop unused fields. |
@@ -42,7 +49,8 @@ Clients should match on the `error` string, not on the full message.
 
 | `error` | Cause | Recovery |
 |---|---|---|
-| `field '<name>' is not nullable` | A write would store NULL on a `:not_null` field: explicit JSON `null`, an omitted insert field with no default, or a malformed `uuid`/`ipv4`/`ipv6` sentinel. Whole-request error on single insert/update and criteria-form bulk update; per-record JSON bulk paths skip and count the record instead (the field name goes to the log). | Supply a real value; a `:default=` covers omission only, never an explicit null. |
+| `field '<name>' is not nullable` | A write would store NULL on a `:not_null` field: explicit JSON `null` or an omitted insert field with no default. Whole-request error on single insert/update and criteria-form bulk update; per-record JSON bulk paths skip and count the record instead (the field name goes to the log). | Supply a real value; a `:default=` covers omission only, never an explicit null. |
+| `value for field '<name>' is not a valid <type>: <detail>` | R4 strict scalar grammar: the input text is not in the type's accepted forms (bool spellings, calendar date, datetime/datetimems shape, `HH:MM:SS`, UUID, IPv4/IPv6, enum member). Fires on every write route and on query comparison literals (criteria carry the generic `invalid criteria value` wire error instead). Malformed `uuid`/`ipv4`/`ipv6` no longer downgrade to NULL/zero, and an empty string is an error for these types (not member 0 / midnight / nil). | Send one of the accepted forms (see [typed records](../concepts/typed-records.md)); send explicit `null` for NULL. |
 | `cannot add :not_null to field '<name>': N record(s) have NULL` | `edit-field` adding `:not_null` found N live records with that field NULL (legacy-generation records count when their next rewrite would make them NULL). | Backfill the NULLs (e.g. `bulk-update` the field), then re-run the edit. |
 | `cannot add :not_null to field '<name>': record scan failed (unreadable record?) — run vacuum-check/reindex first` | The gate's strict live-record scan failed (unreadable record, invalid live reference, or unopenable object) — fail-closed. | Run `vacuum-check` / `reindex`, repair the object, retry. |
 

@@ -13,7 +13,8 @@
  *   rank     (short)   = i mod 100            sum = 49500,   avg = 49.5,  min = 0,    max = 99
  *   level    (byte)    = i mod 256            sum = 124000,  min = 0,     max = 255
  *   balance  (numeric: 2dp) = i.00            sum = 500500,  min = 1.00,  max = 1000.00
- *   birthday (date)    = 20000101 + i (dummy) min/max only — quoted canonical strings
+ *   birthday (date)    = real calendar dates, 2020-01-01..2020-12-28
+ *                        (R4: valid dates only) min/max only — quoted canonical strings
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -71,12 +72,15 @@ static int test_agg_leaf_only_walk_run(void) {
     SB_APPEND(payload, len, cap,
         "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"agg_t\",\"records\":[");
     for (int i = 1; i <= 1000; i++) {
+        /* R4: birthday must be a real calendar date (months 01-12, days
+           01-28) or the strict converter drops every row. */
+        int bday = 20200000 + (1 + i % 12) * 100 + (1 + i % 28);
         SB_APPEND(payload, len, cap,
             "%s{\"key\":\"k%d\",\"value\":{"
             "\"age\":%d,\"user_id\":%d,\"rank\":%d,\"level\":%d,"
             "\"balance\":\"%d.00\",\"birthday\":%d}}",
             i == 1 ? "" : ",", i, i, i * 10, i % 100, i % 256,
-            i, 20000101 + i);
+            i, bday);
     }
     SB_APPEND(payload, len, cap, "]}");
     tc_request(tc, payload, &resp); free(resp); resp = NULL;
@@ -92,7 +96,7 @@ static int test_agg_leaf_only_walk_run(void) {
     tc_request(tc,
         "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"agg_t\","
         "\"aggregates\":[{\"fn\":\"avg\",\"field\":\"age\",\"alias\":\"a\"}]}", &resp);
-    ASSERT_TRUE(agg_value_eq(resp, "a", "500.5"), "avg age = 500.5");
+    ASSERT_TRUE(agg_value_eq(resp, "a", "500.5000000000000000"), "avg age = 500.5");
     free(resp); resp = NULL;
 
     tc_request(tc,
@@ -156,15 +160,15 @@ static int test_agg_leaf_only_walk_run(void) {
     tc_request(tc,
         "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"agg_t\","
         "\"aggregates\":[{\"fn\":\"min\",\"field\":\"birthday\",\"alias\":\"m\"}]}", &resp);
-    ASSERT_TRUE(SAFE_STRSTR(resp, "\"m\":\"20000102\"") != NULL,
-                "min birthday = \"20000102\" (quoted canonical string)");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"m\":\"20200101\"") != NULL,
+                "min birthday = \"20200101\" (quoted canonical string)");
     free(resp); resp = NULL;
 
     tc_request(tc,
         "{\"mode\":\"aggregate\",\"dir\":\"default\",\"object\":\"agg_t\","
         "\"aggregates\":[{\"fn\":\"max\",\"field\":\"birthday\",\"alias\":\"M\"}]}", &resp);
-    ASSERT_TRUE(SAFE_STRSTR(resp, "\"M\":\"20001101\"") != NULL,
-                "max birthday = \"20001101\" (quoted canonical string)");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"M\":\"20201228\"") != NULL,
+                "max birthday = \"20201228\" (quoted canonical string)");
     free(resp); resp = NULL;
 
     tc_close(tc);

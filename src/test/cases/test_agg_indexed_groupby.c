@@ -138,9 +138,9 @@ static int test_agg_indexed_groupby_run(void) {
     ASSERT_TRUE(extract_bucket_field(resp, "active", "false", "n", buf, sizeof(buf))
                 && strcmp(buf, "100") == 0, "active=false count=100");
     ASSERT_TRUE(extract_bucket_field(resp, "active", "true", "avg_b", buf, sizeof(buf))
-                && strcmp(buf, "1010") == 0, "avg balance true=1010");
+                && strcmp(buf, "1010.0000000000000000") == 0, "avg balance true=1010");
     ASSERT_TRUE(extract_bucket_field(resp, "active", "false", "avg_b", buf, sizeof(buf))
-                && strcmp(buf, "1000") == 0, "avg balance false=1000");
+                && strcmp(buf, "1000.0000000000000000") == 0, "avg balance false=1000");
     free(resp); resp = NULL;
 
     /* min(balance) + max(balance) on same indexed field — exercises the
@@ -154,13 +154,13 @@ static int test_agg_indexed_groupby_run(void) {
                         "{\"fn\":\"max\",\"field\":\"balance\",\"alias\":\"mx\"}]}",
         &resp);
     ASSERT_TRUE(extract_bucket_field(resp, "active", "false", "mn", buf, sizeof(buf))
-                && strcmp(buf, "10") == 0, "min balance false=10");
+                && strcmp(buf, "10.00") == 0, "min balance false=10");
     ASSERT_TRUE(extract_bucket_field(resp, "active", "false", "mx", buf, sizeof(buf))
-                && strcmp(buf, "1990") == 0, "max balance false=1990");
+                && strcmp(buf, "1990.00") == 0, "max balance false=1990");
     ASSERT_TRUE(extract_bucket_field(resp, "active", "true", "mn", buf, sizeof(buf))
-                && strcmp(buf, "20") == 0, "min balance true=20");
+                && strcmp(buf, "20.00") == 0, "min balance true=20");
     ASSERT_TRUE(extract_bucket_field(resp, "active", "true", "mx", buf, sizeof(buf))
-                && strcmp(buf, "2000") == 0, "max balance true=2000");
+                && strcmp(buf, "2000.00") == 0, "max balance true=2000");
     free(resp); resp = NULL;
 
     /* sum(balance) — verifies sum accumulator. true=101000, false=100000. */
@@ -170,9 +170,9 @@ static int test_agg_indexed_groupby_run(void) {
         "\"aggregates\":[{\"fn\":\"sum\",\"field\":\"balance\",\"alias\":\"s\"}]}",
         &resp);
     ASSERT_TRUE(extract_bucket_field(resp, "active", "true", "s", buf, sizeof(buf))
-                && strcmp(buf, "101000") == 0, "sum balance true=101000");
+                && strcmp(buf, "101000.00") == 0, "sum balance true=101000");
     ASSERT_TRUE(extract_bucket_field(resp, "active", "false", "s", buf, sizeof(buf))
-                && strcmp(buf, "100000") == 0, "sum balance false=100000");
+                && strcmp(buf, "100000.00") == 0, "sum balance false=100000");
     free(resp); resp = NULL;
 
     /* having: keep only buckets with n > 49 (all 4 age buckets pass). */

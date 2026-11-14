@@ -17,7 +17,10 @@ jobs:
   build-and-test:
     name: Build & test (${{ matrix.os }} ${{ matrix.arch }})
     runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 25
+    # 35m: the suite measured 25m+ on a loaded ubuntu-x86_64 runner with the
+    # slow-test exclusions already applied (the job was killed at exactly
+    # 25m on 2026-11-13); arm64 finishes in ~12m.
+    timeout-minutes: 35
     env:
       # test-runner-parallel's own nested run-all spawns a --jobs 4
       # sub-run internally, unrelated to the --jobs 2 outer setting below.
@@ -26,7 +29,11 @@ jobs:
       # Measured ARM64 cases that alone consume ~9 minutes serially. They
       # remain in the manual/scheduled full gate while their regressions are
       # investigated; the PR gate must finish within five minutes.
-      SHARD_TEST_EXCLUDE: "test-auto-reshard-throttle,test-auto-reshard,test-auto-vacuum,test-startup-refuses-unreadable-kf-maintenance,test-startup-refuses-unreadable-kf-count,test-rebuild-legacy-ambiguous-refuses-start,test-parallel-index-integrity,test-durability-corrupt-marker-policy,test-auto-reshard-shutdown-race,test-parallel-cross-pool-nesting,test-runner-parallel,test-topn-stream-count-no-criteria,test-varlen-pool-donation-stride"
+      # test-agg-packed-routes-extended: 370k-row fixture (36s on the dev
+      # workstation, >600s on these runners; its partition-merge section
+      # requires >=100k live rows so it cannot be shrunk). It stays in the
+      # local full-suite gate, which runs on every change.
+      SHARD_TEST_EXCLUDE: "test-auto-reshard-throttle,test-auto-reshard,test-auto-vacuum,test-startup-refuses-unreadable-kf-maintenance,test-startup-refuses-unreadable-kf-count,test-rebuild-legacy-ambiguous-refuses-start,test-parallel-index-integrity,test-durability-corrupt-marker-policy,test-auto-reshard-shutdown-race,test-parallel-cross-pool-nesting,test-runner-parallel,test-topn-stream-count-no-criteria,test-varlen-pool-donation-stride,test-agg-packed-routes-extended"
       # Shared runners under --jobs 2 contention push timing-sensitive
       # cases (e.g. test-request-timeout's many tiny per-request timeouts)
       # past the 180s default. The 25-minute job timeout still bounds
@@ -37,9 +44,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Loaded ubuntu-x86_64 runners cannot finish the five bitmap race
+          # fixtures: they seed tens of thousands of rows through 300-row
+          # wire chunks (1-3s per chunk under load), so a child needs
+          # 10-50 min against the 1200s per-case watchdog. They pass on the
+          # (fast) arm64 runner and in every local full-suite gate; the
+          # sanitizer and coverage jobs exclude them outright.
           - os: linux
             arch: x86_64
             runs-on: ubuntu-latest
+            extra_exclude: "test-bitmap-keyset-capacity-race,test-bitmap-candidate-floor,test-bitmap-capacity-fallback-shapes,test-bitmap-agg-topn-deadline,test-bitmap-candidate-budget"
           - os: linux
             arch: arm64
             # GitHub-hosted ARM64 runner; free for public repos.
@@ -71,6 +85,8 @@ jobs:
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
 
       - name: Run full C test suite
+        env:
+          SHARD_TEST_EXCLUDE_EXTRA: ${{ matrix.extra_exclude }}
         # 40+ cases / 1000+ assertions. Each case spawns its own daemon on
         # a free port at a unique tmpdir, so cases are CWD-independent and
         # parallel-safe within the runner. --jobs pinned explicitly:
@@ -83,7 +99,7 @@ jobs:
         # thread pools, and produced a contention-driven SIGSEGV in an
         # unrelated pre-existing test (trigram executor) that would not
         # reproduce locally even pinned to 2 vCPUs.
-        run: ./build/bin/shard-db-test run-all --exclude "$SHARD_TEST_EXCLUDE" --jobs 2
+        run: ./build/bin/shard-db-test run-all --exclude "$SHARD_TEST_EXCLUDE${SHARD_TEST_EXCLUDE_EXTRA:+,$SHARD_TEST_EXCLUDE_EXTRA}" --jobs 2
 
       - name: Package binary
         # Tag artifact uploads by os+arch so binaries from different

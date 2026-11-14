@@ -190,7 +190,8 @@ const char *json_skip_value(const char *p) {
 
 /* Extract multiple fields in a single pass. keys[i] -> out_values[i] (caller frees).
    Returns number of fields found. */
-int json_get_fields(const char *json, const char **keys, int nkeys, char **out_values) {
+static int json_get_fields_impl(const char *json, const char **keys, int nkeys,
+                                char **out_values, uint8_t *quoted) {
     for (int i = 0; i < nkeys; i++) out_values[i] = NULL;
 
     const char *p = json_skip(json);
@@ -223,9 +224,16 @@ int json_get_fields(const char *json, const char **keys, int nkeys, char **out_v
                 const char *vend = json_skip_value(p);
                 size_t vlen = vend - vstart;
                 char *out = malloc(vlen + 1);
+                if (!out) {
+                    for (int j = 0; j < nkeys; j++) {
+                        free(out_values[j]); out_values[j] = NULL;
+                    }
+                    return -1;
+                }
                 memcpy(out, vstart, vlen);
                 out[vlen] = '\0';
                 if (out[0] == '"' && vlen > 1 && out[vlen-1] == '"') {
+                    if (quoted) quoted[i] = 1;
                     memmove(out, out + 1, vlen - 2);
                     out[vlen - 2] = '\0';
                 }
@@ -240,24 +248,42 @@ int json_get_fields(const char *json, const char **keys, int nkeys, char **out_v
     return found;
 }
 
-int json_get_fields_unescaped(const char *json, const char **keys, int nkeys,
-                              const enum FieldType *field_types, char **out) {
-    json_get_fields(json, keys, nkeys, out);
+int json_get_fields(const char *json, const char **keys, int nkeys,
+                    char **out_values) {
+    return json_get_fields_impl(json, keys, nkeys, out_values, NULL);
+}
+
+static int json_get_typed_fields(const char *json, const char **keys, int nkeys,
+                                 const enum FieldType *field_types, char **out,
+                                 uint8_t *out_null) {
+    uint8_t quoted[MAX_FIELDS * 4] = {0};
+    if (nkeys < 0 || nkeys > MAX_FIELDS * 4) { errno = EINVAL; return -1; }
+    if (out_null) memset(out_null, 0, (size_t)nkeys);
+    if (json_get_fields_impl(json, keys, nkeys, out, quoted) < 0) return -1;
     int rc = 0;
     for (int i = 0; i < nkeys; i++) {
+        if (out_null) out_null[i] = 0;
         if (!out[i]) continue;
-        if (field_types[i] != FT_VARCHAR) continue;
-        char *unesc = NULL; size_t ulen = 0;
-        if (json_unescape_cstring(out[i], strlen(out[i]), &unesc, &ulen) != 0) {
-            free(out[i]);
-            out[i] = NULL;
-            rc = -1;
+        if (out_null && !quoted[i] &&
+            json_span_is_null(out[i], strlen(out[i]))) {
+            free(out[i]); out[i] = NULL; out_null[i] = 1;
             continue;
         }
-        free(out[i]);
-        out[i] = unesc;
+        if (!quoted[i] || !typed_json_string_type(field_types[i])) continue;
+        char *unesc = NULL;
+        size_t ulen = 0;
+        if (json_unescape_cstring(out[i], strlen(out[i]), &unesc, &ulen) != 0) {
+            free(out[i]); out[i] = NULL; rc = -1;
+            continue;
+        }
+        free(out[i]); out[i] = unesc;
     }
     return rc;
+}
+
+int json_get_fields_unescaped(const char *json, const char **keys, int nkeys,
+                              const enum FieldType *field_types, char **out) {
+    return json_get_typed_fields(json, keys, nkeys, field_types, out, NULL);
 }
 
 /* 1 iff the raw JSON value span is the unquoted literal null. Must be
@@ -267,37 +293,14 @@ int json_span_is_null(const char *v, size_t len) {
            v[3] == 'l';
 }
 
-/* json_get_fields + per-field null detection + varchar unescape.
+/* json_get_fields + per-field null detection + quoted eligible string decoding.
    out_null[i] = 1 ⇔ field i's raw span was unquoted null (out[i] is
    then NULL and no unescape is attempted for it). Same -1 contract as
    json_get_fields_unescaped for malformed escapes. */
 int json_get_fields_null_aware(const char *json, const char **keys, int nkeys,
                                const enum FieldType *field_types, char **out,
                                uint8_t *out_null) {
-    json_get_fields(json, keys, nkeys, out);
-    int rc = 0;
-    for (int i = 0; i < nkeys; i++) {
-        out_null[i] = 0;
-        if (!out[i]) continue;
-        if (json_span_is_null(out[i], strlen(out[i]))) {
-            /* Unquoted JSON null — report it, drop the span. */
-            free(out[i]);
-            out[i] = NULL;
-            out_null[i] = 1;
-            continue;
-        }
-        if (field_types[i] != FT_VARCHAR) continue;
-        char *unesc = NULL; size_t ulen = 0;
-        if (json_unescape_cstring(out[i], strlen(out[i]), &unesc, &ulen) != 0) {
-            free(out[i]);
-            out[i] = NULL;
-            rc = -1;
-            continue;
-        }
-        free(out[i]);
-        out[i] = unesc;
-    }
-    return rc;
+    return json_get_typed_fields(json, keys, nkeys, field_types, out, out_null);
 }
 
 /* ========== Base64 (RFC 4648) ========== */

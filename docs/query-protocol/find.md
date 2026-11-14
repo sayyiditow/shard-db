@@ -330,6 +330,44 @@ direction across all fields.
  "excludedKeys":"bot1,bot2,system"}
 ```
 
+## Bitmap-source errors and partial-result semantics
+
+When a query's plan reads bitmap index sources, those sources are prepared
+before the response starts: candidates and any requested bitmap-derived
+`total` are built first, so a bitmap read failure (a damaged or unreadable
+bitmap file — never a missing one; a shard that was never written is
+logically empty) yields one complete `{"error":"bitmap index unavailable"}`
+object before any response prefix. Candidate allocation that exceeds the
+request budget retains the existing `query memory buffer exceeded` error.
+Requests that previously qualified for small-limit streaming now prepare
+their candidate set first under the same budget, so a broad candidate set
+that does not fit produces that error before any bytes where the old path
+would have streamed; preparation trades bounded latency and memory for the
+pre-emission boundary, after which rows are still delivered one record at a
+time. The framing stays usable: the
+next request on the same connection is a normal response. Optional ordered/cursor
+prefilter probes keep their whole-record fallback (exact rows from a record
+scan instead of the prefilter); only required sources produce errors, and a
+requested total reads its bitmap sources before the envelope too, validating
+every candidate against the full criteria (a hard
+total error is an error response, not `"total":null`). This is a
+pre-emission boundary, not full output atomicity: record or serialization
+errors after rows have been emitted keep their existing behavior.
+
+Bitmap candidate collections prefer at least 8,192 actual hash slots when the
+remaining request budget permits; otherwise they try ordinary estimate-based
+sizing. Concurrent writes can still fill a collection between sizing and
+enumeration. Actual insertion overflow discards all partial candidates and
+recovers once through the original full-record criteria, preserving projection,
+exclusions, joins, pagination, formatting and the original absolute deadline.
+Ordered/cursor paths keep their ordered walk with full record filtering and
+disable bitmap candidate probes for the remainder of the request. This can
+require more scanning; it does not add snapshot isolation or lift memory limits.
+
+## Unordered indexed pages
+
+Unordered finds served from an index candidate set (OR unions, AND intersections, trigram matches, prepared bitmap candidates, and a single indexed leaf when the request has a `join`, `format:"rows"`, or `offset + limit` above 1,000) fetch candidate records in batches of up to 1,024 in candidate order. Each batch is filtered (remaining criteria, `excludedKeys`, inner joins) and paginated before the next is fetched, and fetching stops once `offset + limit` rows have qualified — so a page whose rows are found early reads only the batches it needs, while rare survivors or a large `offset` can still read every candidate. The index walk that collects candidates is unchanged. One batch of record copies counts against `QUERY_BUFFER_MB`; a batch that does not fit is retried at half size, and a single record larger than the budget fails the query — raise `QUERY_BUFFER_MB` (and the server's memory) if records that large must be returned. Page membership and order are unchanged on quiescent data. Allocation failures (batch setup, record copies, an error the fetch call returns), a missing storage handle and join failures fail the query instead of returning a shorter page, and, like other record errors after the response has started, leave the response unterminated. Records the storage layer itself cannot read during the fetch (for example a keyfile or segment that cannot be opened) — or whose lookup buffers cannot be allocated — are still skipped, as before.
+
 ## Indexed vs full-scan
 
 The planner picks an index automatically. Rules of thumb:

@@ -167,11 +167,11 @@ static int test_enum_run(void) {
     ASSERT_CONTAINS(resp, "\"r3\"", "find in [green,blue]: r3 present");
     free(resp); resp = NULL;
 
-    /* === Unknown value handling on QUERY criteria: encode emits a
-       sentinel; the bitmap lookup misses cleanly. count returns 0. */
+    /* === Unknown value on QUERY criteria: R4/D4 rejects the literal at
+       compile time with the generic criteria error (parity with writes). */
     tc_request(tc, "{\"mode\":\"count\",\"dir\":\"e\",\"object\":\"a\","
         "\"criteria\":[{\"field\":\"color\",\"op\":\"eq\",\"value\":\"purple\"}]}", &resp);
-    ASSERT_CONTAINS(resp, "0", "count unknown value=purple → 0");
+    ASSERT_CONTAINS(resp, "\"error\"", "count unknown value=purple → error (D4)");
     free(resp); resp = NULL;
 
     /* === Strict insert-time rejection of unknown enum values === */
@@ -181,8 +181,8 @@ static int test_enum_run(void) {
         "{\"mode\":\"insert\",\"dir\":\"e\",\"object\":\"a\",\"key\":\"bad1\","
         "\"value\":{\"color\":\"purple\",\"name\":\"X\"}}", &resp);
     ASSERT_CONTAINS(resp, "\"error\"",         "single insert unknown: error");
-    ASSERT_CONTAINS(resp, "unknown enum value", "single insert unknown: actionable message");
-    ASSERT_CONTAINS(resp, "legal:",            "single insert unknown: legal list");
+    ASSERT_CONTAINS(resp, "not a valid enum",   "single insert unknown: grammar message (R4 unified)");
+    ASSERT_CONTAINS(resp, "unknown enum member", "single insert unknown: reason");
     free(resp); resp = NULL;
 
     /* Bulk insert with mixed valid + invalid: valid ones go in, invalid

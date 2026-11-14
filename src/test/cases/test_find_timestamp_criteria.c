@@ -190,6 +190,68 @@ static int test_find_timestamp_criteria_run(void) {
     ASSERT_CONTAINS(resp, "\"r5\"", "in includes r5");
     free(resp); resp = NULL;
 
+    /* === Case 8 (2026-10-31, R3 review): non-canonical integer literals on
+       the indexed pre-filter. decode_idx_to_buf gained an FT_TIMESTAMP case
+       in R3, so idx_candidate_admits now string-compares the decoded
+       "%lld" key text against the raw literal (eq/neq) instead of always
+       deferring to the record check. Literals that strtoll normalizes
+       identically (leading zeros, explicit '+') must survive the
+       pre-filter: the compiled typed predicate accepts them, so a
+       candidate dropped here would silently lose rows. */
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"events\","
+        "\"criteria\":[{\"field\":\"time\",\"op\":\"eq\",\"value\":\"001254980454000\"}],"
+        "\"limit\":10}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "find time eq leading-zero response");
+    ASSERT_TRUE(count_substr(resp, "\"key\"") == 1,
+        "time eq with a leading-zero literal returns exactly 1 record");
+    ASSERT_CONTAINS(resp, "\"r2\"", "leading-zero eq match returned r2");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"events\","
+        "\"criteria\":[{\"field\":\"time\",\"op\":\"eq\",\"value\":\"+1254980454000\"}],"
+        "\"limit\":10}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "find time eq plus-prefixed response");
+    ASSERT_TRUE(count_substr(resp, "\"key\"") == 1,
+        "time eq with a '+'-prefixed literal returns exactly 1 record");
+    ASSERT_CONTAINS(resp, "\"r2\"", "plus-prefixed eq match returned r2");
+    free(resp); resp = NULL;
+
+    /* === Case 9 (2026-10-31, R3 review): range at the domain ceiling.
+       Epoch-ms values top out ~2.5e14 (year 9999) — below 2^53, so the
+       pre-filter's atof range path stays exact; pin that with values near
+       the ceiling. (Values above 2^53 are a long-field concern; the long
+       decode path and its atof pre-filter predate R3 and are unchanged.) */
+    snprintf(req, sizeof(req),
+        "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"events\","
+        "\"key\":\"r6\",\"value\":{\"id\":\"r6\",\"time\":253402300799999,\"story_root\":7}}");
+    tc_request(tc, req, &resp);
+    ASSERT_CONTAINS(resp, "\"status\":\"inserted\"", "ceiling row inserted");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"events\","
+        "\"criteria\":[{\"field\":\"time\",\"op\":\"gte\",\"value\":\"2000000000000\"}],"
+        "\"limit\":10}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "find time gte ceiling response");
+    ASSERT_TRUE(count_substr(resp, "\"key\"") == 1,
+        "time gte at 2e12 returns only r6 (r5 is 1.9e12, below)");
+    free(resp); resp = NULL;
+
+    tc_request(tc,
+        "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"events\","
+        "\"criteria\":[{\"field\":\"time\",\"op\":\"between\","
+        "\"value\":\"253402300799998\",\"value2\":\"253402300799999\"}]}",
+        &resp);
+    ASSERT_NOT_NULL(resp, "count time ceiling between response");
+    ASSERT_TRUE(resp[0] == '1',
+        "count between ceiling values returns 1");
+    free(resp); resp = NULL;
+
     tc_close(tc);
     test_env_stop(&env);
     return 0;

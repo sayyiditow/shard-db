@@ -51,6 +51,13 @@ clang $CFLAGS $INC -o "$OUT/fuzz_b64" \
 #       by the fuzzer.
 #   type_desc.c — added 2026.07: query_schema.c and query_aggregate.c
 #       call type_desc() for the field-type descriptor table.
+#   typed_row.c, typed_index.c, typed_read_command.c, typed_bulk_insert.c,
+#       packed_record.c, decnum.c, agg_exact.c, scalar_grammar.c,
+#       schema_wire.c — added 2026.11: the typed/packed record layer
+#       (exact typed records, packed layout) is now referenced from
+#       query.c, query_find.c, query_bulk.c, config.c, storage.c and
+#       index.c call sites, so the fuzz link resolves those symbols the
+#       same way — linked for symbol resolution, never entered.
 # server.c, tls.c are NOT linked: the parser never reaches them and
 # tls.c requires OpenSSL. Instead, fuzz/stubs.c provides zero-valued
 # stub definitions for the two globals they export (g_db,
@@ -72,6 +79,10 @@ clang $CFLAGS $INC -o "$OUT/fuzz_criteria" \
     src/db/io_direct.c \
     src/db/bitmap.c src/db/trigram.c \
     src/db/durability.c src/db/durability_epoch.c \
+    src/db/typed_row.c src/db/typed_index.c src/db/typed_read_command.c \
+    src/db/typed_bulk_insert.c src/db/packed_record.c src/db/decnum.c \
+    src/db/agg_exact.c src/db/scalar_grammar.c src/db/schema_wire.c \
+    src/db/decimal_order.c src/db/packed_csv_command.c \
     -lpthread -latomic
 
 echo

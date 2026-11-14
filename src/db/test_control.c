@@ -37,15 +37,24 @@ enum {
 
 /* INSTALL message phase selects which daemon-side hook to arm.
    0 = legacy slotcask after-old hook; 1 = count-worker pass-1 gap;
-   2 = find-flush gate (batch-fetch park). */
+   2 = find-flush gate (batch-fetch park); 3 = guard check;
+   4 = count-worker gap after the probe reader is released. Both count
+   gaps report REACHED phase 2. */
 #define TEST_HOOK_KIND_AFTER_OLD 0
 #define TEST_HOOK_KIND_COUNT_GAP 1
 #define TEST_HOOK_KIND_FIND_FLUSH_GATE 2
 #define TEST_HOOK_KIND_GUARD_CHECK 3
+#define TEST_HOOK_KIND_COUNT_GAP_LATE 4
 /* TEST_HOOK_SET_GLOBALS phase selectors (runner-side wrappers in
    fixtures.c duplicate these by convention). */
 #define TEST_HOOK_SET_GLOBALS_KF_SEAMS 0
 #define TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL 1
+#define TEST_HOOK_SET_GLOBALS_BMFIX_FAULT 2
+#define TEST_HOOK_SET_GLOBALS_BMLOCK_LOG 3
+#define TEST_HOOK_SET_GLOBALS_BMKS_RACE 4
+#define TEST_HOOK_SET_GLOBALS_FAIL_PHASE 5
+#define TEST_HOOK_SET_GLOBALS_FAIL_STICKY 6
+#define TEST_HOOK_SET_GLOBALS_BMFIX_BACKOFF 7
 
 typedef struct {
     uint32_t kind;   /* INSTALL..REACHED; SET_GLOBALS=6 */
@@ -227,8 +236,11 @@ static void *test_control_thread_main(void *arg) {
 
         switch (msg.kind) {
         case TEST_HOOK_INSTALL:
-            if (msg.phase == TEST_HOOK_KIND_COUNT_GAP) {
-                atomic_store(&g_shard_test_count_gap, 1);
+            if (msg.phase == TEST_HOOK_KIND_COUNT_GAP ||
+                msg.phase == TEST_HOOK_KIND_COUNT_GAP_LATE) {
+                /* the armed value is the park site (1 or 2) */
+                atomic_store(&g_shard_test_count_gap,
+                             msg.phase == TEST_HOOK_KIND_COUNT_GAP ? 1 : 2);
                 atomic_store(&g_shard_test_count_gap_hit, 0);
                 shard_db_test_set_count_gap_hook(test_control_count_gap_block,
                                                  c);
@@ -252,6 +264,46 @@ static void *test_control_thread_main(void *arg) {
         case TEST_HOOK_SET_GLOBALS:
             if (msg.phase == TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL) {
                 atomic_store(&g_shard_test_json_escape_fail, (int)msg.a);
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_BMFIX_FAULT) {
+                atomic_store(&g_shard_test_bmfix_fault_count, 0);
+                atomic_store(&g_shard_test_bmfix_fault_mode, (int)msg.a);
+                atomic_store(&g_shard_test_bmfix_fault_count, (int)msg.b);
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_BMLOCK_LOG) {
+                atomic_store(&g_shard_test_bmlock_log, (int)msg.a);
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_BMKS_RACE) {
+                if (msg.a) {
+                    atomic_store(&g_shard_test_bmks_gate, 0);
+                    atomic_store(&g_shard_test_bmks_stage, (int)msg.a);
+                } else {
+                    atomic_store(&g_shard_test_bmks_stage, 0);
+                    atomic_store(&g_shard_test_bmks_gate, 1);
+                }
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_FAIL_PHASE) {
+                /* a = window-coordinator fail phase ((long)(int64_t)a so
+                   -1 round-trips through the uint64 field), b = 1-based
+                   occurrence. Arm order matters: zero the per-phase
+                   counters first (occurrence is counted from the arm,
+                   matching the workers' __atomic_add_fetch), then
+                   occurrence, then phase — a worker that sees the armed
+                   phase must already see the occurrence. Disarm stores
+                   phase first so workers stop failing before anything
+                   else moves. */
+                long fail_phase = (long)(int64_t)msg.a;
+                if (fail_phase >= 0) {
+                    for (int i = 0; i < SHARD_TEST_PHASE_COUNT; i++)
+                        __atomic_store_n(&g_shard_test_sync_counts[i], 0,
+                                         __ATOMIC_RELAXED);
+                    atomic_store(&g_shard_test_fail_occurrence, (long)msg.b);
+                    atomic_store(&g_shard_test_fail_phase, fail_phase);
+                } else {
+                    atomic_store(&g_shard_test_fail_phase, fail_phase);
+                }
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_FAIL_STICKY) {
+                atomic_store(&g_shard_test_fail_sticky, msg.a ? 1 : 0);
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_BMFIX_BACKOFF) {
+                /* a = interval in ms ((int64_t) round-trip); <= 0 means the
+                   production default. */
+                atomic_store(&g_shard_test_bmfix_backoff_ms, (long)(int64_t)msg.a);
             } else {
                 atomic_store(&g_shard_test_kf_initial_slots, (size_t)msg.a);
                 atomic_store(&g_shard_test_kf_max_slots, (size_t)msg.b);

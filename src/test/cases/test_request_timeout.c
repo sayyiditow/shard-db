@@ -29,7 +29,7 @@ static int test_request_timeout_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"rt_big\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"rt_big\","
         "\"splits\":16,\"max_key\":16,"
         "\"fields\":[\"status:varchar:16\",\"amount:int\",\"note:varchar:40\"]}",
         &resp); free(resp); resp = NULL;
