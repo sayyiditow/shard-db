@@ -143,7 +143,14 @@
 
 /* ───────────────────────── child runner + stages ───────────────────────── */
 
+/* macOS CI runners run these fixtures several times slower than Linux (the
+   floor-overflow child hit the old 30 s bound just as it finished, 2026-11-15);
+   the bound only needs to catch genuine hangs. */
+#if defined(__APPLE__)
+#define BMF_UNIT_CHILD_TIMEOUT_MS 120000
+#else
 #define BMF_UNIT_CHILD_TIMEOUT_MS 30000
+#endif
 #define BMF_POLL_SLICE_MS         50
 /* 600s: the 105k-row race fixtures provably exceed 150s on loaded
    4-vCPU CI runners (2026-11-13 x86_64 leg killed 6 children at the
