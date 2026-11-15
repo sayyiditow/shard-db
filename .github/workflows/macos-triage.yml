@@ -4,18 +4,11 @@ name: macOS race-fixture triage
 # ci.yml die with SIGBUS on Darwin while passing on Linux. This workflow runs
 # them one at a time under a symbolized (-O0 -g) build and surfaces the macOS
 # crash reports, so the exclusion can be root-caused and then removed.
-# Root cause found 2026-11-15: 512 KB macOS thread stacks in the test writers
-# (fixed with db_thread_create); this run verifies the six cases now pass.
-# Delete this file (and the macOS entry of extra_exclude in ci.yml) once the
-# fixtures pass on macOS.
+# Root cause (2026-11-15): 512 KB macOS thread stacks in the test writers,
+# fixed with db_thread_create; all six cases now pass on macOS and run in
+# ci.yml. Kept as a manual tool for any future Darwin-only crash.
 
 on:
-  # TEMPORARY: workflow_dispatch workflows are only dispatchable from the
-  # default branch, so run on a push to a PR that touches this file. Remove
-  # this pull_request block once the SIGBUS is root-caused (keep dispatch).
-  pull_request:
-    paths:
-      - ".github/workflows/macos-triage.yml"
   workflow_dispatch:
     inputs:
       cases:

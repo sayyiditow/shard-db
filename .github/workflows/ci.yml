@@ -62,16 +62,10 @@ jobs:
           - os: macos
             arch: arm64
             # GitHub-hosted macOS runner; Apple silicon on macos-latest.
-            # macOS (3 vCPU, Apple libc) needs the same race-fixture
-            # exclusions as x86_64, plus or-hard-precedence: on 2026-11-14
-            # every bmf fixture child died with SIGBUS on Darwin (first
-            # exposure — these test files are new on this branch and had
-            # never run on macOS). Root cause: run the manual
-            # macos-triage workflow (.github/workflows/macos-triage.yml); the
-            # same fixtures pass on arm64 Linux (11m full suite) and
-            # x86_64, so the exclusion is macOS-only and temporary.
+            # No extra exclusions: the bitmap race fixtures that used to die
+            # with SIGBUS here were overflowing macOS's 512 KB secondary-thread
+            # stack in the test writers (fixed with db_thread_create, 8 MB).
             runs-on: macos-latest
-            extra_exclude: "test-bitmap-keyset-capacity-race,test-bitmap-candidate-floor,test-bitmap-capacity-fallback-shapes,test-bitmap-agg-topn-deadline,test-bitmap-candidate-budget,test-bitmap-or-hard-precedence"
     steps:
       # Pin actions by full commit SHA (Scorecard "Pinned-Dependencies"):
       # tags are mutable, SHAs are not. # vX.Y.Z comment kept so Dependabot
