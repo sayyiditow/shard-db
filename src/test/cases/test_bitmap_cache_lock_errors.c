@@ -1818,7 +1818,7 @@ static int bcl_v_parser_selfcheck_child(void) {
 #define BCL_V_FIELDS   40
 #define BCL_V_ROWS     400
 #define BCL_V_SPLITS   8
-#define BCL_V_IO_MS    (BCL_SAN_WIDE ? 30000 : 3000)
+#define BCL_V_IO_MS    (BCL_SAN_WIDE ? 30000 : 15000)  /* 3000 flaked on loaded x86_64 CI: a 100-row bulk-insert into 40 bitmap indexes missed it (setup exit 8) */
 
 static TestEnv bcl_v_env;
 static TestClient *bcl_v_tc;

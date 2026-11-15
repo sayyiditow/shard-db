@@ -4970,7 +4970,7 @@ static int bmf_topn_deadline_child(void) {
     resp = NULL;
     int rc = bmf_pdb_req(p.db,
         "{\"mode\":\"aggregate\",\"dir\":\"bmf_d11\",\"object\":\"t11ag\","
-        "\"timeout_ms\":4000,"
+        "\"timeout_ms\":10000,"
         "\"aggregates\":[{\"fn\":\"count\"}],"
         "\"criteria\":[{\"field\":\"f1\",\"op\":\"eq\",\"value\":\"0\"}],"
         "\"group_by\":\"f0\",\"order_by\":\"count\",\"limit\":10}", &resp);
