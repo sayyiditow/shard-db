@@ -4,6 +4,8 @@ name: macOS race-fixture triage
 # ci.yml die with SIGBUS on Darwin while passing on Linux. This workflow runs
 # them one at a time under a symbolized (-O0 -g) build and surfaces the macOS
 # crash reports, so the exclusion can be root-caused and then removed.
+# Root cause found 2026-11-15: 512 KB macOS thread stacks in the test writers
+# (fixed with db_thread_create); this run verifies the six cases now pass.
 # Delete this file (and the macOS entry of extra_exclude in ci.yml) once the
 # fixtures pass on macOS.
 
