@@ -904,6 +904,28 @@ int tu_run_cmd(const char *fmt, ...) {
     return system(cmd);
 }
 
+void tu_dump_hung_process(pid_t pid, int whole_group) {
+    /* Hang diagnostics: per-thread name/wchan/syscall (Linux /proc) and, when
+       gdb is installed, full backtraces of every thread. Best effort; all
+       output goes to stderr and failures are ignored. */
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "exec 1>&2; "
+             "pids=$(%s %ld 2>/dev/null); "
+             "for p in $pids; do "
+             "echo \"# HANG-DUMP pid $p: $(cat /proc/$p/cmdline 2>/dev/null | tr '\\0' ' ')\"; "
+             "for t in /proc/$p/task/*; do "
+             "[ -d \"$t\" ] && echo \"#   tid ${t##*/} $(cat $t/comm 2>/dev/null)"
+             " wchan=$(cat $t/wchan 2>/dev/null) syscall=$(cat $t/syscall 2>/dev/null)\"; "
+             "done; "
+             "if [ -d /proc ] && command -v gdb >/dev/null 2>&1 && "
+             "[ \"$(cat /proc/$p/comm 2>/dev/null)\" = shard-db ]; then "
+             "timeout 60 gdb -p $p -batch -ex 'thread apply all bt' 2>&1 | tail -n 400; fi; "
+             "done",
+             whole_group ? "pgrep -g" : "echo", (long)pid);
+    (void)system(cmd);
+}
+
 char *tu_capture_cmd(const char *fmt, ...) {
     char cmd[4096];
     va_list ap;

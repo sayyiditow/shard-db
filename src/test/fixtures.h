@@ -128,6 +128,9 @@ void test_env_stop_keep(TestEnv *env);
 int   tu_appendf(char *buf, size_t cap, size_t *len, const char *fmt, ...)
     __attribute__((format(printf, 4, 5)));
 int   tu_run_cmd(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* Best-effort hang diagnostics (thread wchan/syscall, gdb bt) for pid, or every
+   process in group pid when whole_group != 0. Writes to stderr. */
+void  tu_dump_hung_process(pid_t pid, int whole_group);
 char *tu_capture_cmd(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 char *tu_read_file(const char *path);
 int   tu_file_exists(const char *path);

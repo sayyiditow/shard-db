@@ -1550,6 +1550,7 @@ static int test_bmfix_test_knobs_independent(void) {
            why. */
         TAP_DIAG("# B2 reindex response after %ld ms: %s\n", b2_ms,
                  r ? r : "(null: request failed or timed out)");
+        if (!r) tu_dump_hung_process(b->env.daemon_pid, 0);
         tu_run_cmd("echo '# B2 daemon-restart.log tail:'; tail -n 25 \"$(dirname '%s')/daemon-restart.log\" 2>&1; "
                    "echo '# B2 serving log tail:'; tail -q -n 25 \"$(dirname '%s')\"/logs/*.log 2>&1",
                    root, root);

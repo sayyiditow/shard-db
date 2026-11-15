@@ -289,6 +289,8 @@ static void watchdog_abort(ProcessSlot *slots, int nslots, const ProcessSlot *st
     fprintf(stderr,
             "\n# WATCHDOG: test '%s' exceeded %lds — aborting run-all\n",
             stuck->tc->name, limit_ms / 1000L);
+    for (int i = 0; i < nslots; i++)
+        if (slots[i].pid > 0) tu_dump_hung_process(slots[i].pid, 1);
     for (int i = 0; i < nslots; i++) {
         if (slots[i].pid > 0) {
             /* Workers lead their own process groups, so this reaps a
