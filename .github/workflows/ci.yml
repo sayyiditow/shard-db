@@ -81,6 +81,10 @@ jobs:
           brew --prefix openssl@3
           uname -a
 
+      - name: Install gdb (hang diagnostics)
+        if: matrix.os == 'linux'
+        run: sudo apt-get install -y --no-install-recommends gdb
+
       - name: Build
         # build.sh produces shard-db, shard-cli, shard-db-test, and
         # shard-db-bench under build/bin/. Test runner ships as a single

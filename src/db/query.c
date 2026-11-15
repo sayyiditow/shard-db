@@ -7395,8 +7395,8 @@ size_t idx_count_for_leaf_ck(const char *db_root, const char *object,
                     if (!dl->timed_out) return SIZE_MAX;
                     return 0;   /* timeout: caller renders it */
                 }
-                if (out->reason == CBF_INSERT_CAPACITY)
-                    BMKS_STAT_FALLBACK("count");
+                /* Both reasons recover through the full scan; log either. */
+                BMKS_STAT_FALLBACK("count");
                 cb_out_init(out);
                 free_compiled_criteria(cc, 1);
                 return full;

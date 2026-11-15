@@ -920,7 +920,8 @@ void tu_dump_hung_process(pid_t pid, int whole_group) {
              "done; "
              "if [ -d /proc ] && command -v gdb >/dev/null 2>&1 && "
              "[ \"$(cat /proc/$p/comm 2>/dev/null)\" = shard-db ]; then "
-             "timeout 60 gdb -p $p -batch -ex 'thread apply all bt' 2>&1 | tail -n 400; fi; "
+             "S=; sudo -n true 2>/dev/null && S='sudo -n'; "
+             "timeout 60 $S gdb -p $p -batch -ex 'thread apply all bt' 2>&1 | tail -n 400; fi; "
              "done",
              whole_group ? "pgrep -g" : "echo", (long)pid);
     (void)system(cmd);
