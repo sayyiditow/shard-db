@@ -1542,6 +1542,8 @@ static int test_bmfix_test_knobs_independent(void) {
     r = br_q(b, "{\"mode\":\"reindex\",\"dir\":\"br\",\"object\":\"t\"}");
     ASSERT_TRUE(r && strstr(r, "\"status\":\"reindexed\"") != NULL,
                 "reindex ignores the repair knob");                            /* B2 */
+    if (!(r && strstr(r, "\"status\":\"reindexed\"")))
+        TAP_DIAG("# B2 reindex response: %s\n", r ? r : "(null: request failed or timed out)");
     free(r);
     tc_close(b->tc);
     b->tc = NULL;
