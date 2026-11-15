@@ -8,6 +8,12 @@ name: macOS race-fixture triage
 # fixtures pass on macOS.
 
 on:
+  # TEMPORARY: workflow_dispatch workflows are only dispatchable from the
+  # default branch, so run on a push to a PR that touches this file. Remove
+  # this pull_request block once the SIGBUS is root-caused (keep dispatch).
+  pull_request:
+    paths:
+      - ".github/workflows/macos-triage.yml"
   workflow_dispatch:
     inputs:
       cases:
@@ -31,7 +37,7 @@ jobs:
 
       - name: Run each case, print crash reports
         env:
-          CASES: ${{ inputs.cases }}
+          CASES: ${{ inputs.cases || 'test-bitmap-keyset-capacity-race,test-bitmap-candidate-floor,test-bitmap-capacity-fallback-shapes,test-bitmap-agg-topn-deadline,test-bitmap-candidate-budget,test-bitmap-or-hard-precedence' }}
           SHARD_TEST_WATCHDOG_SEC: "300"
         run: |
           DDIR="$HOME/Library/Logs/DiagnosticReports"
