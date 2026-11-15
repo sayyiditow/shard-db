@@ -1623,7 +1623,7 @@ static int bmf_holder_start(BmfHolder *h, const char *path) {
     h->path = path;
     atomic_init(&h->release, 0);
     atomic_init(&h->holding, 0);
-    if (pthread_create(&h->tid, NULL, bmf_holder_main, h) != 0) return -1;
+    if (db_thread_create(&h->tid, bmf_holder_main, h) != 0) return -1;
     for (int i = 0; i < 5000 && atomic_load(&h->holding) == 0; i++)
         bmf_sleep_ms(2);
     return atomic_load(&h->holding) == 1 ? 0 : -1;
@@ -1758,7 +1758,7 @@ static int bmf_stale_writer_child(void) {
     memset(&w, 0, sizeof(w));
     w.path = target;
     atomic_init(&w.done, 0);
-    BMF_CHECK(pthread_create(&w.tid, NULL, bmf_stale_writer_main, &w) == 0, 6,
+    BMF_CHECK(db_thread_create(&w.tid, bmf_stale_writer_main, &w) == 0, 6,
               "writer thread start");
     for (int i = 0; i < 5000 &&
          bm_test_lock_entered(BM_TEST_LOCK_HIT_WR) <= baseline; i++)
@@ -3148,7 +3148,7 @@ static int bmf_race_scenario(BmfPdb *p, int stage, const char *count_criteria,
     w.past_cap = 1;
     atomic_init(&w.done, 0);
     atomic_init(&w.abort, 0);
-    BMF_CHECK(pthread_create(&w.tid, NULL, bmf_race_writer_main, &w) == 0,
+    BMF_CHECK(db_thread_create(&w.tid, bmf_race_writer_main, &w) == 0,
               scenario_code + 1, "writer thread start");
 
     *out_err = bmf_pdb_count(p, count_criteria, out_count);
@@ -3228,7 +3228,7 @@ static int bmf_race_child(void) {
         w.past_cap = 1;
         atomic_init(&w.done, 0);
     atomic_init(&w.abort, 0);
-        BMF_CHECK(pthread_create(&w.tid, NULL, bmf_race_writer_main, &w) == 0,
+        BMF_CHECK(db_thread_create(&w.tid, bmf_race_writer_main, &w) == 0,
                   41, "writer thread start");
         /* The builder parks at the barrier between sizing and enumeration;
            the writer fills past the complement's capacity and opens the
@@ -3375,7 +3375,7 @@ static int bmf_budget_unit_child(void) {
     pthread_t tids[8];
     for (int i = 0; i < 8; i++) {
         rs[i] = (BmfBudgetRacer){ .budget = &race, .hint = 1000, .over = &over };
-        BMF_CHECK(pthread_create(&tids[i], NULL, bmf_budget_racer_main, &rs[i]) == 0,
+        BMF_CHECK(db_thread_create(&tids[i], bmf_budget_racer_main, &rs[i]) == 0,
                   19, "racer start");
     }
     int ok = 0;
@@ -3622,7 +3622,7 @@ static int bmf_floor_race_child(void) {
     w.to = 100000 + burst;
     atomic_init(&w.done, 0);
     atomic_init(&w.abort, 0);
-    BMF_CHECK(pthread_create(&w.tid, NULL, bmf_race_writer_main, &w) == 0, 31,
+    BMF_CHECK(db_thread_create(&w.tid, bmf_race_writer_main, &w) == 0, 31,
               "writer thread start");
 
     long long got = -1;
@@ -3725,7 +3725,7 @@ static int bmf_floor_overflow_child(void) {
     w.to = 200000 + 12000;
     atomic_init(&w.done, 0);
     atomic_init(&w.abort, 0);
-    BMF_CHECK(pthread_create(&w.tid, NULL, bmf_race_writer_main, &w) == 0, 11,
+    BMF_CHECK(db_thread_create(&w.tid, bmf_race_writer_main, &w) == 0, 11,
               "writer thread start");
     long long got = -1;
     int err = bmf_pdb_count(&p,
@@ -3796,7 +3796,7 @@ static int bmf_floor_overflow_child(void) {
     w.past_cap = 1;   /* freeze a burst larger than the observed allocation */
     atomic_init(&w.done, 0);
     atomic_init(&w.abort, 0);
-    BMF_CHECK(pthread_create(&w.tid, NULL, bmf_race_writer_main, &w) == 0, 27,
+    BMF_CHECK(db_thread_create(&w.tid, bmf_race_writer_main, &w) == 0, 27,
               "generic writer start");
     got = -1;
     err = bmf_pdb_count(&p,
@@ -3836,7 +3836,7 @@ static int bmf_floor_overflow_child(void) {
     w.past_cap = 1;   /* complement must exceed its observed allocation */
     atomic_init(&w.done, 0);
     atomic_init(&w.abort, 0);
-    BMF_CHECK(pthread_create(&w.tid, NULL, bmf_race_writer_main, &w) == 0, 34,
+    BMF_CHECK(db_thread_create(&w.tid, bmf_race_writer_main, &w) == 0, 34,
               "complement writer start");
     resp = NULL;
     BMF_CHECK(bmf_pdb_req(p.db,
@@ -4025,7 +4025,7 @@ static int bmf_floor_budget_child(void) {
         w.f0_value = "0"; w.f1_value = "0";
         w.from = 700001; w.past_cap = 1;
         atomic_init(&w.done, 0); atomic_init(&w.abort, 0);
-        BMF_CHECK(pthread_create(&w.tid, NULL, bmf_race_writer_main, &w) == 0,
+        BMF_CHECK(db_thread_create(&w.tid, bmf_race_writer_main, &w) == 0,
                   46, "mixed writer start");
         char effective[PATH_MAX];
         snprintf(effective, sizeof(effective), "%s/bmf_d10", p.root);
@@ -4258,7 +4258,7 @@ static int bmf_floor_run_child(void) {
         char *resp = NULL;
         BmfAsyncReq ar = { .env = &d.env, .req = creq, .resp = &resp };
         tu_join_signal_init(&ar.js);
-        BMF_CHECK(pthread_create(&ar.tid, NULL, bmf_async_req_main, &ar) == 0,
+        BMF_CHECK(db_thread_create(&ar.tid, bmf_async_req_main, &ar) == 0,
                   110, "spawn parked count");
         int phase = -1;
         int wrc = test_env_test_hook_wait(&d.env, &phase);
@@ -4274,7 +4274,7 @@ static int bmf_floor_run_child(void) {
             ww.from = 500001;
             ww.to = 500000 + dburst;
             tu_join_signal_init(&ww.js);
-            BMF_CHECK(pthread_create(&ww.tid, NULL, bmf_wire_writer_main,
+            BMF_CHECK(db_thread_create(&ww.tid, bmf_wire_writer_main,
                                      &ww) == 0, 111, "spawn frozen burst writer");
             if (bmf_floor_join(ww.tid, &ww.js, 30) != 0) {
                 bmf_stage("FAIL frozen burst writer join deadline");
@@ -4390,7 +4390,7 @@ static int bmf_floor_run_child(void) {
                      "\"value\":\"0\"}]}");
             ar.resp = &resp;
             tu_join_signal_init(&ar.js);
-            BMF_CHECK(pthread_create(&ar.tid, NULL, bmf_async_req_main, &ar) == 0,
+            BMF_CHECK(db_thread_create(&ar.tid, bmf_async_req_main, &ar) == 0,
                       112, "spawn parked count 2");
             int phase2 = -1;
             ASSERT_EQ_INT(test_env_test_hook_wait(&d.env, &phase2), 0,
@@ -4403,7 +4403,7 @@ static int bmf_floor_run_child(void) {
             ww2.from = 600001;
             ww2.to = 600000 + 8000;
             tu_join_signal_init(&ww2.js);
-            BMF_CHECK(pthread_create(&ww2.tid, NULL, bmf_wire_writer_main,
+            BMF_CHECK(db_thread_create(&ww2.tid, bmf_wire_writer_main,
                                      &ww2) == 0, 113, "spawn past-floor writer");
             if (bmf_floor_join(ww2.tid, &ww2.js, 60) != 0) {
                 bmf_stage("FAIL past-floor writer join deadline");
@@ -4700,7 +4700,7 @@ static int bmf_capacity_shape_child(void) {
     w.db = p.db; w.o = &p.o; w.f0_value = "0"; w.f1_value = "0";
     w.from = 100001; w.past_cap = 1;
     atomic_init(&w.done, 0); atomic_init(&w.abort, 0);
-    BMF_CHECK(pthread_create(&w.tid, NULL, bmf_race_writer_main, &w) == 0,
+    BMF_CHECK(db_thread_create(&w.tid, bmf_race_writer_main, &w) == 0,
               11, "shape writer");
     int rc = bmf_pdb_req(p.db, req, &resp);
     atomic_store(&w.abort, 1);
@@ -4867,7 +4867,7 @@ static int bmf_or_precedence_child(void) {
     w.damage_path = dmg_path;
     w.drop_cache = 1;   /* damaged shard must cold-open EUCLEAN at walk time */
     atomic_init(&w.done, 0); atomic_init(&w.abort, 0);
-    BMF_CHECK(pthread_create(&w.tid, NULL, bmf_race_writer_main, &w) == 0,
+    BMF_CHECK(db_thread_create(&w.tid, bmf_race_writer_main, &w) == 0,
               8, "writer thread start");
 
     QueryDeadline dl = { now_ms_coarse(), 0, 0 };
@@ -4964,7 +4964,7 @@ static int bmf_topn_deadline_child(void) {
     w.f0_value = "0"; w.f1_value = "0";
     w.from = 200001; w.past_cap = 1;   /* burst = observed cap + 1 record */
     atomic_init(&w.done, 0); atomic_init(&w.abort, 0);
-    BMF_CHECK(pthread_create(&w.tid, NULL, bmf_race_writer_main, &w) == 0,
+    BMF_CHECK(db_thread_create(&w.tid, bmf_race_writer_main, &w) == 0,
               9, "writer thread start");
 
     resp = NULL;
