@@ -1539,11 +1539,21 @@ static int test_bmfix_test_knobs_independent(void) {
     rc_conn = br_connect(b);
     ASSERT_EQ_INT(rc_conn, 0, "reconnect");
     if (rc_conn != 0) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    long b2_t0 = br_now_ms();
     r = br_q(b, "{\"mode\":\"reindex\",\"dir\":\"br\",\"object\":\"t\"}");
+    long b2_ms = br_now_ms() - b2_t0;
     ASSERT_TRUE(r && strstr(r, "\"status\":\"reindexed\"") != NULL,
                 "reindex ignores the repair knob");                            /* B2 */
-    if (!(r && strstr(r, "\"status\":\"reindexed\"")))
-        TAP_DIAG("# B2 reindex response: %s\n", r ? r : "(null: request failed or timed out)");
+    if (!(r && strstr(r, "\"status\":\"reindexed\""))) {
+        /* Elapsed distinguishes a 300 s client timeout from an early EOF
+           (daemon closed the connection or died); the daemon log tails show
+           why. */
+        TAP_DIAG("# B2 reindex response after %ld ms: %s\n", b2_ms,
+                 r ? r : "(null: request failed or timed out)");
+        tu_run_cmd("echo '# B2 daemon-restart.log tail:'; tail -n 25 \"$(dirname '%s')/daemon-restart.log\" 2>&1; "
+                   "echo '# B2 serving log tail:'; tail -q -n 25 \"$(dirname '%s')\"/logs/*.log 2>&1",
+                   root, root);
+    }
     free(r);
     tc_close(b->tc);
     b->tc = NULL;
