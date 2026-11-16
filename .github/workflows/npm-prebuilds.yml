@@ -22,7 +22,7 @@ jobs:
             arch: arm64
             node: '22'
             cross: true
-          - os: macos-14
+          - os: macos-latest
             arch: arm64
             node: '22'
 
@@ -108,7 +108,7 @@ jobs:
         run: ./node_modules/.bin/prebuildify --napi --strip --arch arm64
 
       - name: prebuildify (darwin-arm64)
-        if: matrix.os == 'macos-14'
+        if: matrix.os == 'macos-latest'
         working-directory: npm
         run: npm run prebuild
 
