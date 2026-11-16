@@ -2517,10 +2517,11 @@ static int kf_bmfix_prepare(KfBmFix *fix, const char *kf_path, const KfRemapCtx 
     if (rc == 0 && (fix->n > 0 || fix->skipped > 0)) {
         if (fix->skipped > 0) fix->keep_marker = 1;
         snprintf(fix->marker, sizeof(fix->marker), "%s/.bmfix-%03x", fix->indexes_dir, shard);
-        if (access(fix->marker, F_OK) == 0) {
+        /* O_EXCL creates the marker atomically: no check-then-create window. */
+        int fd = open(fix->marker, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd < 0 && errno == EEXIST) {
             fix->marker_preexisting = 1;   /* an earlier unconfirmed commit: keep it durable and in place */
         } else {
-            int fd = open(fix->marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd < 0) {
                 saved = errno;
                 fix->marker[0] = '\0';
@@ -9269,7 +9270,7 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
 
     SlotcaskBulkRec rec = {0};
     rec.key = key; rec.klen = klen; rec.value = value; rec.vlen = vlen;
-    rec.hdr2 = opts ? opts->record_hdr2 : 0;
+    rec.hdr2 = opts->record_hdr2;
     rec.user_ctx = &actx;
 
     SlotcaskBulkState st = {0};
@@ -9399,7 +9400,7 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
 
     SlotcaskBulkRec rec = {0};
     rec.key = key; rec.klen = klen; rec.value = value; rec.vlen = vlen;
-    rec.hdr2 = opts ? opts->record_hdr2 : 0;
+    rec.hdr2 = opts->record_hdr2;
     rec.user_ctx = &actx;
 
     SlotcaskBulkState st = {0};

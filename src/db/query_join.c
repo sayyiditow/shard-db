@@ -332,6 +332,9 @@ int resolve_join_record(const JoinSpec *j,const char *root,
         /* No admitted remote key can match a larger complete probe. */
         if(used>=sizeof(key)||width>sizeof(key)-used-1||
            extra>sizeof(key)-used-1-width){free(text);return 0;}
+        /* The escape branch below writes 1 + n + extra bytes (separator,
+           text, one 255 per NUL, two terminators); bound it by n itself. */
+        if(escape&&(n>sizeof(key)-used-1||extra>sizeof(key)-used-1-n)){free(text);return 0;}
         if(count==MAX_FIELDS){free(text);errno=EINVAL;return -1;}
         parts[count++]=(JoinComponent){(size_t)ri,used,width+1};
         if(next_r&&!j->remote_fs.ts->packed.nfields&&j->remote_fs.ts->fields[ri].type==FT_VARCHAR)ambiguous=1;

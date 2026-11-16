@@ -192,6 +192,8 @@ binaries ignore it).
 
 **Dependency security updates.** The npm binding's `undici` dependency is bumped to 8.12.4 (Dependabot alerts #36–#44: eight advisories, including TLS certificate-validation and redirect cache-poisoning issues) and the docs toolchain's `certifi` to 2026.10.18 (emSign root CA removal). Neither affects the daemon or on-disk formats.
 
+**Coverity hardening (2026-11 scan).** Decimal addition now rejects operands whose combined limb span exceeds `DEC_MAX_LIMBS_ALLOC` (`DEC_ERR_RANGE`) instead of sizing the result from a truncated 16-bit limb count and writing past it; `dec_pack`/`dec_payload_len` clamp a negative coefficient-digit count. The packed-layout migration allocates its new schema zeroed so an out-of-memory exit never releases an uninitialised schema; bitmap-repair markers are created with `O_EXCL` (no `access`/`open` window); the cursor, streaming-find and weighted-count aggregate `predicate_error` flags use atomic accesses on every path; the JSON bulk-update worker copy initialises `mutation_error`; the join composite-key probe bounds the escape branch by the probe text itself; bulk-update file reads use bounded chunks; and redundant null checks and dead branches flagged by the scan are removed. No wire, CLI, config or on-disk change.
+
 **macOS build and CI hardening.** `bitmap.c` builds on macOS (no `posix_fallocate`; `EUCLEAN` alias), and the bitmap race fixtures now run on every platform (their writer threads overflowed macOS's 512 KB secondary-thread stack). Rebuild transactions record `indexes_may_change` from `begin`. No wire, CLI, config or on-disk change.
 
 ## 2026.10.2

@@ -1231,6 +1231,21 @@ static int test_decnum_core_run(void) {
         dec_free(&d); dec_free(&u);
     }
 
+    /* Coverity 1708512: operands whose limb spans are far apart used to size
+       the sum from a truncated 16-bit limb count and write past it. */
+    {
+        uint16_t da[1] = {1}, db[1] = {1};
+        dec_t a = { .weight = 100000, .dscale = 0, .sign = DEC_SIGN_POS,
+                    .ndigits = 1, .cap = 1, .digits = da };
+        dec_t b = { .weight = -100000, .dscale = 0, .sign = DEC_SIGN_POS,
+                    .ndigits = 1, .cap = 1, .digits = db };
+        dec_t r;
+        dec_init(&r);
+        ASSERT_EQ_INT(dec_add(&a, &b, &r), DEC_ERR_RANGE,
+                      "sum spanning more than DEC_MAX_LIMBS is a range error");
+        dec_free(&r);
+    }
+
     return t_ctx->failed > 0 ? 1 : 0;
 }
 TEST_REGISTER("test-decnum-core", test_decnum_core_run)
