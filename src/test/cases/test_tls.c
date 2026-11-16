@@ -229,9 +229,12 @@ static int test_tls_run(void) {
                 setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
                 char buf[256];
                 ssize_t n = recv(s, buf, sizeof(buf), 0);
-                /* Either 0 (clean close) or -1 (error) — both acceptable;
-                   anything else means the daemon "responded" to plaintext. */
-                ASSERT_TRUE(n <= 0 || n == 0,
+                /* Either 0 (clean close) or -1 (error) — both acceptable. A
+                   fatal TLS alert record (content type 0x15) is also fine:
+                   newer OpenSSL answers undecodable input with one before
+                   closing (the CI runner started doing so 2026-11-16). Any
+                   other bytes mean the daemon "responded" to plaintext. */
+                ASSERT_TRUE(n <= 0 || buf[0] == 0x15,
                             "server drops plaintext bytes on TLS port");
             }
             close(s);
