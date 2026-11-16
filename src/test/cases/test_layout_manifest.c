@@ -450,7 +450,21 @@ static int test_schema_conf_rewrite_fsync_failure(void) {
 }
 
 static TestClient *lm_start_client(LmRoot *m, TestEnv *env) {
-    if (test_env_start_at(env, m->db_root, m->port) != 0) return NULL;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (test_env_start_at(env, m->db_root, m->port) != 0) {
+        /* Intermittent sanitizer-leg failure (2026-11-15, "first start
+           migrates"): record how long the start waited and what the daemon
+           logged, to tell a readiness timeout from a startup refusal. */
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        TAP_DIAG("# lm_start_client: start failed after %ld ms\n",
+                 (long)((t1.tv_sec - t0.tv_sec) * 1000L +
+                        (t1.tv_nsec - t0.tv_nsec) / 1000000L));
+        tu_run_cmd("tail -n 30 \"$(dirname '%s')\"/daemon*.log 2>&1; "
+                   "tail -q -n 30 \"$(dirname '%s')\"/logs/*.log 2>&1",
+                   m->db_root, m->db_root);
+        return NULL;
+    }
     return lm_connect(m->port);
 }
 
