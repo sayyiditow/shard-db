@@ -97,29 +97,31 @@ static int test_not_null_writes_run(void) {
                    "\"key\":\"kz\",\"value\":{\"name\":\"c\","
                    "\"amount\":\"1.00\",\"uid\":\"nope\",\"req\":1,"
                    "\"v4\":\"" V4OK "\",\"v6\":\"" V6OK "\"}}", &resp);
-    ASSERT_CONTAINS(resp, "field 'uid' is not nullable",
-                    "malformed uuid rejected");
+    ASSERT_CONTAINS(resp, "value for field 'uid' is not a valid uuid",
+                    "malformed uuid rejected (R4 grammar message)");
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"w1\","
                    "\"key\":\"kz\",\"value\":{\"name\":\"c\","
                    "\"amount\":\"1.00\",\"uid\":\"" UID1 "\",\"req\":1,"
                    "\"v4\":\"999.999.1.1\",\"v6\":\"" V6OK "\"}}", &resp);
-    ASSERT_CONTAINS(resp, "field 'v4' is not nullable",
-                    "malformed ipv4 rejected");
+    ASSERT_CONTAINS(resp, "value for field 'v4' is not a valid ipv4",
+                    "malformed ipv4 rejected (R4 grammar message)");
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"w1\","
                    "\"key\":\"kz\",\"value\":{\"name\":\"c\","
                    "\"amount\":\"1.00\",\"uid\":\"" UID1 "\",\"req\":1,"
                    "\"v4\":\"" V4OK "\",\"v6\":\"zz::1\"}}", &resp);
-    ASSERT_CONTAINS(resp, "field 'v6' is not nullable",
-                    "malformed ipv6 rejected");
+    ASSERT_CONTAINS(resp, "value for field 'v6' is not a valid ipv6",
+                    "malformed ipv6 rejected (R4 grammar message)");
     free(resp); resp = NULL;
 
-    /* 5. control (w0): all five shapes succeed; NULLs render. */
+    /* 5. control (w0): all five shapes succeed; NULLs render. R4: NULL on
+       a nullable field is expressed with explicit JSON null (malformed
+       text now errors even on nullable fields). */
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"w0\","
                    "\"key\":\"c1\",\"value\":{\"name\":\"c\",\"amount\":null,"
-                   "\"uid\":\"nope\",\"v4\":\"999.999.1.1\","
-                   "\"v6\":\"zz::1\"}}", &resp);
+                   "\"uid\":null,\"v4\":null,"
+                   "\"v6\":null}}", &resp);
     ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"error\"") == NULL,
                 "control accepts everything");
     free(resp); resp = NULL;
@@ -187,13 +189,13 @@ static int test_not_null_writes_run(void) {
         uint8_t out[64];
 
         tsu.fields[0].not_null = 1;
-        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":null}", out, sizeof(out)), -2,
+        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":null}", out, sizeof(out), NULL, 0), -2,
                       "typed_encode rejects null on not_null field");
-        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":5}", out, sizeof(out)),
+        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":5}", out, sizeof(out), NULL, 0),
                       tsu.total_size,
                       "typed_encode accepts value on not_null field");
         tsu.fields[0].not_null = 0;
-        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":null}", out, sizeof(out)),
+        ASSERT_EQ_INT(typed_encode(&tsu, "{\"f\":null}", out, sizeof(out), NULL, 0),
                       tsu.total_size,
                       "typed_encode accepts null unconstrained");
         ASSERT_EQ_INT(typed_field_null(out + 1, tsu.nullmap_prefix - 1, 0), 1,

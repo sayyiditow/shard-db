@@ -246,7 +246,7 @@ Any response other than a connect error = server is alive. For deeper health, pa
 Two layers:
 
 1. **File-system snapshots** — ZFS / LVM / btrfs snapshots of `$DB_ROOT` give you crash-consistent point-in-time backups. Schedule hourly/daily, retain N.
-2. **Per-object `backup` command** — logical copy of one object's data/indexes/files to a timestamped dir under the same root. Good for pre-upgrade checkpoints.
+2. **Per-object `backup` command** — logical copy of one object's data/indexes/metadata/files and the object's tokens to a timestamped dir under the same root. Good for pre-upgrade checkpoints. It holds the object exclusively for the copy (reads and writes wait).
 
 See [Operations → Backup](backup.md).
 

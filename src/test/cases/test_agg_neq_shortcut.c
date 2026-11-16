@@ -96,8 +96,7 @@ static int test_agg_neq_shortcut_run(void) {
         "\"criteria\":[{\"field\":\"status\",\"op\":\"neq\",\"value\":\"paid\"}]}",
         &resp);
     ASSERT_TRUE(extract_field(resp, "a", buf, sizeof(buf)), "avg returned");
-    ASSERT_TRUE(strcmp(buf, "50") == 0 || strcmp(buf, "50.0") == 0 ||
-                strcmp(buf, "50.000000") == 0, "avg=50");
+    ASSERT_TRUE(strcmp(buf, "50.0000000000000000") == 0, "avg=50");
     free(resp); resp = NULL;
 
     /* Combined COUNT+SUM+AVG — shortcut. */

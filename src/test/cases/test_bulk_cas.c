@@ -31,7 +31,7 @@ static int test_bulk_cas_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"castest\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"castest\","
         "\"splits\":16,\"max_key\":16,"
         "\"fields\":[\"name:varchar:40\",\"status:varchar:16\",\"attempt:int\"],"
         "\"indexes\":[\"name\",\"status\"]}", &resp); free(resp); resp = NULL;

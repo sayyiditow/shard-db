@@ -102,7 +102,11 @@ void bm_cache_init(int cap);
 void bm_cache_shutdown(void);
 
 /* Drop the cache entry for `path` (e.g. after a reindex unlinks it).
-   Caller must ensure no thread holds the entry's rwlock. */
+   The blocking form returns -1 with the entry acquisition's exact errno when
+   the lock acquisition fails (e.g. EDEADLK when the calling thread holds the
+   entry's write lock); ordinary teardown errors propagate the same way.
+   Caller must ensure no OTHER thread holds the entry's rwlock. The void form
+   deliberately discards the result. */
 int bm_cache_invalidate_checked(const char *path);
 void bm_cache_invalidate(const char *path);
 
@@ -124,6 +128,20 @@ bm_publish_result bm_publish_replace(const char *target, const char *tmp_path);
 /* `writer`: 0 takes an rdlock on the cache slot (multiple concurrent
    readers allowed), 1 takes a wrlock (exclusive). Writers must use 1
    so bm_set / bm_clear / bm_grow are serialised. */
+/* Failure: NULL with errno set. Lock-acquisition errors surface the exact
+   pthread result (e.g. EDEADLK when a writer open's selected eviction
+   candidate is write-held by this thread); ordinary contention on another
+   thread's candidate still waits and succeeds on release.
+   With an initialized cache every returned handle is cache-backed (it holds
+   its entry's rwlock, so an in-place rebuild remap excludes it): a stale
+   entry that cannot be retired, or a cache saturated with busy entries,
+   retries admission a bounded number of times and then fails with EBUSY
+   instead of returning an uncached mapping. That bound covers admission
+   retrying only; an individual lock acquisition still blocks normally.
+   A file whose header does not describe it (short file, bad magic, invalid
+   stride/body bounds) fails with EUCLEAN; open/fstat/mmap failures keep
+   their real syscall errno. Only an uninitialized cache (test fixtures)
+   returns uncached reader handles; writers need the cache (ENODEV). */
 BitmapShard *bm_open(const char *path, int slots, int create,
                      int bool_fastpath, uint32_t max_values, int writer);
 
@@ -140,6 +158,66 @@ void bm_close(BitmapShard *bm);
 void bm_test_fail_close_next(int count);
 void bm_test_fail_invalidate_next(int count);
 void bm_test_fail_reset(void);
+/* Test-only corruption helper (TEST_BUILD builds only): open the normal
+ * writer handle for `path` and rewrite only the mapped header's n_values
+ * so the described body extends past the file, then msync + close. The
+ * next cold open fails with EUCLEAN; a warm cached mapping carries the
+ * damaged header into bm_slotmap_prepare's bounds check. Returns 0 or
+ * -1 with errno. No production disk-format surface. */
+int bm_test_damage_header_bounds(const char *path);
+#endif
+
+/* Bitmap-cache seam site identifiers: the four bm_open_impl acquisition
+ * sites (hit/fill × reader/writer) and the two bm_cache_drop_slot modes
+ * (nonblocking try / selected blocking wait). Plain identifiers in all
+ * builds; the seam functions below are TEST_BUILD-only. */
+typedef enum {
+    BM_TEST_LOCK_HIT_RD = 0,
+    BM_TEST_LOCK_HIT_WR,
+    BM_TEST_LOCK_FILL_RD,
+    BM_TEST_LOCK_FILL_WR,
+    BM_TEST_LOCK_DROP_TRY,
+    BM_TEST_LOCK_DROP_WAIT,
+    BM_TEST_LOCK_SITE_COUNT
+} BmTestLockSite;
+
+#ifdef TEST_BUILD
+/* TEST_BUILD test seams: observation + one-shot fault injection for the
+ * bitmap cache's lock acquisition sites. Production builds contain none of
+ * this. */
+
+/* Arm one thread-local, per-site one-shot fault: the next acquisition at
+ * `site` on THIS thread returns `error` without calling pthread. Arming 0
+ * or an out-of-range site is a no-op; never synthesizes success. */
+void bm_test_fail_lock_next(int site, int error);
+
+/* How many one-shot faults this thread has consumed at `site`. */
+int  bm_test_lock_failure_consumed(int site);
+
+/* Zero this thread's armed faults and consumption counts. */
+void bm_test_reset_lock_failure(void);
+typedef struct {
+    int faults[BM_TEST_LOCK_SITE_COUNT];
+    int consumed[BM_TEST_LOCK_SITE_COUNT];
+} BmTestLockFaultState;
+void bm_test_lock_fault_save(BmTestLockFaultState *state);
+void bm_test_lock_fault_restore(const BmTestLockFaultState *state);
+
+/* Process-wide count of acquisition attempts entered at `site` (published
+ * immediately before the pthread call, so a contended waiter is visible to
+ * the coordinating test thread before completion). Pure observation. */
+int  bm_test_lock_entered(int site);
+
+/* Thread-local count of cache-entry rwlock unlocks performed by this thread
+ * through bitmap.c (matched handoffs, evictions, closes). Scoped measurement
+ * for "a failed acquisition performed no unlock" assertions. */
+int  bm_test_entry_unlock_count(void);
+
+/* Startup-only bitmap cache capacity override for tests: 0 resets to the
+ * configured default, 16 forces the 16-entry/32-slot regression geometry.
+ * Any other value, or a call while a cache is initialized, is rejected
+ * (-1 with errno EINVAL / EBUSY). Not a supported configuration knob. */
+int  bm_test_set_cache_cap(int cap);
 #endif
 
 /* Synchronously fdatasync the bitmap file. `bm` must be opened with
@@ -205,6 +283,61 @@ const uint8_t *bm_get_value_bitmap(BitmapShard *bm, const uint8_t *value,
    when the data shard doubles its slots_per_shard). Extends every
    bitmap with zero bytes. Returns 0 on success. */
 int  bm_grow(BitmapShard *bm, uint32_t new_slots);
+
+/* Keyfile-rebuild support. The keyfile resplit / compaction renumbers kf slots;
+   bit i of a bitmap means "kf slot i", so the bits must move with the entries.
+   Three steps, all on one writer handle:
+     bm_slotmap_prepare - write a copy of `bm`'s file to a sibling temporary
+        (`<path>.remap`, name returned in tmp_path) in which every set bit `s`
+        is moved to `map_fn(s, ctx)` and the slot space is resized to
+        `new_slots`. map_fn returns UINT32_MAX to drop a bit (dead slot); a
+        return >= new_slots is corruption (errno EUCLEAN). The live file is not
+        modified; the temporary is fsynced.
+     bm_slotmap_stage   - make the live file and mapping large enough for the
+        new image (blocks are reserved with posix_fallocate) and map the
+        temporary read-only. Everything that can fail runs here, before the
+        caller's point of no return; the old content stays valid and the old
+        header still describes it.
+     bm_slotmap_apply   - copy the staged image over the live mapping in place
+        and msync it. No allocation, no rename, no reopen: the copy cannot
+        fail. The return value only reports whether the msync confirmed
+        durability; the in-memory (and page-cache) content is correct either way.
+   Release the stage and discard the temporary afterwards. */
+typedef struct {
+    const void *src;
+    size_t      len;
+} BmSlotmapStage;
+
+int  bm_slotmap_prepare(BitmapShard *bm, uint32_t new_slots,
+                        uint32_t (*map_fn)(uint32_t old_slot, void *ctx), void *ctx,
+                        char *tmp_path, size_t tmp_len);
+int  bm_slotmap_stage(BitmapShard *bm, const char *tmp_path, BmSlotmapStage *st);
+int  bm_slotmap_apply(BitmapShard *bm, const BmSlotmapStage *st);
+void bm_slotmap_stage_release(BmSlotmapStage *st);
+/* Remove an unpublished temporary (safe on "" / NULL). */
+void bm_slotmap_discard(const char *tmp_path);
+
+/* Open up to BM_OPEN_MANY_MAX bitmap shards for reading in canonical lock
+   order (ascending path, which is ascending field name within one object and
+   shard) and return the handles in the caller's order. Every code path that
+   holds more than one bitmap shard lock at once acquires them in this order
+   (the keyfile-rebuild remap does too), so two such paths can never wait on
+   each other. Returns 0, or -1 with every handle closed and out[] cleared. */
+/* Canonical lock order for two field names of one object and shard: the order
+   bm_open_many_ro uses (compares the paths "<field>/NNN.bm"). */
+int  bm_field_lock_cmp(const char *a, const char *b);
+#define BM_OPEN_MANY_MAX 16
+int  bm_open_many_ro(const char *const *paths, int n, BitmapShard **out);
+/* Close handles opened by bm_open_many_ro: repeated paths share one handle (a
+   second read lock on the same non-recursive lock could deadlock behind a
+   queued writer), so each distinct handle is closed once. Clears out[]. */
+void bm_close_many(BitmapShard **h, int n);
+/* 1 if `bm` holds its cache entry's rwlock (a writer handle without it cannot
+   be used for an in-place rewrite). */
+int  bm_handle_cached(const BitmapShard *bm);
+/* 1 if `path` exists but its header does not describe a file of that size
+   (bm_open refuses such a file with EUCLEAN); 0 otherwise. */
+int  bm_file_is_corrupt(const char *path);
 
 /* Observability — used by tests + describe-object debugging paths. */
 uint32_t bm_n_values(const BitmapShard *bm);

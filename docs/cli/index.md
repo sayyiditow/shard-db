@@ -80,7 +80,7 @@ Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). Fo
 | `vacuum` | `<dir> <obj>` | Lightweight in-place cleanup. Use JSON `{"compact":true}` for the supported transactional full rebuild. |
 | `recount` | `<dir> <obj>` | Rescans shards and rewrites the cached `counts` file. |
 | `truncate` | `<dir> <obj>` | Delete all records. Schema + indexes survive. |
-| `backup` | `<dir> <obj>` | Copy the object's data + metadata + indexes to a timestamped backup directory. |
+| `backup` | `<dir> <obj>` | Copy the object's records, indexes, schema, stored files and tokens to a timestamped backup directory. |
 | `edit-field` | `<dir> <obj> <name:type[:param]>` | Single-field shortcut for [`edit-field`](../query-protocol/schema-mutations.md#edit-field). Same-type edits only (varchar grow/shrink, integer family widen/narrow, numeric scale change, float→double). v2 only. Use JSON mode for batch edits. |
 
 ## Diagnostics

@@ -51,19 +51,19 @@ static int test_schema_export_run(void) {
 
     /* Three objects across two tenants, mixing types. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"mig_users\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"mig_users\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:40\",\"age:int\",\"active:bool\","
                     "\"created_at:datetime\"],"
         "\"indexes\":[\"age\",\"name\"]}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"mig_orders\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"mig_orders\","
         "\"splits\":16,\"max_key\":16,"
         "\"fields\":[\"status:varchar:16\",\"amount:numeric:18,2\","
                     "\"region:varchar:16\"],"
         "\"indexes\":[\"status\",\"status+region\"]}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"migtest\",\"object\":\"mig_events\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"migtest\",\"object\":\"mig_events\","
         "\"splits\":16,\"max_key\":24,"
         "\"fields\":[\"kind:varchar:24\",\"ts:datetime\"],\"indexes\":[]}",
         &resp); free(resp); resp = NULL;

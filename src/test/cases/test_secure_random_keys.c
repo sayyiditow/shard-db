@@ -98,8 +98,8 @@ static int test_secure_random_keys_run(void) {
 
     tc_request(tc, bulk, &resp);
     free(bulk);
-    ASSERT_CONTAINS(resp, "\"status\":\"bulk-inserted\"", "bulk: status OK");
-    ASSERT_CONTAINS(resp, "\"count\":100", "bulk: count=100");
+    ASSERT_CONTAINS(resp, "\"inserted\":", "bulk: status OK");
+    ASSERT_CONTAINS(resp, "\"inserted\":100", "bulk: count=100");
 
     /* Extract the "keys":[...] array from the response. */
     const char *kp = SAFE_STRSTR(resp, "\"keys\":[");

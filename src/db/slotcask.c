@@ -51,6 +51,9 @@
 long g_shard_test_sync_counts[SHARD_TEST_PHASE_COUNT];
 _Atomic long g_shard_test_gate_held_max;
 _Atomic long g_shard_test_bulk_chains;
+_Atomic long g_shard_test_res_checks;
+_Atomic long g_shard_test_res_checks_nonempty;
+_Atomic long g_shard_test_res_mismatch;
 /* W1: TEST_BUILD seams for the per-shard kf slot tier. initial
  * replaces slotcask_default_slots_for_splits() at slotcask_open; max
  * imposes a test-only growth cap on the pre-grow/stage loops (0 =
@@ -59,10 +62,17 @@ _Atomic long g_shard_test_bulk_chains;
  * the channel ACK is not C synchronization. */
 _Atomic size_t g_shard_test_kf_initial_slots;
 _Atomic size_t g_shard_test_kf_max_slots;
-long g_shard_test_fail_phase = -1;
-long g_shard_test_fail_occurrence;
+/* Bitmap-remap fault injection (tests): mode 1 = fail the prepare/stage step,
+   2 = report the commit msync as unconfirmed, 3 = fail the keyfile rename;
+   the next `count` hits of that mode fire. */
+_Atomic int g_shard_test_bmfix_fault_mode;
+_Atomic int g_shard_test_bmfix_fault_count;
+_Atomic long g_shard_test_bmfix_backoff_ms;
+_Atomic int g_shard_test_bmlock_log;
+_Atomic long g_shard_test_fail_phase = -1;
+_Atomic long g_shard_test_fail_occurrence;
 int  g_shard_test_fail_postlink;
-int  g_shard_test_fail_sticky;
+_Atomic int  g_shard_test_fail_sticky;
 _Atomic int g_shard_test_pause_phase = -1;
 _Atomic int g_shard_test_pause_occurrence = 1;
 _Atomic int g_shard_test_pause_hits;
@@ -91,8 +101,8 @@ void shard_db_test_set_count_gap_hook(shard_db_test_count_gap_fn fn,
     pthread_mutex_unlock(&g_count_gap_hook_lock);
 }
 
-void slotcask_test_count_gap_park(void) {
-    if (!atomic_load(&g_shard_test_count_gap) ||
+void slotcask_test_count_gap_park(int site) {
+    if (atomic_load(&g_shard_test_count_gap) != site ||
         atomic_fetch_add(&g_shard_test_count_gap_hit, 1) != 0)
         return;
     atomic_store(&g_shard_test_count_gap, 0); /* one-shot: disarm on hit */
@@ -1109,7 +1119,11 @@ static void writer_gate_unlock(SlotcaskDb *db, int kf_shard) {
     pthread_mutex_unlock(&db->writer_gates[kf_shard]);
 }
 
-static int fsync_dir(const char *dir_path) {
+/* fsync a directory file itself (not its parent). Shared with the bmfix
+   startup repair (embedded.c) and cmd_reindex's repair branch (index.c),
+   which durably publish the <obj>/data/kf directory before clearing the
+   repair markers. */
+int fsync_dir(const char *dir_path) {
     int dfd = open(dir_path, O_RDONLY | O_DIRECTORY);
     if (dfd < 0) return -1;
     int rc = fsync(dfd);
@@ -2140,6 +2154,12 @@ int slotcask_streams_for_nproc(void) {
    splits=4096); auto-resplit handles any tier overshoot. See the
    comment block in slotcask.h for the full table + rationale. */
 size_t slotcask_default_slots_for_splits(int splits) {
+#ifdef TEST_BUILD
+    /* Keep every consumer of the default tier (bitmap sizing included)
+       consistent with slotcask_open under the W1 test seam. */
+    size_t test_initial = atomic_load(&g_shard_test_kf_initial_slots);
+    if (test_initial) return test_initial;
+#endif
     if (splits <= 16)   return 1024u * 1024;   /* 1M  */
     if (splits <= 128)  return 256u  * 1024;   /* 256K */
     if (splits <= 1024) return 128u  * 1024;   /* 128K */
@@ -2226,6 +2246,329 @@ static inline uint64_t kf_now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
 }
 
+/* F7d: growth back-off interval. Production 5000 ms; TEST_BUILD tests set
+   g_shard_test_bmfix_backoff_ms (control selector 7) so fault cases never
+   sleep against a hard-coded constant. */
+static uint64_t kf_bmfix_backoff_ms(void) {
+#ifdef TEST_BUILD
+    long ms = atomic_load(&g_shard_test_bmfix_backoff_ms);
+    if (ms > 0) return (uint64_t)ms;
+#endif
+    return 5000ULL;
+}
+
+#ifdef TEST_BUILD
+static int kf_bmfix_fault(int mode) {
+    if (atomic_load(&g_shard_test_bmfix_fault_mode) != mode) return 0;
+    int c = atomic_load(&g_shard_test_bmfix_fault_count);
+    while (c > 0)
+        if (atomic_compare_exchange_weak(&g_shard_test_bmfix_fault_count, &c, c - 1)) return 1;
+    return 0;
+}
+#else
+#define kf_bmfix_fault(mode) 0
+#endif
+
+/* Cap on bitmap files remapped per kf shard (one per bitmap-indexed field). */
+#define KF_BMFIX_MAX_BM_PER_SHARD MAX_FIELDS
+
+/* ── Bitmap remap across a keyfile rebuild ──
+   Bitmap bit i == "kf slot i" (bitmap.h). A keyfile rebuild moves entries to
+   new slot numbers, so every <obj>/indexes/<field>/<shard>.bm of the rebuilt
+   shard is rewritten with its bits renumbered. Sequence (all under the kf
+   wrlock the caller holds; lock order kf -> bitmap, docs/concepts/concurrency.md;
+   the bitmap write locks are taken in canonical path order, see bm_open_many_ro):
+     prepare  - per .bm: writer handle, fsynced "<shard>.bm.remap" image, live
+                file extended and the image mapped (bm_slotmap_stage). Any
+                failure aborts the whole rebuild with the old kf and bitmaps
+                untouched.
+     marker   - durable <obj>/indexes/.bmfix-<shard>; from here a crash is
+                repaired at startup by rebuilding only the named shard(s)'
+                bitmaps (bitmap_rebuild_shards_durable; any other .bmfix-*
+                name selects every shard) — and if that repair fails, the
+                object is served with bitmap planning disabled until a full
+                reindex heals it.
+     (kf rename happens in kfcache_resplit_locked)
+     commit   - copy each staged image over its live mapping in place and msync
+                it (bm_slotmap_apply: nothing in it can fail except the msync).
+     finish   - drop the marker once the keyfile mapping was also swapped
+                (Phase E); a Phase E failure leaves it for startup. A marker
+                that existed before this rebuild, or that covers a skipped
+                corrupt bitmap, is never removed here. */
+typedef struct {
+    BitmapShard   *bm;
+    char           tmp[PATH_MAX];
+    BmSlotmapStage stage;
+} KfBmFixEntry;
+
+typedef struct {
+    int           n;
+    KfBmFixEntry *e;                    /* n entries, NULL when no bitmaps */
+    char          indexes_dir[PATH_MAX];
+    char          marker[PATH_MAX];     /* "" until the marker is in place */
+    int           marker_preexisting;   /* marker came from an earlier failure: never removed here */
+    int           keep_marker;          /* a corrupt bitmap was skipped: only startup or a full reindex may clear it */
+    int           skipped;              /* corrupt bitmaps left for the startup rebuild */
+} KfBmFix;
+
+typedef struct {
+    const SlotcaskKfEntry *old_map; size_t old_cap;
+    const SlotcaskKfEntry *new_map; size_t new_cap;
+} KfRemapCtx;
+
+/* New slot of the live entry that sat at `old_slot`, found by probing the
+   rebuilt table for its hash (Phase B placed every live entry). UINT32_MAX
+   drops the bit: the old slot was not live. */
+static uint32_t kf_remap_slot(uint32_t old_slot, void *vctx) {
+    const KfRemapCtx *c = (const KfRemapCtx *)vctx;
+    if ((size_t)old_slot >= c->old_cap) return UINT32_MAX;
+    const SlotcaskKfEntry *src = &c->old_map[old_slot];
+    if (src->flag != 1) return UINT32_MAX;
+    size_t start = kf_slot_for(src->hash, c->new_cap);
+    for (size_t j = 0; j < c->new_cap; j++) {
+        size_t s = (start + j) % c->new_cap;
+        if (c->new_map[s].flag == 0) break;
+        if (memcmp(c->new_map[s].hash, src->hash, 16) == 0) return (uint32_t)s;
+    }
+    return UINT32_MAX;
+}
+
+/* "<obj>/data/kf/NNN.kf" -> "<obj>" and the decimal shard number.
+   0 = ok; 1 = not an object-layout keyfile (raw slotcask files cannot have
+   bitmaps); -1 = object layout but unparseable or too long (fail closed). */
+static int kf_bmfix_split_path(const char *kf_path, char *objdir, size_t objlen, int *shard) {
+    static const char suffix[] = "/data/kf";
+    const char *slash = strrchr(kf_path, '/');
+    if (!slash) return 1;
+    size_t dlen = (size_t)(slash - kf_path);
+    size_t slen = sizeof(suffix) - 1;
+    if (dlen <= slen || memcmp(kf_path + dlen - slen, suffix, slen) != 0) return 1;
+    char tail = 0;
+    if (sscanf(slash + 1, "%d.k%c", shard, &tail) != 2 || tail != 'f' || *shard < 0) return -1;
+    size_t olen = dlen - slen;
+    if (olen + 1 > objlen) return -1;
+    memcpy(objdir, kf_path, olen);
+    objdir[olen] = '\0';
+    return 0;
+}
+
+static void kf_bmfix_release(KfBmFix *fix) {
+    for (int i = 0; i < fix->n; i++) {
+        KfBmFixEntry *en = &fix->e[i];
+        bm_slotmap_stage_release(&en->stage);
+        bm_slotmap_discard(en->tmp);
+        en->tmp[0] = '\0';
+        if (en->bm) bm_close(en->bm);
+        en->bm = NULL;
+    }
+    free(fix->e);
+    fix->e = NULL;
+    fix->n = 0;
+}
+
+/* Rebuild did not happen: drop temps, handles and the marker we created. */
+static void kf_bmfix_abort(KfBmFix *fix) {
+    kf_bmfix_release(fix);
+    if (fix->marker[0] && !fix->marker_preexisting) {
+        (void)unlink(fix->marker);
+        (void)fsync_dir(fix->indexes_dir);
+    }
+    fix->marker[0] = '\0';
+}
+
+static int kf_bmfix_path_cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* 0 = ready (fix may be empty: no bitmaps), -1 = failed with everything
+   released/removed (errno set) -- the caller must abandon the rebuild. */
+static int kf_bmfix_prepare(KfBmFix *fix, const char *kf_path, const KfRemapCtx *ctx) {
+    memset(fix, 0, sizeof(*fix));
+    char objdir[PATH_MAX];
+    int shard = 0;
+    int sp = kf_bmfix_split_path(kf_path, objdir, sizeof(objdir), &shard);
+    if (sp == 1) return 0;
+    if (sp != 0) { errno = EINVAL; return -1; }
+    int n = snprintf(fix->indexes_dir, sizeof(fix->indexes_dir), "%s/indexes", objdir);
+    if (n < 0 || (size_t)n >= sizeof(fix->indexes_dir)) { errno = ENAMETOOLONG; return -1; }
+    DIR *d = opendir(fix->indexes_dir);
+    if (!d) return errno == ENOENT ? 0 : -1;
+
+    /* Collect this shard's bitmap files, then lock them in canonical order. */
+    char **paths = NULL;
+    int npaths = 0, rc = 0;
+    struct dirent *de;
+    for (;;) {
+        errno = 0;
+        de = readdir(d);
+        if (!de) { if (errno) rc = -1; break; }
+        if (de->d_name[0] == '.') continue;
+        char bm_path[PATH_MAX];
+        n = snprintf(bm_path, sizeof(bm_path), "%s/%s/%03x.bm", fix->indexes_dir, de->d_name, shard);
+        if (n < 0 || (size_t)n >= sizeof(bm_path)) { errno = ENAMETOOLONG; rc = -1; break; }
+        struct stat st;
+        if (stat(bm_path, &st) != 0) {
+            if (errno == ENOENT || errno == ENOTDIR) continue;   /* btree dir / no file for this shard */
+            rc = -1;                                             /* anything else: fail closed */
+            break;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        if (npaths >= KF_BMFIX_MAX_BM_PER_SHARD || ctx->new_cap > (size_t)(UINT32_MAX / 2)) {
+            errno = EOVERFLOW;
+            rc = -1;
+            break;
+        }
+        char **np = realloc(paths, (size_t)(npaths + 1) * sizeof(*paths));
+        if (!np) { rc = -1; break; }
+        paths = np;
+        paths[npaths] = strdup(bm_path);
+        if (!paths[npaths]) { rc = -1; break; }
+        npaths++;
+    }
+    int saved = errno;
+    closedir(d);
+
+    if (rc == 0 && npaths > 0) {
+        qsort(paths, (size_t)npaths, sizeof(*paths), kf_bmfix_path_cmp);
+        fix->e = calloc((size_t)npaths, sizeof(*fix->e));
+        if (!fix->e) { saved = errno; rc = -1; }
+    }
+    for (int i = 0; rc == 0 && i < npaths; i++) {
+        BitmapShard *bm = bm_open(paths[i], 0, 0, 0, 0, 1 /* writer: kf -> bm lock order */);
+        if (!bm) {
+            /* The open's own errno decides: only a corruption rejection may
+               be skipped; the disk probe confirms it but never outranks an
+               acquisition error (EDEADLK/EINVAL/EIO/EBUSY/ENOMEM abort). */
+            int oe = errno ? errno : EIO;
+            if (oe == EUCLEAN && bm_file_is_corrupt(paths[i])) {
+                /* Retire any cached mapping of the damaged file before the
+                   skip, so no stale mapping keeps serving it; a retirement
+                   failure abandons the rebuild instead. */
+                if (bm_cache_invalidate_checked(paths[i]) != 0) {
+                    saved = errno ? errno : EIO;
+                    rc = -1;
+                    break;
+                }
+                LOG_WARN(LOG_SUB_SLOTCASK,
+                         "KF_BMFIX_SKIP path=%s: corrupt bitmap left for the startup rebuild (open: %s)",
+                         paths[i], strerror(oe));
+                fix->skipped++;
+                continue;
+            }
+            saved = oe;
+            rc = -1;
+            break;
+        }
+        if (!bm_handle_cached(bm)) {
+            /* An uncached handle holds no lock: an in-place rewrite could not
+               exclude readers. Abandon (and back off) rather than race them. */
+            bm_close(bm);
+            saved = EBUSY;
+            rc = -1;
+            break;
+        }
+        KfBmFixEntry *en = &fix->e[fix->n++];
+        en->bm = bm;
+        if (bm_slotmap_prepare(bm, (uint32_t)ctx->new_cap, kf_remap_slot, (void *)ctx,
+                               en->tmp, sizeof(en->tmp)) != 0) {
+            int pe = errno ? errno : EIO;
+            en->tmp[0] = '\0';
+            if (pe == EUCLEAN) {
+                /* Corrupt bitmap: release this entry's writer handle (checked),
+                   drop it from the fix exactly once, then retire the cached
+                   entry before accepting the skip. Never invalidate while
+                   still holding this entry's writer lock; earlier retained
+                   paths precede this one in canonical order, so retiring the
+                   current path keeps that order. A close or retirement
+                   failure abandons the rebuild instead of skipping. */
+                BitmapShard *cur = en->bm;
+                en->bm = NULL;
+                fix->n--;
+                if (bm_close_checked(cur) != 0) {
+                    saved = errno ? errno : EIO;
+                    rc = -1;
+                    break;
+                }
+                if (bm_cache_invalidate_checked(paths[i]) != 0) {
+                    saved = errno ? errno : EIO;
+                    rc = -1;
+                    break;
+                }
+                LOG_WARN(LOG_SUB_SLOTCASK,
+                         "KF_BMFIX_SKIP path=%s: corrupt bitmap left for the startup rebuild (prepare: %s)",
+                         paths[i], strerror(pe));
+                fix->skipped++;
+                continue;
+            }
+            saved = pe;
+            rc = -1;
+            break;
+        }
+        if (kf_bmfix_fault(SHARD_TEST_BMFIX_PREPARE)) { saved = ENOSPC; rc = -1; break; }
+        if (bm_slotmap_stage(bm, en->tmp, &en->stage) != 0) {
+            saved = errno ? errno : EIO;
+            rc = -1;
+            break;
+        }
+    }
+    for (int i = 0; i < npaths; i++) free(paths[i]);
+    free(paths);
+
+    if (rc == 0 && (fix->n > 0 || fix->skipped > 0)) {
+        if (fix->skipped > 0) fix->keep_marker = 1;
+        snprintf(fix->marker, sizeof(fix->marker), "%s/.bmfix-%03x", fix->indexes_dir, shard);
+        if (access(fix->marker, F_OK) == 0) {
+            fix->marker_preexisting = 1;   /* an earlier unconfirmed commit: keep it durable and in place */
+        } else {
+            int fd = open(fix->marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) {
+                saved = errno;
+                fix->marker[0] = '\0';
+                rc = -1;
+            } else {
+                if (fsync(fd) != 0) { saved = errno; rc = -1; }
+                if (close(fd) != 0 && rc == 0) { saved = errno; rc = -1; }
+                if (rc == 0 && fsync_dir(fix->indexes_dir) != 0) { saved = errno; rc = -1; }
+            }
+        }
+    }
+    if (rc != 0) {
+        kf_bmfix_abort(fix);
+        errno = saved ? saved : EIO;
+        return -1;
+    }
+    if (fix->n == 0) { free(fix->e); fix->e = NULL; }
+    return 0;
+}
+
+/* Called right after the new keyfile is renamed in. The copies cannot fail;
+   -1 only means a bitmap msync did not confirm durability. The marker stays
+   until kf_bmfix_finish, which skips it when this returned -1. The in-memory
+   bitmaps are correct either way. */
+static int kf_bmfix_commit(KfBmFix *fix) {
+    int rc = 0;
+    for (int i = 0; i < fix->n; i++) {
+        KfBmFixEntry *en = &fix->e[i];
+        if (!en->bm) continue;
+        int arc = bm_slotmap_apply(en->bm, &en->stage);
+        if (arc != 0 || kf_bmfix_fault(SHARD_TEST_BMFIX_COMMIT_SYNC)) rc = -1;
+    }
+    kf_bmfix_release(fix);
+    return rc;
+}
+
+/* Last step of a successful rebuild (after the keyfile mapping was swapped):
+   drop the marker unless it must outlive this rebuild. */
+static int kf_bmfix_finish(KfBmFix *fix, int commit_rc) {
+    int rc = commit_rc;
+    if (rc == 0 && fix->marker[0] && !fix->marker_preexisting && !fix->keep_marker) {
+        if (unlink(fix->marker) != 0 && errno != ENOENT) rc = -1;
+        else if (fsync_dir(fix->indexes_dir) != 0) rc = -1;
+    }
+    fix->marker[0] = '\0';
+    return rc;
+}
+
 static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     if (kh->slot < 0 || !kh->writer) return -1;
     /* Allow same-cap rebuild: used by vacuum's kf-compaction path to
@@ -2239,6 +2582,13 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     size_t new_size = SLOTCASK_KF_HDR_SIZE + new_cap * sizeof(SlotcaskKfEntry);
 
     uint64_t t_start = kf_now_us();
+    /* A bitmap-remap prepare failed recently on this shard (see Phase C2):
+       do not redo the whole rebuild until the retry time passes. */
+    if (new_cap > kh->capacity && e->bmfix_retry_ms > t_start / 1000ULL &&
+        e->bmfix_retry_gen == atomic_load_explicit(&e->gen, memory_order_acquire)) {
+        errno = EAGAIN;
+        return -1;
+    }
 
     /* === Phase A: open + ftruncate + mmap new file === */
     char new_path[PATH_MAX];
@@ -2292,32 +2642,85 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
 
     /* === Phase C: msync(MS_SYNC) === */
     msync(new_base, new_size, MS_SYNC);
-    munmap(new_base, new_size);
-    close(new_fd);
+
+    /* === Phase C2: prepare slot-remapped bitmaps (abortable) ===
+       Entries just moved to new slot numbers and bitmap bits are slot
+       numbers. Runs after the keyfile msync so bitmap-only readers are not
+       blocked behind it, and while the new table is still mapped (it is
+       probed to find each entry's new slot). Failure aborts the whole rebuild
+       with the old kf and bitmaps untouched; the next attempt is delayed so a
+       persistent error does not redo a full rebuild on every insert. This
+       phase's time is counted in msync_us of the KF_RESPLIT log line. */
+    KfBmFix bmfix;
+    {
+        KfRemapCtx rctx = { .old_map = kh->map, .old_cap = old_cap,
+                            .new_map = new_entries, .new_cap = new_cap };
+        if (kf_bmfix_prepare(&bmfix, e->path, &rctx) != 0) {
+            int perr = errno;
+            LOG_ERROR(LOG_SUB_SLOTCASK,
+                      "KF_BMFIX_PREPARE_FAILED path=%s new_cap=%zu: %s (resplit abandoned, nothing changed; retry in 5s)",
+                      e->path, new_cap, strerror(perr));
+            munmap(new_base, new_size);
+            close(new_fd);
+            unlink(new_path);
+            if (new_cap > old_cap) {   /* growth only: vacuum reports its error and does not retry */
+                e->bmfix_retry_ms = kf_now_us() / 1000ULL + kf_bmfix_backoff_ms();
+                e->bmfix_retry_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
+            }
+            errno = perr;
+            return -1;
+        }
+    }
+    /* The new table stays mapped and open from here on: after the rename it
+       becomes the live mapping (Phase E), so nothing in Phase E can fail. */
     uint64_t t_after_msync = kf_now_us();
 
     /* === Phase D: rename + parent-dir fsync === */
-    if (rename(new_path, e->path) != 0) {
+    if (kf_bmfix_fault(SHARD_TEST_BMFIX_RENAME) || rename(new_path, e->path) != 0) {
+        munmap(new_base, new_size);
+        close(new_fd);
         unlink(new_path);
+        kf_bmfix_abort(&bmfix);   /* kf unchanged: drop temps, marker, bitmap locks */
+        if (new_cap > old_cap) {  /* a persistent failure must not redo the rebuild on every insert */
+            e->bmfix_retry_ms = kf_now_us() / 1000ULL + kf_bmfix_backoff_ms();
+            e->bmfix_retry_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
+        }
         return -1;
     }
     char parent[PATH_MAX];
     snprintf(parent, sizeof(parent), "%s", e->path);
     char *slash = strrchr(parent, '/');
+    int kf_dir_synced = 1;
     if (slash) {
         *slash = '\0';
+        kf_dir_synced = 0;
         int dfd = open(parent, O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) { fsync(dfd); close(dfd); }
+        if (dfd >= 0) { kf_dir_synced = fsync(dfd) == 0; close(dfd); }
     }
     uint64_t t_after_rename = kf_now_us();
 
-    /* === Phase E: remap (close old, open new path, mmap fresh) === */
-    int reopen_fd = open(e->path, O_RDWR);
-    if (reopen_fd < 0) return -1;
-    void *fresh = mmap(NULL, new_size, PROT_READ | PROT_WRITE,
-                        MAP_SHARED, reopen_fd, 0);
-    if (fresh == MAP_FAILED) { close(reopen_fd); return -1; }
-    SHARD_MADV_HUGEPAGE(fresh, new_size);  /* THP hint for resplit remap */
+    /* Apply the remapped bitmaps in place now, before Phase E, so disk state
+       is consistent even if the remap below fails. Still under the kf wrlock. */
+    int bmfix_rc = kf_bmfix_commit(&bmfix);
+    /* The bitmaps now describe the new keyfile: if the rename is not durable
+       yet, a power loss could bring back the old keyfile with them. Keep the
+       marker until a later start repairs it. */
+    if (!kf_dir_synced) bmfix_rc = -1;
+    if (bmfix_rc != 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "KF_BMFIX_FAILED path=%s: remapped bitmaps are applied in memory but a bitmap msync did not "
+                  "confirm durability; marker retained, startup rebuilds the object's indexes if the process "
+                  "dies before writeback", e->path);
+    }
+
+    /* === Phase E: swap in the new mapping (close old) ===
+       The file mapped in Phase A is the inode that was just renamed over
+       e->path, and its contents were msync'd in Phase C. Using that fd and
+       mapping directly, instead of reopening the path, leaves no step after
+       the point of no return that can fail: a reopen failure here would have
+       left the remapped bitmaps in front of the old keyfile mapping. */
+    int reopen_fd = new_fd;
+    void *fresh = new_base;
 
     /* The replacement was MS_SYNC'd and renamed before this old-inode
        mapping is discarded, so no flush of the superseded inode is needed. */
@@ -2357,6 +2760,11 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
             (unsigned long)(t_after_msync   - t_after_rebuild),
             (unsigned long)(t_after_rename  - t_after_msync),
             (unsigned long)(t_end           - t_after_rename));
+    }
+    if (kf_bmfix_finish(&bmfix, bmfix_rc) != 0 && bmfix_rc == 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "KF_BMFIX_FAILED path=%s: could not remove the bitmap-remap marker durably; "
+                  "the next start rebuilds the object's indexes once and clears it", e->path);
     }
     return 0;
 }
@@ -2633,6 +3041,20 @@ static int req_res_copy(ReqSlotRes *dst, size_t dst_cap,
     return 0;
 }
 
+#ifdef TEST_BUILD
+/* F9: cross-check the running count (and the gate's emptiness answer)
+   against a full scan. Called at window starts, after a chain seed and at
+   shard release — the only places the count can be observed wrong. */
+static void req_res_verify(const ReqSlotRes *map, size_t cap, size_t count,
+                           int clear) {
+    size_t scanned = req_res_count(map, cap);
+    atomic_fetch_add(&g_shard_test_res_checks, 1);
+    if (scanned) atomic_fetch_add(&g_shard_test_res_checks_nonempty, 1);
+    if (scanned != count || clear != (scanned == 0))
+        atomic_fetch_add(&g_shard_test_res_mismatch, 1);
+}
+#endif
+
 /* Non-mutating probe for a brand-new kf entry. Finds the slot a subsequent
    kf_commit_planned_slot call should write to, without touching the table.
    Returns 0 (planned into *out_plan), 1 (key already live — duplicate), or
@@ -2712,12 +3134,32 @@ static int kf_plan_window_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh,
                                        const char *data_dir,
                                        const KfInsertPlan *reserved, size_t nreserved,
                                        const ReqSlotRes *res_map, size_t res_cap,
+                                       size_t res_count,
                                        KfInsertPlan *out_plan) {
     (void)db;
+    const int res_clear = (res_count == 0);   /* running |res_map| (F9) */
+#ifdef TEST_BUILD
+    if (res_map && nreserved == 0)
+        req_res_verify(res_map, res_cap, res_count, res_clear);
+#endif
     if (kh->hdr) {
         uint64_t total = kh->hdr->total;
         uint64_t cap = (uint64_t)kh->capacity;
-        if (cap > 0 && total * 4 >= cap * 3) {
+        /* Never resplit while this window or request holds planned-but-
+           uncommitted slots: they are numbered for the current table and a
+           resplit would commit them into the wrong places. res_clear is
+           `res_count == 0`, the running |res_map| maintained by
+           req_res_insert and the chain seed (F9) — the map is not scanned.
+           After a successful stage pre-grow this trigger is unreachable while
+           reservations exist (the stage fails closed on under-coverage —
+           BULK_STAGE_UNGROWN), so this resplit only ever runs for the first,
+           reservation-free plan. The kf_max_slots check keeps the TEST_BUILD
+           tier seam coherent: the stage loop and this planner path respect
+           the same cap (production kf_max_slots() is SIZE_MAX, so this is a
+           no-op there). */
+        if (cap > 0 && total * 4 >= cap * 3 &&
+            cap < kf_max_slots() &&
+            nreserved == 0 && res_clear) {
             if (kfcache_resplit_locked(kh, kh->capacity * 2) == 0)
                 reshard_hint_check(db);
         }
@@ -4074,10 +4516,9 @@ static inline void seg_record_emit(uint8_t *dst, int slot_size,
        relaxed ordering for the initial 0 — readers that see 0 simply skip
        the record (no acquire needed). */
     __atomic_store_n(&dst[18], 0, __ATOMIC_RELEASE);
-    /* Byte 19 carries SREC_FLAG_NULLMAP (null-bitmap generation). Written
-       before the flag release-store, so a live record always has its
-       generation byte visible. */
-    dst[19] = (uint8_t)(hdr2 & SREC_FLAG_NULLMAP);
+    /* Publish the known generation flags with the record payload. The
+       object/schema dispatch remains separately gated. */
+    dst[19] = hdr2;
     uint32_t v32 = (uint32_t)vlen;
     memcpy(dst + 20, &v32, 4);
     memcpy(dst + 24, key, klen);
@@ -4110,7 +4551,7 @@ static inline void seg_record_emit_pending(uint8_t *dst, int slot_size,
     __atomic_store_n(&dst[18], 0, __ATOMIC_RELEASE);
     /* Generation byte rides the staged payload; the activation flag-flip
        publishes both together. */
-    dst[19] = (uint8_t)(hdr2 & SREC_FLAG_NULLMAP);
+    dst[19] = hdr2;
     uint32_t v32 = (uint32_t)vlen;
     memcpy(dst + 20, &v32, 4);
     memcpy(dst + 24, key, klen);
@@ -5142,6 +5583,7 @@ typedef struct {
     SegLoc    *p_locs; size_t np, cap_p;      /* payload bytes (epoch 1)   */
     ReqWindow *windows; size_t nwindows, cap_windows;
     ReqSlotRes *res_map; size_t res_cap;     /* cross-window planned slots */
+    size_t res_count;                        /* F9: running number of used buckets in res_map (I1) */
     int        failed;                 /* EINPROGRESS / unreplayed         */
     /* B1 per-shard pipeline outcome (folded before this shard's gate
        release; supersedes the request-wide payload_rc / publish_rc /
@@ -5795,6 +6237,16 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
     }
 
     if (shard->kind == BULK_MUTATION_UPSERT) {
+        /* value_compute can replace NEW metadata after entry validation.
+           Reject its invalid generation before fallback payload emission. */
+        for (size_t i = begin; i < end; i++) {
+            if (recs[i].status == 0 && !srec_flags_valid(recs[i].hdr2)) {
+                recs[i].status = -1;
+                st[i].needs_write = 0;
+                errno = EINVAL;
+                goto hard_fail;
+            }
+        }
         /* Fallback staging is batched after the planning loop: these
            records could not ride the P wave (their NEW bytes depend on
            OLD), but they stage exactly like it — grouped by stream,
@@ -5815,16 +6267,19 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
             if (!s->old_found) {
                 const ReqSlotRes *res_map = NULL;
                 size_t res_cap = 0;
+                size_t res_count = 0;
                 if (txn->req) {
                     ReqShard *rs = &txn->req->shards[shard->kf_shard_id];
                     res_map = rs->res_map;
                     res_cap = rs->res_cap;
+                    res_count = rs->res_count;
                 }
                 if (kf_plan_window_insert_slot(txn->db, kh, s->hash,
                                                r->key, r->klen,
                                                txn->db->data_dir,
                                                reserved_plans, nreserved,
                                                res_map, res_cap,
+                                               res_count,
                                                &s->kf_plan) != 0) {
                     r->status = -1;
                     continue;
@@ -5833,7 +6288,8 @@ static int bulk_plan_window_locked(BulkMutationTxn *txn,
                 reserved_plans[nreserved++] = s->kf_plan;
                 if (txn->req) {
                     ReqShard *rs = &txn->req->shards[shard->kf_shard_id];
-                    req_res_insert(rs->res_map, rs->res_cap, &s->kf_plan);
+                    if (req_res_insert(rs->res_map, rs->res_cap, &s->kf_plan))
+                        rs->res_count++;
                 }
             }
             /* OLD-derived records never went through the P wave (their
@@ -7210,8 +7666,13 @@ static void slotcask_bulk_shard_release(SlotcaskBulkRequest *req,
     rs->windows = NULL; rs->nwindows = 0; rs->cap_windows = 0;
     free(rs->p_locs);
     rs->p_locs = NULL; rs->np = 0; rs->cap_p = 0;
+#ifdef TEST_BUILD
+    if (rs->res_map)
+        req_res_verify(rs->res_map, rs->res_cap, rs->res_count, rs->res_count == 0);
+#endif
     free(rs->res_map);
     rs->res_map = NULL;
+    rs->res_count = 0;
 }
 
 /* Frees the request container. Since B1 every shard's terminal cleanup
@@ -7242,7 +7703,8 @@ static int slotcask_bulk_stage_shard(SlotcaskBulkRequest *req,
                                      int kf_shard_id,
                                      SlotcaskBulkRec *recs, size_t n,
                                      const SlotcaskBulkOpts *ups,
-                                     const SlotcaskBulkDeleteOpts *dels) {
+                                     const SlotcaskBulkDeleteOpts *dels,
+                                     uint64_t chain_pending) {
     if (!req || kf_shard_id < 0 || kf_shard_id >= req->num_shards ||
         !request_owns_shard(req, kf_shard_id) || !recs || n == 0 ||
         (!!ups == !!dels)) {
@@ -7295,10 +7757,48 @@ static int slotcask_bulk_stage_shard(SlotcaskBulkRequest *req,
        IO-pool worker. The 75% trigger matches kf_put_new's inline check;
        loop because one doubling may still be insufficient. */
     if (kh.hdr) {
-        uint64_t projected = kh.hdr->total + (uint64_t)n;
+        /* chain_pending: records of earlier chain members that are staged but
+           not yet planned into the table. Their slots are planned later, at
+           publish, where no resplit is allowed, so this stage must size the
+           table for the whole chain. */
+        uint64_t projected = kh.hdr->total + chain_pending + (uint64_t)n;
+        int grow_errno = 0;
         while (kh.capacity < kf_max_slots() &&
                projected * 4 >= (uint64_t)kh.capacity * 3) {
-            if (kfcache_resplit_locked(&kh, kh.capacity * 2) != 0) break;
+            if (kfcache_resplit_locked(&kh, kh.capacity * 2) != 0) {
+                grow_errno = errno ? errno : EIO;
+                break;
+            }
+        }
+        /* F2: coverage must be established before publish. Planning refuses
+           to resplit once this window or request holds planned-but-uncommitted
+           slots, and no other writer can resize this shard between stage and
+           publish (the pipeline holds the writer gate throughout; vacuum is
+           excluded by the object lock), so an under-sized table would fail
+           records mid-request with faceless per-record errors and a partial
+           success. Fail the stage atomically instead: every record of this
+           shard errors, the request reports it, and the client retries the
+           failed records (bulk-insert is an upsert). Reachable when a
+           bitmap-remap prepare failure put this shard's growth on its 5 s
+           back-off, on a resplit I/O error, or under the TEST_BUILD
+           kf_max_slots seam. Deletes need no insertion slots, so only
+           upsert stages take this new failure path. */
+        if (ups && projected * 4 >= (uint64_t)kh.capacity * 3) {
+            char kf_path[PATH_MAX];
+            kf_path_for(kf_path, req->db->data_dir, kf_shard_id);
+            LOG_ERROR(LOG_SUB_SLOTCASK,
+                      "BULK_STAGE_UNGROWN path=%s projected=%llu cap=%llu chain_pending=%llu errno=%s "
+                      "(pre-grow could not size the table; failing this shard's stage, retry the request)",
+                      kf_path, (unsigned long long)projected,
+                      (unsigned long long)kh.capacity,
+                      (unsigned long long)chain_pending,
+                      strerror(grow_errno ? grow_errno : EAGAIN));
+            kfcache_release(&kh);
+            reshard_hint_check(req->db);
+            rs->stage_failed = 1;
+            for (size_t i = 0; i < n; i++) recs[i].status = -1;
+            errno = grow_errno ? grow_errno : EAGAIN;
+            return -1;
         }
     }
     kfcache_release(&kh);
@@ -7335,6 +7835,7 @@ static int slotcask_bulk_stage_shard(SlotcaskBulkRequest *req,
         return -1;
     }
     rs->res_cap = req_res_pow2(n * 2);
+    rs->res_count = 0;
     if (rs->res_cap != SIZE_MAX) {
         rs->res_map = calloc(rs->res_cap, sizeof(*rs->res_map));
         if (!rs->res_map) rs->res_cap = 0;
@@ -7445,13 +7946,12 @@ typedef struct {
     size_t            nmembers;
 } BulkCommitChain;
 
-/* Bitmap file path for the chain commit flush (mirrors index.c's
-   bm_build_path: <root>/<obj>/indexes/<field>/<NNN>.bm). */
-static void req_bitmap_file_path(char *out, size_t outlen,
-                                 const char *db_root, const char *object,
-                                 const char *field, int shard_idx) {
-    snprintf(out, outlen, "%s/%s/indexes/%s/%03d.bm",
-             db_root, object, field, shard_idx);
+/* Bitmap file path for the chain commit flush. Delegates to bm_build_path so the
+   shard spelling (%03x, hex) can never drift from the creators/readers. */
+void req_bitmap_file_path(char *out, size_t outlen,
+                          const char *db_root, const char *object,
+                          const char *field, int shard_idx) {
+    bm_build_path(out, outlen, db_root, object, field, shard_idx);
 }
 
 /* fdatasync a file by path without touching any cache. B3a: routed
@@ -7895,6 +8395,10 @@ static int req_shard_seed_chain_reservations(ReqShard *dst,
     free(dst->res_map);
     dst->res_map = map;
     dst->res_cap = cap;
+    dst->res_count = src_n + dst_n;
+#ifdef TEST_BUILD
+    req_res_verify(dst->res_map, dst->res_cap, dst->res_count, dst->res_count == 0);
+#endif
     return 0;
 }
 
@@ -8277,7 +8781,7 @@ static void slotcask_bulk_shard_pipeline(SlotcaskBulkRequest *req,
     if (slotcask_bulk_stage_shard(req, s, in->recs, in->nrecs,
             in->kind == SLOTCASK_BULK_INPUT_UPSERT ? &in->opts.upsert : NULL,
             in->kind == SLOTCASK_BULK_INPUT_DELETE ? &in->opts.delete_
-                                                   : NULL) != 0) {
+                                                   : NULL, 0) != 0) {
         rs->step_failed = 1;
         if (!rs->step_errno) rs->step_errno = errno ? errno : EIO;
     }
@@ -8313,6 +8817,7 @@ static void slotcask_bulk_shard_pipeline(SlotcaskBulkRequest *req,
         bulk_commit_chain_add(&chain, jd->req, jd->in,
                               &jd->req->shards[s], jd);
     }
+    uint64_t chain_pending = (uint64_t)in->nrecs;
     for (size_t j = 0; j < njoiners; j++) {
         BulkGateWaiter *jd = joiners[j];
         uint64_t t0js = now_us();
@@ -8321,7 +8826,9 @@ static void slotcask_bulk_shard_pipeline(SlotcaskBulkRequest *req,
                 jd->in->kind == SLOTCASK_BULK_INPUT_UPSERT
                     ? &jd->in->opts.upsert : NULL,
                 jd->in->kind == SLOTCASK_BULK_INPUT_DELETE
-                    ? &jd->in->opts.delete_ : NULL);
+                    ? &jd->in->opts.delete_ : NULL,
+                chain_pending);
+        chain_pending += (uint64_t)jd->in->nrecs;
         if (jrc != 0) {
             ReqShard *jrs = &jd->req->shards[s];
             jrs->step_failed = 1;
@@ -8377,6 +8884,15 @@ int slotcask_bulk_request_execute(SlotcaskDb *db,
             free(touched);
             errno = EINVAL;
             return -1;
+        }
+        if (inputs[i].kind == SLOTCASK_BULK_INPUT_UPSERT) {
+            for (size_t j = 0; j < inputs[i].nrecs; j++) {
+                if (!srec_flags_valid(inputs[i].recs[j].hdr2)) {
+                    free(touched);
+                    errno = EINVAL;
+                    return -1;
+                }
+            }
         }
         inputs[i].rc = 0;
         inputs[i].error_no = 0;
@@ -8471,6 +8987,18 @@ static int slotcask_bulk_mutation_transaction(BulkMutationTxn *txn) {
         errno = EINVAL;
         return -1;
     }
+    /* Validate every generation before any shard can stage payloads. */
+    for (size_t i = 0; i < txn->nshards; i++) {
+        const BulkMutationShard *shard = &txn->shards[i];
+        if (shard->kind != BULK_MUTATION_UPSERT) continue;
+        if (!shard->recs) { errno = EINVAL; return -1; }
+        for (size_t j = 0; j < shard->nrecs; j++) {
+            if (!srec_flags_valid(shard->recs[j].hdr2)) {
+                errno = EINVAL;
+                return -1;
+            }
+        }
+    }
     ids = malloc(txn->nshards * sizeof(*ids));
     if (!ids) return -1;
     for (size_t i = 0; i < txn->nshards; i++)
@@ -8520,6 +9048,8 @@ typedef struct {
        uo->new_from_old_ctx's err_buf) apart from a soft condition_not_met
        — see slotcask_upsert_with_hooks/slotcask_insert_with_hooks. */
     int hard_error;
+    /* Only owning-constructor failures pin errno across transaction cleanup. */
+    int owned_errno;
 } UpsertAdapterCtx;
 
 /* Folds check_fn + new_from_old into the bulk value_compute slot. Fires once
@@ -8531,8 +9061,39 @@ static int upsert_adapter_value_compute(const SlotcaskOldRecord *old,
     const SlotcaskUpsertOpts *uo = actx->uo;
 
     if (uo->check && uo->check(old, uo->check_ctx) == 0) return -1;
-    if (!uo->new_from_old) return 0;
-    if (!old) return -1;               /* new_from_old requires an existing record */
+    if (!uo->new_from_old && !uo->new_from_old_alloc) return 0;
+    if (!old && !(uo->new_from_old_alloc && uo->new_from_old_alloc_on_insert))
+        return -1;
+
+    if (uo->new_from_old_alloc) {
+        uint8_t *buf = NULL;
+        size_t out_vlen = 0;
+        errno = 0;
+        int rc = uo->new_from_old_alloc(old, &buf, &out_vlen,
+                                         uo->new_from_old_alloc_ctx);
+        int cause = 0;
+        if (rc != 0) cause = errno ? errno : EINVAL;
+        else if (!buf) cause = EINVAL;
+        else if (out_vlen > UINT32_MAX ||
+                 out_vlen > SIZE_MAX - 24 - rec->klen - 7) cause = EFBIG;
+        else {
+            size_t physical = slotcask_record_size_varlen(rec->klen, out_vlen);
+            if (actx->db->slot_size < 0 ||
+                physical > (size_t)actx->db->slot_size ||
+                physical > slotcask_seg_max_bytes()) cause = EFBIG;
+        }
+        if (cause) {
+            free(buf);
+            actx->hard_error = 1;
+            actx->owned_errno = cause;
+            errno = cause;
+            return -1;
+        }
+        actx->callback_buf = buf;
+        rec->value = buf;
+        rec->vlen = out_vlen;
+        return 0;
+    }
 
     size_t out_capacity = (size_t)actx->db->slot_size - 24 - rec->klen;
     uint8_t *buf = malloc(out_capacity ? out_capacity : 1);
@@ -8632,11 +9193,15 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         result->current_hdr2 = 0;
         result->current_hdr2 = 0;
     }
+    if (opts && opts->new_from_old_alloc) {
+        value = NULL;
+        vlen = 0;
+    }
     if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
 
     /* Trim value to field boundary for compact varlen storage. */
     SlotcaskTrimFn trim_fn = atomic_load_explicit(&db->trim_fn, memory_order_acquire);
-    if (trim_fn)
+    if (trim_fn && !(opts && opts->new_from_old_alloc))
         vlen = trim_fn(value, vlen, db->trim_ctx);
     if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
 
@@ -8644,6 +9209,11 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if (!opts) opts = &blank;
     if (opts->out_durability_degraded)
         *opts->out_durability_degraded = 0;
+    if ((opts->new_from_old && opts->new_from_old_alloc) ||
+        (opts->new_from_old_alloc_on_insert && !opts->new_from_old_alloc)) {
+        errno = EINVAL;
+        return -1;
+    }
 
     /* Fail loud on a missed two-phase migration: an indexed object with a
        legacy pre_commit alongside only one half of the prepare/apply pair
@@ -8680,9 +9250,10 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
        see it — the batch-amortised skip this flag otherwise enables doesn't
        apply to a window_cap=1 transaction. */
     bopts.pre_commit_needs_old = 1;
-    bopts.value_compute = (opts->check || opts->new_from_old)
+    bopts.value_compute = (opts->check || opts->new_from_old || opts->new_from_old_alloc)
                           ? upsert_adapter_value_compute : NULL;
-    bopts.value_rewrites_payload = opts->new_from_old != NULL;
+    bopts.value_rewrites_payload = opts->new_from_old != NULL ||
+                                   opts->new_from_old_alloc != NULL;
     bopts.abort_window = upsert_adapter_abort_window;
     bopts.bulk_hook_ctx = &actx;
     bopts.has_indexed_fields = opts->has_indexed_fields;
@@ -8738,7 +9309,10 @@ int slotcask_upsert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         }
         return -2;
     }
-    if (rec.status != 0) return -1;
+    if (rec.status != 0) {
+        if (actx.owned_errno) errno = actx.owned_errno;
+        return -1;
+    }
 
     if (result) {
         result->was_update = rec.was_update;
@@ -8763,10 +9337,14 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         result->current_hdr2 = 0;
         result->current_hdr2 = 0;
     }
+    if (opts && opts->new_from_old_alloc) {
+        value = NULL;
+        vlen = 0;
+    }
     if (klen > UINT16_MAX || vlen > UINT32_MAX) return -1;
 
     SlotcaskTrimFn trim_fn = atomic_load_explicit(&db->trim_fn, memory_order_acquire);
-    if (trim_fn)
+    if (trim_fn && !(opts && opts->new_from_old_alloc))
         vlen = trim_fn(value, vlen, db->trim_ctx);
     if ((size_t)24 + klen + vlen > (size_t)db->slot_size) return -1;
 
@@ -8774,6 +9352,11 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     if (!opts) opts = &blank;
     if (opts->out_durability_degraded)
         *opts->out_durability_degraded = 0;
+    if ((opts->new_from_old && opts->new_from_old_alloc) ||
+        (opts->new_from_old_alloc_on_insert && !opts->new_from_old_alloc)) {
+        errno = EINVAL;
+        return -1;
+    }
 
     /* require_existing is incompatible with INSERT-only semantics; the
        caller should route through slotcask_upsert_with_hooks for that. */
@@ -8801,9 +9384,10 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
     bopts.if_not_exists = 1;
     bopts.pre_commit = upsert_adapter_pre_commit;
     bopts.pre_commit_needs_old = 1;
-    bopts.value_compute = (opts->check || opts->new_from_old)
+    bopts.value_compute = (opts->check || opts->new_from_old || opts->new_from_old_alloc)
                           ? upsert_adapter_value_compute : NULL;
-    bopts.value_rewrites_payload = opts->new_from_old != NULL;
+    bopts.value_rewrites_payload = opts->new_from_old != NULL ||
+                                   opts->new_from_old_alloc != NULL;
     bopts.abort_window = upsert_adapter_abort_window;
     bopts.bulk_hook_ctx = &actx;
     bopts.has_indexed_fields = opts->has_indexed_fields;
@@ -8855,7 +9439,10 @@ int slotcask_insert_with_hooks(SlotcaskDb *db, int stream_id_hint,
         }
         return -2;
     }
-    if (rec.status != 0) return -1;
+    if (rec.status != 0) {
+        if (actx.owned_errno) errno = actx.owned_errno;
+        return -1;
+    }
 
     if (result) {
         result->was_update = rec.was_update;
@@ -11171,6 +11758,179 @@ int slotcask_compact_segs(SlotcaskDb *db, int *out_dropped) {
     if (out_dropped) *out_dropped = total;
     return 0;
 }
+
+/* Count the pending bitmap-remap repair markers under <data_dir>/indexes,
+   optionally filling a per-shard selection mask. `.bmfix-disabled` (the
+   escape flag) is never a marker. A marker whose suffix is 1-8 lowercase
+   hex digits naming a shard below `splits` selects that one shard; any
+   other `.bmfix-*` name (stray, hand-created, or out-of-range) selects
+   every shard — a stray file must not recreate the startup trap, and
+   rebuilding all bitmaps is still correct. out_mask == NULL (any splits)
+   only counts. Returns the marker count (0 = none), or -1 on
+   opendir/readdir error (ENOENT of indexes/ = 0 markers). */
+int slotcask_bmfix_marked_shards(const char *data_dir, int splits,
+                                 uint8_t *out_mask) {
+    char idx[PATH_MAX];
+    int n = snprintf(idx, sizeof(idx), "%s/indexes", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(idx)) return -1;
+    DIR *d = opendir(idx);
+    if (!d) return errno == ENOENT ? 0 : -1;
+    int found = 0;
+    int scan_ok = 1;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(d);
+        if (!de) {
+            if (errno != 0) scan_ok = 0;
+            break;
+        }
+        if (strncmp(de->d_name, ".bmfix-", 7) != 0) continue;
+        if (strcmp(de->d_name, ".bmfix-disabled") == 0) continue;
+        found++;
+        if (!out_mask) continue;
+        const char *sfx = de->d_name + 7;
+        size_t sl = strlen(sfx);
+        unsigned long v = 0;
+        int strict = (sl >= 1 && sl <= 8);
+        for (size_t i = 0; strict && i < sl; i++) {
+            char c = sfx[i];
+            if (c < '0' || (c > '9' && c < 'a') || c > 'f') { strict = 0; break; }
+            v = v * 16 + (unsigned long)(c <= '9' ? c - '0' : c - 'a' + 10);
+        }
+        if (strict && splits > 0 && v < (unsigned long)splits)
+            out_mask[v] = 1;
+        else
+            for (int s = 0; s < splits; s++) out_mask[s] = 1;
+    }
+    closedir(d);
+    if (!scan_ok) return -1;
+    return found;
+}
+
+/* ---- Escape flag (.bmfix-disabled) helpers ------------------------------
+   When the startup bitmap repair fails and no KFM2 commit marker is
+   pending, startup writes this flag and serves the object with bitmap
+   planning disabled until `reindex` repairs it. Empty regular file at
+   <data_dir>/indexes/.bmfix-disabled. */
+
+int slotcask_bmfix_disabled_exists(const char *data_dir) {
+    char p[PATH_MAX];
+    int n = snprintf(p, sizeof(p), "%s/indexes/.bmfix-disabled", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(p)) return -1;
+    if (access(p, F_OK) == 0) return 1;
+    return errno == ENOENT ? 0 : -1;
+}
+
+int slotcask_bmfix_disabled_write(const char *data_dir) {
+    char p[PATH_MAX], idx[PATH_MAX];
+    int n = snprintf(p, sizeof(p), "%s/indexes/.bmfix-disabled", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(p)) return -1;
+    n = snprintf(idx, sizeof(idx), "%s/indexes", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(idx)) return -1;
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    int rc = 0;
+    if (fsync(fd) != 0 && rc == 0) rc = -1;
+    if (close(fd) != 0 && rc == 0) rc = -1;
+    if (rc == 0 && fsync_dir(idx) != 0) rc = -1;
+    return rc;
+}
+
+int slotcask_bmfix_disabled_remove(const char *data_dir, int *removed) {
+    char p[PATH_MAX], idx[PATH_MAX];
+    if (removed) *removed = 0;
+    int n = snprintf(p, sizeof(p), "%s/indexes/.bmfix-disabled", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(p)) return -1;
+    n = snprintf(idx, sizeof(idx), "%s/indexes", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(idx)) return -1;
+    if (unlink(p) != 0) {
+        if (errno == ENOENT) return 0;      /* nothing to remove: *removed stays 0 */
+        return -1;
+    }
+    if (removed) *removed = 1;
+    if (fsync_dir(idx) != 0) return -1;
+    return 0;
+}
+
+/* Process-wide sticky "some object has bitmap planning disabled" gate,
+   set by bmfix_recover_all at startup and by cmd_restore when a restored
+   backup carries the flag. Never cleared within a process: while 0,
+   slotcask_bmfix_object_disabled is one relaxed load with no disk access. */
+_Atomic int g_bmfix_any_disabled;
+
+int slotcask_bmfix_object_disabled(const char *eff_root, const char *object) {
+    if (atomic_load_explicit(&g_bmfix_any_disabled, memory_order_relaxed) == 0)
+        return 0;
+    char data_dir[PATH_MAX];
+    int n = snprintf(data_dir, sizeof(data_dir), "%s/%s", eff_root, object);
+    if (n < 0 || (size_t)n >= sizeof(data_dir)) return 1;
+    /* Never change errno for callers using `errno ? errno : EIO` or
+       `errno = 0; ...; if (errno)` conventions around their own syscalls. */
+    int saved = errno;
+    int f = slotcask_bmfix_disabled_exists(data_dir);
+    errno = saved;
+    return f < 0 ? 1 : f;
+}
+
+static int bmfix_unlink_remaps(const char *idx) {
+    DIR *d = opendir(idx);
+    if (!d) return errno == ENOENT ? 0 : -1;
+    int rc = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        char fdir[PATH_MAX];
+        int n = snprintf(fdir, sizeof(fdir), "%s/%s", idx, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof(fdir)) { rc = -1; continue; }
+        DIR *fd = opendir(fdir);
+        if (!fd) continue;                         /* not a field directory */
+        struct dirent *fe;
+        while ((fe = readdir(fd)) != NULL) {
+            size_t len = strlen(fe->d_name);
+            if (len > 9 && strcmp(fe->d_name + len - 9, ".bm.remap") == 0) {
+                char p[PATH_MAX];
+                n = snprintf(p, sizeof(p), "%s/%s", fdir, fe->d_name);
+                if (n < 0 || (size_t)n >= sizeof(p)) { rc = -1; continue; }
+                if (unlink(p) != 0 && errno != ENOENT) rc = -1;
+            }
+        }
+        closedir(fd);
+    }
+    closedir(d);
+    return rc;
+}
+
+/* Remove leftover "<NNN>.bm.remap" temporaries (a crash during prepare, before
+   any marker existed). Safe at startup only. */
+int slotcask_bmfix_sweep(const char *data_dir) {
+    char idx[PATH_MAX];
+    int n = snprintf(idx, sizeof(idx), "%s/indexes", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(idx)) return -1;
+    return bmfix_unlink_remaps(idx);
+}
+
+int slotcask_bmfix_clear(const char *data_dir) {
+    char idx[PATH_MAX];
+    int n = snprintf(idx, sizeof(idx), "%s/indexes", data_dir);
+    if (n < 0 || (size_t)n >= sizeof(idx)) return -1;
+    DIR *d = opendir(idx);
+    if (!d) return errno == ENOENT ? 0 : -1;
+    int rc = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, ".bmfix-", 7) != 0) continue;
+        if (strcmp(de->d_name, ".bmfix-disabled") == 0) continue;
+        char p[PATH_MAX];
+        n = snprintf(p, sizeof(p), "%s/%s", idx, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof(p)) { rc = -1; continue; }
+        if (unlink(p) != 0 && errno != ENOENT) rc = -1;
+    }
+    closedir(d);
+    if (bmfix_unlink_remaps(idx) != 0) rc = -1;
+    if (fsync_dir(idx) != 0) rc = -1;
+    return rc;
+}
+
 /* Rebuild every kf shard in place to drop tombstones (flag=2 entries).
    Reuses the resplit machinery with new_cap = current_cap, so the rebuilt
    kf has total = live count and deleted = 0. Holds each shard's wrlock
@@ -11192,4 +11952,483 @@ int slotcask_compact_kf(SlotcaskDb *db) {
         if (rc != 0) return -1;
     }
     return 0;
+}
+
+
+/* Ordinary checked reads use exactly the existing keyfile -> segment cache
+ * read-handle order. The caller already holds the matching object read lock;
+ * no writer gate/reservation is acquired and no global snapshot is promised. */
+static int slotcask_emit_checked(SlotcaskDb *db,const SlotcaskKfEntry *entry,
+    SlotcaskScanCb callback,void *ctx){
+    if(entry->stream_id>=db->num_streams){errno=EUCLEAN;return -1;}
+    char path[PATH_MAX];seg_path_for(path,db->data_dir,entry->stream_id,entry->file_id);
+    SlotcaskSegHandle segment={.slot=-1,.fd=-1};
+    if(segcache_acquire(&segment,path,0,0,0))return -1;
+    int rc=0;
+    if(entry->offset>segment.map_size||segment.map_size-entry->offset<24){errno=EUCLEAN;rc=-1;}
+    else{
+        const uint8_t *record=segment.map+entry->offset;
+        uint16_t keylen=seg_rec_klen(record);uint32_t value_len=seg_rec_vlen(record);
+        size_t encoded=24u+(size_t)keylen+(size_t)value_len;
+        size_t padded=slotcask_record_size_varlen(keylen,value_len);
+        if(encoded>(size_t)db->slot_size||padded>(size_t)db->slot_size||
+           padded>segment.map_size-entry->offset||!seg_rec_live_with_hash(record,entry->hash)){
+            errno=EUCLEAN;rc=-1;
+        }else if(callback(entry->hash,record+24,keylen,record+24+keylen,value_len,record[19],ctx))rc=1;
+    }
+    int saved=errno;segcache_release(&segment);errno=saved;return rc;
+}
+int slotcask_walk_live_skip_checked(SlotcaskDb *db, int64_t skip_n,
+    SlotcaskScanCb callback, void *ctx) {
+    if (!db || !callback || db->num_shards < 1) { errno = EINVAL; return -1; }
+    for (int shard = 0; shard < db->num_shards; shard++) {
+        char path[PATH_MAX];
+        kf_path_for(path, db->data_dir, shard);
+        SlotcaskKfHandle keyfile;
+        if (kfcache_acquire(&keyfile, path, db->slots_per_shard, 0)) return -1;
+        int rc = 0;
+        for (size_t slot = 0; slot < keyfile.capacity; slot++) {
+            const SlotcaskKfEntry *entry = &keyfile.map[slot];
+            uint8_t flag = __atomic_load_n(&entry->flag, __ATOMIC_ACQUIRE);
+            if (!flag || flag == 2) continue;
+            if (flag != 1) { errno = EUCLEAN; rc = -1; break; }
+            if (skip_n > 0) { skip_n--; continue; }
+            rc = slotcask_emit_checked(db, entry, callback, ctx);
+            if (rc) break;
+        }
+        int saved = errno;
+        kfcache_release(&keyfile);
+        errno = saved;
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+int slotcask_walk_live_checked(SlotcaskDb *db, SlotcaskScanCb callback, void *ctx) {
+    return slotcask_walk_live_skip_checked(db, 0, callback, ctx);
+}
+int slotcask_lookup_by_hash_checked(SlotcaskDb *db,const uint8_t hash[16],
+    SlotcaskScanCb callback,void *ctx){
+    if(!db||!hash||!callback||db->num_shards<1){errno=EINVAL;return -1;}
+    int shard=shard_for_hash(hash,db->num_shards);char path[PATH_MAX];
+    kf_path_for(path,db->data_dir,shard);SlotcaskKfHandle keyfile;
+    SlotRef *ref=db->kf_slot_refs?&db->kf_slot_refs[shard]:NULL;
+    if(kfcache_acquire_direct(&keyfile,ref,path,db->slots_per_shard,db,shard))return -1;
+    int rc=0;size_t start=kf_slot_for(hash,keyfile.capacity);
+    for(size_t i=0;i<keyfile.capacity;i++){
+        const SlotcaskKfEntry *entry=&keyfile.map[(start+i)%keyfile.capacity];
+        uint8_t flag=__atomic_load_n(&entry->flag,__ATOMIC_ACQUIRE);
+        if(!flag)break;
+        if(flag==2)continue;
+        if(flag!=1){errno=EUCLEAN;rc=-1;break;}
+        if(memcmp(entry->hash,hash,16))continue;
+        rc=slotcask_emit_checked(db,entry,callback,ctx);if(rc)break;
+    }
+    int saved=errno;kfcache_release(&keyfile);errno=saved;return rc;
+}
+
+/* Checked probes distinguish a valid missing/tombstoned key from an
+ * invalid flag anywhere in the traversed probe chain. The caller owns the
+ * existing keyfile reader for the whole probe. */
+static int kf_lookup_no_verify_checked(SlotcaskKfHandle *kh,
+    const uint8_t hash[16],uint8_t *flag_out,uint8_t *stream_id_out,
+    uint16_t *file_id_out,uint32_t *offset_out,size_t *slot_out){
+    size_t start=kf_slot_for(hash,kh->capacity);
+    for(size_t i=0;i<kh->capacity;i++){
+        size_t slot=(start+i)%kh->capacity;
+        const SlotcaskKfEntry *entry=&kh->map[slot];
+        uint8_t flag=__atomic_load_n(&entry->flag,__ATOMIC_ACQUIRE);
+        if(!flag)return -1;
+        if(flag!=1&&flag!=2){errno=EUCLEAN;return -2;}
+        if(memcmp(entry->hash,hash,16))continue;
+        if(flag==2)return -1;
+        *flag_out=flag;*stream_id_out=entry->stream_id;
+        *file_id_out=entry->file_id;*offset_out=entry->offset;
+        *slot_out=slot;return 0;
+    }
+    return -1;
+}
+
+/* Checked bulk readers preserve the existing bucket/resolve/revalidation and
+ * dispatch patterns. Error status and bounds are explicit; no lock/gate or
+ * successful read-handle lifetime changes. Existing public implementations
+ * above remain byte-identical for consumers owned by later integrations. */
+int slotcask_bulk_lookup_in_kfshard_checked(SlotcaskDb *db, int kf_shard_id,
+                                      SlotcaskBulkRec *recs, size_t n) {
+    if(n==0)return 0;
+    if(!db||!recs||n>INT_MAX||kf_shard_id<0||kf_shard_id>=db->num_shards){errno=EINVAL;return -1;}
+    int failed=0;
+
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, db->data_dir, kf_shard_id);
+    SlotcaskKfHandle kh;
+    SlotRef *kf_ref = (db->kf_slot_refs) ? &db->kf_slot_refs[kf_shard_id] : NULL;
+    if (kfcache_acquire_direct(&kh, kf_ref, kf_path,
+                                db->slots_per_shard, db, kf_shard_id) != 0) return -1;
+
+    SlotcaskBulkLookupState *st = calloc(n, sizeof(SlotcaskBulkLookupState));
+    if (!st) { kfcache_release(&kh); return -1; }
+
+    /* Phase 1: probe-only lookup under one rdlock. */
+    for (size_t i = 0; i < n; i++) {
+        SlotcaskBulkRec *r = &recs[i];
+        r->status = 0;
+        r->was_update = 0;
+        if (r->klen > UINT16_MAX) { r->status = -1; continue; }
+        compute_hash(r->key, r->klen, st[i].hash);
+        uint8_t flag = 0;
+        size_t slot;
+        int rc = kf_lookup_no_verify_checked(&kh, st[i].hash, &flag,
+                                      &st[i].sid, &st[i].fid, &st[i].off, &slot);
+        if(rc==-2){r->status=-1;failed=EUCLEAN;continue;}
+        if (rc < 0) { r->status = -2; continue; }
+        st[i].kf_found = 1;
+    }
+    /* The kf reader stays held through phase 2: the window contract
+       ("Kf read handle stays live until the segment record has been
+       checked against its hash/key and copied into caller-owned
+       memory") requires it. Released here, a window could tombstone
+       (T) and re-emit (P) this slot while phase 2 reads it under an
+       independent segcache rdlock — plain-vs-plain, zero common lock.
+       Same discipline as slotcask_get and kf_reval_fetch_one. */
+#ifdef TEST_BUILD
+    /* Regression hook (docs/plans/2026-08-28-eliminate-tsan-supp.md
+       Task B1): parks the caller after the probe phase so a test can
+       run a full window's worth of slot churn in the gap. Post-fix the
+       kf reader is still held here, so any window T step in the gap
+       blocks — which is exactly the assertion the test makes. */
+    if (atomic_load(&g_shard_test_bulk_lookup_gap) &&
+        atomic_fetch_add(&g_shard_test_bulk_lookup_gap_hit, 1) == 0) {
+        while (!atomic_load(&g_shard_test_bulk_lookup_gap_release))
+            nanosleep(&(struct timespec){0, 1000000L}, NULL);
+    }
+#endif
+
+    /* Phase 2: batched verify_stored_key — sort kf-hits by (sid, fid),
+       take segcache rdlock once per unique file, verify each record
+       under the held handle. Records that fail verify (hash collision
+       on a different stored key) get status=-2. */
+    int *vidx = malloc(n * sizeof(int));
+    if (vidx) {
+        int vcount = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (recs[i].status == 0 && st[i].kf_found) vidx[vcount++] = (int)i;
+        }
+        for (int a = 1; a < vcount; a++) {
+            int tmp = vidx[a];
+            uint8_t  ta_sid = st[tmp].sid; uint16_t ta_fid = st[tmp].fid;
+            int b = a - 1;
+            while (b >= 0) {
+                int bi = vidx[b];
+                if (st[bi].sid < ta_sid ||
+                    (st[bi].sid == ta_sid && st[bi].fid <= ta_fid)) break;
+                vidx[b + 1] = vidx[b];
+                b--;
+            }
+            vidx[b + 1] = tmp;
+        }
+        int k = 0;
+        while (k < vcount) {
+            int run_end = k + 1;
+            uint8_t  sid = st[vidx[k]].sid;
+            uint16_t fid = st[vidx[k]].fid;
+            while (run_end < vcount &&
+                   st[vidx[run_end]].sid == sid &&
+                   st[vidx[run_end]].fid == fid)
+                run_end++;
+            char path[PATH_MAX];
+            if(sid>=db->num_streams){failed=EILSEQ;for(int j=k;j<run_end;j++)recs[vidx[j]].status=-1;k=run_end;continue;}
+            seg_path_for(path, db->data_dir, sid, fid);
+            SlotcaskSegHandle h;
+            SlotRef *seg_ref = seg_ref_for(db, (int)sid, (uint32_t)fid);
+            if (segcache_acquire_direct(&h, seg_ref, path) != 0) {
+                failed=errno?errno:EIO;
+                for (int j = k; j < run_end; j++) recs[vidx[j]].status = -1;
+                k = run_end;
+                continue;
+            }
+            for (int j = k; j < run_end; j++) {
+                int i = vidx[j];
+                SlotcaskBulkRec *r = &recs[i];
+                if(st[i].sid>=db->num_streams||st[i].off>h.map_size||h.map_size-st[i].off<24){r->status=-1;failed=EILSEQ;continue;}
+                const uint8_t *rec = h.map + st[i].off;
+                size_t physical=slotcask_record_size_varlen(seg_rec_klen(rec),seg_rec_vlen(rec));
+                if(physical>(size_t)db->slot_size||physical>h.map_size-st[i].off||!seg_rec_live_with_hash(rec,st[i].hash)){
+                    r->status=-1;failed=EILSEQ;continue;
+                }
+                if (__atomic_load_n(&rec[18], __ATOMIC_ACQUIRE) != 1) { r->status = -2; continue; }
+                uint16_t k_stored = seg_rec_klen(rec);
+                if (k_stored != r->klen) { r->status = -2; continue; }
+                if (memcmp(rec + 24, r->key, r->klen) != 0) { r->status = -2; continue; }
+                st[i].verified = 1;
+            }
+            segcache_release(&h);
+            k = run_end;
+        }
+        free(vidx);
+    } else {
+        failed=ENOMEM;
+    }
+
+    kfcache_release(&kh);
+    free(st);
+    if(failed){errno=failed;return -1;}return 0;
+}
+static SlotcaskResolvedRec *slotcask_bulk_resolve_hashes_checked(SlotcaskDb *db,
+                                                    const uint8_t (*hashes)[16],
+                                                    size_t n,
+                                                    size_t *out_n) {
+    errno=0;
+    if (n == 0 || !out_n) { if (out_n) *out_n = 0; return NULL; }
+
+    SlotcaskResolvedRec *resolved = calloc(n, sizeof(SlotcaskResolvedRec));
+    if (!resolved) { *out_n = 0; return NULL; }
+
+    size_t resolved_n = 0;int failure=0;
+    int nshards = db->num_shards;
+
+    /* Pass 1: count hashes per KF shard */
+    size_t *per_shard_count = calloc((size_t)nshards, sizeof(size_t));
+    if (!per_shard_count) { free(resolved); *out_n = 0; return NULL; }
+
+    for (size_t i = 0; i < n; i++) {
+        int sid = shard_for_hash(hashes[i], nshards);
+        per_shard_count[sid]++;
+    }
+
+    /* Pass 2: allocate per-shard index arrays */
+    size_t **per_shard_idxs = calloc((size_t)nshards, sizeof(size_t *));
+    size_t *per_shard_pos   = calloc((size_t)nshards, sizeof(size_t));
+    if (!per_shard_idxs || !per_shard_pos) {
+        free(per_shard_count);
+        free(per_shard_idxs);
+        free(per_shard_pos);
+        free(resolved);
+        *out_n = 0;
+        return NULL;
+    }
+
+    int alloc_ok = 1;
+    for (int s = 0; s < nshards; s++) {
+        if (per_shard_count[s] > 0) {
+            per_shard_idxs[s] = malloc(per_shard_count[s] * sizeof(size_t));
+            if (!per_shard_idxs[s]) { alloc_ok = 0; break; }
+        }
+    }
+    if (!alloc_ok) {
+        for (int s = 0; s < nshards; s++) free(per_shard_idxs[s]);
+        free(per_shard_idxs);
+        free(per_shard_pos);
+        free(per_shard_count);
+        free(resolved);
+        *out_n = 0;
+        return NULL;
+    }
+
+    /* Pass 3: fill per-shard index arrays */
+    for (size_t i = 0; i < n; i++) {
+        int sid = shard_for_hash(hashes[i], nshards);
+        per_shard_idxs[sid][per_shard_pos[sid]++] = i;
+    }
+
+    /* Pass 4: for each non-empty shard, acquire KF, probe all its hashes */
+    char kf_path[PATH_MAX];
+    for (int s = 0; s < nshards; s++) {
+        size_t cnt = per_shard_count[s];
+        if (cnt == 0) continue;
+
+        kf_path_for(kf_path, db->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 0) != 0){failure=errno?errno:EIO;break;}
+
+        for (size_t j = 0; j < cnt; j++) {
+            size_t hash_idx = per_shard_idxs[s][j];
+            uint8_t flag = 0;
+            uint8_t sid;
+            uint16_t fid;
+            uint32_t off;
+            size_t slot;
+            int rc = kf_lookup_no_verify_checked(&kh, hashes[hash_idx], &flag,
+                                          &sid, &fid, &off, &slot);
+            if(rc==-2){failure=EUCLEAN;break;}
+            if (rc == 0) {
+                SlotcaskResolvedRec *rr = &resolved[resolved_n++];
+                memcpy(rr->hash, hashes[hash_idx], 16);
+                rr->sid = sid;
+                rr->fid = fid;
+                rr->off = off;
+            }
+        }
+        kfcache_release(&kh);
+        if(failure)break;
+    }
+
+    /* Cleanup per-shard structures */
+    for (int s = 0; s < nshards; s++) free(per_shard_idxs[s]);
+    free(per_shard_idxs);
+    free(per_shard_pos);
+    free(per_shard_count);
+
+    if(failure){free(resolved);*out_n=0;errno=failure;return NULL;}
+    *out_n = resolved_n;
+    if (resolved_n == 0) { free(resolved); return NULL; }
+    return resolved;
+}
+typedef struct {
+    SlotcaskDb *db;SlotcaskResolvedRec *recs;size_t start,count;int kf_shard;
+    SlotcaskScanCb cb;void *ctx;int error;
+} CheckedRevalFetchArg;
+static void checked_reval_fetch_one(CheckedRevalFetchArg *fa) {
+    char kf_path[PATH_MAX];
+    kf_path_for(kf_path, fa->db->data_dir, fa->kf_shard);
+    SlotcaskKfHandle kh;
+    if (kfcache_acquire(&kh, kf_path, fa->db->slots_per_shard, 0) != 0) {
+        fa->error=errno?errno:EIO;
+        /* Whole partition unreadable — retire every record in it. */
+        for (size_t i = 0; i < fa->count; i++)
+            fa->recs[fa->start + i].sid = 0xFF;
+        return;
+    }
+
+    for (size_t i = 0; i < fa->count; i++) {
+        SlotcaskResolvedRec *r = &fa->recs[fa->start + i];
+        uint8_t flag = 0, sid = 0;
+        uint16_t fid = 0;
+        uint32_t off = 0;
+        size_t slot = 0;
+        int rc=kf_lookup_no_verify_checked(&kh,r->hash,&flag,&sid,&fid,&off,&slot);
+        if(rc==-2){fa->error=EUCLEAN;break;}
+        if (rc != 0 || flag != 1 || sid != r->sid || fid != r->fid || off != r->off)
+            r->sid = 0xFF;  /* repointed or gone since resolve */
+    }
+    if(fa->error){kfcache_release(&kh);return;}
+
+    /* Compact survivors within the slice (disjoint per partition). */
+    size_t live_n = 0;
+    for (size_t i = 0; i < fa->count; i++) {
+        SlotcaskResolvedRec *r = &fa->recs[fa->start + i];
+        if (r->sid != 0xFF) fa->recs[fa->start + live_n++] = *r;
+    }
+
+    if (live_n > 0) {
+        qsort(&fa->recs[fa->start], live_n, sizeof(SlotcaskResolvedRec),
+              compare_sid_fid_off);
+        /* Copy every survivor's bytes under the STILL-HELD reader. */
+        size_t run_start = 0;
+        for (size_t i = 0; i < live_n; i++) {
+            int last = (i == live_n - 1);
+            if (!last &&
+                fa->recs[fa->start + i].sid ==
+                    fa->recs[fa->start + i + 1].sid &&
+                fa->recs[fa->start + i].fid ==
+                    fa->recs[fa->start + i + 1].fid)
+                continue;
+            char seg_path[PATH_MAX];
+            SlotcaskSegHandle h;
+            if(fa->recs[fa->start+run_start].sid>=fa->db->num_streams){fa->error=EILSEQ;break;}
+            seg_path_for(seg_path, fa->db->data_dir,
+                         fa->recs[fa->start + run_start].sid,
+                         fa->recs[fa->start + run_start].fid);
+            if (segcache_acquire(&h, seg_path, 0, 0, 0) == 0) {
+                for (size_t j = run_start; j <= i; j++) {
+                    const SlotcaskResolvedRec *r =
+                        &fa->recs[fa->start + j];
+                    if(r->sid>=fa->db->num_streams||r->off>h.map_size||h.map_size-r->off<24){fa->error=EILSEQ;break;}
+                    const uint8_t *rec = h.map + r->off;
+                    size_t physical=slotcask_record_size_varlen(seg_rec_klen(rec),seg_rec_vlen(rec));
+                    if(physical>(size_t)fa->db->slot_size||physical>h.map_size-r->off||!seg_rec_live_with_hash(rec,r->hash)){fa->error=EILSEQ;break;}
+                    uint16_t klen = seg_rec_klen(rec);
+                    uint32_t vlen = seg_rec_vlen(rec);
+                    if (fa->cb(r->hash, rec + 24, klen,
+                               rec + 24 + klen, vlen, rec[19], fa->ctx) != 0)
+                        break;
+                }
+                segcache_release(&h);
+            }else fa->error=errno?errno:EIO;
+            if(fa->error)break;
+            run_start = i + 1;
+        }
+    }
+
+    kfcache_release(&kh);
+}
+static void *checked_reval_fetch_worker(void *arg){checked_reval_fetch_one(arg);return NULL;}
+int slotcask_bulk_fetch_resolved_checked(SlotcaskDb *db,
+                                  SlotcaskResolvedRec *recs,
+                                  size_t n,
+                                  void *ctx,
+                                  SlotcaskScanCb cb) {
+    if (n == 0 || !cb) return 0;
+
+    /* Partition in place by KF shard: single pass with an index-keyed
+       bucket layout (avoids a comparator that needs db->num_shards). */
+    int nshards = db->num_shards;
+    size_t *part_start = calloc((size_t)nshards, sizeof(size_t));
+    size_t *part_count = calloc((size_t)nshards, sizeof(size_t));
+    if (!part_start || !part_count) {
+        free(part_start); free(part_count); return -1;
+    }
+    for (size_t i = 0; i < n; i++)
+        part_count[shard_for_hash(recs[i].hash, nshards)]++;
+    size_t acc = 0;
+    for (int s = 0; s < nshards; s++) {
+        part_start[s] = acc;
+        acc += part_count[s];
+    }
+    SlotcaskResolvedRec *sorted = malloc(n * sizeof(SlotcaskResolvedRec));
+    size_t *fill = calloc((size_t)nshards, sizeof(size_t));
+    if (!sorted || !fill) {
+        free(part_start); free(part_count); free(fill); free(sorted);
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        int s = shard_for_hash(recs[i].hash, nshards);
+        sorted[part_start[s] + fill[s]++] = recs[i];
+    }
+    free(fill);
+
+    /* Dispatch one reval+fetch pipeline per non-empty partition. */
+    int nparts = 0;
+    for (int s = 0; s < nshards; s++)
+        if (part_count[s] > 0) nparts++;
+    if (nparts > 0) {
+        CheckedRevalFetchArg *fargs = calloc((size_t)nparts, sizeof(CheckedRevalFetchArg));
+        if (!fargs) {
+            free(part_start); free(part_count); free(sorted);
+            return -1;
+        }
+        int fi = 0;
+        for (int s = 0; s < nshards; s++) {
+            if (part_count[s] == 0) continue;
+            fargs[fi].db = db;
+            fargs[fi].recs = sorted;
+            fargs[fi].start = part_start[s];
+            fargs[fi].count = part_count[s];
+            fargs[fi].kf_shard = s;
+            fargs[fi].cb = cb;
+            fargs[fi].ctx = ctx;
+            fi++;
+        }
+        if (nparts <= 3) {
+            for (int i = 0; i < nparts; i++) checked_reval_fetch_one(&fargs[i]);
+        } else {
+            parallel_for_io(checked_reval_fetch_worker, fargs, nparts,
+                            sizeof(CheckedRevalFetchArg));
+        }
+        int failure=0;for(int i=0;i<nparts;i++)if(fargs[i].error){failure=fargs[i].error;break;}
+        free(fargs);
+        if(failure){free(part_start);free(part_count);free(sorted);errno=failure;return -1;}
+    }
+    free(part_start);
+    free(part_count);
+    free(sorted);
+    return 0;
+}
+int slotcask_bulk_resolve_and_fetch_checked(SlotcaskDb *db,const uint8_t (*hashes)[16],size_t n,void *ctx,SlotcaskScanCb cb){
+    if(!db||(!hashes&&n)||!cb){errno=EINVAL;return -1;}
+    size_t count=0;errno=0;
+    SlotcaskResolvedRec *resolved=slotcask_bulk_resolve_hashes_checked(db,hashes,n,&count);
+    if(!resolved){int error=errno;return error?-1:0;}
+    int rc=slotcask_bulk_fetch_resolved_checked(db,resolved,count,ctx,cb);int error=errno;
+    free(resolved);errno=error;return rc;
 }

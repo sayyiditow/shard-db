@@ -388,6 +388,50 @@ int  slotcask_bucket_for(uint32_t capacity, int max_slot_size);
    file). Holds each shard's wrlock for the rebuild duration. */
 int  slotcask_compact_kf(SlotcaskDb *db);
 
+/* Path of the bitmap file for (object, field, kf shard) as used by the bulk chain commit flush.
+   Must equal bm_build_path() for the same inputs. Exposed for tests. */
+void req_bitmap_file_path(char *out, size_t outlen,
+                          const char *db_root, const char *object,
+                          const char *field, int shard_idx);
+
+/* Bitmap-remap crash markers (<data_dir>/indexes/.bmfix-NNN, see slotcask.c).
+   marked_shards: count the pending markers, optionally filling a per-shard
+   selection mask (out_mask NULL = count only; splits <= 0 with a mask set
+   leaves the mask untouched). `.bmfix-disabled` is never a marker.
+   A 1-8-lowercase-hex suffix below splits selects that shard; any other
+   `.bmfix-*` name selects every shard. Returns the count (0 = none),
+   -1 on opendir/readdir error, 0 for a missing indexes/ dir.
+   clear: remove every marker (never the escape flag) and every leftover
+   "<NNN>.bm.remap" temporary (call only after the object's indexes were
+   rebuilt). 0 / -1. */
+int  slotcask_bmfix_marked_shards(const char *data_dir, int splits,
+                                  uint8_t *out_mask);
+int  slotcask_bmfix_clear(const char *data_dir);
+/* Remove leftover "<NNN>.bm.remap" temporaries only (startup, no marker). 0 / -1. */
+int  slotcask_bmfix_sweep(const char *data_dir);
+
+/* Escape flag (<data_dir>/indexes/.bmfix-disabled, empty file): written by
+   startup when the bitmap repair failed and no KFM2 commit marker is
+   pending; while present the object serves with bitmap planning disabled
+   and record mutations refused until `reindex` heals it.
+   exists: 1 / 0 / -1 on error. write: create/truncate + fsync file and
+   indexes/ dir, 0 / -1 (errno preserved). remove: unlink + fsync dir;
+   ENOENT is 0 with *removed = 0; *removed = 1 when a file was unlinked
+   (removed may be NULL). */
+int  slotcask_bmfix_disabled_exists(const char *data_dir);
+int  slotcask_bmfix_disabled_write(const char *data_dir);
+int  slotcask_bmfix_disabled_remove(const char *data_dir, int *removed);
+/* Sticky process-wide gate (never cleared within a process): 0 = no object
+   anywhere is disabled, so the check is one relaxed load with no disk
+   access; otherwise the per-object flag's existence. -1 (unreadable flag)
+   counts as disabled — a stuck flag only keeps the object read-only with
+   bitmaps off, which is always correct. Saves/restores errno. */
+extern _Atomic int g_bmfix_any_disabled;
+int  slotcask_bmfix_object_disabled(const char *eff_root, const char *object);
+/* fsync a directory file itself (open O_RDONLY|O_DIRECTORY, fsync).
+   0 / -1 with errno preserved. */
+int  fsync_dir(const char *dir_path);
+
 /* ============================================================ Two-phase bulk fetch
  *
  * Resolved record location — output of phase 1 KF probe.
@@ -409,7 +453,7 @@ int slotcask_get(SlotcaskDb *db,
                  void **val_out, size_t *vlen_out);
 
 /* Same read, also surfacing the record's generation byte (segment header
-   byte 19: SREC_FLAG_NULLMAP or 0). out_hdr2 may be NULL. */
+   byte 19: 0, NULLMAP, or PACKED|NULLMAP). out_hdr2 may be NULL. */
 int slotcask_get_ex(SlotcaskDb *db,
                     const void *key, size_t klen,
                     void **val_out, size_t *vlen_out,
@@ -475,7 +519,8 @@ int update_compose_new_from_old(const struct TypedSchema *ts,
                                 const SlotcaskOldRecord *old,
                                 uint8_t *out_buf,
                                 char *const *field_vals,
-                                const uint8_t *field_null);
+                                const uint8_t *field_null,
+                                char *err, size_t errsz);
 /* auto_update stamp shared by single and bulk update: writes now() at the
    nullmap-prefixed destination and clears the field's NULL bit — a stamp
    materializes a value, so an auto_update field never carries NULL.
@@ -516,6 +561,28 @@ typedef int (*slotcask_new_from_old_fn)(const SlotcaskOldRecord *old,
                                          size_t out_capacity,
                                          size_t *out_vlen,
                                          void *ctx);
+
+/* Optional owning alternative to new_from_old. The callback executes once
+   against lock-protected OLD, after the existing condition gates and before
+   segment reservation. It must not perform network I/O or database reentry.
+   Slotcask initializes *out_value=NULL and *out_vlen=0. On success return 0
+   with a non-NULL malloc/free-compatible buffer, including a zero-length value.
+   On every return Slotcask owns any non-NULL *out_value: it frees rejected
+   partial output and retains accepted output until the transaction and all
+   hooks finish. Output must not alias OLD, schema storage or caller input.
+   The buffer contains final actual bytes: neither input nor output is passed
+   to trim_fn in this mode. The supplied value/vlen are ignored. Generation
+   remains opts.record_hdr2; a constructor cannot change it.
+   Nonzero return is a hard error, not condition_not_met. Set errno for a
+   specific cause; zero errno falls back to EINVAL. Invalid success output is
+   EINVAL; physical slot/uint32/segment overflow is EFBIG, checked before write.
+   Missing OLD does not invoke the constructor unless the explicit
+   new_from_old_alloc_on_insert option is set. Conditions always run first.
+   new_from_old and new_from_old_alloc are mutually exclusive.
+   This internal hook does not activate packed schemas or convert consumers. */
+typedef int (*slotcask_new_from_old_alloc_fn)(const SlotcaskOldRecord *old,
+                                             uint8_t **out_value,
+                                             size_t *out_vlen, void *ctx);
 
 /* Return 0 to commit; non-zero to abort. NULL = always commit. */
 typedef int (*slotcask_pre_commit_fn)(const SlotcaskOldRecord *old,
@@ -573,6 +640,14 @@ typedef struct {
        upsert reads under the kf-shard wrlock. NULL = existing behavior. */
     slotcask_new_from_old_fn  new_from_old;
     void                     *new_from_old_ctx;
+    /* Owning actual-sized alternative; see slotcask_new_from_old_alloc_fn.
+       Existing callers leave both fields NULL. No persisted layout change. */
+    slotcask_new_from_old_alloc_fn new_from_old_alloc;
+    void                         *new_from_old_alloc_ctx;
+    /* Allow this owning callback on a fresh key with old == NULL. Built-in
+       if_not_exists/require_existing/check gates still run first. Invalid
+       without new_from_old_alloc. Zero preserves the OLD-required contract. */
+    int                           new_from_old_alloc_on_insert;
     slotcask_pre_commit_fn    pre_commit;
     void                     *pre_commit_ctx;
     /* Two-phase hooks — required together for a fresh indexed insert that
@@ -601,9 +676,10 @@ typedef struct {
        converged synchronously. The caller must return the distinct pending
        outcome; it must not report a successful mutation. */
     int                      *out_durability_degraded;
-    /* Segment header byte 19 for the NEW record (SREC_FLAG_NULLMAP when
-       the value was produced by the nullmap encoders). Zero-init = legacy
-       generation. The bulk primitive copies it to the record header. */
+    /* Segment header byte 19 for the NEW record: 0 for legacy, NULLMAP
+       for current typed encoders, NULLMAP|PACKED only for validated packed
+       payloads. The codec is inactive in public object creation; recognizing
+       transport flags does not publish or activate a packed schema. */
     uint8_t                   record_hdr2;
 } SlotcaskUpsertOpts;
 
@@ -638,7 +714,7 @@ typedef struct {
        Lifetime: caller owns the buffer; must outlive the bulk call. */
     const void *old_value;
     size_t      old_vlen;
-    /* Segment header byte 19 for the NEW record (SREC_FLAG_NULLMAP or 0)
+    /* Segment header byte 19 for the NEW record (0, NULLMAP, or PACKED|NULLMAP)
        and for a caller-provided old_value. Zero-init = legacy. */
     uint8_t     hdr2;
     uint8_t     old_hdr2;
@@ -1111,7 +1187,7 @@ void slotcask_registry_shutdown(void);
  */
 
 /* cb returns 0 to continue, 1 to stop the walk early. hdr2 = segment
-   record header byte 19 (SREC_FLAG_NULLMAP generation flag, 0 = legacy). */
+   record header byte 19 (generation flags: 0, NULLMAP, or PACKED|NULLMAP). */
 typedef int (*SlotcaskScanCb)(const uint8_t hash16[16],
                                const void *key, size_t klen,
                                const void *value, size_t vlen,
@@ -1130,6 +1206,19 @@ int slotcask_validate_live_refs(SlotcaskDb *db, uint64_t *out_invalid);
    stop, -1 on any unreadable or invalid live reference. Does not
    silently skip. */
 int slotcask_walk_live_strict(SlotcaskDb *db, SlotcaskScanCb cb, void *ctx);
+/* Checked ordinary-reader counterparts. Use the existing per-shard cache read
+ * handles (no writer gate/reservation, no new lock/order/global snapshot).
+ * Caller pins matching registry/schema and holds the object read lock.
+ * Callbacks borrow the current record while KF/segment handles remain live;
+ * validate/render bounded owned output only, never perform client I/O or
+ * nested storage/pool work. Returns 0 complete/miss, 1 callback stop, -1 invalid
+ * or unreadable reference. Cache handles are released on every return path. */
+int slotcask_walk_live_checked(SlotcaskDb *db,SlotcaskScanCb cb,void *ctx);
+/* Skip live keyfile entries before accessing segments; validate emitted records. */
+int slotcask_walk_live_skip_checked(SlotcaskDb *db, int64_t skip_n,
+    SlotcaskScanCb cb, void *ctx);
+int slotcask_lookup_by_hash_checked(SlotcaskDb *db,const uint8_t hash[16],SlotcaskScanCb cb,void *ctx);
+
 
 /* Walk every live (flag=1) record. Parallelized across keyfile shards
    internally; cb may run on multiple threads — caller's ctx is responsible
@@ -1214,7 +1303,7 @@ int64_t slotcask_count_live(SlotcaskDb *db);
    slotcask_lookup_by_hash, never skips an unreadable live reference:
    any validation failure is -1 (unproven), never a miss. Caller holds
    the shared object lock and every writer gate (Task 4). Sole caller is
-   query.c's guard_has_other. */
+   query.c's guard_has_other and the private packed CSV multi-read backend. */
 int slotcask_guard_lookup(SlotcaskDb *db, const uint8_t hash16[16],
                           SlotcaskScanCb cb, void *ctx);
 
@@ -1266,3 +1355,8 @@ size_t kf_slot_for(const uint8_t hash[16], size_t cap);
 void kf_path_for(char out[PATH_MAX], const char *data_dir, int shard_id);
 
 #endif
+
+/* Checked bulk counterparts keep existing shard/segment batching and pool
+ * dispatch, with explicit allocation/unreadable-reference failure status. */
+int slotcask_bulk_lookup_in_kfshard_checked(SlotcaskDb*,int,SlotcaskBulkRec*,size_t);
+int slotcask_bulk_resolve_and_fetch_checked(SlotcaskDb*,const uint8_t (*)[16],size_t,void*,SlotcaskScanCb);

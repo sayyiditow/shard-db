@@ -32,7 +32,7 @@ static int test_not_null_updates_run(void) {
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"u1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"u1\","
         "\"splits\":8,\"max_key\":32,"
         "\"fields\":[\"name:varchar:16\",\"amount:numeric:18,2:not_null\","
                     "\"uid:uuid:not_null\",\"req:int:not_null\"]}", &resp);
@@ -153,7 +153,7 @@ static int test_not_null_updates_run(void) {
     /* 5. a tombstoned field's :not_null spec is inert — every update
           path ignores a null written to a removed field. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"u2\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"u2\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"x:int:not_null\",\"n:int\"]}", &resp);
     ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"error\"") == NULL, "create u2");

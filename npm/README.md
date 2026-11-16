@@ -56,6 +56,17 @@ db.close()
 
 `query()` returns a `Promise<string>` — queries run on worker threads so the event loop is never blocked.
 
+### Exact numerics and long strings
+
+`query()` resolves to the **raw response text**. `numeric` and `currency` values are emitted as exact JSON number tokens
+(`1234567890123456.1234567890`, `-98765432109876543210.123456789012345678`) and bare `varchar` values can be up to 4 MiB.
+`JSON.parse()` turns a number token into an IEEE-754 double and silently drops digits, so for money:
+
+- read the token from the raw text (or use a parser with a lossless number/BigInt hook) instead of `JSON.parse(...)`, or
+- project the field as a string where your client allows it.
+
+`npm/test/precision.js` demonstrates the exact round trip and asserts that `JSON.parse()` is lossy for a 26-digit decimal.
+
 ## CRUD
 
 ```js
@@ -255,3 +266,29 @@ LOG_LEVEL=3          # 1=ERROR 2=WARN 3=INFO 4=DEBUG
 - [GitHub](https://github.com/sayyiditow/shard-db)
 - [Full documentation](https://github.com/sayyiditow/shard-db/tree/main/docs)
 - [Changelog](https://github.com/sayyiditow/shard-db/blob/main/CHANGELOG.md)
+
+### Exact decimal and CSV values
+
+`query()` preserves response text. For finance fields, send numeric literals as
+strings (for example `"1234567890123456.1234567890"`) and use a lossless JSON
+parser that preserves number tokens when reading. JavaScript `Number` and
+`JSON.parse` cannot preserve arbitrary decimal precision. Existing `JSON.parse`
+examples above use bounded integers and are not a finance-decimal recipe.
+
+Aggregate responses also preserve exact number lexemes: summing two `long`
+values of `9007199254740993` returns `18014398509481986`, an integer
+average renders at the PostgreSQL result scale (`1010.0000000000000000`),
+and `float`/`double` aggregates print shortest round-trip lexemes (up to 17
+digits, e.g. `0.30000000000000004`). Keep this response as text or read it
+with a lossless JSON parser; `JSON.parse` converts number tokens to
+JavaScript `Number` and can lose digits. `ShardDb#query()` returns the raw
+response string; the package does not parse aggregate results.
+
+Ordinary fetch/multi-get/keys/existence CSV cells escape literal backslash as `\\` and control bytes as `\u00xx`.
+After normal CSV quote/delimiter decoding, `ShardDb.decodeCsvCellBytes(cell)`
+returns the original bytes. A literal six-character `\u0000` and an actual NUL
+remain distinct. Pass a `Uint8Array` from a byte-preserving transport for
+non-UTF-8 content; the native `query()` string route is UTF-8 text. CSV still
+conflates SQL NULL with an empty cell, so use JSON for typed record interchange.
+The escape layer is not an instruction to feed rendered CSV directly into the
+existing positional bulk-import grammar.

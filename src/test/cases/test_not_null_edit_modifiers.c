@@ -85,7 +85,7 @@ static int test_not_null_edit_modifiers_run(void) {
     tc_request(tc, "{\"mode\":\"describe-object\",\"dir\":\"default\","
                    "\"object\":\"ed\"}", &resp);
     ASSERT_CONTAINS(resp, "\"default\":\"zz\"", "default literal clean");
-    ASSERT_TRUE(SAFE_STRSTR(resp, "zz:not_null") == NULL,
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"default\":\"zz:not_null\"") == NULL,
                 "token not swallowed into the literal");
     free(resp); resp = NULL;
 

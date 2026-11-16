@@ -481,6 +481,23 @@ static int rf_wait_flag(const int *flag, int ms) {
     return 0;
 }
 
+/* Bounded wait for the scenario-9 sibling: visibility flips at finalize's
+   A step, and the unpaused sibling finalizes independently of any other
+   request — its completion is not synchronized with anything the test
+   waits on. Poll until exactly one of the two shards is visible. A
+   timeout means the sibling stalled (engine) or the parked record leaked
+   visibility early (seam bug); the caller's assertion reports either. */
+static int rf_wait_exactly_one_visible(RfDb *w, const char *k0, const char *v0,
+                                       const char *k1, const char *v1, int ms) {
+    for (int i = 0; i < ms; i++) {
+        int s0 = rf_record_visible(w, k0, v0);
+        int s1 = rf_record_visible(w, k1, v1);
+        if (s0 != s1) return 1;
+        usleep(1000);
+    }
+    return 0;
+}
+
 /* Nested-task body for scenario 7a (named function — C, not a lambda). */
 typedef struct { RfDb *w; RfBatch *b; int done; int rc; } RfNest;
 static void *rf_nested_req_task(void *raw) {
@@ -1018,7 +1035,15 @@ static int test_request_flush_batching_run(void) {
                     "B's record readable while A parked");
 
         /* Intra-request overlap: exactly one of A's shards committed
-           while the other is parked. */
+           while the other is parked. The unpaused sibling finalizes
+           independently of B — wait (bounded) for its finalize
+           instead of racing it; the parked record must stay
+           invisible (visibility flips at finalize's A step). */
+        ASSERT_TRUE(rf_wait_exactly_one_visible(&w, k0[0], "v21-0000",
+                                                k1[0], "v24-0000",
+                                                5000),
+                    "unpaused sibling finalizes while the other "
+                    "stays parked");
         int s0v = rf_record_visible(&w, k0[0], "v21-0000");
         int s1v = rf_record_visible(&w, k1[0], "v24-0000");
         ASSERT_TRUE(s0v != s1v,

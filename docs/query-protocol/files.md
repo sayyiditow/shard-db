@@ -22,6 +22,8 @@ $DB_ROOT/<dir>/<obj>/files/
 
 Flat — basename is the lookup key. No bucketing or sub-directories. `get-file` / `delete-file` / `get-file-path` all open `<files_dir>/<filename>` directly, no hashing.
 
+Stored files are included in `backup` / `restore`: `backup` copies the `files/` directory, and `restore` replaces live `files/` from backups that carry the `"files":1` manifest marker (see [docs/operations/backup.md](../operations/backup.md)).
+
 ## put-file — bytes in JSON (remote-safe)
 
 ### Shape

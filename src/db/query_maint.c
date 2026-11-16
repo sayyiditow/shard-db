@@ -411,9 +411,10 @@ int cmd_backup(const char *db_root, const char *object) {
     snprintf(bak_dir, sizeof(bak_dir), "%s/%s/backup/%s", db_root, object, ts);
     mkdirp(bak_dir);
 
-    /* Recursively copy data/, indexes/, and metadata/. v2 stores
-       kf shards + segments under the same data/ umbrella, so a single
-       cprf("data") captures both layouts. */
+    /* Recursively copy data/, indexes/, and metadata/ (files/ and
+       tokens.conf follow below). v2 stores kf shards + segments under
+       the same data/ umbrella, so a single cprf("data") captures both
+       layouts. */
     Schema sch = load_schema(db_root, object);
     char src_sub[PATH_MAX], dst_sub[PATH_MAX];
     const char *subs[] = { "data", "indexes", "metadata" };
@@ -422,6 +423,18 @@ int cmd_backup(const char *db_root, const char *object) {
         snprintf(dst_sub, sizeof(dst_sub), "%s/%s", bak_dir, subs[i]);
         cprf(src_sub, dst_sub);
     }
+
+    /* files/ (put-file store) is part of the object; copy it as-is. cprf
+       returns silently when the source does not exist. */
+    snprintf(src_sub, sizeof(src_sub), "%s/files", src_dir);
+    snprintf(dst_sub, sizeof(dst_sub), "%s/files", bak_dir);
+    cprf(src_sub, dst_sub);
+
+    /* The object's access tokens travel with it. They are secrets: the copy
+       is 0600 regardless of the source mode. A missing file is fine. */
+    snprintf(src_sub, sizeof(src_sub), "%s/tokens.conf", src_dir);
+    snprintf(dst_sub, sizeof(dst_sub), "%s/tokens.conf", bak_dir);
+    if (access(src_sub, F_OK) == 0) copy_file(src_sub, dst_sub, 0600);
 
     /* Schema capture — make the backup directory self-contained. fields.conf
        has the typed-field layout; object.json carries splits + max_key (which
@@ -438,8 +451,9 @@ int cmd_backup(const char *db_root, const char *object) {
     if (mf) {
         /* storage_version slot kept in the backup metadata for forward
            compatibility — every object the daemon writes is v2. */
-        fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":2,\"streams\":%d}\n",
-                sch.splits, sch.max_key, sch.streams);
+        fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":2,\"streams\":%d,\"layout\":\"%s\",\"files\":1}\n",
+                sch.splits, sch.max_key, sch.streams,
+                sch.packed_layout ? "packed" : "legacy");
         fclose(mf);
     }
 
@@ -452,7 +466,7 @@ int cmd_backup(const char *db_root, const char *object) {
    Returns 1 on success. Defaults out_storage_version to 1 / out_streams
    to 0 when missing, matching legacy semantics. */
 static int parse_object_meta(const char *path, int *out_splits, int *out_max_key,
-                              int *out_storage_version, int *out_streams) {
+                              int *out_storage_version, int *out_streams, int *out_packed) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     char buf[256] = {0};
@@ -470,11 +484,13 @@ static int parse_object_meta(const char *path, int *out_splits, int *out_max_key
     if (p) sv = atoi(p + strlen("\"storage_version\":"));
     p = strstr(buf, "\"streams\":");
     if (p) streams = atoi(p + strlen("\"streams\":"));
+    int packed = strstr(buf, "\"layout\":\"packed\"") != NULL;
     if (splits < 0 || max_key < 0) return 0;
     *out_splits = splits;
     *out_max_key = max_key;
     if (out_storage_version) *out_storage_version = sv;
     if (out_streams)         *out_streams = streams;
+    if (out_packed)          *out_packed = packed;
     return 1;
 }
 
@@ -484,7 +500,7 @@ static int parse_object_meta(const char *path, int *out_splits, int *out_max_key
    Returns 0 on success, -1 on IO failure. */
 static int ensure_schema_conf_line(const char *db_root, const char *object,
                                    int splits, int max_key,
-                                   int storage_version, int streams) {
+                                   int storage_version, int streams, int packed) {
     const char *dir = db_root + strlen(g_db_root);
     if (*dir == '/') dir++;
 
@@ -511,8 +527,8 @@ static int ensure_schema_conf_line(const char *db_root, const char *object,
     if (!found) {
         fseek(f, 0, SEEK_END);
         if (storage_version >= 2)
-            fprintf(f, "%s%d:%d:%d:%d\n", prefix, splits, max_key,
-                    storage_version, streams);
+            fprintf(f, "%s%d:%d:%d:%d%s\n", prefix, splits, max_key,
+                    storage_version, streams, packed ? ":layout=packed" : "");
         else
             fprintf(f, "%s%d:%d\n", prefix, splits, max_key);
     }
@@ -521,10 +537,27 @@ static int ensure_schema_conf_line(const char *db_root, const char *object,
     return 0;
 }
 
+/* 1 when the backup's object.json carries "files":1 (written by backups
+   taken with files/ support); 0 for older backups or unreadable manifests. */
+static int backup_manifest_has_files(const char *meta_path) {
+    FILE *f = fopen(meta_path, "r");
+    if (!f) return 0;
+    char buf[256] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    int err = ferror(f);
+    fclose(f);
+    if (err) return 0;
+    buf[n] = '\0';
+    return strstr(buf, "\"files\":1") != NULL;
+}
+
 /* ========== RESTORE ==========
    Symmetric to backup: copies data/ + indexes/ + metadata/ + fields.conf
-   from `<obj>/backup/<from>` over the live tree, and ensures the
-   schema.conf line is in place from object.json.
+   (plus files/ when the backup's object.json carries "files":1) from
+   `<obj>/backup/<from>` over the live tree, and ensures the
+   schema.conf line is in place from object.json. The backup's
+   tokens.conf is not applied here — the JSON dispatcher merges those
+   tokens into the running store after cmd_restore succeeds.
    Refuses if any live state would conflict, unless force=1. Holds the
    object's write lock for the whole operation; invalidates the slotcask
    registry + bt cache + idx cache + schema caches before the swap so the
@@ -552,6 +585,12 @@ int cmd_restore(const char *db_root, const char *object,
         OUT("{\"error\":\"objlock_wrlock failed for restore\"}\n");
         return 1;
     }
+
+    /* Does the backup govern files/? (meta_src is declared later, so a
+       dedicated path variable here.) */
+    char fmeta[PATH_MAX];
+    snprintf(fmeta, sizeof(fmeta), "%s/object.json", src_dir);
+    int bak_files = backup_manifest_has_files(fmeta);
 
     const char *subs[] = { "data", "indexes", "metadata" };
     char src_sub[PATH_MAX], dst_sub[PATH_MAX];
@@ -584,6 +623,31 @@ int cmd_restore(const char *db_root, const char *object,
         }
     }
 
+    /* Same refusal for files/ when the backup governs it. This runs before
+       the later layout/schema/fields.conf refusals, so in the rare state
+       where only files/ is non-empty it answers the files error first, and
+       nothing is mutated before it. */
+    if (bak_files && !force) {
+        char files_probe[PATH_MAX];
+        snprintf(files_probe, sizeof(files_probe), "%s/files", obj_dir);
+        DIR *d = opendir(files_probe);
+        if (d) {
+            struct dirent *e; int empty = 1;
+            while ((e = readdir(d))) {
+                if (e->d_name[0] == '.' &&
+                    (e->d_name[1] == '\0' ||
+                     (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
+                empty = 0; break;
+            }
+            closedir(d);
+            if (!empty) {
+                objlock_wrunlock(db_root, object);
+                OUT("{\"error\":\"files/ is not empty (use force=true to overwrite)\"}\n");
+                return 1;
+            }
+        }
+    }
+
     /* Schema reconciliation. If the backup carries object.json, cross-check
        it against the live schema.conf entry. Mismatch → refuse without
        force; missing live entry → append (the object exists on disk but
@@ -592,11 +656,26 @@ int cmd_restore(const char *db_root, const char *object,
        object.json — accept and skip. */
     char meta_src[PATH_MAX];
     snprintf(meta_src, sizeof(meta_src), "%s/object.json", src_dir);
-    int bak_splits = 0, bak_max_key = 0, bak_sv = 1, bak_streams = 0;
+    int bak_splits = 0, bak_max_key = 0, bak_sv = 1, bak_streams = 0, bak_packed = 0;
     int have_meta = parse_object_meta(meta_src, &bak_splits, &bak_max_key,
-                                       &bak_sv, &bak_streams);
+                                       &bak_sv, &bak_streams, &bak_packed);
+    if (!have_meta) {
+        /* No layout evidence: after the layout migration every live object
+           is packed, so unknown bytes must never be copied over it. */
+        objlock_wrunlock(db_root, object);
+        OUT("{\"error\":\"backup has no layout metadata (object.json); restore refused\"}\n");
+        return 1;
+    }
     if (have_meta) {
         Schema live = load_schema(db_root, object);
+        if ((live.splits > 0 && (live.packed_layout ? 1 : 0) != bak_packed) ||
+            (live.splits <= 0 && !bak_packed)) {
+            objlock_wrunlock(db_root, object);
+            OUT("{\"error\":\"backup layout (%s) does not match the live object's layout (%s); restore refused — a backup taken before the layout migration cannot be restored into a migrated object\"}\n",
+                bak_packed ? "packed" : "legacy",
+                live.splits > 0 ? (live.packed_layout ? "packed" : "legacy") : "absent");
+            return 1;
+        }
         if (live.splits > 0 && (live.splits != bak_splits || live.max_key != bak_max_key) && !force) {
             objlock_wrunlock(db_root, object);
             OUT("{\"error\":\"schema mismatch: live splits=%d max_key=%d, "
@@ -605,7 +684,7 @@ int cmd_restore(const char *db_root, const char *object,
             return 1;
         }
         if (ensure_schema_conf_line(db_root, object, bak_splits, bak_max_key,
-                                     bak_sv, bak_streams) != 0) {
+                                     bak_sv, bak_streams, bak_packed) != 0) {
             objlock_wrunlock(db_root, object);
             OUT("{\"error\":\"failed to update schema.conf\"}\n");
             return 1;
@@ -718,6 +797,27 @@ int cmd_restore(const char *db_root, const char *object,
         rmrf(dst_sub);
         snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, subs[i]);
         if (stat(src_sub, &st) == 0) cprf(src_sub, dst_sub);
+    }
+
+    /* files/ follows the same wipe-and-copy pattern when the backup
+       governs it ("files":1 in its manifest). Older backups leave live
+       files/ untouched. */
+    if (bak_files) {
+        snprintf(dst_sub, sizeof(dst_sub), "%s/files", obj_dir);
+        rmrf(dst_sub);
+        snprintf(src_sub, sizeof(src_sub), "%s/files", src_dir);
+        if (stat(src_sub, &st) == 0) cprf(src_sub, dst_sub);
+    }
+
+    /* The restored indexes/ replaces this object's flag/marker state with
+       the backup's: a backup taken while bitmap planning was disabled
+       re-arms the escape here (reads fall back, writes refused) until a
+       full reindex heals it. -1 (unreadable flag) counts as present. */
+    if (slotcask_bmfix_disabled_exists(obj_dir) != 0) {
+        atomic_store(&g_bmfix_any_disabled, 1);
+        LOG_WARN(LOG_SUB_CONFIG,
+                 "RESTORE %s/%s: restored object has bitmap planning disabled; run reindex",
+                 db_root, object);
     }
 
     objlock_wrunlock(db_root, object);

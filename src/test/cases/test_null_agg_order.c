@@ -233,12 +233,12 @@ static int test_null_agg_vs_limit_null_group(void) {
         ASSERT_NOT_NULL(r, "resp");
         /* NULL group present WITH a limit; its accums skip r5's NULL v
            (count 2, avg/min from r1's 10 alone). */
-        ASSERT_TRUE(strstr(r, "{\"g\":null,\"c\":2,\"a\":10,\"m\":10}") != NULL,
+        ASSERT_TRUE(strstr(r, "{\"g\":null,\"c\":2,\"a\":10.0000000000000000,\"m\":10}") != NULL,
                     "NULL group with limit: NULL v skipped, not zeroed");
-        /* All-NULL spec group: avg renders null (denominator excludes
-           the NULL), min renders the documented empty-0. */
-        ASSERT_TRUE(strstr(r, "{\"g\":\"x\",\"c\":1,\"a\":null,\"m\":0}") != NULL,
-                    "all-NULL group: avg null, not 0/1");
+        /* All-NULL spec group: avg and min of no values render null
+           (min/max of an empty group have no answer — Task 8). */
+        ASSERT_TRUE(strstr(r, "{\"g\":\"x\",\"c\":1,\"a\":null,\"m\":null}") != NULL,
+                    "all-NULL group: avg and min null, not 0/1");
         ASSERT_TRUE(strstr(r, "\"g\":\"\"") != NULL &&
                     strstr(r, "\"g\":\"null\"") != NULL,
                     "value buckets intact alongside the NULL group");

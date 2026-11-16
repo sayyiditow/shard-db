@@ -89,3 +89,17 @@ If you want multiple counts (by status, by region, etc.) in one trip, use [`aggr
  "group_by":["status"],
  "aggregates":[{"fn":"count","alias":"n"}]}
 ```
+
+## Bitmap-source errors
+
+A count whose criteria drive through bitmap index sources fails with a single
+error object when a bitmap file cannot be read; a shard that was never
+written is logically empty and contributes zero. A raw popcount is never the
+answer — bitmap candidates are validated through the record fetch as before.
+
+Bitmap candidate collections prefer 8,192 actual slots within the existing
+request budget, falling back to ordinary estimate-based sizing if only the
+floor does not fit. If concurrent growth exhausts the admitted collection,
+partial candidates are discarded and the complete original criteria run once
+through the full-record scan with the original deadline. Allocation-budget failures and real bitmap read
+errors retain their separate existing policies; they are not insertion overflow.

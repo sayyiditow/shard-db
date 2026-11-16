@@ -1,8 +1,13 @@
+#include <limits.h>
+#include <stdint.h>
+#include <unistd.h>
 /* shard-cli main entry — parses env (db.env should be sourced), opens a
    connection (lazy on first action), drives the top-level menu. */
 
 #define _GNU_SOURCE
 #include "cli.h"
+#include <limits.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <spawn.h>
@@ -180,56 +185,83 @@ static void browse_object(CliConn *c, const char *dir, const char *object) {
     free(resp);
 }
 
-static int collect_string_array(const char *resp, const char *key,
-                                char ***out_arr, int *out_n) {
-    /* Parse {"key":"...","key2":[...]} where key2 is an array of strings.
-       Or top-level array if key is NULL. */
-    const char *arr = resp;
-    if (key) {
-        size_t vlen;
-        extern const char *json_find_key_extern(const char *, const char *, size_t *);
-        /* Inline parse — duplicate of json_find_key in views.c kept private. */
-        const char *p = resp;
-        while (*p && *p != '[') {
-            if (strncmp(p, key, strlen(key)) == 0 &&
-                p > resp && p[-1] == '"') {
-                p += strlen(key);
-                while (*p && *p != '[' && *p != '{') p++;
-                arr = p;
-                break;
+static int transfer_hex(unsigned char c){
+    if(c>='0'&&c<='9')return c-'0';
+    if(c>='a'&&c<='f')return c-'a'+10;
+    if(c>='A'&&c<='F')return c-'A'+10;
+    return -1;
+}
+static int transfer_code(const char **text,unsigned *code){
+    unsigned value=0;
+    for(int i=0;i<4;i++){
+        int digit=transfer_hex((unsigned char)**text);if(digit<0)return -1;
+        (*text)++;value=value*16+(unsigned)digit;
+    }
+    *code=value;return 0;
+}
+static char *transfer_string(const char **text){
+    const char *start=*text;if(*start!='"')return NULL;
+    const char *end=start;cli_json_skip_value(&end);
+    size_t raw=(size_t)(end-start);
+    if(raw<2||end[-1]!='"')return NULL;
+    char *out=malloc(raw);if(!out)return NULL;
+    size_t n=0;const char *p=start+1;
+    while(p<end-1){
+        unsigned code=(unsigned char)*p++;
+        if(code<32)goto fail;
+        if(code=='\\'){
+            unsigned char e=(unsigned char)*p++;
+            switch(e){
+            case '"':code='"';break;case '\\':code='\\';break;case '/':code='/';break;
+            case 'b':code=8;break;case 'f':code=12;break;case 'n':code=10;break;
+            case 'r':code=13;break;case 't':code=9;break;
+            case 'u':
+                if(end-1-p<4||transfer_code(&p,&code))goto fail;
+                if(code>=0xd800&&code<=0xdbff){
+                    unsigned low=0;
+                    if(end-1-p<6||p[0]!='\\'||p[1]!='u')goto fail;
+                    p+=2;if(transfer_code(&p,&low)||low<0xdc00||low>0xdfff)goto fail;
+                    code=0x10000+((code-0xd800)<<10)+(low-0xdc00);
+                }else if(code>=0xdc00&&code<=0xdfff)goto fail;
+                if(!code)goto fail;
+                if(code>=0x10000){out[n++]=(char)(0xf0|(code>>18));out[n++]=(char)(0x80|((code>>12)&63));}
+                else if(code>=0x800)out[n++]=(char)(0xe0|(code>>12));
+                if(code>=0x80)out[n++]=(char)(code>=0x800?0x80|((code>>6)&63):0xc0|(code>>6));
+                code=code<0x80?code:0x80|(code&63);break;
+            default:goto fail;
             }
-            p++;
         }
-        (void)vlen;
+        out[n++]=(char)code;
     }
-    if (!arr || *arr != '[') return -1;
-    /* Walk array. */
-    int cap = 16, n = 0;
-    char **out = malloc(cap * sizeof(char *));
-    const char *p = arr + 1;
-    while (*p) {
-        while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t') p++;
-        if (*p == ']' || *p == '\0') break;
-        if (*p != '"') break;
-        p++;
-        const char *s = p;
-        while (*p && *p != '"') p++;
-        size_t L = p - s;
-        if (n >= cap) {
-            cap *= 2;
-            char **t = xrealloc_or_free(out, (size_t)cap * sizeof(char *));
-            if (!t) { *out_arr = NULL; *out_n = 0; return -1; }
-            out = t;
+    out[n]=0;*text=end;return out;
+fail:free(out);return NULL;
+}
+static int collect_string_array(const char *resp,const char *key,char ***out_arr,int *out_n){
+    if(!out_arr||!out_n)return -1;
+    *out_arr=NULL;*out_n=0;
+    size_t length=0;const char *array=key?cli_json_find_key(resp,key,&length):resp;
+    const char *p=array?cli_json_skip_ws(array):NULL;
+    if(!p||*p++!='[')return -1;
+    char **rows=NULL;int count=0;size_t capacity=0;
+    p=cli_json_skip_ws(p);
+    while(*p!=']'){
+        char *value=transfer_string(&p);if(!value)goto fail;
+        if((size_t)count==capacity){
+            size_t next=capacity?capacity*2:16;
+            if(next>SIZE_MAX/sizeof(*rows)||next>INT_MAX){free(value);goto fail;}
+            char **grown=realloc(rows,next*sizeof(*rows));if(!grown){free(value);goto fail;}
+            rows=grown;capacity=next;
         }
-        out[n] = malloc(L + 1);
-        memcpy(out[n], s, L);
-        out[n][L] = '\0';
-        n++;
-        if (*p == '"') p++;
+        rows[count++]=value;p=cli_json_skip_ws(p);
+        if(*p==']')break;
+        if(*p++!=',')goto fail;
+        p=cli_json_skip_ws(p);if(*p==']')goto fail;
     }
-    *out_arr = out;
-    *out_n = n;
-    return 0;
+    if(!key&&*cli_json_skip_ws(p+1))goto fail;
+    *out_arr=rows;*out_n=count;return 0;
+fail:
+    for(int i=0;i<count;i++)free(rows[i]);
+    free(rows);return -1;
 }
 
 /* Loop at the object-pick level: ←/q goes back to tenant pick; describe view
@@ -1905,90 +1937,108 @@ static void menu_auth(void) {
    user-facing N. Numeric P (precision) isn't preserved — describe-object
    only round-trips S (scale) — so we default P=18 (max int64 digits) on
    export. P is informational; it doesn't affect storage. */
-static void cached_field_to_spec(const CachedField *fd, char *out, size_t out_sz) {
-    if (strcmp(fd->type, "varchar") == 0) {
-        int n = fd->size - 2;
-        if (n < 0) n = 0;
-        snprintf(out, out_sz, "%s:%s:%d", fd->name, fd->type, n);
-    } else if (strcmp(fd->type, "numeric") == 0) {
-        snprintf(out, out_sz, "%s:%s:18,%d", fd->name, fd->type, fd->scale);
-    } else {
-        snprintf(out, out_sz, "%s:%s", fd->name, fd->type);
+
+
+static int transfer_quote(FILE *out,const char *s,size_t n){
+    static const char hex[]="0123456789abcdef";
+    if(fputc('"',out)==EOF)return -1;
+    for(size_t i=0;i<n;i++){
+        unsigned char c=(unsigned char)s[i];
+        if(c=='"'||c=='\\'){if(fputc('\\',out)==EOF||fputc(c,out)==EOF)return -1;}
+        else if(c<32){char escape[6]={'\\','u','0','0',hex[c>>4],hex[c&15]};if(fwrite(escape,1,6,out)!=6)return -1;}
+        else if(fputc(c,out)==EOF)return -1;
     }
+    return fputc('"',out)==EOF?-1:0;
 }
-
-static void schema_transfer_export(CliConn *c) {
-    FormField fs[1] = {0};
-    fs[0].label = "output path"; fs[0].kind = FF_TEXT;
-    snprintf(fs[0].value, sizeof(fs[0].value), "schema.json");
-    if (tui_form("export-schema → file", fs, 1) != 0) return;
-    if (!fs[0].value[0]) { tui_alert("export", "output path required"); return; }
-
-    FILE *out = fopen(fs[0].value, "w");
-    if (!out) { tui_alert("export", "cannot open output file for writing"); return; }
-
-    char *resp = NULL; size_t rlen = 0;
-    if (cli_query(c, "{\"mode\":\"db-dirs\"}", &resp, &rlen) != 0) {
-        tui_alert("error", "db-dirs failed"); fclose(out); return;
+static int transfer_specs(FILE *out,const char *array,size_t length){
+    if(length<2||array[0]!='['||array[length-1]!=']')return -1;
+    const char *p=array+1,*end=array+length-1;int first=1;
+    while((p=cli_json_skip_ws(p))<end){
+        if(*p!='{')return -1;
+        const char *start=p;cli_json_skip_value(&p);if(p>end)return -1;
+        size_t n=0;const char *spec=cli_json_find_key(start,"spec",&n);
+        if(!spec||n<2||spec[0]!='"'||spec[n-1]!='"'||spec+n>p)return -1;
+        if((!first&&fputc(',',out)==EOF)||fwrite(spec,1,n,out)!=n)return -1;
+        first=0;p=cli_json_skip_ws(p);
+        if(p<end){if(*p++!=',')return -1;if(cli_json_skip_ws(p)==end)return -1;}
     }
-    char **dirs = NULL; int ndirs = 0;
-    collect_string_array(resp, NULL, &dirs, &ndirs);
-    free(resp);
-
-    fprintf(out, "{\n");
-    fprintf(out, "  \"version\": \"2026.05\",\n");
-    fprintf(out, "  \"dirs\": [");
-    for (int i = 0; i < ndirs; i++) fprintf(out, "%s\"%s\"", i ? "," : "", dirs[i]);
-    fprintf(out, "],\n");
-    fprintf(out, "  \"objects\": [\n");
-
-    int total = 0;
-    int first = 1;
-    for (int i = 0; i < ndirs; i++) {
-        char req[256];
-        snprintf(req, sizeof(req), "{\"mode\":\"list-objects\",\"dir\":\"%s\"}", dirs[i]);
-        char *list_resp = NULL;
-        if (cli_query(c, req, &list_resp, &rlen) != 0) continue;
-        char **objs = NULL; int nobjs = 0;
-        collect_string_array(list_resp, "objects", &objs, &nobjs);
-        free(list_resp);
-        for (int j = 0; j < nobjs; j++) {
-            ObjectInfo oi;
-            if (describe_object(c, dirs[i], objs[j], &oi) != 0) continue;
-            if (!first) fprintf(out, ",\n");
-            fprintf(out,
-                "    {\"dir\":\"%s\",\"object\":\"%s\",\"splits\":%d,\"max_key\":%d,\"fields\":[",
-                oi.dir, oi.object, oi.splits, oi.max_key);
-            for (int f = 0; f < oi.nfields; f++) {
-                char spec[256];
-                cached_field_to_spec(&oi.fields[f], spec, sizeof(spec));
-                fprintf(out, "%s\"%s\"", f ? "," : "", spec);
+    return 0;
+}
+static int transfer_publish(FILE *stage,const char *path){
+    if(ferror(stage)||fflush(stage)||fseek(stage,0,SEEK_SET))return -1;
+    size_t n=strlen(path);if(n>SIZE_MAX-16)return -1;
+    char *temporary=malloc(n+16);if(!temporary)return -1;
+    snprintf(temporary,n+16,"%s.tmp.XXXXXX",path);int fd=mkstemp(temporary);
+    if(fd<0){free(temporary);return -1;}
+    FILE *out=fdopen(fd,"w");if(!out){close(fd);unlink(temporary);free(temporary);return -1;}
+    int error=0;char block[8192];size_t take;
+    while((take=fread(block,1,sizeof(block),stage)))if(fwrite(block,1,take,out)!=take){error=1;break;}
+    if(ferror(stage)||ferror(out)||fflush(out)||fsync(fileno(out)))error=1;
+    if(fclose(out))error=1;
+    if(!error&&rename(temporary,path))error=1;
+    if(error)unlink(temporary);
+    free(temporary);return error?-1:0;
+}
+static int transfer_request(CliConn *c,const char *mode,const char *dir,
+    const char *object,char **response,size_t *length){
+    *response=NULL;*length=0;
+    char *request=NULL;size_t n=0;FILE *out=open_memstream(&request,&n);
+    if(!out)return -1;
+    int error=fputs("{\"mode\":",out)==EOF||transfer_quote(out,mode,strlen(mode));
+    if(!error&&dir)error=fputs(",\"dir\":",out)==EOF||transfer_quote(out,dir,strlen(dir));
+    if(!error&&object)error=fputs(",\"object\":",out)==EOF||transfer_quote(out,object,strlen(object));
+    if(fputc('}',out)==EOF)error=1;
+    if(fclose(out))error=1;
+    if(!error)error=cli_query(c,request,response,length)!=0;
+    free(request);
+    if(!error&&(!*response||cli_json_find_key(*response,"error",length)))error=1;
+    return error?-1:0;
+}
+static void schema_transfer_export(CliConn *c){
+    FormField field[1]={0};field[0].label="output path";field[0].kind=FF_TEXT;
+    snprintf(field[0].value,sizeof(field[0].value),"schema.json");
+    if(tui_form("export-schema → file",field,1))return;
+    if(!field[0].value[0]){tui_alert("export","output path required");return;}
+    FILE *stage=tmpfile();if(!stage){tui_alert("export","cannot stage schema manifest");return;}
+    char *response=NULL;size_t length=0;char **dirs=NULL;int ndirs=0,total=0,first=1,error=0;
+    if(transfer_request(c,"db-dirs",NULL,NULL,&response,&length))error=1;
+    if(!error&&collect_string_array(response,NULL,&dirs,&ndirs))error=1;
+    free(response);response=NULL;
+    if(fputs("{\"dirs\":[",stage)==EOF)error=1;
+    for(int i=0;i<ndirs&&!error;i++)if((i&&fputc(',',stage)==EOF)||transfer_quote(stage,dirs[i],strlen(dirs[i])))error=1;
+    if(fputs("],\"objects\":[",stage)==EOF)error=1;
+    for(int i=0;i<ndirs&&!error;i++){
+        char **objects=NULL;int count=0;
+        if(transfer_request(c,"list-objects",dirs[i],NULL,&response,&length))error=1;
+        if(!error&&collect_string_array(response,"objects",&objects,&count))error=1;
+        free(response);response=NULL;
+        for(int j=0;j<count&&!error;j++){
+            if(transfer_request(c,"describe-object",dirs[i],objects[j],&response,&length)){error=1;free(response);response=NULL;break;}
+            size_t fn=0,in=0;const char *fields=cli_json_find_key(response,"fields",&fn),*indexes=cli_json_find_key(response,"indexes",&in);
+            if(!fields||!indexes){error=1;free(response);response=NULL;break;}
+            if((!first&&fputc(',',stage)==EOF)||fputs("{\"dir\":",stage)==EOF||transfer_quote(stage,dirs[i],strlen(dirs[i]))||
+               fputs(",\"object\":",stage)==EOF||transfer_quote(stage,objects[j],strlen(objects[j])))error=1;
+            const char *names[]={"splits","max_key","streams","auto_key","declaration_layout"};
+            for(size_t k=0;k<sizeof(names)/sizeof(names[0])&&!error;k++){
+                size_t n=0;const char *value=cli_json_find_key(response,names[k],&n);
+                if(value&&(fprintf(stage,",\"%s\":",names[k])<0||fwrite(value,1,n,stage)!=n))error=1;
             }
-            fprintf(out, "],\"indexes\":[");
-            for (int x = 0; x < oi.nindexes; x++)
-                fprintf(out, "%s\"%s\"", x ? "," : "", oi.indexes[x]);
-            fprintf(out, "]}");
-            first = 0;
-            total++;
+            if(!error&&(fputs(",\"fields\":[",stage)==EOF||transfer_specs(stage,fields,fn)||
+                fputs("],\"indexes\":",stage)==EOF||fwrite(indexes,1,in,stage)!=in||fputc('}',stage)==EOF))error=1;
+            first=0;total++;free(response);response=NULL;
         }
-        for (int j = 0; j < nobjs; j++) free(objs[j]);
-        free(objs);
+        for(int j=0;j<count;j++)free(objects[j]);
+        free(objects);
     }
-    fprintf(out, "\n  ]\n}\n");
-    fclose(out);
-
-    for (int i = 0; i < ndirs; i++) free(dirs[i]);
-    free(dirs);
-
-    char msg[512];
-    snprintf(msg, sizeof(msg),
-        "exported %d object%s across %d tenant%s to %s\n\n"
-        "no data and no tokens were copied — only schema/index definitions.\n"
-        "use Schema Transfer → Import on the prod machine to recreate.",
-        total, total == 1 ? "" : "s",
-        ndirs, ndirs == 1 ? "" : "s", fs[0].value);
-    tui_alert("export-schema", msg);
+    if(fputs("]}\n",stage)==EOF)error=1;
+    if(!error&&transfer_publish(stage,field[0].value))error=1;
+    if(fclose(stage))error=1;
+    for(int i=0;i<ndirs;i++)free(dirs[i]);
+    free(dirs);free(response);
+    if(error)tui_alert("export","schema export failed; no complete new manifest published");
+    else{char message[128];snprintf(message,sizeof(message),"exported %d objects",total);tui_alert("export-schema",message);}
 }
+
 
 /* Walk a JSON array of object entries and dispatch one create-object per row.
    Each row has dir/object/splits/max_key/fields[]/indexes[]. We pass the
@@ -2046,8 +2096,10 @@ static int import_object_cb(const char *elem, size_t len, void *ctx) {
     }
 
     /* Build request: prepend mode, append if_not_exists if requested. */
-    size_t req_cap = len + 256;
-    char *req = malloc(req_cap);
+    if(len<2||len>INT_MAX||len>SIZE_MAX-256){ic->failed++;return 0;}
+    size_t req_cap=len+256;
+    char *req=malloc(req_cap);
+    if(!req){ic->failed++;return 0;}
     /* The manifest entry is {"dir":"...","object":"...","splits":...,...}.
        create-object expects the same shape under mode "create-object", so
        we just prepend "mode":"create-object", into the entry. */
@@ -2062,7 +2114,7 @@ static int import_object_cb(const char *elem, size_t len, void *ctx) {
             "{\"mode\":\"create-object\",%.*s",
             (int)(len - 1), elem + 1);
     }
-    (void)n;
+    if(n<0||(size_t)n>=req_cap){free(req);ic->failed++;return 0;}
 
     char *resp = NULL; size_t rlen = 0;
     int rc = cli_query(ic->c, req, &resp, &rlen);

@@ -17,6 +17,7 @@
 #include "slotcask.h"
 #include "query_internal.h"
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 
 static int test_coverity_join_buf_overflow_run(void) {
@@ -24,12 +25,14 @@ static int test_coverity_join_buf_overflow_run(void) {
        rendered JSON values are each bigger than the tiny buffer below. */
     TypedSchema ts;
     memset(&ts, 0, sizeof(ts));
+    ts.typed = 1;
     ts.nfields = 4;
     int off = 0;
     for (int i = 0; i < ts.nfields; i++) {
         TypedField *f = &ts.fields[i];
         memset(f, 0, sizeof(*f));
         snprintf(f->name, sizeof(f->name), "f%d", i);
+        f->name_len = (int)strlen(f->name);
         f->type = FT_VARCHAR;
         f->size = 64; /* on-disk: 2-byte length prefix + 62 content bytes */
         f->offset = off;
@@ -67,7 +70,8 @@ static int test_coverity_join_buf_overflow_run(void) {
 
     int pos = buf_driver_values(raw, (size_t)ts.total_size, &fs, NULL, 0, 0, region, BUF_SZ);
 
-    ASSERT_TRUE(pos >= 0 && (size_t)pos < BUF_SZ, "returned pos stays within bufsz");
+    ASSERT_TRUE(pos == -1 && errno == ENOBUFS, "undersized buffer explicitly fails");
+    ASSERT_TRUE(region[0] == 0, "failed output has no truncated prefix");
 
     int canary_intact = 1;
     for (size_t i = 0; i < CANARY_SZ; i++) {

@@ -405,18 +405,23 @@ static int startup_schema_line(char *line, StartupSchemaEntry *out) {
     if (!*p || *p == '#') return 1;
 
     char *save = NULL;
-    char *parts[7] = {0};
+    char *parts[8] = {0};
     int n = 0;
-    for (char *part = strtok_r(p, ":", &save);
-         part && n < 7; part = strtok_r(NULL, ":", &save))
+    char *part = strtok_r(p, ":", &save);
+    while (part && n < 8) {
         parts[n++] = part;
+        part = strtok_r(NULL, ":", &save);
+    }
+    /* A ninth token is not part of any known line shape: refuse instead of
+       letting the cap silently drop it. */
+    if (part) return -1;
     /* dir_name_ok is a pure string-format check (no path separators,
        no control chars, no leading dot). is_valid_dir would additionally
        require the dir to be currently registered in dirs.conf, which is
        wrong here — a schema.conf entry for a since-removed tenant dir
        must still parse so the caller can treat it as a soft/stale entry
        instead of a hard parse failure. */
-    if (n < 6 || n > 7 || !dir_name_ok(parts[0]) ||
+    if (n < 6 || n > 8 || !dir_name_ok(parts[0]) ||
         !is_valid_object(parts[1]))
         return -1;
 
@@ -426,6 +431,15 @@ static int startup_schema_line(char *line, StartupSchemaEntry *out) {
         *end != '\0' || streams <= 0 || streams > SLOTCASK_MAX_STREAMS)
         return -1;
     if (strcmp(parts[4], "2") != 0) return -1;
+    {
+        int layouts = 0;
+        for (int i = 6; i < n; i++) {
+            if (strncmp(parts[i], "layout", 6) != 0 ||
+                (parts[i][6] != '\0' && parts[i][6] != '='))
+                continue;
+            if (layouts++ || strcmp(parts[i], "layout=packed") != 0) return -1;
+        }
+    }
 
     snprintf(out->dir, sizeof(out->dir), "%s", parts[0]);
     snprintf(out->object, sizeof(out->object), "%s", parts[1]);
@@ -764,6 +778,372 @@ static int btri_migration_stamp_write(const char *db_root) {
     return (sync_rc == 0 && close_rc == 0) ? 0 : -1;
 }
 
+/* ── Layout migration (R5 Task 8) ──
+   Converts every legacy object to the packed layout. See the plan for the
+   ordering rationale: audit and preconditions first, version stamp second,
+   per-object RebuildTxn conversion third, completion stamp last. */
+#define LAYOUT_MIGRATION_STAMP  ".layout-migrated"
+#define LAYOUT_MIGRATION_REPORT ".layout-migration-report"
+
+static int layout_stamp_exists(const char *db_root) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", db_root, LAYOUT_MIGRATION_STAMP);
+    return access(path, F_OK) == 0;
+}
+
+static int layout_stamp_write(const char *db_root) {
+    char tmp[PATH_MAX], final[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s/%s.tmp", db_root, LAYOUT_MIGRATION_STAMP);
+    snprintf(final, sizeof(final), "%s/%s", db_root, LAYOUT_MIGRATION_STAMP);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    int rc = dprintf(fd, "layout-migration complete (binary %s)\n", SHARD_DB_VERSION) > 0 ? 0 : -1;
+    if (close(fd) != 0) rc = -1;
+    if (rc != 0) { (void)unlink(tmp); return -1; }
+    int prc = durability_publish_replace(final, tmp, NULL, NULL);   /* fsync(tmp) → rename → fsync(dir) */
+    if (prc < 0) { (void)unlink(tmp); return -1; }
+    return prc == 0 ? 0 : -1;   /* renamed but unconfirmed durable: refuse; the next start re-checks */
+}
+
+static void layout_report_write(const char *db_root, const char *text) {
+    char tmp[PATH_MAX], final[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s/%s.tmp", db_root, LAYOUT_MIGRATION_REPORT);
+    snprintf(final, sizeof(final), "%s/%s", db_root, LAYOUT_MIGRATION_REPORT);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    int ok = fputs(text, f) >= 0;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok || rename(tmp, final) != 0) (void)unlink(tmp);
+}
+
+static void layout_report_remove(const char *db_root) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", db_root, LAYOUT_MIGRATION_REPORT);
+    (void)unlink(path);
+}
+
+static int layout_migration_run(const char *db_root) {
+    if (layout_stamp_exists(db_root)) return 0;
+    layout_test_crash_point("after-recovery");
+
+    StartupSchemaEntry *ents = NULL;
+    size_t n = 0;
+    if (startup_read_schema(db_root, &ents, &n) != 0) return -1;
+
+    size_t nlegacy = 0;
+    for (size_t i = 0; i < n; i++) {
+        char eff[PATH_MAX];
+        snprintf(eff, sizeof(eff), "%s/%s", db_root, ents[i].dir);
+        int packed = 0;
+        if (schema_conf_layout(eff, ents[i].object, &packed) != 0) {
+            fprintf(stderr, "shard-db: refusing to start: unreadable layout token for %s/%s\n",
+                    ents[i].dir, ents[i].object);
+            free(ents);
+            return -1;
+        }
+        if (!packed) nlegacy++;
+    }
+    if (nlegacy == 0) {
+        free(ents);
+        if (layout_stamp_write(db_root) != 0) return -1;
+        layout_report_remove(db_root);
+        return 0;
+    }
+
+    char disk[64] = {0};
+    int decision = shard_db_version_check(db_root, disk, sizeof(disk));
+    if (decision != SHARD_DB_VERSION_STAMP && decision != SHARD_DB_VERSION_NOOP) {
+        free(ents);
+        return -1;
+    }
+    int first_start = decision == SHARD_DB_VERSION_STAMP;
+
+    /* D7: the previous version must have closed cleanly with no pending
+       markers. Nothing has been touched yet. */
+    if (first_start && !clean_flag_exists(db_root)) {
+        fprintf(stderr,
+                "shard-db: refusing to start: database was not closed cleanly by shard-db %s. "
+                "Start shard-db %s against this DB_ROOT, stop it cleanly, then upgrade to %s.\n",
+                disk, SHARD_DB_REQUIRED_SOURCE_VERSION, SHARD_DB_VERSION);
+        free(ents);
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char data_dir[PATH_MAX];
+        snprintf(data_dir, sizeof(data_dir), "%s/%s/%s", db_root, ents[i].dir, ents[i].object);
+        if (object_has_pending_markers(data_dir) != 0) {
+            fprintf(stderr,
+                    "shard-db: refusing to start: %s/%s has pending commit markers. "
+                    "Start shard-db %s against this DB_ROOT, stop it cleanly, then upgrade to %s.\n",
+                    ents[i].dir, ents[i].object, SHARD_DB_REQUIRED_SOURCE_VERSION, SHARD_DB_VERSION);
+            free(ents);
+            return -1;
+        }
+    }
+
+    /* D5 audit: read-only, whole root, before the stamp. */
+    char report[2048];
+    size_t rl = 0;
+    int refused = 0;
+    report[0] = '\0';
+    for (size_t i = 0; i < n; i++) {
+        char eff[PATH_MAX], diag[1024];
+        int packed = 0;
+        snprintf(eff, sizeof(eff), "%s/%s", db_root, ents[i].dir);
+        (void)schema_conf_layout(eff, ents[i].object, &packed);
+        if (packed) continue;
+        if (objlock_wrlock(eff, ents[i].object) != 0) { free(ents); return -1; }
+        int rc = layout_migrate_object(eff, ents[i].object, 1, diag, sizeof(diag));
+        objlock_wrunlock(eff, ents[i].object);
+        if (rc != 0) {
+            refused = 1;
+            if (rl + 1 < sizeof(report))
+                rl += (size_t)snprintf(report + rl, sizeof(report) - rl,
+                                       "%s/%s: layout migration refused:\n%s%s",
+                                       ents[i].dir, ents[i].object, diag,
+                                       diag[0] && diag[strlen(diag) - 1] == '\n' ? "" : "\n");
+        }
+    }
+    if (refused) {
+        fputs(report, stderr);
+        layout_report_write(db_root, report);
+        free(ents);
+        return -1;
+    }
+    layout_test_crash_point("after-audit");
+
+    /* F16: the new version must be stamped BEFORE any packed layout is
+       published, otherwise a crash leaves a packed object under an old
+       stamp that 2026.10.2 would open as legacy. */
+    if (first_start && shard_db_version_stamp(db_root) != SHARD_DB_VERSION_STAMP_OK) {
+        free(ents);
+        return -1;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        char eff[PATH_MAX], diag[1024];
+        int packed = 0;
+        snprintf(eff, sizeof(eff), "%s/%s", db_root, ents[i].dir);
+        (void)schema_conf_layout(eff, ents[i].object, &packed);
+        if (packed) continue;
+        if (objlock_wrlock(eff, ents[i].object) != 0) { free(ents); return -1; }
+        int rc = layout_migrate_object(eff, ents[i].object, 0, diag, sizeof(diag));
+        objlock_wrunlock(eff, ents[i].object);
+        if (rc != 0) {
+            fprintf(stderr, "shard-db: refusing to start: layout migration failed for %s/%s: %s\n",
+                    ents[i].dir, ents[i].object, diag);
+            free(ents);
+            return -1;
+        }
+    }
+    free(ents);
+    if (layout_stamp_write(db_root) != 0) return -1;
+    layout_report_remove(db_root);
+    return 0;
+}
+
+/* A keyfile rebuild interrupted between its keyfile rename and its bitmap
+   publication (or whose bitmap publication failed and was logged) leaves
+   <obj>/indexes/.bmfix-NNN. Bitmap bits are kf slot numbers, so those bitmaps
+   may name old slots. The marker name selects the affected shard(s): a
+   1-8-lowercase-hex suffix below the object's split count repairs just that
+   shard's bitmaps (every bitmap field); any other `.bmfix-*` name repairs
+   all of them. The rebuild goes through bitmap_rebuild_shards_durable
+   (temp files + bm_publish_replace, from kf + segments — btrees and
+   trigrams are never touched) under the object's write lock.
+
+   A pending marker must never stop the daemon from starting. If the repair
+   (or the marker cleanup) fails and the object has no pending KFM2 commit
+   marker, startup writes <obj>/indexes/.bmfix-disabled and serves the
+   object with bitmap planning disabled: reads fall back to btree or scan,
+   every record mutation and every mode_is_schema mutation (except backup,
+   a read-only copy an operator wants before reindex) is refused up
+   front, and a full `reindex` repairs and re-enables. Only an unreadable
+   marker directory, an unloadable schema for a marked object, a failed
+   flag write, or a failed repair with pending KFM2 markers (replaying a
+   window into a torn bitmap would recreate the trap) refuses startup. A
+   flag with no markers left is stale (writes were refused the whole time,
+   so the bitmaps are complete) and is removed. On the unclean path this
+   runs BEFORE the KFM2 replay (replay then applies pending windows to the
+   repaired bitmaps). It also removes leftover "<NNN>.bm.remap" temporaries
+   of every object. */
+static int bmfix_recover_all(const char *db_root) {
+    StartupSchemaEntry *ents = NULL;
+    size_t cnt = 0;
+    if (startup_read_schema(db_root, &ents, &cnt) != 0) return -1;
+    int any_flagged = 0;
+    for (size_t i = 0; i < cnt; i++) {
+        char eff_root[PATH_MAX], data_dir[PATH_MAX];
+        snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root, ents[i].dir);
+        snprintf(data_dir, sizeof(data_dir), "%s/%s/%s", db_root, ents[i].dir, ents[i].object);
+        int n = slotcask_bmfix_marked_shards(data_dir, 0, NULL);
+        if (n < 0) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: cannot scan repair markers (errno=%d); startup refused",
+                      ents[i].dir, ents[i].object, errno);
+            free(ents);
+            return -1;
+        }
+        int flagged = slotcask_bmfix_disabled_exists(data_dir);
+        if (flagged < 0) {
+            /* A stuck flag only keeps the object read-only with bitmaps
+               off — always correct. Refusing would recreate the trap.
+               But a pending KFM2 window would be replayed past a repair
+               that was never attempted, into possibly-torn bitmaps:
+               refuse like the repair-failed-with-KFM2 case. */
+            if (object_has_pending_markers(data_dir) != 0) {
+                LOG_ERROR(LOG_SUB_REINDEX,
+                          "BMFIX-RECOVER %s/%s: cannot read disabled flag (errno=%d) "
+                          "with pending commit markers; startup refused",
+                          ents[i].dir, ents[i].object, errno);
+                free(ents);
+                return -1;
+            }
+            LOG_WARN(LOG_SUB_REINDEX,
+                     "BMFIX-RECOVER %s/%s: cannot read disabled flag (errno=%d); "
+                     "treating object as disabled; repair not attempted",
+                     ents[i].dir, ents[i].object, errno);
+            any_flagged = 1;
+            continue;
+        }
+        if (n == 0) {
+            (void)slotcask_bmfix_sweep(data_dir);   /* best effort: only disk space */
+            if (flagged) {
+                int removed = 0;
+                if (objlock_wrlock(eff_root, ents[i].object) != 0) {
+                    LOG_ERROR(LOG_SUB_REINDEX,
+                              "BMFIX-RECOVER %s/%s: objlock_wrlock failed; startup refused",
+                              ents[i].dir, ents[i].object);
+                    free(ents);
+                    return -1;
+                }
+                int rmrc = slotcask_bmfix_disabled_remove(data_dir, &removed);
+                objlock_wrunlock(eff_root, ents[i].object);
+                if (rmrc == 0 && removed) {
+                    LOG_WARN(LOG_SUB_REINDEX,
+                             "BMFIX-RECOVER %s/%s: stale disabled flag removed (no markers)",
+                             ents[i].dir, ents[i].object);
+                } else if (rmrc != 0) {
+                    LOG_WARN(LOG_SUB_REINDEX,
+                             "BMFIX-RECOVER %s/%s: could not remove stale disabled flag "
+                             "(errno=%d); object stays disabled until reindex",
+                             ents[i].dir, ents[i].object, errno);
+                    any_flagged = 1;
+                }
+            }
+            continue;
+        }
+        /* n > 0: repair exactly the named shards' bitmaps. */
+        Schema sch = load_schema(eff_root, ents[i].object);
+        if (sch.splits <= 0) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: cannot load schema (splits=%d); startup refused",
+                      ents[i].dir, ents[i].object, sch.splits);
+            free(ents);
+            return -1;
+        }
+        uint8_t *mask = calloc((size_t)sch.splits, 1);
+        if (!mask) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: out of memory (%d splits); startup refused",
+                      ents[i].dir, ents[i].object, sch.splits);
+            free(ents);
+            return -1;
+        }
+        int selected = 0;
+        if (slotcask_bmfix_marked_shards(data_dir, sch.splits, mask) < 0) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: cannot scan repair markers (errno=%d); startup refused",
+                      ents[i].dir, ents[i].object, errno);
+            free(mask);
+            free(ents);
+            return -1;
+        }
+        for (int s = 0; s < sch.splits; s++)
+            if (mask[s]) selected++;
+        if (objlock_wrlock(eff_root, ents[i].object) != 0) {
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: objlock_wrlock failed; startup refused",
+                      ents[i].dir, ents[i].object);
+            free(mask);
+            free(ents);
+            return -1;
+        }
+        LOG_WARN(LOG_SUB_REINDEX,
+                 "BMFIX-RECOVER %s/%s: interrupted bitmap remap; bitmap rebuild of %d shard(s)",
+                 ents[i].dir, ents[i].object, selected);
+        int eno = 0;
+        int rc = bitmap_rebuild_shards_durable(eff_root, ents[i].object, mask, &eno);
+        if (rc == 0) {
+            /* Durably publish the kf directory before the markers may be
+               cleared: the rebuilt bitmaps are a function of the kf state
+               the repair just walked, and a marker cleared ahead of the
+               directory entry being durable could lose the repair on
+               power loss. A failed fsync counts as a repair failure. */
+            char kf_dir[PATH_MAX];
+            snprintf(kf_dir, sizeof(kf_dir), "%s/data/kf", data_dir);
+            if (fsync_dir(kf_dir) != 0) rc = -1;
+        }
+        if (rc == 0)
+            rc = slotcask_bmfix_clear(data_dir);
+        if (rc != 0) {
+            /* Capture errno immediately: every later call may overwrite it. */
+            int E = rc < 0 && eno != 0 ? eno : errno;
+            /* Escape decision: refuse only when replaying a pending KFM2
+               window would write into the torn bitmap. */
+            if (object_has_pending_markers(data_dir) != 0) {
+                LOG_ERROR(LOG_SUB_REINDEX,
+                          "BMFIX-RECOVER %s/%s: repair failed (errno=%d) with pending "
+                          "commit markers; startup refused",
+                          ents[i].dir, ents[i].object, E);
+                objlock_wrunlock(eff_root, ents[i].object);
+                free(mask);
+                free(ents);
+                return -1;
+            }
+            if (slotcask_bmfix_disabled_write(data_dir) != 0) {
+                LOG_ERROR(LOG_SUB_REINDEX,
+                          "BMFIX-RECOVER %s/%s: could not write the disabled flag "
+                          "(errno=%d); startup refused",
+                          ents[i].dir, ents[i].object, errno);
+                objlock_wrunlock(eff_root, ents[i].object);
+                free(mask);
+                free(ents);
+                return -1;
+            }
+            LOG_ERROR(LOG_SUB_REINDEX,
+                      "BMFIX-RECOVER %s/%s: bitmap planning DISABLED (repair failed, "
+                      "errno=%d); reads fall back, writes refused; run reindex",
+                      ents[i].dir, ents[i].object, E);
+            objlock_wrunlock(eff_root, ents[i].object);
+            any_flagged = 1;
+            free(mask);
+            continue;
+        }
+        int removed = 0;
+        int rmrc = slotcask_bmfix_disabled_remove(data_dir, &removed);
+        if (rmrc != 0) {
+            /* Markers are already gone and the bitmaps are complete; only
+               the flag removal failed. Writes stay refused until reindex. */
+            LOG_WARN(LOG_SUB_REINDEX,
+                     "BMFIX-RECOVER %s/%s: repair succeeded but disabled flag could not "
+                     "be removed (errno=%d); object stays disabled until reindex",
+                     ents[i].dir, ents[i].object, errno);
+            any_flagged = 1;
+        } else if (removed) {
+            LOG_WARN(LOG_SUB_REINDEX,
+                     "BMFIX-RECOVER %s/%s: repair succeeded; bitmap planning re-enabled",
+                     ents[i].dir, ents[i].object);
+        }
+        objlock_wrunlock(eff_root, ents[i].object);
+        free(mask);
+    }
+    free(ents);
+    if (any_flagged)
+        atomic_store(&g_bmfix_any_disabled, 1);
+    return 0;
+}
+
 int shard_db_recover_before_stamp(const char *db_root,
                                   int *out_markers_replayed) {
     if (!out_markers_replayed) return -1;
@@ -816,15 +1196,24 @@ int shard_db_recover_before_stamp(const char *db_root,
         btri_migration_ran = 1;
     }
 
+    /* Layout migration: after artifact recovery and the BTRI migration,
+       before the clean flag is consumed (its presence is a D7 precondition). */
+    if (layout_migration_run(db_root) != 0) return -1;
+
     int was_clean = clean_flag_exists(db_root);
     if (clean_flag_remove(db_root) != 0) return -1;
     if (was_clean) {
-        /* Clean stop: no markers can be pending, so the migration (if it
-           ran) is the last recovery work — stamp completion and serve. */
+        /* Clean stop: no KFM2 markers can be pending, but a bitmap-remap
+           marker can survive a logged commit failure: repair it before
+           serving. The migration (if it ran) is then the last recovery work. */
+        if (bmfix_recover_all(db_root) != 0) return -1;
         if (btri_migration_ran &&
             btri_migration_stamp_write(db_root) != 0) return -1;
         return 0;
     }
+
+    /* Bitmap-remap repair runs before the replay (see bmfix_recover_all). */
+    if (bmfix_recover_all(db_root) != 0) return -1;
 
     StartupSchemaEntry *entries = NULL;
     size_t count = 0;

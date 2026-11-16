@@ -1,6 +1,12 @@
+#include "schema_wire.h"
 #include "types.h"
+#include "scalar_grammar.h"
+#include "typed_row.h"
 #include "slotcask.h"
 #include "bitmap.h"
+#include <math.h>
+#include <stdarg.h>
+#include <assert.h>
 
 /* ========== Config ========== */
 
@@ -406,6 +412,12 @@ int load_db_root(char *out, size_t outlen) {
     if (!f) { fprintf(stderr, "Error: db.env not found\n"); return -1; }
     char line[PATH_MAX + 64];
     int found_root = 0;
+#ifdef TEST_BUILD
+    /* Reset the startup-only bitmap-cache test override before parsing. An
+     * EBUSY here means a cache is already live: ordinary reentrant config
+     * loads leave the live cache (and override) unchanged. */
+    (void)bm_test_set_cache_cap(0);
+#endif
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
         if (strncmp(p, "export ", 7) == 0) p += 7;
@@ -430,6 +442,13 @@ int load_db_root(char *out, size_t outlen) {
                process). Drives the BTRI startup-migration failure case.
                Not a documented production setting. */
             index_test_fail_next_build(atoi(p + 27));
+        } else if (strncmp(p, "BMFIX_REPAIR_TEST_FAIL_NEXT=", 28) == 0) {
+            /* Test-only knob: the next bmfix startup bitmap repair fails
+               with this errno before touching any index file (one-shot
+               per process; consumed only by bitmap_rebuild_shards_durable,
+               independent of INDEX_TEST_FAIL_NEXT_BUILD). Not a documented
+               production setting. */
+            index_test_bmfix_repair_fail_next(atoi(p + 28));
         } else if (strncmp(p, "BT_TEST_PUBLISH_FAIL_STAGE=", 27) == 0) {
             /* Test-only knob: fails the next btree replacement publication
                at 1=pre-rename or 2=post-rename parent-durability reporting
@@ -445,6 +464,14 @@ int load_db_root(char *out, size_t outlen) {
                refuse to serve under either. Not a documented production
                setting. */
             btri_stamp_test_inject(atoi(p + 21));
+        } else if (strncmp(p, "SCHEMA_CONF_TEST_FSYNC_FAIL_CALL=", 33) == 0) {
+            /* Test-only knob; not a documented production setting. */
+            schema_conf_test_fsync_fail_call(atoi(p + 33));
+        } else if (strncmp(p, "LAYOUT_MIGRATE_TEST_CRASH=", 26) == 0) {
+            /* Test-only knob; not a documented production setting. */
+            char *v = p + 26;
+            v[strcspn(v, "\r\n")] = '\0';
+            layout_migrate_test_crash_phase(v);
 #endif
         } else if (strncmp(p, "LOG_DIR=", 8) == 0) {
             p += 8;
@@ -590,10 +617,40 @@ int load_db_root(char *out, size_t outlen) {
                configuration.md. */
             int n = atoi(p + 29);
             if (n >= 0 && g_db) g_warmup_test_prelock_delay_ms = n;
+#ifdef TEST_BUILD
+        } else if (strncmp(p, "KF_TEST_INITIAL_SLOTS=", 22) == 0) {
+            /* TEST_BUILD-only: persists the W1 kf-tier seam across daemon
+               restarts (the control channel only reaches a running daemon),
+               so crash tests can reopen grown shards under the same tier. */
+            extern _Atomic size_t g_shard_test_kf_initial_slots;
+            long n = atol(p + 22);
+            if (n > 0) atomic_store(&g_shard_test_kf_initial_slots, (size_t)n);
+        } else if (strncmp(p, "BM_TEST_CACHE_CAP=", 18) == 0) {
+            /* TEST_BUILD-only startup seam for the bitmap-cache lock-error
+               regression cases: accepts exactly 16 (→ 32 hash slots, 16-entry
+               eviction threshold). Not a documented production setting; the
+               production parser neither changes BT_CACHE_MAX nor exposes any
+               operational override. An explicit value after cache
+               initialization is an error; malformed values are rejected. */
+            char *v = p + 18;
+            v[strcspn(v, "\r\n")] = '\0';
+            if (strcmp(v, "16") == 0) {
+                if (bm_test_set_cache_cap(16) != 0)
+                    fprintf(stderr,
+                            "config: BM_TEST_CACHE_CAP=16 rejected (%s); "
+                            "keeping default bitmap cache capacity\n",
+                            strerror(errno));
+            } else {
+                fprintf(stderr,
+                        "config: BM_TEST_CACHE_CAP=\"%s\" unsupported (only "
+                        "16 is valid); keeping default bitmap cache capacity\n",
+                        v);
+            }
+#endif
         } else if (strncmp(p, "SCHEMA_WRLOCK_TEST_DELAY_MS=", 28) == 0) {
             /* Test-only knob (widens dispatch_json_query's schema-mode
                objlock_wrlock-held window and publishes a synchronous marker
-               for the NQL-vs-JSON lock-contention regression test). Not a
+               for the NQL-vs-JSON lock-contention and backup-fence regression tests). Not a
                documented production setting — do not add to
                configuration.md. */
             int n = atoi(p + 28);
@@ -604,6 +661,7 @@ int load_db_root(char *out, size_t outlen) {
             if (strcmp(v, "after-stage") == 0 ||
                 strcmp(v, "after-walk") == 0 ||
                 strcmp(v, "after-metadata") == 0 ||
+                strcmp(v, "after-indexes") == 0 ||
                 strcmp(v, "after-commit") == 0) {
                 if (g_db) snprintf(g_rebuild_test_pause_phase,
                                    sizeof(g_rebuild_test_pause_phase), "%s", v);
@@ -913,6 +971,7 @@ Schema load_schema(const char *effective_root, const char *object) {
     char line[512];
     int found = 0;
     int legacy_v1 = 0;
+    int layout_bad = 0;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
         if (strncmp(line, prefix, pfxlen) == 0) {
@@ -969,6 +1028,7 @@ Schema load_schema(const char *effective_root, const char *object) {
                     scan = next;
                 }
             }
+            if (schema_tail_layout(p, &s.packed_layout) != 0) layout_bad = 1;
             if (parsed_version != 2) legacy_v1 = 1;
             found = 1;
             break;
@@ -985,6 +1045,15 @@ Schema load_schema(const char *effective_root, const char *object) {
                 "Error: Object [%s] is in legacy v1 storage; this binary "
                 "supports v2 only. Install 2026.05.4 first and run "
                 "`./migrate` to convert v1 → v2, then upgrade.\n",
+                object);
+        Schema zeroed = {0};
+        return zeroed;
+    }
+
+    if (found && layout_bad) {
+        /* Never fall back to legacy on a malformed layout token: an
+           unreadable layout means the bytes cannot be interpreted. */
+        fprintf(stderr, "Error: Object [%s] has a malformed schema layout token\n",
                 object);
         Schema zeroed = {0};
         return zeroed;
@@ -1014,6 +1083,54 @@ Schema load_schema(const char *effective_root, const char *object) {
     }
     pthread_mutex_unlock(&g_schema_lock);
     return s;
+}
+
+int schema_tail_layout(const char *tail, int *out) {
+    int seen = 0;
+    *out = 0;
+    const char *p = tail;
+    while (p && *p) {
+        const char *next = strchr(p, ':');
+        size_t tlen = next ? (size_t)(next - p) : strlen(p);
+        if (tlen >= 6 && strncmp(p, "layout", 6) == 0 &&
+            (tlen == 6 || p[6] == '=')) {
+            if (seen) { *out = 0; return -2; }
+            if (tlen != 13 || strncmp(p, "layout=packed", 13) != 0) {
+                *out = 0;
+                return -2;
+            }
+            seen = 1;
+            *out = 1;
+        }
+        p = next ? next + 1 : NULL;
+    }
+    return 0;
+}
+
+int schema_conf_layout(const char *effective_root, const char *object, int *out) {
+    *out = 0;
+    size_t rootlen = strlen(g_db_root);
+    if (strncmp(effective_root, g_db_root, rootlen) != 0) return 0;
+    const char *dir = effective_root + rootlen;
+    if (*dir == '/') dir++;
+    char path[PATH_MAX], prefix[512];
+    snprintf(path, sizeof(path), "%s/schema.conf", g_db_root);
+    int pfxlen = snprintf(prefix, sizeof(prefix), "%s:%s:", dir, object);
+    if (pfxlen < 0 || (size_t)pfxlen >= sizeof(prefix)) return -1;
+    FILE *f = fopen(path, "r");
+    if (!f) return errno == ENOENT ? 0 : -1;
+    char line[4096];
+    int rc = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, prefix, (size_t)pfxlen) != 0) continue;
+        line[strcspn(line, "\r\n")] = '\0';
+        rc = schema_tail_layout(line + pfxlen, out);
+        break;
+    }
+    if (ferror(f)) rc = -1;
+    if (fclose(f) != 0) rc = -1;
+    if (rc != 0) *out = 0;
+    return rc;
 }
 
 /* Backward compat wrapper */
@@ -1338,10 +1455,13 @@ void free_enum_values(TypedField *f) {
    tf->default_val on entry; on a no-modifier call it leaves them
    alone. Callers that want a guaranteed clean slate should zero those
    fields before invoking. */
-int field_default_too_long(const char *field_spec) {
-    const char *d = strstr(field_spec, ":default=");
-    if (!d) return 0;
-    return strlen(d + 9) >= sizeof(((TypedField *)0)->default_val);
+int field_default_too_long(const char *spec){
+    if(!spec)return 0;
+    const char *value=strstr(spec,":default=");if(!value)return 0;value+=9;
+    size_t n=strlen(value);
+    if(n>=8&&!strcmp(value+n-8,":removed"))n-=8;
+    if(n>=9&&(!memcmp(value+n-9,":not_null",9)||!memcmp(value+n-9,":nullable",9)))n-=9;
+    return n>=sizeof(((TypedField*)0)->default_val);
 }
 
 /* Strip default/nullability modifiers in place. Returns 1 when a default
@@ -1438,6 +1558,52 @@ int parse_default_modifier(char *type_spec_inout, TypedField *tf) {
         *dflt = '\0';
         return 1;
     }
+    return 0;
+}
+
+int parse_default_modifier_checked(char *spec,TypedField *f){
+    if(!spec||!f)return 0;
+    if(strchr(spec,'\n')||strchr(spec,'\r'))return -1;
+    f->default_invalid=0;
+    f->not_null=0;f->not_null_set=0;f->default_kind=DK_NONE;f->default_val[0]=0;
+    size_t n=strlen(spec);
+    if(n>=9&&!strcmp(spec+n-9,":not_null")){spec[n-9]=0;f->not_null=1;f->not_null_set=1;}
+    else if(n>=9&&!strcmp(spec+n-9,":nullable")){spec[n-9]=0;f->not_null_set=1;}
+    if(strstr(spec,":not_null")||strstr(spec,":nullable"))return -1;
+    char *d=strstr(spec,":default=");
+    if(d){
+        const char *value=d+9;size_t length=strlen(value);
+        if(strstr(value,":auto_create")||strstr(value,":auto_update")||strstr(value,":default="))return -1;
+        if(length>=sizeof(f->default_val))return -1;
+        if(!strncmp(value,"seq(",4)||!strncmp(value,"random(",7)){
+            int random=!strncmp(value,"random(",7);size_t prefix=random?7:4;
+            if(length<=prefix+1||value[length-1]!=')')return -1;
+            size_t arglen=length-prefix-1;
+            if(!arglen||arglen>=sizeof(f->default_val))return -1;
+            const char *arg=value+prefix;
+            if(random){
+                unsigned long count=0;
+                for(size_t i=0;i<arglen;i++){
+                    if(arg[i]<'0'||arg[i]>'9'||count>(2097152u-(unsigned)(arg[i]-'0'))/10)return -1;
+                    count=count*10+(unsigned)(arg[i]-'0');
+                }
+                if(!count||count>2097152u)return -1;
+                f->default_kind=DK_RANDOM;
+            }else{
+                if(arglen>=128)return -1;
+                for(size_t i=0;i<arglen;i++)if(arg[i]==':'||arg[i]=='+'||arg[i]=='/'||
+                    arg[i]=='('||arg[i]==')'||(unsigned char)arg[i]<=32)return -1;
+                f->default_kind=DK_SEQ;
+            }
+            memcpy(f->default_val,arg,arglen);f->default_val[arglen]=0;
+        }else if(!strcmp(value,"uuid()"))f->default_kind=DK_UUID;
+        else{f->default_kind=DK_LITERAL;memcpy(f->default_val,value,length+1);}
+        *d=0;return 1;
+    }
+    char *a=strstr(spec,":auto_create"),*u=strstr(spec,":auto_update");
+    if(a&&u)return -1;
+    d=a?a:u;
+    if(d){if(d[12])return -1;*d=0;f->default_kind=a?DK_AUTO_CREATE:DK_AUTO_UPDATE;return 1;}
     return 0;
 }
 
@@ -1575,9 +1741,22 @@ void parse_field_type(const char *spec, TypedField *f) {
     }
     /* Precompute 10^scale so decode-hot paths don't recompute per record */
     if (f->type == FT_NUMERIC) {
-        int64_t mult = 1;
-        for (int i = 0; i < f->numeric_scale; i++) mult *= 10;
-        f->numeric_scale_mult = mult;
+        if (f->numeric_scale >= 0 && f->numeric_scale <= 18) {
+            int64_t mult = 1;
+            for (int i = 0; i < f->numeric_scale; i++) mult *= 10;
+            f->numeric_scale_mult = mult;
+        } else {
+            /* Legacy roots may declare S outside 0..18 (S was never
+               validated). Those objects rendered wrapped garbage before;
+               keep them loadable, but every consumer guards mult <= 0
+               (raw-integer fallback) and conv_numeric_text rejects
+               writes — never compute a wrapped multiplier again. */
+            f->numeric_scale_mult = 0;
+            LOG_WARN(LOG_SUB_CONFIG,
+                     "numeric scale %d outside representable 0..18; "
+                     "writes rejected, decoded as raw integer",
+                     f->numeric_scale);
+        }
     } else {
         f->numeric_scale_mult = 0;
     }
@@ -1635,6 +1814,24 @@ char *conf_read_line(FILE *fp, size_t max_len, int *err) {
     }
 }
 
+/* Packed layouts declare varchar/numeric/currency with the bare grammar that
+   the legacy parse_field_type rejects (it would return FT_NONE and the field
+   would be silently dropped). Pre-set the logical type so the line survives
+   until typed_schema_bind_packed assigns the real width. */
+static void packed_declared_type(const char *spec, TypedField *tf) {
+    if (!strncmp(spec, "varchar", 7) || !strncmp(spec, "numeric", 7) ||
+        !strcmp(spec, "currency")) {
+        tf->type = spec[0] == 'v' ? FT_VARCHAR : FT_NUMERIC;
+        tf->size = 1;   /* placeholder; overwritten by typed_schema_bind_packed */
+        return;
+    }
+    parse_field_type(spec, tf);
+}
+
+static void ptypes_free(char **ptypes, int n) {
+    for (int i = 0; i < n; i++) free(ptypes[i]);
+}
+
 TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     char cache_key[512];
     snprintf(cache_key, sizeof(cache_key), "%s:%s", db_root, object);
@@ -1652,11 +1849,21 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     }
     pthread_mutex_unlock(&g_typed_lock);
 
-    /* Cache miss — read from file */
+    /* Cache miss — establish the authoritative layout BEFORE parsing any
+       field. A layout that cannot be established is a load failure: never
+       cached, never a legacy fallback. */
+    int layout_packed = 0;
+    if (schema_conf_layout(db_root, object, &layout_packed) != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG,
+                  "%s/%s: schema layout unreadable or malformed — load refused",
+                  db_root, object);
+        return NULL;
+    }
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s/fields.conf", db_root, object);
     FILE *f = fopen(path, "r");
     if (!f) {
+        if (layout_packed) return NULL;   /* packed object without fields.conf: refuse, do not negative-cache */
         /* No fields.conf — cache as non-typed */
         pthread_mutex_lock(&g_typed_lock);
         uint32_t sidx = str_hash(cache_key) % TYPED_BUCKETS;
@@ -1679,6 +1886,7 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     ts.typed = 0;
     ts.nfields = 0;
     int offset = 0;
+    char *ptypes[MAX_FIELDS] = {0};   /* packed: one type token per accepted field */
 
     for (;;) {
         int rderr = 0;
@@ -1695,6 +1903,7 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
                           MAX_FIELD_DEF - 1);
                 for (int i = 0; i < ts.nfields; i++)
                     free_enum_values(&ts.fields[i]);
+                ptypes_free(ptypes, ts.nfields);
                 fclose(f);
                 return NULL;   /* not cached; next load retries the file */
             }
@@ -1735,6 +1944,11 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
         /* Default modifiers — strip from type_spec before parse_field_type.
            Format: :auto_create, :auto_update, :default=<val>
            These are always the last colon-segment (before :removed). */
+        char *default_check=strdup(type_spec);
+        if(!default_check){free(line);fclose(f);for(int i=0;i<ts.nfields;i++)free_enum_values(&ts.fields[i]);ptypes_free(ptypes,ts.nfields);return NULL;}
+        TypedField checked_default={0};
+        tf->default_invalid=parse_default_modifier_checked(default_check,&checked_default)<0;
+        free(default_check);
         if (parse_default_modifier(type_spec, tf) < 0) {
             /* Never drop a field: later offsets/bitmap positions would
                shift. Refuse the entire schema, without caching it. */
@@ -1744,17 +1958,32 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
             for (int i = 0; i < ts.nfields; i++)
                 free_enum_values(&ts.fields[i]);
             free_enum_values(tf);
+            ptypes_free(ptypes, ts.nfields);
             free(line);
             fclose(f);
             return NULL;
         }
 
-        parse_field_type(type_spec, tf);
+        if (layout_packed) packed_declared_type(type_spec, tf);
+        else parse_field_type(type_spec, tf);
+        char *ptype_copy = layout_packed ? strdup(type_spec) : NULL;
         free(line);
+        if (layout_packed && (!ptype_copy || tf->type == FT_NONE || tf->size <= 0)) {
+            /* Packed: a field line we cannot parse is a load failure, never a
+               silently dropped field (it would shift every later position). */
+            free(ptype_copy);
+            free_enum_values(tf);
+            for (int i = 0; i < ts.nfields; i++)
+                free_enum_values(&ts.fields[i]);
+            ptypes_free(ptypes, ts.nfields);
+            fclose(f);
+            return NULL;
+        }
         if (tf->type == FT_NONE || tf->size <= 0) continue;
 
         tf->offset = offset;
         offset += tf->size;
+        ptypes[ts.nfields] = ptype_copy;
         ts.nfields++;
         ts.typed = 1;
     }
@@ -1767,6 +1996,21 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
        field-region-relative. */
     ts.nullmap_prefix = 1 + typed_nullmap_bytes(ts.nfields);
     ts.total_size += ts.nullmap_prefix;
+
+    if (layout_packed) {
+        char berr[160] = {0};
+        if (typed_schema_bind_packed(&ts, (const char *const *)ptypes,
+                                     (size_t)ts.nfields, berr, sizeof(berr)) != 0) {
+            LOG_ERROR(LOG_SUB_CONFIG,
+                      "%s/%s: packed layout does not match fields.conf (%s) — load refused",
+                      db_root, object, berr[0] ? berr : "bind failed");
+            for (int i = 0; i < ts.nfields; i++)
+                free_enum_values(&ts.fields[i]);
+            ptypes_free(ptypes, ts.nfields);
+            return NULL;   /* not cached */
+        }
+    }
+    ptypes_free(ptypes, ts.nfields);
 
     /* Store in cache, capture the slot we wrote to so we can return the
        pointer without doing a second (lock-free) linear-probe lookup. */
@@ -1795,6 +2039,119 @@ TypedSchema *load_typed_schema(const char *db_root, const char *object) {
     return result;
 }
 
+void typed_schema_release(TypedSchema *ts) {
+    if (!ts) return;
+    for (int i = 0; i < ts->nfields; i++) free_enum_values(&ts->fields[i]);
+    memset(ts, 0, sizeof(*ts));
+}
+
+/* Rewrites one fields.conf line from the legacy grammar to the packed
+   grammar. The ONLY change: a legacy `numeric:N` (no comma — historical
+   scale 2, F20) becomes `numeric:N,2`; every other line is copied verbatim.
+   0 ok, -1 if the result does not fit in cap. */
+int layout_packed_decl_line(const char *line, char *out, size_t cap) {
+    size_t n = strlen(line);
+    const char *colon = strchr(line, ':');
+    if (colon && strncmp(colon + 1, "numeric:", 8) == 0) {
+        const char *digits = colon + 9;
+        const char *p = digits;
+        while (*p >= '0' && *p <= '9') p++;
+        if (p > digits && (*p == '\0' || *p == ':')) {
+            size_t head = (size_t)(p - line), tail = strlen(p);
+            if (head + 2 + tail >= cap) return -1;
+            memcpy(out, line, head);
+            memcpy(out + head, ",2", 2);
+            memcpy(out + head + 2, p, tail + 1);
+            return 0;
+        }
+    }
+    if (n >= cap) return -1;
+    memcpy(out, line, n + 1);
+    return 0;
+}
+
+/* Builds an UNCACHED packed TypedSchema from fields.conf lines (declaration
+   order; blank and '#' lines are skipped). This mirrors load_typed_schema's
+   packed parse exactly — same modifiers, same `:removed` handling, same
+   typed_schema_bind_packed call — so the migration converts to precisely
+   what the loader will later read (the migration re-verifies this after
+   publication). 0 ok; -1 with err filled. On success the caller owns the
+   enum value lists: release with typed_schema_release(). */
+int typed_schema_build_packed(const char *const *lines, size_t nlines,
+                              TypedSchema *out, char *err, size_t errsz) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    TypedSchema ts;
+    memset(&ts, 0, sizeof(ts));
+    char *ptypes[MAX_FIELDS] = {0};
+    int offset = 0;
+#define BP_FAIL(...) do { if (err && errsz) snprintf(err, errsz, __VA_ARGS__); goto fail; } while (0)
+    for (size_t li = 0; li < nlines; li++) {
+        const char *src = lines[li];
+        if (!src || !src[0] || src[0] == '#') continue;
+        if (ts.nfields >= MAX_FIELDS) BP_FAIL("too many fields (max %d)", MAX_FIELDS);
+        char *line = strdup(src);
+        if (!line) BP_FAIL("out of memory");
+        TypedField *tf = &ts.fields[ts.nfields];
+        char *colon = strchr(line, ':');
+        if (!colon || colon == line || (size_t)(colon - line) >= sizeof(tf->name)) {
+            free(line);
+            BP_FAIL("invalid field line");
+        }
+        size_t name_len = (size_t)(colon - line);
+        memcpy(tf->name, line, name_len);
+        tf->name[name_len] = '\0';
+        tf->name_len = (int)name_len;
+        tf->removed = 0;
+        tf->default_kind = DK_NONE;
+        tf->default_val[0] = '\0';
+        char *type_spec = colon + 1;
+        size_t ts_len = strlen(type_spec);
+        if (ts_len >= 8 && strcmp(type_spec + ts_len - 8, ":removed") == 0) {
+            type_spec[ts_len - 8] = '\0';
+            tf->removed = 1;
+        }
+        char *default_check = strdup(type_spec);
+        if (!default_check) { free(line); BP_FAIL("out of memory"); }
+        TypedField checked_default = {0};
+        tf->default_invalid = parse_default_modifier_checked(default_check, &checked_default) < 0;
+        free(default_check);
+        if (parse_default_modifier(type_spec, tf) < 0) {
+            free_enum_values(tf);
+            free(line);
+            BP_FAIL("invalid nullability structure in field '%s'", tf->name);
+        }
+        packed_declared_type(type_spec, tf);
+        if (tf->type == FT_NONE || tf->size <= 0) {
+            free_enum_values(tf);
+            free(line);
+            BP_FAIL("unparseable type for field '%s'", tf->name);
+        }
+        ptypes[ts.nfields] = strdup(type_spec);
+        free(line);
+        if (!ptypes[ts.nfields]) { free_enum_values(tf); BP_FAIL("out of memory"); }
+        tf->offset = offset;
+        offset += tf->size;
+        ts.nfields++;
+        ts.typed = 1;
+    }
+    if (ts.nfields < 1) BP_FAIL("no fields");
+    ts.total_size = offset;
+    ts.nullmap_prefix = 1 + typed_nullmap_bytes(ts.nfields);
+    ts.total_size += ts.nullmap_prefix;
+    if (typed_schema_bind_packed(&ts, (const char *const *)ptypes,
+                                 (size_t)ts.nfields, err, errsz) != 0)
+        goto fail;
+    ptypes_free(ptypes, ts.nfields);
+    *out = ts;
+    return 0;
+fail:
+    for (int i = 0; i < ts.nfields; i++) free_enum_values(&ts.fields[i]);
+    ptypes_free(ptypes, ts.nfields);
+    return -1;
+#undef BP_FAIL
+}
+
 /* Find field index by name. Tombstoned fields are invisible to lookups. */
 int typed_field_index(const TypedSchema *ts, const char *name) {
     if (!ts) return -1;
@@ -1821,6 +2178,525 @@ static inline void cbuf_from_span(char *buf, size_t bufsz,
 /* Length-based encoder: identical semantics to encode_field but takes an
    explicit vlen instead of requiring a null-terminated string. Used by the
    CSV path to parse directly against an mmap'd, unmodifiable buffer. */
+/* Full-input parsers preserve syntax/range errors before stored bytes
+   are changed. The void encoders retain legacy conversion semantics. */
+
+static int is_ascii_space(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static void fmt_conv_err(char *err, size_t errsz, const TypedField *f,
+                         const char *fmt, ...) {
+    if (err && errsz > 0) {
+        va_list ap;
+        va_start(ap, fmt);
+        int n = snprintf(err, errsz,
+                         "value for field '%s' is not a valid %s: ",
+                         f->name, typed_type_name(f->type));
+        if (n > 0 && (size_t)n < errsz)
+            vsnprintf(err + n, errsz - (size_t)n, fmt, ap);
+        va_end(ap);
+    }
+}
+
+/* Parse the whole span as optional-sign decimal digits (no fraction, no
+   exponent, no other bytes). Leading zeros are valid at any length and
+   do not count toward the magnitude budget — "0000000000000000000001"
+   is 1. Only significant digits are bounded (≤19), with the sign-aware
+   maximum. 0 = ok, -1 = syntax, -2 = int64 range. */
+static int parse_full_i64(const char *val, size_t vlen, int64_t *out) {
+    if (vlen == 0) return -1;
+    size_t i = 0;
+    int neg = 0;
+    if (val[0] == '+' || val[0] == '-') { neg = (val[0] == '-'); i = 1; }
+    if (i >= vlen) return -1;
+    for (size_t k = i; k < vlen; k++)
+        if (val[k] < '0' || val[k] > '9') return -1;
+    while (i + 1 < vlen && val[i] == '0') i++;   /* leading zeros */
+    size_t ndig = vlen - i;                      /* significant digits */
+    const uint64_t maxmag = neg ? 9223372036854775808ull
+                                : 9223372036854775807ull;
+    if (ndig > 19) return -2;
+    uint64_t mag = 0;
+    for (; i < vlen; i++) {
+        uint64_t d = (uint64_t)(val[i] - '0');
+        if (mag > (maxmag - d) / 10) return -2;
+        mag = mag * 10 + d;
+    }
+    /* mag <= 2^63; the negative path wraps 2^63 to its two's-complement
+       int64 bit pattern (unsigned arithmetic is defined; the cast is
+       implementation-defined and two's complement on all targets). */
+    *out = neg ? (int64_t)(0u - mag) : (int64_t)mag;
+    return 0;
+}
+
+static int conv_i16(const TypedField *f, const char *val, size_t vlen,
+                    uint8_t *out, char *err, size_t errsz) {
+    int64_t v;
+    int rc = parse_full_i64(val, vlen, &v);
+    if (rc == -1) {
+        fmt_conv_err(err, errsz, f, "expected a whole decimal number");
+        return -1;
+    }
+    if (rc == -2 || v < -32768 || v > 32767) {
+        fmt_conv_err(err, errsz, f, "out of short range (-32768..32767)");
+        return -1;
+    }
+    int16_t s = (int16_t)v;
+    out[0] = (uint8_t)(((uint16_t)s >> 8) & 0xFF);
+    out[1] = (uint8_t)s;
+    return 0;
+}
+
+static int conv_i32(const TypedField *f, const char *val, size_t vlen,
+                    uint8_t *out, char *err, size_t errsz) {
+    int64_t v;
+    int rc = parse_full_i64(val, vlen, &v);
+    if (rc == -1) {
+        fmt_conv_err(err, errsz, f, "expected a whole decimal number");
+        return -1;
+    }
+    if (rc == -2 || v < -2147483648LL || v > 2147483647LL) {
+        fmt_conv_err(err, errsz, f,
+                     "out of int range (-2147483648..2147483647)");
+        return -1;
+    }
+    int32_t s = (int32_t)v;
+    out[0] = (uint8_t)(((uint32_t)s >> 24) & 0xFF);
+    out[1] = (uint8_t)(((uint32_t)s >> 16) & 0xFF);
+    out[2] = (uint8_t)(((uint32_t)s >> 8) & 0xFF);
+    out[3] = (uint8_t)s;
+    return 0;
+}
+
+static int conv_i64(const TypedField *f, const char *val, size_t vlen,
+                    uint8_t *out, char *err, size_t errsz) {
+    int64_t v;
+    int rc = parse_full_i64(val, vlen, &v);
+    if (rc == -1) {
+        fmt_conv_err(err, errsz, f, "expected a whole decimal number");
+        return -1;
+    }
+    if (rc == -2) {
+        fmt_conv_err(err, errsz, f,
+                     "out of signed 64-bit range (-9223372036854775808.."
+                     "9223372036854775807)");
+        return -1;
+    }
+    uint64_t u = (uint64_t)v;
+    for (int b = 7; b >= 0; b--) { out[b] = (uint8_t)(u & 0xFF); u >>= 8; }
+    return 0;
+}
+
+static int conv_u8(const TypedField *f, const char *val, size_t vlen,
+                   uint8_t *out, char *err, size_t errsz) {
+    int64_t v;
+    int rc = parse_full_i64(val, vlen, &v);
+    if (rc == -1) {
+        fmt_conv_err(err, errsz, f, "expected a whole decimal number");
+        return -1;
+    }
+    if (rc == -2 || v < 0 || v > 255) {
+        fmt_conv_err(err, errsz, f, "out of byte range (0..255)");
+        return -1;
+    }
+    out[0] = (uint8_t)v;
+    return 0;
+}
+
+/* Finite binary floating parse via strtof/strtod (direct binary32 for
+   float — no double round-trip). Rejects: junk suffixes, hex float
+   syntax, non-finite spellings (inf/nan and overflow), and nonzero
+   values that underflow to zero. Representable subnormals are accepted
+   (ERANGE with a nonzero result). */
+static int conv_f64(const TypedField *f, const char *val, size_t vlen,
+                    uint8_t *out, char *err, size_t errsz) {
+    char cbuf[64];
+    if (vlen == 0 || vlen >= sizeof(cbuf)) {
+        fmt_conv_err(err, errsz, f, "empty or over-long numeric text");
+        return -1;
+    }
+    if (memchr(val, 'x', vlen) || memchr(val, 'X', vlen)) {
+        fmt_conv_err(err, errsz, f, "hex float syntax is not accepted");
+        return -1;
+    }
+    memcpy(cbuf, val, vlen);
+    cbuf[vlen] = '\0';
+    errno = 0;
+    char *end = NULL;
+    double v = strtod(cbuf, &end);
+    if (end != cbuf + vlen) {
+        fmt_conv_err(err, errsz, f, "trailing characters after number");
+        return -1;
+    }
+    if (!isfinite(v)) {
+        fmt_conv_err(err, errsz, f,
+                     "only finite values are accepted (no inf/nan)");
+        return -1;
+    }
+    if (errno == ERANGE && v == 0.0) {
+        fmt_conv_err(err, errsz, f,
+                     "nonzero value underflows to zero in double");
+        return -1;
+    }
+    memcpy(out, &v, 8);
+    return 0;
+}
+
+static int conv_f32(const TypedField *f, const char *val, size_t vlen,
+                    uint8_t *out, char *err, size_t errsz) {
+    char cbuf[64];
+    if (vlen == 0 || vlen >= sizeof(cbuf)) {
+        fmt_conv_err(err, errsz, f, "empty or over-long numeric text");
+        return -1;
+    }
+    if (memchr(val, 'x', vlen) || memchr(val, 'X', vlen)) {
+        fmt_conv_err(err, errsz, f, "hex float syntax is not accepted");
+        return -1;
+    }
+    memcpy(cbuf, val, vlen);
+    cbuf[vlen] = '\0';
+    errno = 0;
+    char *end = NULL;
+    float v = strtof(cbuf, &end);
+    if (end != cbuf + vlen) {
+        fmt_conv_err(err, errsz, f, "trailing characters after number");
+        return -1;
+    }
+    if (!isfinite((double)v)) {
+        fmt_conv_err(err, errsz, f,
+                     "only finite values are accepted (no inf/nan)");
+        return -1;
+    }
+    if (errno == ERANGE && v == 0.0f) {
+        fmt_conv_err(err, errsz, f,
+                     "nonzero value underflows to zero in float");
+        return -1;
+    }
+    memcpy(out, &v, 4);
+    return 0;
+}
+
+/* Exact decimal text -> scaled int64 (value × 10^scale), ties away from
+   zero, no double anywhere. Identical rounding for writes and criteria
+   ensures a saved value matches its own literal.
+   0 = ok, -1 = invalid syntax/unsupported field
+   scale, -2 = out of range for the field's int64 scaled storage.
+   Scale 0 is valid (mult 1). The magnitude bound is sign-aware:
+   negatives may reach 2^63 (INT64_MIN). */
+int conv_numeric_text(const TypedField *f, const char *val, size_t vlen,
+                      int64_t *out, char *err, size_t errsz) {
+    if (f->numeric_scale < 0 || f->numeric_scale > 18 ||
+        f->numeric_scale_mult <= 0) {
+        fmt_conv_err(err, errsz, f,
+                     "field has an unsupported legacy scale; the object "
+                     "needs a scale edit before writes");
+        return -1;
+    }
+    /* Write/query/index literal parity: strip one outer ASCII
+       whitespace run exactly as the write boundary does, so criterion
+       text like " 0.145" matches a value written as "0.145". */
+    while (vlen > 0 && is_ascii_space(val[0])) { val++; vlen--; }
+    while (vlen > 0 && is_ascii_space(val[vlen - 1])) vlen--;
+    size_t i = 0;
+    int neg = 0;
+    if (vlen && (val[0] == '+' || val[0] == '-')) { neg = (val[0]=='-'); i = 1; }
+    size_t int_start = i;
+    while (i < vlen && val[i] >= '0' && val[i] <= '9') i++;
+    size_t int_len = i - int_start;
+    size_t frac_len = 0;
+    if (i < vlen && val[i] == '.') {
+        i++;
+        size_t fs = i;
+        while (i < vlen && val[i] >= '0' && val[i] <= '9') i++;
+        frac_len = i - fs;
+    }
+    long expv = 0;
+    if (i < vlen && (val[i] == 'e' || val[i] == 'E')) {
+        i++;
+        int eneg = 0;
+        if (i < vlen && (val[i] == '+' || val[i] == '-')) {
+            eneg = (val[i] == '-'); i++;
+        }
+        size_t es = i;
+        while (i < vlen && val[i] >= '0' && val[i] <= '9') i++;
+        size_t el = i - es;
+        if (el == 0 || el > 6) {
+            fmt_conv_err(err, errsz, f, "exponent out of supported range");
+            return -1;
+        }
+        for (size_t k = 0; k < el; k++) expv = expv * 10 + (val[es+k]-'0');
+        if (eneg) expv = -expv;
+        if (expv > 400000 || expv < -400000) {
+            fmt_conv_err(err, errsz, f, "exponent out of supported range");
+            return -1;
+        }
+    }
+    if (i != vlen || (int_len + frac_len) == 0) {
+        fmt_conv_err(err, errsz, f, "expected a decimal number");
+        return -1;
+    }
+    if (memchr(val, 0, vlen)) {
+        fmt_conv_err(err, errsz, f, "embedded NUL byte");
+        return -1;
+    }
+    const uint64_t maxmag = neg ? 9223372036854775808ull      /* INT64_MIN */
+                                : 9223372036854775807ull;
+    const char *digits_int = val + int_start;
+    const char *digits_frac = val + int_start + int_len + 1; /* past '.' */
+    size_t total = int_len + frac_len;
+    /* All-zero digits: the value is 0 whatever the exponent says (0e19
+       is a valid zero), and leading zeros do not count toward the
+       magnitude budget (0000000000000000000001 is 1). */
+    size_t lz = 0;
+    while (lz < total && (lz < int_len ? digits_int[lz]
+                                       : digits_frac[lz - int_len]) == '0')
+        lz++;
+    if (lz == total) { *out = 0; return 0; }
+    size_t sig = total - lz;
+    /* stored = ±D × 10^te, te = scale - frac_len + exp; round the
+       dropped tail half-away-from-zero. The round-up test is safe only
+       when at least the dropped run's leading position exists in D:
+       for total < k_drop the whole value is below half of the last kept
+       place and rounds to zero (6e-100 at scale 2 → 0, not 0.01). */
+    long te = (long)f->numeric_scale - (long)frac_len + expv;
+    if (te >= 0) {
+        if (sig > 19 || te > 18) {
+            fmt_conv_err(err, errsz, f,
+                         "out of range for numeric scale %d (stored as a "
+                         "64-bit scaled integer)", f->numeric_scale);
+            return -2;
+        }
+        uint64_t mag = 0;
+        for (size_t k = 0; k < total; k++) {
+            char c = (k < int_len) ? digits_int[k] : digits_frac[k - int_len];
+            uint64_t d = (uint64_t)(c - '0');
+            if (mag > (maxmag - d) / 10) {
+                fmt_conv_err(err, errsz, f,
+                             "out of range for numeric scale %d (stored as "
+                             "a 64-bit scaled integer)", f->numeric_scale);
+                return -2;
+            }
+            mag = mag * 10 + d;
+        }
+        for (long k = 0; k < te; k++) {
+            if (mag > maxmag / 10) {
+                fmt_conv_err(err, errsz, f,
+                             "out of range for numeric scale %d",
+                             f->numeric_scale);
+                return -2;
+            }
+            mag *= 10;
+        }
+        *out = neg ? (int64_t)(0u - mag) : (int64_t)mag;
+        return 0;
+    }
+    long k_drop = -te;   /* digit positions dropped by rounding */
+    size_t q_len = (total > (size_t)k_drop) ? total - (size_t)k_drop : 0;
+    uint64_t mag = 0;
+    for (size_t k = 0; k < q_len; k++) {
+        char c = (k < int_len) ? digits_int[k] : digits_frac[k - int_len];
+        uint64_t d = (uint64_t)(c - '0');
+        if (mag > (maxmag - d) / 10) {
+            fmt_conv_err(err, errsz, f,
+                         "out of range for numeric scale %d",
+                         f->numeric_scale);
+            return -2;
+        }
+        mag = mag * 10 + d;
+    }
+    int round_up = 0;
+    if (total >= (size_t)k_drop) {
+        size_t di = total - (size_t)k_drop;   /* first dropped digit */
+        char c = (di < int_len) ? digits_int[di] : digits_frac[di - int_len];
+        round_up = (c >= '5');   /* r >= 5*10^(k-1) ⟺ 2r ≥ 10^k */
+    }
+    if (round_up) {
+        if (mag >= maxmag) {
+            fmt_conv_err(err, errsz, f,
+                         "out of range for numeric scale %d",
+                         f->numeric_scale);
+            return -2;
+        }
+        mag++;
+    }
+    *out = neg ? (int64_t)(0u - mag) : (int64_t)mag;
+    return 0;
+}
+
+static int conv_numeric(const TypedField *f, const char *val, size_t vlen,
+                        uint8_t *out, char *err, size_t errsz) {
+    int64_t v;
+    if (conv_numeric_text(f, val, vlen, &v, err, errsz) != 0) return -1;
+    uint64_t u = (uint64_t)v;
+    for (int b = 7; b >= 0; b--) { out[b] = (uint8_t)(u & 0xFF); u >>= 8; }
+    return 0;
+}
+
+/* Strict encoder for the grammar-backed scalar types — the single place
+   their bytes are packed. 0 = ok, -1 = not in the type's grammar. Callers
+   decide what an invalid span means (error vs. zero-fill). */
+static int encode_grammar_scalar(const TypedField *f, const char *val,
+                                 size_t vlen, uint8_t *out) {
+    switch (f->type) {
+    case FT_BOOL: {
+        uint8_t b;
+        if (sg_bool(val, vlen, &b)) return -1;
+        out[0] = b;
+        return 0;
+    }
+    case FT_DATE: {
+        int32_t d;
+        if (sg_date(val, vlen, &d)) return -1;
+        out[0] = (uint8_t)(d >> 24); out[1] = (uint8_t)(d >> 16);
+        out[2] = (uint8_t)(d >> 8);  out[3] = (uint8_t)d;
+        return 0;
+    }
+    case FT_DATETIME: {
+        int32_t d; uint32_t t;
+        if (sg_datetime(val, vlen, &d, &t)) return -1;
+        out[0] = (uint8_t)(d >> 24); out[1] = (uint8_t)(d >> 16);
+        out[2] = (uint8_t)(d >> 8);  out[3] = (uint8_t)d;
+        out[4] = (uint8_t)(t >> 16); out[5] = (uint8_t)(t >> 8); out[6] = (uint8_t)t;
+        return 0;
+    }
+    case FT_DATETIMEMS: {
+        int32_t d; uint32_t ms;
+        if (sg_datetimems(val, vlen, &d, &ms)) return -1;
+        out[0] = (uint8_t)(d >> 24);  out[1] = (uint8_t)(d >> 16);
+        out[2] = (uint8_t)(d >> 8);   out[3] = (uint8_t)d;
+        out[4] = (uint8_t)(ms >> 24); out[5] = (uint8_t)(ms >> 16);
+        out[6] = (uint8_t)(ms >> 8);  out[7] = (uint8_t)ms;
+        return 0;
+    }
+    case FT_TIME: {
+        uint32_t s;
+        if (sg_time(val, vlen, &s)) return -1;
+        out[0] = (uint8_t)(s >> 16); out[1] = (uint8_t)(s >> 8); out[2] = (uint8_t)s;
+        return 0;
+    }
+    case FT_UUID: return sg_uuid(val, vlen, out);
+    case FT_IPV4: return sg_ipv4(val, vlen, out);
+    case FT_IPV6: return sg_ipv6(val, vlen, out);
+    default: return -1;
+    }
+}
+
+static const char *grammar_scalar_hint(enum FieldType t) {
+    switch (t) {
+    case FT_BOOL: return "expected true/false (t, f, yes, no, on, off, 1, 0)";
+    case FT_DATE: return "expected YYYYMMDD or YYYY-MM-DD (a real calendar date)";
+    case FT_DATETIME: return "expected YYYYMMDDHHMMSS, 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DDTHH:MM:SS'";
+    case FT_DATETIMEMS: return "expected YYYYMMDDHHMMSSfff or 'YYYY-MM-DD HH:MM:SS.fff' (exactly 3 fraction digits)";
+    case FT_TIME: return "expected HH:MM:SS (00:00:00..23:59:59)";
+    case FT_UUID: return "expected 32 hex digits or the 36-character dashed form";
+    case FT_IPV4: return "not a valid IPv4 address";
+    case FT_IPV6: return "not a valid IPv6 address";
+    default: return "invalid value";
+    }
+}
+
+int encode_field_checked(const TypedField *f, const char *val, size_t vlen,
+                         uint8_t *out, char *err, size_t errsz) {
+    if (err && errsz > 0) err[0] = '\0';
+    if (!val) vlen = 0;
+    /* Strip one outer ASCII whitespace run for the
+       scalar numeric types ONLY — varchar, enum and every other type is
+       byte-exact (trimming would rewrite stored content and could select
+       a different enum member). Embedded whitespace inside scalars is
+       rejected by the parsers. */
+    switch (f->type) {
+    case FT_SHORT: case FT_INT: case FT_LONG: case FT_TIMESTAMP:
+    case FT_BYTE: case FT_NUMERIC: case FT_DOUBLE: case FT_FLOAT:
+        while (vlen > 0 && is_ascii_space(val[0])) { val++; vlen--; }
+        while (vlen > 0 && is_ascii_space(val[vlen - 1])) vlen--;
+        break;
+    default:
+        break;
+    }
+    if (vlen == 0) {
+        switch (f->type) {
+        case FT_BOOL: case FT_DATE: case FT_DATETIME: case FT_DATETIMEMS:
+        case FT_TIME: case FT_UUID: case FT_IPV4: case FT_IPV6:
+            /* R4: an empty span is not a value of these types; NULL is
+               expressed by the caller (JSON null / omitted / delimited
+               empty cell), never by a zero-length string reaching here. */
+            fmt_conv_err(err, errsz, f, "empty value");
+            return -1;
+        case FT_ENUM:
+            /* Empty is invalid unless it is an explicit declared member. */
+            if (enum_value_index(f, val, 0) < 0) {
+                fmt_conv_err(err, errsz, f, "unknown enum member");
+                return -1;
+            }
+            break;
+        default:
+            break;
+        }
+        /* Historic zero-filled representation for the remaining types. */
+        memset(out, 0, f->size);
+        return 0;
+    }
+    switch (f->type) {
+    case FT_SHORT:
+        return conv_i16(f, val, vlen, out, err, errsz);
+    case FT_INT:
+        return conv_i32(f, val, vlen, out, err, errsz);
+    case FT_LONG:
+    case FT_TIMESTAMP:
+        return conv_i64(f, val, vlen, out, err, errsz);
+    case FT_BYTE:
+        return conv_u8(f, val, vlen, out, err, errsz);
+    case FT_NUMERIC:
+        return conv_numeric(f, val, vlen, out, err, errsz);
+    case FT_DOUBLE:
+        return conv_f64(f, val, vlen, out, err, errsz);
+    case FT_FLOAT:
+        return conv_f32(f, val, vlen, out, err, errsz);
+    case FT_VARCHAR:
+        /* Reject overlength input before the legacy encoder can truncate it. */
+        if ((int)vlen > f->size - 2) {
+            fmt_conv_err(err, errsz, f,
+                         "%zu bytes exceeds max %d", vlen, f->size - 2);
+            return -1;
+        }
+        break;
+    case FT_BOOL: case FT_DATE: case FT_DATETIME: case FT_DATETIMEMS:
+    case FT_TIME: case FT_UUID: case FT_IPV4: case FT_IPV6:
+        if (encode_grammar_scalar(f, val, vlen, out)) {
+            fmt_conv_err(err, errsz, f, grammar_scalar_hint(f->type));
+            return -1;
+        }
+        return 0;
+    case FT_ENUM:
+        if (enum_value_index(f, val, vlen) < 0) {
+            fmt_conv_err(err, errsz, f, "unknown enum member");
+            return -1;
+        }
+        break; /* encode_field_len writes the index */
+    default:
+        break;
+    }
+    encode_field_len(f, val, vlen, out);
+    return 0;
+}
+
+/* 1 iff f is a uuid field and v is a valid uuid literal (including the
+   brace-wrapped form). Used to exempt such values from the "starts with
+   '{' ⇒ computed-update object" gate. */
+int value_is_braced_uuid(const TypedField *f, const char *v, size_t n) {
+    uint8_t tmp[16];
+    return f->type == FT_UUID && n && v[0] == '{' && sg_uuid(v, n, tmp) == 0;
+}
+
+/* Truth value of an already-validated bool literal (grammar: sg_bool);
+   0 for anything the grammar rejects. */
+uint8_t scalar_bool_value(const char *s) {
+    uint8_t b = 0;
+    if (s && sg_bool(s, strlen(s), &b)) b = 0;
+    return b;
+}
+
 void encode_field_len(const TypedField *f, const char *val, size_t vlen,
                       uint8_t *out) {
     if (!val || vlen == 0) {
@@ -1875,130 +2751,18 @@ void encode_field_len(const TypedField *f, const char *val, size_t vlen,
         memcpy(out, &v, 4);
         break;
     }
-    case FT_BOOL: {
-        out[0] = (vlen > 0 && (val[0] == 't' || val[0] == 'T' || val[0] == '1')) ? 1 : 0;
-        break;
-    }
     case FT_BYTE: {
         char cbuf[8]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         out[0] = (uint8_t)atoi(cbuf);
         break;
     }
-    case FT_DATE: {
-        /* Iterate the span directly, extract up to 8 digits. */
-        char clean[16]; int ci = 0;
-        for (size_t i = 0; i < vlen && ci < 8; i++)
-            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
-        clean[ci] = '\0';
-        int32_t v = (int32_t)atoi(clean);
-        out[0] = (v >> 24) & 0xFF; out[1] = (v >> 16) & 0xFF;
-        out[2] = (v >> 8) & 0xFF;  out[3] = v & 0xFF;
+    case FT_BOOL: case FT_DATE: case FT_DATETIME: case FT_DATETIMEMS:
+    case FT_TIME: case FT_UUID: case FT_IPV4: case FT_IPV6:
+        /* Lenient wrapper over the strict grammar: server-generated and
+           internal callers only; invalid input zero-fills. Client input
+           goes through encode_field_checked. */
+        if (encode_grammar_scalar(f, val, vlen, out)) memset(out, 0, f->size);
         break;
-    }
-    case FT_DATETIME: {
-        char clean[16]; int ci = 0;
-        for (size_t i = 0; i < vlen && ci < 14; i++)
-            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
-        while (ci < 14) clean[ci++] = '0';
-        clean[14] = '\0';
-        char datebuf[9]; memcpy(datebuf, clean, 8); datebuf[8] = '\0';
-        int32_t d = (int32_t)atoi(datebuf);
-        out[0] = (d >> 24) & 0xFF; out[1] = (d >> 16) & 0xFF;
-        out[2] = (d >> 8) & 0xFF;  out[3] = d & 0xFF;
-        int hh = (clean[8]-'0')*10 + (clean[9]-'0');
-        int mm = (clean[10]-'0')*10 + (clean[11]-'0');
-        int ss = (clean[12]-'0')*10 + (clean[13]-'0');
-        uint32_t t = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
-        out[4] = (uint8_t)(t >> 16);
-        out[5] = (uint8_t)(t >> 8);
-        out[6] = (uint8_t)t;
-        break;
-    }
-    case FT_DATETIMEMS: {
-        /* Parse up to 17 digits: yyyyMMddHHmmssfff. Short input zero-pads
-           on the right (mirrors FT_DATETIME's convention). */
-        char clean[24]; int ci = 0;
-        for (size_t i = 0; i < vlen && ci < 17; i++)
-            if (val[i] >= '0' && val[i] <= '9') clean[ci++] = val[i];
-        while (ci < 17) clean[ci++] = '0';
-        clean[17] = '\0';
-        char datebuf[9]; memcpy(datebuf, clean, 8); datebuf[8] = '\0';
-        int32_t d = (int32_t)atoi(datebuf);
-        out[0] = (d >> 24) & 0xFF; out[1] = (d >> 16) & 0xFF;
-        out[2] = (d >> 8) & 0xFF;  out[3] = d & 0xFF;
-        int hh = (clean[8]-'0')*10 + (clean[9]-'0');
-        int mm = (clean[10]-'0')*10 + (clean[11]-'0');
-        int ss = (clean[12]-'0')*10 + (clean[13]-'0');
-        int fff = (clean[14]-'0')*100 + (clean[15]-'0')*10 + (clean[16]-'0');
-        uint32_t ms = (uint32_t)((hh * 3600 + mm * 60 + ss) * 1000 + fff);
-        out[4] = (ms >> 24) & 0xFF; out[5] = (ms >> 16) & 0xFF;
-        out[6] = (ms >> 8) & 0xFF;  out[7] = ms & 0xFF;
-        break;
-    }
-    case FT_TIME: {
-        /* Parse "HH:MM:SS" into 3 bytes (seconds since midnight, big-endian).
-           Validate strictly: 8 chars, digits at 0/1/3/4/6/7, ':' at 2 and 5,
-           hh ≤ 23, mm ≤ 59, ss ≤ 59. Malformed → encode 0 (matches the UUID
-           "garbage in → zeroed" convention). */
-        uint32_t secs = 0;
-        if (vlen >= 8 && val[2] == ':' && val[5] == ':') {
-            int ok = 1;
-            for (int i = 0; i < 8 && ok; i++) {
-                if (i == 2 || i == 5) continue;
-                if (val[i] < '0' || val[i] > '9') ok = 0;
-            }
-            if (ok) {
-                int hh = (val[0]-'0')*10 + (val[1]-'0');
-                int mm = (val[3]-'0')*10 + (val[4]-'0');
-                int ss = (val[6]-'0')*10 + (val[7]-'0');
-                if (hh <= 23 && mm <= 59 && ss <= 59)
-                    secs = (uint32_t)hh * 3600u + (uint32_t)mm * 60u + (uint32_t)ss;
-            }
-        }
-        out[0] = (secs >> 16) & 0xFF;
-        out[1] = (secs >> 8) & 0xFF;
-        out[2] = secs & 0xFF;
-        break;
-    }
-    case FT_UUID: {
-        /* Parse 32 hex digits (skip hyphens), pack into 16 bytes BE.
-           On malformed input (not exactly 32 hex digits), zero the field. */
-        uint8_t buf[16] = {0};
-        int pos = 0;
-        for (size_t i = 0; i < vlen && pos < 32; i++) {
-            char c = val[i];
-            if (c == '-') continue;
-            int nibble = -1;
-            if (c >= '0' && c <= '9') nibble = c - '0';
-            else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
-            else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
-            if (nibble < 0) { pos = 0; break; }
-            if (pos % 2 == 0) buf[pos / 2] = nibble << 4;
-            else buf[pos / 2] |= nibble;
-            pos++;
-        }
-        if (pos != 32) memset(buf, 0, 16);
-        memcpy(out, buf, 16);
-        break;
-    }
-    case FT_IPV4: {
-        char ipbuf[16]; /* max "255.255.255.255" + NUL = 16 */
-        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
-        memcpy(ipbuf, val, n);
-        ipbuf[n] = '\0';
-        if (n == 0 || inet_pton(AF_INET, ipbuf, out) != 1)
-            memset(out, 0, 4);
-        break;
-    }
-    case FT_IPV6: {
-        char ipbuf[46]; /* INET6_ADDRSTRLEN */
-        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
-        memcpy(ipbuf, val, n);
-        ipbuf[n] = '\0';
-        if (n == 0 || inet_pton(AF_INET6, ipbuf, out) != 1)
-            memset(out, 0, 16);
-        break;
-    }
     case FT_NUMERIC: {
         char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
         double dv = atof(cbuf);
@@ -2055,7 +2819,7 @@ void encode_field(const TypedField *f, const char *val, uint8_t *out) {
                 positive but flip kept for consistency with other signed types)
      datetime — 4 bytes BE flipped-int32 date + 3 bytes BE seconds-of-day
      double   — 8 bytes BE with IEEE-754 total-order transform */
-void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
+void encode_field_text_for_index(const TypedField *f, const char *val, size_t vlen,
                             uint8_t *out, size_t *out_len) {
     if (!val || vlen == 0) {
         /* Empty / null input. For fixed-width fields we zero f->size bytes
@@ -2080,8 +2844,8 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
     case FT_TIMESTAMP: {
         /* Same index-key shape — top-bit-flipped BE int64 gives a memcmp
            total order over the signed range. */
-        char cbuf[32]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        int64_t v = strtoll(cbuf, NULL, 10);
+        assert(val[vlen] == '\0');
+        int64_t v = strtoll(val, NULL, 10);
         uint64_t u = (uint64_t)v ^ (1ULL << 63);
         out[0] = (u >> 56) & 0xFF; out[1] = (u >> 48) & 0xFF;
         out[2] = (u >> 40) & 0xFF; out[3] = (u >> 32) & 0xFF;
@@ -2091,8 +2855,8 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     case FT_INT: {
-        char cbuf[16]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        int32_t v = (int32_t)atoi(cbuf);
+        assert(val[vlen] == '\0');
+        int32_t v = (int32_t)strtoll(val, NULL, 10);
         uint32_t u = (uint32_t)v ^ 0x80000000u;
         out[0] = (u >> 24) & 0xFF; out[1] = (u >> 16) & 0xFF;
         out[2] = (u >> 8) & 0xFF;  out[3] = u & 0xFF;
@@ -2100,16 +2864,16 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     case FT_SHORT: {
-        char cbuf[16]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        int16_t v = (int16_t)atoi(cbuf);
+        assert(val[vlen] == '\0');
+        int16_t v = (int16_t)strtoll(val, NULL, 10);
         uint16_t u = (uint16_t)v ^ 0x8000u;
         out[0] = (u >> 8) & 0xFF; out[1] = u & 0xFF;
         *out_len = 2;
         break;
     }
     case FT_DOUBLE: {
-        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        double v = atof(cbuf);
+        assert(val[vlen] == '\0');
+        double v = strtod(val, NULL);
         uint64_t bits;
         memcpy(&bits, &v, 8);
         /* IEEE-754 total order: if sign bit set (negative), flip all bits;
@@ -2125,8 +2889,8 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     case FT_FLOAT: {
-        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        float v = (float)atof(cbuf);
+        assert(val[vlen] == '\0');
+        float v = strtof(val, NULL);
         uint32_t bits;
         memcpy(&bits, &v, 4);
         /* IEEE-754 total order: if sign bit set (negative), flip all bits;
@@ -2145,8 +2909,8 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     case FT_BYTE: {
-        char cbuf[8]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        out[0] = (uint8_t)atoi(cbuf);
+        assert(val[vlen] == '\0');
+        out[0] = (uint8_t)strtoll(val, NULL, 10);
         *out_len = 1;
         break;
     }
@@ -2262,9 +3026,13 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
         break;
     }
     case FT_NUMERIC: {
-        char cbuf[48]; cbuf_from_span(cbuf, sizeof(cbuf), val, vlen);
-        double dv = atof(cbuf);
-        int64_t v = (int64_t)(dv * f->numeric_scale_mult + (dv >= 0 ? 0.5 : -0.5));
+        /* Exact: the same conversion as the write path, so a saved
+           value is always found by its own literal. Invalid or
+           out-of-range literals evaluate to 0 — identical to the
+           scan-side criterion compiler, so indexed and scan routes
+           agree for junk input too (the historic atof behavior). */
+        int64_t v;
+        if (conv_numeric_text(f, val, vlen, &v, NULL, 0) != 0) v = 0;
         uint64_t u = (uint64_t)v ^ (1ULL << 63);
         out[0] = (u >> 56) & 0xFF; out[1] = (u >> 48) & 0xFF;
         out[2] = (u >> 40) & 0xFF; out[3] = (u >> 32) & 0xFF;
@@ -2305,7 +3073,7 @@ void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
 
 /* Direct typed-binary → index-key. Reads the field's stored bytes at
    f->offset and emits the same memcmp-sortable encoding as
-   encode_field_for_index would for equivalent text input. Skips the
+   encode_field_text_for_index would for equivalent text input. Skips the
    typed→ASCII render step on integer/date/numeric fields. */
 void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
                               size_t data_len, int field_idx,
@@ -2446,39 +3214,47 @@ void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
    0.0.0.0 / :: / nil-uuid, so the JSON encoders store NULL instead —
    the historical "unset sentinel" convention. A well-formed 0.0.0.0 /
    :: / nil uuid parses and stays a real (bit-clear) zero value. */
-static int sentinel_span_parses(enum FieldType t, const char *val, size_t vlen) {
+int encode_json_field_checked(const TypedField *f, const char *val,
+                                      size_t vlen, int was_quoted,
+                                      uint8_t *out, char *err, size_t errsz) {
+    if (!was_quoted || !typed_json_string_type(f->type))
+        return encode_field_checked(f, val, vlen, out, err, errsz);
+    char *decoded = NULL;
+    size_t decoded_len = 0;
+    errno = 0;
+    if (json_unescape_cstring(val, vlen, &decoded, &decoded_len) != 0) {
+        int decode_errno = errno;
+        if (err && errsz)
+            snprintf(err, errsz, decode_errno == ENOMEM
+                     ? "out of memory decoding JSON value for field '%s'"
+                     : "malformed JSON escape in value for field '%s'",
+                     f->name);
+        errno = decode_errno;
+        return -1;
+    }
+    int rc = encode_field_checked(f, decoded, decoded_len, out, err, errsz);
+    free(decoded);
+    return rc;
+}
+
+/* R4: types for which a zero-length string is an invalid value (it must
+   reach encode_field_checked, which rejects it) rather than the historic
+   "no value" no-op. */
+static int empty_span_invalid(enum FieldType t) {
     switch (t) {
-    case FT_IPV4: {
-        char ipbuf[16]; uint8_t sink[4];
-        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
-        memcpy(ipbuf, val, n); ipbuf[n] = '\0';
-        return n > 0 && inet_pton(AF_INET, ipbuf, sink) == 1;
-    }
-    case FT_IPV6: {
-        char ipbuf[46]; uint8_t sink[16];
-        size_t n = vlen < sizeof(ipbuf) - 1 ? vlen : sizeof(ipbuf) - 1;
-        memcpy(ipbuf, val, n); ipbuf[n] = '\0';
-        return n > 0 && inet_pton(AF_INET6, ipbuf, sink) == 1;
-    }
-    case FT_UUID: {
-        int pos = 0;
-        for (size_t i = 0; i < vlen && pos < 32; i++) {
-            char c = val[i];
-            if (c == '-') continue;
-            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
-                  (c >= 'A' && c <= 'F'))) return 0;
-            pos++;
-        }
-        return pos == 32;
-    }
-    default:
+    case FT_BOOL: case FT_DATE: case FT_DATETIME: case FT_DATETIMEMS:
+    case FT_TIME: case FT_UUID: case FT_IPV4: case FT_IPV6: case FT_ENUM:
         return 1;
+    default:
+        return 0;
     }
 }
 
-int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_size) {
+int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out,
+                 int out_size, char *err_buf, size_t err_buf_size) {
     if (!ts || !ts->typed || out_size < ts->total_size) return -1;
     memset(out, 0, ts->total_size);
+    if (err_buf && err_buf_size > 0) err_buf[0] = '\0';
     /* Null bitmap head — no defaults pass here, so bits are only set by
        explicit JSON null spans below. */
     out[0] = (uint8_t)typed_nullmap_bytes(ts->nfields);
@@ -2529,33 +3305,13 @@ int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_
                 typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
                 break;
             }
-            if (el > 0) {
-                if (!sentinel_span_parses(ts->fields[i].type, ev, el)) {
-                    if (ts->fields[i].not_null) return -2;
-                    /* Malformed uuid/ipv4/ipv6 — the historic unset
-                       sentinel. Store NULL (bit set) rather than a
-                       visible zero value on nullmap records. */
-                    typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
-                    break;
-                }
-                /* Varchar values carry JSON escapes (\" \n \\ \uXXXX
-                   etc.) — must decode before storage or round-trips
-                   come back double-escaped. Other types' values are
-                   numeric / bool / null literals that don't need it. */
-                if (ts->fields[i].type == FT_VARCHAR) {
-                    char *unesc = NULL; size_t unesc_len = 0;
-                    if (json_unescape_string(ev, el, &unesc, &unesc_len) == 0) {
-                        encode_field_len(&ts->fields[i], unesc, unesc_len,
-                                          out + ts->nullmap_prefix + ts->fields[i].offset);
-                        free(unesc);
-                    } else {
-                        encode_field_len(&ts->fields[i], ev, el,
-                                          out + ts->nullmap_prefix + ts->fields[i].offset);
-                    }
-                } else {
-                    encode_field_len(&ts->fields[i], ev, el,
-                                      out + ts->nullmap_prefix + ts->fields[i].offset);
-                }
+            if (el > 0 || empty_span_invalid(ts->fields[i].type)) {
+                /* Decode eligible JSON string fields exactly once before
+                   full-span conversion; non-JSON defaults use the literal path. */
+                if (encode_json_field_checked(&ts->fields[i], ev, el, was_quoted,
+                                              out + ts->nullmap_prefix + ts->fields[i].offset,
+                                              err_buf, err_buf_size) != 0)
+                    return -2;
             }
             break;
         }
@@ -2757,13 +3513,18 @@ int format_wire_key(const Schema *sc, const char *key, size_t klen,
 }
 
 /* Random N bytes, hex-encoded (2*N chars + NUL) */
-static void gen_random_hex(int nbytes, char *buf, size_t bufsz) {
-    if (nbytes <= 0 || (size_t)(nbytes * 2 + 1) > bufsz) { buf[0] = '\0'; return; }
-    uint8_t raw[256];
-    if (nbytes > (int)sizeof(raw)) nbytes = (int)sizeof(raw);
-    if (fill_random(raw, (size_t)nbytes) != 0) { buf[0] = '\0'; return; }
-    for (int i = 0; i < nbytes; i++)
-        snprintf(buf + i * 2, 3, "%02x", raw[i]);
+static void gen_random_hex(int nbytes,char *buf,size_t bufsz){
+    if(!buf||!bufsz)return;
+    buf[0]=0;
+    if(nbytes<=0||(size_t)nbytes>(bufsz-1)/2)return;
+    static const char hex[]="0123456789abcdef";uint8_t raw[256];size_t done=0;
+    while(done<(size_t)nbytes){
+        size_t take=(size_t)nbytes-done;if(take>sizeof(raw))take=sizeof(raw);
+        if(fill_random(raw,take)){buf[0]=0;return;}
+        for(size_t i=0;i<take;i++){buf[2*(done+i)]=hex[raw[i]>>4];buf[2*(done+i)+1]=hex[raw[i]&15];}
+        done+=take;
+    }
+    buf[2*(size_t)nbytes]=0;
 }
 
 /* Durable sequence-state write: temp file in the same directory, full
@@ -2901,8 +3662,9 @@ long long seq_next_val_batch(const char *db_root, const char *object,
 
 /* Generate a default value string for a field. Returns static/malloc'd string
    in gen_buf (caller-provided, >= 256 bytes). Returns NULL if no default. */
-static const char *generate_default(const TypedField *tf, char *gen_buf, size_t bufsz,
+const char *generate_default(const TypedField *tf, char *gen_buf, size_t bufsz,
                                     const char *db_root, const char *object) {
+    if(!tf||tf->default_invalid){errno=EINVAL;return NULL;}
     switch (tf->default_kind) {
     case DK_NONE:
         return NULL;
@@ -2938,55 +3700,25 @@ static const char *generate_default(const TypedField *tf, char *gen_buf, size_t 
     return NULL;
 }
 
-/* Helper: render an actionable "unknown enum value" error message into
-   err_buf. Truncates the legal-values list cleanly when there's no room
-   left, keeping the message readable for large enums.
-
-   CodeQL #91 ("potentially overflowing call to snprintf"): the previous
-   implementation accumulated snprintf's *would-have-written* return
-   value into `pos`, then passed `err_buf_size - pos` as the next call's
-   remaining-size. If snprintf returned a value larger than the actual
-   space, `pos` walked past `err_buf_size` and the next subtraction
-   underflowed (size_t), letting subsequent snprintf calls write
-   unbounded. Fixed by clamping the running offset after every snprintf
-   so it never exceeds err_buf_size − 1 (the NUL terminator slot). */
-static void fmt_unknown_enum_err(const TypedField *f, const char *bad_val,
-                                  size_t bad_len, char *err_buf, size_t err_buf_size) {
-    if (!err_buf || err_buf_size == 0) return;
-    err_buf[0] = '\0';
-
-    #define APPEND(...) do {                                         \
-        if (pos + 1 >= err_buf_size) break;                          \
-        int _n = snprintf(err_buf + pos, err_buf_size - pos,         \
-                          __VA_ARGS__);                              \
-        if (_n < 0) { err_buf[pos] = '\0'; break; }                  \
-        if ((size_t)_n >= err_buf_size - pos) {                      \
-            pos = err_buf_size - 1; /* clamped + NUL-terminated */   \
-            err_buf[pos] = '\0';                                     \
-            break;                                                   \
-        }                                                            \
-        pos += (size_t)_n;                                           \
-    } while (0)
-
-    size_t pos = 0;
-    APPEND("unknown enum value '%.*s' for field [%s]; legal: [",
-           (int)bad_len, bad_val, f->name);
-
-    for (int i = 0; i < f->n_enum_values; i++) {
-        const char *v = f->enum_values[i];
-        if (!v) continue;
-        size_t vl = strlen(v);
-        /* Reserve 5 bytes for ",..." + "]" + NUL so the truncation
-           marker always fits, even if we have to bail mid-loop. */
-        if (pos + vl + 5 >= err_buf_size) {
-            APPEND("...");
-            break;
+char *generate_default_owned(const TypedField *f,const char *root,const char *object,size_t budget){
+    if(!f||!budget||f->default_invalid){errno=EINVAL;return NULL;}
+    size_t need=256;
+    if(f->default_kind==DK_LITERAL)need=strlen(f->default_val)+1;
+    else if(f->default_kind==DK_RANDOM){
+        const char *p=f->default_val;size_t count=0;
+        if(!*p){errno=EINVAL;return NULL;}
+        for(;*p;p++){
+            if(*p<'0'||*p>'9'||count>(2097152u-(unsigned)(*p-'0'))/10){errno=EINVAL;return NULL;}
+            count=count*10+(unsigned)(*p-'0');
         }
-        APPEND("%s%s", i ? "," : "", v);
+        if(!count||count>2097152u){errno=EINVAL;return NULL;}need=2*count+1;
     }
-    APPEND("]");
-
-    #undef APPEND
+    if(need>budget){errno=ENOBUFS;return NULL;}
+    char *out=malloc(need);if(!out){errno=ENOMEM;return NULL;}
+    const char *value=generate_default(f,out,need,root,object);
+    if(!value){free(out);errno=EIO;return NULL;}
+    if(value!=out)memcpy(out,value,strlen(value)+1);
+    return out;
 }
 
 /* Canonical :not_null rejection text — one source so single-request
@@ -3074,63 +3806,15 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                     typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
                     break;
                 }
-                if (el > 0) {
-                    if (!sentinel_span_parses(ts->fields[i].type, ev, el)) {
-                        if (ts->fields[i].not_null) {
-                            char message[320];
-                            fmt_not_null_err(&ts->fields[i], message, sizeof(message));
-                            LOG_WARN(LOG_SUB_CONFIG, "%s/%s: %s (malformed sentinel)",
-                                     db_root ? db_root : "?", object ? object : "?", message);
-                            fmt_not_null_err(&ts->fields[i], err_buf, err_buf_size);
-                            return -2;
-                        }
-                        /* Malformed uuid/ipv4/ipv6 — the historic unset
-                           sentinel. Store NULL (bit set) rather than a
-                           visible zero value on nullmap records. */
-                        typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
-                        break;
-                    }
-                    /* Enum: strict membership check before the encode.
-                       Unknown values are silently zeroed by encode_field_len
-                       (legacy convention for other typed fields). For enum
-                       that would corrupt every record on a typo, so we
-                       reject at the wire layer instead. */
-                    if (ts->fields[i].type == FT_ENUM &&
-                        enum_value_index(&ts->fields[i], ev, el) < 0) {
-                        fmt_unknown_enum_err(&ts->fields[i], ev, el,
-                                              err_buf, err_buf_size);
+                if (el > 0 || empty_span_invalid(ts->fields[i].type)) {
+                    /* R4: no sentinel downgrade and no separate enum
+                       pre-check — encode_field_checked enforces the strict
+                       grammar (malformed input is an error, never NULL,
+                       and unknown enum members are rejected uniformly). */
+                    if (encode_json_field_checked(&ts->fields[i], ev, el, was_quoted,
+                                                  out + ts->nullmap_prefix + ts->fields[i].offset,
+                                                  err_buf, err_buf_size) != 0)
                         return -2;
-                    }
-                    /* Same JSON-unescape pass typed_encode does for
-                       varchars — keeps wire and stored bytes in sync. */
-                    if (ts->fields[i].type == FT_VARCHAR) {
-                        char *unesc = NULL; size_t unesc_len = 0;
-                        if (json_unescape_cstring(ev, el, &unesc, &unesc_len) != 0) {
-                            /* Malformed escape (including an embedded NUL)
-                               — reject rather than silently falling back
-                               to raw, still-escaped bytes. */
-                            if (err_buf && err_buf_size > 0)
-                                snprintf(err_buf, err_buf_size,
-                                    "malformed JSON escape in value for field '%s'",
-                                    ts->fields[i].name);
-                            return -2;
-                        }
-                        int content_max = ts->fields[i].size - 2;
-                        if ((int)unesc_len > content_max) {
-                            if (err_buf && err_buf_size > 0)
-                                snprintf(err_buf, err_buf_size,
-                                    "value for field '%s' is %zu bytes; exceeds max %d for varchar",
-                                    ts->fields[i].name, unesc_len, content_max);
-                            free(unesc);
-                            return -2;
-                        }
-                        encode_field_len(&ts->fields[i], unesc, unesc_len,
-                                          out + ts->nullmap_prefix + ts->fields[i].offset);
-                        free(unesc);
-                    } else {
-                        encode_field_len(&ts->fields[i], ev, el,
-                                          out + ts->nullmap_prefix + ts->fields[i].offset);
-                    }
                     seen[i] = 1;
                 }
                 break;
@@ -3155,9 +3839,7 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
             typed_set_null(out + 1, ts->nullmap_prefix - 1, i);
             continue;
         }
-        char gen_buf[256];
-        const char *dv = generate_default(&ts->fields[i], gen_buf, sizeof(gen_buf),
-                                          db_root, object);
+        char *dv=generate_default_owned(&ts->fields[i],db_root,object,g_query_buffer_max_bytes);
         if (!dv) {
             /* The loop already skipped DK_NONE, so NULL here always means the
                generator failed (seq lock/filesystem error, random source
@@ -3170,8 +3852,9 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
                          ts->fields[i].name);
             return -2;
         }
-        encode_field(&ts->fields[i], dv,
-                     out + ts->nullmap_prefix + ts->fields[i].offset);
+        int rc=encode_field_checked(&ts->fields[i],dv,strlen(dv),
+            out+ts->nullmap_prefix+ts->fields[i].offset,err_buf,err_buf_size);
+        free(dv);if(rc)return -2;
     }
     return ts->total_size;
 }
@@ -3181,7 +3864,7 @@ int typed_encode_defaults(const TypedSchema *ts, const char *json, uint8_t *out,
 /* render_zeros: set for nullmap records (the bitmap is authoritative —
    a bit-clear zero is a real value and must render). Legacy records pass
    0 and keep the skip-on-zero absence heuristics. */
-static int decode_field_to_buf(const TypedField *f, const uint8_t *data,
+int decode_field_to_buf(const TypedField *f, const uint8_t *data,
                                char *buf, int buflen, int render_zeros) {
     switch (f->type) {
     case FT_VARCHAR: {
@@ -3269,7 +3952,8 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data,
             if (!render_zeros) return 0;
             return snprintf(buf, buflen, "0");
         }
-        return snprintf(buf, buflen, "%g", v);
+        /* 17 significant digits: every double round-trips exactly. */
+        return snprintf(buf, buflen, "%.17g", v);
     }
     case FT_FLOAT: {
         float v;
@@ -3278,7 +3962,9 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data,
             if (!render_zeros) return 0;
             return snprintf(buf, buflen, "0");
         }
-        return snprintf(buf, buflen, "%g", (double)v);
+        /* 9 significant digits: every float round-trips exactly, parsed
+           directly as binary32. */
+        return snprintf(buf, buflen, "%.9g", (double)v);
     }
     case FT_BOOL: {
         return snprintf(buf, buflen, "%s", data[0] ? "true" : "false");
@@ -3294,15 +3980,21 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data,
         int64_t v = (int64_t)u;   /* see FT_LONG: unsigned accumulate (UB gate) */
         if (v == 0) return snprintf(buf, buflen, "0");
         int64_t scale = f->numeric_scale_mult;
-        int64_t whole = v / scale;
-        int64_t frac = v % scale;
-        int neg = (v < 0);
-        if (frac < 0) frac = -frac;
-        if (whole < 0) whole = -whole;
+        if (scale <= 0)   /* unsupported legacy scale: raw integer fallback */
+            return snprintf(buf, buflen, "%lld", (long long)v);
+        /* Magnitude in unsigned arithmetic — negating INT64_MIN is UB
+           and rendered "--9223372036854775808" at scale 0. */
+        uint64_t m = (uint64_t)v;
+        int neg = v < 0;
+        if (neg) m = 0u - m;
+        uint64_t whole = m / (uint64_t)scale;
+        uint64_t frac = m % (uint64_t)scale;
         if (frac == 0)
-            return snprintf(buf, buflen, "%s%lld", neg ? "-" : "", (long long)whole);
-        return snprintf(buf, buflen, "%s%lld.%0*lld", neg ? "-" : "",
-                        (long long)whole, f->numeric_scale, (long long)frac);
+            return snprintf(buf, buflen, "%s%llu", neg ? "-" : "",
+                            (unsigned long long)whole);
+        return snprintf(buf, buflen, "%s%llu.%0*llu", neg ? "-" : "",
+                        (unsigned long long)whole, f->numeric_scale,
+                        (unsigned long long)frac);
     }
     case FT_DATE: {
         uint32_t u = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
@@ -3426,145 +4118,149 @@ static int decode_field_to_buf(const TypedField *f, const uint8_t *data,
     }
 }
 
-char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
-                   uint8_t hdr2) {
-    if (!ts || !ts->typed) return NULL;
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t field_region_len = 0;
-    int render_zeros = 0;
-    if (data_len < 0 ||
-        typed_record_view(data, (size_t)data_len, hdr2, &fbase, &bm,
-                          &bm_bytes, &field_region_len) != 0) {
-        errno = EILSEQ;   /* corrupt flagged record — error, not JSON null */
+char *typed_decode_bounded_size(const TypedSchema *ts,const uint8_t *data,int data_len,
+    uint8_t hdr2,size_t budget,size_t *allocated) {
+    if(allocated)*allocated=0;
+    if (!ts || !ts->typed || ts->nfields < 1 || ts->nfields > MAX_FIELDS) {
+        errno = EINVAL;
         return NULL;
     }
-    render_zeros = (hdr2 & SREC_FLAG_NULLMAP) ? 1 : 0;
-    /* Size the outer record-JSON buffer based on actual field types.
-       Pre-2026.05.6 this was a flat `nfields * 300` heuristic, which
-       silently truncated mid-field on records carrying a large
-       varchar (e.g. HN comment text up to 8 KB). For each field:
-         "name":<value>, =>  name_len + 4 punctuation bytes
-       Plus the value:
-         FT_VARCHAR: worst-case 6 * (size - 2) + 2 quotes (escapes can
-                     6x-expand control chars per RFC 8259)
-         everything else: a generous 64 bytes (long literals, dates,
-                     numerics — all fit comfortably) */
-    size_t est = 4;  /* { ... } + NUL */
-    for (int i = 0; i < ts->nfields; i++) {
-        if (ts->fields[i].removed) continue;
-        est += (size_t)ts->fields[i].name_len + 4;
-        if (ts->fields[i].type == FT_VARCHAR) {
-            int cm = ts->fields[i].size > 2 ? ts->fields[i].size - 2 : 0;
-            est += (size_t)cm * 6 + 2;
-        } else {
-            est += 64;
-        }
+    if (data_len < 0) { errno = EILSEQ; return NULL; }
+    if (ts->packed.nfields)
+        {
+        if(!data){errno=EINVAL;return NULL;}
+        size_t allowance=typed_packed_render_allowance(ts,data,(size_t)data_len,hdr2,NULL,budget);
+        char *text=allowance?typed_packed_decode(ts,data,(size_t)data_len,hdr2,allowance):NULL;
+        if(text&&allocated)*allocated=strlen(text)+1;
+        return text;
     }
-    char *buf = malloc(est);
-    size_t pos = 0;
-    if (est > 0) buf[pos++] = '{';
-    int first = 1;
-
+    const uint8_t *fbase = NULL, *bm = NULL;
+    int bm_bytes = 0;
+    size_t region = 0;
+    if (data_len < 0 || typed_record_view(data, (size_t)data_len, hdr2,
+                                         &fbase, &bm, &bm_bytes, &region)) {
+        errno = EILSEQ;
+        return NULL;
+    }
+    static const uint8_t zero_field[65537];
+    int capacities[MAX_FIELDS] = {0};
+    size_t est=4,workspace=0;
     for (int i = 0; i < ts->nfields; i++) {
         const TypedField *f = &ts->fields[i];
-        if (f->removed) continue;  /* tombstoned — not visible to consumers */
-
-        /* For trim-encoded records, fields past the field region are
-           zero/default. Use a static zero buffer so decode_field_to_buf
-           always has valid input. */
-        static const uint8_t zero_field[65537]; /* BSS — always zero-initialised */
-        const uint8_t *field_src = ((size_t)f->offset + (size_t)f->size <= field_region_len)
-            ? fbase + f->offset
-            : zero_field;
-
-        /* NULL bit ⇒ emit JSON null (key present), canonical-NULL bytes
-           are an encoder bug (defensive LOG at debug noise level omitted —
-           render null regardless). */
-        if (typed_field_null(bm, bm_bytes, i)) {
-            if (!first && pos + 1 < est) buf[pos++] = ',';
-            SB_APPEND(buf, pos, est, "\"%s\":null", f->name);
-            first = 0;
-            continue;
+        if (f->removed) continue;
+        if (f->offset < 0 || f->size < 1 || f->size > (int)sizeof(zero_field)) {
+            errno = EILSEQ;
+            return NULL;
         }
-
-        /* Stack buffer covers non-varchar fields (numbers / bool / dates
-           fit comfortably). Varchar may need 6 * content_max + 2 bytes
-           worst-case after JSON-escape expansion (\u00XX per byte); fall
-           back to a heap allocation for those. */
-        char vbuf_stack[512];
-        char *vbuf = vbuf_stack;
-        int vbufsz = (int)sizeof(vbuf_stack);
-        if (f->type == FT_VARCHAR) {
-            int need = 6 * (f->size > 2 ? f->size - 2 : 0) + 3;
-            if (need > vbufsz) {
-                vbuf = malloc((size_t)need);
-                if (!vbuf) { vbuf = vbuf_stack; }   /* falls back; may truncate */
-                else        { vbufsz = need; }
-            }
+        const uint8_t *src = (size_t)f->offset + (size_t)f->size <= region
+            ? fbase + f->offset : zero_field;
+        size_t need = 512;
+        if (typed_field_null(bm, bm_bytes, i)) need = 5;
+        else if (f->type == FT_VARCHAR) {
+            if (f->size < 2) { errno = EILSEQ; return NULL; }
+            size_t n = ((size_t)src[0] << 8) | src[1];
+            if (n > (size_t)f->size - 2) n = (size_t)f->size - 2;
+            need = 6 * n + 3;
+        } else if (f->type == FT_ENUM) {
+            if (f->enum_width == 2 && f->size < 2) { errno = EILSEQ; return NULL; }
+            unsigned index = f->enum_width == 2
+                ? ((unsigned)src[0] << 8) | src[1] : src[0];
+            const char *v = f->enum_values && f->n_enum_values > 0 && index < (unsigned)f->n_enum_values
+                ? f->enum_values[index] : NULL;
+            size_t n = v ? strlen(v) : 0;
+            if (n > (INT_MAX - 4u) / 6u) { errno = EOVERFLOW; return NULL; }
+            need = 6 * n + 4;
         }
-        int vlen = decode_field_to_buf(f, field_src, vbuf, vbufsz, render_zeros);
-        if (vlen <= 0) { if (vbuf != vbuf_stack) free(vbuf); continue; }
-
-        if (!first && pos + 1 < est) buf[pos++] = ',';
-        SB_APPEND(buf, pos, est, "\"%s\":%s", f->name, vbuf);
-        first = 0;
-        if (vbuf != vbuf_stack) free(vbuf);
+        if(need>512&&need>workspace)workspace=need;
+        size_t name=strlen(f->name);
+        if(name>(SIZE_MAX-2)/6){errno=EOVERFLOW;return NULL;}
+        name=6*name+2;
+        if (name > SIZE_MAX - need - 4 || est > SIZE_MAX - name - need - 4) {
+            errno = EOVERFLOW;
+            return NULL;
+        }
+        capacities[i] = (int)need;
+        est += name + need + 4;
     }
-    if (pos + 1 < est) buf[pos++] = '}';
-    buf[pos] = '\0';
-    return buf;
-}
-
-int typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
-                        int data_len, FILE *out, uint8_t hdr2) {
-    if (!ts || !ts->typed || !out) return -1;
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t field_region_len = 0;
-    if (data_len < 0 ||
-        typed_record_view(data, (size_t)data_len, hdr2, &fbase, &bm,
-                          &bm_bytes, &field_region_len) != 0) {
-        errno = EILSEQ;   /* corrupt flagged record — fail, never emit */
-        return -1;
-    }
-    int render_zeros = (hdr2 & SREC_FLAG_NULLMAP) ? 1 : 0;
-    fputc('{', out);
+    if(est>budget||workspace>budget-est){errno=ENOMEM;return NULL;}
+    char *buf = malloc(est);
+    if (!buf) { errno = ENOMEM; return NULL; }
+    size_t pos = 0;
+    buf[pos++] = '{';
     int first = 1;
     for (int i = 0; i < ts->nfields; i++) {
         const TypedField *f = &ts->fields[i];
         if (f->removed) continue;
-
-        static const uint8_t zero_field[65537];
-        const uint8_t *field_src = ((size_t)f->offset + (size_t)f->size <= field_region_len)
-            ? fbase + f->offset
-            : zero_field;
-
+        const uint8_t *src = (size_t)f->offset + (size_t)f->size <= region
+            ? fbase + f->offset : zero_field;
+        char stack[512], *value = stack;
+        int len;
         if (typed_field_null(bm, bm_bytes, i)) {
-            if (!first) fputc(',', out);
-            fprintf(out, "\"%s\":null", f->name);
-            first = 0;
-            continue;
-        }
-
-        char vbuf_stack[512];
-        char *vbuf = vbuf_stack;
-        int vbufsz = (int)sizeof(vbuf_stack);
-        if (f->type == FT_VARCHAR) {
-            int need = 6 * (f->size > 2 ? f->size - 2 : 0) + 3;
-            if (need > vbufsz) {
-                vbuf = malloc((size_t)need);
-                if (!vbuf) { vbuf = vbuf_stack; }
-                else        { vbufsz = need; }
+            memcpy(stack, "null", 5);
+            len = 4;
+        } else {
+            int cap = capacities[i];
+            if (cap > (int)sizeof(stack)) {
+                value = malloc((size_t)cap);
+                if (!value) { free(buf); errno = ENOMEM; return NULL; }
+            }
+            len = decode_field_to_buf(f, src, value,
+                                      cap > (int)sizeof(stack) ? cap : (int)sizeof(stack),
+                                      (hdr2 & SREC_FLAG_NULLMAP) != 0);
+            if (len < 0 || len >= (cap > (int)sizeof(stack) ? cap : (int)sizeof(stack))) {
+                if (value != stack) free(value);
+                free(buf);
+                errno = EILSEQ;
+                return NULL;
             }
         }
-        int vlen = decode_field_to_buf(f, field_src, vbuf, vbufsz, render_zeros);
-        if (vlen <= 0) { if (vbuf != vbuf_stack) free(vbuf); continue; }
-
-        if (!first) fputc(',', out);
-        fprintf(out, "\"%s\":%s", f->name, vbuf);
+        /* Preserve unflagged legacy skip-on-zero/absence semantics. */
+        if (len == 0) { if (value != stack) free(value); continue; }
+        if(!first)buf[pos++]=',';
+        buf[pos++]='"';
+        int escaped=json_escape_into(buf+pos,est-pos,f->name,strlen(f->name));
+        if(escaped<0){if(value!=stack)free(value);free(buf);errno=EOVERFLOW;return NULL;}
+        pos+=(size_t)escaped;buf[pos++]='"';buf[pos++]=':';
+        int written=snprintf(buf+pos,est-pos,"%s",value);
+        if (value != stack) free(value);
+        if (written < 0 || (size_t)written >= est - pos) {
+            free(buf);
+            errno = EOVERFLOW;
+            return NULL;
+        }
+        pos += (size_t)written;
         first = 0;
-        if (vbuf != vbuf_stack) free(vbuf);
     }
-    fputc('}', out);
+    if (pos > est - 2) { free(buf); errno = EOVERFLOW; return NULL; }
+    buf[pos++] = '}';
+    buf[pos] = '\0';
+    if(allocated)*allocated=est;
+    return buf;
+}
+char *typed_decode_bounded(const TypedSchema *ts,const uint8_t *data,int len,uint8_t flags,size_t budget){
+    return typed_decode_bounded_size(ts,data,len,flags,budget,NULL);
+}
+char *typed_decode(const TypedSchema *ts,const uint8_t *data,int data_len,uint8_t hdr2){
+    return typed_decode_bounded(ts,data,data_len,hdr2,g_query_buffer_max_bytes);
+}
+
+int typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
+                        int data_len, FILE *out, uint8_t hdr2) {
+    if (!out) { errno = EINVAL; return -1; }
+    if (ferror(out)) { errno = EIO; return -1; }
+    /* Complete validation/rendering precedes output. In particular ENOMEM
+       never falls back to a smaller field buffer or drops an enum value. */
+    char *json = typed_decode(ts, data, data_len, hdr2);
+    if (!json) return -1;
+    size_t length = strlen(json);
+    errno = 0;
+    size_t written = fwrite(json, 1, length, out);
+    int saved = errno;
+    free(json);
+    if (written != length || ferror(out)) {
+        errno = saved ? saved : EIO;
+        return -1;
+    }
     return 0;
 }
 
@@ -4014,11 +4710,12 @@ int cmd_add_fields(const char *db_root, const char *object,
         OUT("{\"error\":\"fields.conf missing for [%s]\"}\n", object);
         return 1;
     }
+    const int packed_obj = ts->packed.nfields != 0;   /* R5b: packed grammar below */
 
     for (int a = 0; a < nlines; a++) {
         char *colon = strchr(lines[a], ':');
         if (!colon || colon == lines[a]) {
-            OUT("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
+            OUT_ERR_ESC("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
             return 1;
         }
         size_t nlen = colon - lines[a];
@@ -4026,10 +4723,10 @@ int cmd_add_fields(const char *db_root, const char *object,
         char name[128];
         memcpy(name, lines[a], nlen); name[nlen] = '\0';
         if (!valid_field_name(name)) {
-            OUT("{\"error\":\"Invalid field name: %s\"}\n", name);
+            OUT_ERR_ESC("{\"error\":\"Invalid field name: %s\"}\n", name);
             return 1;
         }
-        if (strstr(lines[a], ":removed")) {
+        if (fields_line_is_removed(lines[a])) {
             OUT("{\"error\":\"Cannot add field with ':removed' marker\"}\n");
             return 1;
         }
@@ -4054,6 +4751,32 @@ int cmd_add_fields(const char *db_root, const char *object,
                 return 1;
             }
         }
+        if (packed_obj) {
+            TypedField ptf;
+            PkrField ppf;
+            memset(&ptf, 0, sizeof(ptf));
+            if (!parse_field_line_packed(lines[a], &ptf, &ppf)) {
+                free_enum_values(&ptf);
+                OUT_ERR_ESC("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
+                return 1;
+            }
+            if (ptf.default_kind == DK_RANDOM) {
+                int n_bytes = atoi(ptf.default_val);
+                if (n_bytes < 1 || n_bytes > 256) {
+                    free_enum_values(&ptf);
+                    OUT_ERR_ESC("{\"error\":\"random(N) requires 1 <= N <= 256 in: %s\"}\n", lines[a]);
+                    return 1;
+                }
+                if (ptf.type == FT_VARCHAR && (uint32_t)(n_bytes * 2) > ppf.payload_max) {
+                    free_enum_values(&ptf);
+                    OUT("{\"error\":\"random(%d) produces %d hex chars but field [%s] holds only %u\"}\n",
+                        n_bytes, n_bytes * 2, name, ppf.payload_max);
+                    return 1;
+                }
+            }
+            free_enum_values(&ptf);
+            continue;   /* storability of every default is probed in rebuild_object */
+        }
         /* Type parseability — use a throwaway TypedField. parse_default_modifier
            strips any trailing :default=... / :auto_* suffix so parse_field_type
            sees a clean spec ("int", "varchar:32", etc.) and the default kind
@@ -4070,17 +4793,23 @@ int cmd_add_fields(const char *db_root, const char *object,
             OUT("{\"error\":\"out of memory\"}\n");
             return 1;
         }
-        if (parse_default_modifier(clean_spec, &tf) < 0) {
+        if (parse_default_modifier_checked(clean_spec, &tf) < 0) {
             free(clean_spec);
             free_enum_values(&tf);
-            OUT("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
+            OUT_ERR_ESC("{\"error\":\"Invalid field line: %s\"}\n", lines[a]);
             return 1;
         }
-        parse_field_type(clean_spec, &tf);
+        if(typed_legacy_decl_size(clean_spec)<=0){
+            free(clean_spec);OUT("{\"error\":\"Invalid field declaration\"}\n");return 1;
+        }
+        parse_field_type(clean_spec,&tf);
         free(clean_spec);
         if (tf.type == FT_NONE || tf.size <= 0) {
-            OUT("{\"error\":\"Invalid type in: %s\"}\n", lines[a]);
+            OUT_ERR_ESC("{\"error\":\"Invalid type in: %s\"}\n", lines[a]);
             return 1;
+        }
+        if(typed_default_validate(&tf)){
+            free_enum_values(&tf);OUT("{\"error\":\"Invalid default in field declaration\"}\n");return 1;
         }
         /* Pre-flight: refuse random(N) with hex output that exceeds the
            field's storage. random(N) generates 2*N hex chars; for varchar
@@ -4101,7 +4830,7 @@ int cmd_add_fields(const char *db_root, const char *object,
                 }
             } else if (n_bytes <= 0) {
                 free_enum_values(&tf);
-                OUT("{\"error\":\"random(N) requires N > 0 in: %s\"}\n", lines[a]);
+                OUT_ERR_ESC("{\"error\":\"random(N) requires N > 0 in: %s\"}\n", lines[a]);
                 return 1;
             }
         }
@@ -4116,6 +4845,11 @@ int cmd_add_fields(const char *db_root, const char *object,
     if (rc == 0)
         LOG_AUDIT(LOG_SUB_CONFIG, "ADD-FIELD %s/%s: %d field(s) added", db_root, object, nlines);
     return rc;
+}
+
+int fields_line_is_removed(const char *line) {
+    size_t n = strlen(line);
+    return n >= 8 && strcmp(line + n - 8, ":removed") == 0;
 }
 
 /* ========== remove-field ==========
@@ -4216,7 +4950,7 @@ int cmd_remove_fields(const char *db_root, const char *object,
     }
     for (int i = 0; i < nnames; i++) {
         if (!valid_field_name(names[i])) {
-            OUT("{\"error\":\"Invalid field name: %s\"}\n", names[i]);
+            OUT_ERR_ESC("{\"error\":\"Invalid field name: %s\"}\n", names[i]);
             return 1;
         }
     }
@@ -4262,7 +4996,7 @@ int cmd_remove_fields(const char *db_root, const char *object,
             const char *colon = strchr(ln, ':');
             size_t nlen = colon ? (size_t)(colon - ln) : strlen(ln);
             if (token_matches(ln, nlen, names[r])) {
-                if (strstr(ln, ":removed")) {
+                if (fields_line_is_removed(ln)) {
                     OUT("{\"error\":\"Field [%s] is already removed\"}\n", names[r]);
                     return 1;
                 }
@@ -4291,7 +5025,7 @@ int cmd_remove_fields(const char *db_root, const char *object,
         for (int r = 0; r < nnames; r++) {
             if (token_matches(ln, nlen, names[r])) { tombstone_this = 1; break; }
         }
-        if (tombstone_this && !strstr(ln, ":removed"))
+        if (tombstone_this && !fields_line_is_removed(ln))
             fprintf(nf, "%s:removed\n", ln);
         else
             fprintf(nf, "%s\n", ln);
@@ -4360,7 +5094,7 @@ int cmd_rename_field(const char *db_root, const char *object,
             if (token_matches(ln, nlen, old_name)) found_old = 1;
             if (token_matches(ln, nlen, new_name)) {
                 /* tombstoned entry ending with :removed is not a conflict */
-                if (!strstr(ln, ":removed")) new_conflict = 1;
+                if (!fields_line_is_removed(ln)) new_conflict = 1;
             }
         }
         nlines++;

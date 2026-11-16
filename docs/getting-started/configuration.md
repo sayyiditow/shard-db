@@ -183,7 +183,7 @@ $DB_ROOT/
         <a>+<b>/                            # Composite index — '+' joined name
           NNN.idx
       backup/
-        <YYYYMMDD-HHMMSS>/                  # Per-backup snapshots created by `backup` mode
+        <YYYYMMDD_HHMMSS>/                  # Per-backup snapshots created by `backup` mode
           ...
       files/                       # Stored files (put-file)
         <filename>                 # Flat — basename is the lookup key

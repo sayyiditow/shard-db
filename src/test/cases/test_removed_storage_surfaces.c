@@ -50,7 +50,7 @@ static int test_heavy_vacuum_transaction_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"vac\",\"splits\":8,\"max_key\":16,\"fields\":[\"name:varchar:16\"]}", &resp);
+    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"vac\",\"declaration_layout\":\"legacy\",\"splits\":8,\"max_key\":16,\"fields\":[\"name:varchar:16\"]}", &resp);
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"vac\",\"key\":\"k\",\"value\":{\"name\":\"v\"}}", &resp);
     free(resp); resp = NULL;

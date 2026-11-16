@@ -21,7 +21,7 @@ static int test_varchar_overflow_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vo\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"vo\",\"object\":\"t\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vo\",\"object\":\"t\","
         "\"splits\":16,\"max_key\":16,\"fields\":[\"name:varchar:8\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create obj"); free(resp); resp = NULL;
 

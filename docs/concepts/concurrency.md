@@ -29,7 +29,115 @@ bitmap rebuild use the same acquisition order.
 Opening the bitmap first is forbidden even for read/read nesting. A concurrent
 CRUD writer can hold the kfcache wrlock while waiting for the bitmap wrlock; a
 reader holding the bitmap rdlock while waiting for the kfcache rdlock would
-complete an AB-BA deadlock.
+complete an AB-BA deadlock. The same holds after releasing a kfcache lock: a
+path that dropped its kfcache entry must drop its bitmap handles too before it
+takes any kfcache lock again. The indexed count with bitmap post-filters
+(`shard_count_worker`) releases its pass-1 kf probe reader and its bitmap
+readers together before the pass-2 record fetch, which takes kf readers.
+
+Keyfile rebuilds (growth resplit, vacuum compaction) follow the same order: `kfcache_resplit_locked` holds the kf entry wrlock and takes each affected bitmap shard's wrlock, applying the slot-remapped images in place, so no reader can observe a new keyfile with old bitmap bits.
+
+**Order between bitmaps.** Code that holds more than one bitmap shard lock at once (the keyfile-rebuild remap, the single-insert bitmap staging in `v2_insert_prepare_commit`, the bitmap-only AND-count `bm_intersect_shard_worker`, and the bitmap group-by aggregate) acquires them in one canonical order: ascending path of `<field>/NNN.bm` (`bm_open_many_ro`, `bm_field_lock_cmp`). Bitmap-only readers take no kf lock, so without a shared order a reader holding `kind` and waiting for `flag` would deadlock against a rebuild holding `flag` and waiting for `kind`. The bulk-insert window preopens every bitmap (field, shard) handle it can touch in the same canonical order (`bitmap_prepare_window_preopen`) and reopens parked handles in entry order at apply, so every multi-bitmap holder — readers, the keyfile-rebuild remap, the single-insert staging and the bulk window — shares one acquisition order.
+
+### Returned lock errors in the bitmap cache (Plan C)
+
+Cache-hit and cache-fill rwlock acquisition errors fail `bm_open` immediately
+with the exact pthread error in `errno`: no handle is returned and no
+unacquired lock is unlocked. A fill's installed fd/map remain cache-owned.
+`bm_cache_invalidate_checked` also propagates acquisition errors as `-1`.
+
+Eviction treats nonblocking `EBUSY` as ordinary contention. Other errors make
+that candidate unusable, but another candidate may still be evicted
+successfully. If no candidate succeeds, a writer waits on the selected busy
+candidate; a returned blocking error overrides an earlier try error. Thus a
+selected candidate write-held by the calling thread can return `EDEADLK`,
+which fails the writer open instead of being retried forever. Ordinary
+contention still waits for the other holder to release. Reader opens apply
+the same error precedence (they have no selected blocking wait); see
+"Cached-only bitmap handles" below for what happens when no error exists.
+
+This is deliberately narrow. `EDEADLK` is a pthread result, not portable
+ownership detection: a reader that self-upgrades from a read hold can still
+block without an error, and a candidate held by a *different* thread can still
+participate in cross-thread circular waits. The guarantee is only: **when an
+open fails on a returned lock error it fails promptly with that errno;
+ordinary contention still waits.** An error on one eviction candidate does not
+by itself fail the open: a later candidate's successful eviction can still
+satisfy it, and for writers a selected blocking-wait error is returned only
+when no successful eviction remains (a failed try's error is reported only if
+no later eviction succeeds either). The
+`bm_cache_drop_slot` wait-return-0 identity-change path keeps its successful-
+acquire verification and retry, and no error erasure: a blocking-wait failure
+overrides an earlier try error, and busy/identity-change results never erase
+one.
+
+
+### Cached-only bitmap handles and checked corrupt-file retirement (Plan D)
+
+**Cached-only handles.** Once the bitmap cache is initialized (always, in the
+daemon and embedded mode) every handle `bm_open` returns holds its cache
+entry's rwlock, so an in-place keyfile-rebuild remap — which takes the
+entry's write lock — can never change the layout under a reader. The two
+former uncached returns are gone:
+
+- *Stale publication.* When a cached entry's inode no longer matches the path
+  (a replacement was published), the acquirer retires the entry
+  non-blockingly and retries. A retirement error fails the open with its exact
+  errno; a busy entry (another holder still reads the old inode) consumes an
+  admission retry.
+- *Saturation.* When every evictable entry is busy and no acquisition error
+  occurred, the private mapping is disposed and admission is retried.
+
+Admission is bounded: an initial attempt plus 4 retries, 2 ms apart, shared by
+both paths; exhaustion fails the open with `EBUSY`. The bound covers admission
+retrying only — an individual lock acquisition (e.g. a writer waiting for a
+reader to release, or the selected writer eviction wait) still blocks
+normally, so total open latency is not time-bounded. The Plan C error
+precedence is unchanged and applies to readers too: a returned acquisition
+error with no successful eviction fails the open with that error (never
+replaced by `EBUSY`); a later candidate's successful eviction can still
+satisfy the open. Only an uninitialized cache (test fixtures) hands out
+uncached reader handles; writers require the cache (`ENODEV`).
+
+A file whose header does not describe it — short file, bad magic, invalid
+stride/body bounds — fails the open with `EUCLEAN`; open/fstat/mmap failures
+keep their real errno.
+
+**Checked retirement before a corrupt skip.** A keyfile rebuild
+(`kf_bmfix_prepare`, under the shard's kf write lock, bitmaps in canonical
+path order) may skip a corrupt bitmap and leave it to the startup repair
+(`.bmfix-NNN` kept; `bmfix_recover_all` rebuilds only the named shards'
+bitmaps from kf + segments, and on repair failure with no pending KFM2
+commit marker writes `.bmfix-disabled` and serves the object with bitmap
+planning disabled and mutations refused until a full `reindex` heals it —
+only a repair failure with pending KFM2 markers still refuses startup).
+It now does so only after retiring that path's cache
+entry with `bm_cache_invalidate_checked`:
+
+- open failed: only an `EUCLEAN` open is skip-eligible (the on-disk corruption
+  probe confirms it but never outranks an acquisition error such as
+  `EDEADLK`/`EIO`/`EBUSY`, which abort the rebuild);
+- prepare rejected the mapped header (`EUCLEAN`): the rebuild first releases
+  its own writer handle for that entry (checked), then retires the entry —
+  never while still holding that entry's write lock. Earlier retained paths
+  precede it in canonical order, so the order is preserved.
+
+`KF_BMFIX_SKIP` is logged only after a successful retirement. If the release
+or the retirement fails, the rebuild of that shard is abandoned instead
+(`KF_BMFIX_PREPARE_FAILED`, 5 s growth back-off): light vacuum reports
+`keyfile compaction failed` and the refused shard's keyfile is unchanged
+(vacuum compacts shards independently, so other shards may already have been
+compacted). A growth resplit that cannot run keeps the shard ungrown, and a
+bulk upsert stage needing that growth fails closed (`BULK_STAGE_UNGROWN`) for
+the client to retry.
+
+**Bitmap read failures are errors, not missing rows.** Read consumers treat a
+never-written shard file (`ENOENT`) as logically empty, but any other open
+failure is a hard error that propagates out of every worker fan-out after all
+workers join; KeySet collectors check every insert, and a full set (matches
+grew between sizing and enumeration) discards the collection with `ENOBUFS`
+rather than returning a truncated one. Bitmap handles are released before any
+record fetch (kfcache-before-bitmap order is unchanged).
 
 ## Per-kfcache-entry rwlock — the commit lock
 
@@ -143,7 +251,7 @@ Two different writers hashing to the same stream contend on `rotation_lock` brie
 Layered on top of the per-shard locks. Every JSON request gets classified:
 
 - **Normal ops** (all CRUD, queries, bulk ops) → `objlock_rdlock()`. Many concurrent.
-- **Schema mutations** (`add-field`, `remove-field`, `rename-field`, `vacuum --compact`, `vacuum --splits`, `truncate`, `add-index`, `remove-index`) → `objlock_wrlock()`. Blocks everyone; held only for the duration of the rebuild.
+- **Schema mutations** (`add-field`, `remove-field`, `rename-field`, `vacuum --compact`, `vacuum --splits`, `truncate`, `add-index`, `remove-index`) and `backup` → `objlock_wrlock()`. Blocks everyone; held only for the duration of the rebuild. `backup` holds it for the whole copy.
 
 `add-index`/`remove-index` take `objlock_wrlock()` (not `objlock_rdlock()`, despite mutating rather than restructuring schema) because both `unlink()` and rebuild index files in place — the same pattern `vacuum`/`truncate` use. Without the exclusive lock, a concurrent insert's on-the-fly index maintenance can land on the same file mid-rebuild and either get silently discarded or corrupt the B-tree pages being written (fixed in 2026.07.1 — see [changelog](../reference/changelog.md#202671)).
 
@@ -415,7 +523,7 @@ Set `TIMEOUT=<seconds>` in db.env for a global default, or pass `"timeout_ms":N`
 
 ## Per-query memory cap
 
-`QUERY_BUFFER_MB` (default 256) caps the intermediate buffers any single query can hold. Checked at every collection site (ordered find buffer, aggregate hash tables, OR KeySet, AND-intersection KeySets, bulk-delete/update key list, btree hash collection). When exceeded → `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}`. Prevents one bad query from monopolising RAM. Pair with whole-process containment (`MemoryMax=`, cgroup `memory.max`) as a backstop.
+`QUERY_BUFFER_MB` (default 256) caps the intermediate buffers any single query can hold. Checked at every collection site (ordered find buffer, aggregate hash tables, OR KeySet, AND-intersection KeySets, bulk-delete/update key list, btree hash collection, indexed-find record batches). When exceeded → `{"error":"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor"}`, except at the indexed-find record batch: a batch that does not fit is retried at half size, and a single record larger than the budget fails the query mid-stream (unterminated response, no error object). Prevents one bad query from monopolising RAM. Pair with whole-process containment (`MemoryMax=`, cgroup `memory.max`) as a backstop.
 
 ## Crash consistency
 
@@ -458,3 +566,13 @@ re-fired after the chunked-resumable fetch rework — no lock is ever
 held across a `bt_cache_lock` re-probe). See
 `docs/plans/2026-08-28-eliminate-tsan-supp.md` for the per-finding
 rationale. Any new TSan report fails the gate and must be root-caused.
+
+Bitmap candidate sizing prefers `next_power_of_two(max(8192, 2*m))` actual
+slots for estimated matches `m`, subject to exact simultaneous request-budget
+reservations. If that floor alone does not fit, ordinary sizing may be used;
+allocation failures are not retried as smaller allocations. Actual insertion
+overflow after concurrent growth discards the incomplete optimization and
+recovers count/find/aggregate once from original record criteria, preserving
+the original absolute deadline. Hard read errors outrank insertion overflow
+after workers have joined. The floor is headroom, not a growth guarantee;
+queries retain existing concurrent-generation semantics, not snapshot isolation.

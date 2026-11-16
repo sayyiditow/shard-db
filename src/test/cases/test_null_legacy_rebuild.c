@@ -127,7 +127,7 @@ static int test_null_legacy_rebuild_trims(void) {
         "{\"mode\":\"add-dir\",\"dir\":\"lr\"}", &r), 0, "add-dir");
     free(r); r = NULL;
     ASSERT_EQ_INT(tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"lr\",\"object\":\"t\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"lr\",\"object\":\"t\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"s:varchar:8\",\"n:int\",\"d:date\"]}", &r), 0,
         "create lr object");

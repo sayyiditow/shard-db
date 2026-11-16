@@ -36,7 +36,7 @@ static int test_all_field_types_run(void) {
     char *resp = NULL;
 
     /* ========== INT ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_int\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_int\","
         "\"fields\":[\"v:int\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_int\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"1\"}},{\"key\":\"k2\",\"value\":{\"v\":\"2\"}},"
@@ -55,7 +55,7 @@ static int test_all_field_types_run(void) {
     /* Note: IN/NOT_IN broken - tracked in issue #24 */
 
     /* ========== LONG ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_long\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_long\","
         "\"fields\":[\"v:long\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_long\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"100\"}},{\"key\":\"k2\",\"value\":{\"v\":\"200\"}},"
@@ -67,7 +67,7 @@ static int test_all_field_types_run(void) {
     ASSERT_EQ_INT(do_count(tc, "test_long", "[{\"field\":\"v\",\"op\":\"exists\"}]"), 3, "long exists");
 
     /* ========== SHORT ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_short\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_short\","
         "\"fields\":[\"v:short\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_short\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"10\"}},{\"key\":\"k2\",\"value\":{\"v\":\"20\"}},"
@@ -77,7 +77,7 @@ static int test_all_field_types_run(void) {
     ASSERT_EQ_INT(do_count(tc, "test_short", "[{\"field\":\"v\",\"op\":\"exists\"}]"), 3, "short exists");
 
     /* ========== DOUBLE ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_double\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_double\","
         "\"fields\":[\"v:double\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_double\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"1.5\"}},{\"key\":\"k2\",\"value\":{\"v\":\"2.5\"}},"
@@ -89,7 +89,7 @@ static int test_all_field_types_run(void) {
     ASSERT_EQ_INT(do_count(tc, "test_double", "[{\"field\":\"v\",\"op\":\"exists\"}]"), 3, "double exists");
 
     /* ========== FLOAT ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_float\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_float\","
         "\"fields\":[\"v:float\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_float\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"1.5\"}},{\"key\":\"k2\",\"value\":{\"v\":\"2.5\"}},"
@@ -102,7 +102,7 @@ static int test_all_field_types_run(void) {
     ASSERT_EQ_INT(do_count(tc, "test_float", "[{\"field\":\"v\",\"op\":\"exists\"}]"), 3, "float exists");
 
     /* ========== NUMERIC ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_numeric\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_numeric\","
         "\"fields\":[\"v:numeric:2\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_numeric\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"10.50\"}},{\"key\":\"k2\",\"value\":{\"v\":\"20.75\"}},"
@@ -112,7 +112,7 @@ static int test_all_field_types_run(void) {
     ASSERT_EQ_INT(do_count(tc, "test_numeric", "[{\"field\":\"v\",\"op\":\"exists\"}]"), 3, "numeric exists");
 
     /* ========== DATE ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_date\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_date\","
         "\"fields\":[\"v:date\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_date\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"20240101\"}},{\"key\":\"k2\",\"value\":{\"v\":\"20240102\"}},"
@@ -125,7 +125,7 @@ static int test_all_field_types_run(void) {
     ASSERT_EQ_INT(do_count(tc, "test_date", "[{\"field\":\"v\",\"op\":\"in\",\"value\":\"[20240101,20240103]\"}]"), 2, "date in");
 
     /* ========== DATETIME ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_datetime\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_datetime\","
         "\"fields\":[\"v:datetime\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_datetime\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"20240101120000\"}},{\"key\":\"k2\",\"value\":{\"v\":\"20240102120000\"}},"
@@ -135,7 +135,7 @@ static int test_all_field_types_run(void) {
     ASSERT_EQ_INT(do_count(tc, "test_datetime", "[{\"field\":\"v\",\"op\":\"exists\"}]"), 3, "datetime exists");
 
     /* ========== TIME ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_time\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_time\","
         "\"fields\":[\"v:time\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_time\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"09:30:00\"}},{\"key\":\"k2\",\"value\":{\"v\":\"14:45:00\"}},"
@@ -147,7 +147,7 @@ static int test_all_field_types_run(void) {
     ASSERT_EQ_INT(do_count(tc, "test_time", "[{\"field\":\"v\",\"op\":\"exists\"}]"), 3, "time exists");
 
     /* ========== UUID ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_uuid\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_uuid\","
         "\"fields\":[\"v:uuid\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_uuid\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"11111111-1111-1111-1111-111111111111\"}},"
@@ -158,7 +158,7 @@ static int test_all_field_types_run(void) {
     ASSERT_EQ_INT(do_count(tc, "test_uuid", "[{\"field\":\"v\",\"op\":\"exists\"}]"), 3, "uuid exists");
 
     /* ========== VARCHAR ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_varchar\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_varchar\","
         "\"fields\":[\"v:varchar:16\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_varchar\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"apple\"}},{\"key\":\"k2\",\"value\":{\"v\":\"banana\"}},"
@@ -177,7 +177,7 @@ static int test_all_field_types_run(void) {
     /* Note: IN/NOT_IN broken for varchar */
 
     /* ========== BOOL ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_bool\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_bool\","
         "\"fields\":[\"v:bool\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_bool\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"true\"}},{\"key\":\"k2\",\"value\":{\"v\":\"false\"}},"
@@ -188,7 +188,7 @@ static int test_all_field_types_run(void) {
     ASSERT_EQ_INT(do_count(tc, "test_bool", "[{\"field\":\"v\",\"op\":\"exists\"}]"), 3, "bool exists");
 
     /* ========== BYTE ========== */
-    tc_request(tc, "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"test_byte\","
+    tc_request(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"test_byte\","
         "\"fields\":[\"v:byte\"],\"splits\":8}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"test_byte\","
         "\"records\":[{\"key\":\"k1\",\"value\":{\"v\":\"10\"}},{\"key\":\"k2\",\"value\":{\"v\":\"20\"}},"

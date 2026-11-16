@@ -252,7 +252,9 @@ static int test_token_perms_run(void) {
         "{\"mode\":\"add-field\",\"dir\":\"tp_acme\",\"object\":\"orders\","
         "\"fields\":[\"note:varchar:32\"],\"auth\":\"%s\"}", tatok);
     tc_request(tc, req, &resp);
-    ASSERT_CONTAINS(resp, "\"status\":", "tenant-rwx add-field on own dir");
+    /* Packed objects refuse add-field (R5b restores it); this case pins
+       authorization, so only an auth failure is a failure here. */
+    ASSERT_TRUE(resp && !strstr(resp, "auth failed"), "tenant-rwx add-field on own dir passes auth");
     free(resp); resp = NULL;
 
     snprintf(req, sizeof(req), "{\"mode\":\"stats\",\"auth\":\"%s\"}", tatok);

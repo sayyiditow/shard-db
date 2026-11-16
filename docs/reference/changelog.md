@@ -6,6 +6,147 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## Unreleased
 
+**Fix: a bitmap-filtered count no longer deadlocks with a concurrent bulk insert.**
+An indexed `count` with bitmap post-filters kept the shard's bitmap read locks while its record fetch
+took that shard's keyfile lock again, the reverse of the keyfile-then-bitmap order bulk insert uses.
+A bulk insert on the same shard in that window hung both requests (and every later writer on the
+shard). The count now releases its bitmap locks together with its keyfile probe lock before the
+fetch. No wire/CLI/config/on-disk change.
+
+**Count-ranked top-N aggregates stream again with exact extras; tie order is defined.**
+A top-N aggregate ranked by `count(*)` that also asks for `count(g)`, `sum/avg/min/max(g)` on the
+group field (numeric, index-exact; not `sum`/`avg` over `float`/`double`, and not `count(g)` on
+varchar/date/datetime/datetimems/time/uuid) streams the group-field index in O(limit) memory again,
+computing the exact extras per winner from the group value and its count, byte-identical to the
+exact hash path. Aggregate tie order is now defined on both paths: groups with equal `order_by`
+values sort by group value ascending in the field's index order, NULL group last, field by field,
+never flipped by the direction — tied groups that previously came out in an unspecified
+(hash-table / heap-position) order now come out in this order. The stream's `"total"` is now the
+exact distinct-group count instead of `null`. No wire/CLI/config/on-disk change.
+
+**A pending bitmap-remap marker never blocks startup; shard-scoped repair with a read-only escape.**
+`bmfix_recover_all` used to answer any `<obj>/indexes/.bmfix-NNN` marker with a full strict reindex
+of every btree, trigram and bitmap index on every shard, refusing startup on any failure — the same
+failure then repeated on every later start, with cost growing with the object rather than the damage.
+Startup now rebuilds only the named shards' bitmaps for every bitmap field
+(`bitmap_rebuild_shards_durable`, temp files + `bm_publish_replace`; a 1–8 lowercase-hex suffix below
+the object's splits names the shards, any other `.bmfix-*` name selects all of them). If that repair
+or the marker cleanup fails and no KFM2 commit marker is pending for the object, startup durably
+writes `indexes/.bmfix-disabled` and serves the object with bitmap planning disabled: reads fall back
+to btree or full scan (planner and dispatcher skip bitmap entries for the object), every record
+mutation and every schema/maintenance mode (add-field, edit-field, rename-field, remove-field,
+add-index, remove-index, vacuum, truncate; insert/update/delete/bulk-*) is refused up front with
+`{"error":"object writes disabled: bitmap repair failed at startup; run reindex"}` (text fast path:
+`Error: object writes disabled: bitmap repair failed at startup; run reindex`), and background
+auto-vacuum/auto-reshard skip the object; `put-file`, `delete-file`, `sequence`, `backup`, `restore`,
+`reindex` and `drop-object` stay allowed. A full (non-composites-only) `reindex` of a flagged or
+marked object now runs the strict durable rebuild and clears the markers and the flag (a
+composites-only reindex leaves repair state untouched) — this includes serving-time `.bmfix` markers
+left after a logged commit failure, which previously only startup could clear. A later start retries
+the repair first, and success there also clears both; a stale flag with no markers is removed at
+startup; a flagged object heals without operator action. Startup still refuses in exactly these
+cases: the repair fails while KFM2 commit markers are pending for the object (replaying the window
+into the torn bitmap would recreate the trap), the disabled flag cannot be written, the marker
+directory cannot be read, or the schema of a marked object cannot be loaded. An older binary
+treats `.bmfix-disabled` as a `.bmfix-` marker: it runs one full strict reindex and deletes the
+file — benign when the rebuild is complete, but if that reindex fails, the older binary refuses
+startup (its pre-escape behaviour). `restore` replaces the object's flag/marker state
+with the backup's and re-arms the escape when the backup carried the flag. No wire, CLI, config or
+record/index format change.
+
+- Bitmap candidate collections prefer 8,192 actual slots within the request
+  budget and recover actual concurrent insertion overflow through a complete
+  record scan with the original deadline; bitmap read and allocation-budget
+  failures retain their separate policies. Rows-format find responses with
+  `total:true` keep the total inside the valid response object (a correction
+  to this cycle's prepared shapes; no released response shape changes).
+
+**Bitmap opens are cached-only; corrupt-skip retires the cache entry; bitmap read failures fail the query.** With the bitmap cache initialized (daemon and embedded), `bm_open` never returns an uncached mapping: a stale published entry is retired non-blockingly and admission retried, a saturated cache retries admission, and both give up after four 2 ms-apart retries with `EBUSY` (the bound covers admission only — ordinary lock contention still waits, and Plan C's returned-lock-error precedence is unchanged, now for readers too). Corruption is deterministic `EUCLEAN` (short file, bad magic, invalid stride/body bounds); syscall failures keep their errno. A keyfile rebuild that skips a corrupt bitmap first retires that path's cached entry (checked): `KF_BMFIX_SKIP` is logged only after successful retirement, and a failed release/retirement abandons the shard's rebuild (`keyfile compaction failed`; other shards may have compacted already) instead of leaving a stale mapping in service. Bitmap read consumers treat a never-written shard (`ENOENT`) as logically empty but fail the query on any other bitmap read/lock failure with one complete `{"error":"bitmap index unavailable"}` before any find response byte, because find now prepares bitmap candidates and bitmap-derived totals before the envelope. An actual candidate-collection insertion overflow is not an error: count, find and aggregate recover once through a complete record scan with the original criteria and deadline; candidate allocations that exceed the request budget keep the existing query-buffer error. Former small-limit streaming bitmap finds now prepare their candidate set first (bounded by the same request budget; broader sets that do not fit produce the existing query-buffer error before any bytes instead of streaming) and then fetch one record at a time (deadline-checked) with at most one live record reference; bitmap candidates are charged by exact allocation bytes (object + rounded keys/state arrays, `keyset_allocation_bytes`) against the request query-buffer budget, and `total:true` totals on bitmap-reading plans are validated per candidate against the full criteria before emission. No on-disk format or configuration change; the new error and recovery response shapes are documented in find/count/aggregate. Not covered: record/serialization errors after emission (find responses are not fully output-atomic), and the all-candidate payload materialization of already-buffered emit shapes.
+
+
+**Bitmap cache: handle lock errors fail opens; writer eviction errors no longer loop.** Cache-hit/fill acquisition errors now fail immediately with the exact pthread error in `errno`. Eviction can still succeed on a later candidate after an earlier try error; if none succeeds, a selected blocking-wait error takes precedence and fails the writer open. In particular, a selected candidate write-held by the calling thread can return `EDEADLK`: the rebuild then abandons keyfile publication (`KF_BMFIX_PREPARE_FAILED`; light vacuum reports `keyfile compaction failed`) while preserving record values and bitmap slot coherence. Ordinary contention still waits. Reader uncached fallbacks are unchanged. `EDEADLK` is a returned pthread error, not complete deadlock detection; reader self-upgrades and cross-thread cycles remain outside this change.
+
+**Bulk insert stages fail closed when growth is impossible.** A bulk upsert shard stage whose pre-grow cannot size the keyfile table (bitmap-remap back-off, resplit I/O error, TEST_BUILD tier cap) used to continue and let publish fail records one by one with a faceless partial-success response; it now fails the stage atomically (`BULK_STAGE_UNGROWN` in the error log, every record of the shard errors, no partial commit) and the client retries via bulk-insert's upsert semantics. Bulk-delete keeps its existing behavior because deletes need no new insertion slots. The bulk window planner additionally respects the TEST_BUILD kf tier cap, and its reservation-free resplit is now documented as the only path that can hit the 75% trigger.
+
+**2026.11.1 — packed layout metadata, strict `layout=` token, version gate (R5, in progress).**
+`SHARD_DB_VERSION` is now `2026.11.1` and the minimum supported source release is
+`2026.10.2`; roots must carry 2026.10.2 clean-open evidence to open (older roots get
+the existing TOO_OLD upgrade hint). The strict `layout=packed` schema.conf token is
+the authoritative object layout; a malformed token refuses the object's load.
+
+**Packed recompose (R5b).** `add-field`, `edit-field` and `vacuum compact` (also with `splits`) are supported on packed-layout objects, with the same transactional rebuild, crash recovery and index handling as legacy objects. Numeric scale reduction rounds half away from zero and is refused only if the integer part no longer fits; bare↔bounded `varchar`/`numeric` edits are allowed with every existing row validated first; `seq(...)` backfill follows shard-scan order. `vacuum compact`, `remove-field`, `rename-field`, `add-field` and `edit-field` no longer mistake a live field whose `:default=` literal merely contains the text `:removed` for a tombstone (only an exact trailing `:removed` is the marker). Bitmap indexes are now rebuilt after every recompose (`add-field`, `edit-field`, `vacuum compact`, legacy and packed): bitmap bits are keyfile slot numbers and a rebuild renumbers slots, so un-rebuilt bitmaps could miss rows. A forced bitmap build (`add-index … "force":true`, reindex of a single bitmap field) on a packed object now reads packed cells correctly — it previously produced an empty bitmap. Rebuild transaction staging (rollback copy, metadata, directory entries) is now fsynced so a power loss during a rebuild still recovers.
+
+**Bitmap indexes survive keyfile rebuilds.** Bitmap bit `i` means "kf slot `i`", and a keyfile growth resplit or `vacuum` compaction renumbers slots; previously the bits were not renumbered, so bitmap predicates silently under-counted until `reindex` (observed 762 of 1714 rows). `kfcache_resplit_locked` now writes a slot-remapped copy of each of the shard's `.bm` files before the keyfile rename (an I/O failure aborts the resplit with nothing changed), records a durable `indexes/.bmfix-NNN` marker, and applies the remapped images over the live bitmaps in place right after the keyfile rename, under the same kf lock (nothing in the apply step can fail except its msync); a crash in between is repaired at startup by a strict reindex of that object. Log lines: `KF_BMFIX_SKIP` (WARN; a corrupt bitmap is left for the startup rebuild), `KF_BMFIX_PREPARE_FAILED` (ERROR; the resplit is retried after 5 s), `KF_BMFIX_FAILED` (ERROR; a bitmap msync was unconfirmed, marker kept), `BMFIX-RECOVER` (WARN). Bitmap shard locks are now taken in one canonical order by every multi-bitmap holder, and an older binary ignores the `.bmfix-*` markers. No on-disk format change.
+
+**Bulk windows take bitmap locks canonically.** The bulk-insert window used to open its bitmap writer handles lazily in first-use (schema declaration) order while holding them across prepare; combined with canonical readers and the keyfile-rebuild remap that was a lock-order inversion (deadlock exposure). The window now preopens all bitmap (field, shard) handles in canonical ascending path order before processing records and reopens parked handles in entry order at apply; a TEST_BUILD BMLOCK-ORDER trace pins the order deterministically. If a bitmap file is absent, even an untouched field can materialize an empty file during preopen; normal create-object already creates all bitmap shards.
+
+**Bulk commit flush synced the wrong bitmap file names.** The bulk-chain commit flush spelled bitmap shard paths with a decimal shard id (`%03d`) while every creator and reader spells them hex (`%03x`, via `bm_build_path`), so for shard ids ≥ 10 (any object with `splits ≥ 11`) it fdatasynced a name that does not exist or belongs to a different shard; ENOENT is treated as success, so the coalesced bitmap durability sync was silently skipped for those shards. Crash-window only: dirty bitmap pages still reached disk through the bm cache's own writeback, and startup KFM2 replay re-applies indexed windows. The flush path now delegates to `bm_build_path`. No format change.
+
+**2026.11.1 — acceptance (R6).** Packed layout is the default: new objects are packed and the first start migrates every existing object. `varchar` reaches 4 MiB and `numeric` is an exact decimal — constrained `numeric:P,S` up to P=1000 (S −1000..1000), or bare `numeric` with per-value scale (up to 131 072 integer + 16 383 fractional digits). Compatibility: `numeric:N` means scale 0 for *new* objects (it used to mean scale 2) while migration rewrites existing fields to `numeric:N,2` so stored values are unchanged, and a migrated scale-2 field now renders whole values at their declared scale (`100` → `100.00` — numerically identical; text-comparing clients must normalise). Together with R1–R4, malformed `bool`/`date`/`time`/`uuid`/`ip`/`enum` input and decimals that do not fit are rejected instead of coerced, and aggregates over decimals are exact. Acceptance is pinned by the new daemon-backed cases `test-type-correctness-acceptance`, `test-finance-routes`, `test-predicate-equivalence` and `test-layout-migration-finance-acceptance` (finance-shaped legacy→packed migration compared textually against a pre-migration snapshot).
+
+**BREAKING (R4 — strict scalar grammars).** Malformed non-NULL input on
+`bool`/`date`/`datetime`/`datetimems`/`time`/`uuid`/`ipv4`/`ipv6`/`enum`
+fields is now rejected with a field-named error on every write route and on
+query comparison literals; it previously became a different valid value, zero,
+or NULL. Specifically: out-of-calendar or partial dates (`2024-02-30`,
+`2024-1-5`, `20240105x`) are errors; date-only datetimes no longer pad to
+midnight; out-of-range times no longer encode `00:00:00`; bool accepts only
+`1 t tr tru true y ye yes on` / `0 f fa fal fals false n no of off`
+(case-insensitive) — `yes` is now **true** (it previously stored false by
+first byte), and `trash`/`10` are errors; malformed `uuid`/`ipv4`/`ipv6` are
+errors instead of a NULL downgrade or zero-fill; the empty string `""` is an
+error for all of these types and for `enum` (it previously stored member 0 /
+false / zero bytes); an unknown enum member errors uniformly (previously
+member 0 on some routes, and a silent 0-row result as a query literal); a
+valid brace-wrapped UUID (`{…}`) is now accepted and exempt from the
+computed-update `{` gate. Criteria with invalid comparison literals fail at
+compile time with `invalid criteria value` (previously they compiled to
+unrelated keys — bool `eq yes` searched the false bucket). Outer ASCII
+whitespace (space/tab/newline/CR) is stripped on the new scalar types;
+`\v`/`\f` are not whitespace. Stored bytes, layouts, and previously stored
+values are unchanged — no migration; only new input is validated. `:default=`
+literals are validated at declaration time for the new types, and defaults
+re-read at insert time from schemas declared before this change now fail the
+insert if the literal is not in the grammar (e.g. `default=yes` on a bool now
+applies **true** where it previously applied false).
+
+Aggregates now preserve exact integer and decimal arithmetic through scans,
+indexes, parallel merging, grouping, `having`, ordering, and JSON/CSV
+output. Integer sums retain every digit beyond int64 and 2⁵³; decimal
+results retain declared/display scale, and integer/decimal averages follow
+the PostgreSQL 18 result-scale policy (`select_div_scale`: 16 significant
+digits, both operands' display scales as floors, ties rounded away from
+zero), so an integer `avg` renders 16 fractional digits (`1010.0000000000000000`).
+`float`/`double` aggregates print shortest round-trip lexemes (up to 17
+digits, e.g. `0.30000000000000004`) instead of the old `%.6f`-trimmed form.
+Clients that depend on the previous trimmed decimal output must preserve
+the new number lexemes. Timestamp group labels use epoch milliseconds,
+and numeric group fields compare numerically in `order_by` and `having`.
+An average with no contributing values returns JSON `null` on every route;
+an empty group's `min`/`max` now also render `null`, while its `sum` renders
+zero at the declared scale; CSV retains its historical `0` cells. Oversized
+or NUL-containing group keys (511 bytes per value, 4096 bytes per composite
+key) and invalid numeric `having` literals now return explicit errors — the
+literal check runs before the operator check, so `regex` on a numeric
+having reports the invalid literal. Index `find`/`count` pre-filters decode
+`timestamp` keys to epoch-millis text; non-canonical integer literals still
+match, and all epoch-ms values sit below 2⁵³ so range pre-filters stay
+exact. Packed decimal indexed aggregates agree with scans, varchar extrema
+retain their full values, and finite floating-point `count`/`min`/`max`
+remain available when an unused sum would overflow. Query memory limits
+cover retained rendered number strings and escaped text; exhausting the cap
+or hitting an allocation failure on any route returns one error and no
+success body — except the bitmap-dictionary deferred collector, which keeps
+its documented deadline-style partial result.
+
+Fixed: `group_by` over a non-integer key (varchar, double, decimal, composite)
+with more than 256 distinct groups returned the same group several times
+with split counts (totals stayed right). The bucket table's resize, the
+parallel-merge scatter, and the partition splice hashed the NUL-tagged group
+key with a NUL-terminated hash, while lookups hashed it by length, so
+buckets were unreachable after the first table doubling. All sites now use
+one bucket hash shared with the lookup path.
+
 **2026.10.2 — real NULL for typed fields, `:not_null` constraint, BTRI
 index format, conditional writes.** Typed
 fields are now nullable: every record carries a per-record null bitmap
@@ -128,7 +269,7 @@ ceiling no longer exists. All growth paths (bulk pre-grow, bulk stage,
 and the inline resplits) double a shard's slot capacity at the 75–80 %
 load trigger for the life of the object, and inserts never refuse for
 capacity — an object grows for as long as the disk holds out, with no
-opt-in required. The nightly auto-reshard sweep is now **default on**
+opt-in required (the one transient exception is a bulk-insert shard stage that fails closed while that shard's growth is temporarily impossible — see "Bulk insert stages fail closed when growth is impossible" above). The nightly auto-reshard sweep is now **default on**
 (`AUTO_RESHARD_ENABLE=1`; set `0` to disable): it rebalances objects
 whose live record count outgrows their splits, keeping shards near the
 sweet spot so resplit doublings stay cheap. A new `RESHARD-HINT` log
@@ -186,6 +327,50 @@ safety could not be proven at the call sites).
 See [cas.md](../query-protocol/cas.md) for the full semantics and
 [concurrency.md](../concepts/concurrency.md) for the writer-reservation
 cost model.
+
+**`backup` takes the object's exclusive lock.** `backup` used to run under the object's
+shared read lock like ordinary reads, so a backup of a live object could capture a
+half-finished commit window, a mid-resplit keyfile, a `.bmfix-NNN` bitmap-repair marker
+or a half-written `metadata/sequences/<name>` file, and `restore` would copy all of that
+back. `backup` now holds the object's `objlock_wrlock` for the whole copy, exactly like
+`vacuum`/`truncate`: every request on that object — reads included — waits until the
+copy finishes, and `./shard-db stop` waits for a running backup (it is counted in
+`in_flight_writes`). This fences the copy against every concurrent operation, so no live
+write, resplit, repair marker or `sequence` update can be captured. Backup stays allowed
+on a bitmap-disabled object (the `.bmfix-disabled` flag and any markers in `indexes/`
+are copied verbatim, and `restore` re-arms the escape until `reindex`); backups taken by
+releases before this change were not fenced — if one was taken on a live object, run
+`reindex` after restoring it. No wire, CLI, config or on-disk change.
+
+**`backup`/`restore` now cover `files/` and the object's `tokens.conf`.** A backup of an
+object is now enough to restore the same object — records, indexes, sequences, stored
+files **and access tokens** — into another database later: `backup` also copies the
+object's `files/` directory (the `put-file` store) and its `tokens.conf` (the copy is
+created with mode `0600` — it holds token secrets; protecting the backup directory
+remains the operator's responsibility), and writes a `"files":1` marker into
+`object.json`. Behaviour changes: backups are larger and the copy under the object's
+exclusive lock grows with the stored-file volume; `restore` replaces live `files/` for
+backups carrying the marker only (refusing without `force` when live `files/` is
+non-empty) and leaves `files/` untouched for backups taken before this change. On the
+JSON protocol a successful `restore` now **adds** the backup's object tokens to the
+running token store immediately (no restart) and rewrites the object's `tokens.conf`
+from the store, like `add-token`: it adds only tokens that are not already present
+(any scope) — an existing token's scope or perm is never changed — and never removes
+anything, so a token revoked after the backup returns if the backup contains it, live
+tokens absent from the backup are kept, and a full token table (`TOKEN_CAP`) skips the
+remaining tokens and logs it. **Security fix:** on the JSON protocol `restore` is now
+an object-admin mode — it requires an `rwx` token whose scope covers the object, as
+`multi-tenancy.md` has always documented. Previously `restore` was treated as a plain
+read-allowed mode, so any token covering the object, even read-only, could run it
+(wiping the object with `force:true`); with the token merge it could also have injected
+tokens into the auth store. Clients that used `r`/`rw` tokens to restore must switch
+to an `rwx` token (they now get `{"error":"auth failed"}`). The legacy text-wire
+protocol remains unauthenticated, as before — it never restores tokens (a text-path
+restore leaves the object's live `tokens.conf` and the running token set untouched;
+use the JSON `restore` to bring tokens back). No wire, CLI or config change; `object.json` gains `"files":1` (older
+binaries ignore it).
+
+**Unordered indexed finds fetch only the record batches a page needs.** Small pages over OR/intersection/trigram/prepared-bitmap candidates (and single-leaf finds with joins, `format:"rows"` or a large offset) now fetch 1,024-candidate batches until the page is full instead of fetching every candidate first, and hold one batch of record copies under `QUERY_BUFFER_MB` (halved on overflow). Behaviour changes: a single record larger than `QUERY_BUFFER_MB` now fails the query (raise `QUERY_BUFFER_MB` if such records must be returned), and allocation failures on this path (batch setup, record copies, an error the fetch call returns) and a missing storage handle now fail the query (unterminated response, as for other mid-stream record errors) instead of returning an empty or shorter page. Records the storage layer cannot read during the fetch — or whose lookup buffers cannot be allocated — are still skipped, as before. Order and membership of pages are unchanged; no wire, CLI, config or on-disk change.
 
 ## 2026.09.2
 

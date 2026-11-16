@@ -60,7 +60,7 @@ static int test_agg_varchar_groupby_sum_run(void) {
      * viewer:  balance 300.00 each, ×100 → sum 30000, avg 300, min/max 300
      */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"u_sum\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"u_sum\","
         "\"fields\":[\"role:varchar:16\",\"balance:numeric:14,2\"],"
         "\"indexes\":[\"role\",\"balance\"],\"splits\":8}", &resp);
     free(resp); resp = NULL;
@@ -139,7 +139,7 @@ static int test_agg_varchar_groupby_sum_run(void) {
 
     /* === Case 2: all-distinct usernames, each with unique balance === */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"u_uniq\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"u_uniq\","
         "\"fields\":[\"username:varchar:16\",\"balance:numeric:14,2\"],"
         "\"indexes\":[\"username\",\"balance\"],\"splits\":8}", &resp);
     free(resp); resp = NULL;

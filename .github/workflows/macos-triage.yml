@@ -1,0 +1,67 @@
+name: macOS race-fixture triage
+
+# Manual only. The six bitmap race fixtures excluded from the macOS leg of
+# ci.yml die with SIGBUS on Darwin while passing on Linux. This workflow runs
+# them one at a time under a symbolized (-O0 -g) build and surfaces the macOS
+# crash reports, so the exclusion can be root-caused and then removed.
+# Root cause (2026-11-15): 512 KB macOS thread stacks in the test writers,
+# fixed with db_thread_create; all six cases now pass on macOS and run in
+# ci.yml. Kept as a manual tool for any future Darwin-only crash.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: "Comma-separated test cases to run (one at a time)"
+        required: true
+        default: "test-bitmap-keyset-capacity-race,test-bitmap-candidate-floor,test-bitmap-capacity-fallback-shapes,test-bitmap-agg-topn-deadline,test-bitmap-candidate-budget,test-bitmap-or-hard-precedence"
+
+permissions:
+  contents: read
+
+jobs:
+  triage:
+    name: Triage (macos arm64, debug build)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build (debug, symbolized)
+        run: SKIP_TESTS=1 BUILD_MODE=debug ./build.sh
+
+      - name: Run each case, print crash reports
+        env:
+          CASES: ${{ inputs.cases || 'test-bitmap-keyset-capacity-race,test-bitmap-candidate-floor,test-bitmap-capacity-fallback-shapes,test-bitmap-agg-topn-deadline,test-bitmap-candidate-budget,test-bitmap-or-hard-precedence' }}
+          SHARD_TEST_WATCHDOG_SEC: "300"
+        run: |
+          DDIR="$HOME/Library/Logs/DiagnosticReports"
+          mkdir -p triage-out
+          summary=triage-out/summary.txt
+          : > "$summary"
+          for c in $(echo "$CASES" | tr ',' ' '); do
+            echo "::group::$c"
+            before=$(ls "$DDIR"/*.ips 2>/dev/null | sort || true)
+            rc=0
+            ./build/bin/shard-db-test run "$c" > "triage-out/$c.log" 2>&1 || rc=$?
+            echo "$c exit=$rc" | tee -a "$summary"
+            tail -n 40 "triage-out/$c.log"
+            sleep 3   # crash reports are written asynchronously
+            after=$(ls "$DDIR"/*.ips 2>/dev/null | sort || true)
+            for f in $(comm -13 <(echo "$before") <(echo "$after")); do
+              echo "== new crash report: $f"
+              cp "$f" "triage-out/$c.$(basename "$f")"
+              cat "$f"
+            done
+            echo "::endgroup::"
+          done
+          cat "$summary"
+
+      - name: Upload triage output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-triage
+          path: triage-out/
+          if-no-files-found: ignore
+          retention-days: 14

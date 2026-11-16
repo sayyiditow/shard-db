@@ -33,3 +33,8 @@ const TypeDescriptor *type_desc(enum FieldType t) {
     if (t <= FT_NONE || t >= FT_COUNT) return NULL;
     return &g_type_desc[t];
 }
+
+const char *typed_type_name(enum FieldType t) {
+    const TypeDescriptor *d = type_desc(t);
+    return d ? d->name : "?";
+}

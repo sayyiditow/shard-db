@@ -28,7 +28,7 @@ static int test_cas_tree_if_run(void) {
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"ti\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"ti\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"status:varchar:12\",\"amount:int\","
         "\"region:varchar:8\",\"lo:long\",\"hi:long\"],"

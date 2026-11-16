@@ -77,11 +77,13 @@ static int set_streams_in_schema_conf(const char *path, int new_streams) {
         line[len] = '\0';
 
         if (strncmp(line, "default:vmstreams:", 18) == 0) {
-            int splits, max_key, sv, old_streams;
-            if (sscanf(line, "default:vmstreams:%d:%d:%d:%d",
-                       &splits, &max_key, &sv, &old_streams) >= 3) {
-                fprintf(out, "default:vmstreams:%d:%d:%d:%d\n",
-                        splits, max_key, sv, new_streams);
+            int splits, max_key, sv, old_streams, used = 0;
+            if (sscanf(line, "default:vmstreams:%d:%d:%d:%d%n",
+                       &splits, &max_key, &sv, &old_streams, &used) >= 4 &&
+                used > 0) {
+                /* Preserve any trailing tokens (e.g. :layout=packed). */
+                fprintf(out, "default:vmstreams:%d:%d:%d:%d%s\n",
+                        splits, max_key, sv, new_streams, line + used);
             } else {
                 fputs(line, out);
                 fputc('\n', out);

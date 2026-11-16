@@ -157,6 +157,9 @@ When the new field's spec includes a default modifier, the rebuild walk applies 
 - Existing record count and hash routing are preserved.
 - Full object rebuild — scales with object size. Not instantaneous on millions of records.
 - Sequence allocation is exact at walk start: the live count is read from the kf-header summary on the legacy slotcask handle, which is the authoritative source of record counts in v2.
+- **Packed-layout objects (every migrated or new object).** Existing rows get the field's declared `:default=` (literal or computed) if there is one; otherwise NULL for a nullable field. A `:not_null` field with no default is refused while the object has any record (`Field 'x' is NOT NULL and has no default; existing rows cannot be backfilled`). Legacy-layout objects keep zero-fill. The new field list may use the packed grammar (`varchar` bare or `varchar:N` up to 4194304, `numeric`, `numeric:P[,S]`, `currency`). A default that cannot be stored in the field (`random(4)` into an `int`, `uuid()` into `varchar:20`, `random(N)` outside 1..256, a `seq(...)` range whose last value does not fit, an unparsable literal) is **refused before any row is written**, and the failed request is rolled back: `fields.conf`, rows and indexes are left unchanged (a `seq` range that was already reserved is not returned — the sequence just skips it). A `:not_null` field with no default is refused up front, before the rebuild starts.
+- `seq(<name>)` backfill assigns values in **shard-scan order** (kf shard 0, 1, … and, within a shard, keyfile slot order — i.e. hash order, **not** insertion or key order). The set of values is exactly `[start, start+live_count)`.
+- The number of fields (tombstoned included) is capped at 256; `vacuum compact` reclaims tombstoned slots.
 
 ## edit-field
 
@@ -207,6 +210,16 @@ CLI shortcut (single-field — JSON form covers batch):
 | `enum(a,b,c) → enum(c,a,b)` (reorder) | **Refused** (caught by the position-by-position diff — same shape as remove). |
 | `enum(…) → enum(…)` narrow 2B → 1B | **Refused.** Records that hold an index ≥ 256 would lose data. |
 
+**Packed-layout objects (2026.11.1).** The same edits are supported, with these rules:
+
+| Edit | Rule on packed objects |
+|---|---|
+| `varchar:N ↔ varchar:M ↔ varchar` (bare) | Every direction is allowed. Every existing row is validated first; the edit is refused (no change) if any value is longer than the new cap. |
+| `numeric:P,S ↔ numeric:P2,S2 ↔ numeric ↔ currency` | Every direction is allowed. Reducing the scale **rounds half away from zero** (`1.0050 → 1.01`, `-1.0050 → -1.01`). The edit is refused (no row changes) only when a rounded value's integer part no longer fits `P−S` digits (`99999999.9999 → numeric:10,2` is refused). |
+| Integer family, `float → double`, enum append/rename/1B→2B widen | As in the table above, validated per row. |
+
+All-or-nothing: the pre-flight and `dry_run:true` run the same per-row conversion as the rebuild, so a refusal means nothing changed. An edit that changes no stored encoding (default, `:not_null`, enum append/rename within the same width) rewrites `fields.conf` only (`"rebuilt":false`).
+
 **Other cross-type edits are hard-refused** with the hint: use `add-field <new> + remove-field <old> + bulk-update` and migrate the data explicitly.
 
 ### What happens
@@ -217,7 +230,7 @@ CLI shortcut (single-field — JSON form covers batch):
 4. Builds a new `TypedSchema` by overlaying each edited field onto a clone of the old schema (positions unchanged, only `size` / `offset` / `numeric_scale` move).
 5. **No-op fast path** — if no field's encoding actually changed (a varchar staying the same size with only `:default=...` modifier shift, say), skip the data rebuild and rewrite `fields.conf` only.
 6. Otherwise **pre-flight scan**: walks every live record across all keyfile shards and verifies each edited field's value fits the new shape. First violation aborts with `{"error":"Pre-flight failed on field [<name>]: <reason>"}` — no data or schema change.
-7. **Rebuild**: runs the same v2 rebuild path used by `add-field` / `vacuum --compact`, but with `transform_field_value()` re-encoding the edited fields per record. Atomic — the legacy data tree is preserved until the rebuild succeeds.
+7. **Rebuild**: runs the same v2 rebuild path used by `add-field` / `vacuum --compact`, but with `transform_field_value()` re-encoding the edited fields per record. Atomic — the legacy data tree is preserved until the rebuild succeeds. On packed objects the per-field conversion is the packed converter (decimal re-encode, width change) instead of `transform_field_value()`.
 8. Rewrites `fields.conf` to lock in the new spec.
 9. **Smart reindex**: walks `index.conf` and only rebuilds indexes whose referenced fields actually changed encoding. Indexes referencing untouched fields are skipped — the response carries `indexes_skipped:N` alongside `indexes_rebuilt:N` so operators can verify.
 10. Releases the write lock.
@@ -356,7 +369,7 @@ Maintenance — reclaim deleted-record slots, drop tombstoned fields, or reshard
 | Call | What it does |
 |---|---|
 | `{"mode":"vacuum",...}` | Direction-C seg compaction — sparse non-active seg files are pair-merged into denser ones via kf-repoint, then unlinked. Active seg of each stream is never touched. *Also*: if the host's CPU count has changed since `create-object` and `slotcask_streams_for_nproc()` no longer matches `schema.streams`, the call automatically promotes to a full rebuild that re-routes records into the new stream layout. Idempotent. |
-| `{"mode":"vacuum","compact":true}` | Full rebuild. Drops tombstoned fields, shrinks `slot_size`. Indexes preserved. |
+| `{"mode":"vacuum","compact":true}` | Full rebuild. Drops tombstoned fields, shrinks `slot_size`, reclaims deleted-record space (runs even when there is nothing to drop). Indexes preserved. Supported on packed-layout objects; an object whose every field is tombstoned is refused. |
 | `{"mode":"vacuum","splits":N}` | Full rebuild with a new shard count. Re-hashes data; hash routing identity is preserved. **Triggers a full reindex** — see below. Also folds in the streams-mismatch check on the same rebuild, so you never need a second call. |
 | `{"mode":"vacuum","compact":true,"splits":N}` | Both — compact schema and reshard in one pass. |
 
@@ -412,15 +425,15 @@ Response: `{"count":N,"orphaned":M}`.
 
 ## backup
 
-Copies the object's `data/`, `indexes/`, `metadata/`, and `files/` directories into a timestamped snapshot under the same root.
+Copies the object's `data/`, `indexes/`, `metadata/`, and `files/` directories plus its `tokens.conf` into a timestamped snapshot under the same root (the backup's `tokens.conf` copy is created `0600`). Restore rules — including the `files/` replace semantics and the live token merge — are documented in [docs/operations/backup.md](../operations/backup.md).
 
 ```json
 {"mode":"backup","dir":"<dir>","object":"<obj>"}
 ```
 
-Response: `{"status":"backed_up","path":"<dir>/<obj>.backup-20260418T153012"}`.
+Response: `{"status":"backed_up","path":"<db_root>/<dir>/<obj>/backup/<timestamp>"}` (e.g. `.../t/backup/20260418_153012`).
 
-Snapshot is a point-in-time copy — in-flight writes after the copy starts may or may not be included. For consistent production backups, pause writes first (or accept best-effort consistency).
+Backup holds the object's exclusive lock for the whole copy — every request on that object (reads and writes) waits until it finishes, so the copy cannot observe a write, resplit, bitmap-repair marker or `sequence` update in flight.
 
 ## Lock model summary
 
@@ -430,7 +443,8 @@ Snapshot is a point-in-time copy — in-flight writes after the copy starts may 
 | `rename-field` | `objlock_wrlock` | Same. |
 | `truncate` | `objlock_wrlock` | Same. |
 | `add-index`, `remove-index` | `objlock_wrlock` | Same — both unlink()+rebuild index files in place; needs exclusivity against concurrent on-the-fly index writes (2026.07.1). |
-| `backup`, `recount` | `objlock_rdlock` | Only schema mutations. |
+| `backup` | `objlock_wrlock` | All other ops on this object (reads + writes). |
+| `recount` | `objlock_rdlock` | Only schema mutations. |
 | Normal CRUD / queries | `objlock_rdlock` | Only schema mutations. |
 
 Held only for the rebuild duration. For multi-second rebuilds, clients see temporarily-blocked queries; consider running these in a maintenance window.

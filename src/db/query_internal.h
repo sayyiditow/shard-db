@@ -11,6 +11,97 @@ void order_walk_test_set_pause_hook_after(order_walk_test_pause_fn fn,
                                           size_t callbacks_to_skip);
 void bulk_upd_json_test_set_fail_alloc(int fail_n);
 void query_plan_test_set_fail_grow(int fail_n);
+/* Bitmap-KeySet race seam (bitmap-keyset builders, TEST_BUILD only).
+ * Arm an explicit stage (BMKS_RACE_* ids below) on the CALLING thread: the
+ * next build_keyset_from_bitmap / build_keyset_bitmap_complement run on
+ * this thread parks between its sizing pass and its enumeration pass,
+ * publishing the sizing estimate and the allocated KeySet capacity, until
+ * query_bm_test_race_open_gate() releases it (one-shot; rearm for a new
+ * run). query_bm_test_race_reached/gate_opened report consumption;
+ * allocated_cap/sized_total/insert_fails expose the observation counters.
+ * query_bm_test_race_reset disarms without waiting. Stage ids must stay in
+ * sync with the definitions in query.c. */
+#define BMKS_RACE_EQ         1
+#define BMKS_RACE_GENERIC    2
+#define BMKS_RACE_COMPLEMENT 3
+#define BMKS_RACE_OR         4
+int query_bm_test_arm_keyset_race(int stage);
+void query_bm_test_race_open_gate(void);
+int query_bm_test_race_reached(void);
+int query_bm_test_race_gate_opened(void);
+unsigned query_bm_test_race_allocated_cap(void);
+unsigned query_bm_test_race_sized_total(void);
+unsigned query_bm_test_race_insert_fails(void);
+void query_bm_test_race_reset(void);
+/* Prepared small-limit find iterator observer (TEST_BUILD only): armed on
+ * the thread that runs the find; reports iterator invocations, record
+ * fetches, currently live RecordRefs and the peak live count. */
+void query_test_prepared_stream_observe(int on);
+void query_test_prepared_stream_stats(unsigned *calls, unsigned *fetches,
+                                      unsigned *live, unsigned *peak_live);
+/* Candidate sizing/overflow/fallback observation (thread that runs the
+ * query): last admitted candidate allocation's actual slot count, actual
+ * keyset_insert overflow hits in bitmap collectors, whole-record capacity
+ * fallback recoveries, and the last prepared-find budget peak. */
+void query_test_candidate_observe(int on);
+void query_test_candidate_fallback_note(const char *kind);
+int query_test_parallel_candidate_race(const char *field, int stage);
+int query_test_parallel_candidate_fault(const char *field, int site, int error);
+void query_test_parallel_candidate_stats(unsigned *workers, unsigned *joined,
+                                         unsigned *capacity, unsigned *hard,
+                                         unsigned *offthread, unsigned *consumed);
+void query_test_candidate_stats(unsigned *last_slots, unsigned *overflow_hits,
+                                unsigned *fallbacks, unsigned *budget_peak);
+/* Thread-local override of a prepared find's request budget limit (0 =
+ * query-buffer default); lets a test refuse only the preferred floor. */
+void query_test_prepared_budget_limit(size_t limit);
+size_t query_test_prepared_budget_limit_value(void);
+/* Allocate the bitmap candidate KeySet the policy helper would build for an
+ * initial estimate `m` (TEST_BUILD wrapper over the internal helper; reports
+ * the actual admitted slot count). */
+KeySet *query_test_candidate_keyset_alloc(size_t m, size_t *out_slots);
+/* Streaming top-N deadline trap (armed on the thread that runs the
+ * aggregate): consumed once at a capacity handoff, where it lets the
+ * request's original absolute deadline elapse (bounded by max_wait_ms)
+ * before the caller's recovery decision. Reports consumption count. */
+void query_test_agg_topn_arm_deadline_trap(int max_wait_ms);
+unsigned query_test_agg_topn_deadline_trap_consumed(void);
+/* keyset_emit_find counters and one-shot fault seams (query.c).
+   kef_test_arm(seam, n): fire on the n-th hit after arming (n >= 1);
+   KEF_SEAM_BUDGET instead sets the record-copy budget in bytes (0 = default).
+   SETUP_ALLOC: the call's first scratch allocation fails (ENOMEM).
+   COPY_ALLOC: a record-copy allocation fails (ENOMEM).
+   FETCH: a fetch attempt is not issued and reports -1/EIO.
+   JOIN: a join resolution reports -1/EIO.  REGISTRY: the registry lookup
+   yields NULL/EIO.  TIMEOUT: after a fetch attempt returns, the deadline is
+   marked timed out.  Counters are process-wide; kef_test_reset() zeroes
+   them and disarms every seam. */
+enum { KEF_SEAM_SETUP_ALLOC = 1, KEF_SEAM_COPY_ALLOC, KEF_SEAM_FETCH, KEF_SEAM_JOIN,
+       KEF_SEAM_REGISTRY, KEF_SEAM_TIMEOUT, KEF_SEAM_BUDGET, KEF_SEAM_COUNT };
+typedef struct {
+    long calls, fetch_calls, fetch_hashes, copies, copy_bytes,
+         live_copies, live_bytes, peak_bytes;
+} KefTestStats;
+void kef_test_reset(void);
+void kef_test_arm(int seam, long arg);
+void kef_test_stats(KefTestStats *out);
+/* Runs keyset_emit_find (use_reference = 0) or the retained previous
+   whole-candidate-set implementation (use_reference = 1) on `ks`, writing rows (no envelope) to
+   `out`. eff_root = <db_root>/<dir>; object is bare. criteria_json/
+   excluded_csv/format/join_json may be NULL. Returns the function's rc with
+   its errno; -1/EINVAL for bad arguments or criteria/join setup. */
+int keyset_emit_find_for_test(const char *eff_root, const char *object, KeySet *ks,
+        const char *criteria_json, const char *excluded_csv, int offset, int limit,
+        const char *format, const char *join_json, uint32_t timeout_ms,
+        int use_reference, FILE *out);
+/* Streaming top-N aggregate counters and seams (query_aggregate.c).
+   runs: stream answered (rc 0); declines: stream fell back (-2) on its own;
+   forced: force_decline made it fall back; repeats: exact states scaled for
+   selected groups. fail_repeat(n): the n-th repeat reports ENOMEM. */
+void agg_topn_test_reset(void);
+void agg_topn_test_force_decline(int on);
+void agg_topn_test_fail_repeat(long nth);
+void agg_topn_test_stats(long *runs, long *declines, long *forced, long *repeats);
 #endif
 
 /* Prototypes for helpers shared across the query_*.c translation units.
@@ -20,6 +111,39 @@ void query_plan_test_set_fail_grow(int fail_n);
 typedef struct SlotcaskDb SlotcaskDb;  /* defined in slotcask.h */
 
 #define MAX_INTERSECT_LEAVES 8
+
+/* Why a bitmap candidate build produced NULL. errno stays available
+ * for diagnostics but never decides the category: budget reservation and
+ * read/lock errors can share errno values with capacity codes. */
+typedef enum {
+    CBF_NONE = 0,           /* success (KeySet returned) or deliberate empty */
+    CBF_INSERT_CAPACITY,    /* an actual keyset_insert returned -1 */
+    CBF_BUDGET,             /* budget reservation refused (owner's policy) */
+    CBF_TIMEOUT,            /* deadline expired during the build */
+    CBF_HARD                /* read/lock/allocation/arithmetic failure */
+} CandidateBuildFailure;
+
+/* Checked build outcome carried through candidate builders/consumers.
+ * Request/call-owned — never a global or TLS last-failure slot. */
+typedef struct {
+    CandidateBuildFailure reason;
+    int saved_errno;        /* meaningful for CBF_HARD and diagnostics */
+} CandidateBuildOut;
+
+static inline int candidate_deadline_expired(QueryDeadline *dl) {
+    if (!dl || dl->timeout_ms == 0) return 0;
+    if (atomic_load_explicit(&dl->timed_out, memory_order_relaxed)) return 1;
+    if (now_ms_coarse() - dl->t0_ms > (uint64_t)dl->timeout_ms) {
+        atomic_store_explicit(&dl->timed_out, 1, memory_order_relaxed);
+        return 1;
+    }
+    return 0;
+}
+
+static inline void cb_out_init(CandidateBuildOut *o) {
+    o->reason = CBF_NONE;
+    o->saved_errno = 0;
+}
 
 /* Filter plan types — shared by query.c and query_aggregate.c */
 typedef enum {
@@ -75,6 +199,7 @@ typedef struct {
     size_t buffer_bytes;
     _Atomic int budget_exceeded;
     pthread_mutex_t lock;
+    int predicate_error;
 } BulkCriteriaCtx;
 
 /* ========== Joins ========== */
@@ -142,6 +267,13 @@ int selective_reindex_dirty(const char *db_root, const char *object,
                             char dirty_names[][128], int n_dirty,
                             int *out_rebuilt, int *out_skipped);
 int parse_field_line(const char *line, TypedField *out);
+int packed_preflight_walk(SlotcaskDb *sdb, const TypedSchema *old_ts,
+                          const TypedSchema *new_ts, const int *new_to_old,
+                          char *field, size_t fsz, char *reason, size_t rsz);
+int packed_probe_added(const TypedSchema *nts, const int *new_to_old,
+                       char *err, size_t errsz);
+int packed_probe_text(const TypedSchema *nts, int k, const char *text,
+                      char *err, size_t errsz);
 void transform_field_value(const TypedField *old_f,
                            const TypedField *new_f,
                            const uint8_t *src,
@@ -179,14 +311,46 @@ int shard_group_batch(CollectedHash *batch, int batch_count,
    (which revalidates each candidate at the Kf reader). Raw index
    popcounts are never the count answer. Used by count/find totals and
    query_aggregate.c's NEQ fast path. */
+int count_full_record_checked(const char *db_root, const char *object,
+                              CriteriaNode *tree, FieldSchema *fs,
+                              const Schema *sch, QueryDeadline *dl,
+                              size_t *out_count);
+
 size_t idx_count_for_leaf(const char *db_root, const char *object,
                           const Schema *sch, const FieldSchema *fs,
                           SearchCriterion *leaf, QueryDeadline *dl);
+/* Checked variant: candidate build reasons (insertion-capacity, budget,
+ * timeout, hard) are reported in *out for recovery decisions. */
+size_t idx_count_for_leaf_ck(const char *db_root, const char *object,
+                             const Schema *sch, const FieldSchema *fs,
+                             SearchCriterion *leaf, QueryDeadline *dl,
+                             CandidateBuildOut *out);
+/* Checked candidate builders (query.c): reasons reported via *out;
+ * external-facing signatures keep their wrappers. */
+KeySet *build_keyset_from_leaf_ck(const char *db_root, const char *object,
+                                  int splits, SearchCriterion *leaf,
+                                  QueryDeadline *dl, KeySetBudget *budget,
+                                  CandidateBuildOut *out);
+KeySet *intersect_indexed_leaves_ck(const char *db_root, const char *object,
+                                    int splits, SearchCriterion **leaves,
+                                    int n, QueryDeadline *dl,
+                                    int *out_small_primary,
+                                    KeySetBudget *budget,
+                                    CandidateBuildOut *out);
+KeySet *build_or_keyset_ck(const char *db_root, const char *object, int splits,
+                           const CriteriaNode *or_node, QueryDeadline *dl,
+                           int *out_budget_exceeded, int target_count,
+                           KeySetBudget *budget, CandidateBuildOut *out);
+KeySet *build_smaller_bitmap_keyset_ck(const char *db_root, const char *object,
+                                       int splits, const SearchCriterion *leaf,
+                                       const TypedField *tf, QueryDeadline *dl,
+                                       int *inverted, KeySetBudget *budget,
+                                       CandidateBuildOut *out);
 
 /* query_find.c — O_DIRECT scan helpers (used by query.c find/count paths) */
 int od_seg_record_cb(const uint8_t *rec, size_t vlen,
                      const uint8_t hash16[16], void *raw_ctx);
-void scan_shards_v2_o_direct_match(SlotcaskDb *db,
+int scan_shards_v2_o_direct_match_checked(SlotcaskDb *db,
                                    FieldSchema *fs,
                                    const CompiledCriterion *single_cc,
                                    const CriteriaNode *tree,
@@ -332,6 +496,7 @@ typedef struct {
     QueryDeadline *deadline;
     int dl_counter;
     pthread_mutex_t lock;
+    int predicate_error;
 } AdvSearchCtx;
 
 /* query.c — callback functions (used by query_aggregate.c) */
@@ -348,6 +513,11 @@ int op_prefers_trigram(enum SearchOp op);
 
 /* query.c — criterion encoding (used by query_aggregate.c) */
 void group_by_csv_to_json(const char *csv, char *out, size_t out_sz);
+/* Raw/varchar criteria are explicit spans. Libc-parsed scalar criteria
+   must be full C strings with a readable terminator at val[vlen]. */
+int encode_criterion_value_checked(const TypedSchema*,const TypedField*,const char*,size_t,uint8_t*,size_t,size_t*);
+int btree_dispatch_schema_checked(const TypedSchema*,const char*,const char*,const char*,int,SearchCriterion*,const TypedField*,bt_result_cb,void*);
+int btree_dispatch_checked(const char*,const char*,const char*,int,SearchCriterion*,const TypedField*,bt_result_cb,void*);
 void encode_criterion_value(const TypedField *tf,
                             const char *val, size_t vlen,
                             uint8_t *buf, size_t *out_len);
@@ -366,13 +536,18 @@ void btree_dispatch(const char *db_root, const char *object,
                     const char *field, int splits,
                     SearchCriterion *pc, const TypedField *tf,
                     bt_result_cb cb, void *ctx);
+/* 1 = cb signalled stop; 0 = shard walked completely or logically empty
+   (no keyfile / never-written bitmap); -1 = hard bitmap read failure with
+   errno preserved. Callers must not confuse a stop with a failure. */
 int bitmap_emit_for_shard(const char *db_root, const char *object,
                           const char *field, int shard_idx,
                           const uint8_t *value, size_t vlen,
                           bt_result_cb cb, void *ctx, SlotcaskDb *sdb);
 
 /* query.c — criteria tree operations (used by query_aggregate.c) */
-void recompile_criteria_tree(CriteriaNode *n, const TypedSchema *ts);
+int recompile_criteria_tree(CriteriaNode *n, const TypedSchema *ts);
+int pick_index_for_leaf_schema(const TypedSchema*,const char*,const char*,const SearchCriterion*);
+int search_criterion_indexable(const TypedSchema*,const SearchCriterion*);
 int leaf_is_indexed(const SearchCriterion *c, const char *db_root,
                     const char *object, char *out_idx_path, size_t out_sz);
 int find_intersect_leaves(CriteriaNode *root,
@@ -388,6 +563,9 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
                        int fetching, int limit);
 
 /* query.c — bitmap/keyset builders (used by query_aggregate.c) */
+/* Raw popcount (optimization / aggregate group-count input, not a
+   validated count answer). A never-written shard contributes zero; a hard
+   read failure returns SIZE_MAX with errno — check before summing. */
 size_t bm_popcount_one_value(const char *db_root, const char *object,
                              const char *field, int splits,
                              const uint8_t *value, size_t vlen);
@@ -412,31 +590,21 @@ int typed_field_to_buf_raw(const TypedField *f, const uint8_t *p,
 int decode_idx_to_buf(const TypedField *f, const uint8_t *p, size_t plen,
                       char *buf, size_t bufsz, int skip_zero);
 
+/* query.c — sound tier-0 candidate pre-filter shared by every btree
+   candidate callback (collect_hash_cb, stream_keyset_cb, idx_count_cb,
+   stream_primary_check/filter). 1 = admit to per-record verification,
+   0 = positively rejected on an exactly-decoded mismatch. */
+int idx_candidate_admits(const TypedField *tf, const char *payload,
+                         size_t plen, const SearchCriterion *c);
+
 /* query_join.c — join helpers (used by query.c find paths) */
 int parse_joins_json(const char *json, JoinSpec **out, int *count);
 void free_joins(JoinSpec *arr, int n);
 int resolve_joins(JoinSpec *joins, int n, const char *db_root,
                   const char *driver_object, FieldSchema *driver_fs);
-int extract_local_key(const JoinSpec *j, const uint8_t *driver_raw,
-                      size_t driver_len,
-                      const TypedSchema *driver_ts,
-                      uint8_t driver_hdr2,
-                      char *buf, size_t bufsz);
-int lookup_remote(const JoinSpec *j, const char *db_root,
-                  const char *local_key, size_t local_len,
-                  RecordRef *out_rr);
 int buf_driver_values(const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs,
                       const char **driver_proj, int driver_proj_count,
                       uint8_t driver_hdr2, char *buf, size_t bufsz);
-int buf_join_values(const JoinSpec *j, const uint8_t *remote_raw, size_t remote_len,
-                    uint8_t remote_hdr2, char *buf, size_t bufsz);
-size_t build_joined_csv_row(const char *key,
-                            const uint8_t *driver_raw, size_t driver_len, FieldSchema *driver_fs, uint8_t driver_hdr2,
-                            const char **proj_fields, int proj_count,
-                            const JoinSpec *joins, int njoins,
-                            const RecordRef *jrefs,
-                            char csv_delim,
-                            char *buf, size_t bufsz);
 void emit_joined_csv_header(const char *driver_object,
                             FieldSchema *driver_fs,
                             const JoinSpec *joins, int njoins,
@@ -487,4 +655,14 @@ typedef struct {
 void order_walk_bounds(CriteriaNode *tree, FieldSchema *fs,
                        const char *order_by, OrderWalkBounds *b);
 
+/* Render one complete bounded row before writing it; 0/-1 with errno. */
+int typed_query_emit_row(FILE *out,const char *wire,size_t wire_len,
+    const uint8_t *raw,size_t len,uint8_t flags,FieldSchema *fs,
+    const char **fields,int nfields,int rows,int dict,char delimiter,int comma,
+    const JoinSpec *joins,int njoins,const RecordRef *refs,size_t budget);
+
+int typed_query_named_text(const TypedSchema *,const uint8_t *,size_t,uint8_t,const char *,size_t,char **,size_t *);
+int typed_query_columns_into(const uint8_t *,size_t,uint8_t,FieldSchema *,const char **,int,char *,size_t);
+int resolve_join_record(const JoinSpec *,const char *,const TypedSchema *,const uint8_t *,size_t,uint8_t,size_t,RecordRef *);
+int order_walk_bounds_checked(CriteriaNode *,FieldSchema *,const char *,OrderWalkBounds *);
 #endif

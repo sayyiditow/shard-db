@@ -17,7 +17,28 @@
 #define _GNU_SOURCE
 #include "types.h"
 #include "bitmap.h"
+#ifdef TEST_BUILD
+#include <stdatomic.h>
+#include <pthread.h>
+#include "log.h"
+#include "shard_test_ctl.h"
+/* F7b: paired events on cached writer handles; thread identity allows
+   concurrent per-shard windows to be checked independently.
+   Compiled only into TEST_BUILD binaries; inert unless armed via the
+   control channel (SET_GLOBALS phase 3). */
+static void bm_lock_order_trace(const char *path, char op) {
+    if (!atomic_load(&g_shard_test_bmlock_log)) return;
+    LOG_WARN(LOG_SUB_BITMAP, "BMLOCK-ORDER tid=%lu op=%c %s",
+             (unsigned long)pthread_self(), op, path);
+}
+#endif
 #include <errno.h>
+
+/* Linux exposes EUCLEAN for detected on-disk corruption; Darwin does not.
+   Same alias as slotcask.c — bitmap metadata corruption reports as EIO. */
+#ifndef EUCLEAN
+#define EUCLEAN EIO
+#endif
 
 #include <fcntl.h>
 #include <limits.h>
@@ -100,10 +121,142 @@ static int bm_test_consume_failure(_Atomic int *counter) {
     }
     return 0;
 }
+
+/* ─── TEST_BUILD test seams: lock-acquisition faults, observation, cap
+ * override. Compiled only into TEST_BUILD binaries; inert unless a test
+ * arms them. */
+
+static __thread int bm_test_lock_fault[BM_TEST_LOCK_SITE_COUNT];
+static __thread int bm_test_lock_consumed[BM_TEST_LOCK_SITE_COUNT];
+/* Cross-thread acquisition-entry observation: published before the pthread
+ * call so a coordinating thread can see a contended waiter reach the real
+ * lock attempt. Never changes the pthread result. */
+static _Atomic int bm_test_lock_entered_count[BM_TEST_LOCK_SITE_COUNT];
+/* Thread-local cache-entry rwlock unlock counter (scoped measurement only). */
+static __thread int bm_test_entry_unlocks_count;
+/* Startup-only capacity override; 0 = configured default. */
+static int bm_test_cache_cap_override;
+/* Fire-once-per-site diagnostic gate (bounded even if a caller retries). */
+static _Atomic int bm_test_lock_diag_done[BM_TEST_LOCK_SITE_COUNT];
+
+static const char *bm_test_lock_site_name(int site) {
+    switch (site) {
+    case BM_TEST_LOCK_HIT_RD:   return "hit-rd";
+    case BM_TEST_LOCK_HIT_WR:   return "hit-wr";
+    case BM_TEST_LOCK_FILL_RD:  return "fill-rd";
+    case BM_TEST_LOCK_FILL_WR:  return "fill-wr";
+    case BM_TEST_LOCK_DROP_TRY: return "drop-try";
+    case BM_TEST_LOCK_DROP_WAIT: return "drop-wait";
+    default:                    return "?";
+    }
+}
+
+void bm_test_fail_lock_next(int site, int error) {
+    if (site < 0 || site >= BM_TEST_LOCK_SITE_COUNT || error == 0) return;
+    bm_test_lock_fault[site] = error;
+}
+
+int bm_test_lock_failure_consumed(int site) {
+    if (site < 0 || site >= BM_TEST_LOCK_SITE_COUNT) return -1;
+    return bm_test_lock_consumed[site];
+}
+
+void bm_test_reset_lock_failure(void) {
+    for (int i = 0; i < BM_TEST_LOCK_SITE_COUNT; i++) {
+        bm_test_lock_fault[i] = 0;
+        bm_test_lock_consumed[i] = 0;
+    }
+}
+
+void bm_test_lock_fault_save(BmTestLockFaultState *state) {
+    memcpy(state->faults, bm_test_lock_fault, sizeof(bm_test_lock_fault));
+    memcpy(state->consumed, bm_test_lock_consumed, sizeof(bm_test_lock_consumed));
+}
+
+void bm_test_lock_fault_restore(const BmTestLockFaultState *state) {
+    memcpy(bm_test_lock_fault, state->faults, sizeof(bm_test_lock_fault));
+    memcpy(bm_test_lock_consumed, state->consumed, sizeof(bm_test_lock_consumed));
+}
+
+int bm_test_lock_entered(int site) {
+    if (site < 0 || site >= BM_TEST_LOCK_SITE_COUNT) return -1;
+    return atomic_load_explicit(&bm_test_lock_entered_count[site],
+                                memory_order_acquire);
+}
+
+int bm_test_entry_unlock_count(void) {
+    return bm_test_entry_unlocks_count;
+}
+
+int bm_test_set_cache_cap(int cap) {
+    /* g_bm_cache dereferences g_db, which the daemon does not create until
+     * after config loading; a NULL g_db means no cache can be live. */
+    if (g_db && g_bm_cache) { errno = EBUSY; return -1; }
+    if (cap != 0 && cap != 16) { errno = EINVAL; return -1; }
+    bm_test_cache_cap_override = cap;
+    return 0;
+}
+
+/* TEST_BUILD acquisition-failure diagnostic, gated on the bmlock-log
+ * observability flag (armed for daemon-backed cases via the test control
+ * channel) and emitted at most once per site per process. Observation only;
+ * emitted before retry handling so repeated acquisition failures remain
+ * observable. */
+static void bm_test_lock_diag(int site, int rc, const char *path) {
+    if (atomic_load(&g_shard_test_bmlock_log) == 0) return;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&bm_test_lock_diag_done[site],
+                                        &expected, 1))
+        return;
+    LOG_WARN(LOG_SUB_BITMAP, "BMLOCK-ACQUIRE-FAIL site=%s error=%d path=%s",
+             bm_test_lock_site_name(site), rc, path);
+}
+#else  /* !TEST_BUILD */
+static void bm_test_lock_diag(int site, int rc, const char *path) {
+    (void)site; (void)rc; (void)path;
+}
 #endif
+
+/* Scoped TEST_BUILD measurement: count entry-rwlock unlocks performed by
+ * this thread through bitmap.c. No-op in production builds. */
+static void bm_test_note_entry_unlock(void) {
+#ifdef TEST_BUILD
+    bm_test_entry_unlocks_count++;
+#endif
+}
+
+/* Lock-acquisition call for a bitmap cache entry rwlock. TEST_BUILD: an
+ * armed thread-local one-shot fault is consumed and returned instead of
+ * calling pthread (never synthesizing success); otherwise, and always in
+ * production builds, the real pthread operation runs. */
+static int bm_entry_lock_call(int site,
+                              int (*op)(pthread_rwlock_t *),
+                              pthread_rwlock_t *lock) {
+#ifdef TEST_BUILD
+    if (site >= 0 && site < BM_TEST_LOCK_SITE_COUNT) {
+        int err = bm_test_lock_fault[site];
+        if (err != 0) {
+            bm_test_lock_fault[site] = 0;
+            bm_test_lock_consumed[site]++;
+            return err;
+        }
+        atomic_fetch_add_explicit(&bm_test_lock_entered_count[site], 1,
+                                  memory_order_release);
+    }
+#else
+    (void)site;
+#endif
+    return op(lock);
+}
 
 void bm_cache_init(int cap) {
     if (g_bm_cache) return;
+#ifdef TEST_BUILD
+    /* Startup-only test override (bm_test_set_cache_cap): consulted on the
+     * first initialization, before the ordinary floor/sizing arithmetic.
+     * Not a supported configuration knob. */
+    if (bm_test_cache_cap_override) cap = bm_test_cache_cap_override;
+#endif
     if (cap < 16) cap = 16;
     g_bm_cache_slots = bm_next_pow2(cap * 2);
     g_bm_cache = calloc((size_t)g_bm_cache_slots, sizeof(BmCacheEntry));
@@ -112,6 +265,14 @@ void bm_cache_init(int cap) {
         rwlock_init_writer_preferring(&g_bm_cache[i].rwlock);
         g_bm_cache[i].fd = -1;
     }
+#ifdef TEST_BUILD
+    if (bm_test_cache_cap_override)
+        LOG_WARN(LOG_SUB_BITMAP,
+                 "BM_TEST_CACHE_CAP=%d: effective cap=%d hash slots=%d "
+                 "eviction threshold=%d",
+                 bm_test_cache_cap_override, cap, g_bm_cache_slots,
+                 g_bm_cache_slots / 2);
+#endif
 }
 
 void bm_cache_shutdown(void) {
@@ -160,21 +321,38 @@ static int bm_cache_drop_slot(int slot, int wait) {
     char expected_path[PATH_MAX];
     snprintf(expected_path, sizeof(expected_path), "%s", e->path);
     pthread_mutex_unlock(&g_bm_cache_lock);
-    int lock_rc = wait ? pthread_rwlock_wrlock(&e->rwlock)
-                       : pthread_rwlock_trywrlock(&e->rwlock);
+    int lock_rc = bm_entry_lock_call(wait ? BM_TEST_LOCK_DROP_WAIT
+                                          : BM_TEST_LOCK_DROP_TRY,
+                                     wait ? pthread_rwlock_wrlock
+                                          : pthread_rwlock_trywrlock,
+                                     &e->rwlock);
+    if (lock_rc != 0)
+        bm_test_lock_diag(wait ? BM_TEST_LOCK_DROP_WAIT : BM_TEST_LOCK_DROP_TRY,
+                          lock_rc, expected_path);
     pthread_mutex_lock(&g_bm_cache_lock);
-    if (lock_rc != 0) return 0;
+    if (lock_rc != 0) {
+        /* Only a nonblocking EBUSY is ordinary contention. Every other
+           pthread result — including a blocking wait's EDEADLK (the calling
+           thread holds this entry's write lock) — is a returned acquisition
+           error: fail with it instead of looping. */
+        if (!wait && lock_rc == EBUSY) return 0;
+        errno = lock_rc;
+        return -1;
+    }
     if (!e->used) {
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(&e->rwlock);
         return 1;
     }
     if (strcmp(e->path, expected_path) != 0) {
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(&e->rwlock);
         return 0;
     }
     if (e->map && e->map_size > 0 &&
         durability_flush_dirty(&e->dirty, &e->dirty_since_ms,
                                e->map, e->map_size) < 0) {
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(&e->rwlock);
         return -1;
     }
@@ -182,6 +360,7 @@ static int bm_cache_drop_slot(int slot, int wait) {
        complete entry so a later invalidation can safely retry teardown. */
     if (e->map && munmap(e->map, e->map_size) != 0) {
         int saved_errno = errno;
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(&e->rwlock);
         errno = saved_errno;
         return -1;
@@ -198,6 +377,7 @@ static int bm_cache_drop_slot(int slot, int wait) {
     atomic_store_explicit(&e->used, 0, memory_order_relaxed);
     e->path[0] = '\0';
     g_bm_cache_count--;
+    bm_test_note_entry_unlock();
     pthread_rwlock_unlock(&e->rwlock);
     if (saved_errno) {
         errno = saved_errno;
@@ -217,7 +397,10 @@ int bm_cache_invalidate_checked(const char *path) {
            identity is rechecked after taking the entry wrlock. */
         rc = bm_cache_drop_slot(slot, 1);
     }
+    /* Propagate the helper's -1 and exact errno across mutex cleanup. */
+    int saved_errno = errno;
     pthread_mutex_unlock(&g_bm_cache_lock);
+    errno = saved_errno;
     if (rc < 0) return -1;
 #ifdef TEST_BUILD
     if (bm_test_consume_failure(&g_bm_test_fail_invalidate_count)) {
@@ -238,8 +421,9 @@ void bm_cache_invalidate(const char *path) {
    publication returns. Cache entries record the generation at which their
    open inode was validated; the first acquire after a generation change
    compares the cached fd's (st_dev, st_ino) with the current path. A
-   mismatched entry is retired non-blockingly when possible; otherwise that
-   acquire opens the current path uncached. An acquire overlapping
+   mismatched entry is retired non-blockingly; while it stays busy the
+   acquire retries admission under a bounded budget and then fails with
+   EBUSY — it never maps the current path uncached. An acquire overlapping
    publication may finish on the old inode, but an acquire beginning after
    publication completes cannot. The only remaining lock order is
    g_bm_cache_lock -> per-entry rwlock (never the reverse). */
@@ -254,7 +438,10 @@ static int bm_cache_invalidate_nowait(const char *path) {
     int slot = bm_cache_probe(path, &found);
     if (found && slot >= 0) {
         int rc = bm_cache_drop_slot(slot, 0);
+        /* Propagate the helper's -1 and exact errno across mutex cleanup. */
+        int saved_errno = errno;
         pthread_mutex_unlock(&g_bm_cache_lock);
+        errno = saved_errno;
         return rc;
     }
     pthread_mutex_unlock(&g_bm_cache_lock);
@@ -491,27 +678,65 @@ static int bm_write_initial(const char *path, uint32_t slots, int bool_fastpath,
 }
 
 /* Open and mmap the on-disk file. Used by both the cached and uncached
-   paths. Reads the header into *out_hdr. Returns 0/fd on success. */
+   paths. Reads the header into *out_hdr. Returns 0/fd on success; -1 with
+   errno: the real syscall errno for open/fstat/mmap failures (preserved
+   across close/munmap), or deterministic EUCLEAN for a header that does not
+   describe the file (short file, bad magic, stride/body bounds). */
 static int bm_file_open_mmap(const char *path,
-                              int *out_fd, uint8_t **out_map, size_t *out_size,
-                              struct BmHeader *out_hdr) {
+                             int *out_fd, uint8_t **out_map, size_t *out_size,
+                             struct BmHeader *out_hdr) {
     int fd = open(path, O_RDWR);
     if (fd < 0) return -1;
+    int saved;
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(struct BmHeader)) {
-        close(fd); return -1;
+    if (fstat(fd, &st) != 0) {
+        saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
+    if (st.st_size < (off_t)sizeof(struct BmHeader)) {
+        close(fd);
+        errno = EUCLEAN;
+        return -1;
     }
     uint8_t *map = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE,
                         MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED) { close(fd); return -1; }
+    if (map == MAP_FAILED) {
+        saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
     memcpy(out_hdr, map, sizeof(struct BmHeader));
     if (out_hdr->magic != BM_MAGIC) {
-        munmap(map, st.st_size); close(fd); return -1;
+        munmap(map, st.st_size); close(fd);
+        errno = EUCLEAN;
+        return -1;
+    }
+    /* A header that describes more bytes than the file has (a torn in-place
+       rewrite after power loss) must not be mapped: every accessor trusts it. */
+    if (out_hdr->stride != bm_stride_for(out_hdr->slots) ||
+        (size_t)out_hdr->bitmaps_off + (size_t)out_hdr->n_values * (size_t)out_hdr->stride
+            > (size_t)st.st_size) {
+        munmap(map, st.st_size); close(fd);
+        errno = EUCLEAN;
+        return -1;
     }
     *out_fd = fd;
     *out_map = map;
     *out_size = (size_t)st.st_size;
     return 0;
+}
+
+/* Bounded admission retrying: an initial attempt plus this many retries,
+ * 2 ms apart, shared by stale-entry retirement and cache-saturation paths.
+ * Bounds admission churn only — ordinary blocking lock waits stay unbounded. */
+#define BM_OPEN_ADMISSION_RETRIES 4
+
+static void bm_admission_backoff(void) {
+    struct timespec ts = { 0, 2 * 1000 * 1000L };
+    nanosleep(&ts, NULL);
 }
 
 static BitmapShard *bm_open_impl(const char *path, int slots, int create,
@@ -556,7 +781,12 @@ static BitmapShard *bm_open_impl(const char *path, int slots, int create,
         return bm;
     }
 
-    /* Cached path — mirror bt_acquire's verify-and-retry pattern. */
+    /* Cached path — mirror bt_acquire's verify-and-retry pattern. With an
+       initialized cache every returned handle is cache-backed: stale
+       retirements and cache-saturation retry admission under a shared
+       bounded budget instead of returning uncached mappings that an
+       in-place rebuild could remap. */
+    int admission_retries = 0;
 retry_bm_acquire:;
     int retries = 0;
     int found = 0;
@@ -571,8 +801,20 @@ retry_bm_acquire:;
         pthread_rwlock_t *lock = &g_bm_cache[slot].rwlock;
         pthread_mutex_unlock(&g_bm_cache_lock);
 
-        if (writer) pthread_rwlock_wrlock(lock);
-        else        pthread_rwlock_rdlock(lock);
+        int hit_rc = bm_entry_lock_call(writer ? BM_TEST_LOCK_HIT_WR
+                                               : BM_TEST_LOCK_HIT_RD,
+                                        writer ? pthread_rwlock_wrlock
+                                               : pthread_rwlock_rdlock,
+                                        lock);
+        if (hit_rc != 0) {
+            /* Returned acquisition error: no entry access, no unlock, no
+               handle. The table mutex was already released above. */
+            bm_test_lock_diag(writer ? BM_TEST_LOCK_HIT_WR
+                                     : BM_TEST_LOCK_HIT_RD,
+                              hit_rc, path);
+            errno = hit_rc;
+            return NULL;
+        }
 
         BmCacheEntry *e = &g_bm_cache[slot];
         if (e->used && strcmp(e->path, path) == 0) {
@@ -585,29 +827,22 @@ retry_bm_acquire:;
                 &e->validated_publish_generation, memory_order_acquire);
             if (validated_generation != current_generation) {
                 if (!durability_same_open_inode(e->fd, path)) {
-                    /* Stale target: retire it non-blockingly, never waiting
-                       on its entry lock. If it is busy, serve the current
-                       path from a fresh uncached mapping. */
+                    /* Stale target: retire it non-blockingly and restart
+                       cached acquisition under the shared admission budget.
+                       A retirement error fails the open with its exact
+                       errno; a busy or already-gone entry consumes a retry.
+                       The new inode is never mapped directly. */
+                    bm_test_note_entry_unlock();
                     pthread_rwlock_unlock(lock);
-                    if (bm_cache_invalidate_nowait(path) > 0)
-                        goto retry_bm_acquire;
-                    int nfd; uint8_t *nmap; size_t nsz; struct BmHeader nhdr;
-                    if (bm_file_open_mmap(path, &nfd, &nmap, &nsz, &nhdr) != 0)
+                    int inv_rc = bm_cache_invalidate_nowait(path);
+                    if (inv_rc < 0)
                         return NULL;
-                    BitmapShard *nbm = calloc(1, sizeof(*nbm));
-                    if (!nbm) { munmap(nmap, nsz); close(nfd); return NULL; }
-                    nbm->slot = -1;
-                    nbm->writer = writer;
-                    nbm->fd = nfd;
-                    nbm->mmap_ptr = nmap;
-                    nbm->mmap_size = nsz;
-                    nbm->hdr = nhdr;
-                    snprintf(nbm->path, sizeof(nbm->path), "%s", path);
-                    if (nbm->hdr.max_values == 0 && writer) {
-                        nbm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
-                        memcpy(nbm->mmap_ptr, &nbm->hdr, sizeof(struct BmHeader));
+                    if (++admission_retries > BM_OPEN_ADMISSION_RETRIES) {
+                        errno = EBUSY;
+                        return NULL;
                     }
-                    return nbm;
+                    bm_admission_backoff();
+                    goto retry_bm_acquire;
                 }
                 atomic_store_explicit(&e->validated_publish_generation,
                                       current_generation, memory_order_release);
@@ -621,13 +856,16 @@ retry_bm_acquire:;
                coverity[missing_unlock] rwlock handoff to caller is intentional
                coverity[atomicity] slot stability guaranteed by rwlock + verify */
             BitmapShard *bm = calloc(1, sizeof(*bm));
-            if (!bm) { pthread_rwlock_unlock(lock); return NULL; }
+            if (!bm) { bm_test_note_entry_unlock(); pthread_rwlock_unlock(lock); return NULL; }
             bm->slot = slot;
             bm->writer = writer;
             bm->fd = e->fd;
             bm->mmap_ptr = e->map;
             bm->mmap_size = e->map_size;
             snprintf(bm->path, sizeof(bm->path), "%s", path);
+#ifdef TEST_BUILD
+            if (writer) bm_lock_order_trace(bm->path, '+');
+#endif
             memcpy(&bm->hdr, e->map, sizeof(struct BmHeader));
             if (bm->hdr.max_values == 0 && writer) {
                 bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
@@ -637,6 +875,7 @@ retry_bm_acquire:;
         }
 
         /* Slot was evicted+reused while we were blocked on the rwlock. */
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(lock);
         if (++retries >= 4) {
             slot = -1; found = 0;
@@ -687,45 +926,47 @@ retry_bm_acquire:;
         }
         if (slot < 0 && writer && wait_candidate >= 0) {
             int drop_rc = bm_cache_drop_slot(wait_candidate, 1);
-            if (drop_rc > 0) slot = wait_candidate;
-            else if (drop_rc < 0 && first_error == 0) first_error = errno;
-            else if (drop_rc == 0) first_error = 0;
+            if (drop_rc > 0) {
+                slot = wait_candidate;
+            } else if (drop_rc < 0) {
+                /* A selected blocking-wait failure overrides any earlier try
+                   error and is returned promptly — never retried. */
+                first_error = errno;
+            }
+            /* drop_rc == 0 (identity changed under the lock): retain any
+               earlier try error; only when no error exists does the changed
+               identity retry. */
         }
-        if (slot < 0 && writer && first_error != 0) {
+        if (slot < 0 && first_error != 0) {
+            /* Readers and writers alike: a returned acquisition error with
+               no successful eviction fails the open with that exact error
+               (the selected writer wait's error took precedence above). */
+            int saved_error = first_error;
             pthread_mutex_unlock(&g_bm_cache_lock);
             munmap(map, sz);
             close(fd);
-            errno = first_error;
+            errno = saved_error;
             return NULL;
         }
     }
 
-    if (slot < 0 && writer) {
+    if (slot < 0) {
+        /* Saturated with no error: dispose the private mapping and retry
+           admission under the shared budget; never fall back to an uncached
+           handle. */
         pthread_mutex_unlock(&g_bm_cache_lock);
         munmap(map, sz);
         close(fd);
+        if (++admission_retries > BM_OPEN_ADMISSION_RETRIES) {
+            errno = EBUSY;
+            return NULL;
+        }
+        bm_admission_backoff();
         goto retry_bm_acquire;
     }
 
     BitmapShard *bm = calloc(1, sizeof(*bm));
     if (!bm) { munmap(map, sz); close(fd); pthread_mutex_unlock(&g_bm_cache_lock); return NULL; }
-
-    if (slot < 0) {
-        /* Cache full — uncached fallback. */
-        pthread_mutex_unlock(&g_bm_cache_lock);
-        bm->slot = -1;
-        bm->writer = writer;
-        bm->fd = fd;
-        bm->mmap_ptr = map;
-        bm->mmap_size = sz;
-        bm->hdr = hdr;
-        snprintf(bm->path, sizeof(bm->path), "%s", path);
-        if (bm->hdr.max_values == 0 && writer) {
-            bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
-            memcpy(bm->mmap_ptr, &bm->hdr, sizeof(struct BmHeader));
-        }
-        return bm;
-    }
 
     BmCacheEntry *e = &g_bm_cache[slot];
     strncpy(e->path, path, PATH_MAX - 1);
@@ -751,13 +992,33 @@ retry_bm_acquire:;
        against that. Verify-and-retry exactly like the hit path handles the
        resulting window where a concurrent evictor can steal this slot
        before we lock it. */
-    if (writer) pthread_rwlock_wrlock(lock);
-    else        pthread_rwlock_rdlock(lock);
+    int fill_rc = bm_entry_lock_call(writer ? BM_TEST_LOCK_FILL_WR
+                                            : BM_TEST_LOCK_FILL_RD,
+                                     writer ? pthread_rwlock_wrlock
+                                            : pthread_rwlock_rdlock,
+                                     lock);
+    if (fill_rc != 0) {
+        /* Returned acquisition error: free only the prospective handle. The
+           fd/map installed before the acquisition belong to the cache (or to
+           an intervening evictor) — never closed, unmapped or unlocked here. */
+        bm_test_lock_diag(writer ? BM_TEST_LOCK_FILL_WR : BM_TEST_LOCK_FILL_RD,
+                          fill_rc, path);
+        free(bm);
+        errno = fill_rc;
+        return NULL;
+    }
     if (!e->used || strcmp(e->path, path) != 0) {
         /* Stolen by a concurrent evictor; they now own disposing our
-           fd/map. Retry from scratch. */
+           fd/map (the installed resources stay cache-owned). Retry under
+           the shared admission budget. */
+        bm_test_note_entry_unlock();
         pthread_rwlock_unlock(lock);
         free(bm);
+        if (++admission_retries > BM_OPEN_ADMISSION_RETRIES) {
+            errno = EBUSY;
+            return NULL;
+        }
+        bm_admission_backoff();
         goto retry_bm_acquire;
     }
 
@@ -768,6 +1029,9 @@ retry_bm_acquire:;
     bm->mmap_size = sz;
     bm->hdr = hdr;
     snprintf(bm->path, sizeof(bm->path), "%s", path);
+#ifdef TEST_BUILD
+    if (writer) bm_lock_order_trace(bm->path, '+');
+#endif
     if (bm->hdr.max_values == 0 && writer) {
         bm->hdr.max_values = BM_DEFAULT_MAX_VALUES;
         memcpy(bm->mmap_ptr, &bm->hdr, sizeof(struct BmHeader));
@@ -818,6 +1082,10 @@ int bm_close_checked(BitmapShard *bm) {
             BmCacheEntry *e = &g_bm_cache[bm->slot];
             durability_mark_dirty(&e->dirty, &e->dirty_since_ms);
         }
+#ifdef TEST_BUILD
+        if (bm->writer) bm_lock_order_trace(bm->path, '-');
+#endif
+        bm_test_note_entry_unlock();
         int rc = pthread_rwlock_unlock(&g_bm_cache[bm->slot].rwlock);
         if (rc != 0) saved_errno = rc;
     } else {
@@ -1116,6 +1384,292 @@ int bm_grow(BitmapShard *bm, uint32_t new_slots) {
     close(fd);
 
     return bm_publish(bm, tmp);
+}
+
+/* ─────────────────────── slot remap (kf rebuild) ─────────────────────── */
+
+int bm_slotmap_prepare(BitmapShard *bm, uint32_t new_slots,
+                       uint32_t (*map_fn)(uint32_t old_slot, void *ctx), void *ctx,
+                       char *tmp_path, size_t tmp_len) {
+    if (!bm || !map_fn || !tmp_path || tmp_len == 0 || new_slots == 0 || !bm->writer) {
+        errno = EINVAL;
+        return -1;
+    }
+    int n = snprintf(tmp_path, tmp_len, "%s.remap", bm->path);
+    if (n < 0 || (size_t)n >= tmp_len) {
+        tmp_path[0] = '\0';
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    const struct BmHeader *oh = &bm->hdr;
+    size_t old_end = (size_t)oh->bitmaps_off + (size_t)oh->n_values * (size_t)oh->stride;
+    if (oh->stride != bm_stride_for(oh->slots) || old_end > bm->mmap_size ||
+        oh->bitmaps_off < oh->dict_off) {
+        tmp_path[0] = '\0';
+        errno = EUCLEAN;
+        return -1;
+    }
+
+    struct BmHeader nhdr = *oh;
+    nhdr.slots = new_slots;
+    nhdr.stride = bm_stride_for(new_slots);
+    size_t total = bm_file_size(&nhdr);
+
+    int saved = 0;
+    int fd = -1;
+    uint8_t *obuf = malloc(nhdr.stride);
+    if (!obuf) { saved = ENOMEM; goto fail; }
+    fd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { saved = errno; goto fail; }
+    if (ftruncate(fd, (off_t)total) != 0) { saved = errno; goto fail; }
+    if (pwrite(fd, &nhdr, sizeof(nhdr), 0) != (ssize_t)sizeof(nhdr)) {
+        saved = errno ? errno : EIO;
+        goto fail;
+    }
+    /* Dictionary and its alignment padding pass through unchanged. */
+    size_t dict_bytes = (size_t)oh->bitmaps_off - (size_t)oh->dict_off;
+    if (dict_bytes &&
+        pwrite(fd, (const uint8_t *)bm->mmap_ptr + oh->dict_off, dict_bytes,
+               (off_t)nhdr.dict_off) != (ssize_t)dict_bytes) {
+        saved = errno ? errno : EIO;
+        goto fail;
+    }
+    for (uint32_t v = 0; v < oh->n_values; v++) {
+        const uint8_t *src = (const uint8_t *)bm->mmap_ptr + oh->bitmaps_off +
+                             (size_t)v * (size_t)oh->stride;
+        memset(obuf, 0, nhdr.stride);
+        for (uint32_t bi = 0; bi < oh->stride; bi++) {
+            uint8_t byte = src[bi];
+            while (byte) {
+                uint32_t slot = bi * 8u + (uint32_t)__builtin_ctz(byte);
+                byte &= (uint8_t)(byte - 1u);
+                if (slot >= oh->slots) break;   /* padding bits, as bm_walk */
+                uint32_t ns = map_fn(slot, ctx);
+                if (ns == UINT32_MAX) continue;
+                if (ns >= new_slots) { saved = EUCLEAN; goto fail; }
+                obuf[ns >> 3] |= (uint8_t)(1u << (ns & 7u));
+            }
+        }
+        if (pwrite(fd, obuf, nhdr.stride,
+                   (off_t)nhdr.bitmaps_off + (off_t)v * (off_t)nhdr.stride)
+                != (ssize_t)nhdr.stride) {
+            saved = errno ? errno : EIO;
+            goto fail;
+        }
+    }
+    if (fsync(fd) != 0) { saved = errno; goto fail; }
+    {
+        int cfd = fd;
+        fd = -1;
+        if (close(cfd) != 0) { saved = errno; goto fail; }
+    }
+    free(obuf);
+    return 0;
+
+fail:
+    if (fd >= 0) close(fd);
+    unlink(tmp_path);
+    free(obuf);
+    tmp_path[0] = '\0';
+    errno = saved ? saved : EIO;
+    return -1;
+}
+
+int bm_slotmap_stage(BitmapShard *bm, const char *tmp_path, BmSlotmapStage *st) {
+    if (!bm || !bm->writer || !tmp_path || !tmp_path[0] || !st) {
+        errno = EINVAL;
+        return -1;
+    }
+    st->src = NULL;
+    st->len = 0;
+    int tfd = open(tmp_path, O_RDONLY);
+    if (tfd < 0) return -1;
+    struct stat ts;
+    if (fstat(tfd, &ts) != 0 || ts.st_size < (off_t)sizeof(struct BmHeader)) {
+        int e = errno ? errno : EUCLEAN;
+        close(tfd);
+        errno = e;
+        return -1;
+    }
+    size_t len = (size_t)ts.st_size;
+    void *src = mmap(NULL, len, PROT_READ, MAP_SHARED, tfd, 0);
+    int saved = errno;
+    close(tfd);
+    if (src == MAP_FAILED) { errno = saved; return -1; }
+
+    if (len > bm->mmap_size) {
+        /* Reserve the blocks now: a later store into a sparse hole could
+           otherwise fault with SIGBUS on ENOSPC at apply time. Filesystems
+           without fallocate fall back to a plain extend. macOS has no
+           posix_fallocate at all and takes the same plain extend. */
+#if defined(__APPLE__)
+        int fr = EOPNOTSUPP;
+#else
+        int fr = posix_fallocate(bm->fd, 0, (off_t)len);
+#endif
+        if (fr != 0 && fr != EOPNOTSUPP && fr != EINVAL) {
+            munmap(src, len);
+            errno = fr;
+            return -1;
+        }
+        if (fr != 0 && ftruncate(bm->fd, (off_t)len) != 0) {
+            saved = errno;
+            munmap(src, len);
+            errno = saved;
+            return -1;
+        }
+        /* The new size must be durable before any byte of the new header can
+           be: a crash must never leave a header that describes more bytes
+           than the file has. */
+        if (fdatasync(bm->fd) != 0) {
+            saved = errno;
+            munmap(src, len);
+            errno = saved;
+            return -1;
+        }
+        /* Map the larger window before dropping the old one so a failure
+           leaves the handle and the cache entry exactly as they were. */
+        void *nm = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, bm->fd, 0);
+        if (nm == MAP_FAILED) {
+            saved = errno;
+            munmap(src, len);
+            errno = saved;
+            return -1;
+        }
+        munmap(bm->mmap_ptr, bm->mmap_size);
+        bm->mmap_ptr = nm;
+        bm->mmap_size = len;
+        if (bm->slot >= 0 && g_bm_cache) {
+            BmCacheEntry *e = &g_bm_cache[bm->slot];
+            e->map = nm;
+            e->map_size = len;
+        }
+    }
+    st->src = src;
+    st->len = len;
+    return 0;
+}
+
+int bm_slotmap_apply(BitmapShard *bm, const BmSlotmapStage *st) {
+    if (!bm || !bm->writer || !st || !st->src || st->len > bm->mmap_size) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(bm->mmap_ptr, st->src, st->len);
+    memcpy(&bm->hdr, bm->mmap_ptr, sizeof(struct BmHeader));
+    return msync(bm->mmap_ptr, st->len, MS_SYNC);
+}
+
+void bm_slotmap_stage_release(BmSlotmapStage *st) {
+    if (st && st->src) munmap((void *)st->src, st->len);
+    if (st) { st->src = NULL; st->len = 0; }
+}
+
+void bm_slotmap_discard(const char *tmp_path) {
+    if (tmp_path && tmp_path[0]) unlink(tmp_path);
+}
+
+int bm_field_lock_cmp(const char *a, const char *b) {
+    for (size_t i = 0;; i++) {
+        int ea = a[i] == '\0', eb = b[i] == '\0';
+        unsigned char ca = ea ? (unsigned char)'/' : (unsigned char)a[i];
+        unsigned char cb = eb ? (unsigned char)'/' : (unsigned char)b[i];
+        if (ca != cb) return ca < cb ? -1 : 1;
+        if (ea && eb) return 0;
+    }
+}
+
+void bm_close_many(BitmapShard **h, int n) {
+    int uniq[BM_OPEN_MANY_MAX];
+    if (!h || n < 0 || n > BM_OPEN_MANY_MAX) return;
+    for (int i = 0; i < n; i++) {                  /* decide before anything is freed */
+        uniq[i] = h[i] != NULL;
+        for (int j = 0; j < i && uniq[i]; j++)
+            if (h[j] == h[i]) uniq[i] = 0;
+    }
+    for (int i = 0; i < n; i++)
+        if (uniq[i]) bm_close(h[i]);
+    for (int i = 0; i < n; i++) h[i] = NULL;
+}
+
+int bm_file_is_corrupt(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat st;
+    struct BmHeader h;
+    int bad = 0;
+    if (fstat(fd, &st) == 0) {
+        if (st.st_size < (off_t)sizeof(h)) bad = 1;
+        else if (pread(fd, &h, sizeof(h), 0) == (ssize_t)sizeof(h))
+            bad = h.magic != BM_MAGIC ||
+                  h.stride != bm_stride_for(h.slots) ||
+                  (size_t)h.bitmaps_off + (size_t)h.n_values * (size_t)h.stride > (size_t)st.st_size;
+    }
+    close(fd);
+    return bad;
+}
+
+int bm_handle_cached(const BitmapShard *bm) {
+    return bm && bm->slot >= 0;
+}
+
+#ifdef TEST_BUILD
+/* Test-only damage helper for corruption-retirement regressions. Takes the
+ * normal writer handle for `path`, rewrites only the mapped header's
+ * n_values so the described bitmap body extends past the end of the file,
+ * syncs through the same msync path as every other writer, closes, and
+ * returns 0 or -1 with errno. It does not unlink, skip or invalidate
+ * anything itself: the damage simply makes the next cold open fail with
+ * EUCLEAN and a warm cached mapping carry the out-of-bounds description
+ * into bm_slotmap_prepare's bounds check. TEST_BUILD only; no production
+ * disk-format surface. */
+int bm_test_damage_header_bounds(const char *path) {
+    BitmapShard *bm = bm_open(path, 0, 0, 0, 0, 1);
+    if (!bm) return -1;
+    if (!bm->mmap_ptr || bm->mmap_size < sizeof(struct BmHeader)) {
+        bm_close(bm);
+        errno = EINVAL;
+        return -1;
+    }
+    struct BmHeader h;
+    memcpy(&h, bm->mmap_ptr, sizeof(h));
+    h.n_values = h.n_values + 4096u;
+    memcpy(bm->mmap_ptr, &h, sizeof(h));
+    if (msync(bm->mmap_ptr, bm->mmap_size, MS_SYNC) != 0) {
+        int saved = errno;
+        bm_close(bm);
+        errno = saved;
+        return -1;
+    }
+    bm_close(bm);
+    return 0;
+}
+#endif
+
+int bm_open_many_ro(const char *const *paths, int n, BitmapShard **out) {
+    if (!paths || !out || n < 0 || n > BM_OPEN_MANY_MAX) { errno = EINVAL; return -1; }
+    int order[BM_OPEN_MANY_MAX];
+    for (int i = 0; i < n; i++) { order[i] = i; out[i] = NULL; }
+    for (int i = 1; i < n; i++) {                  /* insertion sort by path */
+        int k = order[i], j = i - 1;
+        while (j >= 0 && strcmp(paths[order[j]], paths[k]) > 0) { order[j + 1] = order[j]; j--; }
+        order[j + 1] = k;
+    }
+    for (int i = 0; i < n; i++) {
+        if (i > 0 && strcmp(paths[order[i]], paths[order[i - 1]]) == 0) {
+            out[order[i]] = out[order[i - 1]];     /* same file: share the one read lock */
+            continue;
+        }
+        out[order[i]] = bm_open(paths[order[i]], 0, 0, 0, 0, 0);
+        if (!out[order[i]]) {
+            int saved = errno;
+            bm_close_many(out, n);
+            errno = saved;
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /* ─────────────────────── observability ─────────────────────── */

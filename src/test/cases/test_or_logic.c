@@ -49,7 +49,7 @@ static int test_or_logic_run(void) {
     /* === Schema + dataset setup (mirrors shell test exactly) ===
        status + region are indexed; amount + notes are NOT indexed. */
     resp = req(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"or_orders\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"or_orders\","
         "\"splits\":16,\"max_key\":16,"
         "\"fields\":[\"status:varchar:16\",\"amount:int\","
                     "\"region:varchar:16\",\"notes:varchar:64\"],"

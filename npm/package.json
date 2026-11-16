@@ -9,7 +9,7 @@
     "build": "node-gyp rebuild",
     "build:release": "node-gyp rebuild --release",
     "prebuild": "prebuildify --napi --strip -t 18.0.0 -t 20.0.0 -t 22.0.0",
-    "test": "bun test/basic.js"
+    "test": "bun test/basic.js && bun test/csv-bytes.js && bun test/precision.js"
   },
   "keywords": [
     "database",

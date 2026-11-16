@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "packed_record.h"
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <fcntl.h>
@@ -203,6 +204,7 @@ typedef struct {
        site, so both default to unconstrained. */
     uint8_t not_null;
     uint8_t not_null_set;
+    uint8_t default_invalid; /* legacy declaration readable; unsafe default generation refused */
 
     /* FT_ENUM only — populated by load_typed_schema, freed by
        free_typed_schema. Empty/zeroed for every other type.
@@ -222,14 +224,27 @@ typedef struct TypedSchema {
                            write [u8 bm_nbytes][bits] there, field bytes after.
                            0 only before load completes — every loaded schema
                            and every hand-built TypedSchema must set it. */
+    /* By-value private codec metadata. Zero means legacy. Existing loaders
+       never bind packed layouts in Phase 3B. Schemas are immutable in use. */
+    PkrSchema packed;
 } TypedSchema;
 
 /* ===== Null bitmap record support (2026.10.2) ===== */
 
-/* Segment record header byte 19 (reserved): bit 0 = value region carries
-   a field-null bitmap ([u8 bm_nbytes][bits...]) ahead of the field bytes.
-   Bits 1-7 must be zero on disk; unknown bits fail closed. */
+/* Segment record generation flags. The generic transport recognizes
+   nullmap (bit 0) and packed-with-nullmap (bits 0|1). Other bits and
+   packed-without-nullmap are invalid. Recognizing transport flags does
+   not activate packed object loading: legacy typed_record_view and the
+   schema version gate remain unchanged until their approved slices. */
 #define SREC_FLAG_NULLMAP 0x01
+#define SREC_FLAG_PACKED  0x02
+#define SREC_KNOWN_FLAGS  (SREC_FLAG_NULLMAP | SREC_FLAG_PACKED)
+
+/* Physical transport accepts legacy, nullmap, or packed+nullmap only. */
+static inline int srec_flags_valid(uint8_t flags) {
+    return flags == 0 || flags == SREC_FLAG_NULLMAP ||
+           flags == SREC_KNOWN_FLAGS;
+}
 
 static inline int typed_nullmap_bytes(int nfields) {
     return (nfields + 7) / 8;
@@ -328,6 +343,10 @@ typedef struct {
        `auto_key=seq(<name>)` token. */
     enum AutoKeyKind { AK_NONE = 0, AK_UUID, AK_SEQ } auto_key;
     char auto_key_seq_name[128];   /* meaningful only when auto_key == AK_SEQ */
+    /* 0 = legacy layout, 1 = packed layout. Set from the strict
+       `layout=packed` schema.conf token (schema_tail_layout); a malformed
+       token makes load_schema refuse the object instead of defaulting. */
+    int packed_layout;
 } Schema;
 
 
@@ -371,6 +390,8 @@ typedef struct {
     enum SearchOp op;
     char value[1024];
     char value2[1024];
+    char *owned_value, *owned_value2;
+    size_t owned_value_len, owned_value2_len;
     char **in_values;
     int in_count;
     int in_cap;
@@ -386,6 +407,15 @@ typedef struct {
     int64_t len_target2;   /* second bound for OP_LEN_BETWEEN */
 } SearchCriterion;
 
+const char *search_criterion_value(const SearchCriterion *c);
+const char *search_criterion_value2(const SearchCriterion *c);
+size_t search_criterion_value_len(const SearchCriterion *c);
+size_t search_criterion_value2_len(const SearchCriterion *c);
+int search_criterion_set(SearchCriterion *c, int second, const char *s, size_t n);
+void search_criterion_clear(SearchCriterion *c);
+int search_criterion_clone(SearchCriterion *dst, const SearchCriterion *src);
+void search_criterion_move(SearchCriterion *dst, SearchCriterion *src);
+
 /* Like-kind for OP_LIKE / OP_ILIKE — determined at compile-criteria time
    from the pattern shape (no wildcards → LK_EXACT, trailing % → LK_PREFIX,
    leading+trailing % → LK_CONTAINS).  Replaces a runtime string search. */
@@ -395,6 +425,10 @@ typedef enum LikeKind { LK_EXACT, LK_PREFIX, LK_CONTAINS } LikeKind;
    match_typed() in the scan hot path.  Fully visible so io_direct.c's
    batch matchers can pre-digest field type + op without opaque accessors. */
 typedef struct CompiledCriterion {
+    const TypedSchema *schema;
+    size_t workspace_budget; /* immutable remainder after collection prepare */
+    dec_t numeric1, numeric2;
+    dec_t *in_numeric;
     const TypedField *tf;       /* resolved; NULL iff composite or unknown */
     const TypedField *rhs_tf;   /* RHS for field-vs-field ops; NULL otherwise */
     enum SearchOp op;
@@ -459,6 +493,7 @@ typedef struct CriteriaNode {
     CompiledCriterion *compiled;     /* populated by compile_criteria_tree() */
     struct CriteriaNode **children;  /* valid iff kind == CNODE_AND || CNODE_OR */
     int n_children;
+    int children_cap; /* retained allocation may exceed n_children after coalescing */
 } CriteriaNode;
 
 #define MAX_CRITERIA_DEPTH 16
@@ -468,15 +503,45 @@ typedef struct CriteriaNode {
    from their respective B+ tree lookups; duplicates are deduplicated via
    lock-free CAS inserts. Capacity is fixed at construction — callers must
    pre-size large enough to avoid hitting full (probes return failure). */
+/* Request-owned candidate memory budget for prepared bitmap find sources.
+   `limit` is fixed at creation; `used`/`peak` are the live and highest
+   simultaneous actual charges (exact allocation bytes). */
+typedef struct {
+    size_t         limit;
+    _Atomic size_t used;
+    _Atomic size_t peak;
+} KeySetBudget;
+
 typedef struct {
     uint8_t  (*keys)[16];    /* cap buckets of 16-byte xxh128 */
     uint32_t *state;          /* 0=empty, 1=filling, 2=filled */
     size_t   cap;             /* power of two */
     size_t   mask;            /* cap - 1 */
     _Atomic size_t n;         /* filled count (approximate until all threads join) */
+    KeySetBudget *budget;     /* charged budget, NULL when unbudgeted */
+    size_t   budget_charge;   /* exact bytes released by keyset_free */
 } KeySet;
 
 KeySet *keyset_new(size_t capacity_hint);
+/* Exact bytes keyset_new(hint) allocates (object + keys + state at the shared
+   capacity rule). 0, or -1 with errno EOVERFLOW. */
+int     keyset_allocation_bytes(size_t capacity_hint, size_t *out);
+/* Slot capacity keyset_new(hint) would use (shared rule; no second
+   formula). 0, or -1 with errno EOVERFLOW. */
+int     keyset_capacity_hint_slots(size_t capacity_hint, size_t *out_slots);
+/* keyset_new charged against `budget` (exact bytes, reserved before
+   allocation, rolled back on failure). NULL/ENOBUFS when it does not fit.
+   NULL budget = keyset_new. */
+KeySet *keyset_new_budgeted(size_t capacity_hint, KeySetBudget *budget);
+/* Charge / release non-KeySet candidate memory against the same budget.
+   reserve: 0, or -1/ENOBUFS without charging. NULL budget = no-op. */
+int     keyset_budget_reserve(KeySetBudget *budget, size_t bytes);
+void    keyset_budget_release(KeySetBudget *budget, size_t bytes);
+#ifdef TEST_BUILD
+/* Thread-local one-shot: the next budgeted allocation on this thread fails
+   (ENOMEM) after its reservation, exercising the rollback. */
+void    keyset_test_fail_budgeted_alloc_next(int on);
+#endif
 void    keyset_free(KeySet *ks);
 /* Returns 1 if newly inserted, 0 if duplicate, -1 if set is full. */
 int     keyset_insert(KeySet *ks, const uint8_t hash[16]);
@@ -744,6 +809,11 @@ void index_test_conf_publish_fail_stage(int stage);
 /* One-shot: the next checked reindex build fails with this errno before
    touching any index file (BTRI startup-migration failure case). */
 void index_test_fail_next_build(int en);
+/* One-shot: the next bmfix startup bitmap repair fails with this errno
+   before touching any index file (consumed only by
+   bitmap_rebuild_shards_durable; independent of the reindex-build knob
+   above). */
+void index_test_bmfix_repair_fail_next(int en);
 /* After N successful durable index mutations, make the next completed
    mutation report EIO. The mutation is intentionally performed first so
    callers can exercise partial index apply and its abort/recovery path. */
@@ -767,6 +837,12 @@ int is_excluded(const ExcludedKeys *ex, const char *key);
 void free_excluded(ExcludedKeys *ex);
 void rmrf(const char *path);
 void sort_dedup_file(const char *path);
+
+static inline int typed_json_string_type(enum FieldType t) {
+    return t == FT_VARCHAR || t == FT_SHORT || t == FT_INT ||
+           t == FT_LONG || t == FT_TIMESTAMP || t == FT_BYTE ||
+           t == FT_NUMERIC || t == FT_DOUBLE || t == FT_FLOAT;
+}
 
 /* JSON helpers */
 const char *json_skip(const char *p);
@@ -862,7 +938,8 @@ int json_get_fields_unescaped(const char *json, const char **keys, int nkeys,
 /* 1 iff the raw JSON value span is the unquoted literal null (util.c).
    Call before quote stripping — quoted "null" is a string value. */
 int json_span_is_null(const char *v, size_t len);
-/* json_get_fields + per-field unquoted-null detection + varchar unescape.
+/* json_get_fields + per-field unquoted-null detection + quoted eligible
+   string decoding (varchar and scalar numeric types).
    out_null[i] = 1 ⇔ field i's raw span was unquoted null; out[i] is then
    NULL. Same -1 contract as json_get_fields_unescaped. */
 int json_get_fields_null_aware(const char *json, const char **keys, int nkeys,
@@ -890,6 +967,51 @@ int shard_db_version_decide(const char *disk_version, int version_present,
 /* config.c */
 int load_db_root(char *out, size_t outlen);
 Schema load_schema(const char *effective_root, const char *object);
+/* Strict layout-token reader over the text after "dir:object:" of a
+   schema.conf line. *out = 1 for exactly one `layout=packed` token, else 0.
+   Returns 0 ok, -2 for any malformed/unknown/duplicate `layout` token. */
+int schema_tail_layout(const char *tail, int *out);
+/* Layout of an object from the global schema.conf. Returns 0 (*out set;
+   0 when the object has no line or the root is outside DB_ROOT), -1 when
+   schema.conf is unreadable, -2 for a malformed token. *out is 0 on error. */
+int schema_conf_layout(const char *effective_root, const char *object, int *out);
+/* Sets (packed=1) or clears (packed=0) the `layout=packed` token on the
+   object's schema.conf line, preserving every other token; checked
+   publication; -1 when the line is absent or anything fails. */
+int update_schema_conf_layout(const char *effective_root, const char *object, int packed);
+/* fields.conf legacy->packed declaration rewrite and the uncached packed
+   builder used by create-object and the startup migration. */
+int layout_packed_decl_line(const char *line, char *out, size_t cap);
+int typed_schema_build_packed(const char *const *lines, size_t nlines,
+                              TypedSchema *out, char *err, size_t errsz);
+void typed_schema_release(TypedSchema *ts);
+/* R5b packed recompose helpers (query_find.c / query_schema.c). */
+int  packed_schema_same(const PkrSchema *a, const PkrSchema *b);
+/* Packed-grammar twin of parse_field_line: "name:type[:param][:default=..]".
+   Returns 1 on a valid declaration (out->type/size/name/defaults/not_null/enum
+   filled; pf_out, when non-NULL, receives the PkrField), 0 otherwise. Caller
+   frees enum lists with free_enum_values(out). */
+int  parse_field_line_packed(const char *line, TypedField *out, PkrField *pf_out);
+/* >0 when "name:type..." is valid in the packed grammar, 0 otherwise. */
+int  validate_packed_field_type(const char *field_spec);
+/* Exact-suffix tombstone test: the loader treats only a fields.conf line that
+   ENDS in ":removed" as a tombstone; ":removed" inside a default literal is
+   data. Every remove/rename/compact/add decision must use this, never strstr. */
+int  fields_line_is_removed(const char *line);
+/* Reads fields.conf declaration lines exactly as load_typed_schema counts
+   them (blank, '#' and colon-less lines skipped). 0 ok; caller releases with
+   packed_free_decl_lines. */
+int  packed_read_decl_lines(const char *obj_dir, char ***lines_out, size_t *n_out);
+void packed_free_decl_lines(char **lines, size_t n);
+/* Startup migration of ONE legacy object to the packed layout. dry_run=1:
+   read-only audit (nothing is written). Returns 0 ok, 1 when records do not
+   fit their packed declaration (diag lists up to 8, one per line), -1 on
+   any other failure (diag has the reason). Caller holds objlock_wrlock. */
+int layout_migrate_object(const char *effective_root, const char *object,
+                          int dry_run, char *diag, size_t diagsz);
+/* No-op outside TEST_BUILD; in TEST_BUILD raises SIGKILL when the db.env
+   knob LAYOUT_MIGRATE_TEST_CRASH names this phase. */
+void layout_test_crash_point(const char *phase);
 int load_splits(const char *db_root, const char *object);
 int load_index_fields(const char *db_root, const char *object, char fields[][256], int max_fields);
 /* Companion to load_index_fields — fills `types[i]` with the IndexType for
@@ -937,6 +1059,13 @@ void free_enum_values(TypedField *f);
    max_len bytes or longer. Deliberately not getline(): no feature-macro
    regime questions on macOS. */
 char *conf_read_line(FILE *fp, size_t max_len, int *err);
+char *typed_decode_bounded_size(const TypedSchema *ts,const uint8_t *data,int len,
+    uint8_t hdr2,size_t budget,size_t *allocated);
+char *typed_decode_bounded(const TypedSchema *ts,const uint8_t *data,int len,
+    uint8_t hdr2,size_t budget);
+int parse_default_modifier(char *type_spec_inout,TypedField *tf);
+int parse_default_modifier_checked(char *type_spec_inout,TypedField *tf);
+char *generate_default_owned(const TypedField *tf,const char *root,const char *object,size_t budget);
 
 /* True when the spec's ":default=" tail exceeds TypedField.default_val's
    255-byte capacity. parse_default_modifier would silently truncate such
@@ -952,9 +1081,10 @@ void build_effective_root(char *out, size_t outlen, const char *dir);
 TypedSchema *load_typed_schema(const char *db_root, const char *object);
 /* Encode without defaults. Returns ts->total_size on success, -1 on
    bad args, or -2 when a :not_null field would produce NULL (explicit
-   JSON null or an unparseable uuid/ipv4/ipv6 sentinel) — no err_buf
-   channel on this encoder. */
-int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out, int out_size);
+   JSON null or an unparseable uuid/ipv4/ipv6 sentinel. On -1/-2 the
+   err_buf channel carries the validation message. */
+int typed_encode(const TypedSchema *ts, const char *json, uint8_t *out,
+                 int out_size, char *err_buf, size_t err_buf_size);
 
 /* Canonical ":not_null" rejection text — one source so wire errors,
    bulk skip-log lines, and the error-code docs stay identical. */
@@ -972,11 +1102,12 @@ size_t schema_trim_fn(const void *val, size_t vlen, void *ctx);
 
 char *typed_decode(const TypedSchema *ts, const uint8_t *data, int data_len,
                    uint8_t hdr2);
-/* Stream variant — writes the JSON object directly to `out` without
-   allocating an intermediate string. Use on the GET hot path; saves one
-   malloc + one memcpy per response vs. typed_decode + OUT("%s\n").
-   Returns 0 on success, -1 (errno=EILSEQ) on a corrupt flagged record —
-   callers must fail the request, never emit a partial object. */
+/* Checked FILE variant. Builds the complete JSON string before
+   emitting bytes, so validation/render/allocation failures leave out untouched.
+   Adds one owned whole-response buffer on the GET path; no schema-max arena.
+   Returns 0 after fwrite accepts all bytes, -1 with errno on failure. FILE I/O
+   errors may have emitted a prefix: callers must not append a replacement JSON
+   error when ferror(out) is set. Does not flush, close or own the FILE. */
 int   typed_decode_stream(const TypedSchema *ts, const uint8_t *data,
                           int data_len, FILE *out, uint8_t hdr2);
 /* data_len is the number of valid bytes in data (may be < ts->total_size for
@@ -985,6 +1116,26 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
                            int data_len, int field_idx, uint8_t hdr2);
 extern const uint8_t g_zero_field_65537[65537];
 void encode_field(const TypedField *f, const char *val, uint8_t *out);
+/* Checked conversion boundary: returns 0 on success, -1 on
+   validation failure with a field-specific message in err (if non-NULL).
+   `out` is only written on success. Outer ASCII whitespace is stripped
+   for the scalar numeric types only; varchar/enum are byte-exact. */
+int encode_field_checked(const TypedField *f, const char *val, size_t vlen,
+                         uint8_t *out, char *err, size_t errsz);
+/* 1 iff f is a uuid field and v is a valid uuid literal (including the
+   brace-wrapped form). Used to exempt such values from the "starts with
+   '{' ⇒ computed-update object" gate. */
+int value_is_braced_uuid(const TypedField *f, const char *v, size_t n);
+/* Truth value of an already-validated bool literal (grammar: sg_bool);
+   0 for anything the grammar rejects. */
+uint8_t scalar_bool_value(const char *s);
+/* Exact decimal text -> scaled int64 for the field's declared scale,
+   ties away from zero, with identical rounding for writes and criteria.
+   0 = ok, -1 = invalid,
+   -2 = out of range. */
+int conv_numeric_text(const TypedField *f, const char *val, size_t vlen,
+                      int64_t *out, char *err, size_t errsz);
+const char *typed_type_name(enum FieldType t);
 void encode_field_len(const TypedField *f, const char *val, size_t vlen, uint8_t *out);
 /* Produce the "now" string for an auto_create / auto_update timestamp field
    in the form its type expects (buf must be >= 24 bytes). Shared between
@@ -998,12 +1149,20 @@ void auto_now_str(const TypedField *f, char *buf, size_t bufsz);
    flip all bits). Varchar/byte/bool/composite are raw bytes, no flip.
    Output length returned via *out_len — callers must reserve at least
    f->size bytes (varchar: up to vlen bytes, no 2-byte length prefix). */
-void encode_field_for_index(const TypedField *f, const char *val, size_t vlen,
+/* Internal typed-text lookup encoder. FT_LONG/TIMESTAMP/INT/SHORT/BYTE/
+   DOUBLE/FLOAT require a complete C string: val[vlen] is a readable NUL.
+   Numeric uses its existing exact length-aware converter; other type
+   grammars retain their prior span semantics.
+   Varchar remains an explicit binary span; embedded NUL bytes are valid.
+   Scalar conversion is allocation-free; callers never receive a zero key
+   merely because an allocation failed. Raw/mmap scalar spans need a
+   separate checked adapter, not this text-only interface. */
+void encode_field_text_for_index(const TypedField *f, const char *val, size_t vlen,
                             uint8_t *out, size_t *out_len);
 
 /* Typed-binary → index-key encoder. Reads field bytes from a typed record
    (at the field's fixed offset) and emits the same memcmp-sortable bytes
-   that encode_field_for_index would produce for the equivalent text input.
+   that encode_field_text_for_index would produce for the equivalent text input.
    Used by index scan paths that already hold typed binary records and want
    to skip the typed→ASCII→index-bytes roundtrip. */
 void typed_field_to_index_key(const TypedSchema *ts, const uint8_t *data,
@@ -1032,7 +1191,7 @@ int build_index_key_from_record(const TypedSchema *ts, const uint8_t *record,
 
 /* Build an index key from a JSON object for a (possibly composite) spec.
    Extracts the necessary fields from json, then encodes:
-     single-field → encode_field_for_index (binary),
+     single-field → encode_field_text_for_index (binary),
       composite    → typed binary concatenation.
    Returns 1 on success with malloc'd *out_val and *out_len set; caller
    frees. ts may be NULL (untyped object) — in that case every field is
@@ -1165,7 +1324,7 @@ char parse_csv_delim(const char *s);
 int cmd_not_exists(const char *db_root, const char *object, const char *keys_json);
 
 /* index.c */
-/* Value is raw index-key bytes (see encode_field_for_index /
+/* Value is raw index-key bytes (see encode_field_text_for_index /
    typed_field_to_index_key). Composite indexes pass the typed binary
    concatenated sub-field index keys; single-field indexes pass encoded
    bytes + their true length. vlen may be 0 (empty key sorts before all others). */
@@ -1284,6 +1443,13 @@ int reindex_object_checked_ex(const char *eff_root, const char *object,
 int reindex_object_durable_checked_ex(const char *eff_root, const char *object,
                                       int composites_only, int *out_count,
                                       int *out_errno);
+/* Rebuild ONLY the selected shards' bitmaps for every bitmap field
+   (bmfix startup repair + cmd_reindex's healing path). only_shards is
+   NULL (all shards) or splits bytes with nonzero = rebuild that shard.
+   Caller holds objlock_wrlock. 0 on success (or no bitmap fields);
+   -1 with *out_errno on failure, durability-unconfirmed included. */
+int bitmap_rebuild_shards_durable(const char *eff_root, const char *object,
+                                  const uint8_t *only_shards, int *out_errno);
 int cmd_remove_index(const char *db_root, const char *object, const char *field);
 int cmd_remove_indexes(const char *db_root, const char *object, const char *fields_json);
 
@@ -1314,6 +1480,11 @@ char *json_projected_field(const char *raw, size_t raw_len, const char *field,
 char *json_typed_row_cell(const TypedSchema *ts, const uint8_t *raw,
                           int raw_len, int idx, uint8_t hdr2);
 char *json_escape_const(const char *v);
+/* Echo caller-supplied text inside a hand-built {"error":"..."} line with JSON
+   escaping (quotes, backslashes, control characters). FMT must contain exactly
+   one %s. */
+#define OUT_ERR_ESC(FMT, SRC) do { char *_esc = json_escape_const(SRC); \
+    OUT(FMT, _esc ? _esc : "?"); free(_esc); } while (0)
 
 /* Typed-binary fast path: compile criteria against a TypedSchema once, then
    call match_typed() per record during scan. Composite/unknown fields fall
@@ -1497,7 +1668,7 @@ int cmd_list_files(const char *db_root, const char *object,
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
-                      const char *auto_key_spec);
+                      const char *auto_key_spec, int packed);
 /* Drops an object entirely: data, metadata, indexes, fields.conf, indexes/,
    counts, and the schema.conf line. Invalidates caches. if_exists=1 makes
    the call idempotent (no-op if the object is already gone). */
@@ -1575,6 +1746,9 @@ RebuildTxn *rebuild_txn_begin(const char *db_root, const char *object,
                               int old_splits, int old_streams,
                               int indexes_may_change);
 const char *rebuild_txn_legacy_root(const RebuildTxn *txn);
+/* Record (durably) that index files are about to be rewritten, so abort and
+   recovery reindex against the restored keyfile. Idempotent. 0 ok, -1 failed. */
+int rebuild_txn_set_indexes_may_change(RebuildTxn *txn);
 int rebuild_txn_commit(RebuildTxn *txn);
 int rebuild_txn_abort(RebuildTxn *txn);
 void rebuild_txn_cleanup_committed(RebuildTxn *txn);
@@ -1607,6 +1781,10 @@ void free_criteria_tree(CriteriaNode *root);
 /* Pre-compile every leaf in the tree against the schema so match_typed() has
    zero-malloc-per-record cost during scans. Safe to call multiple times — leaves
    already compiled are skipped. */
+int compile_one_checked(CompiledCriterion*, const SearchCriterion*, const TypedSchema*, char*, size_t);
+int compile_criteria_tree_checked(CriteriaNode*, const TypedSchema*, char*, size_t);
+int match_typed_checked(const uint8_t*, size_t, const CompiledCriterion*, FieldSchema*, uint8_t, int*);
+int criteria_match_tree_checked(const uint8_t*, size_t, const CriteriaNode*, FieldSchema*, uint8_t, int*);
 void compile_criteria_tree(CriteriaNode *root, const TypedSchema *ts);
 
 /* Recursive match: AND short-circuits on first false, OR on first true. Passing
@@ -1828,6 +2006,25 @@ typedef struct {
 
 int  bitmap_prepare_window_init(BitmapPrepareWindow *win, size_t max_fields,
                                 size_t max_records);
+
+/* One window entry per bitmap field, preopened before any record is
+   processed. */
+typedef struct {
+    const char *field;        /* borrowed; lives for the call */
+    int         bool_fastpath; /* schema-derived: field type == FT_BOOL */
+} BitmapPreopenField;
+/* Open every bitmap (field, kf_shard) handle the bulk window can touch, in
+   the canonical lock order (ascending <field>/NNN.bm, bm_field_lock_cmp) —
+   the same order bm_open_many_ro, the keyfile-rebuild remap and the
+   single-insert staging use. After this returns 0, no window path takes a
+   bitmap writer lock in any other order: add() only looks entries up, and
+   apply() reopens parked handles in entry order. Untouched fields keep a
+   valid empty .bm file (the same artifact set a reindex produces).
+   Returns 0, or -2 with every handle released (err_field filled with the
+   failing field). */
+int  bitmap_prepare_window_preopen(BitmapPrepareWindow *win, int kf_shard,
+                                   const BitmapPreopenField *fields, size_t n,
+                                   char *err_field, size_t err_field_len);
 /* Stages one record's bitmap mutation for `arg->field` at `arg->kf_shard`.
    Returns 0 (staged), 1 (this record would exceed the field's cap — the
    caller marks only this record rejected and does NOT call add() again

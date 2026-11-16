@@ -108,14 +108,14 @@ esac
 #        shrinks the binary by eliminating dead code visible only across files).
 # strip: remove symbol/debug tables from the shipped binary (~25K cut). Skipped
 #        for sanitizer/debug builds — symbols are needed for readable stack traces.
-gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/durability.c src/db/durability_epoch.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/type_desc.c src/db/nql.c src/db/embedded.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+gcc $MODE_CFLAGS -o shard-db src/db/util.c src/db/durability.c src/db/durability_epoch.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/decnum.c src/db/decimal_order.c src/db/agg_exact.c src/db/scalar_grammar.c src/db/typed_index.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c src/db/type_desc.c src/db/nql.c src/db/embedded.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db
 
 # libshard-db.a — embedded mode static library (all daemon sources except main.c)
 LIB_SRCS="src/db/util.c src/db/durability.c src/db/durability_epoch.c src/db/parallel.c src/db/storage.c src/db/index.c \
           src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c \
           src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c \
-          src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/config.c src/db/type_desc.c \
+          src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/config.c src/db/decnum.c src/db/decimal_order.c src/db/agg_exact.c src/db/scalar_grammar.c src/db/typed_index.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c src/db/type_desc.c \
           src/db/nql.c src/db/embedded.c"
 LIB_OBJS=""
 mkdir -p build/bin build/obj
@@ -158,7 +158,7 @@ gcc $MODE_CFLAGS -o shard-cli src/cli/main.c src/cli/widgets.c src/cli/views.c s
 # TCP cases reach the deterministic seam; the production shard-db binary and
 # its flags are never built from TEST_BUILD.
 gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test-server \
-    src/db/util.c src/db/durability.c src/db/durability_epoch.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/type_desc.c src/db/nql.c src/db/embedded.c src/db/test_control.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
+    src/db/util.c src/db/durability.c src/db/durability_epoch.c src/db/parallel.c src/db/storage.c src/db/index.c src/db/keyset.c src/db/btree.c src/db/bitmap.c src/db/trigram.c src/db/objlock.c src/db/tls.c src/db/slotcask.c src/db/simd.c src/db/io_direct.c src/db/query.c src/db/query_aggregate.c src/db/query_join.c src/db/query_plan.c src/db/query_maint.c src/db/query_schema.c src/db/query_bulk.c src/db/query_find.c src/db/server.c src/db/main.c src/db/config.c src/db/decnum.c src/db/decimal_order.c src/db/agg_exact.c src/db/scalar_grammar.c src/db/typed_index.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c src/db/type_desc.c src/db/nql.c src/db/embedded.c src/db/test_control.c -Isrc/db $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-test-server
 
 # shard-db-test — TAP-style C test runner. Links daemon's JSON helpers
@@ -167,6 +167,9 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test-server \
 # under src/test/cases/ get listed here.
 gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/shard-db-test.c \
+    src/db/decnum.c src/db/decimal_order.c src/db/agg_exact.c src/db/scalar_grammar.c src/db/typed_index.c \
+    src/db/packed_record.c \
+    src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c \
     src/test/test_client.c \
     src/test/test_runner.c \
     src/test/fixtures.c \
@@ -176,6 +179,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_crash_safety.c \
     src/test/cases/test_rename_field.c \
     src/test/cases/test_edit_field.c \
+    src/test/cases/test_packed_recompose.c \
+    src/test/cases/test_legacy_recompose.c \
     src/test/cases/test_edit_field_polish.c \
     src/test/cases/test_add_field_computed_defaults.c \
     src/test/cases/test_auto_key.c \
@@ -192,6 +197,12 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_list_files.c \
     src/test/cases/test_bulk_update_json.c \
     src/test/cases/test_bulk_update_json_oom.c \
+    src/test/cases/test_alloc_error_propagation.c \
+    src/test/cases/test_indexed_zero_exists.c \
+    src/test/cases/test_agg_exact_routes.c \
+    src/test/cases/test_agg_empty_avg_order.c \
+    src/test/cases/test_agg_ht_resize.c \
+    src/test/cases/test_agg_packed_routes.c \
     src/test/cases/test_bulk_update_delimited.c \
     src/test/cases/test_remove_field.c \
     src/test/cases/test_length_ops.c \
@@ -269,6 +280,9 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_durability_sync_cache_paths.c \
     src/test/cases/test_embedded_bg_threads.c \
     src/test/cases/test_read_objlock_contention.c \
+    src/test/cases/test_backup_objlock.c \
+    src/test/cases/test_backup_files.c \
+    src/test/cases/test_restore_tokens.c \
     src/test/cases/test_shard_stats_hint.c \
     src/test/cases/test_startup_validator.c \
     src/test/cases/test_index_splits_curve.c \
@@ -343,13 +357,49 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_kf_uncapped_growth.c \
     src/test/cases/test_trigram_index.c \
     src/test/cases/test_config_encode.c \
+    src/test/cases/test_scalar_conversion_safety.c \
+    src/test/cases/test_type_correctness_acceptance.c \
+    src/test/cases/test_finance_routes.c \
+    src/test/cases/test_predicate_equivalence.c \
+    src/test/cases/test_bulk_stage_ungrown.c \
+    src/test/cases/test_bulk_chain_pregrow.c \
+    src/test/cases/test_bulk_res_count.c \
+    src/test/cases/test_bitmap_window_order.c \
+    src/test/cases/test_bitmap_window_duplicates.c \
+    src/test/cases/test_bitmap_resplit.c \
+    src/test/cases/test_bitmap_cache_lock_errors.c \
+    src/test/cases/test_bitmap_open_failures.c \
+    src/test/cases/test_bulk_chain_bitmap_path.c \
+    src/test/cases/test_scalar_routes_checked.c \
+    src/test/cases/test_scalar_csv_update.c \
+    src/test/cases/test_scalar_grammar_routes.c \
+    src/test/cases/test_decnum_core.c \
+    src/test/cases/test_scalar_grammar_core.c \
+    src/test/cases/test_layout_manifest.c \
+    src/test/cases/test_decimal_order_decode.c \
+    src/test/cases/test_agg_exact_core.c \
+    src/test/cases/test_packed_record_codec.c \
+    src/test/cases/test_packed_record_storage.c \
+    src/test/cases/test_typed_row_adapter.c \
+    src/test/cases/test_owning_write_hooks.c \
+    src/test/cases/test_single_write_integration.c \
+    src/test/cases/test_typed_bulk_insert.c \
+    src/test/cases/test_typed_bulk_update.c \
+    src/test/cases/test_whole_record_readers.c \
+    src/test/cases/test_packed_json_projection.c \
+    src/test/cases/test_packed_named_projection.c \
+    src/test/cases/test_packed_csv.c \
+    src/test/cases/test_packed_csv_commands.c \
+    src/test/cases/test_r1_routes.c src/test/cases/test_r2_predicate_verification.c \
     src/test/cases/test_version_gate.c \
+    src/test/cases/test_version_gate_2026_11.c \
     src/test/cases/test_datetime_evening.c \
     src/test/cases/test_error_paths.c \
     src/test/cases/test_explain.c \
     src/test/cases/test_dispatch_leak_paths.c \
     src/test/cases/test_removed_storage_surfaces.c \
     src/test/cases/test_keyset.c \
+    src/test/cases/test_kef_batches.c \
     src/test/cases/test_objlock_dynamic_growth.c \
     src/test/cases/test_objlock_unit.c \
     src/test/cases/test_query_plan_in_oom.c \
@@ -368,6 +418,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_nql_joins.c \
     src/test/cases/test_util.c \
     src/test/cases/test_agg_topn_stream.c \
+    src/test/cases/test_agg_topn_exact.c \
     src/test/cases/test_find_orderby_selective.c \
     src/test/cases/test_planner_trigram_selectivity.c \
     src/test/cases/test_cardinality_estimate.c \
@@ -436,6 +487,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_bt_kf_inversion_stream_find.c \
     src/test/cases/test_stream_find_chunk_resume.c \
     src/test/cases/test_shard_count_nested_kf_read.c \
+    src/test/cases/test_count_bitmap_bulk_lock_order.c \
     src/test/cases/test_bitmap_stream_find_flush_gate.c \
     src/db/util.c \
     src/db/durability.c \
@@ -518,7 +570,7 @@ gcc $MODE_CFLAGS -o shard-db-bench \
     src/db/query_bulk.c \
     src/db/query_find.c \
     src/db/server.c \
-    src/db/config.c \
+    src/db/config.c src/db/decnum.c src/db/decimal_order.c src/db/agg_exact.c src/db/scalar_grammar.c src/db/typed_index.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c \
     src/db/type_desc.c \
     src/db/embedded.c \
     src/db/nql.c \

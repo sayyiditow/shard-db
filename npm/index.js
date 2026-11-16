@@ -29,5 +29,6 @@ class ShardDb {
   }
 }
 
+ShardDb.decodeCsvCellBytes = require('./csv-bytes')
 ShardDb.LOG_TYPES = LOG_TYPES
 module.exports = ShardDb

@@ -142,6 +142,22 @@ let db
   const agg = JSON.parse(await db.query({ mode: 'aggregate', dir: 'test', object: 'scores', aggregates: [{ fn: 'sum', field: 'score', alias: 'total' }] }))
   assert(agg && agg.total === 60, 'aggregate sum returns correct total')
 
+  // 17b. raw JSON carries integer lexemes that JS Number cannot represent.
+  const exactObj = 'r3_exact_aggregate'
+  try {
+    const created = await db.query({ mode: 'create-object', dir: 'test', object: exactObj,
+      splits: 8, max_key: 16, fields: ['score:long'] })
+    assert(!created.includes('"error"'), 'exact aggregate fixture created')
+    const inserted = await db.query(`{"mode":"bulk-insert","dir":"test","object":"${exactObj}","records":[{"key":"b1","value":{"score":9007199254740993}},{"key":"b2","value":{"score":9007199254740993}}]}`)
+    assert(!inserted.includes('"error"'), 'exact integer rows inserted')
+    const rawAgg = await db.query({ mode: 'aggregate', dir: 'test', object: exactObj,
+      aggregates: [{ fn: 'sum', field: 'score', alias: 'total' }] })
+    assert(rawAgg.trim() === '{"total":18014398509481986}',
+      'aggregate sum keeps the exact lexeme above 2^53 (no JSON.parse)')
+  } finally {
+    await db.query({ mode: 'drop-object', dir: 'test', object: exactObj })
+  }
+
   // 18. list-objects
   const objs = JSON.parse(await db.query({ mode: 'list-objects', dir: 'test' }))
   assert(Array.isArray(objs.objects) && objs.objects.includes('items'), 'list-objects includes items')

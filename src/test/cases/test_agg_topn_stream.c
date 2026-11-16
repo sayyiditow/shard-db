@@ -599,36 +599,34 @@ static int test_topn_stream_bitmap_postfilter_bounded(void) {
         "\"indexes\":[\"name\",\"active:bitmap\"]}", &resp);
     free(resp); resp = NULL;
 
-    /* 40000 active=true + 5000 active=false, all in group g0. */
-    const int N_TRUE = 40000, N_FALSE = 5000;
-    size_t body_cap = 1 << 22; /* 4 MB */
+    /* 40000 active=true + 5000 active=false, all in group g0. Inserted in
+     * 1000-row chunks: packed bulk charges the whole request body against
+     * QUERY_BUFFER_MB (pinned to 1 here), so one 1.8MB body cannot fit. */
+    const int N_TRUE = 40000, N_FALSE = 5000, CHUNK = 1000;
+    size_t body_cap = 1 << 20; /* 1 MB: one chunk is ~44KB */
     char *body = malloc(body_cap);
-    size_t p = 0;
-    SB_APPEND(body, p, body_cap, "{");
-    int next = 0;
-    for (int i = 0; i < N_TRUE; i++) {
-        SB_APPEND(body, p, body_cap,
-                  "%s\"k%d\":{\"name\":\"g0\",\"active\":true}",
-                  next == 0 ? "" : ",", next);
-        next++;
-    }
-    for (int i = 0; i < N_FALSE; i++) {
-        SB_APPEND(body, p, body_cap,
-                  ",\"k%d\":{\"name\":\"g0\",\"active\":false}", next);
-        next++;
-    }
-    SB_APPEND(body, p, body_cap, "}");
-    ASSERT_TRUE(p < body_cap, "bulk body fit in buffer");
-
     size_t req_cap = body_cap + 1024;
     char *req = malloc(req_cap);
-    snprintf(req, req_cap,
-        "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"topn_bmpf\","
-        "\"records\":%s}", body);
-    tc_request(tc, req, &resp);
-    ASSERT_TRUE(resp && !strstr(resp, "\"error\""),
-                "45k-row bitmap fixture bulk insert succeeds");
-    free(req); free(body); free(resp); resp = NULL;
+    int bulk_ok = 1;
+    for (int base = 0; base < N_TRUE + N_FALSE; base += CHUNK) {
+        size_t p = 0;
+        SB_APPEND(body, p, body_cap, "{");
+        for (int i = base; i < base + CHUNK; i++) {
+            SB_APPEND(body, p, body_cap,
+                      "%s\"k%d\":{\"name\":\"g0\",\"active\":%s}",
+                      i == base ? "" : ",", i, i < N_TRUE ? "true" : "false");
+        }
+        SB_APPEND(body, p, body_cap, "}");
+        ASSERT_TRUE(p < body_cap, "bulk chunk fit in buffer");
+        snprintf(req, req_cap,
+            "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"topn_bmpf\","
+            "\"records\":%s}", body);
+        tc_request(tc, req, &resp);
+        if (!resp || strstr(resp, "\"error\"")) bulk_ok = 0;
+        free(resp); resp = NULL;
+    }
+    ASSERT_TRUE(bulk_ok, "45k-row bitmap fixture bulk insert succeeds");
+    free(req); free(body);
 
     /* group_by name, count, criteria active=true, top 5. */
     tc_request(tc,
@@ -640,6 +638,7 @@ static int test_topn_stream_bitmap_postfilter_bounded(void) {
     ASSERT_TRUE(resp != NULL, "bitmap-criteria aggregate response");
     if (!resp) { tc_close(tc); test_env_stop(&env); return 1; }
 
+    if (!SAFE_STRSTR(resp, "\"n\":40000")) TAP_DIAG("# bitmap-postfilter response: %.400s\n", resp ? resp : "(null)");
     ASSERT_TRUE(SAFE_STRSTR(resp, "\"n\":40000") != NULL,
                 "g0 count is the FILTERED active=true count (40000)");
     ASSERT_TRUE(SAFE_STRSTR(resp, "\"n\":45000") == NULL,

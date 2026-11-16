@@ -60,7 +60,7 @@ static int test_slotcask_v2_bulk_run(void) {
 
     /* v2 object */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"bulk2\",\"object\":\"orders\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"bulk2\",\"object\":\"orders\","
         "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"status:varchar:16\",\"amount:int\",\"region:varchar:16\","
                     "\"note:varchar:32\"],"

@@ -42,7 +42,7 @@ Human-readable block with the same numbers. Use `format:"table"` from the CLI; J
 
 - **`ucache` hit rate** — kept in the export for back-compat; idle on a slotcask install. Reads route through `kfcache` + `segcache` (under the same `FCACHE_MAX` budget) which aren't surfaced as separate JSON fields yet. Watch `bt_cache` instead.
 - **`bt_cache` hit rate** — below 90% for indexed queries = `FCACHE_MAX` too low (raises bt_cache too, since it's derived). The universal read-cache metric.
-- **`in_flight_writes`** — should drain quickly. Sustained high = bottleneck (disk, lock contention).
+- **`in_flight_writes`** — should drain quickly. Sustained high = bottleneck (disk, lock contention). A running `backup` counts.
 - **`slow_queries` ring** — the last 64 queries exceeding `SLOW_QUERY_MS`. See also `slow-*.log` for history.
 - **`commit.lock_hold_us_avg` / `sync_us_avg`** — rising average = growing contention or a slower disk under the kf writer lock. `sync_us_avg` isolates the marker-fsync/targeted-sync cost specifically; if it dominates `lock_hold_us_avg`, the bottleneck is fsync latency, not lock contention.
 - **`marker_recovery_ran`** — `1` after a crash-recovered startup; correlate with logs around that restart to confirm what was replayed.

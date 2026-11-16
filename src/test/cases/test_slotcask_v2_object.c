@@ -75,10 +75,10 @@ static int test_slotcask_v2_object_run(void) {
     char *line = read_schema_line(env.db_root, "v2tenant", "sc_users");
     ASSERT_NOT_NULL(line, "v2 schema.conf line present");
     if (line) {
-        /* Count the colons — must be at least 5 (dir:obj:splits:max_key:sv:streams). */
+        /* Count the colons — 6: dir:obj:splits:max_key:sv:streams:layout=packed. */
         int colons = 0;
         for (char *c = line; *c; c++) if (*c == ':') colons++;
-        ASSERT_TRUE(colons == 5, "schema line has 5 colons (extended form)");
+        ASSERT_TRUE(colons == 6, "schema line has 6 colons (extended form + layout token)");
         free(line);
     }
 
@@ -115,7 +115,7 @@ static int test_slotcask_v2_object_run(void) {
     if (line) {
         int colons = 0;
         for (char *c = line; *c; c++) if (*c == ':') colons++;
-        ASSERT_TRUE(colons == 5, "default schema line has 5 colons (v2 form)");
+        ASSERT_TRUE(colons == 6, "default schema line has 6 colons (v2 form + layout token)");
         free(line);
     }
 
