@@ -855,17 +855,26 @@ static int dec_coeff_digit(const dec_t *d, long long e) {
     return (v / DEC_POW10[3 - idx]) % 10;
 }
 
-size_t dec_payload_len(const dec_t *d) {
+/* Coefficient digit count clamped to [0, DEC_MAX_LIMBS_ALLOC * 4]: a
+   normalised value is inside that range, and the explicit two-sided bound
+   keeps the (nd + 1) / 2 payload arithmetic provably overflow-free. */
+static long long dec_payload_digits(const dec_t *d) {
     long long nd = d->ndigits == 0 ? 0 : dec_coeff_digits(d);
-    if (nd < 0) nd = 0;   /* a normalised value has >= 0 coefficient digits */
+    const long long max_nd = (long long)DEC_MAX_LIMBS_ALLOC * DEC_LIMB_DIGITS;
+    if (nd < 0) nd = 0;
+    if (nd > max_nd) nd = max_nd;
+    return nd;
+}
+
+size_t dec_payload_len(const dec_t *d) {
+    long long nd = dec_payload_digits(d);
     return DEC_PAYLOAD_HEADER + (size_t)((nd + 1) / 2);
 }
 
 dec_status dec_pack(const dec_t *d, uint8_t *out, size_t cap,
                     size_t *out_len) {
     if (!d || !out || !out_len) return DEC_ERR_INVALID;
-    long long nd = d->ndigits == 0 ? 0 : dec_coeff_digits(d);
-    if (nd < 0) nd = 0;   /* a normalised value has >= 0 coefficient digits */
+    long long nd = dec_payload_digits(d);
     size_t need = DEC_PAYLOAD_HEADER + (size_t)((nd + 1) / 2);
     if (cap < need) return DEC_ERR_TRUNCATED;
     memset(out, 0, need);

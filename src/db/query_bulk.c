@@ -5792,6 +5792,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         compute_hash_raw(key, klen, r->hash);
         r->shard_id = compute_record_shard(r->hash, sch.splits);
         r->start_slot = 0;
+        r->mutation_error = 0;   /* records[] is malloc'd; copied into workers below */
         r->if_present = 0;
         r->if_tree = NULL;
 
@@ -5986,7 +5987,6 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         for (int gi = 0; gi < nshard_groups; gi++) {
             if (workers[gi].shard_id == records[i].shard_id) {
                 workers[gi].recs[workers[gi].count++] = records[i];
-                workers[gi].recs[workers[gi].count - 1].mutation_error = 0;   /* records[] is malloc'd; the parse phase never sets it */
                 break;
             }
         }

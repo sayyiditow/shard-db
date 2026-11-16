@@ -340,7 +340,13 @@ int resolve_join_record(const JoinSpec *j,const char *root,
         if(next_r&&!j->remote_fs.ts->packed.nfields&&j->remote_fs.ts->fields[ri].type==FT_VARCHAR)ambiguous=1;
         key[used++]=0;
         if(escape){
-            for(size_t i=0;i<n;i++){key[used++]=(uint8_t)text[i];if(!text[i])key[used++]=255;}
+            for(size_t i=0;i<n;i++){
+                /* Each iteration writes at most 2 bytes; the pre-check above
+                   already guarantees room, this keeps the bound local. */
+                if(used+2>sizeof(key)){free(text);return 0;}
+                key[used++]=(uint8_t)text[i];if(!text[i])key[used++]=255;
+            }
+            if(used+2>sizeof(key)){free(text);return 0;}
             key[used++]=0;key[used++]=0;
         }else{
             size_t written=0;
