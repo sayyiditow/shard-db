@@ -540,10 +540,10 @@ int typed_bulk_update_source(const char *root,const char *object,
     data=malloc(len+1);if(!data){saved=ENOMEM;goto failed;}
     size_t at=0;
     while(at<len){
-        size_t want=len-at;if(want>(size_t)SSIZE_MAX)want=(size_t)SSIZE_MAX;
+        size_t want=len-at;if(want>((size_t)1<<30))want=(size_t)1<<30;   /* bounded read chunks */
         ssize_t n=read(fd,data+at,want);
         if(n<0&&errno==EINTR)continue;
-        if(n<=0){saved=n<0?errno:EIO;goto failed;}at+=(size_t)n;
+        if(n<=0||(size_t)n>want){saved=n<0?errno:EIO;goto failed;}at+=(size_t)n;   /* read() never returns more than asked; reject a lying return */
     }
     if(close(fd)){fd=-1;goto failed;}fd=-1;data[len]=0;
     int rc=typed_bulk_update_command(root,object,sc,ts,borrowed,data,len,0,0);

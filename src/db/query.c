@@ -590,11 +590,12 @@ static int bitmap_text_key_alloc(const TypedSchema *ts,const TypedField *tf,
     int rc=tf?typed_index_text_key_into(ts,(size_t)field,text,text_len,NULL,0,&need):1;
     if(rc!=1)return rc;
     if(need>UINT16_MAX||need>budget){errno=ENOBUFS;return -1;}
-    uint8_t *buf=malloc(need?need:1);
+    uint8_t *buf=malloc(need+1);   /* +1: the key is binary, but keep a terminating NUL for any string-style consumer */
     if(!buf){errno=ENOMEM;return -1;}
     if(tf)rc=typed_index_text_key_into(ts,(size_t)field,text,text_len,buf,need,&need);
     else if(need)memcpy(buf,text,need);
     if(rc!=1){free(buf);return rc;}
+    buf[need]=0;
     *out=buf;*len=need;return 1;
 }
 static int bitmap_literal_fits(const TypedSchema *ts,const SearchCriterion *c,size_t cap){
@@ -917,7 +918,7 @@ int btree_dispatch_schema_checked(const TypedSchema *literal_schema,const char *
                 .shard_idx = s, .crit = pc, .tf = tf,
                 .cb = cb, .ctx = ctx, .sdb = sdb, .stop_flag = &stop_flag,
                 .schema = literal_schema,
-                .budget = g_query_buffer_max_bytes / (size_t)(splits > 0 ? splits : 1)
+                .budget = g_query_buffer_max_bytes / (size_t)splits  /* loop body: splits > 0 */
             };
         }
         parallel_for_io(bm_generic_shard_worker, gargs, splits, sizeof(BmGenericShardArg));
@@ -2018,7 +2019,7 @@ static int stream_find_record_cb(const uint8_t hash16[16],
 
     int matched=0;
     if(criteria_match_tree_checked(value,vlen,sc->tree,sc->fs,hdr2,&matched)){
-        pthread_mutex_lock(&sc->lock);sc->predicate_error=errno?errno:EILSEQ;pthread_mutex_unlock(&sc->lock);return 1;}
+        pthread_mutex_lock(&sc->lock);__atomic_store_n(&sc->predicate_error,errno?errno:EILSEQ,__ATOMIC_RELAXED);pthread_mutex_unlock(&sc->lock);return 1;}
     if(!matched)return 0;
 
     pthread_mutex_lock(&sc->lock);
@@ -2029,7 +2030,7 @@ static int stream_find_record_cb(const uint8_t hash16[16],
         if(typed_query_emit_row(g_out?g_out:stdout,keybuf,strlen(keybuf),value,vlen,hdr2,sc->fs,
             sc->proj_fields,sc->proj_count,sc->rows_fmt,sc->dict_fmt,sc->csv_delim,sc->printed>0,
             NULL,0,NULL,g_query_buffer_max_bytes)){
-            sc->predicate_error=errno?errno:EILSEQ;
+            __atomic_store_n(&sc->predicate_error,errno?errno:EILSEQ,__ATOMIC_RELAXED);
             pthread_mutex_unlock(&sc->lock);return 1;
         }
         sc->printed++;
@@ -2462,7 +2463,7 @@ typedef struct {
 static int prepared_stream_iter_cb(const uint8_t hash[16], void *raw) {
     PreparedStreamIter *it = (PreparedStreamIter *)raw;
     StreamFindCtx *sc = it->sc;
-    if (__atomic_load_n(&sc->stop, __ATOMIC_ACQUIRE) || sc->predicate_error)
+    if (__atomic_load_n(&sc->stop, __ATOMIC_ACQUIRE) || __atomic_load_n(&sc->predicate_error, __ATOMIC_RELAXED))
         return 1;
     if (prepared_deadline_expired(it->dl)) return 1;
 #ifdef TEST_BUILD
@@ -4450,7 +4451,7 @@ static KeySet *build_keyset_from_bitmap(const char *db_root, const char *object,
                                            (SearchCriterion *)leaf, tf,
                                            bm_ks_insert_cb, &kec, sdb_g,
                                            literal_schema,
-                                           g_query_buffer_max_bytes / (size_t)(splits > 0 ? splits : 1)) < 0) {
+                                           g_query_buffer_max_bytes / (size_t)splits) < 0) {   /* loop body: splits > 0 */
                 int saved = errno;
                 keyset_free(ks_g);
                 return bm_build_fail(out, CBF_HARD, saved);
@@ -7424,7 +7425,7 @@ size_t idx_count_for_leaf_ck(const char *db_root, const char *object,
         col.check_primary = op_needs_check_primary(leaf->op);
         col.deadline = dl;
         col.tf = tf;
-        if(btree_dispatch_schema_checked(fs?fs->ts:NULL,db_root, object, leaf->field, sch->splits,
+        if(btree_dispatch_schema_checked(fs->ts,db_root, object, leaf->field, sch->splits,
                        leaf, tf, collect_hash_cb, &col)<0){collect_ctx_destroy(&col);free_compiled_criteria(cc,1);return SIZE_MAX;}
         if (col.budget_exceeded) {
             collect_ctx_destroy(&col);
@@ -8416,13 +8417,13 @@ static int cursor_fetch_cb(const uint8_t hash[16],
 
     int matched=0;
     if(criteria_match_tree_checked(value,vlen,ctx->tree,ctx->fs,hdr2,&matched)){
-        int error=errno?errno:EILSEQ;pthread_mutex_lock(&ctx->lock);ctx->predicate_error=error;pthread_mutex_unlock(&ctx->lock);return 1;}
+        int error=errno?errno:EILSEQ;pthread_mutex_lock(&ctx->lock);__atomic_store_n(&ctx->predicate_error,error,__ATOMIC_RELAXED);pthread_mutex_unlock(&ctx->lock);return 1;}
     if(!matched)return 0;
 
     SmallPrefilterRow candidate={0};memcpy(candidate.hash,hash,16);
     if(small_row_build(&candidate,ctx->ts,value,vlen,hdr2,ctx->order_field_idx,
                        ctx->sort_owned_bytes,ctx->sort_overflow_budget)){
-        pthread_mutex_lock(&ctx->lock);ctx->predicate_error=errno?errno:EILSEQ;
+        pthread_mutex_lock(&ctx->lock);__atomic_store_n(&ctx->predicate_error,errno?errno:EILSEQ,__ATOMIC_RELAXED);
         pthread_mutex_unlock(&ctx->lock);return 1;
     }
     pthread_mutex_lock(&ctx->lock);
@@ -8430,7 +8431,7 @@ static int cursor_fetch_cb(const uint8_t hash[16],
         int new_cap=ctx->result_cap?ctx->result_cap*2:64;
         SmallPrefilterRow *t=sort_array_resize(ctx->results,(size_t)ctx->result_cap,
             (size_t)new_cap,ctx->sort_owned_bytes,ctx->sort_overflow_budget);
-        if(!t){ctx->predicate_error=errno?errno:ENOMEM;goto failed;}
+        if(!t){__atomic_store_n(&ctx->predicate_error,errno?errno:ENOMEM,__ATOMIC_RELAXED);goto failed;}
         ctx->results=t;ctx->result_cap=new_cap;
     }
     ctx->results[ctx->result_count++]=candidate;
@@ -8451,14 +8452,14 @@ static void *cursor_fetch_worker(void *arg) {
     SlotcaskDb *sdb SDB_REG_REF = slotcask_registry_get(ctx->db_root, ctx->object, &info);
     if (!sdb) {
         LOG_WARN(LOG_SUB_SLOTCASK, "cursor_fetch_worker: slotcask_registry_get failed for %s/%s", ctx->db_root, ctx->object);
-        ctx->predicate_error=errno?errno:EIO;return NULL;
+        __atomic_store_n(&ctx->predicate_error,errno?errno:EIO,__ATOMIC_RELAXED);return NULL;
     }
 
     /* Extract hashes from entries */
     uint8_t (*hashes)[16] = malloc((size_t)ctx->entry_count * sizeof(*hashes));
     if (!hashes) {
         LOG_ERROR(LOG_SUB_QUERY, "cursor_fetch_worker: malloc failed for entry_count=%d", ctx->entry_count);
-        ctx->predicate_error=ENOMEM;return NULL;
+        __atomic_store_n(&ctx->predicate_error,ENOMEM,__ATOMIC_RELAXED);return NULL;
     }
     for (int i = 0; i < ctx->entry_count; i++)
         memcpy(hashes[i], ctx->entries[i].hash, 16);

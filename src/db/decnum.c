@@ -449,8 +449,12 @@ static dec_status dec_add_signed(const dec_t *a, const dec_t *b,
             if (b->weight - (int32_t)b->ndigits + 1 < lo_place)
                 lo_place = b->weight - (int32_t)b->ndigits + 1;
         }
-        int32_t nlimbs = hi_place - lo_place + 1;
+        int64_t span_limbs = (int64_t)hi_place - (int64_t)lo_place + 1;
+        if (span_limbs <= 0 || span_limbs + 1 > DEC_MAX_LIMBS_ALLOC)
+            return DEC_ERR_RANGE;
+        int32_t nlimbs = (int32_t)span_limbs;
         dec_status st = dec_reserve(out, (uint16_t)(nlimbs + 1));
+        if (st == DEC_OK && !out->digits) st = DEC_ERR_NOMEM;
         if (st != DEC_OK) return st;
         int32_t carry = 0;
         for (int32_t k = 0; k < nlimbs; k++) {
@@ -853,6 +857,7 @@ static int dec_coeff_digit(const dec_t *d, long long e) {
 
 size_t dec_payload_len(const dec_t *d) {
     long long nd = d->ndigits == 0 ? 0 : dec_coeff_digits(d);
+    if (nd < 0) nd = 0;   /* a normalised value has >= 0 coefficient digits */
     return DEC_PAYLOAD_HEADER + (size_t)((nd + 1) / 2);
 }
 
@@ -860,6 +865,7 @@ dec_status dec_pack(const dec_t *d, uint8_t *out, size_t cap,
                     size_t *out_len) {
     if (!d || !out || !out_len) return DEC_ERR_INVALID;
     long long nd = d->ndigits == 0 ? 0 : dec_coeff_digits(d);
+    if (nd < 0) nd = 0;   /* a normalised value has >= 0 coefficient digits */
     size_t need = DEC_PAYLOAD_HEADER + (size_t)((nd + 1) / 2);
     if (cap < need) return DEC_ERR_TRUNCATED;
     memset(out, 0, need);

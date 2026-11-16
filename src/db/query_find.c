@@ -1968,9 +1968,8 @@ int layout_migrate_object(const char *eff_root, const char *object, int dry_run,
     if (!cached) LM_FAIL("fields.conf for %s is unreadable", object);
     if (cached->packed.nfields) goto out;
     old_ts = malloc(sizeof(*old_ts));
-    new_ts = malloc(sizeof(*new_ts));
+    new_ts = calloc(1, sizeof(*new_ts));
     if (!old_ts || !new_ts) LM_FAIL("out of memory");
-    memset(new_ts, 0, sizeof(*new_ts));
     *old_ts = *cached;   /* snapshot: the cache slot may be reused after invalidation; enum lists stay cache-owned and are never touched here */
 
     /* Rewritten fields.conf (comments/blank lines kept verbatim). */

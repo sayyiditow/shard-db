@@ -508,12 +508,12 @@ int compile_one_checked(CompiledCriterion *cc, const SearchCriterion *c,
            positive ops" (EQ/IN/LT/GT/etc.) and "every record matches under
            the negation" (NEQ/NOT_IN). The search_criterion_value(c) lookup uses
            enum_value_index (linear scan; cold path, n ≤ 65535). */
-        if (cc->tf && search_criterion_value(c)[0]) {
+        if (search_criterion_value(c)[0]) {   /* cc->tf is non-null on this path */
             cc->i1 = (int64_t)enum_value_index(cc->tf, search_criterion_value(c), strlen(search_criterion_value(c)));
         } else {
             cc->i1 = -1;
         }
-        if (cc->tf && search_criterion_value2(c)[0]) {
+        if (search_criterion_value2(c)[0]) {
             cc->i2 = (int64_t)enum_value_index(cc->tf, search_criterion_value2(c), strlen(search_criterion_value2(c)));
         } else {
             cc->i2 = -1;
@@ -3287,7 +3287,7 @@ static int most_selective_indexed(const char *db_root, const char *object,
     int best = -1;
     size_t budget = selectivity_budget(N);
     for (int i = 0; i < n; i++) {
-        int it = pick_index_for_leaf_schema(fs?fs->ts:NULL,db_root, object, leaves[i]);
+        int it = pick_index_for_leaf_schema(fs->ts,db_root, object, leaves[i]);
         if (it < 0) { est[i] = (CardEst){0,0,0}; continue; }     /* not indexed */
         const TypedField *tf = resolve_idx_field(fs->ts, leaves[i]->field);
         est[i] = card_est_leaf(db_root, object, splits, leaves[i], tf, budget);
@@ -3297,7 +3297,7 @@ static int most_selective_indexed(const char *db_root, const char *object,
          * leaf walks).  When the bitmap has the smaller K and both estimates
          * are reliable, cardinality wins — the primary feeds a prefilter set
          * whose order is irrelevant (always a hash table for D2/D3/count). */
-        int it_best = pick_index_for_leaf_schema(fs?fs->ts:NULL,db_root, object, leaves[best]);
+        int it_best = pick_index_for_leaf_schema(fs->ts,db_root, object, leaves[best]);
         int i_bm = (it == IT_BITMAP), b_bm = (it_best == IT_BITMAP);
         if (i_bm != b_bm) {
             int bm_i  = i_bm ? i : best;

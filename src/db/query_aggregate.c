@@ -2089,12 +2089,12 @@ static int wfc_batch_cb(const uint8_t hash16[16],
     WfcBatchCtx *bc = (WfcBatchCtx *)ctx;
     int matched=0;
     if(criteria_match_tree_checked(value,vlen,bc->tree,bc->fs,hdr2,&matched)){
-        pthread_mutex_lock(&bc->mu);bc->predicate_error=errno?errno:EILSEQ;pthread_mutex_unlock(&bc->mu);return 1;}
+        pthread_mutex_lock(&bc->mu);__atomic_store_n(&bc->predicate_error,errno?errno:EILSEQ,__ATOMIC_RELAXED);pthread_mutex_unlock(&bc->mu);return 1;}
     if(!matched)return 0;
     TypedRowView view;
     if (typed_row_open(bc->fs->ts, (const uint8_t *)value, vlen, hdr2, &view)) {
         pthread_mutex_lock(&bc->mu);
-        bc->predicate_error = errno ? errno : EILSEQ;
+        __atomic_store_n(&bc->predicate_error, errno ? errno : EILSEQ, __ATOMIC_RELAXED);
         pthread_mutex_unlock(&bc->mu);
         return 1;
     }
@@ -2120,7 +2120,7 @@ static void flush_wfc_batch(SlotcaskDb *sdb, WfcArg *w,
             release_record_ref(&rr);
         }
     }
-    if(bc->predicate_error)w->predicate_error=bc->predicate_error;
+    {int pe=__atomic_load_n(&bc->predicate_error,__ATOMIC_RELAXED);if(pe)w->predicate_error=pe;}
 }
 
 static void *wfc_worker(void *arg) {

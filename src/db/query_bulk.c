@@ -5986,6 +5986,7 @@ static int bulk_upd_json_run(const char *db_root, const char *object,
         for (int gi = 0; gi < nshard_groups; gi++) {
             if (workers[gi].shard_id == records[i].shard_id) {
                 workers[gi].recs[workers[gi].count++] = records[i];
+                workers[gi].recs[workers[gi].count - 1].mutation_error = 0;   /* records[] is malloc'd; the parse phase never sets it */
                 break;
             }
         }

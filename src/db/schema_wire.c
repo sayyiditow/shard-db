@@ -257,6 +257,7 @@ fail:{int saved=errno?errno:EINVAL;for(size_t i=0;i<*count;i++){free(specs[i]);s
 int typed_field_lines_parse(const char *json,char (**lines)[MAX_FIELD_DEF],int *nlines){
     if(!lines||!nlines){errno=EINVAL;return -1;}*lines=NULL;*nlines=0;
     char *specs[MAX_FIELDS];size_t count=0;if(typed_field_specs_parse(json,specs,&count))return -1;
+    if(count>MAX_FIELDS){errno=E2BIG;return -1;}   /* typed_field_specs_parse already caps it; keeps the bound local */
     size_t copied=0;for(size_t i=0;i<count;i++)copied+=strlen(specs[i])+1;
     int error=0;
     if(count>SIZE_MAX/MAX_FIELD_DEF||count*MAX_FIELD_DEF>g_query_buffer_max_bytes||
