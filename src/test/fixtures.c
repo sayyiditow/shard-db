@@ -919,7 +919,7 @@ void tu_dump_hung_process(pid_t pid, int whole_group) {
              " wchan=$(cat $t/wchan 2>/dev/null) syscall=$(cat $t/syscall 2>/dev/null)\"; "
              "done; "
              "if [ -d /proc ] && command -v gdb >/dev/null 2>&1 && "
-             "[ \"$(cat /proc/$p/comm 2>/dev/null)\" = shard-db ]; then "
+             "case \"$(cat /proc/$p/comm 2>/dev/null)\" in shard-db*) true;; *) false;; esac; then "
              "S=; sudo -n true 2>/dev/null && S='sudo -n'; "
              "timeout 60 $S gdb -p $p -batch -ex 'thread apply all bt' 2>&1 | tail -n 400; fi; "
              "done",

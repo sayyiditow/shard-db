@@ -4,7 +4,7 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
-## Unreleased
+## 2026.11.1
 
 **Fix: a bitmap-filtered count no longer deadlocks with a concurrent bulk insert.**
 An indexed `count` with bitmap post-filters kept the shard's bitmap read locks while its record fetch
@@ -63,12 +63,11 @@ record/index format change.
 
 **Bitmap opens are cached-only; corrupt-skip retires the cache entry; bitmap read failures fail the query.** With the bitmap cache initialized (daemon and embedded), `bm_open` never returns an uncached mapping: a stale published entry is retired non-blockingly and admission retried, a saturated cache retries admission, and both give up after four 2 ms-apart retries with `EBUSY` (the bound covers admission only — ordinary lock contention still waits, and Plan C's returned-lock-error precedence is unchanged, now for readers too). Corruption is deterministic `EUCLEAN` (short file, bad magic, invalid stride/body bounds); syscall failures keep their errno. A keyfile rebuild that skips a corrupt bitmap first retires that path's cached entry (checked): `KF_BMFIX_SKIP` is logged only after successful retirement, and a failed release/retirement abandons the shard's rebuild (`keyfile compaction failed`; other shards may have compacted already) instead of leaving a stale mapping in service. Bitmap read consumers treat a never-written shard (`ENOENT`) as logically empty but fail the query on any other bitmap read/lock failure with one complete `{"error":"bitmap index unavailable"}` before any find response byte, because find now prepares bitmap candidates and bitmap-derived totals before the envelope. An actual candidate-collection insertion overflow is not an error: count, find and aggregate recover once through a complete record scan with the original criteria and deadline; candidate allocations that exceed the request budget keep the existing query-buffer error. Former small-limit streaming bitmap finds now prepare their candidate set first (bounded by the same request budget; broader sets that do not fit produce the existing query-buffer error before any bytes instead of streaming) and then fetch one record at a time (deadline-checked) with at most one live record reference; bitmap candidates are charged by exact allocation bytes (object + rounded keys/state arrays, `keyset_allocation_bytes`) against the request query-buffer budget, and `total:true` totals on bitmap-reading plans are validated per candidate against the full criteria before emission. No on-disk format or configuration change; the new error and recovery response shapes are documented in find/count/aggregate. Not covered: record/serialization errors after emission (find responses are not fully output-atomic), and the all-candidate payload materialization of already-buffered emit shapes.
 
-
 **Bitmap cache: handle lock errors fail opens; writer eviction errors no longer loop.** Cache-hit/fill acquisition errors now fail immediately with the exact pthread error in `errno`. Eviction can still succeed on a later candidate after an earlier try error; if none succeeds, a selected blocking-wait error takes precedence and fails the writer open. In particular, a selected candidate write-held by the calling thread can return `EDEADLK`: the rebuild then abandons keyfile publication (`KF_BMFIX_PREPARE_FAILED`; light vacuum reports `keyfile compaction failed`) while preserving record values and bitmap slot coherence. Ordinary contention still waits. Reader uncached fallbacks are unchanged. `EDEADLK` is a returned pthread error, not complete deadlock detection; reader self-upgrades and cross-thread cycles remain outside this change.
 
 **Bulk insert stages fail closed when growth is impossible.** A bulk upsert shard stage whose pre-grow cannot size the keyfile table (bitmap-remap back-off, resplit I/O error, TEST_BUILD tier cap) used to continue and let publish fail records one by one with a faceless partial-success response; it now fails the stage atomically (`BULK_STAGE_UNGROWN` in the error log, every record of the shard errors, no partial commit) and the client retries via bulk-insert's upsert semantics. Bulk-delete keeps its existing behavior because deletes need no new insertion slots. The bulk window planner additionally respects the TEST_BUILD kf tier cap, and its reservation-free resplit is now documented as the only path that can hit the 75% trigger.
 
-**2026.11.1 — packed layout metadata, strict `layout=` token, version gate (R5, in progress).**
+**2026.11.1 — packed layout metadata, strict `layout=` token, version gate (R5).**
 `SHARD_DB_VERSION` is now `2026.11.1` and the minimum supported source release is
 `2026.10.2`; roots must carry 2026.10.2 clean-open evidence to open (older roots get
 the existing TOO_OLD upgrade hint). The strict `layout=packed` schema.conf token is
@@ -146,6 +145,56 @@ parallel-merge scatter, and the partition splice hashed the NUL-tagged group
 key with a NUL-terminated hash, while lookups hashed it by length, so
 buckets were unreachable after the first table doubling. All sites now use
 one bucket hash shared with the lookup path.
+
+**`backup` takes the object's exclusive lock.** `backup` used to run under the object's
+shared read lock like ordinary reads, so a backup of a live object could capture a
+half-finished commit window, a mid-resplit keyfile, a `.bmfix-NNN` bitmap-repair marker
+or a half-written `metadata/sequences/<name>` file, and `restore` would copy all of that
+back. `backup` now holds the object's `objlock_wrlock` for the whole copy, exactly like
+`vacuum`/`truncate`: every request on that object — reads included — waits until the
+copy finishes, and `./shard-db stop` waits for a running backup (it is counted in
+`in_flight_writes`). This fences the copy against every concurrent operation, so no live
+write, resplit, repair marker or `sequence` update can be captured. Backup stays allowed
+on a bitmap-disabled object (the `.bmfix-disabled` flag and any markers in `indexes/`
+are copied verbatim, and `restore` re-arms the escape until `reindex`); backups taken by
+releases before this change were not fenced — if one was taken on a live object, run
+`reindex` after restoring it. No wire, CLI, config or on-disk change.
+
+**`backup`/`restore` now cover `files/` and the object's `tokens.conf`.** A backup of an
+object is now enough to restore the same object — records, indexes, sequences, stored
+files **and access tokens** — into another database later: `backup` also copies the
+object's `files/` directory (the `put-file` store) and its `tokens.conf` (the copy is
+created with mode `0600` — it holds token secrets; protecting the backup directory
+remains the operator's responsibility), and writes a `"files":1` marker into
+`object.json`. Behaviour changes: backups are larger and the copy under the object's
+exclusive lock grows with the stored-file volume; `restore` replaces live `files/` for
+backups carrying the marker only (refusing without `force` when live `files/` is
+non-empty) and leaves `files/` untouched for backups taken before this change. On the
+JSON protocol a successful `restore` now **adds** the backup's object tokens to the
+running token store immediately (no restart) and rewrites the object's `tokens.conf`
+from the store, like `add-token`: it adds only tokens that are not already present
+(any scope) — an existing token's scope or perm is never changed — and never removes
+anything, so a token revoked after the backup returns if the backup contains it, live
+tokens absent from the backup are kept, and a full token table (`TOKEN_CAP`) skips the
+remaining tokens and logs it. **Security fix:** on the JSON protocol `restore` is now
+an object-admin mode — it requires an `rwx` token whose scope covers the object, as
+`multi-tenancy.md` has always documented. Previously `restore` was treated as a plain
+read-allowed mode, so any token covering the object, even read-only, could run it
+(wiping the object with `force:true`); with the token merge it could also have injected
+tokens into the auth store. Clients that used `r`/`rw` tokens to restore must switch
+to an `rwx` token (they now get `{"error":"auth failed"}`). The legacy text-wire
+protocol remains unauthenticated, as before — it never restores tokens (a text-path
+restore leaves the object's live `tokens.conf` and the running token set untouched;
+use the JSON `restore` to bring tokens back). No wire, CLI or config change; `object.json` gains `"files":1` (older
+binaries ignore it).
+
+**Unordered indexed finds fetch only the record batches a page needs.** Small pages over OR/intersection/trigram/prepared-bitmap candidates (and single-leaf finds with joins, `format:"rows"` or a large offset) now fetch 1,024-candidate batches until the page is full instead of fetching every candidate first, and hold one batch of record copies under `QUERY_BUFFER_MB` (halved on overflow). Behaviour changes: a single record larger than `QUERY_BUFFER_MB` now fails the query (raise `QUERY_BUFFER_MB` if such records must be returned), and allocation failures on this path (batch setup, record copies, an error the fetch call returns) and a missing storage handle now fail the query (unterminated response, as for other mid-stream record errors) instead of returning an empty or shorter page. Records the storage layer cannot read during the fetch — or whose lookup buffers cannot be allocated — are still skipped, as before. Order and membership of pages are unchanged; no wire, CLI, config or on-disk change.
+
+**Dependency security updates.** The npm binding's `undici` dependency is bumped to 8.12.4 (Dependabot alerts #36–#44: eight advisories, including TLS certificate-validation and redirect cache-poisoning issues) and the docs toolchain's `certifi` to 2026.10.18 (emSign root CA removal). Neither affects the daemon or on-disk formats.
+
+**macOS build and CI hardening.** `bitmap.c` builds on macOS (no `posix_fallocate`; `EUCLEAN` alias), and the bitmap race fixtures now run on every platform (their writer threads overflowed macOS's 512 KB secondary-thread stack). Rebuild transactions record `indexes_may_change` from `begin`. No wire, CLI, config or on-disk change.
+
+## 2026.10.2
 
 **2026.10.2 — real NULL for typed fields, `:not_null` constraint, BTRI
 index format, conditional writes.** Typed
@@ -327,50 +376,6 @@ safety could not be proven at the call sites).
 See [cas.md](../query-protocol/cas.md) for the full semantics and
 [concurrency.md](../concepts/concurrency.md) for the writer-reservation
 cost model.
-
-**`backup` takes the object's exclusive lock.** `backup` used to run under the object's
-shared read lock like ordinary reads, so a backup of a live object could capture a
-half-finished commit window, a mid-resplit keyfile, a `.bmfix-NNN` bitmap-repair marker
-or a half-written `metadata/sequences/<name>` file, and `restore` would copy all of that
-back. `backup` now holds the object's `objlock_wrlock` for the whole copy, exactly like
-`vacuum`/`truncate`: every request on that object — reads included — waits until the
-copy finishes, and `./shard-db stop` waits for a running backup (it is counted in
-`in_flight_writes`). This fences the copy against every concurrent operation, so no live
-write, resplit, repair marker or `sequence` update can be captured. Backup stays allowed
-on a bitmap-disabled object (the `.bmfix-disabled` flag and any markers in `indexes/`
-are copied verbatim, and `restore` re-arms the escape until `reindex`); backups taken by
-releases before this change were not fenced — if one was taken on a live object, run
-`reindex` after restoring it. No wire, CLI, config or on-disk change.
-
-**`backup`/`restore` now cover `files/` and the object's `tokens.conf`.** A backup of an
-object is now enough to restore the same object — records, indexes, sequences, stored
-files **and access tokens** — into another database later: `backup` also copies the
-object's `files/` directory (the `put-file` store) and its `tokens.conf` (the copy is
-created with mode `0600` — it holds token secrets; protecting the backup directory
-remains the operator's responsibility), and writes a `"files":1` marker into
-`object.json`. Behaviour changes: backups are larger and the copy under the object's
-exclusive lock grows with the stored-file volume; `restore` replaces live `files/` for
-backups carrying the marker only (refusing without `force` when live `files/` is
-non-empty) and leaves `files/` untouched for backups taken before this change. On the
-JSON protocol a successful `restore` now **adds** the backup's object tokens to the
-running token store immediately (no restart) and rewrites the object's `tokens.conf`
-from the store, like `add-token`: it adds only tokens that are not already present
-(any scope) — an existing token's scope or perm is never changed — and never removes
-anything, so a token revoked after the backup returns if the backup contains it, live
-tokens absent from the backup are kept, and a full token table (`TOKEN_CAP`) skips the
-remaining tokens and logs it. **Security fix:** on the JSON protocol `restore` is now
-an object-admin mode — it requires an `rwx` token whose scope covers the object, as
-`multi-tenancy.md` has always documented. Previously `restore` was treated as a plain
-read-allowed mode, so any token covering the object, even read-only, could run it
-(wiping the object with `force:true`); with the token merge it could also have injected
-tokens into the auth store. Clients that used `r`/`rw` tokens to restore must switch
-to an `rwx` token (they now get `{"error":"auth failed"}`). The legacy text-wire
-protocol remains unauthenticated, as before — it never restores tokens (a text-path
-restore leaves the object's live `tokens.conf` and the running token set untouched;
-use the JSON `restore` to bring tokens back). No wire, CLI or config change; `object.json` gains `"files":1` (older
-binaries ignore it).
-
-**Unordered indexed finds fetch only the record batches a page needs.** Small pages over OR/intersection/trigram/prepared-bitmap candidates (and single-leaf finds with joins, `format:"rows"` or a large offset) now fetch 1,024-candidate batches until the page is full instead of fetching every candidate first, and hold one batch of record copies under `QUERY_BUFFER_MB` (halved on overflow). Behaviour changes: a single record larger than `QUERY_BUFFER_MB` now fails the query (raise `QUERY_BUFFER_MB` if such records must be returned), and allocation failures on this path (batch setup, record copies, an error the fetch call returns) and a missing storage handle now fail the query (unterminated response, as for other mid-stream record errors) instead of returning an empty or shorter page. Records the storage layer cannot read during the fetch — or whose lookup buffers cannot be allocated — are still skipped, as before. Order and membership of pages are unchanged; no wire, CLI, config or on-disk change.
 
 ## 2026.09.2
 

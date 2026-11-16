@@ -71,16 +71,22 @@ jobs:
           #   unused   — lcov 2.x errors on exclude patterns that don't match;
           #              src/test/ files DO have .gcda after the C migration,
           #              but we still pass defensively if a pattern misses.
+          #   inconsistent — bitmap.c compiles into both the daemon and the
+          #              TEST_BUILD server with different bodies for the same
+          #              helper (bm_test_lock_diag, #if TEST_BUILD / #else);
+          #              lcov 2.x rejects the merged gcov data as a duplicate
+          #              function. Counters stay correct; the lines are
+          #              attributed to each variant.
           #   gcov     — geninfo warns about "unexecuted block on non-branch
           #              line" for some inlined functions; informational only.
           lcov --capture --directory . --output-file coverage.info \
                --rc branch_coverage=1 \
-               --ignore-errors negative,negative,gcov
+               --ignore-errors negative,negative,gcov,inconsistent,inconsistent
           lcov --remove coverage.info \
                '/usr/*' '*/src/test/*' '*/src/bench/*' '*/fuzz/*' \
                --output-file coverage.info \
                --rc branch_coverage=1 \
-               --ignore-errors negative,negative,unused
+               --ignore-errors negative,negative,unused,inconsistent,inconsistent
           lcov --list coverage.info
 
       - name: Upload to Codecov

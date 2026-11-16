@@ -8,9 +8,8 @@ month**. Older releases are end-of-life as soon as a newer one ships.
 
 | Version line | Supported |
 |---|---|
-| 2026.05.x (latest) | ✓ |
-| 2026.04.x | end-of-life |
-| < 2026.04 | end-of-life |
+| 2026.11.x (latest) | ✓ |
+| < 2026.11 | end-of-life |
 
 ## Reporting a vulnerability
 

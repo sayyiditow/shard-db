@@ -1,14 +1,15 @@
 # shard-db
 
 **Upgrading:** a populated data directory must carry clean-open evidence at
-or after shard-db `2026.09.2` — older roots are refused with an upgrade
-hint. In binding versions that means `1.0.22` or later (these embed the
-`2026.09.2` engine); if your data was last opened by an older binding,
-install `1.0.22`+ and open once before upgrading. A filesystem-empty
-directory initializes directly. The first `2026.10.2` open of an existing
-root performs a one-time, crash-safe startup migration that reindexes
-every indexed object before serving; subsequent opens skip it. Leave the
-data directory untouched while a migration open is in progress.
+or after shard-db `2026.10.2` — older roots are refused with an upgrade
+hint. In binding versions that means `1.3.0` or later (these embed the
+`2026.10.2` engine); if your data was last opened by an older binding,
+install `1.3.0` and open it once, close it cleanly, then upgrade. A
+filesystem-empty directory initializes directly. The first `2026.11.1`
+open of an existing root migrates every object to the packed record layout
+before serving (crash-safe; leave the data directory untouched while it
+runs); subsequent opens skip it. It refuses an unclean root or one with
+pending commit markers, so close the previous version cleanly first.
 
 High-performance embedded database for Node.js and Bun. Runs entirely in-process — no daemon, no TCP socket, no external dependencies.
 

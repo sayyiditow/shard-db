@@ -69,6 +69,9 @@ jobs:
             src/db/type_desc.c src/db/nql.c src/db/embedded.c \
             src/db/objlock.c src/db/keyset.c src/db/parallel.c src/db/tls.c \
             src/db/slotcask.c src/db/simd.c \
+            src/db/decnum.c src/db/decimal_order.c src/db/agg_exact.c src/db/scalar_grammar.c \
+            src/db/typed_index.c src/db/packed_record.c src/db/typed_row.c src/db/typed_bulk_insert.c \
+            src/db/packed_csv_command.c src/db/typed_read_command.c src/db/schema_wire.c \
             -Isrc/db -lpthread -lssl -lcrypto -o /dev/null
 
       - name: Tar + upload

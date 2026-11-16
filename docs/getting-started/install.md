@@ -84,7 +84,12 @@ later) upgrade with a binary swap:
 ./shard-db start
 ```
 
-2026.09.2 performs the datetime-width migration automatically when opening a
+2026.11.1 requires a **cleanly stopped 2026.10.2 root** (start 2026.10.2 against the
+DB_ROOT, stop it cleanly, then upgrade); it refuses an unclean root or one with pending
+commit markers. Its first start migrates every object to the packed record layout before
+serving, so back up first and leave the data directory untouched while it runs.
+
+2026.09.2 performed the datetime-width migration automatically when opening a
 2026.09.1-compatible root; backup first, then start the new binary and verify
 the root. Other objects are left unchanged, and indexes for migrated datetime
 fields are rebuilt inside the migration transaction. Low-numbered segment
