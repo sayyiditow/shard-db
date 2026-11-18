@@ -63,9 +63,9 @@ static inline int seg_scan_varlen_struct_ok(const uint8_t *map, size_t map_size,
 
 /* Verify the record at map[pos] carries a hash matching its key bytes
    (xxh128). Caller must already have validated the header (klen known
-   in-bounds) via seg_scan_varlen_struct_ok. Only meaningful for
-   flag in {1, 2} (live/tombstone) — flag == 0 (padding) records have no
-   real key content and are never passed here. */
+   in-bounds) via seg_scan_varlen_struct_ok. flag == 0 records passed
+   here must carry real key content (content graves — abandoned staged
+   payloads); zeros-only flag==0 regions are never passed. */
 static inline int seg_scan_varlen_hash_ok(const uint8_t *map, size_t pos, uint16_t klen) {
     const uint8_t *rec = map + pos;
     uint8_t computed[16];
@@ -118,6 +118,64 @@ static inline int seg_scan_varlen_resync(const uint8_t *map, size_t map_size,
         }
         if (flag == 0) continue;
         if (!seg_scan_varlen_hash_ok(map, cand, klen)) continue;
+        *out_off = cand;
+        return 1;
+    }
+    return 0;
+}
+
+/* seg_scan_varlen_resync variant whose resync targets additionally
+   include structurally valid flag==0 records with content (klen or vlen
+   nonzero) — abandoned staged payloads ("graves"; a staged record can
+   also be live-pending until its KFM2 marker replays, which is a second
+   reason stepping over it by declared size is safe). Zeros-only flag==0
+   regions are still never targets. Hash verification applies to every
+   target: flag in {1,2} as before, and flag==0 targets must carry the
+   xxh128 of their own key bytes (genuine graves do; garbage that merely
+   misparses as a flag=0 header does not). A grave target is a safe
+   resume point because the caller steps over it by its own declared
+   size. Docs/plans/2026-11-17-kf-grave-frontier-fix.md, shared
+   groundwork; regression cases test-slotcask-grave-run-frontier,
+   test-slotcask-vacuum-grave-run, test-od-scan-healthy-tail. */
+static inline int seg_scan_varlen_resync_graves(const uint8_t *map,
+                                                size_t map_size, size_t pos,
+                                                size_t max_slot_size,
+                                                size_t window,
+                                                size_t *out_off) {
+    if (pos >= map_size) return 0;
+    size_t start = pos & ~(size_t)7;
+    size_t limit = (window > map_size - pos) ? map_size : pos + window;
+    for (size_t cand = start; cand < map_size && cand <= limit; cand += 8) {
+        if (cand < pos) continue;
+        /* Cheap zero-word pre-test before struct_ok. The bounds test
+           MUST come before the load: an unconditional memcpy would read
+           up to 16 bytes past the buffer/mapping — an ASan
+           heap-buffer-overflow on seg_resync_wide_fd's exact-size
+           buffer and a possible SEGV/SIGBUS at the end of a 128 MiB
+           mapping. klen, flag, hdr2 and vlen all zero is exactly the
+           zero-fill case the function already excludes after
+           struct_ok; this makes scanning zero regions one load per 8
+           bytes. */
+        if (cand + 24 > map_size) continue;
+        {
+            uint64_t w;
+            memcpy(&w, map + cand + 16, 8);
+            if (w == 0) continue;
+        }
+        size_t rec_size;
+        uint8_t flag;
+        uint16_t klen;
+        uint32_t vlen;
+        if (!seg_scan_varlen_struct_ok(map, map_size, cand, max_slot_size,
+                                        &rec_size, &flag, &klen, &vlen,
+                                        NULL))
+            continue;
+        if (flag == 0) {
+            if (klen == 0 && vlen == 0) continue;      /* zero fill */
+            if (!seg_scan_varlen_hash_ok(map, cand, klen)) continue;
+        } else if (!seg_scan_varlen_hash_ok(map, cand, klen)) {
+            continue;
+        }
         *out_off = cand;
         return 1;
     }

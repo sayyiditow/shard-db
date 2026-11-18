@@ -102,6 +102,13 @@ void agg_topn_test_reset(void);
 void agg_topn_test_force_decline(int on);
 void agg_topn_test_fail_repeat(long nth);
 void agg_topn_test_stats(long *runs, long *declines, long *forced, long *repeats);
+/* TEST_BUILD wrapper over query_maint.c's internal copy_file (the
+   backup/restore file copy) so test-backup-copy-sparse can exercise the
+   copy directly. */
+void maint_test_copy_file(const char *src, const char *dst);
+/* While on, copy_file_sparse scribbles past EOF then fails, forcing the
+   dense fallback (test-backup-copy-sparse). */
+void maint_test_copy_partial_fail(int on);
 #endif
 
 /* Prototypes for helpers shared across the query_*.c translation units.

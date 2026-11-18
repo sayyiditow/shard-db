@@ -4,6 +4,69 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.11.2
+
+**Fix: recovery/stat/O_DIRECT scans break on abandoned staged records ("graves").**
+Every mutation writes its record bytes with flag=0 (the durable "P" phase) *before* the
+KFM2 marker and activation. A write whose window dies in between leaves a structurally
+valid flag=0 record with intact content — an inert "grave". Four scans shared the same
+faulty tail heuristic: resync within one `slot_size`, and if no live/tombstone header
+sat in that window, break as an ordinary unwritten tail. A run of graves longer than one
+slot size parked the startup append frontier (`recover_one_stream`) mid-file, so later
+appends overwrote live records beyond the graves — dangling live keyfile entries, which
+the 2026.11.x layout migration refuses (`invalid live kf references`). The same break
+made vacuum undercount live records behind graves (`seg_stat_one_varlen`), stop the
+compaction recipient free-list walk early, and stop the O_DIRECT scanner
+(`seg_scan_o_direct`) — segments were dropped or under-migrated with live records still
+in them, and reindex missed records.
+
+All four scans now step over hash-verified staged records by their declared size (every
+grave is hash-verified before it is stepped over or harvested — a failed hash is a
+desync, never a blind step), resync targets include hash-verified graves, and the tail
+break fires only after a hole-aware full-remainder search proves no hash-valid record
+lies ahead. The wide resync asks the filesystem for data extents (`lseek(SEEK_DATA/
+SEEK_HOLE)`, trusted via a per-filesystem runtime probe) and reads them with `pread` —
+never through the mapping — so a healthy open's sparse tail costs one `open`, a few
+`lseek` calls and one small `pread` per stream instead of faulting in up to 128 MiB of
+zero pages; filesystems without a usable `SEEK_DATA` (or fully-allocated/plain-copied
+segments) take a slower, still mmap-fault-free rolling `pread` scan. Unparseable
+records keep failing closed exactly as before, and the wide search itself fails closed
+if it cannot open or read the segment. The startup scan logs one WARN line per affected
+stream at open (staged, not-activated records; vacuum reclaims the inert ones).
+
+**Vacuum reclaims grave space and no longer starves or drops data.** Because the
+recipient free-list walk harvests hash-verified grave capacity at its exact declared
+extent (and `seg_stat_one_varlen` counts graves toward `total`, never `live`), a
+segment whose live records sit behind graves migrates completely and the donor is only
+then dropped. Vacuum on an object that is *already* damaged (a live kf entry pointing
+at a grave) is unchanged — vacuum does not validate kf references.
+
+**Vacuum's free pool drops slots consumed by compaction.** At open the free pool is
+rebuilt from the recipient segment's keyfile tombstones; the migration could hand such
+a slot to a migrated record while leaving it in the pool, and the next insert would
+overwrite the migrated record. The consumed range is now removed from the pool before
+the migrated record lands.
+
+**`backup`/`restore` copies preserve sparseness.** The backup file copy walked every
+byte, so restored segments were fully allocated and every open then paid the full
+rolling resync scan (~155 ms per 8-stream object vs ~4 ms sparse, measured). The copy
+now walks data extents (`SEEK_DATA`/`SEEK_HOLE`, gated on the same trust probe) and
+finishes with `ftruncate`; filesystems without a usable `SEEK_DATA` keep the dense
+loop. Backups taken by earlier releases (and plain `cp` copies) stay dense until
+re-copied sparsely.
+
+**Cost note.** On a sparse-aware filesystem a healthy open adds ~4 ms per 8-stream
+object (vs ~0.2 ms before) — one bounded search plus one open and an extent query per
+stream. On filesystems without a usable `SEEK_DATA`, or on fully-allocated/plain-copied
+segments, the untrusted rolling scan costs ~one full-segment `pread` per stream per
+open.
+
+**Known cost / operator guidance.** Segments written by 2026.10.2 or earlier that
+already contain graves open with the WARN line until vacuum runs; see
+[deployment](../operations/deployment.md#refused-invalid-live-kf-references) for the
+`invalid live kf references` refusal (cause and remediation). No repair command ships
+in this release. No on-disk format change; wire-compatible.
+
 ## 2026.11.1
 
 **Fix: a bitmap-filtered count no longer deadlocks with a concurrent bulk insert.**

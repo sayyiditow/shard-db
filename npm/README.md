@@ -11,6 +11,14 @@ before serving (crash-safe; leave the data directory untouched while it
 runs); subsequent opens skip it. It refuses an unclean root or one with
 pending commit markers, so close the previous version cleanly first.
 
+Binding `1.5.0` embeds shard-db `2026.11.2`, which fixes append-frontier
+recovery over abandoned staged records (segment scans now step over them
+hash-verified and only break at a verified-dead remainder — see the
+[2026.11.2 release notes](../docs/release-notes/2026.11.2.md)). Roots
+written by `1.4.0` open normally; the first `1.5.0` open re-stamps the
+data directory's `.version`, after which `1.4.0` / `2026.11.1` refuse it —
+no rolling back.
+
 High-performance embedded database for Node.js and Bun. Runs entirely in-process — no daemon, no TCP socket, no external dependencies.
 
 ```bash

@@ -1,6 +1,7 @@
 #include "types.h"
 #include "slotcask.h"
 #include "trigram.h"
+#include "io_direct.h"   /* od_seek_data_trusted — sparse copy gate (Task 11) */
 #include <dirent.h>
 
 /* ========== SIZE ========== */
@@ -210,8 +211,8 @@ int cmd_vacuum(const char *db_root, const char *object,
         OUT("{\"error\":\"object not open\"}\n");
         return 1;
     }
-    int dropped = 0;
-    if (slotcask_compact_segs(sdb, &dropped) != 0) {
+    int dropped = 0, skipped = 0;
+    if (slotcask_compact_segs_ex(sdb, &dropped, &skipped) != 0) {
         OUT("{\"error\":\"segment compaction failed\"}\n");
         return 1;
     }
@@ -223,7 +224,10 @@ int cmd_vacuum(const char *db_root, const char *object,
         return 1;
     }
     reset_deleted_count(db_root, object);  /* v1 only; no-op for v2 */
-    OUT("{\"status\":\"vacuumed\",\"cleaned\":%d}\n", dropped);
+    if (skipped)
+        OUT("{\"status\":\"vacuumed\",\"cleaned\":%d,\"segments_skipped\":\"pending-markers\"}\n", dropped);
+    else
+        OUT("{\"status\":\"vacuumed\",\"cleaned\":%d}\n", dropped);
     return 0;
 }
 int reshard_target_for_count(long long live) {
@@ -313,7 +317,101 @@ int cmd_sequence(const char *db_root, const char *object,
 
 /* ========== BACKUP ========== */
 
-/* Copy one regular file. Preserves mode bits. Returns 0 on success. */
+/* Copy one regular file. Preserves mode bits. Sparse-preserving
+   (2026.11.2, docs/plans/2026-11-17-kf-grave-frontier-fix.md Task 11):
+   the copy walks the source with lseek(SEEK_DATA/SEEK_HOLE) and copies
+   only data extents, finishing with ftruncate — a dense copy made every
+   restored segment fully allocated, so the hole-aware wide resync then
+   pays a full-segment scan per stream on open (~155 ms per 8-stream
+   object vs ~4 ms sparse). Regression case: test-backup-copy-sparse.
+   Returns 0 on success. */
+
+/* Copy every data extent of src into dst at the same offsets (both fds
+   open). EINTR-safe pread/pwrite loops throughout. Returns 0 on
+   success, -1 with errno on the first failure. NOTE: the extent lseeks
+   move the source fd's offset — a caller falling back to a sequential
+   read() loop must lseek it back to 0 first (pwrite never moves the
+   destination fd's offset). */
+static int copy_pwrite_all(int sfd, int dfd, off_t size) {
+    size_t bufsz = 1024 * 1024;
+    char *buf = malloc(bufsz);
+    if (!buf) { errno = ENOMEM; return -1; }
+    off_t off = 0;
+    int rc = 0;
+    while (off < size) {
+        off_t d = lseek(sfd, off, SEEK_DATA);
+        if (d < 0) {
+            if (errno == ENXIO) break;   /* nothing but hole ahead: done */
+            rc = -1;
+            break;
+        }
+        if (d >= size) break;
+        off_t h = lseek(sfd, d, SEEK_HOLE);
+        if (h <= d) { rc = -1; break; }  /* must advance */
+        if (h > size) h = size;
+        off_t p = d;
+        while (p < h) {
+            size_t want = (h - p > (off_t)bufsz) ? bufsz : (size_t)(h - p);
+            size_t got = 0;
+            while (got < want) {
+                ssize_t n = pread(sfd, buf + got, want - got, p + (off_t)got);
+                if (n < 0) { if (errno == EINTR) continue; rc = -1; break; }
+                if (n == 0) break;       /* EOF: source shrank under us */
+                got += (size_t)n;
+            }
+            if (rc == 0 && got == 0) { errno = EIO; rc = -1; }  /* source shrank: fail, never pad */
+            if (rc != 0) break;
+            size_t written = 0;
+            while (written < got) {
+                ssize_t w = pwrite(dfd, buf + written, got - written,
+                                   p + (off_t)written);
+                if (w < 0) { if (errno == EINTR) continue; rc = -1; break; }
+                written += (size_t)w;
+            }
+            if (rc != 0) break;
+            p += (off_t)got;
+        }
+        if (rc != 0) break;
+        off = h;
+    }
+    free(buf);
+    return rc;
+}
+
+/* Sparse-preserving copy of [0, size). Gated on od_seek_data_trusted so
+   a dirty unflushed page is never skipped; unusable (SEEK_DATA
+   untrusted on this filesystem) or failed -> -1 and the caller falls
+   back to the dense loop. */
+#ifdef TEST_BUILD
+static int g_copy_test_partial_fail = 0;
+void maint_test_copy_partial_fail(int on) { g_copy_test_partial_fail = on; }
+#endif
+
+static int copy_file_sparse(int sfd, int dfd, const char *src, off_t size) {
+    if (!od_seek_data_trusted(sfd, src)) return -1;
+#ifdef TEST_BUILD
+    if (g_copy_test_partial_fail) {
+        /* Simulate a sparse copy that wrote more than the dense pass will:
+           the fallback must truncate it away. */
+        static const char junk[4096] = {'X'};
+        (void)pwrite(dfd, junk, sizeof(junk), 0);
+        (void)pwrite(dfd, junk, sizeof(junk), size + 8192);
+        return -1;
+    }
+#endif
+    if (copy_pwrite_all(sfd, dfd, size) != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "copy_file: sparse extent copy of %s failed: %s",
+                  src, strerror(errno));
+        return -1;
+    }
+    if (ftruncate(dfd, size) != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "copy_file: ftruncate of %s copy failed: %s",
+                  src, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 static int copy_file(const char *src, const char *dst, mode_t mode) {
     int sfd = open(src, O_RDONLY);
     if (sfd < 0) {
@@ -324,6 +422,35 @@ static int copy_file(const char *src, const char *dst, mode_t mode) {
     if (dfd < 0) {
         LOG_ERROR(LOG_SUB_CONFIG, "copy_file: open(%s) failed: %s", dst, strerror(errno));
         close(sfd); return -1;
+    }
+    struct stat st;
+    if (fstat(sfd, &st) != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "copy_file: fstat(%s) failed: %s", src, strerror(errno));
+        close(sfd); close(dfd);
+        return -1;
+    }
+    if (st.st_size > 0 && copy_file_sparse(sfd, dfd, src, st.st_size) == 0) {
+        close(sfd);
+        close(dfd);
+        return 0;
+    }
+    if (st.st_size == 0) {
+        /* Nothing to copy; O_TRUNC already left dst empty. */
+        close(sfd);
+        close(dfd);
+        return 0;
+    }
+    /* Sparse path unusable (SEEK_DATA untrusted) or failed mid-copy:
+       dense fallback. The extent lseeks moved the source offset, so
+       rewind both fds before the sequential loop. */
+    (void)lseek(sfd, 0, SEEK_SET);
+    (void)lseek(dfd, 0, SEEK_SET);
+    /* A failed sparse attempt may have left partial data; drop it so no
+       stale tail survives if the source is shorter on this pass. */
+    if (ftruncate(dfd, 0) != 0) {
+        LOG_ERROR(LOG_SUB_CONFIG, "copy_file: ftruncate(%s) failed: %s", dst, strerror(errno));
+        close(sfd); close(dfd);
+        return -1;
     }
     char buf[64 * 1024];
     ssize_t n;
@@ -350,6 +477,15 @@ done:
     close(dfd);
     return rc;
 }
+
+#ifdef TEST_BUILD
+/* TEST_BUILD wrapper over the internal copy_file (the backup/restore
+   file copy) so test-backup-copy-sparse can exercise the copy
+   directly. */
+void maint_test_copy_file(const char *src, const char *dst) {
+    (void)copy_file(src, dst, 0600);
+}
+#endif
 
 /* Recursively copy a directory tree. No shell, no path interpolation —
    every path is built component-wise, so the source-object name (which
@@ -378,6 +514,9 @@ static void cprf(const char *src, const char *dst) {
                 (e->d_name[1] == '\0' ||
                  (e->d_name[1] == '.' && e->d_name[2] == '\0')))
                 continue;
+            /* Crash-orphaned SEEK_DATA probe file (od_seek_data_trusted):
+               never copy it into a backup. */
+            if (strncmp(e->d_name, ".sdprobe-", 9) == 0) continue;
             char child_src[PATH_MAX], child_dst[PATH_MAX];
             snprintf(child_src, sizeof(child_src), "%s/%s", src, e->d_name);
             snprintf(child_dst, sizeof(child_dst), "%s/%s", dst, e->d_name);

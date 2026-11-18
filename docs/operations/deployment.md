@@ -262,6 +262,20 @@ systemctl start shard-db
 
 **2026.11.1** requires a cleanly stopped 2026.10.2 root. The runbook is: backup → stop writes → cleanly stop 2026.10.2 → replace with 2026.11.1 → start and verify; the first start migrates every object to the packed record layout (crash-safe) before serving, and a root from before 2026.10.2 is refused with an upgrade hint.
 
+### Refused: `invalid live kf references`
+
+The 2026.11.x layout migration (and the same check at every embedded open) refuses an object with `{"error":"invalid live kf references in <object>"}` when one or more of its live keyfile entries points at a segment record that is missing, tombstoned, another key's, or structurally dead. The migration never modifies the object's data when it refuses — the check is read-only and fails closed, so the refusal itself causes no damage.
+
+This state can occur on roots written by **2026.10.2 or earlier** because of an append-frontier recovery bug fixed in **2026.11.2**: startup recovery could park the append frontier at a run of inert "staged, not-activated" records (struct-valid flag=0 records whose write window died before activation), and later appends then overwrote live records beyond that run. 2026.11.2 prevents new damage; it does **not** repair existing damage.
+
+What to do today:
+
+1. **Restore the affected object from a backup taken before the damage** (`backup`/`restore`), or re-ingest the object from its source of truth. Keys whose live records were clobbered are unreadable or resolve to wrong content — there is no in-place repair in this release.
+2. **Do not hand-edit** keyfile entries or segment bytes unless you have been asked to by the maintainers; a wrong edit turns recoverable data into unrecoverable data.
+3. After restoring, upgrade to 2026.11.2 (or later) and start once: the fixed frontier scan prevents a recurrence, and each affected stream logs one WARN line (`staged, not-activated record(s)`) at open until a `vacuum` reclaims the inert records.
+
+No automatic repair command ships in this release; a reviewed repair tool is a recommended follow-up. If you hit the refusal without a usable backup, contact the maintainers with the object directory (and, if possible, the pre-upgrade copy) — no byte-editing recipes are published here.
+
 2026.09.2 used the compatibility gate and automatically migrates legacy datetime fields from the 2026.09.1 layout before stamping the root. The runbook is: backup → stop writes → cleanly stop 2026.09.1 → replace with 2026.09.2 → start and verify. Other objects remain unchanged; migrated datetime indexes are rebuilt transactionally. Low-numbered files are valid for new VARIABLE objects and `048000+` files are valid legacy 2026.08.1 conversion output; neither filename range is a format marker, and files must not be renamed or deleted during upgrade.
 
 **Upgrading from a pre-2026.05.5 install with legacy v1 (probe-into-slot) objects.** This binary refuses v1 objects at load. Run the migration on the previous release first:
