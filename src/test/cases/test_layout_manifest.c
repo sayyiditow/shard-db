@@ -1,4 +1,5 @@
 #include "test_runner.h"
+#include "version.h"
 #include "bappend.h"
 #include "test_assert.h"
 #include "fixtures.h"
@@ -719,7 +720,7 @@ static void lm_assert_migrated(LmRoot *m, TestClient *tc) {
                 "legacy numeric:N rewritten to scale 2, explicit P,S kept");
     free(fields);
     char *ver = lm_read(m, ".version");
-    ASSERT_TRUE(ver && strncmp(ver, "2026.11.1", 9) == 0, "root stamped with the new version");
+    ASSERT_TRUE(ver && strncmp(ver, SHARD_DB_VERSION, strlen(SHARD_DB_VERSION)) == 0, "root stamped with the new version");
     free(ver);
 }
 
@@ -837,7 +838,7 @@ static int test_layout_migration_crash_points(void) {
         ASSERT_TRUE(test_env_start_at(&env, m.db_root, m.port) != 0, "run 1 killed");
         if (strcmp(phase, "after-publish") == 0) {
             char *ver = lm_read(&m, ".version");
-            ASSERT_TRUE(ver && strncmp(ver, "2026.11.1", 9) == 0,
+            ASSERT_TRUE(ver && strncmp(ver, SHARD_DB_VERSION, strlen(SHARD_DB_VERSION)) == 0,
                         "F16: the new version is stamped before any packed layout is published");
             free(ver);
         }

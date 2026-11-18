@@ -4760,6 +4760,74 @@ static int cmp_int(const void *a, const void *b) {
     return (ia > ib) - (ia < ib);
 }
 
+/* ============================================================ Wide resync
+ *
+ * Shared tail/desync search for the mmap-based walks (startup recovery,
+ * vacuum stat, compaction recipient free-list). Steps over abandoned
+ * staged payloads ("graves") — struct-valid flag=0 records with content
+ * whose write window died between the durable P phase and activation;
+ * docs/plans/2026-11-17-kf-grave-frontier-fix.md. A bounded in-mapping
+ * search runs first (no syscalls); on a miss the hole-aware wide search
+ * (seg_resync_wide_fd, pread-only) covers the rest of the segment, so a
+ * healthy open's sparse tail costs one open + a few lseek + one small
+ * pread instead of faulting in up to 128 MiB of zero pages.
+ *
+ * Returns 1 and *out_off (a mapping offset) when a hash-verified target
+ * lies ahead, 0 when the remainder is verified dead (caller may take
+ * its ordinary unwritten-tail break), -1 with errno set on failure
+ * (open/fstat/search I/O error — callers fail closed). */
+
+#ifdef TEST_BUILD
+/* Test seam for frontier scenario 10: make seg_resync_graves_wide's
+   open/fstat fail so slotcask_open fails closed (the failure the
+   fail-closed rule answers). */
+static int g_fail_wide_resync_opens = 0;
+void slotcask_test_fail_wide_resync_opens(int on) {
+    __atomic_store_n(&g_fail_wide_resync_opens, on, __ATOMIC_SEQ_CST);
+}
+#endif
+
+static int seg_resync_graves_wide(const char *path, const uint8_t *map,
+                                   size_t map_size, size_t pos,
+                                   size_t max_slot_size, size_t *out_off) {
+    if (pos >= map_size) return 0;
+    if (seg_scan_varlen_resync_graves(map, map_size, pos, max_slot_size,
+                                       max_slot_size, out_off))
+        return 1;                                    /* bounded: no syscalls */
+    if (pos + max_slot_size >= map_size) return 0;   /* bounded search covered the rest */
+    /* The segment is re-opened by path (not the segcache handle's fd:
+       seg_resync_wide_fd calls lseek, which would move a shared fd's
+       offset). Segments are never renamed during open or under vacuum's
+       exclusive lock, so a path swap is not a concern. */
+    int fd;
+    struct stat st;
+#ifdef TEST_BUILD
+    if (__atomic_load_n(&g_fail_wide_resync_opens, __ATOMIC_SEQ_CST)) {
+        errno = EIO;   /* seam: make the open/fstat fail */
+        fd = -1;
+    } else
+#endif
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;                           /* errno set by open */
+    if (fstat(fd, &st) != 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    /* A segment larger than the mapping only occurs with the test
+       seg-max override; search the covered range only. */
+    off_t fsz = ((size_t)st.st_size < map_size) ? st.st_size : (off_t)map_size;
+    off_t found = 0;
+    int rc = seg_resync_wide_fd(fd, path, fsz, max_slot_size,
+                                 (off_t)(pos + max_slot_size), &found);
+    close(fd);
+    if (rc == 1) { *out_off = (size_t)found; return 1; }
+    if (rc == 0) return 0;
+    errno = EIO;
+    return -1;
+}
+
 /* Per-stream recovery worker arg. Used by recover_streams to fan out
    independent per-stream I/O via parallel_for_io. */
 typedef struct {
@@ -4814,6 +4882,11 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
     int last_id = ids[n_ids - 1];
     off_t last_offset = 0;
 
+    /* Abandoned staged payloads ("graves") stepped over while walking the
+       active segment — declared before the segment loop so the final
+       LOG_WARN sees the per-stream total. */
+    uint64_t graves = 0;
+
     for (size_t fi = 0; fi < n_ids; fi++) {
         int file_id = ids[fi];
         char path[PATH_MAX];
@@ -4834,30 +4907,75 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
             uint8_t flag;
             uint16_t klen;
             uint32_t vlen;
-            int valid = seg_scan_varlen_struct_ok(h.map, lim, pos,
-                                                   (size_t)db->slot_size,
-                                                   &rec_size, &flag,
-                                                   &klen, &vlen, NULL);
-            if (valid && flag != 0)
+            /* Structural validity, the hash result and base's `valid` are
+               kept as separate variables (plan Task 2): a flag=0 content
+               header whose hash FAILS is structurally valid (it takes the
+               wide-resync -> flag==0 break path), NOT !valid. */
+            int struct_ok = seg_scan_varlen_struct_ok(h.map, lim, pos,
+                                                       (size_t)db->slot_size,
+                                                       &rec_size, &flag,
+                                                       &klen, &vlen, NULL);
+            int valid = struct_ok;
+            if (struct_ok && flag != 0)
                 valid = seg_scan_varlen_hash_ok(h.map, pos, klen);
 
-            if (!valid || flag == 0) {
-                size_t next;
-                if (seg_scan_varlen_resync(h.map, lim, pos,
-                                            (size_t)db->slot_size,
-                                            (size_t)db->slot_size, &next)) {
-                    pos = next;
-                    continue;
-                }
-                if (valid && flag == 0)
-                    break; /* ordinary unwritten tail */
+            if (valid && flag != 0) {           /* hash-verified live/tombstone */
+                pos += rec_size;
+                continue;
+            }
+            if (struct_ok && flag == 0 && (klen != 0 || vlen != 0) &&
+                seg_scan_varlen_hash_ok(h.map, pos, klen)) {
+                /* Abandoned staged payload ("grave"; may also be
+                   live-pending until its KFM2 marker replays): dead space,
+                   stepped over by its declared size — no later record can
+                   start inside it. A torn pending payload with an intact
+                   header lands here too; its declared size is
+                   authoritative and the region is dead. Hash failure on a
+                   flag=0 content header is NOT a grave (fall through to
+                   the desync handling below) — never a blind step.
+                   Behaviour deltas vs the pre-2026.11.2 scan: graves break
+                   -> stepped over (this fix); every gap/desync resync is
+                   no longer limited to slot_size — bounded first, then
+                   hole-aware over the whole remainder via
+                   seg_resync_graves_wide, and the tail break happens only
+                   after that search finds no hash-valid record ahead;
+                   hash-corrupted live/tombstone records keep base's
+                   resync-else-fail-closed treatment, with the wider search
+                   making "step to the next target" the outcome in more
+                   cases (deliberate). Regression case:
+                   test-slotcask-grave-run-frontier. */
+                pos += rec_size;
+                graves++;
+                continue;
+            }
+            /* Everything else — zero-fill/tail header, flag=0 content
+               header whose hash failed, live/tombstone header whose hash
+               failed, or an unparseable header — is a gap/desync. */
+            size_t next;
+            int wrc = seg_resync_graves_wide(path, h.map, lim, pos,
+                                              (size_t)db->slot_size, &next);
+            if (wrc == 1) {
+                pos = next;
+                continue;
+            }
+            if (wrc == 0) {
+                if (struct_ok && flag == 0)
+                    break; /* ordinary unwritten tail: nothing hash-valid lies ahead */
                 segcache_release(&h);
                 free(ids);
                 errno = EUCLEAN;
                 return -1;
             }
-
-            pos += rec_size;
+            /* wrc < 0: open/fstat/search I/O failure — fail closed with
+               the search's errno (Task 10; segcache_release may clobber
+               errno, so save it). */
+            {
+                int saved = errno;
+                segcache_release(&h);
+                free(ids);
+                errno = saved ? saved : EIO;
+                return -1;
+            }
         }
         last_offset = (off_t)pos;
         segcache_release(&h);
@@ -4871,6 +4989,11 @@ static int recover_one_stream(SlotcaskDb *db, int sid) {
     db->streams[sid].active_file_id = (uint32_t)last_id;
     db->streams[sid].reserve_off = (uint64_t)last_offset;
     pthread_mutex_unlock(&db->streams[sid].rotation_lock);
+    if (graves > 0)
+        LOG_WARN(LOG_SUB_SLOTCASK,
+                 "recovery: %llu staged, not-activated record(s) (skipped as dead "
+                 "space; vacuum reclaims the inert ones once the segment rotates) in active segment of stream %03d under %s",
+                 (unsigned long long)graves, sid, db->data_dir);
     free(ids);
     return 0;
 }
@@ -11305,27 +11428,40 @@ static int seg_stat_one_varlen(SlotcaskDb *db, int stream_id, uint32_t file_id,
         int ok = seg_scan_varlen_struct_ok(h.map, file_size, off,
                                             db->slot_size, &rec_size,
                                             &flag, &klen, &vlen, NULL);
-        if (ok && flag == 0) {
-            size_t next;
-            if (!seg_scan_varlen_resync(h.map, file_size, off,
-                                         db->slot_size, db->slot_size,
-                                         &next))
-                break; /* ordinary sparse tail */
-            off = next;
+        if (ok && flag == 0 && (klen != 0 || vlen != 0) &&
+            seg_scan_varlen_hash_ok(h.map, off, klen)) {
+            /* Hash-verified content grave (abandoned staged payload):
+               written and occupiable, so it counts toward total exactly
+               like a flag=2 tombstone, but never toward live. Stepped
+               over by its declared size; a failed hash is a desync and
+               falls through to the resync below — never a blind step
+               (uniform rule across all four scans;
+               docs/plans/2026-11-17-kf-grave-frontier-fix.md, Task 3). */
+            total++;
+            off += rec_size;
             continue;
         }
         if (ok && flag != 0)
             ok = seg_scan_varlen_hash_ok(h.map, off, klen);
-        if (!ok) {
+        if (!ok || flag == 0) {
+            /* Zero-fill/tail header, failed hash (live/tombstone or
+               content grave), or unparseable header: desync. Resync is
+               bounded first, then hole-aware over the whole remainder. */
             size_t next;
-            if (!seg_scan_varlen_resync(h.map, file_size, off,
-                                         db->slot_size, db->slot_size,
-                                         &next)) {
+            int wrc = seg_resync_graves_wide(path, h.map, file_size, off,
+                                              db->slot_size, &next);
+            if (wrc == 1) {
+                off = next;
+                continue;
+            }
+            if (wrc == 0) {
+                if (ok && flag == 0)
+                    break; /* ordinary sparse tail: nothing hash-valid ahead */
                 segcache_release(&h);
                 return -1;
             }
-            off = next;
-            continue;
+            segcache_release(&h);   /* wrc < 0: fail closed, errno preserved */
+            return -1;
         }
         total++;
         if (flag == 1) live++;
@@ -11348,6 +11484,34 @@ static void pool_drop_for_file(SlotcaskStream *p, uint16_t fid) {
         for (size_t r = 0; r < p->free_count[b]; r++) {
             if (p->free_slots[b][r].file_id != fid)
                 p->free_slots[b][w++] = p->free_slots[b][r];
+        }
+        p->free_count[b] = w;
+    }
+    pthread_mutex_unlock(&p->pool_lock);
+}
+
+/* Drop any pool entry overlapping the consumed [off, off+len) slot of
+   `fid`. Called by varlen_compact_cb before it writes a migrated record
+   into a recipient tombstone/grave slot: at open the pool was rebuilt
+   from the recipient's kf tombstones, so the slot the migration consumes
+   may still sit in the pool — the next insert would pop it and overwrite
+   the migrated record (Task 9 / M3,
+   docs/plans/2026-11-17-kf-grave-frontier-fix.md; regression case
+   test-slotcask-compact-pool-consumed). Vacuum holds the exclusive
+   object lock, so there is no concurrent popper. A reopen cannot
+   resurrect the slot (the rebuild checks the record hash). */
+static void pool_drop_range(SlotcaskStream *p, uint16_t fid, uint32_t off,
+                             uint32_t len) {
+    pthread_mutex_lock(&p->pool_lock);
+    for (int b = 0; b < SLOTCASK_POOL_BUCKETS; b++) {
+        size_t w = 0;
+        for (size_t r = 0; r < p->free_count[b]; r++) {
+            SlotcaskFreeSlot *s = &p->free_slots[b][r];
+            if (s->file_id == fid &&
+                s->offset < off + len &&
+                off < s->offset + s->capacity)
+                continue;   /* overlaps the consumed range: drop */
+            p->free_slots[b][w++] = *s;
         }
         p->free_count[b] = w;
     }
@@ -11405,6 +11569,15 @@ static int varlen_compact_cb(const uint8_t *rec, size_t vlen,
 
     uint32_t target_off = c->free_offs[slot_idx];
     c->free_next = slot_idx + 1;
+
+    /* The slot we are about to consume may still sit in the stream's
+       free pool (rebuilt at open from the recipient's kf tombstones).
+       Drop any overlapping pool entry BEFORE the migrated record lands,
+       or the next insert pops the slot and overwrites the record (Task
+       9 / M3). Vacuum holds the exclusive object lock. */
+    pool_drop_range(&c->db->streams[c->stream_id],
+                    (uint16_t)c->recipient_fid, target_off,
+                    (uint32_t)donor_rec_size);
 
     /* Remove this slot from the free list by swapping with the last used
        position and shrinking free_count.  This avoids O(n²) compaction. */
@@ -11504,10 +11677,18 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
 
     size_t rmap_size = rh.map_size;
 
-    /* Walk recipient records to find tombstone slots (flag == 2) with
-       capacity. Never add flag==0 padding or sparse tail bytes to the free
-       list: those bytes are not records and may contain a later record after
-       slot reuse. */
+    /* Walk recipient records to collect free slots with capacity: flag==2
+       tombstones, and (2026.11.2) hash-verified content graves —
+       abandoned staged payloads, stepped over/harvested at their exact
+       declared extent (no later record can start inside a grave, so the
+       capacity cannot double-book with a tombstone harvested later in
+       the same walk; every grave is hash-verified before its capacity is
+       harvested — an unverified forged extent could overlap migrated
+       records and corrupt the recipient). Zeros-only flag==0 padding and
+       sparse tail bytes are still never added to the free list: those
+       bytes are not records. Resync is bounded first, then hole-aware
+       over the whole remainder
+       (docs/plans/2026-11-17-kf-grave-frontier-fix.md, Task 3). */
     uint32_t *free_offs = NULL;
     uint32_t *free_caps = NULL;
     size_t free_count = 0, free_cap = 0;
@@ -11518,62 +11699,68 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
         uint8_t flag;
         uint16_t klen;
         uint32_t vlen;
-        int ok = seg_scan_varlen_struct_ok(rh.map, rmap_size, off,
-                                            db->slot_size, &rec_size,
-                                            &flag, &klen, &vlen, NULL);
-        if (!ok) {
-            size_t next;
-            if (!seg_scan_varlen_resync(rh.map, rmap_size, off,
-                                         db->slot_size, db->slot_size,
-                                         &next)) {
-                free(free_offs);
-                free(free_caps);
-                segcache_release(&rh);
-                return -1;
+        int struct_ok = seg_scan_varlen_struct_ok(rh.map, rmap_size, off,
+                                                   db->slot_size, &rec_size,
+                                                   &flag, &klen, &vlen, NULL);
+        int grave = 0;
+        int usable = 0;
+        if (struct_ok && flag == 0 && (klen != 0 || vlen != 0) &&
+            seg_scan_varlen_hash_ok(rh.map, off, klen)) {
+            grave = 1;
+            usable = 1;
+        } else if (struct_ok && flag != 0 &&
+                   seg_scan_varlen_hash_ok(rh.map, off, klen)) {
+            usable = 1;
+        }
+
+        if (usable) {
+            if (grave || flag == 2) {
+                if (free_count == free_cap) {
+                    size_t nc = free_cap ? free_cap * 2 : 256;
+                    uint32_t *old_o = free_offs;
+                    uint32_t *old_c = free_caps;
+                    uint32_t *t = realloc(free_offs, nc * sizeof(uint32_t));
+                    uint32_t *c = realloc(free_caps, nc * sizeof(uint32_t));
+                    if (!t) { free(old_o); free(c ? c : old_c); segcache_release(&rh); return -1; }
+                    if (!c) { free(t); free(old_c); segcache_release(&rh); return -1; }
+                    free_offs = t;
+                    free_caps = c;
+                    free_cap = nc;
+                }
+                free_offs[free_count] = (uint32_t)off;
+                free_caps[free_count] = (uint32_t)rec_size;
+                free_count++;
             }
+            off += rec_size;
+            continue;
+        }
+
+        /* Zero-fill/tail header, hash-failed (live/tombstone or content
+           grave — never harvested unverified), or unparseable header:
+           desync. */
+        size_t next;
+        int wrc = seg_resync_graves_wide(recipient_path, rh.map, rmap_size,
+                                          off, db->slot_size, &next);
+        if (wrc == 1) {
             off = next;
             continue;
         }
-        if (flag == 0) {
-            size_t next;
-            if (!seg_scan_varlen_resync(rh.map, rmap_size, off,
-                                         db->slot_size, db->slot_size,
-                                         &next))
-                break; /* ordinary sparse tail */
-            off = next;
-            continue;
+        if (wrc == 0) {
+            if (struct_ok && flag == 0)
+                break; /* nothing hash-valid ahead: ordinary sparse tail */
+            free(free_offs);
+            free(free_caps);
+            segcache_release(&rh);
+            return -1;
         }
-        if (!seg_scan_varlen_hash_ok(rh.map, off, klen)) {
-            size_t next;
-            if (!seg_scan_varlen_resync(rh.map, rmap_size, off,
-                                         db->slot_size, db->slot_size,
-                                         &next)) {
-                free(free_offs);
-                free(free_caps);
-                segcache_release(&rh);
-                return -1;
-            }
-            off = next;
-            continue;
+        {
+            int saved = errno;   /* wrc < 0: fail closed, errno preserved */
+            free(free_offs);
+            free(free_caps);
+            segcache_release(&rh);
+            errno = saved ? saved : EIO;
+            return -1;
         }
-        if (flag == 2) {
-            if (free_count == free_cap) {
-                size_t nc = free_cap ? free_cap * 2 : 256;
-                uint32_t *old_o = free_offs;
-                uint32_t *old_c = free_caps;
-                uint32_t *t = realloc(free_offs, nc * sizeof(uint32_t));
-                uint32_t *c = realloc(free_caps, nc * sizeof(uint32_t));
-                if (!t) { free(old_o); free(c ? c : old_c); segcache_release(&rh); return -1; }
-                if (!c) { free(t); free(old_c); segcache_release(&rh); return -1; }
-                free_offs = t;
-                free_caps = c;
-                free_cap = nc;
-            }
-            free_offs[free_count] = (uint32_t)off;
-            free_caps[free_count] = (uint32_t)rec_size;
-            free_count++;
-        }
-        off += rec_size;
     }
 
     /* The callback acquires kfcache before briefly reacquiring this recipient
@@ -11748,8 +11935,31 @@ static int compact_one_stream(SlotcaskDb *db, int stream_id) {
 }
 
 /* Public entry point. Caller must hold objlock_wrlock for the object. */
-int slotcask_compact_segs(SlotcaskDb *db, int *out_dropped) {
+/* A flag=0 record can be live-pending: its KFM2 marker (left on disk
+   after a failed post-publish kf-dir fsync) is replayed later from
+   exactly that segment slot. Migration reuses hash-verified flag=0
+   space, so with any marker pending (or the marker directory
+   unreadable) skip segment compaction for the whole object — the next
+   replay or startup clears the marker and a later vacuum compacts.
+   Vacuum holds the object lock exclusively, so no marker can appear
+   between this check and the migration. *out_skipped is 1 when skipped. */
+int slotcask_compact_segs_ex(SlotcaskDb *db, int *out_dropped,
+                             int *out_skipped) {
     if (!db) return -1;
+    if (out_skipped) *out_skipped = 0;
+    int pend = object_has_pending_markers(db->data_dir);
+    if (pend != 0) {
+        if (pend < 0)
+            LOG_WARN(LOG_SUB_SLOTCASK,
+                     "segment compaction skipped: marker directory unreadable (%s)",
+                     strerror(errno));
+        else
+            LOG_WARN(LOG_SUB_SLOTCASK,
+                     "segment compaction skipped: pending KFM2 markers");
+        if (out_dropped) *out_dropped = 0;
+        if (out_skipped) *out_skipped = 1;
+        return 0;
+    }
     int total = 0;
     for (int s = 0; s < db->num_streams; s++) {
         int rc = compact_one_stream(db, s);
@@ -11758,6 +11968,10 @@ int slotcask_compact_segs(SlotcaskDb *db, int *out_dropped) {
     }
     if (out_dropped) *out_dropped = total;
     return 0;
+}
+
+int slotcask_compact_segs(SlotcaskDb *db, int *out_dropped) {
+    return slotcask_compact_segs_ex(db, out_dropped, NULL);
 }
 
 /* Count the pending bitmap-remap repair markers under <data_dir>/indexes,

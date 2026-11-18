@@ -94,11 +94,23 @@ VARLEN records are rounded up to the next 8-byte boundary. When a new
 record reuses a larger tombstoned slot, the bytes between the record's
 natural end and that slot's old capacity are zero-filled padding. Scanners
 must therefore advance by the record's natural size and, when they land in
-that padding, resynchronize only at the next 8-byte-aligned header whose
-flag and key hash validate. The resync search is bounded by the owning
-object's maximum slot size; an unrecoverable non-padding desync aborts the
-scan so compaction cannot mistake an unaccounted live record for an empty
-segment.
+that padding, resynchronize at the next 8-byte-aligned header whose
+flag and key hash validate. Since 2026.11.2 the resync targets also
+include structurally valid flag=0 records with content — abandoned staged
+payloads ("graves": the durable P-phase bytes of a write whose marker and
+activation never happened; inert until its segment rotates, and reclaimed
+by vacuum; a staged record can also be live-pending until its KFM2 marker
+replays, which is why stepping over it by declared size is safe) — and
+every such target is hash-verified first. A desync search runs bounded by
+the owning object's maximum slot size first, then (on a miss) hole-aware
+over the rest of the segment: data extents found via
+`lseek(SEEK_DATA/SEEK_HOLE)` on filesystems where a runtime probe trusts
+`SEEK_DATA`, read with `pread` (never through the mapping) and padded by
+one slot so a record spanning into a hole-punched region still parses;
+other filesystems take a rolling `pread` scan. The scan only breaks as an
+ordinary unwritten tail once that search proves no hash-valid record lies
+ahead; an unrecoverable non-padding desync still aborts the scan so
+compaction cannot mistake an unaccounted live record for an empty segment.
 
 **flag at byte 18** mirrors the keyfile flag. A `pwrite()` of one byte tombstones a record without rewriting the value. The kf flag is the *commit truth*; the seg flag is a redundant mirror used by full-segment recovery scans.
 

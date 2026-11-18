@@ -59,6 +59,44 @@ void odirect_init_buf_size(void);
 void *od_alloc_buf(void);
 
 /* ---------------------------------------------------------------------------
+ * Hole-aware wide resync support (2026.11.2)
+ * ------------------------------------------------------------------------- */
+
+/* Is lseek(SEEK_DATA) trustworthy on the filesystem backing `fd` (path
+ * gives the directory the runtime probe file is created in)?  Trusted
+ * means the property the hole-aware wide resync relies on: a dirty,
+ * unflushed page is reported as data.  Probed once per st_dev and
+ * cached (fixed 32-entry table); any probe failure returns 0 without
+ * caching, so it is retried on a later call. */
+int od_seek_data_trusted(int fd, const char *path);
+
+/* Hole-aware wide resync search: returns 1 and the absolute offset of
+ * the next resume target (a hash-verified live/tombstone header or a
+ * hash-verified content grave — what seg_scan_varlen_resync_graves
+ * accepts) at or after `from`, 0 when none lies ahead, -1 on I/O error
+ * (errno set). `from` is the first byte not already covered by the
+ * caller's bounded search. All reads are pread (never through a
+ * mapping); on filesystems where od_seek_data_trusted holds, only data
+ * extents are read, each padded by max_slot_size so a record running
+ * into a hole-punched region still parses. Any SEEK_DATA anomaly falls
+ * back to an untrusted rolling pread scan of the remainder. */
+int seg_resync_wide_fd(int fd, const char *path, off_t file_size,
+                       size_t max_slot_size, off_t from, off_t *out_off);
+
+#ifdef TEST_BUILD
+/* Bytes read by every pread inside od_varlen_resync_find and
+ * seg_resync_wide_fd since the last reset. Test instrumentation for
+ * test-od-scan-healthy-tail's healthy-tail read bound. */
+uint64_t od_test_resync_bytes_read(void);
+/* SEEK_DATA probe seams (test-od-scan-healthy-tail): force a definitive
+   untrusted verdict, count real probes, clear the verdict cache. */
+void od_test_force_probe_untrusted(int on);
+uint64_t od_test_probe_count(void);
+void od_test_probe_cache_reset(void);
+void od_test_resync_bytes_reset(void);
+#endif
+
+/* ---------------------------------------------------------------------------
  * Scan callback types
  * ------------------------------------------------------------------------- */
 

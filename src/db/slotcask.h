@@ -212,6 +212,14 @@ void slotcask_test_set_seg_max_bytes(size_t bytes);
 #define slotcask_seg_max_bytes() SLOTCASK_SEG_MAX_BYTES
 #endif
 
+/* Test-only: make seg_resync_graves_wide's open/fstat fail so
+   slotcask_open fails closed (frontier scenario 10 pins the
+   fail-closed behaviour of the wide resync; Task 10 of
+   docs/plans/2026-11-17-kf-grave-frontier-fix.md). */
+#ifdef TEST_BUILD
+void slotcask_test_fail_wide_resync_opens(int on);
+#endif
+
 /* ============================================================ Per-stream pool */
 
 /* Number of size-class buckets in the per-stream free pool.
@@ -376,6 +384,10 @@ void slotcask_close(SlotcaskDb *db);
    objlock_wrlock for the object. *out_dropped (optional) receives the total
    number of seg files unlinked across all streams. Returns 0 on success. */
 int  slotcask_compact_segs(SlotcaskDb *db, int *out_dropped);
+/* As slotcask_compact_segs, plus *out_skipped = 1 when compaction was
+   skipped because KFM2 markers are pending (or unreadable). */
+int  slotcask_compact_segs_ex(SlotcaskDb *db, int *out_dropped,
+                              int *out_skipped);
 
 /* Returns the pool bucket index (0-3) for a slot of given capacity.
    max_slot_size is db->slot_size (the object's schema max). */

@@ -282,6 +282,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_read_objlock_contention.c \
     src/test/cases/test_backup_objlock.c \
     src/test/cases/test_backup_files.c \
+    src/test/cases/test_backup_copy_sparse.c \
     src/test/cases/test_restore_tokens.c \
     src/test/cases/test_shard_stats_hint.c \
     src/test/cases/test_startup_validator.c \
@@ -301,6 +302,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_slotcask_v2_schema.c \
     src/test/cases/test_slotcask_v2_crash.c \
     src/test/cases/test_slotcask_active_recovery_resync.c \
+    src/test/cases/test_slotcask_grave_run_frontier.c \
     src/test/cases/test_slotcask_v2_concurrent.c \
     src/test/cases/test_varlen_pool_donation_stride.c \
     src/test/cases/test_single_op_index_sync.c \
@@ -479,6 +481,9 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_varlen_scan_resync.c \
     src/test/cases/test_varlen_scan_resync_odirect.c \
     src/test/cases/test_varlen_compact_stat_resync.c \
+    src/test/cases/test_slotcask_vacuum_grave_run.c \
+    src/test/cases/test_slotcask_compact_pool_consumed.c \
+    src/test/cases/test_od_scan_healthy_tail.c \
     src/test/cases/test_varlen_compact_recipient_resync.c \
     src/test/cases/test_varlen_compact_donor_resync.c \
     src/test/cases/test_varlen_compact_donor_preserved_on_desync.c \

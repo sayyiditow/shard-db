@@ -66,6 +66,14 @@
 #include <pthread.h>
 #include <errno.h>
 #include <stdint.h>
+#include <limits.h>
+#include <libgen.h>
+#ifdef __APPLE__
+#include <sys/param.h>
+#include <sys/mount.h>
+#else
+#include <sys/vfs.h>
+#endif
 
 static inline uint16_t bts_data_len(const uint8_t *e);
 static inline uint8_t bts_prefix_len(const uint8_t *e);
@@ -121,6 +129,279 @@ void odirect_init_buf_size(void)
     }
     atomic_store_explicit(&odirect_buf_size, ODIRECT_BUF_SIZE_DEFAULT,
                           memory_order_relaxed);
+}
+
+/* ============================================================
+ * TEST_BUILD instrumentation: bytes read by resync searches
+ * ========================================================= */
+
+#ifdef TEST_BUILD
+/* Byte count of every pread issued by od_varlen_resync_find and
+ * seg_resync_wide_fd (docs/plans/2026-11-17-kf-grave-frontier-fix.md,
+ * Task 4a). Read by test-od-scan-healthy-tail's healthy-tail bound. */
+static _Atomic uint64_t g_od_resync_bytes_read = 0;
+
+uint64_t od_test_resync_bytes_read(void) {
+    return atomic_load_explicit(&g_od_resync_bytes_read, memory_order_relaxed);
+}
+
+void od_test_resync_bytes_reset(void) {
+    atomic_store_explicit(&g_od_resync_bytes_read, 0, memory_order_relaxed);
+}
+#endif /* TEST_BUILD */
+
+/* ============================================================
+ * SEEK_DATA trust probe (hole-aware wide resync support)
+ * ========================================================= */
+
+/* Is `lseek(SEEK_DATA)` trustworthy on the filesystem backing `fd`?
+ *
+ * The hole-aware wide resync (seg_resync_wide_fd) relies on the
+ * property "a dirty, unflushed page is reported as data by
+ * lseek(SEEK_DATA)": the segments it searches are mmap'd MAP_SHARED and
+ * may hold dirty unflushed writes, and a SEEK_DATA that skipped a dirty
+ * page could hide a record the caller must find. Rather than guessing
+ * from filesystem type, probe the exact property at runtime, once per
+ * st_dev (fixed 32-entry cache; a full cache just probes every call).
+ *
+ * Probe: mkstemp a .sdprobe-XXXXXX file in dirname(path) (same
+ * filesystem), unlink it at once (no reader ever sees the name; the
+ * crash window between mkstemp and unlink leaves a file every directory
+ * reader ignores — data_file_id_from_name returns -1 for non-.dat
+ * names), ftruncate 8 MiB, dirty one page with pwrite (NOT an mmap
+ * store: a write fault on a full or quota-limited filesystem delivers
+ * SIGBUS, which would crash a daemon restart that base survives;
+ * pwrite returns ENOSPC/EDQUOT cleanly and leaves the same dirty
+ * page-cache state), then lseek(fd, 0, SEEK_DATA): trusted iff the
+ * reported data offset is <= the dirty byte. Any failure (cannot
+ * create the file — read-only dir, EACCES, ENOSPC, EDQUOT, EROFS —
+ * pwrite error, ENXIO, unsupported) → NOT trusted and NOT cached (the
+ * probe is retried on a later call). */
+#define OD_SD_CACHE_ENTRIES 32
+static pthread_mutex_t g_sd_probe_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Keyed on st_dev AND the filesystem id/type (fstatfs): a st_dev number
+   can be reused by a different filesystem after an unmount/remount. */
+static struct {
+    dev_t dev; fsid_t fsid; long ftype; int trusted;
+} g_sd_probe_cache[OD_SD_CACHE_ENTRIES];
+
+static int sd_cache_match(size_t i, dev_t dev, const struct statfs *sf) {
+    return g_sd_probe_cache[i].dev == dev &&
+           g_sd_probe_cache[i].ftype == (long)sf->f_type &&
+           memcmp(&g_sd_probe_cache[i].fsid, &sf->f_fsid, sizeof(fsid_t)) == 0;
+}
+static size_t g_sd_probe_cache_len = 0;
+
+#ifdef TEST_BUILD
+static _Atomic int g_sd_test_force_untrusted = 0;
+static _Atomic uint64_t g_sd_test_probes = 0;
+void od_test_force_probe_untrusted(int on) {
+    atomic_store(&g_sd_test_force_untrusted, on);
+}
+uint64_t od_test_probe_count(void) { return atomic_load(&g_sd_test_probes); }
+void od_test_probe_cache_reset(void) {
+    pthread_mutex_lock(&g_sd_probe_lock);
+    g_sd_probe_cache_len = 0;
+    pthread_mutex_unlock(&g_sd_probe_lock);
+    atomic_store(&g_sd_test_probes, 0);
+}
+#endif
+
+int od_seek_data_trusted(int fd, const char *path) {
+    struct stat st;
+    struct statfs sf;
+    if (fstat(fd, &st) != 0) return 0;
+    if (fstatfs(fd, &sf) != 0) return 0;
+
+    pthread_mutex_lock(&g_sd_probe_lock);
+    for (size_t i = 0; i < g_sd_probe_cache_len; i++) {
+        if (sd_cache_match(i, st.st_dev, &sf)) {
+            int t = g_sd_probe_cache[i].trusted;
+            pthread_mutex_unlock(&g_sd_probe_lock);
+            return t;
+        }
+    }
+    pthread_mutex_unlock(&g_sd_probe_lock);
+
+    /* dirname() may modify its argument; `path` is const. */
+    char dirbuf[PATH_MAX];
+    snprintf(dirbuf, sizeof(dirbuf), "%s", path);
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof(tmpl), "%s/.sdprobe-XXXXXX", dirname(dirbuf));
+    int pfd = mkstemp(tmpl);
+    if (pfd < 0) return 0;
+    (void)unlink(tmpl);
+
+    int trusted = 0;
+    int definitive = 0;   /* the lseek ran and answered: safe to cache */
+#ifdef TEST_BUILD
+    atomic_fetch_add(&g_sd_test_probes, 1);
+    if (atomic_load(&g_sd_test_force_untrusted)) {
+        close(pfd);
+        definitive = 1;   /* simulated definitive untrusted verdict */
+        goto cache_verdict;
+    }
+#endif
+    if (ftruncate(pfd, 8LL * 1024 * 1024) == 0) {
+        char b = 'P';
+        if (pwrite(pfd, &b, 1, 4LL * 1024 * 1024 + 123) == 1) {
+            off_t d = lseek(pfd, 0, SEEK_DATA);
+            /* A filesystem reporting the whole file as data returns 0 —
+               still sound, merely not sparse-aware. */
+            trusted = (d >= 0 && d <= 4LL * 1024 * 1024 + 123);
+            /* A real "dirty page skipped" (offset past it, or ENXIO) is a
+               definitive untrusted verdict; any other errno is not. */
+            definitive = (d >= 0) || errno == ENXIO;
+        }
+    }
+    close(pfd);
+
+    /* Environmental failure (mkstemp/ftruncate/pwrite error, odd errno):
+       not trusted, NOT cached, retried later. A definitive untrusted
+       verdict IS cached so each wide search does not recreate, write and
+       unlink an 8 MiB probe file. */
+#ifdef TEST_BUILD
+cache_verdict:
+#endif
+    if (!trusted && !definitive) return 0;
+
+    pthread_mutex_lock(&g_sd_probe_lock);
+    /* Re-scan under the lock: parallel recovery workers can all miss at
+       once, then serialize here. */
+    for (size_t i = 0; i < g_sd_probe_cache_len; i++) {
+        if (sd_cache_match(i, st.st_dev, &sf)) {
+            pthread_mutex_unlock(&g_sd_probe_lock);
+            return g_sd_probe_cache[i].trusted;
+        }
+    }
+    if (g_sd_probe_cache_len < OD_SD_CACHE_ENTRIES) {
+        g_sd_probe_cache[g_sd_probe_cache_len].dev = st.st_dev;
+        g_sd_probe_cache[g_sd_probe_cache_len].fsid = sf.f_fsid;
+        g_sd_probe_cache[g_sd_probe_cache_len].ftype = (long)sf.f_type;
+        g_sd_probe_cache[g_sd_probe_cache_len].trusted = trusted;
+        g_sd_probe_cache_len++;
+    }
+    pthread_mutex_unlock(&g_sd_probe_lock);
+    return trusted;
+}
+
+/* ── hole-aware wide resync search ────────────────────────────────────
+ *
+ * Find the next resume target (a hash-verified live/tombstone header or
+ * a hash-verified content grave, i.e. exactly what
+ * seg_scan_varlen_resync_graves accepts) at or after `from`. Returns 1
+ * and the absolute target offset, 0 when no target lies ahead, -1 on
+ * I/O error (errno set). `from` is the first byte not already covered
+ * by the caller's bounded search.
+ *
+ * The search is hole-aware: on filesystems where the runtime probe
+ * trusts SEEK_DATA (od_seek_data_trusted), it asks the kernel for data
+ * extents and searches only those, reading with pread — never through
+ * any mapping, so a healthy sparse tail costs one open, a few lseeks
+ * and one small pread instead of faulting in up to 128 MiB of zero
+ * pages (on tmpfs a read fault on a hole instantiates a 2 MiB huge
+ * page, which the next SEEK_DATA then reports as data). Every read is
+ * padded by max_slot_size so a record that starts in an extent and
+ * runs into a hole-punched region still passes struct_ok. Any anomaly
+ * drops to the untrusted rolling pread scan of the remainder — correct,
+ * slower, still mmap-fault-free (the page cache is coherent with dirty
+ * mmap pages, so fresh unflushed writes are visible). Termination: each
+ * iteration advances `off` — by limit - start > 0, or by
+ * n - max_slot_size > 0 (n > max_slot_size because buf_sz >=
+ * 2 * max_slot_size, unless the read hit EOF, which returns). "return
+ * 0" fires only after every byte range that could hold a target was
+ * read (data extents) or is a hole (zeros, which cannot hold a target:
+ * live/tombstone headers are non-zero, zero-fill flag==0 is excluded).
+ */
+#define OD_WIDE_MIN_BUF (1024UL * 1024)
+
+int seg_resync_wide_fd(int fd, const char *path, off_t file_size,
+                       size_t max_slot_size, off_t from, off_t *out_off) {
+    size_t buf_sz = 2 * max_slot_size;
+    if (buf_sz < OD_WIDE_MIN_BUF) buf_sz = OD_WIDE_MIN_BUF;
+    int trusted = od_seek_data_trusted(fd, path);
+    off_t off = from & ~(off_t)7;
+    uint8_t *buf = NULL;
+    size_t buf_cap = 0;
+    int rc_found = 0;
+
+    while (off < file_size) {
+        off_t start = off;
+        off_t limit = file_size;
+        if (trusted) {
+            off_t d = lseek(fd, off, SEEK_DATA);
+            if (d < 0) {
+                if (errno == ENXIO) { rc_found = 0; goto done; } /* only hole ahead */
+                trusted = 0;                  /* anomaly: rescan untrusted */
+                continue;
+            }
+            if (d >= file_size) { rc_found = 0; goto done; }
+            off_t h = lseek(fd, d, SEEK_HOLE);
+            if (h <= d) {                     /* must advance */
+                trusted = 0;
+                continue;
+            }
+            start = (d > off ? d : off) & ~(off_t)7;
+            limit = h < file_size ? h : file_size;   /* extent [start, limit) */
+        }
+        /* Pad the read with up to max_slot_size bytes beyond the extent
+           end (hole bytes read back as zeros) so a record that starts
+           in the extent and runs into a hole still passes struct_ok. */
+        off_t span = (limit - start) + (off_t)max_slot_size;
+        off_t avail = file_size - start;
+        off_t want_o = span < (off_t)buf_sz ? span : (off_t)buf_sz;
+        if (avail < want_o) want_o = avail;
+        size_t want = (size_t)want_o;
+        if (want > buf_cap) {
+            uint8_t *nb = realloc(buf, want);
+            if (!nb) { errno = ENOMEM; rc_found = -1; goto done; }
+            buf = nb;
+            buf_cap = want;
+        }
+        /* EINTR-safe pread; a short read happens only at EOF. */
+        size_t got_total = 0;
+        while (got_total < want) {
+            ssize_t got = pread(fd, buf + got_total, want - got_total,
+                                start + (off_t)got_total);
+            if (got < 0) {
+                if (errno == EINTR) continue;
+#ifdef TEST_BUILD
+                g_od_resync_bytes_read += got_total;
+#endif
+                int e = errno;
+                rc_found = -1;
+                free(buf);                    /* done: frees again; null it */
+                buf = NULL;
+                errno = e;
+                goto done;
+            }
+            if (got == 0) break;
+#ifdef TEST_BUILD
+            g_od_resync_bytes_read += (uint64_t)got;
+#endif
+            got_total += (size_t)got;
+        }
+        size_t n = got_total;
+        if (n < want)
+            file_size = start + (off_t)n;     /* file shrank/short read = EOF */
+        size_t rel = 0;
+        if (seg_scan_varlen_resync_graves(buf, n, 0, max_slot_size, n, &rel)) {
+            *out_off = start + (off_t)rel;
+            rc_found = 1;
+            goto done;
+        }
+        if (start + (off_t)n >= file_size) { rc_found = 0; goto done; }
+        if (trusted && n == want && want == (size_t)span) {
+            off = limit;                      /* whole extent + pad covered */
+        } else {
+            off = start + (off_t)n - (off_t)max_slot_size; /* one-slot overlap */
+        }
+    }
+    rc_found = 0;
+
+done:
+    free(buf);
+    return rc_found;
 }
 
 
@@ -550,12 +831,75 @@ static inline size_t od_varlen_rec_size(uint16_t klen, uint32_t vlen) {
    scan context completely untouched and its existing teardown path works
    unmodified. Reads a bounded window starting at the 8-byte-aligned floor
    of desync_off and looks for the next structurally valid, hash-verified
-   record header via seg_scan_varlen_resync(). Returns 0 and sets
-   *out_resume_off on success; 1 if the bounded window has no such record;
-   -1 on I/O or allocation failure. A flag==0 scan hit may treat the 1
-   result as the ordinary sparse tail; every other desync must treat it as
-   an unrecoverable scan failure and must not delete or otherwise trust the
-   file beyond desync_off. */
+   record header — or hash-verified content grave ("grave"; abandoned
+   staged payload, docs/plans/2026-11-17-kf-grave-frontier-fix.md) — via
+   seg_scan_varlen_resync_graves(). On a miss it escalates to the shared
+   hole-aware wide search seg_resync_wide_fd() over the rest of the file
+   (pread-only; the fd is buffered and quiescent, so its lseeks only move
+   an unused file offset). A resync target that is a content grave reports
+   the resume offset PAST the grave (target + rec_size): the grave is dead
+   space and stepping over it is exact, which also removes the straddle
+   bounce/livelock where a grave larger than the scan chunk restarts the
+   scan at itself forever. Live/tombstone targets resume at the target so
+   the restarted scan delivers the record. If target + rec_size ==
+   file_size the resume offset is that value (the restart gets remain == 0
+   from dbctx_init and the scan ends cleanly); a target whose header does
+   not re-parse as a valid record is treated as not-found.
+   Returns 0 and sets *out_resume_off on success; 1 if no such record lies
+   ahead; -1 on I/O or allocation failure. A flag==0 scan hit may treat the
+   1 result as the ordinary tail ("no hash-valid record ahead"); every
+   other desync must treat it as an unrecoverable scan failure and must
+   not delete or otherwise trust the file beyond desync_off. */
+static int od_varlen_resume_target(int fd, const char *seg_path,
+                                    off_t file_size, size_t max_slot_size,
+                                    off_t target, off_t *out_resume) {
+    /* Re-parse the header at the target: struct_ok for the declared
+       record size + flag, so a grave resumes past itself and a bogus
+       target is not-found. The target came from a hash-verified search;
+       this pass reads the header bytes again through the fd. */
+    off_t avail_o = file_size - target;
+    size_t avail = (avail_o > (off_t)max_slot_size)
+                       ? max_slot_size : (size_t)(avail_o > 0 ? avail_o : 0);
+    if (avail < 24) return 1;
+    uint8_t *buf = malloc(avail);
+    if (!buf) return -1;
+    size_t got_total = 0;
+    while (got_total < avail) {
+        ssize_t got = pread(fd, buf + got_total, avail - got_total,
+                            target + (off_t)got_total);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            int e = errno;
+            free(buf);
+            errno = e;
+            return -1;
+        }
+        if (got == 0) break;
+        got_total += (size_t)got;
+    }
+    size_t rec_size;
+    uint8_t flag;
+    uint16_t klen;
+    uint32_t vlen;
+    int ok = seg_scan_varlen_struct_ok(buf, got_total, 0, max_slot_size,
+                                        &rec_size, &flag, &klen, &vlen, NULL);
+    free(buf);
+    if (!ok) return 1;      /* header was not a valid record */
+    if (flag == 0) {
+        /* Content grave: resume past its declared extent. */
+        off_t end = target + (off_t)rec_size;
+        if (end >= file_size) {
+            if (end > file_size) return 1;   /* not a valid record */
+            *out_resume = end;               /* == file_size: scan ends cleanly */
+            return 0;
+        }
+        *out_resume = end;
+        return 0;
+    }
+    *out_resume = target;                    /* live/tombstone: deliver on restart */
+    return 0;
+}
+
 static int od_varlen_resync_find(int fd, const char *seg_path, off_t file_size,
                                   size_t max_slot_size, off_t desync_off,
                                   off_t *out_resume_off)
@@ -597,30 +941,59 @@ static int od_varlen_resync_find(int fd, const char *seg_path, off_t file_size,
             return -1;
         }
         if (got == 0) break;
+#ifdef TEST_BUILD
+        g_od_resync_bytes_read += (uint64_t)got;
+#endif
         got_total += (size_t)got;
     }
 
     size_t next;
     size_t search_from = (desync_off > aligned_off)
         ? (size_t)(desync_off - aligned_off) : 0;
+    /* window_effective is the bound the search actually used — NOT
+       read_cap, which would skip candidates in [window,
+       window + max_slot_size); one-candidate overlap is harmless. */
+    size_t window_eff = (got_total - search_from < window)
+                            ? got_total - search_from : window;
     int found = (search_from < got_total) &&
-                seg_scan_varlen_resync(buf, got_total, search_from,
-                                       max_slot_size,
-                                       got_total - search_from < window
-                                           ? got_total - search_from : window,
-                                       &next);
+                seg_scan_varlen_resync_graves(buf, got_total, search_from,
+                                              max_slot_size,
+                                              window_eff,
+                                              &next);
     free(buf);
 
-    if (!found) {
+    if (found) {
+        off_t target = aligned_off + (off_t)next;
+        int rrc = od_varlen_resume_target(fd, seg_path, file_size,
+                                           max_slot_size, target,
+                                           out_resume_off);
+        return rrc;   /* 0 = resume set; 1 = not-found; -1 = I/O error */
+    }
+
+    /* Bounded miss: the shared hole-aware wide search covers the rest of
+       the file (extent loop, max_slot_size zero padding, overlap rule and
+       termination live in seg_resync_wide_fd — no logic duplicated here).
+       It uses the scan's own fd, which is pread-only. */
+    off_t wfrom = (aligned_off + (off_t)search_from + (off_t)window_eff)
+                  & ~(off_t)7;
+    off_t wfound = 0;
+    int wrc = seg_resync_wide_fd(fd, seg_path, file_size, max_slot_size,
+                                  wfrom, &wfound);
+    if (wrc < 0) {
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "od_varlen_resync_find: %s wide resync failed at %lld: %s",
+                  seg_path, (long long)wfrom, strerror(errno));
+        return -1;
+    }
+    if (wrc == 0) {
         LOG_DEBUG(LOG_SUB_SLOTCASK,
                   "od_varlen_resync_find: %s no valid record found within "
                   "%zu-byte per-object window starting at %lld",
                   seg_path, window, (long long)aligned_off);
         return 1;
     }
-
-    *out_resume_off = aligned_off + (off_t)next;
-    return 0;
+    return od_varlen_resume_target(fd, seg_path, file_size, max_slot_size,
+                                    wfound, out_resume_off);
 }
 
 int seg_scan_o_direct(const char *seg_path, size_t max_slot_size,
@@ -781,6 +1154,31 @@ scan_top:
             memcpy(&vlen, rec + 20, 4);
             size_t rec_size = od_varlen_rec_size(klen, (uint32_t)vlen);
 
+            /* Abandoned staged payload ("grave"; docs/plans/
+               2026-11-17-kf-grave-frontier-fix.md, Task 4): structurally
+               valid flag==0 record with content whose whole record fits
+               in the chunk and whose hash verifies its own key bytes.
+               Dead space — step over it by declared size; the callback
+               still fires only for flag==1. A hash failure takes the
+               existing resync machinery below — never a blind step,
+               because this scanner feeds vacuum donor migration and
+               reindex, where a wrongly skipped live record is data loss. */
+            if (flag == 0 && (klen != 0 || vlen != 0) &&
+                rec_size <= max_slot_size &&
+                pos + rec_size <= (size_t)chunk_len) {
+                size_t v_rs;
+                uint8_t v_flag;
+                uint16_t v_kl;
+                uint32_t v_vl;
+                if (seg_scan_varlen_struct_ok(chunk, (size_t)chunk_len, pos,
+                                               max_slot_size, &v_rs, &v_flag,
+                                               &v_kl, &v_vl, NULL) &&
+                    seg_scan_varlen_hash_ok(chunk, pos, klen)) {
+                    pos += rec_size;
+                    continue;
+                }
+            }
+
             if (flag == 0 || flag > 2 || rec_size > max_slot_size) {
                 /* Cheap in-buffer fast path: the vast majority of gaps
                    (undersized-record padding tails, tiny reused-slot
@@ -788,19 +1186,23 @@ scan_top:
                    already resident here, with the next real record only
                    a handful of bytes further in. Search this buffer
                    directly via the same primitive the slow path uses
-                   (seg_scan_varlen_resync) before paying for a full
+                   (seg_scan_varlen_resync_graves, whose targets include
+                   hash-verified content graves) before paying for a full
                    prefetch-context teardown/rebuild (dbctx_destroy +
                    pread probe + dbctx_init [+ pthread_create]) via
-                   do_resync below. Only genuinely unresolvable gaps —
-                   one that runs past the end of this chunk, or actual
-                   corruption — fall through to the slow path, which is
-                   unchanged. */
+                   do_resync below. The window stays
+                   min(remaining chunk bytes, max_slot_size) exactly as
+                   before: a miss inside the chunk falls through to
+                   od_varlen_resync_find, which does the wide search. Only
+                   genuinely unresolvable gaps — one that runs past the
+                   end of this chunk, or actual corruption — fall through
+                   to the slow path. */
                 size_t remain = (size_t)chunk_len - pos;
                 size_t window = (remain < max_slot_size) ? remain : max_slot_size;
                 size_t next_in_chunk;
-                if (seg_scan_varlen_resync(chunk, (size_t)chunk_len, pos,
-                                           max_slot_size, window,
-                                           &next_in_chunk)) {
+                if (seg_scan_varlen_resync_graves(chunk, (size_t)chunk_len, pos,
+                                                  max_slot_size, window,
+                                                  &next_in_chunk)) {
                     pos = next_in_chunk;
                     continue;
                 }
