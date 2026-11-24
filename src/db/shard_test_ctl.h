@@ -41,6 +41,11 @@ typedef enum {
                                        caller's queue push and before the
                                        blocking lock — a hit proves the
                                        caller is queued. */
+    SHARD_TEST_PHASE_ABANDONED,       /* the durable abandoned-reservation
+                                       tombstone sync that runs BEFORE a
+                                       publishing window's marker; a fault
+                                       here must leave the window
+                                       unpublished. */
     SHARD_TEST_PHASE_COUNT
 } ShardTestPhase;
 

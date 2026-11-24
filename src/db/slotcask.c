@@ -824,6 +824,7 @@ retry_kfcache_acquire:
     e->capacity = (sz - SLOTCASK_KF_HDR_SIZE) / sizeof(SlotcaskKfEntry);
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->unbooked_reuse_warned, 0, memory_order_relaxed);
     atomic_store_explicit(&e->used, 1, memory_order_release);
     e->last_access = __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
     e->file_dev = dev;
@@ -857,6 +858,23 @@ retry_kfcache_acquire:
 
     h->slot = slot;
     kf_handle_from_entry(h, e);
+    /* Open-time visibility: deleted > total can only come from legacy
+       unbooked inert tombstones that were since reused — the write side
+       books since the counter-booking fix and the reuse guard is
+       non-wrapping. Warn once per cache entry (the bit resets at
+       install, so an evicted-and-reopened entry re-warns — accepted);
+       this runs on every kfcache miss, not once per daemon. No
+       mutation: vacuum's kf-compact step and resplit recompute the
+       counters from a real scan and heal; recount/reindex do not. */
+    if (h->hdr && h->hdr->deleted > h->hdr->total &&
+        !atomic_load_explicit(&e->unbooked_reuse_warned,
+                              memory_order_relaxed)) {
+        atomic_store_explicit(&e->unbooked_reuse_warned, 1,
+                              memory_order_relaxed);
+        LOG_WARN(LOG_SUB_SLOTCASK,
+                 "kf header counters inconsistent (deleted > total) on %s; "
+                 "run vacuum to rebuild the shard", path);
+    }
     /* coverity[missing_unlock] intentional: returning with the per-slot
        rwlock held; caller releases via kfcache_release. */
     return 0;
@@ -3249,6 +3267,34 @@ static int kf_plan_window_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh,
     return -1;
 }
 
+/* Warn once per cache entry when a reuse commits against a tombstone
+   the counters never booked (on-disk state written before tombstones
+   were booked). It can also be reached when a replayed commit re-enters
+   on the same plan — that is a double-count of an already-booked
+   placement, not an unbooked tombstone, and the fallback below keeps the
+   live count from wrapping either way. Thread-safe marker: a
+   per-KfCacheEntry atomic bit (a bare static array would be a TSan
+   finding). The entry is reachable via the handle's cache slot; the
+   uncached fallback (-1) stays silent. Cleared at install, so an
+   evicted-and-reopened entry re-warns (accepted). */
+static void kf_warn_unbooked_reuse(SlotcaskKfHandle *kh) {
+    if (kh->slot < 0) return;
+    KfCacheEntry *e = &g_kfcache[kh->slot];
+    if (atomic_load_explicit(&e->unbooked_reuse_warned,
+                             memory_order_relaxed))
+        return;
+    atomic_store_explicit(&e->unbooked_reuse_warned, 1,
+                          memory_order_relaxed);
+    /* No operator action is offered: the fallback leaves live = total -
+       deleted exact, and a shard with deleted == 0 is skipped by the
+       vacuum kf-compact, which would not rebuild it anyway. */
+    LOG_WARN(LOG_SUB_SLOTCASK,
+             "reused a tombstone the kf counters never booked "
+             "(deleted==0) on %s; live count never wraps (total++ "
+             "fallback), no action required",
+             e->path);
+}
+
 /* Mutating write at a slot found by a prior kf_plan_insert_slot /
    kf_plan_window_insert_slot call. Identical bookkeeping to the old
    kf_put_new's write branches (tombstone reclaim vs fresh-slot occupy). */
@@ -3264,8 +3310,28 @@ static void kf_commit_planned_slot(SlotcaskKfHandle *kh, const KfInsertPlan *pla
     t->offset = offset;
     __atomic_store_n(&t->flag, 1, __ATOMIC_RELEASE);
     if (hdr) {
-        if (plan->reused_tomb) hdr->deleted--;
-        else                   hdr->total++;
+        if (plan->reused_tomb) {
+            if (hdr->deleted) {
+                hdr->deleted--;
+            } else {
+                /* The tombstone this reuse committed against was never
+                   booked (deleted == 0 for a flag==2 slot): on-disk state
+                   written before tombstones were booked. A replayed
+                   commit re-entering on the same plan can land here too;
+                   that is a double-count of an already-booked placement
+                   (it over-counts live by one), not an unbooked
+                   tombstone. Decrementing would wrap
+                   deleted to UINT64_MAX and clamp the whole object's
+                   live count to 0 (resolve_counts). Count the
+                   resurrected slot as a fresh placement instead: live =
+                   total - deleted stays exact, only `deleted` under-
+                   counts. Warn-once for visibility. */
+                hdr->total++;
+                kf_warn_unbooked_reuse(kh);
+            }
+        } else {
+            hdr->total++;
+        }
     }
     (*used_delta)++;
     if (out_slot) *out_slot = plan->target_slot;
@@ -3280,17 +3346,29 @@ static void kf_commit_planned_slot(SlotcaskKfHandle *kh, const KfInsertPlan *pla
    (its only stop condition) and can orphan another record in the same
    window whose accepted slot lands further along the same probe chain.
    flag==2 does not stop the walk, so tombstoning restores reachability.
-   No header total/deleted bookkeeping: no live record was ever committed
-   here, so get_live_count/get_deleted_count's total-minus-deleted
-   accounting must not count it either way. */
+   The tombstone IS booked as lived-and-died (hdr->total++ and
+   hdr->deleted++, below) — superseding the earlier no-bookkeeping intent.
+   A later insert reusing any flag==2 slot commits with hdr->deleted--
+   (kf_commit_planned_slot cannot tell an inert tombstone from a real
+   one); without a matching increment that decrement underflows when the
+   shard's deleted is 0, wraps deleted to UINT64_MAX, and clamps the
+   whole object's live count to 0 (resolve_counts). Booked only on the
+   0/1 -> 2 transition (prior_flag) so forward-replay re-entry — which
+   re-runs this write on an already-tombstoned slot — cannot
+   double-count. */
 static void kf_write_tombstone_at_slot(SlotcaskKfHandle *kh, size_t slot,
-                                        const uint8_t hash[16]) {
+                                        const uint8_t hash[16],
+                                        uint8_t prior_flag) {
     SlotcaskKfEntry *t = &kh->map[slot];
     memcpy(t->hash, hash, 16);
     t->stream_id = 0;
     t->file_id = 0;
     t->offset = 0;
     __atomic_store_n(&t->flag, 2, __ATOMIC_RELEASE);
+    if (kh->hdr && prior_flag != 2) {
+        kh->hdr->total++;
+        kh->hdr->deleted++;
+    }
 }
 
 /* Insert a brand-new kf entry. Probes via linear hashing; on first-tombstone
@@ -5682,6 +5760,10 @@ struct ReqWindow {
     int             unlink_succeeded;  /* unlink/ENOENT completed          */
     int             cleared;           /* unlink made durable by dir fsync */
     int             hooks_staged;
+    int             holes_unresolved;  /* unpublished window whose kf
+                                          reservations could not be
+                                          tombstoned durably: no later
+                                          window of the shard may commit */
     struct {
         slotcask_bulk_terminal_window_fn commit_done;
         slotcask_bulk_terminal_window_fn release_window;
@@ -7003,6 +7085,128 @@ void slotcask_test_radix_sort_sizes(size_t *a, size_t *scratch, size_t n) {
     radix_sort_sizes(a, scratch, n);
 }
 
+/* Tombstone every reservation this window abandoned (rejected after its kf
+   slot was reserved). An abandoned slot left at flag==0 hard-stops
+   kf_probe_next's chain walk, so any record committed past it becomes
+   unreachable. Only a slot that is still empty or already holds this key's
+   own tombstone is written: a live foreign entry means the reservation was
+   consumed and no hole exists. The counter booking in
+   kf_write_tombstone_at_slot must reach disk with the slot bytes, so the
+   header is marked changed on the booking transition (re-entry rewrites
+   identical bytes and does not re-mark it). Written slots are appended to
+   slots_out (capacity >= plan->nabandoned) and counted in *nout. Caller
+   holds the kf writer handle and owns the msync. */
+static void bulk_tombstone_abandoned_locked(SlotcaskKfHandle *kh,
+                                            BulkWindowPlan *plan,
+                                            size_t *slots_out,
+                                            size_t *nout) {
+    for (size_t i = 0; i < plan->nabandoned; i++) {
+        const KfInsertPlan *ap = &plan->abandoned[i];
+        SlotcaskKfEntry *t = &kh->map[ap->target_slot];
+        uint8_t tflag = __atomic_load_n(&t->flag, __ATOMIC_ACQUIRE);
+        if (tflag == 0 ||
+            (tflag == 2 && memcmp(t->hash, ap->hash, 16) == 0)) {
+            kf_write_tombstone_at_slot(kh, ap->target_slot, ap->hash, tflag);
+            if (tflag != 2)
+                plan->kf_header_changed = 1;
+            slots_out[(*nout)++] = ap->target_slot;
+        }
+    }
+}
+
+/* Write one reservation's tombstone if the slot is still ours to resolve
+   (empty, or this key's own tombstone). Returns 1 when the slot was
+   written (booked = 1 when the header counters moved), 0 when nothing was
+   needed (a live or foreign entry consumed the reservation). */
+static int kf_tombstone_reservation_locked(SlotcaskKfHandle *kh,
+                                           const KfInsertPlan *rp,
+                                           int *booked) {
+    SlotcaskKfEntry *t = &kh->map[rp->target_slot];
+    uint8_t tflag = __atomic_load_n(&t->flag, __ATOMIC_ACQUIRE);
+    if (tflag == 0 ||
+        (tflag == 2 && memcmp(t->hash, rp->hash, 16) == 0)) {
+        kf_write_tombstone_at_slot(kh, rp->target_slot, rp->hash, tflag);
+        if (tflag != 2) *booked = 1;
+        return 1;
+    }
+    return 0;
+}
+
+#define KF_RESOLVE_CHUNK 128
+
+/* Resolve every reservation of an UNPUBLISHED window durably.
+   A window that never publishes a marker (all records rejected, a hard
+   plan failure, or any pre-marker error) leaves the kf slots it reserved at
+   flag==0 — the probe walk's only stop condition — while later windows of
+   the same request have been placed beyond them through the request's
+   reservation map. Tombstone each reserved slot (active and abandoned
+   alike: nothing of this window commits) and msync them before the next
+   window can publish. Chunked with a stack vector so there is no
+   allocation to fail. Returns 0, or -1 (errno set) when a sync failed —
+   the holes are then not durable and the caller must stop later windows.
+   The header is always synced with the slots: a re-entry after a failed
+   earlier attempt finds the slots already tombstoned (booked == 0) while
+   the earlier booking may not have reached disk. */
+static int bulk_resolve_unpublished_reservations_locked(
+        SlotcaskKfHandle *kh, BulkMutationShard *shard,
+        size_t begin, size_t end) {
+    if (shard->kind != BULK_MUTATION_UPSERT) return 0;
+    size_t slots[KF_RESOLVE_CHUNK];
+    size_t n = 0;
+    int booked = 0;
+    for (size_t i = begin; i < end; i++) {
+        SlotcaskBulkState *s = &shard->st[i];
+        if (!s->has_plan) continue;
+        if (kf_tombstone_reservation_locked(kh, &s->kf_plan, &booked))
+            slots[n++] = s->kf_plan.target_slot;
+        if (n == KF_RESOLVE_CHUNK) {
+            qsort(slots, n, sizeof(*slots), size_cmp);
+            if (kfcache_sync_slots_locked(kh, slots, n, 1) != 0)
+                return -1;
+            n = 0;
+            booked = 0;
+        }
+    }
+    if (n > 0) {
+        if (n > 1) qsort(slots, n, sizeof(*slots), size_cmp);
+        if (kfcache_sync_slots_locked(kh, slots, n, 1) != 0) return -1;
+    }
+    return 0;
+}
+
+/* Tombstone a PUBLISHING window's abandoned reservations and make them
+   durable BEFORE its marker is published. The K phase tombstones them too
+   (idempotently), but its msync waits for the commit barrier — a crash
+   between marker durability and that barrier would forward-replay the
+   active entries and leave the abandoned slots at flag==0 ahead of the
+   records replay commits beyond them. */
+static int bulk_tombstone_abandoned_durable_locked(SlotcaskKfHandle *kh,
+                                                   BulkWindowPlan *plan) {
+    size_t slots[KF_RESOLVE_CHUNK];
+    size_t n = 0;
+    int booked = 0;
+    for (size_t i = 0; i < plan->nabandoned; i++) {
+        if (kf_tombstone_reservation_locked(kh, &plan->abandoned[i], &booked))
+            slots[n++] = plan->abandoned[i].target_slot;
+        if (n == KF_RESOLVE_CHUNK) {
+            qsort(slots, n, sizeof(*slots), size_cmp);
+            if (kfcache_sync_slots_locked(kh, slots, n, 1) != 0)
+                return -1;
+            n = 0;
+            booked = 0;
+        }
+    }
+    if (n > 0) {
+        if (n > 1) qsort(slots, n, sizeof(*slots), size_cmp);
+        if (kfcache_sync_slots_locked(kh, slots, n, 1) != 0) return -1;
+    }
+    if (SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_ABANDONED)) {   /* TEST_BUILD */
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 static int bulk_apply_and_sync_kf_locked(BulkMutationTxn *txn,
                                          SlotcaskKfHandle *kh,
                                          BulkWindowPlan *plan) {
@@ -7024,21 +7228,8 @@ static int bulk_apply_and_sync_kf_locked(BulkMutationTxn *txn,
     plan->nkf_slots = 0;
     plan->kf_slots = calloc(plan->nactive + plan->nabandoned, sizeof(size_t));
     if (!plan->kf_slots) return -1;
-    for (size_t i = 0; i < plan->nabandoned; i++) {
-        const KfInsertPlan *ap = &plan->abandoned[i];
-        /* Guard against clobbering a slot that another chain member's K
-           claimed after this window's publish: only tombstone when the
-           slot is still empty or already holds our own tombstone. A live
-           foreign entry means the reservation was consumed — the
-           probe-chain hole this write exists to prevent does not exist. */
-        SlotcaskKfEntry *t = &kh->map[ap->target_slot];
-        uint8_t tflag = __atomic_load_n(&t->flag, __ATOMIC_ACQUIRE);
-        if (tflag == 0 ||
-            (tflag == 2 && memcmp(t->hash, ap->hash, 16) == 0)) {
-            kf_write_tombstone_at_slot(kh, ap->target_slot, ap->hash);
-            plan->kf_slots[plan->nkf_slots++] = ap->target_slot;
-        }
-    }
+    bulk_tombstone_abandoned_locked(kh, plan, plan->kf_slots,
+                                    &plan->nkf_slots);
     for (size_t i = 0; i < plan->nactive; i++) {
         SlotcaskBulkRec *r = &shard->recs[plan->active[i]];
         SlotcaskBulkState *s = &shard->st[plan->active[i]];
@@ -7446,6 +7637,8 @@ static int bulk_publish_one_kf_window(BulkMutationTxn *txn,
     rw->plan.hook_state = NULL;
     rw->plan.hooks_staged = 0;
     if (rw->plan.nactive == 0) {
+        /* Nothing to commit: no marker, no K phase. The reservations the
+           rejected records made are resolved at out: below. */
         req_window_abort_pre_marker(rw);
         rc = 0;
         goto out;
@@ -7457,8 +7650,15 @@ static int bulk_publish_one_kf_window(BulkMutationTxn *txn,
     durability_test_pause(txn->db->data_dir, "bulk-window-prepared");
     if (bulk_sync_fallback_payloads(txn, shard, begin, end) != 0)
         goto out;
+    if (rw->plan.nabandoned > 0 &&
+        bulk_tombstone_abandoned_durable_locked(kh, &rw->plan) != 0)
+        goto out;
     if (bulk_build_window_marker_v2(&rw->plan, &buf, &len) != 0)
         goto out;
+    if (SHARD_TEST_NOTE_SYNC(SHARD_TEST_PHASE_M)) {   /* TEST_BUILD fault */
+        errno = EIO;
+        goto out;
+    }
     {
         char final_name[128];
         int nn = snprintf(final_name, sizeof(final_name),
@@ -7484,6 +7684,20 @@ static int bulk_publish_one_kf_window(BulkMutationTxn *txn,
 out:
     free(buf);
     bulk_window_plan_destroy(&plan); /* moved source is zero */
+    if (!rw->published) {
+        /* Every exit without a marker — all-rejected window, plan hard
+           failure, payload/marker I/O error — must leave no flag==0 hole
+           behind. If the tombstones cannot be made durable, report the
+           failure and let the publish loop stop later windows. */
+        int saved = errno;
+        if (bulk_resolve_unpublished_reservations_locked(kh, shard, begin,
+                                                         end) != 0) {
+            rw->holes_unresolved = 1;
+            if (rc == 0) rc = -1;
+            saved = errno ? errno : EIO;
+        }
+        errno = saved;
+    }
     if (rc != 0 && !rw->published) {
         req_window_abort_pre_marker(rw);
         for (size_t i = begin; i < end; i++)
@@ -8007,8 +8221,19 @@ static int slotcask_bulk_publish_shard(SlotcaskBulkRequest *req,
         }
         if (bulk_publish_one_kf_window(&rs->txn, &rs->shard, &kh,
                                        begin, end, rw) != 0) {
-            rc = -1; /* this window aborted pre-M; later windows may proceed */
+            rc = -1; /* this window aborted pre-M */
             if (!saved_errno) saved_errno = errno ? errno : EIO;
+            if (rw->holes_unresolved) {
+                /* Its reservations are still flag==0: a later window would
+                   probe past them (the request's reservation map) and
+                   commit records behind a hole. Fail the rest of the
+                   shard's records instead of committing them. */
+                for (size_t i = end; i < rs->shard.nrecs; i++)
+                    if (rs->shard.recs[i].status == 0)
+                        rs->shard.recs[i].status = -1;
+                rs->shard.cursor = rs->shard.nrecs;
+                break;
+            }
         }
         rs->shard.cursor = end;
     }
@@ -8582,9 +8807,22 @@ static int bulk_commit_chain_run(BulkCommitChain *chain) {
           the chain. */
     const ReqSlotRes *chain_res_map = NULL;
     size_t chain_res_cap = 0;
+    int chain_holes = 0; /* an earlier member left unresolved flag==0 holes */
     for (size_t m = 0; m < chain->nmembers; m++) {
         BulkChainMember *mem = &chain->members[m];
         if (mem->rs->stage_failed || mem->rs->payload_failed) continue;
+        if (chain_holes) {
+            /* Seeding from that member's reservation map would make this
+               member's planner skip the holes and commit records behind
+               them (unreachable on probe). Fail its records instead. */
+            mem->rs->step_failed = 1;
+            if (!mem->rs->step_errno) mem->rs->step_errno = EIO;
+            for (size_t i = 0; i < mem->in->nrecs; i++)
+                if (mem->in->recs[i].status == 0)
+                    mem->in->recs[i].status = -1;
+            rc = -1;
+            continue;
+        }
         if (req_shard_seed_chain_reservations(mem->rs, chain_res_map,
                                                chain_res_cap) != 0) {
             mem->rs->stage_failed = 1;
@@ -8605,6 +8843,8 @@ static int bulk_commit_chain_run(BulkCommitChain *chain) {
         }
         chain_res_map = mem->rs->res_map;
         chain_res_cap = mem->rs->res_cap;
+        for (size_t w = 0; w < mem->rs->nwindows; w++)
+            if (mem->rs->windows[w].holes_unresolved) chain_holes = 1;
     }
     if (bulk_commit_chain_flush_marker_dir(chain) != 0) rc = -1;
 
