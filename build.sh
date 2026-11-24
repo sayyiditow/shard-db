@@ -204,6 +204,10 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_agg_ht_resize.c \
     src/test/cases/test_agg_packed_routes.c \
     src/test/cases/test_bulk_update_delimited.c \
+    src/test/cases/test_kf_deleted_underflow.c \
+    src/test/cases/test_abort_pre_marker_holes.c \
+    src/test/cases/test_failclosed_walkers.c \
+    src/test/cases/test_audit_oracle_strictness.c \
     src/test/cases/test_remove_field.c \
     src/test/cases/test_length_ops.c \
     src/test/cases/test_unknown_field_validation.c \
@@ -231,6 +235,20 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_agg_varchar_groupby_limit.c \
     src/test/cases/test_agg_varchar_groupby_sum.c \
     src/test/cases/test_aggregate_type_matrix.c \
+    src/test/cases/test_igb_bitmap_group_fallback.c \
+    src/test/cases/test_agg_or_subtree_full_tree.c \
+    src/test/cases/test_agg_subtree_flag_fields.c \
+    src/test/cases/test_composite_exact_count_agg.c \
+    src/test/cases/test_igb_bitmap_dict_cap.c \
+    src/test/cases/test_igb_bitmap_long_value.c \
+    src/test/cases/test_igb_pass1_open_fail.c \
+    src/test/cases/test_igb_agg_open_fail_routes.c \
+    src/test/cases/test_composite_exact_formats.c \
+    src/test/cases/test_composite_exact_nocover.c \
+    src/test/cases/test_keyset_intersect_envelope.c \
+    src/test/cases/test_wfc_chunk_open_fail.c \
+    src/test/cases/test_idx_absent_shard.c \
+    src/test/cases/test_runner_include_audit.c \
     src/test/cases/test_temporal_in_criteria.c \
     src/test/cases/test_find_indexed_orderby.c \
     src/test/cases/test_find_filter_first_orderby.c \
@@ -442,6 +460,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_reindex_spill_collision.c \
     src/test/cases/test_slow_query_log.c \
     src/test/cases/test_find_with_total.c \
+    src/test/cases/test_find_subtree_totals.c \
     src/test/cases/test_o_direct_scan.c \
     src/test/cases/test_registry_single_flight.c \
     src/test/cases/test_add_indexes_single_scan.c \
@@ -494,6 +513,11 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_shard_count_nested_kf_read.c \
     src/test/cases/test_count_bitmap_bulk_lock_order.c \
     src/test/cases/test_bitmap_stream_find_flush_gate.c \
+    src/test/audit/audit_crash_restart.c \
+    src/test/audit/audit_planner_diff.c \
+    src/test/audit/audit_fault_inject.c \
+    src/test/audit/audit_craft_grave_frontier.c \
+    src/test/audit/audit_gate_resplit_bitmap.c \
     src/db/util.c \
     src/db/durability.c \
     src/db/durability_epoch.c \
@@ -527,6 +551,16 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     -Isrc/db -Isrc/test -Isrc/bench \
     $OSSL_CFLAGS $OSSL_LDFLAGS $MODE_LDFLAGS -lpthread -lssl -lcrypto
 [ "$DO_STRIP" = 1 ] && strip shard-db-test
+
+# audit fault-injection interposer — LD_PRELOAD'd into shard-db-test-server
+# by the audit campaign's fault harness (src/test/audit/audit_fault_inject.c).
+# Tool artifact: never linked into a shipped binary, never preloaded outside
+# audit runs. Linux-only: the harness interposes ELF symbols via LD_PRELOAD
+# (a Mach-O preload needs DYLD_INSERT_LIBRARIES and different semantics), so
+# the fault harness fails closed with a clear message on other platforms.
+if [ "$(uname -s)" = "Linux" ]; then
+    gcc -shared -fPIC -O1 -g -Wall -o build/bin/audit-faultlib.so audit/faultlib.c -ldl
+fi
 
 # shard-db-bench — bench runner. Same TCP+TLS client as shard-db-test,
 # different output format (latency histograms + throughput). Future bench

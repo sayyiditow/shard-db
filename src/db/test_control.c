@@ -23,6 +23,12 @@
 #include "slotcask.h"
 #include "shard_test_ctl.h"
 #include "test_control.h"
+#include "btree.h"
+/* query.c (TEST_BUILD): find-side per-leaf KeySet alloc-fault injection. */
+void build_keyset_leaf_test_set_fail_alloc(int fail_n);
+/* query_aggregate.c (TEST_BUILD): Pass-1 parallel-route observability. */
+void igb_pass1_parallel_reset_for_test(void);
+int igb_pass1_parallel_taken_for_test(void);
 
 /* Message kinds — private duplicated constants; the runner (fixtures.c)
    defines the same layout independently. */
@@ -33,6 +39,7 @@ enum {
     TEST_HOOK_ACK     = 4,
     TEST_HOOK_REACHED = 5,
     TEST_HOOK_SET_GLOBALS = 6,
+    TEST_HOOK_GET_GLOBALS = 7,   /* reply ACK .a = the queried value */
 };
 
 /* INSTALL message phase selects which daemon-side hook to arm.
@@ -55,6 +62,30 @@ enum {
 #define TEST_HOOK_SET_GLOBALS_FAIL_PHASE 5
 #define TEST_HOOK_SET_GLOBALS_FAIL_STICKY 6
 #define TEST_HOOK_SET_GLOBALS_BMFIX_BACKOFF 7
+/* Audit campaign crash/restart fuzzer: arm the window-coordinator
+ * phase-boundary pause (shard_test_phase_pause, ShardTestPhase) inside the
+ * daemon so a biased-kill test can park the next matching window at the
+ * payload-staging (P) barrier and SIGKILL there, leaving a deterministic
+ * flag=0 grave. a = phase as (int64_t) so -1 disarms round-trips; b =
+ * 1-based occurrence (which armed hit parks). The parked thread is never
+ * released through this channel — the biased-kill caller kills the daemon
+ * while parked (the 30 s park safety cap makes a missed kill self-heal). */
+#define TEST_HOOK_SET_GLOBALS_PAUSE_PHASE 8
+/* Arm the btree range-iterator open-failure seam: the NEXT
+ * btree_range_iter_open on a path ending /<NNN>.idx for the given
+ * 3-hex shard fails with EIO (one-shot; btree_test_fail_next_range_open_shard).
+ * a = shard number as (int64_t); -1 disarms (clears the pending shot). */
+#define TEST_HOOK_SET_GLOBALS_BT_RANGE_OPEN_FAIL 9
+#define TEST_HOOK_SET_GLOBALS_KEYSET_LEAF_FAIL_ALLOC 10
+#define TEST_HOOK_GET_PASS1_PARALLEL_TAKEN 11   /* GET_GLOBALS selector */
+#define TEST_HOOK_SET_GLOBALS_PASS1_RESET 12    /* a=1 resets the counter */
+/* Arm the shard-walker open-failure seam: every btree_search /
+ * btree_range_ex open of a path ending /<NNN>.idx for the given 3-hex
+ * shard fails with EIO until disarmed (btree_test_fail_walk_open_shard).
+ * Persistent — unlike selector 9's one-shot — because one query may walk
+ * the same numbered shard of several fields. a = shard number as
+ * (int64_t); -1 disarms. */
+#define TEST_HOOK_SET_GLOBALS_BT_WALK_OPEN_FAIL 13
 
 typedef struct {
     uint32_t kind;   /* INSTALL..REACHED; SET_GLOBALS=6 */
@@ -304,10 +335,66 @@ static void *test_control_thread_main(void *arg) {
                 /* a = interval in ms ((int64_t) round-trip); <= 0 means the
                    production default. */
                 atomic_store(&g_shard_test_bmfix_backoff_ms, (long)(int64_t)msg.a);
-            } else {
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_PAUSE_PHASE) {
+                /* a = ShardTestPhase ((int64_t) round-trip; -1 disarms),
+                   b = 1-based occurrence. Arm order matters, mirroring
+                   FAIL_PHASE: a worker must see hits==0 (fresh counting)
+                   and the occurrence before it sees the armed phase, so
+                   the first matching window after this ACK is the one
+                   that parks. Disarm stores the phase first so a parked
+                   worker stops waiting for a release that will never
+                   come. */
+                int pause_phase = (int)(int64_t)msg.a;
+                if (pause_phase >= 0) {
+                    atomic_store(&g_shard_test_pause_hits, 0);
+                    atomic_store(&g_shard_test_pause_release, 0);
+                    atomic_store(&g_shard_test_pause_occurrence,
+                                 (int)msg.b);
+                    atomic_store(&g_shard_test_pause_phase, pause_phase);
+                } else {
+                    /* Disarm: store the phase first so no NEW hit parks,
+                       then raise the release flag — the parked worker
+                       polls g_shard_test_pause_release every 1 ms and
+                       would otherwise sit out its full 30 s safety cap
+                       waiting for a release that will never come. */
+                    atomic_store(&g_shard_test_pause_phase, -1);
+                    atomic_store(&g_shard_test_pause_release, 1);
+                }
+            } else if (msg.phase ==
+                       TEST_HOOK_SET_GLOBALS_BT_RANGE_OPEN_FAIL) {
+                /* a = index shard number ((int64_t) round-trip); -1
+                   disarms a pending (unconsumed) failure shot. b = how
+                   many matching opens to skip before firing (reaches a
+                   later route's open of the same numbered shard). */
+                btree_test_fail_nth_range_open_shard((int)(int64_t)msg.a,
+                                                     (int)msg.b);
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_PASS1_RESET) {
+                /* a = 1: zero the Pass-1 parallel-route counter. */
+                if (msg.a)
+                    igb_pass1_parallel_reset_for_test();
+            } else if (msg.phase ==
+                       TEST_HOOK_SET_GLOBALS_KEYSET_LEAF_FAIL_ALLOC) {
+                /* a = countdown of per-leaf KeySet-build allocations to
+                   fail with ENOMEM (atomic; 0 disarms). Deterministic
+                   hard-failure trigger for the find-side keyset builds,
+                   whose shard walks do not go through
+                   btree_range_iter_open (selector 9 does not reach
+                   them). */
+                build_keyset_leaf_test_set_fail_alloc((int)(int64_t)msg.a);
+            } else if (msg.phase ==
+                       TEST_HOOK_SET_GLOBALS_BT_WALK_OPEN_FAIL) {
+                /* a = index shard number; every btree_search /
+                   btree_range_ex open of that shard's .idx fails with EIO
+                   until disarmed (a = -1) — persistent, because a query
+                   may walk the same numbered shard of several fields and
+                   the test must not depend on which walk comes first. */
+                btree_test_fail_walk_open_shard((int)(int64_t)msg.a);
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_KF_SEAMS) {
                 atomic_store(&g_shard_test_kf_initial_slots, (size_t)msg.a);
                 atomic_store(&g_shard_test_kf_max_slots, (size_t)msg.b);
             }
+            /* an unknown selector is ignored (still ACKed): it must never
+               fall through into the kf seams */
             break;
         case TEST_HOOK_CLEAR:
             slotcask_test_set_after_old_hook(NULL, NULL);
@@ -321,8 +408,21 @@ static void *test_control_thread_main(void *arg) {
             pthread_cond_broadcast(&c->cond);
             pthread_mutex_unlock(&c->lock);
             break;
-        default:
-            break; /* malformed message — stop the control thread */
+        case TEST_HOOK_GET_GLOBALS:
+            /* Reply ACK carries the queried value in .a. Only the Pass-1
+               route counter today; extend with more selectors as needed. */
+            {
+                /* Unknown selectors reply UINT64_MAX so a client never
+                   blocks waiting for an answer that will not come. */
+                uint64_t val = UINT64_MAX;
+                if (msg.phase == TEST_HOOK_GET_PASS1_PARALLEL_TAKEN)
+                    val = (uint64_t)igb_pass1_parallel_taken_for_test();
+                TestHookMessage rep2 = { .kind = TEST_HOOK_ACK,
+                                         .phase = 0, .a = val };
+                if (test_control_write_full(c->fd, &rep2, sizeof(rep2)) != 0)
+                    return NULL;
+                continue;   /* the shared ACK below must not double-reply */
+            }
         }
 
         if (msg.kind == TEST_HOOK_INSTALL || msg.kind == TEST_HOOK_RELEASE ||

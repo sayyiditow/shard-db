@@ -101,6 +101,42 @@ int test_env_ctl_set_bmks_race(TestEnv *env, int stage);
    armed before the phase and cleared after the disarm. */
 int test_env_ctl_set_fail_phase(TestEnv *env, int phase, int occurrence,
                                 int sticky);
+/* Window-coordinator pause arm (audit crash/restart fuzzer): park the
+   `occurrence`-th phase-boundary hit of `phase` (ShardTestPhase; -1
+   disarms) inside the TEST_BUILD daemon. The parked thread blocks until
+   released or the 30 s park cap; biased-kill callers SIGKILL while parked
+   and never release through this channel. Requires a test-server daemon
+   (test_control_fd >= 0). */
+int test_env_ctl_set_pause_phase(TestEnv *env, int phase, int occurrence);
+/* Btree range-iterator open-failure seam: the daemon's NEXT
+   btree_range_iter_open on `<idx-dir>/<shard:03x>.idx` fails with EIO
+   (one-shot; a concurrent open race decides which caller takes it).
+   shard = -1 disarms a pending shot. In-process fault for open failures
+   on EXISTING index files — unlike a chmod 000 it is root-safe (root
+   ignores file modes) and needs no daemon restart. Requires a
+   test-server daemon (test_control_fd >= 0). */
+int test_env_ctl_set_bt_range_open_fail(TestEnv *env, int shard);
+/* Same seam with a skip count: fire on the (skip+1)-th matching open —
+   targets a later route's open of the same numbered shard when an
+   earlier query phase opens it first. */
+int test_env_ctl_set_bt_range_open_fail_nth(TestEnv *env, int shard,
+                                            int skip);
+/* Shard-walker open-failure seam (the hot eq/range walks — btree_search /
+   btree_range_ex — which never go through btree_range_iter_open): EVERY
+   open of `<idx-dir>/<shard:03x>.idx` fails with EIO until shard = -1
+   disarms. Persistent so a test does not depend on which of a query's
+   several walks of the same numbered shard runs first. Requires a
+   test-server daemon (test_control_fd >= 0). */
+int test_env_ctl_set_bt_walk_open_fail(TestEnv *env, int shard);
+/* Fail the next N per-leaf KeySet-build allocations with ENOMEM (the
+   find-side keyset builds; the bt range-open seam does not reach their
+   shard walks). fail_n = 0 disarms. */
+int test_env_ctl_set_keyset_leaf_fail_alloc(TestEnv *env, int fail_n);
+/* Reset / read the daemon-side Pass-1 parallel-route counter (the test
+   binary's own copy is a different process — always go through the
+   control channel). */
+int test_env_ctl_reset_pass1_parallel(TestEnv *env);
+int test_env_ctl_get_pass1_parallel(TestEnv *env);
 /* Growth back-off seam (F7d): override the daemon's bitmap-remap retry
    back-off interval (ms) so fault tests never sleep out a hard-coded 5 s.
    ms <= 0 restores the production default. Requires a test-server daemon

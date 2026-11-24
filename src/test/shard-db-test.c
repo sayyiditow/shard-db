@@ -21,7 +21,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
         fprintf(stderr,
-            "usage: shard-db-test list | run <name> | run-all [--filter <substr>] [--exclude <name,...>] [--jobs N]\n");
+            "usage: shard-db-test list | run <name> | run-all [--filter <substr>] [--exclude <name,...>] [--jobs N] [--include-audit]\n");
         return 1;
     }
     const char *cmd = argv[1];
@@ -37,16 +37,40 @@ int main(int argc, char **argv) {
         const char *filter = NULL;
         const char *exclude = NULL;
         int jobs = 0;
-        for (int i = 2; i + 1 < argc; i++) {
-            if (strcmp(argv[i], "--filter") == 0) filter = argv[i + 1];
-            else if (strcmp(argv[i], "--exclude") == 0) exclude = argv[i + 1];
-            else if (strcmp(argv[i], "--jobs") == 0) jobs = atoi(argv[i + 1]);
+        int include_audit = 0;
+        /* Value flags consume the following argument; --include-audit is a
+           standalone flag so it works in any position, including last. A
+           value flag followed by another option (or nothing) does not
+           consume it — `--jobs --include-audit` keeps the audit flag. A
+           value may itself start with '-' (`--filter -foo`); only a known
+           flag name is refused as a value. */
+        for (int i = 2; i < argc; i++) {
+            int has_val = i + 1 < argc &&
+                strcmp(argv[i + 1], "--filter") != 0 &&
+                strcmp(argv[i + 1], "--exclude") != 0 &&
+                strcmp(argv[i + 1], "--jobs") != 0 &&
+                strcmp(argv[i + 1], "--include-audit") != 0;
+            if (strcmp(argv[i], "--filter") == 0 && has_val) {
+                filter = argv[++i];
+            } else if (strcmp(argv[i], "--exclude") == 0 && has_val) {
+                exclude = argv[++i];
+            } else if (strcmp(argv[i], "--jobs") == 0 && has_val) {
+                jobs = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--include-audit") == 0) {
+                include_audit = 1;
+            } else {
+                /* a typo such as --include_audit must not silently skip
+                   the audit cases (or filter nothing) */
+                fprintf(stderr, "run-all: unknown or incomplete option: %s\n",
+                        argv[i]);
+                return 2;
+            }
         }
         if (jobs <= 0) {
             long nproc = sysconf(_SC_NPROCESSORS_ONLN);
             jobs = (nproc > 0) ? (int)nproc : 4;
         }
-        return test_run_all(filter, exclude, jobs) == 0 ? 0 : 1;
+        return test_run_all(filter, exclude, jobs, include_audit) == 0 ? 0 : 1;
     }
     fprintf(stderr, "unknown subcommand: %s\n", cmd);
     return 1;

@@ -90,13 +90,17 @@ static int is_excluded(const char *name, const char *exclude) {
 }
 
 /* Builds a flat array of registered cases matching `filter` (NULL = all)
-   except exact names in `exclude`. Returns the count; *out receives a
-   malloc'd array the caller must free. Both scheduler paths share this. */
+   except exact names in `exclude`. Audit cases (TEST_REGISTER_AUDIT) are
+   skipped unless include_audit is set — default `run-all` and every
+   CI/sanitizer workflow keep their pre-audit behavior. Returns the count;
+   *out receives a malloc'd array the caller must free. Both scheduler
+   paths share this. */
 static int collect_matching(const char *filter, const char *exclude,
-                            TestCaseEntry ***out) {
+                            int include_audit, TestCaseEntry ***out) {
     int cap = 16, n = 0;
     TestCaseEntry **arr = malloc((size_t)cap * sizeof(*arr));
     for (TestCaseEntry *p = g_head; p; p = p->next) {
+        if (p->audit && !include_audit) continue;
         if (filter && !strstr(p->name, filter)) continue;
         if (is_excluded(p->name, exclude)) continue;
         if (n == cap) {
@@ -399,10 +403,11 @@ static int run_all_parallel(TestCaseEntry **cases, int n, int jobs) {
     return total_failed;
 }
 
-int test_run_all(const char *filter, const char *exclude, int jobs) {
+int test_run_all(const char *filter, const char *exclude, int jobs,
+                 int include_audit) {
     test_fixture_set_jobs(jobs);
     TestCaseEntry **cases = NULL;
-    int n = collect_matching(filter, exclude, &cases);
+    int n = collect_matching(filter, exclude, include_audit, &cases);
 
     int result = jobs <= 1 ? run_all_sequential(cases, n)
                            : run_all_parallel(cases, n, jobs);
