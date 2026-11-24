@@ -1,0 +1,6 @@
+o_plain count: 7 | agg-count: {"c":7} | find rows: 7
+o_btree count: 7 | agg-count: {"c":26} | find rows: 7
+o_bitmap count: 7 | agg-count: {"c":26} | find rows: 7
+o_plain AND-control count: 5 | agg: {"c":5}
+o_btree AND-control count: 5 | agg: {"c":5}
+o_bitmap AND-control count: 5 | agg: {"c":5}

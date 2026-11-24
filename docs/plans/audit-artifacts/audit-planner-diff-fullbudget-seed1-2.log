@@ -1,0 +1,943 @@
+DIVERGENCE criterion 2 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 3 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 10 aggregate: pd_plain gave {"c":1155,"s":2886717,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 10 aggregate: pd_plain gave {"c":1155,"s":2886717,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 10 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 10 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 13 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 17 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 19 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3514,"value2":3539}]
+DIVERGENCE criterion 21 aggregate: pd_plain gave {"c":846,"s":2115195,"m":4995}
+ but pd_btree gave {"c":1000,"s":2497500,"m":4995}
+ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 21 aggregate: pd_plain gave {"c":846,"s":2115195,"m":4995}
+ but pd_bitmap gave {"c":1000,"s":2497500,"m":4995}
+ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 21 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 21 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 22 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 28 aggregate: pd_plain gave {"c":1154,"s":2886727,"m":4997}
+ but pd_btree gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 28 aggregate: pd_plain gave {"c":1154,"s":2886727,"m":4997}
+ but pd_bitmap gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 28 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 28 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 31 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 32 aggregate: pd_plain gave {"c":24,"s":72464,"m":3032}
+ but pd_btree gave {"c":26,"s":78507,"m":3032}
+ criteria=[{"field":"t","op":"between","value":3007,"value2":3032},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 32 aggregate: pd_plain gave {"c":24,"s":72464,"m":3032}
+ but pd_bitmap gave {"c":26,"s":78507,"m":3032}
+ criteria=[{"field":"t","op":"between","value":3007,"value2":3032},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 32 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":3007,"value2":3032},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 32 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3007,"value2":3032},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 33 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 34 aggregate: pd_plain gave {"c":615,"s":1537540,"m":4996}
+ but pd_btree gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 34 aggregate: pd_plain gave {"c":615,"s":1537540,"m":4996}
+ but pd_bitmap gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 34 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 34 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 35 aggregate: pd_plain gave {"c":923,"s":2307310,"m":4995}
+ but pd_btree gave {"c":1000,"s":2497500,"m":4995}
+ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":12}]}]
+DIVERGENCE criterion 35 aggregate: pd_plain gave {"c":923,"s":2307310,"m":4995}
+ but pd_bitmap gave {"c":1000,"s":2497500,"m":4995}
+ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":12}]}]
+DIVERGENCE criterion 35 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":12}]}]
+DIVERGENCE criterion 35 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":12}]}]
+DIVERGENCE criterion 38 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 40 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 41 aggregate: pd_plain gave {"c":1052,"s":2629605,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 41 aggregate: pd_plain gave {"c":1052,"s":2629605,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 41 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 41 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 48 aggregate: pd_plain gave {"c":847,"s":2117346,"m":4998}
+ but pd_btree gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 48 aggregate: pd_plain gave {"c":847,"s":2117346,"m":4998}
+ but pd_bitmap gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 48 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 48 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 56 aggregate: pd_plain gave {"c":18,"s":34152,"m":1908}
+ but pd_btree gave {"c":26,"s":49361,"m":1911}
+ criteria=[{"field":"t","op":"between","value":1886,"value2":1911},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 56 aggregate: pd_plain gave {"c":18,"s":34152,"m":1908}
+ but pd_bitmap gave {"c":26,"s":49361,"m":1911}
+ criteria=[{"field":"t","op":"between","value":1886,"value2":1911},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 56 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":1886,"value2":1911},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 56 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1886,"value2":1911},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 57 aggregate: pd_plain gave {"c":1359,"s":3395370,"m":4999}
+ but pd_btree gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 57 aggregate: pd_plain gave {"c":1359,"s":3395370,"m":4999}
+ but pd_bitmap gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 57 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 57 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 61 aggregate: pd_plain gave {"c":1051,"s":2627912,"m":4997}
+ but pd_btree gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 61 aggregate: pd_plain gave {"c":1051,"s":2627912,"m":4997}
+ but pd_bitmap gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 61 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 61 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 62 aggregate: pd_plain gave {"c":1461,"s":3651963,"m":4997}
+ but pd_btree gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 62 aggregate: pd_plain gave {"c":1461,"s":3651963,"m":4997}
+ but pd_bitmap gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 62 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 62 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 68 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 71 aggregate: pd_plain gave {"c":18,"s":54388,"m":3034}
+ but pd_btree gave {"c":26,"s":78559,"m":3034}
+ criteria=[{"field":"t","op":"between","value":3009,"value2":3034},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 71 aggregate: pd_plain gave {"c":18,"s":54388,"m":3034}
+ but pd_bitmap gave {"c":26,"s":78559,"m":3034}
+ criteria=[{"field":"t","op":"between","value":3009,"value2":3034},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 71 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":3009,"value2":3034},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 71 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3009,"value2":3034},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 77 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3305,"value2":3330}]
+DIVERGENCE criterion 83 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 85 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 86 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2944,"value2":2969}]
+DIVERGENCE criterion 96 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 101 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 102 aggregate: pd_plain gave {"c":948,"s":2368740,"m":4997}
+ but pd_btree gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 102 aggregate: pd_plain gave {"c":948,"s":2368740,"m":4997}
+ but pd_bitmap gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 102 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 102 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 106 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 107 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 108 aggregate: pd_plain gave {"c":19,"s":85797,"m":4529}
+ but pd_btree gave {"c":26,"s":117429,"m":4529}
+ criteria=[{"field":"t","op":"between","value":4504,"value2":4529},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 108 aggregate: pd_plain gave {"c":19,"s":85797,"m":4529}
+ but pd_bitmap gave {"c":26,"s":117429,"m":4529}
+ criteria=[{"field":"t","op":"between","value":4504,"value2":4529},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 108 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":4504,"value2":4529},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 108 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":4504,"value2":4529},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 111 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 113 aggregate: pd_plain gave {"c":693,"s":1732192,"m":4999}
+ but pd_btree gave {"c":1000,"s":2501500,"m":4999}
+ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":9}]}]
+DIVERGENCE criterion 113 aggregate: pd_plain gave {"c":693,"s":1732192,"m":4999}
+ but pd_bitmap gave {"c":1000,"s":2501500,"m":4999}
+ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":9}]}]
+DIVERGENCE criterion 113 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":9}]}]
+DIVERGENCE criterion 113 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":9}]}]
+DIVERGENCE criterion 114 aggregate: pd_plain gave {"c":462,"s":1155693,"m":4999}
+ but pd_btree gave {"c":1000,"s":2501500,"m":4999}
+ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 114 aggregate: pd_plain gave {"c":462,"s":1155693,"m":4999}
+ but pd_bitmap gave {"c":1000,"s":2501500,"m":4999}
+ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 114 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 114 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 119 aggregate: pd_plain gave {"c":20,"s":94975,"m":4762}
+ but pd_btree gave {"c":26,"s":123487,"m":4762}
+ criteria=[{"field":"t","op":"between","value":4737,"value2":4762},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 119 aggregate: pd_plain gave {"c":20,"s":94975,"m":4762}
+ but pd_bitmap gave {"c":26,"s":123487,"m":4762}
+ criteria=[{"field":"t","op":"between","value":4737,"value2":4762},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 119 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":4737,"value2":4762},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 119 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":4737,"value2":4762},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 120 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 128 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 140 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 148 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 150 aggregate: pd_plain gave {"c":18,"s":5657,"m":328}
+ but pd_btree gave {"c":26,"s":8203,"m":328}
+ criteria=[{"field":"t","op":"between","value":303,"value2":328},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 150 aggregate: pd_plain gave {"c":18,"s":5657,"m":328}
+ but pd_bitmap gave {"c":26,"s":8203,"m":328}
+ criteria=[{"field":"t","op":"between","value":303,"value2":328},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 150 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":303,"value2":328},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 150 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":303,"value2":328},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 152 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2716,"value2":2741}]
+DIVERGENCE criterion 153 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3384,"value2":3409}]
+DIVERGENCE criterion 155 aggregate: pd_plain gave {"c":847,"s":2118193,"m":4999}
+ but pd_btree gave {"c":1000,"s":2501500,"m":4999}
+ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 155 aggregate: pd_plain gave {"c":847,"s":2118193,"m":4999}
+ but pd_bitmap gave {"c":1000,"s":2501500,"m":4999}
+ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 155 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 155 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 158 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 161 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 168 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 175 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 177 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 180 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 185 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 188 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 191 aggregate: pd_plain gave {"c":18,"s":87313,"m":4864}
+ but pd_btree gave {"c":26,"s":126139,"m":4864}
+ criteria=[{"field":"t","op":"between","value":4839,"value2":4864},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 191 aggregate: pd_plain gave {"c":18,"s":87313,"m":4864}
+ but pd_bitmap gave {"c":26,"s":126139,"m":4864}
+ criteria=[{"field":"t","op":"between","value":4839,"value2":4864},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 191 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":4839,"value2":4864},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 191 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":4839,"value2":4864},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 192 aggregate: pd_plain gave {"c":20,"s":48064,"m":2417}
+ but pd_btree gave {"c":26,"s":62517,"m":2417}
+ criteria=[{"field":"t","op":"between","value":2392,"value2":2417},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 192 aggregate: pd_plain gave {"c":20,"s":48064,"m":2417}
+ but pd_bitmap gave {"c":26,"s":62517,"m":2417}
+ criteria=[{"field":"t","op":"between","value":2392,"value2":2417},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 192 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":2392,"value2":2417},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 192 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2392,"value2":2417},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 193 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3123,"value2":3148}]
+DIVERGENCE criterion 195 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 201 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 207 aggregate: pd_plain gave {"c":1360,"s":3399054,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 207 aggregate: pd_plain gave {"c":1360,"s":3399054,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 207 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 207 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 214 aggregate: pd_plain gave {"c":21,"s":90310,"m":4312}
+ but pd_btree gave {"c":26,"s":111787,"m":4312}
+ criteria=[{"field":"t","op":"between","value":4287,"value2":4312},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 214 aggregate: pd_plain gave {"c":21,"s":90310,"m":4312}
+ but pd_bitmap gave {"c":26,"s":111787,"m":4312}
+ criteria=[{"field":"t","op":"between","value":4287,"value2":4312},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 214 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":4287,"value2":4312},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 214 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":4287,"value2":4312},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 223 aggregate: pd_plain gave {"c":22,"s":84155,"m":3838}
+ but pd_btree gave {"c":26,"s":99463,"m":3838}
+ criteria=[{"field":"t","op":"between","value":3813,"value2":3838},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 223 aggregate: pd_plain gave {"c":22,"s":84155,"m":3838}
+ but pd_bitmap gave {"c":26,"s":99463,"m":3838}
+ criteria=[{"field":"t","op":"between","value":3813,"value2":3838},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 223 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":3813,"value2":3838},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 223 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3813,"value2":3838},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 225 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3230,"value2":3255}]
+DIVERGENCE criterion 226 aggregate: pd_plain gave {"c":1564,"s":3909358,"m":4999}
+ but pd_btree gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 226 aggregate: pd_plain gave {"c":1564,"s":3909358,"m":4999}
+ but pd_bitmap gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 226 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 226 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 227 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 228 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 236 aggregate: pd_plain gave {"c":1360,"s":3398655,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 236 aggregate: pd_plain gave {"c":1360,"s":3398655,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 236 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 236 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 237 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 241 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 243 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":384,"value2":409}]
+DIVERGENCE criterion 248 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2801,"value2":2826}]
+DIVERGENCE criterion 253 aggregate: pd_plain gave {"c":15,"s":71938,"m":4807}
+ but pd_btree gave {"c":26,"s":124657,"m":4807}
+ criteria=[{"field":"t","op":"between","value":4782,"value2":4807},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 253 aggregate: pd_plain gave {"c":15,"s":71938,"m":4807}
+ but pd_bitmap gave {"c":26,"s":124657,"m":4807}
+ criteria=[{"field":"t","op":"between","value":4782,"value2":4807},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 253 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":4782,"value2":4807},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 253 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":4782,"value2":4807},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 255 aggregate: pd_plain gave {"c":769,"s":1921924,"m":4996}
+ but pd_btree gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 255 aggregate: pd_plain gave {"c":769,"s":1921924,"m":4996}
+ but pd_bitmap gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 255 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 255 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 257 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 260 aggregate: pd_plain gave {"c":1565,"s":3913571,"m":4999}
+ but pd_btree gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":12}]}]
+DIVERGENCE criterion 260 aggregate: pd_plain gave {"c":1565,"s":3913571,"m":4999}
+ but pd_bitmap gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":12}]}]
+DIVERGENCE criterion 260 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":12}]}]
+DIVERGENCE criterion 260 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":12}]}]
+DIVERGENCE criterion 261 aggregate: pd_plain gave {"c":22,"s":58431,"m":2669}
+ but pd_btree gave {"c":26,"s":69069,"m":2669}
+ criteria=[{"field":"t","op":"between","value":2644,"value2":2669},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 261 aggregate: pd_plain gave {"c":22,"s":58431,"m":2669}
+ but pd_bitmap gave {"c":26,"s":69069,"m":2669}
+ criteria=[{"field":"t","op":"between","value":2644,"value2":2669},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 261 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":2644,"value2":2669},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 261 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2644,"value2":2669},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 263 aggregate: pd_plain gave {"c":19,"s":70606,"m":3727}
+ but pd_btree gave {"c":26,"s":96577,"m":3727}
+ criteria=[{"field":"t","op":"between","value":3702,"value2":3727},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 263 aggregate: pd_plain gave {"c":19,"s":70606,"m":3727}
+ but pd_bitmap gave {"c":26,"s":96577,"m":3727}
+ criteria=[{"field":"t","op":"between","value":3702,"value2":3727},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 263 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":3702,"value2":3727},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 263 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3702,"value2":3727},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 271 aggregate: pd_plain gave {"c":1153,"s":2881753,"m":4999}
+ but pd_btree gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 271 aggregate: pd_plain gave {"c":1153,"s":2881753,"m":4999}
+ but pd_bitmap gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 271 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 271 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 274 aggregate: pd_plain gave {"c":1155,"s":2887905,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 274 aggregate: pd_plain gave {"c":1155,"s":2887905,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 274 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 274 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 278 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2920,"value2":2945}]
+DIVERGENCE criterion 282 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 283 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 284 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 287 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 292 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 293 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 295 aggregate: pd_plain gave {"c":1256,"s":3138586,"m":4997}
+ but pd_btree gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 295 aggregate: pd_plain gave {"c":1256,"s":3138586,"m":4997}
+ but pd_bitmap gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 295 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 295 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 298 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 300 aggregate: pd_plain gave {"c":1358,"s":3395741,"m":4999}
+ but pd_btree gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 300 aggregate: pd_plain gave {"c":1358,"s":3395741,"m":4999}
+ but pd_bitmap gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 300 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 300 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":11}]}]
+DIVERGENCE criterion 308 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 313 aggregate: pd_plain gave {"c":615,"s":1536925,"m":4995}
+ but pd_btree gave {"c":1000,"s":2497500,"m":4995}
+ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 313 aggregate: pd_plain gave {"c":615,"s":1536925,"m":4995}
+ but pd_bitmap gave {"c":1000,"s":2497500,"m":4995}
+ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 313 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 313 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 316 aggregate: pd_plain gave {"c":1461,"s":3653883,"m":4999}
+ but pd_btree gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":12}]}]
+DIVERGENCE criterion 316 aggregate: pd_plain gave {"c":1461,"s":3653883,"m":4999}
+ but pd_bitmap gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":12}]}]
+DIVERGENCE criterion 316 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":12}]}]
+DIVERGENCE criterion 316 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":12}]}]
+DIVERGENCE criterion 320 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2120,"value2":2145}]
+DIVERGENCE criterion 324 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 326 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":4826,"value2":4851}]
+DIVERGENCE criterion 329 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1833,"value2":1858}]
+DIVERGENCE criterion 338 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 351 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3433,"value2":3458}]
+DIVERGENCE criterion 354 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 355 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 356 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 360 aggregate: pd_plain gave {"c":923,"s":2304383,"m":4996}
+ but pd_btree gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 360 aggregate: pd_plain gave {"c":923,"s":2304383,"m":4996}
+ but pd_bitmap gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 360 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 360 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 365 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 368 aggregate: pd_plain gave {"c":1461,"s":3650418,"m":4997}
+ but pd_btree gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 368 aggregate: pd_plain gave {"c":1461,"s":3650418,"m":4997}
+ but pd_bitmap gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 368 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 368 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 373 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 380 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 382 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":416,"value2":441}]
+DIVERGENCE criterion 383 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 385 aggregate: pd_plain gave {"c":1256,"s":3138350,"m":4999}
+ but pd_btree gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 385 aggregate: pd_plain gave {"c":1256,"s":3138350,"m":4999}
+ but pd_bitmap gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 385 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 385 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 387 aggregate: pd_plain gave {"c":23,"s":105226,"m":4587}
+ but pd_btree gave {"c":26,"s":118963,"m":4588}
+ criteria=[{"field":"t","op":"between","value":4563,"value2":4588},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 387 aggregate: pd_plain gave {"c":23,"s":105226,"m":4587}
+ but pd_bitmap gave {"c":26,"s":118963,"m":4588}
+ criteria=[{"field":"t","op":"between","value":4563,"value2":4588},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 387 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":4563,"value2":4588},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 387 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":4563,"value2":4588},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 389 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 390 aggregate: pd_plain gave {"c":1462,"s":3655429,"m":4999}
+ but pd_btree gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 390 aggregate: pd_plain gave {"c":1462,"s":3655429,"m":4999}
+ but pd_bitmap gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 390 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 390 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 393 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3989,"value2":4014},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":12}]}]
+DIVERGENCE criterion 394 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 400 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 401 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 402 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 405 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 406 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 407 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3337,"value2":3362}]
+DIVERGENCE criterion 410 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 413 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 414 aggregate: pd_plain gave {"c":23,"s":21907,"m":965}
+ but pd_btree gave {"c":26,"s":24765,"m":965}
+ criteria=[{"field":"t","op":"between","value":940,"value2":965},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 414 aggregate: pd_plain gave {"c":23,"s":21907,"m":965}
+ but pd_bitmap gave {"c":26,"s":24765,"m":965}
+ criteria=[{"field":"t","op":"between","value":940,"value2":965},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 414 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":940,"value2":965},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 414 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":940,"value2":965},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 415 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 417 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 418 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 420 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 425 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 429 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 432 aggregate: pd_plain gave {"c":846,"s":2113346,"m":4996}
+ but pd_btree gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 432 aggregate: pd_plain gave {"c":846,"s":2113346,"m":4996}
+ but pd_bitmap gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 432 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 432 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 435 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 436 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 442 aggregate: pd_plain gave {"c":20,"s":36390,"m":1832}
+ but pd_btree gave {"c":26,"s":47307,"m":1832}
+ criteria=[{"field":"t","op":"between","value":1807,"value2":1832},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 442 aggregate: pd_plain gave {"c":20,"s":36390,"m":1832}
+ but pd_bitmap gave {"c":26,"s":47307,"m":1832}
+ criteria=[{"field":"t","op":"between","value":1807,"value2":1832},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 442 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":1807,"value2":1832},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 442 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1807,"value2":1832},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":10}]}]
+DIVERGENCE criterion 448 aggregate: pd_plain gave {"c":1360,"s":3401388,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 448 aggregate: pd_plain gave {"c":1360,"s":3401388,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 448 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 448 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 449 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 450 aggregate: pd_plain gave {"c":1565,"s":3910992,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 450 aggregate: pd_plain gave {"c":1565,"s":3910992,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 450 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 450 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":11}]}]
+DIVERGENCE criterion 453 aggregate: pd_plain gave {"c":1360,"s":3398655,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 453 aggregate: pd_plain gave {"c":1360,"s":3398655,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 453 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 453 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 457 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1082,"value2":1107}]
+DIVERGENCE criterion 464 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 466 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 472 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 474 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 481 aggregate: pd_plain gave {"c":539,"s":1346037,"m":4998}
+ but pd_btree gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 481 aggregate: pd_plain gave {"c":539,"s":1346037,"m":4998}
+ but pd_bitmap gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 481 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 481 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 487 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 488 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 489 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":945,"value2":970}]
+DIVERGENCE criterion 492 aggregate: pd_plain gave {"c":616,"s":1539538,"m":4998}
+ but pd_btree gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 492 aggregate: pd_plain gave {"c":616,"s":1539538,"m":4998}
+ but pd_bitmap gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 492 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 492 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 496 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_2"}]}]
+PLANPATH scan plain=250 btree=57 bitmap=45 composite=250
+PLANPATH leaf plain=0 btree=111 bitmap=40 composite=0
+PLANPATH bitmap plain=0 btree=0 bitmap=66 composite=0
+PLANPATH intersect plain=0 btree=42 bitmap=59 composite=0
+PLANPATH union plain=0 btree=40 bitmap=40 composite=0
+DIVSEC count=0 find=0 agg=102 group_by=199 order_by=0
+audit-planner-diff seed 1: 301 divergences over 500 criteria, 5000 rows
+DIVERGENCE criterion 7 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 8 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 26 aggregate: pd_plain gave {"c":23,"s":106989,"m":4664}
+ but pd_btree gave {"c":26,"s":120939,"m":4664}
+ criteria=[{"field":"t","op":"between","value":4639,"value2":4664},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":12}]}]
+DIVERGENCE criterion 26 aggregate: pd_plain gave {"c":23,"s":106989,"m":4664}
+ but pd_bitmap gave {"c":26,"s":120939,"m":4664}
+ criteria=[{"field":"t","op":"between","value":4639,"value2":4664},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":12}]}]
+DIVERGENCE criterion 26 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":4639,"value2":4664},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":12}]}]
+DIVERGENCE criterion 26 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":4639,"value2":4664},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":12}]}]
+DIVERGENCE criterion 31 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 37 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 43 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1628,"value2":1653}]
+DIVERGENCE criterion 48 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 50 aggregate: pd_plain gave {"c":23,"s":13223,"m":588}
+ but pd_btree gave {"c":26,"s":14963,"m":588}
+ criteria=[{"field":"t","op":"between","value":563,"value2":588},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 50 aggregate: pd_plain gave {"c":23,"s":13223,"m":588}
+ but pd_bitmap gave {"c":26,"s":14963,"m":588}
+ criteria=[{"field":"t","op":"between","value":563,"value2":588},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 50 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":563,"value2":588},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 50 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":563,"value2":588},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 54 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 59 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2486,"value2":2511}]
+DIVERGENCE criterion 60 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":97,"value2":122},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":12}]}]
+DIVERGENCE criterion 64 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 67 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":842,"value2":867}]
+DIVERGENCE criterion 68 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1066,"value2":1091}]
+DIVERGENCE criterion 70 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 72 aggregate: pd_plain gave {"c":17,"s":44474,"m":2629}
+ but pd_btree gave {"c":26,"s":68029,"m":2629}
+ criteria=[{"field":"t","op":"between","value":2604,"value2":2629},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 72 aggregate: pd_plain gave {"c":17,"s":44474,"m":2629}
+ but pd_bitmap gave {"c":26,"s":68029,"m":2629}
+ criteria=[{"field":"t","op":"between","value":2604,"value2":2629},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 72 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":2604,"value2":2629},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 72 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2604,"value2":2629},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 76 aggregate: pd_plain gave {"c":1359,"s":3395370,"m":4999}
+ but pd_btree gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 76 aggregate: pd_plain gave {"c":1359,"s":3395370,"m":4999}
+ but pd_bitmap gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 76 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 76 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 77 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":659,"value2":684}]
+DIVERGENCE criterion 88 aggregate: pd_plain gave {"c":21,"s":96882,"m":4625}
+ but pd_btree gave {"c":26,"s":119925,"m":4625}
+ criteria=[{"field":"t","op":"between","value":4600,"value2":4625},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 88 aggregate: pd_plain gave {"c":21,"s":96882,"m":4625}
+ but pd_bitmap gave {"c":26,"s":119925,"m":4625}
+ criteria=[{"field":"t","op":"between","value":4600,"value2":4625},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 88 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":4600,"value2":4625},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 88 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":4600,"value2":4625},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 98 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 101 aggregate: pd_plain gave {"c":950,"s":2377098,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 101 aggregate: pd_plain gave {"c":950,"s":2377098,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 101 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 101 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 106 aggregate: pd_plain gave {"c":615,"s":1537540,"m":4996}
+ but pd_btree gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 106 aggregate: pd_plain gave {"c":615,"s":1537540,"m":4996}
+ but pd_bitmap gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 106 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 106 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":10}]}]
+DIVERGENCE criterion 108 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 118 aggregate: pd_plain gave {"c":21,"s":57077,"m":2729}
+ but pd_btree gave {"c":26,"s":70655,"m":2730}
+ criteria=[{"field":"t","op":"between","value":2705,"value2":2730},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 118 aggregate: pd_plain gave {"c":21,"s":57077,"m":2729}
+ but pd_bitmap gave {"c":26,"s":70655,"m":2730}
+ criteria=[{"field":"t","op":"between","value":2705,"value2":2730},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 118 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":2705,"value2":2730},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 118 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2705,"value2":2730},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 122 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":943,"value2":968}]
+DIVERGENCE criterion 126 aggregate: pd_plain gave {"c":616,"s":1541309,"m":4999}
+ but pd_btree gave {"c":1000,"s":2501500,"m":4999}
+ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 126 aggregate: pd_plain gave {"c":616,"s":1541309,"m":4999}
+ but pd_bitmap gave {"c":1000,"s":2501500,"m":4999}
+ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 126 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 126 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_4"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 128 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 129 aggregate: pd_plain gave {"c":461,"s":1152695,"m":4995}
+ but pd_btree gave {"c":1000,"s":2497500,"m":4995}
+ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 129 aggregate: pd_plain gave {"c":461,"s":1152695,"m":4995}
+ but pd_bitmap gave {"c":1000,"s":2497500,"m":4995}
+ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 129 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 129 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 132 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 137 aggregate: pd_plain gave {"c":1053,"s":2634210,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 137 aggregate: pd_plain gave {"c":1053,"s":2634210,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 137 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 137 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 139 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 140 aggregate: pd_plain gave {"c":1257,"s":3143088,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":9}]}]
+DIVERGENCE criterion 140 aggregate: pd_plain gave {"c":1257,"s":3143088,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":9}]}]
+DIVERGENCE criterion 140 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":9}]}]
+DIVERGENCE criterion 140 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":9}]}]
+DIVERGENCE criterion 142 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 144 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 145 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":4250,"value2":4275}]
+DIVERGENCE criterion 148 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 152 aggregate: pd_plain gave {"c":21,"s":5504,"m":275}
+ but pd_btree gave {"c":26,"s":6825,"m":275}
+ criteria=[{"field":"t","op":"between","value":250,"value2":275},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 152 aggregate: pd_plain gave {"c":21,"s":5504,"m":275}
+ but pd_bitmap gave {"c":26,"s":6825,"m":275}
+ criteria=[{"field":"t","op":"between","value":250,"value2":275},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 152 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":250,"value2":275},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 152 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":250,"value2":275},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 161 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 174 aggregate: pd_plain gave {"c":616,"s":1539923,"m":4998}
+ but pd_btree gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 174 aggregate: pd_plain gave {"c":616,"s":1539923,"m":4998}
+ but pd_bitmap gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 174 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 174 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 177 aggregate: pd_plain gave {"c":1155,"s":2886717,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 177 aggregate: pd_plain gave {"c":1155,"s":2886717,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 177 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 177 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 180 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 181 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 182 aggregate: pd_plain gave {"c":21,"s":87057,"m":4157}
+ but pd_btree gave {"c":26,"s":107809,"m":4159}
+ criteria=[{"field":"t","op":"between","value":4134,"value2":4159},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 182 aggregate: pd_plain gave {"c":21,"s":87057,"m":4157}
+ but pd_bitmap gave {"c":26,"s":107809,"m":4159}
+ criteria=[{"field":"t","op":"between","value":4134,"value2":4159},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 182 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":4134,"value2":4159},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 182 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":4134,"value2":4159},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":9}]}]
+DIVERGENCE criterion 186 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 190 aggregate: pd_plain gave {"c":539,"s":1346037,"m":4998}
+ but pd_btree gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 190 aggregate: pd_plain gave {"c":539,"s":1346037,"m":4998}
+ but pd_bitmap gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 190 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 190 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 192 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":896,"value2":921}]
+DIVERGENCE criterion 195 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 198 aggregate: pd_plain gave {"c":692,"s":1728577,"m":4996}
+ but pd_btree gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 198 aggregate: pd_plain gave {"c":692,"s":1728577,"m":4996}
+ but pd_bitmap gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 198 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 198 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 200 aggregate: pd_plain gave {"c":22,"s":25723,"m":1181}
+ but pd_btree gave {"c":26,"s":30381,"m":1181}
+ criteria=[{"field":"t","op":"between","value":1156,"value2":1181},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 200 aggregate: pd_plain gave {"c":22,"s":25723,"m":1181}
+ but pd_bitmap gave {"c":26,"s":30381,"m":1181}
+ criteria=[{"field":"t","op":"between","value":1156,"value2":1181},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 200 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":1156,"value2":1181},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 200 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1156,"value2":1181},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 207 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 208 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 211 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 213 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 218 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 221 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 223 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3538,"value2":3563},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":12}]}]
+DIVERGENCE criterion 226 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1640,"value2":1665}]
+DIVERGENCE criterion 232 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 233 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2980,"value2":3005}]
+DIVERGENCE criterion 240 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 245 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":270,"value2":295}]
+DIVERGENCE criterion 249 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 250 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 251 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 252 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 256 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 258 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 262 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 263 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 264 aggregate: pd_plain gave {"c":616,"s":1540308,"m":4998}
+ but pd_btree gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 264 aggregate: pd_plain gave {"c":616,"s":1540308,"m":4998}
+ but pd_bitmap gave {"c":1000,"s":2500500,"m":4998}
+ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 264 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 264 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_3"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 268 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 269 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 270 aggregate: pd_plain gave {"c":1462,"s":3655425,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 270 aggregate: pd_plain gave {"c":1462,"s":3655425,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 270 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 270 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 271 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 276 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 277 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 279 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 288 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 290 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 293 aggregate: pd_plain gave {"c":22,"s":17773,"m":821}
+ but pd_btree gave {"c":26,"s":21021,"m":821}
+ criteria=[{"field":"t","op":"between","value":796,"value2":821},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 293 aggregate: pd_plain gave {"c":22,"s":17773,"m":821}
+ but pd_bitmap gave {"c":26,"s":21021,"m":821}
+ criteria=[{"field":"t","op":"between","value":796,"value2":821},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 293 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":796,"value2":821},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 293 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":796,"value2":821},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 294 aggregate: pd_plain gave {"c":1461,"s":3651963,"m":4997}
+ but pd_btree gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 294 aggregate: pd_plain gave {"c":1461,"s":3651963,"m":4997}
+ but pd_bitmap gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 294 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 294 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":10}]}]
+DIVERGENCE criterion 295 aggregate: pd_plain gave {"c":1359,"s":3396783,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 295 aggregate: pd_plain gave {"c":1359,"s":3396783,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 295 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 295 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 298 aggregate: pd_plain gave {"c":18,"s":49131,"m":2742}
+ but pd_btree gave {"c":26,"s":70967,"m":2742}
+ criteria=[{"field":"t","op":"between","value":2717,"value2":2742},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 298 aggregate: pd_plain gave {"c":18,"s":49131,"m":2742}
+ but pd_bitmap gave {"c":26,"s":70967,"m":2742}
+ criteria=[{"field":"t","op":"between","value":2717,"value2":2742},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 298 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":2717,"value2":2742},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 298 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2717,"value2":2742},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 302 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 310 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 312 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 313 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 315 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 320 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 326 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 333 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 337 aggregate: pd_plain gave {"c":1052,"s":2629605,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 337 aggregate: pd_plain gave {"c":1052,"s":2629605,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 337 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 337 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 341 aggregate: pd_plain gave {"c":18,"s":38396,"m":2147}
+ but pd_btree gave {"c":26,"s":55497,"m":2147}
+ criteria=[{"field":"t","op":"between","value":2122,"value2":2147},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 341 aggregate: pd_plain gave {"c":18,"s":38396,"m":2147}
+ but pd_bitmap gave {"c":26,"s":55497,"m":2147}
+ criteria=[{"field":"t","op":"between","value":2122,"value2":2147},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 341 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":2122,"value2":2147},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 341 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2122,"value2":2147},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 342 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 347 aggregate: pd_plain gave {"c":18,"s":66771,"m":3722}
+ but pd_btree gave {"c":26,"s":96447,"m":3722}
+ criteria=[{"field":"t","op":"between","value":3697,"value2":3722},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 347 aggregate: pd_plain gave {"c":18,"s":66771,"m":3722}
+ but pd_bitmap gave {"c":26,"s":96447,"m":3722}
+ criteria=[{"field":"t","op":"between","value":3697,"value2":3722},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 347 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":3697,"value2":3722},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 347 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3697,"value2":3722},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 348 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 349 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 351 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 354 aggregate: pd_plain gave {"c":1462,"s":3655425,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 354 aggregate: pd_plain gave {"c":1462,"s":3655425,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 354 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 354 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":11}]}]
+DIVERGENCE criterion 359 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 361 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1345,"value2":1370}]
+DIVERGENCE criterion 366 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 369 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 370 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 372 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 376 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3208,"value2":3233}]
+DIVERGENCE criterion 377 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 382 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 383 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1023,"value2":1048}]
+DIVERGENCE criterion 386 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 387 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 388 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1489,"value2":1514}]
+DIVERGENCE criterion 395 aggregate: pd_plain gave {"c":616,"s":1538306,"m":4996}
+ but pd_btree gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 395 aggregate: pd_plain gave {"c":616,"s":1538306,"m":4996}
+ but pd_bitmap gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 395 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 395 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":8}]}]
+DIVERGENCE criterion 402 aggregate: pd_plain gave {"c":692,"s":1728577,"m":4996}
+ but pd_btree gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 402 aggregate: pd_plain gave {"c":692,"s":1728577,"m":4996}
+ but pd_bitmap gave {"c":1000,"s":2498500,"m":4996}
+ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 402 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 402 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":11}]}]
+DIVERGENCE criterion 403 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 405 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 406 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2753,"value2":2778}]
+DIVERGENCE criterion 408 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 411 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_4"}]}]
+DIVERGENCE criterion 414 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 419 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 420 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_3"}]}]
+DIVERGENCE criterion 424 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 431 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 438 aggregate: pd_plain gave {"c":461,"s":1152695,"m":4995}
+ but pd_btree gave {"c":1000,"s":2497500,"m":4995}
+ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 438 aggregate: pd_plain gave {"c":461,"s":1152695,"m":4995}
+ but pd_bitmap gave {"c":1000,"s":2497500,"m":4995}
+ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 438 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 438 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"v","op":"eq","value":"cat_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":8}]}]
+DIVERGENCE criterion 439 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 440 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":3233,"value2":3258}]
+DIVERGENCE criterion 441 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_0"}]}]
+DIVERGENCE criterion 443 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"v","op":"eq","value":"cat_2"}]}]
+DIVERGENCE criterion 446 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":684,"value2":709}]
+DIVERGENCE criterion 452 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1817,"value2":1842}]
+DIVERGENCE criterion 455 aggregate: pd_plain gave {"c":1358,"s":3394693,"m":4997}
+ but pd_btree gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 455 aggregate: pd_plain gave {"c":1358,"s":3394693,"m":4997}
+ but pd_bitmap gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 455 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 455 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":1,"value2":10}]}]
+DIVERGENCE criterion 456 aggregate: pd_plain gave {"c":1053,"s":2634210,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 456 aggregate: pd_plain gave {"c":1053,"s":2634210,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 456 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 456 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":8}]}]
+DIVERGENCE criterion 460 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 466 aggregate: pd_plain gave {"c":1051,"s":2627912,"m":4997}
+ but pd_btree gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 466 aggregate: pd_plain gave {"c":1051,"s":2627912,"m":4997}
+ but pd_bitmap gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 466 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 466 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 468 aggregate: pd_plain gave {"c":1154,"s":2886727,"m":4997}
+ but pd_btree gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 468 aggregate: pd_plain gave {"c":1154,"s":2886727,"m":4997}
+ but pd_bitmap gave {"c":1666,"s":4164167,"m":4997}
+ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 468 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 468 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_2"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 469 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_4"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 471 aggregate: pd_plain gave {"c":1155,"s":2886717,"m":4998}
+ but pd_btree gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 471 aggregate: pd_plain gave {"c":1155,"s":2886717,"m":4998}
+ but pd_bitmap gave {"c":1667,"s":4165833,"m":4998}
+ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 471 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 471 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_0"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":2,"value2":9}]}]
+DIVERGENCE criterion 473 aggregate: pd_plain gave {"c":1359,"s":3398424,"m":4999}
+ but pd_btree gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 473 aggregate: pd_plain gave {"c":1359,"s":3398424,"m":4999}
+ but pd_bitmap gave {"c":1667,"s":4167500,"m":4999}
+ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 473 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 473 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"w","op":"eq","value":"w_1"},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":12}]}]
+DIVERGENCE criterion 480 aggregate: pd_plain gave {"c":19,"s":30438,"m":1615}
+ but pd_btree gave {"c":26,"s":41665,"m":1615}
+ criteria=[{"field":"t","op":"between","value":1590,"value2":1615},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 480 aggregate: pd_plain gave {"c":19,"s":30438,"m":1615}
+ but pd_bitmap gave {"c":26,"s":41665,"m":1615}
+ criteria=[{"field":"t","op":"between","value":1590,"value2":1615},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 480 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":1590,"value2":1615},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 480 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":1590,"value2":1615},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":0,"value2":8}]}]
+DIVERGENCE criterion 487 aggregate: pd_plain gave {"c":16,"s":32584,"m":2048}
+ but pd_btree gave {"c":26,"s":52923,"m":2048}
+ criteria=[{"field":"t","op":"between","value":2023,"value2":2048},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 487 aggregate: pd_plain gave {"c":16,"s":32584,"m":2048}
+ but pd_bitmap gave {"c":26,"s":52923,"m":2048}
+ criteria=[{"field":"t","op":"between","value":2023,"value2":2048},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 487 group_by: pd_plain vs pd_btree group counts differ criteria=[{"field":"t","op":"between","value":2023,"value2":2048},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 487 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"field":"t","op":"between","value":2023,"value2":2048},{"or":[{"field":"v","op":"eq","value":"cat_2"},{"field":"u","op":"between","value":3,"value2":9}]}]
+DIVERGENCE criterion 489 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_0"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 496 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_1"},{"field":"v","op":"eq","value":"cat_1"}]}]
+DIVERGENCE criterion 499 group_by: pd_plain vs pd_bitmap group counts differ criteria=[{"or":[{"field":"v","op":"eq","value":"cat_3"},{"field":"v","op":"eq","value":"cat_4"}]}]
+PLANPATH scan plain=250 btree=69 bitmap=56 composite=250
+PLANPATH leaf plain=0 btree=111 bitmap=43 composite=0
+PLANPATH bitmap plain=0 btree=0 bitmap=61 composite=0
+PLANPATH intersect plain=0 btree=25 bitmap=45 composite=0
+PLANPATH union plain=0 btree=45 bitmap=45 composite=0
+DIVSEC count=0 find=0 agg=80 group_by=184 order_by=0
+audit-planner-diff seed 2: 264 divergences over 500 criteria, 5000 rows

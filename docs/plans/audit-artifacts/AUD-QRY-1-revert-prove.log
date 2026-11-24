@@ -1,0 +1,15 @@
+# AUD-QRY-1 revert-prove-paste (2026-11-20, branch fix/audit-igb-bitmap-group-fallback worktree)
+# Method: git stash push -m 'AUD-QRY-1 fix revert-proof' -- src/db/query_aggregate.c  (path-limited; test + build.sh wiring stayed present)
+# RED = fix stashed (base behavior); GREEN = git stash pop (fix restored). Both builds: SKIP_TESTS=1 ./build.sh (rc=0).
+
+=== RED (fix stashed): ./build/bin/shard-db-test run test-igb-bitmap-group-fallback ===
+ok 96 - control: no-criteria popcount path stays correct
+ok 97 - control: no-criteria popcount path stays correct
+ok 98 - control: no-criteria popcount path stays correct
+ok 99 - control: no-criteria popcount path stays correct
+# test-igb-bitmap-group-fallback: 75 passed, 24 failed
+(full log: AUD-QRY-1-red-base.log, same 24 failures: 'cb >= 0' — gb_bm drops cat_1..3 while the oracle has 25/label; rc=24)
+
+=== GREEN (fix popped): same command ===
+ok 99 - control: no-criteria popcount path stays correct
+# test-igb-bitmap-group-fallback: 99 passed, 0 failed   (case rc=0)

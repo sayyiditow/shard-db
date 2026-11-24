@@ -1,0 +1,4 @@
+# AUD-QRY-8 Task 4.4 differential spot-check (2026-11-20, post-QRY-8 tree)
+# No delta vs the post-QRY-2 baseline (the diff's composite twin is all-scan per AUD-PLN-3):
+DIVSEC count=0 find=0 agg=0 group_by=0 order_by=0
+per-criterion DIVERGENCE lines: 0

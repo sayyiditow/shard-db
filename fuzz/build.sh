@@ -17,6 +17,16 @@ mkdir -p "$OUT"
 CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined"
 INC="-Isrc/db"
 
+# -latomic resolution: on Ubuntu/Debian libatomic sits in the default
+# linker path; on Arch it lives only in the gcc toolchain dir, which
+# clang's default search misses (slotcask.c's misaligned kf-header magic
+# atomics emit __atomic_load/__atomic_store libcalls). Locate it once.
+ATOMIC_LD=""
+if [ ! -e /usr/lib/libatomic.so ] && [ ! -e /usr/lib/x86_64-linux-gnu/libatomic.so ]; then
+    ATOMIC_DIR="$(ls -d /usr/lib/gcc/x86_64-*/[0-9]* 2>/dev/null | sort -V | tail -1)"
+    [ -n "$ATOMIC_DIR" ] && ATOMIC_LD="-L$ATOMIC_DIR"
+fi
+
 echo "==> fuzz_json"
 clang $CFLAGS $INC -o "$OUT/fuzz_json" \
     fuzz/fuzz_json.c \
@@ -83,13 +93,92 @@ clang $CFLAGS $INC -o "$OUT/fuzz_criteria" \
     src/db/typed_bulk_insert.c src/db/packed_record.c src/db/decnum.c \
     src/db/agg_exact.c src/db/scalar_grammar.c src/db/schema_wire.c \
     src/db/decimal_order.c src/db/packed_csv_command.c \
-    -lpthread -latomic
+    -lpthread $ATOMIC_LD -latomic
+
+# fuzz_filename hammers the three filesystem-name validators (util.c +
+# config.c). config.c is linked for dir_name_ok; its transitive refs
+# resolve through the same subset fuzz_criteria uses.
+echo "==> fuzz_filename"
+# Same TU subset as fuzz_criteria: config.c pulls in the typed-record
+# layer, scalar grammar, storage/btree/index and rebuild_object
+# (query_find.c), which drag most of the engine in for symbol
+# resolution. Linked but never executed — the harness only calls the
+# three validators.
+clang $CFLAGS $INC -o "$OUT/fuzz_filename" \
+    fuzz/fuzz_filename.c \
+    fuzz/stubs.c \
+    src/db/util.c src/db/keyset.c \
+    src/db/query.c \
+    src/db/query_find.c src/db/query_aggregate.c src/db/query_join.c \
+    src/db/query_plan.c src/db/query_bulk.c src/db/query_maint.c \
+    src/db/query_schema.c src/db/type_desc.c \
+    src/db/config.c src/db/storage.c src/db/index.c src/db/btree.c \
+    src/db/objlock.c src/db/parallel.c src/db/slotcask.c src/db/simd.c \
+    src/db/io_direct.c \
+    src/db/bitmap.c src/db/trigram.c \
+    src/db/durability.c src/db/durability_epoch.c \
+    src/db/typed_row.c src/db/typed_index.c src/db/typed_read_command.c \
+    src/db/typed_bulk_insert.c src/db/packed_record.c src/db/decnum.c \
+    src/db/agg_exact.c src/db/scalar_grammar.c src/db/schema_wire.c \
+    src/db/decimal_order.c src/db/packed_csv_command.c \
+    -lpthread $ATOMIC_LD -latomic
+
+# fuzz_cursor reaches parse_cursor_object (static in query.c) via
+# #include "query.c" in the harness TU — so query.c is NOT linked again
+# here; every other TU matches the fuzz_criteria subset.
+echo "==> fuzz_cursor"
+clang $CFLAGS $INC -o "$OUT/fuzz_cursor" \
+    fuzz/fuzz_cursor.c \
+    fuzz/stubs.c \
+    src/db/util.c src/db/keyset.c \
+    src/db/query_find.c src/db/query_aggregate.c src/db/query_join.c \
+    src/db/query_plan.c src/db/query_bulk.c src/db/query_maint.c \
+    src/db/query_schema.c src/db/type_desc.c \
+    src/db/config.c src/db/storage.c src/db/index.c src/db/btree.c \
+    src/db/objlock.c src/db/parallel.c src/db/slotcask.c src/db/simd.c \
+    src/db/io_direct.c \
+    src/db/bitmap.c src/db/trigram.c \
+    src/db/durability.c src/db/durability_epoch.c \
+    src/db/typed_row.c src/db/typed_index.c src/db/typed_read_command.c \
+    src/db/typed_bulk_insert.c src/db/packed_record.c src/db/decnum.c \
+    src/db/agg_exact.c src/db/scalar_grammar.c src/db/schema_wire.c \
+    src/db/decimal_order.c src/db/packed_csv_command.c \
+    -lpthread $ATOMIC_LD -latomic
+
+# fuzz_frame drives the daemon's real request-framing worker loop over a
+# loopback TCP pair. server.c enters via #include in the harness TU (statics
+# visible), and the REAL legacy fast-path dispatcher executes behind it —
+# no stub. tls.c is linked for symbol resolution only (the TLS branch
+# never runs: g_tls_enable=0); OpenSSL is required at link time.
+echo "==> fuzz_frame"
+clang $CFLAGS $INC \
+    -o "$OUT/fuzz_frame" \
+    fuzz/fuzz_frame.c \
+    src/db/nql.c src/db/embedded.c \
+    src/db/util.c src/db/keyset.c src/db/query.c \
+    src/db/query_find.c src/db/query_aggregate.c src/db/query_join.c \
+    src/db/query_plan.c src/db/query_bulk.c src/db/query_maint.c \
+    src/db/query_schema.c src/db/type_desc.c \
+    src/db/config.c src/db/storage.c src/db/index.c src/db/btree.c \
+    src/db/objlock.c src/db/parallel.c src/db/slotcask.c src/db/simd.c \
+    src/db/io_direct.c \
+    src/db/bitmap.c src/db/trigram.c \
+    src/db/durability.c src/db/durability_epoch.c \
+    src/db/typed_row.c src/db/typed_index.c src/db/typed_read_command.c \
+    src/db/typed_bulk_insert.c src/db/packed_record.c src/db/decnum.c \
+    src/db/agg_exact.c src/db/scalar_grammar.c src/db/schema_wire.c \
+    src/db/decimal_order.c src/db/packed_csv_command.c \
+    src/db/tls.c \
+    -lpthread $ATOMIC_LD -latomic -lssl -lcrypto
 
 echo
 echo "Built fuzzers in $OUT/:"
 ls -la "$OUT"
 echo
 echo "Run with:"
-echo "  $OUT/fuzz_json -max_total_time=60 fuzz/corpora/json/"
-echo "  $OUT/fuzz_b64 -max_total_time=60 fuzz/corpora/b64/"
-echo "  $OUT/fuzz_criteria -max_total_time=60 fuzz/corpora/criteria/"
+echo "  $OUT/fuzz_json -max_total_time=60 fuzz/corpora/json/ $OUT/corpus-growth/json/"
+echo "  $OUT/fuzz_b64 -max_total_time=60 fuzz/corpora/b64/ $OUT/corpus-growth/b64/"
+echo "  $OUT/fuzz_criteria -max_total_time=60 fuzz/corpora/criteria/ $OUT/corpus-growth/criteria/"
+echo "  $OUT/fuzz_filename -max_total_time=60 fuzz/corpora/filename/ $OUT/corpus-growth/filename/"
+echo "  $OUT/fuzz_cursor -max_total_time=60 fuzz/corpora/cursor/ $OUT/corpus-growth/cursor/"
+echo "  $OUT/fuzz_frame -max_total_time=60 fuzz/corpora/frame/ $OUT/corpus-growth/frame/"

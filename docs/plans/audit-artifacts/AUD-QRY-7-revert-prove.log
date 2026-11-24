@@ -1,0 +1,18 @@
+# AUD-QRY-7 Task 3.1 revert-prove (2026-11-22)
+# Method: git stash push -m '...' -- src/db/query_aggregate.c (path-limited, per the plan).
+# LIFT-NOTE: the stash lifted the stacked uncommitted QRY-1/2/5/8/6/7 hunks in the same file —
+# the reds are UNAFFECTED: this plan's shape carries no criteria, 5 distinct values (< the
+# QRY-5 cap), no composite-exact fields, and all values <= 1024 bytes; the QRY-7 stat-first
+# fail-closed template is the only gate the faulted shape reaches. Verified: the base run reds
+# exactly the two case-1 assertions.
+
+=== GREEN (fix in tree, pre-stash): 57 passed, 0 failed
+   (case1 diag: pf_ix ERR — the faulted group_by fails closed with the pinned EIO text;
+    baseline sanity + controls 2/3/4 green)
+
+=== RED (fix stashed, base query_aggregate.c): 55 passed, 2 failed — the Task 1 base proof
+not ok 29 - case1: faulted group_by fails closed    [pf_ix OK: silently-short group list]
+not ok 30 - case1: pinned EIO text
+(case2 pf_plain control, case3 count==500, case4 restored-match all GREEN on base)
+
+=== GREEN (git stash pop, fix restored): 57 passed, 0 failed (rebuild clean)

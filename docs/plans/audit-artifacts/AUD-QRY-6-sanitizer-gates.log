@@ -1,0 +1,18 @@
+# AUD-QRY-6 sanitizer gates (2026-11-22, post-fix tree)
+# Diff class: collection-callback refusal (scalar latch + return) + comment
+# extensions — no locks, atomics, shared/cached state, object lifetimes, or
+# background threads → once each per the AGENTS standing rule.
+# The ASan gate doubles as the fix's MEMORY-SAFETY PROOF: the Task-0 case
+# (whose base run aborts the daemon with the stack-buffer-overflow, see
+# AUD-QRY-6-asan-base.log) must run clean post-fix.
+
+BUILD_MODE=asan  → test-igb-bitmap-long-value: 6307 passed, 0 failed
+                   (no ASan report, no leaks — the OOB is gone)
+                   → run-all --jobs 6: 1..698, 2,435,332 passed, 0 failed
+BUILD_MODE=tsan  → run-all --jobs 3 (TSAN_OPTIONS second_deadlock_stack=1:print_stacktrace=1):
+                   1..698, 2,435,328 passed, 0 failed
+(normal suite same tree: 698 cases, 2,435,334 assertions, 0 failed — the ±few
+ assertion delta across build modes is the usual mode-dependent assertion count,
+ case count identical at 698 with 0 failures in all three)
+
+No ASan/UBSan/TSan reports. Gate discharged for this branch's diff.

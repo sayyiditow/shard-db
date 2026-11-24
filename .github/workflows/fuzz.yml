@@ -3,15 +3,18 @@ name: libFuzzer (wire-format parsers)
 # Build the libFuzzer harnesses with ASan + UBSan and run a short
 # coverage-driven fuzz pass on each. Catches the bug class that none of
 # our static analyzers can: malformed-input parsing crashes (heap OOB,
-# leaks, infinite loops in the JSON / base64 / criteria-tree parsers).
+# leaks, infinite loops in the JSON / base64 / criteria-tree parsers,
+# the filename validators, the cursor protocol, and the request framing
+# loop — fuzz_frame drives the real dispatcher, auth included).
 #
-# First three runs of these harnesses found two real heap-buffer-overflows
+# Early runs of these harnesses found two real heap-buffer-overflows
 # in the wire path — both reachable from any unauthenticated TCP byte
 # before auth. Those are now fixed; this workflow keeps regressions out.
 #
-# CI budget per harness is intentionally short (60s of fuzzing per parser
-# = 3 minutes total). For deeper continuous fuzzing, register with
-# OSS-Fuzz — the harnesses live in fuzz/ ready to be picked up.
+# CI budget per harness is intentionally short (60s of fuzzing each =
+# 6 minutes across the six harnesses). For deeper continuous fuzzing,
+# register with OSS-Fuzz — the harnesses live in fuzz/ ready to be
+# picked up.
 
 on:
   push:
@@ -30,7 +33,7 @@ jobs:
   fuzz:
     name: libFuzzer (Linux x86_64)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       FUZZ_TIME: 60          # seconds per harness on PRs
       ASAN_OPTIONS: "halt_on_error=1:abort_on_error=0:print_stacktrace=1"
@@ -56,6 +59,15 @@ jobs:
 
       - name: Fuzz parse_criteria_tree (FUZZ_TIME=${{ env.FUZZ_TIME }}s)
         run: ./fuzz/build/fuzz_criteria -max_total_time=${{ env.FUZZ_TIME }} -print_final_stats=1 fuzz/corpora/criteria/
+
+      - name: Fuzz fuzz_filename (name validators) (FUZZ_TIME=${{ env.FUZZ_TIME }}s)
+        run: ./fuzz/build/fuzz_filename -max_total_time=${{ env.FUZZ_TIME }} -print_final_stats=1 fuzz/corpora/filename/
+
+      - name: Fuzz fuzz_cursor (cursor pagination parser) (FUZZ_TIME=${{ env.FUZZ_TIME }}s)
+        run: ./fuzz/build/fuzz_cursor -max_total_time=${{ env.FUZZ_TIME }} -print_final_stats=1 fuzz/corpora/cursor/
+
+      - name: Fuzz fuzz_frame (request framing loop) (FUZZ_TIME=${{ env.FUZZ_TIME }}s)
+        run: ./fuzz/build/fuzz_frame -max_total_time=${{ env.FUZZ_TIME }} -print_final_stats=1 fuzz/corpora/frame/
 
       - name: Upload crash artifacts (if any)
         if: failure()

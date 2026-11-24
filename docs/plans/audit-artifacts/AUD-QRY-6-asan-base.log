@@ -1,0 +1,207 @@
+# AUD-QRY-6 Task 0 — base ASan red (2026-11-22, pre-fix tree)
+# Command: BUILD_MODE=asan build; ASAN_OPTIONS=log_path=/tmp/... ./build/bin/shard-db-test run test-igb-bitmap-long-value
+# Case result on base: 6302 passed, 5 failed — the designed reds: case2 x2 (lv_bm OK silent
+# under-report vs oracle ERR), case3 x2 (lv_only OK silent empty), case5 (lv_wide daemon
+# abort mid-group_by). case1 (oracle E2BIG) + case4 (short-value controls) GREEN.
+# NOTE: the fixture's long values are VLEN-1 = 1999 bytes (NUL-terminated buffer of VLEN=2000)
+# — row 255 read end 261,120 + 1999 = 263,119 > 262,144, same firing arithmetic.
+# The lv_wide placement engineering (probe-routed shard-7 keys, then in-place updates) is
+# REQUIRED for detectability — see PLAN_NOTES QRY-6: with uncontrolled key routing the long
+# values collect at row ~n_shards*shorts_per_shard and no read crosses the array end
+# (root-caused by reading the on-disk .bm dicts after the naive fixture returned ERR silently).
+# Standalone-daemon corroboration: same construction reproduced the identical report.
+
+=== daemon ASan report (from asan.<pid>) ===
+=================================================================
+==276035==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x7b8db5a9c250 at pc 0x7f8e1a4ed06c bp 0x7b8db59f53d0 sp 0x7b8db59f4b78
+READ of size 1999 at 0x7b8db5a9c250 thread T74
+    #0 0x7f8e1a4ed06b  (/usr/lib/libasan.so.8+0xed06b) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x7f8e1a4ed464 in memcmp (/usr/lib/libasan.so.8+0xed464) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #2 0x0000005cbec6 in bm_collect_uniq_cb src/db/query_aggregate.c:4751
+    #3 0x0000004a6d02 in bm_iter_values src/db/bitmap.c:1328
+    #4 0x00000060a9cd in cmd_aggregate_do src/db/query_aggregate.c:6111
+    #5 0x00000061d695 in cmd_aggregate src/db/query_aggregate.c:7373
+    #6 0x00000071962f in dispatch_json_query src/db/server.c:2280
+    #7 0x00000071bf3e in server_process_fast src/db/server.c:2474
+    #8 0x00000071ed9d in worker_thread src/db/server.c:2774
+    #9 0x7f8e1a461858  (/usr/lib/libasan.so.8+0x61858) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #10 0x7f8e19298041  (/usr/lib/libc.so.6+0x98041) (BuildId: 6961407ef2e7877eabf5ed8c5a39aea9de7194c1)
+    #11 0x7f8e19320b2b  (/usr/lib/libc.so.6+0x120b2b) (BuildId: 6961407ef2e7877eabf5ed8c5a39aea9de7194c1)
+
+Address 0x7b8db5a9c250 is located in stack of thread T74 at offset 682256 in frame
+    #0 0x0000005f9d65 in cmd_aggregate_do src/db/query_aggregate.c:4796
+
+  This frame has 129 object(s):
+    [32, 36) 'topn_cap_fb' (line 4799)
+    [48, 52) 'nhv' (line 5131)
+    [64, 68) 'isect_partial' (line 5365)
+    [80, 84) 'small_primary' (line 5373)
+    [96, 100) 'small_primary' (line 5517)
+    [112, 116) 'budget_exceeded' (line 5535)
+    [128, 132) 'dl_counter' (line 6075)
+    [144, 148) 'bm_n' (line 6091)
+    [160, 164) 'bm_dl' (line 6092)
+    [176, 180) 'bm_n_h' (line 6289)
+    [192, 196) 'bm_dl_h' (line 6290)
+    [208, 212) 'small_primary' (line 6467)
+    [224, 228) 'budget_exceeded' (line 6491)
+    [240, 244) 'snull' (line 6973)
+    [256, 260) 'nbuckets' (line 7142)
+    [272, 276) 'nhaving' (line 7151)
+    [288, 296) 'wbytes' (line 4889)
+    [320, 328) 'cnt' (line 4917)
+    [352, 360) 'agg_budget_bytes' (line 5026)
+    [384, 392) 'hv' (line 5131)
+    [416, 424) 'cb' (line 5505)
+    [448, 456) 'cb' (line 5518)
+    [480, 488) 'cb' (line 5536)
+    [512, 520) 'cnt' (line 5577)
+    [544, 552) 'vs_sdb' (line 5683)
+    [576, 584) 'v' (line 5733)
+    [608, 616) 'vl' (line 5733)
+    [640, 648) 'h' (line 5733)
+    [672, 680) 'v' (line 5804)
+    [704, 712) 'vl' (line 5804)
+    [736, 744) 'h' (line 5804)
+    [768, 776) 'bm_sdb' (line 6342)
+    [800, 808) 'cb' (line 6455)
+    [832, 840) 'cb' (line 6468)
+    [864, 872) 'cb' (line 6492)
+    [896, 904) 'val' (line 6903)
+    [928, 936) 'vlen' (line 6903)
+    [960, 968) 'hash16' (line 6903)
+    [992, 1000) 'sval' (line 6968)
+    [1024, 1032) 'slen' (line 6968)
+    [1056, 1064) 'stext' (line 6974)
+    [1088, 1096) 'stext_len' (line 6974)
+    [1120, 1128) 'val' (line 7058)
+    [1152, 1160) 'vlen' (line 7058)
+    [1184, 1192) 'hash16' (line 7058)
+    [1216, 1224) 'having' (line 7150)
+    [1248, 1260) 'info' (line 5685)
+    [1280, 1292) 'bm_info' (line 6337)
+    [1312, 1328) 'wdl' (line 4888)
+    [1344, 1360) 'dl' (line 4947)
+    [1376, 1400) 'hbk' (line 6069)
+    [1440, 1464) 'hbk_bm' (line 6333)
+    [1504, 1528) 'bx' (line 6362)
+    [1568, 1600) 'ns' (line 4878)
+    [1632, 1664) 'ns' (line 4899)
+    [1696, 1728) 'wfc_ns' (line 5200)
+    [1760, 1792) 'aw_ns' (line 5458)
+    [1824, 1856) 'ns' (line 5565)
+    [1888, 1920) 'dc' (line 6109)
+    [1952, 1984) 'dc' (line 6305)
+    [2016, 2056) 'env' (line 4918)
+    [2096, 2136) 'wenv' (line 5226)
+    [2176, 2216) 'wc' (line 6221)
+    [2256, 2304) 'cell' (line 5247)
+    [2336, 2384) 'sk' (line 5316)
+    [2416, 2512) 'num' (line 4916)
+    [2544, 2640) 'total' (line 5225)
+    [2672, 2768) 'num' (line 5576)
+    [2800, 3056) 'proto' (line 4909)
+    [3120, 3376) 'proto' (line 5572)
+    [3440, 3448) 'kvp' (line 5912)
+    [3472, 3480) 'kvp' (line 6139)
+    [3504, 3512) 'kvp' (line 6244)
+    [3536, 3544) 'kvp_h' (line 6355)
+    [3568, 3632) 'isect_leaves' (line 5363)
+    [3664, 3728) 'cvlens' (line 6180)
+    [3760, 3832) 'held' (line 6199)
+    [3872, 3944) 'hpaths' (line 6201)
+    [3984, 4112) 'done' (line 4894)
+    [4144, 4272) 'sibs' (line 4901)
+    [4304, 4432) 'done' (line 5559)
+    [4464, 4592) 'sibs' (line 5567)
+    [4624, 4752) 'vs_spec_tidx' (line 5693)
+    [4784, 4912) 'processed' (line 7026)
+    [4944, 5072) 'sibs' (line 7031)
+    [5104, 5248) 'lc' (line 5833)
+    [5312, 5456) 'lc' (line 5860)
+    [5520, 5676) 'sch' (line 4800)
+    [5744, 6192) 'aw_fp' (line 5477)
+    [6256, 6704) 'igb_crit_fp' (line 6050)
+    [6768, 8304) 'cells' (line 4891)
+    [8432, 9968) 'cells' (line 5556)
+    [10096, 12144) 'bm_vlens' (line 6090)
+    [12272, 14320) 'counts' (line 6191)
+    [14448, 16496) 'bm_vlens_h' (line 6288)
+    [16624, 18672) 'gvals' (line 6929)
+    [18800, 26992) 'cvals' (line 6179)
+    [27248, 35440) 'cps' (line 6200)
+    [35696, 44944) 'ring' (line 7050)
+    [45200, 77968) 'isect_paths' (line 5364)
+    [78224, 143760) 'tmp_fields' (line 4954)
+    [144016, 209728) 'fs' (line 4801)
+    [209984, 288520) 'ctx' (line 5012)
+    [288784, 419856) 'gbufs' (line 6928)
+    [420112, 682256) 'bm_vals' (line 6089)
+    [682512, 944656) 'bm_vals_h' (line 6287) <== Memory access at offset 682256 partially underflows this variable
+    [944912, 944913) 'knull' (line 5905)
+    [944928, 944930) 'd' (line 7256)
+    [944944, 944946) 'd' (line 7260)
+    [944960, 944962) 'd' (line 7267)
+    [944976, 944978) 'd' (line 7271)
+    [944992, 945024) 'raw_key' (line 6931)
+    [945056, 945120) 'prev_enc' (line 6891)
+    [945152, 945408) 'verr' (line 4809)
+    [945472, 945728) 'verr' (line 5035)
+    [945792, 946048) 'verr' (line 5126)
+    [946112, 946368) 'gnulls' (line 6930)
+    [946432, 946944) 'display' (line 6135)
+    [947008, 947520) 'display' (line 6238)
+    [947584, 948096) 'display_h' (line 6349)
+    [948160, 948705) 'min_key' (line 5779)
+    [948848, 949393) 'label' (line 5902)
+    [949536, 950560) 'bp' (line 6097)
+    [950688, 951712) 'bp' (line 6194)
+    [951840, 952864) 'bp' (line 6295)
+    [952992, 955040) 'gb_csv' (line 4952)
+    [955168, 959264) 'idx_path' (line 5725)
+    [959392, 963488) 'idx_path' (line 6895)
+    [963616, 967712) 'idx_path' (line 7052)
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork
+      (longjmp and C++ exceptions *are* supported)
+Thread T74 created by T0 here:
+    #0 0x7f8e1a5226f4 in pthread_create (/usr/lib/libasan.so.8+0x1226f4) (BuildId: b8a4241051a1621937fdc46e867ba7ecb56d96ea)
+    #1 0x000000730f22 in db_thread_create src/db/config.c:223
+    #2 0x000000721cd2 in cmd_server src/db/server.c:4018
+    #3 0x000000728745 in main src/db/main.c:148
+    #4 0x7f8e19227780  (/usr/lib/libc.so.6+0x27780) (BuildId: 6961407ef2e7877eabf5ed8c5a39aea9de7194c1)
+    #5 0x7f8e192278b8 in __libc_start_main (/usr/lib/libc.so.6+0x278b8) (BuildId: 6961407ef2e7877eabf5ed8c5a39aea9de7194c1)
+    #6 0x0000004075b4 in _start (/home/hashim/junk-system/git-workspace/sayyiditow/shard-db/build/bin/shard-db-test-server+0x4075b4) (BuildId: 5551d0e31024ee96fbdccf5af2637ae9f1cb2714)
+
+SUMMARY: AddressSanitizer: stack-buffer-overflow src/db/query_aggregate.c:4751 in bm_collect_uniq_cb
+Shadow bytes around the buggy address:
+  0x7b8db5a9bf80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b8db5a9c000: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b8db5a9c080: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b8db5a9c100: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b8db5a9c180: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x7b8db5a9c200: 00 00 00 00 00 00 00 00 00 00[f2]f2 f2 f2 f2 f2
+  0x7b8db5a9c280: f2 f2 f2 f2 f2 f2 f2 f2 f2 f2 f2 f2 f2 f2 f2 f2
+  0x7b8db5a9c300: f2 f2 f2 f2 f2 f2 f2 f2 f2 f2 00 00 00 00 00 00
+  0x7b8db5a9c380: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b8db5a9c400: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b8db5a9c480: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==276035==ABORTING

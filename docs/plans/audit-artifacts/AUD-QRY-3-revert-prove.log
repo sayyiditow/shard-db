@@ -1,0 +1,16 @@
+# AUD-QRY-3 Task 4 revert-prove-paste (2026-11-20)
+# Method: git stash push -m 'AUD-QRY-3 fix revert-proof' -- src/db/slotcask.c src/db/shard_db_internal.h
+# (path-limited; slotcask.c/shard_db_internal.h carried no other uncommitted changes; the untracked
+#  test file stayed present). RED = fix stashed; GREEN = git stash pop. Both builds rc=0.
+
+=== RED (fix stashed): identical Task-1 red — 195 passed, 8 failed
+not ok 181 - case A: count == live model (80)
+not ok 183 - case A: orphaned >= 0
+not ok 185 - case A: shard 001 header total(11) >= deleted(18446744073709551614)
+not ok 187 - case A: shard 003 header total(10) >= deleted(18446744073709551615)
+not ok 188 - case A: shard 004 header total(5) >= deleted(18446744073709551612)
+not ok 189 - case A: shard 005 header total(13) >= deleted(18446744073709551613)
+not ok 191 - case A: shard 007 header total(10) >= deleted(18446744073709551614)
+not ok 203 - case B: count == 1 (live exact, no wrap)
+
+=== GREEN (fix restored): 203 passed, 0 failed (case rc=0)

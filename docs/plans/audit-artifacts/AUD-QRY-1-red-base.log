@@ -1,0 +1,125 @@
+# test-igb-bitmap-group-fallback
+ok 1 - connect
+ok 2 - oracle object created
+ok 3 - bitmap object created
+ok 4 - alloc records
+ok 5 - alloc insert
+ok 6 - bulk insert oracle
+ok 7 - oracle bulk inserted
+ok 8 - alloc insert2
+ok 9 - bulk insert bitmap
+ok 10 - bitmap bulk inserted
+ok 11 - AUD-QRY-1: t-between criteria groups match the oracle
+ok 12 - AUD-QRY-1: t-between criteria groups match the oracle
+ok 13 - AUD-QRY-1: t-between criteria groups match the oracle
+not ok 14 - AUD-QRY-1: t-between criteria groups match the oracle
+#   assertion failed: cb >= 0
+not ok 15 - AUD-QRY-1: t-between criteria groups match the oracle
+#   expected -1 got 25
+ok 16 - AUD-QRY-1: t-between criteria groups match the oracle
+ok 17 - AUD-QRY-1: t-between criteria groups match the oracle
+ok 18 - AUD-QRY-1: t-between criteria groups match the oracle
+not ok 19 - AUD-QRY-1: t-between criteria groups match the oracle
+#   assertion failed: cb >= 0
+not ok 20 - AUD-QRY-1: t-between criteria groups match the oracle
+#   expected -1 got 25
+ok 21 - AUD-QRY-1: t-between criteria groups match the oracle
+ok 22 - AUD-QRY-1: t-between criteria groups match the oracle
+ok 23 - AUD-QRY-1: t-between criteria groups match the oracle
+not ok 24 - AUD-QRY-1: t-between criteria groups match the oracle
+#   assertion failed: cb >= 0
+not ok 25 - AUD-QRY-1: t-between criteria groups match the oracle
+#   expected -1 got 25
+ok 26 - AUD-QRY-1: t-between criteria groups match the oracle
+ok 27 - AUD-QRY-1: t-between criteria groups match the oracle
+ok 28 - AUD-QRY-1: t-between criteria groups match the oracle
+not ok 29 - AUD-QRY-1: t-between criteria groups match the oracle
+#   assertion failed: cb >= 0
+not ok 30 - AUD-QRY-1: t-between criteria groups match the oracle
+#   expected -1 got 25
+ok 31 - AUD-QRY-1: count+sum groups match the oracle
+ok 32 - AUD-QRY-1: count+sum groups match the oracle
+ok 33 - AUD-QRY-1: count+sum groups match the oracle
+not ok 34 - AUD-QRY-1: count+sum groups match the oracle
+#   assertion failed: cb >= 0
+not ok 35 - AUD-QRY-1: count+sum groups match the oracle
+#   expected -1 got 25
+ok 36 - AUD-QRY-1: count+sum groups match the oracle
+not ok 37 - AUD-QRY-1: count+sum groups match the oracle
+#   assertion failed: sb >= 0
+not ok 38 - AUD-QRY-1: count+sum groups match the oracle
+#   expected -1 got 147
+ok 39 - AUD-QRY-1: count+sum groups match the oracle
+ok 40 - AUD-QRY-1: count+sum groups match the oracle
+ok 41 - AUD-QRY-1: count+sum groups match the oracle
+not ok 42 - AUD-QRY-1: count+sum groups match the oracle
+#   assertion failed: cb >= 0
+not ok 43 - AUD-QRY-1: count+sum groups match the oracle
+#   expected -1 got 25
+ok 44 - AUD-QRY-1: count+sum groups match the oracle
+not ok 45 - AUD-QRY-1: count+sum groups match the oracle
+#   assertion failed: sb >= 0
+not ok 46 - AUD-QRY-1: count+sum groups match the oracle
+#   expected -1 got 146
+ok 47 - AUD-QRY-1: count+sum groups match the oracle
+ok 48 - AUD-QRY-1: count+sum groups match the oracle
+ok 49 - AUD-QRY-1: count+sum groups match the oracle
+not ok 50 - AUD-QRY-1: count+sum groups match the oracle
+#   assertion failed: cb >= 0
+not ok 51 - AUD-QRY-1: count+sum groups match the oracle
+#   expected -1 got 25
+ok 52 - AUD-QRY-1: count+sum groups match the oracle
+not ok 53 - AUD-QRY-1: count+sum groups match the oracle
+#   assertion failed: sb >= 0
+not ok 54 - AUD-QRY-1: count+sum groups match the oracle
+#   expected -1 got 149
+ok 55 - AUD-QRY-1: count+sum groups match the oracle
+ok 56 - AUD-QRY-1: count+sum groups match the oracle
+ok 57 - AUD-QRY-1: count+sum groups match the oracle
+not ok 58 - AUD-QRY-1: count+sum groups match the oracle
+#   assertion failed: cb >= 0
+not ok 59 - AUD-QRY-1: count+sum groups match the oracle
+#   expected -1 got 25
+ok 60 - AUD-QRY-1: count+sum groups match the oracle
+not ok 61 - AUD-QRY-1: count+sum groups match the oracle
+#   assertion failed: sb >= 0
+not ok 62 - AUD-QRY-1: count+sum groups match the oracle
+#   expected -1 got 148
+ok 63 - control: slot-eligible eq criteria stay correct
+ok 64 - control: slot-eligible eq criteria stay correct
+ok 65 - control: slot-eligible eq criteria stay correct
+ok 66 - control: slot-eligible eq criteria stay correct
+ok 67 - control: slot-eligible eq criteria stay correct
+ok 68 - control: slot-eligible eq criteria stay correct
+ok 69 - control: slot-eligible eq criteria stay correct
+ok 70 - control: slot-eligible eq criteria stay correct
+ok 71 - control: slot-eligible eq criteria stay correct
+ok 72 - control: slot-eligible eq criteria stay correct
+ok 73 - control: slot-eligible eq criteria stay correct
+ok 74 - control: slot-eligible eq criteria stay correct
+ok 75 - control: slot-eligible eq criteria stay correct
+ok 76 - control: slot-eligible eq criteria stay correct
+ok 77 - control: slot-eligible eq criteria stay correct
+ok 78 - control: slot-eligible eq criteria stay correct
+ok 79 - control: slot-eligible eq criteria stay correct
+ok 80 - control: no-criteria popcount path stays correct
+ok 81 - control: no-criteria popcount path stays correct
+ok 82 - control: no-criteria popcount path stays correct
+ok 83 - control: no-criteria popcount path stays correct
+ok 84 - control: no-criteria popcount path stays correct
+ok 85 - control: no-criteria popcount path stays correct
+ok 86 - control: no-criteria popcount path stays correct
+ok 87 - control: no-criteria popcount path stays correct
+ok 88 - control: no-criteria popcount path stays correct
+ok 89 - control: no-criteria popcount path stays correct
+ok 90 - control: no-criteria popcount path stays correct
+ok 91 - control: no-criteria popcount path stays correct
+ok 92 - control: no-criteria popcount path stays correct
+ok 93 - control: no-criteria popcount path stays correct
+ok 94 - control: no-criteria popcount path stays correct
+ok 95 - control: no-criteria popcount path stays correct
+ok 96 - control: no-criteria popcount path stays correct
+ok 97 - control: no-criteria popcount path stays correct
+ok 98 - control: no-criteria popcount path stays correct
+ok 99 - control: no-criteria popcount path stays correct
+# test-igb-bitmap-group-fallback: 75 passed, 24 failed

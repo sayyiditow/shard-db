@@ -1,0 +1,7 @@
+# AUD-QRY-3 sanitizer gate — THREE consecutive passes each (kf header counters = shared state under the kf wrlock; AGENTS.md rule)
+# 2026-11-20, post-fix tree. All runs: 694 cases, 0 failed.
+
+ASan+UBSan (--jobs 6): pass 1 = 2416637/0; pass 2 = 2416637/0; pass 3 = 2416637/0  (rc=0 each)
+TSan (--jobs 3, second_deadlock_stack=1:print_stacktrace=1): pass 1 = 2416633/0; pass 2 = 2416633/0; pass 3 = 2416633/0  (rc=0 each)
+
+Normal build rebuilt afterwards; targeted case re-verified on it.

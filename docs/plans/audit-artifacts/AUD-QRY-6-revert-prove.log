@@ -1,0 +1,21 @@
+# AUD-QRY-6 Task 3.1 revert-prove (2026-11-22)
+# Method: git stash push -m '...' -- src/db/query_aggregate.c (path-limited, per the plan).
+# LIFT-NOTE: the stash lifted the stacked uncommitted QRY-1/QRY-2/QRY-5/QRY-8/QRY-6 hunks in the
+# same file — the reds are UNAFFECTED: this plan's shapes carry no criteria (no QRY-2 tree),
+# <=4 distinct values (no QRY-5 cap), non-composite fields (no QRY-8), no group fallback shapes
+# (no QRY-1); the QRY-6 refusal is the only gate they reach. Verified: the base run reds exactly
+# the four functional QRY-6 assertions. (The ASan red is Task 0's artifact — the stash also
+# re-enables the OOB; not re-run here, the Task-0 log stands.)
+
+=== GREEN (fix in tree, pre-stash): 6307 passed, 0 failed
+   diag: lv_bm ERR (parity) / lv_only ERR / lv_wide ERR — every shape matches the no-index oracle
+
+=== RED (fix stashed, base query_aggregate.c): 6303 passed, 4 failed — the Task 1 base proof
+not ok 117 - case2: bitmap twin matches oracle classification (ERR)      [lv_bm OK: silent under-report]
+not ok 118 - case2: bitmap twin same pinned E2BIG text
+not ok 120 - case3: long-values-only object errors E2BIG                 [lv_only OK: silent empty group list]
+not ok 121 - case3: pinned E2BIG text
+(case1 oracle E2BIG + case4 short-value controls GREEN on base too; case5 diag OK on the
+ normal build — the daemon abort needs the ASan build, see AUD-QRY-6-asan-base.log)
+
+=== GREEN (git stash pop, fix restored): 6307 passed, 0 failed (rebuild clean)

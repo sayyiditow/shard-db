@@ -1,0 +1,10 @@
+up=1
+r_plain insert -> {"inserted":60}
+r_bitmap insert -> {"inserted":60}
+plain  crit10 -> [{"v":"cat_0","n":14}]
+bitmap crit10 -> [{"v":"cat_0","n":20}]
+plain  nocrit  -> {"error":"bad criteria: criteria must be array or object"}
+bitmap nocrit  -> {"error":"bad criteria: criteria must be array or object"}
+count plain  -> 14
+count bitmap -> 14
+done

@@ -1,0 +1,19 @@
+# AUD-QRY-5 Task 2 RED proof on base (2026-11-20; stacked tree with QRY-1/2/3/8 fixes)
+# Build rc=0, case rc=3; 236 passed / 3 failed. (Two earlier drafts had test-only bugs:
+#  snprintf formatting msg into itself (UB), case 4 comparing a 100-distinct object against the
+#  300-distinct oracle (now has its own cap_small_plain twin), and case 3's expect constant (the
+#  [w eq w_1] surviving label set is the 150 odd v-labels by parity algebra, not 300).)
+
+=== RED (3) — the cap truncation, one per fast-path shape:
+not ok 25 - case1: no-criteria popcount branch
+#   expected 256 got 300
+--
+not ok 29 - case2: Phase 1b hbm branch
+#   expected 256 got 300
+--
+  case1 popcount:  oracle 300 labels vs twin 256
+  case2 Phase 1b:  oracle 300 vs twin 256
+  case3 can_slot:  oracle 150 (odd v-labels x3) vs twin 132 wrong labels/counts
+
+=== GREEN as planned: case4 (100-distinct control vs its own oracle twin), case5 (count == 900).
+=== Task 0 repro artifact: AUD-QRY-5-repro.{sh,out} — count=900, group_by=256 labels on cap_demo.

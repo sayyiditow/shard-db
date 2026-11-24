@@ -1,0 +1,52 @@
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 1710433063
+INFO: Loaded 1 modules   (129437 inline 8-bit counters): 129437 [0x55f1f8cad910, 0x55f1f8ccd2ad), 
+INFO: Loaded 1 PC tables (129437 PCs): 129437 [0x55f1f8ccd2b0,0x55f1f8ec6c80), 
+./fuzz/build/fuzz_frame: Running 1 inputs 1 time(s) each.
+Running: docs/plans/audit-artifacts/AUD-RES-1-leak-input.bin
+frame: pre-push mrs=64
+frame: post mrs=64 got=60 resp={"error":"Unknown dir: "}
+
+frame: pre-push mrs=64
+frame: post mrs=64 got=60 resp={"error":"Unknown dir: "}
+
+
+=================================================================
+==820410==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 128 byte(s) in 2 object(s) allocated from:
+    #0 0x55f1f83dcea4 in malloc (/home/hashim/junk-system/git-workspace/sayyiditow/shard-db/fuzz/build/fuzz_frame+0x6bcea4) (BuildId: 43ba28df3e2090f6e254b565090c0165f6ed72d5)
+    #1 0x55f1f847114a in read_list /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:184:20
+    #2 0x55f1f847114a in parse_predicate /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:271:13
+    #3 0x55f1f847114a in parse_atom /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:314:12
+    #4 0x55f1f846ff31 in parse_and_expr /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:318:26
+    #5 0x55f1f8466c21 in parse_or_expr /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:330:26
+    #6 0x55f1f846693d in nql_parse_filter /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:345:26
+    #7 0x55f1f8468ebd in nql_parse_command /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:504:23
+    #8 0x55f1f8446d8a in dispatch_nql_query /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/fuzz/../src/db/server.c:644:9
+    #9 0x55f1f8446d8a in server_process_fast /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/fuzz/../src/db/server.c:2469:9
+    #10 0x55f1f844a5a1 in worker_thread /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/fuzz/../src/db/server.c:2774:17
+    #11 0x55f1f845d15f in frame_worker_trampoline /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/fuzz/fuzz_frame.c:74:12
+    #12 0x55f1f83d9fe6 in asan_thread_start(void*) asan_interceptors.cpp.o
+
+Indirect leak of 24 byte(s) in 6 object(s) allocated from:
+    #0 0x55f1f83c1e5b in strdup (/home/hashim/junk-system/git-workspace/sayyiditow/shard-db/fuzz/build/fuzz_frame+0x6a1e5b) (BuildId: 43ba28df3e2090f6e254b565090c0165f6ed72d5)
+    #1 0x55f1f84713d6 in read_list /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:199:39
+    #2 0x55f1f84713d6 in parse_predicate /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:271:13
+    #3 0x55f1f84713d6 in parse_atom /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:314:12
+    #4 0x55f1f846ff31 in parse_and_expr /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:318:26
+    #5 0x55f1f8466c21 in parse_or_expr /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:330:26
+    #6 0x55f1f846693d in nql_parse_filter /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:345:26
+    #7 0x55f1f8468ebd in nql_parse_command /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/src/db/nql.c:504:23
+    #8 0x55f1f8446d8a in dispatch_nql_query /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/fuzz/../src/db/server.c:644:9
+    #9 0x55f1f8446d8a in server_process_fast /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/fuzz/../src/db/server.c:2469:9
+    #10 0x55f1f844a5a1 in worker_thread /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/fuzz/../src/db/server.c:2774:17
+    #11 0x55f1f845d15f in frame_worker_trampoline /home/hashim/junk-system/git-workspace/sayyiditow/shard-db/fuzz/fuzz_frame.c:74:12
+    #12 0x55f1f83d9fe6 in asan_thread_start(void*) asan_interceptors.cpp.o
+
+SUMMARY: AddressSanitizer: 152 byte(s) leaked in 8 allocation(s).
+
+INFO: a leak has been found in the initial corpus.
+
+INFO: to ignore leaks on libFuzzer side use -detect_leaks=0.
+

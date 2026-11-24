@@ -1,0 +1,9 @@
+create: {"status":"created","object":"cap_demo","dir":"default","splits":8,"max_key":16,"value_size":30,"fields":2,"storage_version":2,"streams":8}
+bulk chunk: {"inserted":300}
+bulk chunk: {"inserted":300}
+bulk chunk: {"inserted":300}
+count: 900
+group_by label count: 256 (expected 300; the cap truncates at 256)
+group_by head: [{"v":"v089","n":3},{"v":"v010","n":3},{"v":"v011","n":3},{"v":"v012","n":3},{"v":"v013","n":3},{"v":"v014","n":3},{"v":"v015","n":3},{"v":"v016","n":3},{"v":"v ...
+group_by tail: n":3},{"v":"v086","n":3},{"v":"v248","n":3},{"v":"v087","n":3},{"v":"v168","n":3},{"v":"v249","n":3},{"v":"v169","n":3}]
+done

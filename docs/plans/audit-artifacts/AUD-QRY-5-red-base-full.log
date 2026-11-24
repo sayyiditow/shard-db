@@ -1,0 +1,247 @@
+# test-igb-bitmap-dict-cap
+ok 1 - connect
+ok 2 - oracle created
+ok 3 - cap_bm created
+ok 4 - cap_small created
+ok 5 - cap_small oracle created
+ok 6 - alloc body
+ok 7 - alloc request
+ok 8 - bulk insert response
+ok 9 - bulk insert accepted
+ok 10 - alloc body
+ok 11 - alloc request
+ok 12 - bulk insert response
+ok 13 - bulk insert accepted
+ok 14 - alloc body
+ok 15 - alloc request
+ok 16 - bulk insert response
+ok 17 - bulk insert accepted
+ok 18 - alloc body
+ok 19 - alloc request
+ok 20 - bulk insert response
+ok 21 - bulk insert accepted
+ok 22 - group_by response
+ok 23 - group_by response
+# case1: no-criteria popcount branch: oracle labels=300 (expect 300), twin labels=256
+ok 24 - case1: no-criteria popcount branch
+not ok 25 - case1: no-criteria popcount branch
+#   expected 256 got 300
+ok 26 - group_by response
+ok 27 - group_by response
+# case2: Phase 1b hbm branch: oracle labels=300 (expect 300), twin labels=256
+ok 28 - case2: Phase 1b hbm branch
+not ok 29 - case2: Phase 1b hbm branch
+#   expected 256 got 300
+ok 30 - group_by response
+ok 31 - group_by response
+# case3: can_slot slot-level branch: oracle labels=150 (expect 150), twin labels=132
+ok 32 - case3: can_slot slot-level branch
+not ok 33 - case3: can_slot slot-level branch
+#   expected 132 got 150
+ok 34 - group_by response
+ok 35 - group_by response
+ok 36 - case4: <=256-distinct control
+ok 37 - case4: <=256-distinct control
+ok 38 - case4: <=256-distinct control
+ok 39 - case4: <=256-distinct control
+ok 40 - case4: <=256-distinct control
+ok 41 - case4: <=256-distinct control
+ok 42 - case4: <=256-distinct control
+ok 43 - case4: <=256-distinct control
+ok 44 - case4: <=256-distinct control
+ok 45 - case4: <=256-distinct control
+ok 46 - case4: <=256-distinct control
+ok 47 - case4: <=256-distinct control
+ok 48 - case4: <=256-distinct control
+ok 49 - case4: <=256-distinct control
+ok 50 - case4: <=256-distinct control
+ok 51 - case4: <=256-distinct control
+ok 52 - case4: <=256-distinct control
+ok 53 - case4: <=256-distinct control
+ok 54 - case4: <=256-distinct control
+ok 55 - case4: <=256-distinct control
+ok 56 - case4: <=256-distinct control
+ok 57 - case4: <=256-distinct control
+ok 58 - case4: <=256-distinct control
+ok 59 - case4: <=256-distinct control
+ok 60 - case4: <=256-distinct control
+ok 61 - case4: <=256-distinct control
+ok 62 - case4: <=256-distinct control
+ok 63 - case4: <=256-distinct control
+ok 64 - case4: <=256-distinct control
+ok 65 - case4: <=256-distinct control
+ok 66 - case4: <=256-distinct control
+ok 67 - case4: <=256-distinct control
+ok 68 - case4: <=256-distinct control
+ok 69 - case4: <=256-distinct control
+ok 70 - case4: <=256-distinct control
+ok 71 - case4: <=256-distinct control
+ok 72 - case4: <=256-distinct control
+ok 73 - case4: <=256-distinct control
+ok 74 - case4: <=256-distinct control
+ok 75 - case4: <=256-distinct control
+ok 76 - case4: <=256-distinct control
+ok 77 - case4: <=256-distinct control
+ok 78 - case4: <=256-distinct control
+ok 79 - case4: <=256-distinct control
+ok 80 - case4: <=256-distinct control
+ok 81 - case4: <=256-distinct control
+ok 82 - case4: <=256-distinct control
+ok 83 - case4: <=256-distinct control
+ok 84 - case4: <=256-distinct control
+ok 85 - case4: <=256-distinct control
+ok 86 - case4: <=256-distinct control
+ok 87 - case4: <=256-distinct control
+ok 88 - case4: <=256-distinct control
+ok 89 - case4: <=256-distinct control
+ok 90 - case4: <=256-distinct control
+ok 91 - case4: <=256-distinct control
+ok 92 - case4: <=256-distinct control
+ok 93 - case4: <=256-distinct control
+ok 94 - case4: <=256-distinct control
+ok 95 - case4: <=256-distinct control
+ok 96 - case4: <=256-distinct control
+ok 97 - case4: <=256-distinct control
+ok 98 - case4: <=256-distinct control
+ok 99 - case4: <=256-distinct control
+ok 100 - case4: <=256-distinct control
+ok 101 - case4: <=256-distinct control
+ok 102 - case4: <=256-distinct control
+ok 103 - case4: <=256-distinct control
+ok 104 - case4: <=256-distinct control
+ok 105 - case4: <=256-distinct control
+ok 106 - case4: <=256-distinct control
+ok 107 - case4: <=256-distinct control
+ok 108 - case4: <=256-distinct control
+ok 109 - case4: <=256-distinct control
+ok 110 - case4: <=256-distinct control
+ok 111 - case4: <=256-distinct control
+ok 112 - case4: <=256-distinct control
+ok 113 - case4: <=256-distinct control
+ok 114 - case4: <=256-distinct control
+ok 115 - case4: <=256-distinct control
+ok 116 - case4: <=256-distinct control
+ok 117 - case4: <=256-distinct control
+ok 118 - case4: <=256-distinct control
+ok 119 - case4: <=256-distinct control
+ok 120 - case4: <=256-distinct control
+ok 121 - case4: <=256-distinct control
+ok 122 - case4: <=256-distinct control
+ok 123 - case4: <=256-distinct control
+ok 124 - case4: <=256-distinct control
+ok 125 - case4: <=256-distinct control
+ok 126 - case4: <=256-distinct control
+ok 127 - case4: <=256-distinct control
+ok 128 - case4: <=256-distinct control
+ok 129 - case4: <=256-distinct control
+ok 130 - case4: <=256-distinct control
+ok 131 - case4: <=256-distinct control
+ok 132 - case4: <=256-distinct control
+ok 133 - case4: <=256-distinct control
+ok 134 - case4: <=256-distinct control
+ok 135 - case4: <=256-distinct control
+ok 136 - case4: <=256-distinct control
+ok 137 - case4: <=256-distinct control
+ok 138 - case4: <=256-distinct control
+ok 139 - case4: <=256-distinct control
+ok 140 - case4: <=256-distinct control
+ok 141 - case4: <=256-distinct control
+ok 142 - case4: <=256-distinct control
+ok 143 - case4: <=256-distinct control
+ok 144 - case4: <=256-distinct control
+ok 145 - case4: <=256-distinct control
+ok 146 - case4: <=256-distinct control
+ok 147 - case4: <=256-distinct control
+ok 148 - case4: <=256-distinct control
+ok 149 - case4: <=256-distinct control
+ok 150 - case4: <=256-distinct control
+ok 151 - case4: <=256-distinct control
+ok 152 - case4: <=256-distinct control
+ok 153 - case4: <=256-distinct control
+ok 154 - case4: <=256-distinct control
+ok 155 - case4: <=256-distinct control
+ok 156 - case4: <=256-distinct control
+ok 157 - case4: <=256-distinct control
+ok 158 - case4: <=256-distinct control
+ok 159 - case4: <=256-distinct control
+ok 160 - case4: <=256-distinct control
+ok 161 - case4: <=256-distinct control
+ok 162 - case4: <=256-distinct control
+ok 163 - case4: <=256-distinct control
+ok 164 - case4: <=256-distinct control
+ok 165 - case4: <=256-distinct control
+ok 166 - case4: <=256-distinct control
+ok 167 - case4: <=256-distinct control
+ok 168 - case4: <=256-distinct control
+ok 169 - case4: <=256-distinct control
+ok 170 - case4: <=256-distinct control
+ok 171 - case4: <=256-distinct control
+ok 172 - case4: <=256-distinct control
+ok 173 - case4: <=256-distinct control
+ok 174 - case4: <=256-distinct control
+ok 175 - case4: <=256-distinct control
+ok 176 - case4: <=256-distinct control
+ok 177 - case4: <=256-distinct control
+ok 178 - case4: <=256-distinct control
+ok 179 - case4: <=256-distinct control
+ok 180 - case4: <=256-distinct control
+ok 181 - case4: <=256-distinct control
+ok 182 - case4: <=256-distinct control
+ok 183 - case4: <=256-distinct control
+ok 184 - case4: <=256-distinct control
+ok 185 - case4: <=256-distinct control
+ok 186 - case4: <=256-distinct control
+ok 187 - case4: <=256-distinct control
+ok 188 - case4: <=256-distinct control
+ok 189 - case4: <=256-distinct control
+ok 190 - case4: <=256-distinct control
+ok 191 - case4: <=256-distinct control
+ok 192 - case4: <=256-distinct control
+ok 193 - case4: <=256-distinct control
+ok 194 - case4: <=256-distinct control
+ok 195 - case4: <=256-distinct control
+ok 196 - case4: <=256-distinct control
+ok 197 - case4: <=256-distinct control
+ok 198 - case4: <=256-distinct control
+ok 199 - case4: <=256-distinct control
+ok 200 - case4: <=256-distinct control
+ok 201 - case4: <=256-distinct control
+ok 202 - case4: <=256-distinct control
+ok 203 - case4: <=256-distinct control
+ok 204 - case4: <=256-distinct control
+ok 205 - case4: <=256-distinct control
+ok 206 - case4: <=256-distinct control
+ok 207 - case4: <=256-distinct control
+ok 208 - case4: <=256-distinct control
+ok 209 - case4: <=256-distinct control
+ok 210 - case4: <=256-distinct control
+ok 211 - case4: <=256-distinct control
+ok 212 - case4: <=256-distinct control
+ok 213 - case4: <=256-distinct control
+ok 214 - case4: <=256-distinct control
+ok 215 - case4: <=256-distinct control
+ok 216 - case4: <=256-distinct control
+ok 217 - case4: <=256-distinct control
+ok 218 - case4: <=256-distinct control
+ok 219 - case4: <=256-distinct control
+ok 220 - case4: <=256-distinct control
+ok 221 - case4: <=256-distinct control
+ok 222 - case4: <=256-distinct control
+ok 223 - case4: <=256-distinct control
+ok 224 - case4: <=256-distinct control
+ok 225 - case4: <=256-distinct control
+ok 226 - case4: <=256-distinct control
+ok 227 - case4: <=256-distinct control
+ok 228 - case4: <=256-distinct control
+ok 229 - case4: <=256-distinct control
+ok 230 - case4: <=256-distinct control
+ok 231 - case4: <=256-distinct control
+ok 232 - case4: <=256-distinct control
+ok 233 - case4: <=256-distinct control
+ok 234 - case4: <=256-distinct control
+ok 235 - case4: <=256-distinct control
+ok 236 - case4: <=256-distinct control
+ok 237 - case4: <=256-distinct control
+ok 238 - case5: count response
+ok 239 - case5: count == 900 (defect is group_by-specific)
+# test-igb-bitmap-dict-cap: 236 passed, 3 failed

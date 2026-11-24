@@ -1,0 +1,540 @@
+           PID: 366691 (shard-db-test-s)
+           TID: 366761 (shard-db-test-s)
+           UID: 1000 (hashim)
+           GID: 1001 (hashim)
+        Signal: 7 (BUS) si_code: BUS_ADRERR
+     Timestamp: Thu 2026-11-19 03:45:52 +08 (28min ago)
+  Command Line: /home/hashim/junk-system/git-workspace/sayyiditow/shard-db-gate-163/build/bin/shard-db-test-server server --test-control-fd 1056
+    Executable: /home/hashim/junk-system/git-workspace/sayyiditow/shard-db-gate-163/build/bin/shard-db-test-server
+ Control Group: /user.slice/user-1000.slice/user@1000.service/app.slice/app-zcode-19888.scope
+          Unit: user@1000.service
+     User Unit: app-zcode-19888.scope
+         Slice: user-1000.slice
+     Owner UID: 1000 (hashim)
+       Boot ID: cdef40665453494a8ee52fb43c5206cb
+    Machine ID: 5050fa91b2d84cba8d718ee4ed7619e4
+      Hostname: h-em780
+       Storage: /var/lib/systemd/coredump/core.shard-db-test-s.1000.cdef40665453494a8ee52fb43c5206cb.366691.1795031152000000.zst (present)
+  Size on Disk: 220K
+       Message: Process 366691 (shard-db-test-s) of user 1000 dumped core.
+                
+                Stack trace of thread 366761:
+                #0  0x000055e3a84f8700 n/a (shard-db-test-server + 0x39700)
+                #1  0x000055e3a84d304c n/a (shard-db-test-server + 0x1404c)
+                #2  0x000055e3a84fe8bf n/a (shard-db-test-server + 0x3f8bf)
+                #3  0x000055e3a851601d n/a (shard-db-test-server + 0x5701d)
+                #4  0x000055e3a85a91e8 n/a (shard-db-test-server + 0xea1e8)
+                #5  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #6  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366691:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab29116f5 __poll (libc.so.6 + 0x1116f5)
+                #2  0x000055e3a85aa8a1 n/a (shard-db-test-server + 0xeb8a1)
+                #3  0x000055e3a84c50d1 n/a (shard-db-test-server + 0x60d1)
+                #4  0x00007f9ab2827781 n/a (libc.so.6 + 0x27781)
+                #5  0x00007f9ab28278b9 __libc_start_main (libc.so.6 + 0x278b9)
+                #6  0x000055e3a84ca235 n/a (shard-db-test-server + 0xb235)
+                
+                Stack trace of thread 366694:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84caa53 n/a (shard-db-test-server + 0xba53)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366696:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366699:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366700:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366702:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366701:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366704:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366695:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84caa53 n/a (shard-db-test-server + 0xba53)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366693:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a85a73a3 n/a (shard-db-test-server + 0xe83a3)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366698:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366692:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2911ed2 read (libc.so.6 + 0x111ed2)
+                #2  0x000055e3a85d96ee n/a (shard-db-test-server + 0x11a6ee)
+                #3  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #4  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366697:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366703:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366705:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366706:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366710:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366709:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366708:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366707:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366713:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366714:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366711:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366715:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366712:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366718:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366716:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366717:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366719:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366762:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a85a6670 n/a (shard-db-test-server + 0xe7670)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366720:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366763:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a85a6670 n/a (shard-db-test-server + 0xe7670)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366765:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a85a6670 n/a (shard-db-test-server + 0xe7670)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366721:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366764:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a85a6670 n/a (shard-db-test-server + 0xe7670)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366723:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366722:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366724:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366725:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366727:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366726:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366728:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366729:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366730:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366731:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366732:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366733:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366734:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366735:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366736:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366737:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366738:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366739:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366740:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366741:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366742:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366743:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366744:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366745:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366746:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366747:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366748:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                
+                Stack trace of thread 366749:
+                #0  0x00007f9ab28a08f2 n/a (libc.so.6 + 0xa08f2)
+                #1  0x00007f9ab2894c79 n/a (libc.so.6 + 0x94c79)
+                #2  0x00007f9ab28974ec pthread_cond_wait (libc.so.6 + 0x974ec)
+                #3  0x000055e3a84cab83 n/a (shard-db-test-server + 0xbb83)
+                #4  0x00007f9ab2898042 n/a (libc.so.6 + 0x98042)
+                #5  0x00007f9ab2920b2c n/a (libc.so.6 + 0x120b2c)
+                ELF object binary architecture: AMD x86-64
+
+Symbolized offsets (DO_STRIP=0 rebuild of same sources, addr2line):
+  +0x39700 slotcask_pool_rebuild_worker
+  +0x1404c ?
+  +0x3f8bf parallel_for_io (src/db/parallel.c:390)
+  +0x5701d slotcask_open (src/db/slotcask.c:5089)
+  +0xea1e8 slotcask_registry_get (src/db/slotcask.c:10222)

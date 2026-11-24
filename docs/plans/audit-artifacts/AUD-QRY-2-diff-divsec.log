@@ -1,0 +1,8 @@
+# AUD-QRY-2 Task 5.3 differential spot-check (post-fix, on the QRY-1+QRY-2 tree)
+# 2026-11-20; SHARD_AUDIT_DIFF_ROWS=5000 SHARD_AUDIT_DIFF_CRITERIA=200, --filter audit-planner-diff
+
+DIVSEC count=0 find=0 agg=0 group_by=0 order_by=0
+
+Per-criterion DIVERGENCE shape-pair tally: NONE (zero lines matched pd_X vs pd_Y —
+the pd_plain-vs-pd_bitmap residual from the QRY-1 halt, the pd_plain-vs-pd_btree OR
+divergences, and the aggregate section are ALL gone). Task 5.3's end state met in full.

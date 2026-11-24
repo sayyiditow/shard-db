@@ -1,0 +1,16 @@
+up=1
+plain nocrit   -> [{"v":"cat_0","n":20},{"v":"cat_1","n":20},{"v":"cat_2","n":20},{"v":"cat_3","n":20},{"v":"cat_4","n":20}]
+btree nocrit   -> [{"v":"cat_0","n":20},{"v":"cat_1","n":20},{"v":"cat_2","n":20},{"v":"cat_3","n":20},{"v":"cat_4","n":20}]
+bitmap nocrit  -> [{"v":"cat_0","n":20},{"v":"cat_1","n":20},{"v":"cat_2","n":20},{"v":"cat_3","n":20},{"v":"cat_4","n":20}]
+comp nocrit    -> [{"v":"cat_0","n":20},{"v":"cat_1","n":20},{"v":"cat_2","n":20},{"v":"cat_3","n":20},{"v":"cat_4","n":20}]
+o_plain t-range    -> [{"v":"cat_0","n":6},{"v":"cat_1","n":5},{"v":"cat_2","n":5},{"v":"cat_3","n":5},{"v":"cat_4","n":5}]
+o_btree t-range    -> [{"v":"cat_0","n":6},{"v":"cat_1","n":5},{"v":"cat_2","n":5},{"v":"cat_3","n":5},{"v":"cat_4","n":5}]
+o_bitmap t-range    -> []
+o_comp t-range    -> [{"v":"cat_0","n":6},{"v":"cat_1","n":5},{"v":"cat_2","n":5},{"v":"cat_3","n":5},{"v":"cat_4","n":5}]
+o_plain v-eq       -> [{"v":"cat_1","n":20}]
+o_btree v-eq       -> [{"v":"cat_1","n":20}]
+o_bitmap v-eq       -> [{"v":"cat_1","n":20}]
+o_comp v-eq       -> [{"v":"cat_1","n":20}]
+bitmap scalar: {"c":26,"s":1625}
+o_btree explain t-range: {"plan":"leaf","order":"none","total_cheap":true,"table_rows":100,"source":[{"field":"t","op":"between","index":"btree","role":"seed","estimated_rows":13}],"postfilter":[],"hints":[]}
+o_bitmap explain t-range: {"plan":"leaf","order":"none","total_cheap":true,"table_rows":100,"source":[{"field":"t","op":"between","index":"btree","role":"seed","estimated_rows":13}],"postfilter":[],"hints":[]}

@@ -1,0 +1,207 @@
+# test-agg-or-subtree-full-tree
+ok 1 - connect
+ok 2 - oracle object created
+ok 3 - btree object created
+ok 4 - bitmap object created
+ok 5 - alloc fixture body
+ok 6 - alloc fixture request
+ok 7 - bulk insert response
+ok 8 - bulk insert accepted
+ok 9 - alloc fixture body
+ok 10 - alloc fixture request
+ok 11 - bulk insert response
+ok 12 - bulk insert accepted
+ok 13 - alloc fixture body
+ok 14 - alloc fixture request
+ok 15 - bulk insert response
+ok 16 - bulk insert accepted
+ok 17 - big object created
+ok 18 - big oracle created
+ok 19 - alloc big body
+ok 20 - alloc big request
+ok 21 - big bulk response
+ok 22 - big bulk chunk accepted
+ok 23 - big bulk response
+ok 24 - big bulk chunk accepted
+ok 25 - big bulk response
+ok 26 - big bulk chunk accepted
+ok 27 - big bulk response
+ok 28 - big bulk chunk accepted
+ok 29 - big bulk response
+ok 30 - big bulk chunk accepted
+ok 31 - big bulk response
+ok 32 - big bulk chunk accepted
+ok 33 - big bulk response
+ok 34 - big bulk chunk accepted
+ok 35 - big bulk response
+ok 36 - big bulk chunk accepted
+ok 37 - big bulk response
+ok 38 - big bulk chunk accepted
+ok 39 - big bulk response
+ok 40 - big bulk chunk accepted
+ok 41 - big bulk response
+ok 42 - big bulk chunk accepted
+ok 43 - big bulk response
+ok 44 - big bulk chunk accepted
+ok 45 - big bulk response
+ok 46 - big bulk chunk accepted
+ok 47 - big bulk response
+ok 48 - big bulk chunk accepted
+ok 49 - big bulk response
+ok 50 - big bulk chunk accepted
+ok 51 - big bulk response
+ok 52 - big bulk chunk accepted
+ok 53 - big bulk response
+ok 54 - big bulk chunk accepted
+ok 55 - big bulk response
+ok 56 - big bulk chunk accepted
+ok 57 - big bulk response
+ok 58 - big bulk chunk accepted
+ok 59 - big bulk response
+ok 60 - big bulk chunk accepted
+ok 61 - alloc big body
+ok 62 - alloc big request
+ok 63 - big bulk response
+ok 64 - big bulk chunk accepted
+ok 65 - big bulk response
+ok 66 - big bulk chunk accepted
+ok 67 - big bulk response
+ok 68 - big bulk chunk accepted
+ok 69 - big bulk response
+ok 70 - big bulk chunk accepted
+ok 71 - big bulk response
+ok 72 - big bulk chunk accepted
+ok 73 - big bulk response
+ok 74 - big bulk chunk accepted
+ok 75 - big bulk response
+ok 76 - big bulk chunk accepted
+ok 77 - big bulk response
+ok 78 - big bulk chunk accepted
+ok 79 - big bulk response
+ok 80 - big bulk chunk accepted
+ok 81 - big bulk response
+ok 82 - big bulk chunk accepted
+ok 83 - big bulk response
+ok 84 - big bulk chunk accepted
+ok 85 - big bulk response
+ok 86 - big bulk chunk accepted
+ok 87 - big bulk response
+ok 88 - big bulk chunk accepted
+ok 89 - big bulk response
+ok 90 - big bulk chunk accepted
+ok 91 - big bulk response
+ok 92 - big bulk chunk accepted
+ok 93 - big bulk response
+ok 94 - big bulk chunk accepted
+ok 95 - big bulk response
+ok 96 - big bulk chunk accepted
+ok 97 - big bulk response
+ok 98 - big bulk chunk accepted
+ok 99 - big bulk response
+ok 100 - big bulk chunk accepted
+ok 101 - big bulk response
+ok 102 - big bulk chunk accepted
+ok 103 - case1: oracle count
+ok 104 - case1: btree count
+not ok 105 - case1: scalar OR mixed-indexed matches oracle
+#   expected 100 got 26
+ok 106 - case2: oracle count
+ok 107 - case2: btree count
+not ok 108 - case2: scalar OR all-indexed matches oracle
+#   expected 100 got 47
+ok 109 - group_by response
+ok 110 - group_by response
+not ok 111 - case3: label 0 vector match
+#   expected 20 got 1
+ok 112 - case3: label 1 vector match
+not ok 113 - case3: label 2 vector match
+#   expected 20 got 2
+not ok 114 - case3: label 3 vector match
+#   expected 20 got 1
+not ok 115 - case3: label 4 vector match
+#   expected 20 got 2
+ok 116 - group_by response
+ok 117 - group_by response
+ok 118 - case4: label 0 vector match
+not ok 119 - case4: label 1 vector match
+#   expected 80 got 53
+ok 120 - case4: label 2 vector match
+ok 121 - case4: label 3 vector match
+ok 122 - case4: label 4 vector match
+ok 123 - TopN response
+ok 124 - TopN response
+ok 125 - case5: TopN OR matches oracle
+ok 126 - case5: TopN OR matches oracle
+not ok 127 - case5: TopN OR matches oracle
+#   expected 20 got 2
+not ok 128 - case5: TopN OR matches oracle
+#   expected 20 got 2
+ok 129 - case6: oracle count
+ok 130 - case6: btree count
+ok 131 - case6: intersect+OR matches oracle
+ok 132 - case7: oracle count
+ok 133 - case7: btree count
+not ok 134 - case7: AND-of-ORs matches oracle
+#   expected 160 got 106
+ok 135 - case9: oracle count
+ok 136 - case9: big count
+not ok 137 - case9: large intersect+OR matches oracle
+#   expected 10000 got 1538
+ok 138 - group_by response
+ok 139 - group_by response
+ok 140 - case10: label 0 vector match
+not ok 141 - case10: label 1 vector match
+#   expected 27 got 4
+ok 142 - case10: label 2 vector match
+ok 143 - case10: label 3 vector match
+ok 144 - case10: label 4 vector match
+ok 145 - TopN response
+ok 146 - TopN response
+ok 147 - case10: TopN variant matches oracle
+ok 148 - case10: TopN variant matches oracle
+ok 149 - case11: explain response
+ok 150 - case11: explain plan is union
+ok 151 - case11: oracle count
+ok 152 - case11: btree count
+ok 153 - case11: array-form OR matches oracle
+ok 154 - group_by response
+ok 155 - group_by response
+not ok 156 - case12: label 0 vector match
+#   expected 27 got 16
+not ok 157 - case12: label 1 vector match
+#   expected 27 got 17
+ok 158 - case12: label 2 vector match
+not ok 159 - case12: label 3 vector match
+#   expected 27 got 17
+not ok 160 - case12: label 4 vector match
+#   expected 27 got 17
+ok 161 - case12: oracle count-mode
+ok 162 - case12: bitmap count-mode
+ok 163 - case12: count MODE matches (correct today)
+ok 164 - case12: vector sum == count-mode
+ok 165 - group_by response
+ok 166 - group_by response
+ok 167 - case13: label 0 vector match
+not ok 168 - case13: label 1 vector match
+#   expected 27 got 2
+ok 169 - case13: label 2 vector match
+ok 170 - case13: label 3 vector match
+ok 171 - case13: label 4 vector match
+ok 172 - case13: oracle count
+ok 173 - case13: true count is 2 (i=46,241)
+ok 174 - case13: bitmap count
+ok 175 - case13: count() stays correct
+ok 176 - control: oracle count
+ok 177 - control: btree count
+ok 178 - control: postfilter-leaf scalar matches oracle
+ok 179 - control: oracle AND count
+ok 180 - control: btree AND count
+ok 181 - control: fully-indexed AND matches oracle
+ok 182 - group_by response
+ok 183 - group_by response
+ok 184 - control: no-criteria label 0 match
+ok 185 - control: no-criteria label 1 match
+ok 186 - control: no-criteria label 2 match
+ok 187 - control: no-criteria label 3 match
+ok 188 - control: no-criteria label 4 match
+# test-agg-or-subtree-full-tree: 171 passed, 17 failed
