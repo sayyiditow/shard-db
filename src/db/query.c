@@ -17,6 +17,15 @@
 #define BMKS_RACE_COMPLEMENT 3
 #define BMKS_RACE_OR         4
 
+/* Rows a row-streaming find executor had written when it failed. The
+   executor stores it on the request thread right before its -1 return
+   (cmd_find_do_impl resets it to -1 before the call); the two exits that
+   may close a bare envelope read it to keep the documented mid-stream
+   contract: 0 = nothing but the envelope prefix is on the wire, so the
+   envelope can still be closed and followed by an error object; anything
+   else (rows out, or not reported) leaves the response unterminated. */
+static __thread long t_find_rows_emitted = -1;
+
 #ifdef TEST_BUILD
 static void bm_defer_gate_park(void);   /* defined with the find-flush gate */
 
@@ -793,6 +802,7 @@ typedef struct {
     char          idx_path[PATH_MAX];
     bt_result_cb  cb;
     void         *ctx;
+    int           err;      /* 0 ok/absent shard; else the scan's errno */
 } BtreeOdShardArg;
 
 /* §2.4.2: the O_DIRECT full-leaf scan delivers the value-tier view —
@@ -811,7 +821,11 @@ static int btree_od_tier_cb(const uint8_t *value, size_t vlen,
 static void *btree_od_shard_worker(void *raw)
 {
     BtreeOdShardArg *arg = (BtreeOdShardArg *)raw;
-    btree_leaf_scan_o_direct(arg->idx_path, btree_od_tier_cb, arg);
+    int rc = btree_leaf_scan_o_direct(arg->idx_path, btree_od_tier_cb, arg);
+    /* -ENOENT: the shard file was never created (nothing routed to it) —
+       an empty shard. Any other negative return is an I/O failure that must
+       not read as "no matches". +1 is the callback's early stop. */
+    arg->err = (rc < 0 && rc != -ENOENT) ? -rc : 0;
     /* Flush any thread-local count accumulator just as shard_walk_worker
        does (index.c:129). No-op for callbacks that don't use TLS. */
     idx_count_cb_flush_thread();
@@ -820,7 +834,7 @@ static void *btree_od_shard_worker(void *raw)
 
 /* Fan out btree_leaf_scan_o_direct across index_splits_for(splits) shards,
  * mirroring the parallel_for pattern of shard_walk_dispatch in index.c. */
-static void btree_idx_full_leaf_scan_o_direct(
+static int btree_idx_full_leaf_scan_o_direct(
         const char *db_root, const char *object,
         const char *field, int splits,
         bt_result_cb cb, void *ctx)
@@ -829,18 +843,26 @@ static void btree_idx_full_leaf_scan_o_direct(
     BtreeOdShardArg *args = malloc((size_t)idx_n * sizeof(BtreeOdShardArg));
     if (!args) {
         /* OOM fallback: original mmap path. */
-        btree_idx_range(db_root, object, field, splits,
-                        "", 0, "\xff\xff\xff\xff", 4, cb, ctx);
-        return;
+        if (btree_idx_range(db_root, object, field, splits,
+                            "", 0, "\xff\xff\xff\xff", 4, cb, ctx) != 0) {
+            if (!errno) errno = EIO;
+            return -1;
+        }
+        return 0;
     }
     for (int s = 0; s < idx_n; s++) {
         build_idx_path(args[s].idx_path, sizeof(args[s].idx_path),
                        db_root, object, field, s);
         args[s].cb  = cb;
         args[s].ctx = ctx;
+        args[s].err = 0;
     }
     parallel_for_io(btree_od_shard_worker, args, idx_n, sizeof(BtreeOdShardArg));
+    int first_err = 0;
+    for (int s = 0; s < idx_n && !first_err; s++) first_err = args[s].err;
     free(args);
+    if (first_err) { errno = first_err; return -1; }
+    return 0;
 }
 
 int btree_dispatch_schema_checked(const TypedSchema *literal_schema,const char *db_root, const char *object,
@@ -938,51 +960,51 @@ int btree_dispatch_schema_checked(const TypedSchema *literal_schema,const char *
     switch (pc->op) {
         case OP_EQUAL:
             if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
-            btree_idx_search(db_root, object, field, splits,
-                             (const char *)buf1, len1, cb, ctx);
+            if (btree_idx_search(db_root, object, field, splits,
+                                 (const char *)buf1, len1, cb, ctx) != 0) { errno = EIO; return -1; }
             break;
         case OP_GREATER_EQ:
             if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
-            btree_idx_range(db_root, object, field, splits,
-                            (const char *)buf1, len1,
-                            "\xff\xff\xff\xff", 4, cb, ctx);
+            if (btree_idx_range(db_root, object, field, splits,
+                                (const char *)buf1, len1,
+                                "\xff\xff\xff\xff", 4, cb, ctx) != 0) { errno = EIO; return -1; }
             break;
         case OP_GREATER:
             if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
-            btree_idx_range_ex(db_root, object, field, splits,
-                               (const char *)buf1, len1, 1,
-                               "\xff\xff\xff\xff", 4, 0, cb, ctx);
+            if (btree_idx_range_ex(db_root, object, field, splits,
+                                   (const char *)buf1, len1, 1,
+                                   "\xff\xff\xff\xff", 4, 0, cb, ctx) != 0) { errno = EIO; return -1; }
             break;
         case OP_LESS_EQ:
             if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
-            btree_idx_range(db_root, object, field, splits,
-                            "", 0, (const char *)buf1, len1, cb, ctx);
+            if (btree_idx_range(db_root, object, field, splits,
+                                "", 0, (const char *)buf1, len1, cb, ctx) != 0) { errno = EIO; return -1; }
             break;
         case OP_LESS:
             if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
-            btree_idx_range_ex(db_root, object, field, splits,
-                               "", 0, 0,
-                               (const char *)buf1, len1, 1, cb, ctx);
+            if (btree_idx_range_ex(db_root, object, field, splits,
+                                   "", 0, 0,
+                                   (const char *)buf1, len1, 1, cb, ctx) != 0) { errno = EIO; return -1; }
             break;
         case OP_BETWEEN:
             if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value2(pc),strlen(search_criterion_value2(pc)),buf2,sizeof(buf2),&len2)<0){return -1;}
             if (pc->min_exclusive || pc->max_exclusive) {
-                btree_idx_range_ex(db_root, object, field, splits,
-                                   (const char *)buf1, len1, pc->min_exclusive,
-                                   (const char *)buf2, len2, pc->max_exclusive,
-                                   cb, ctx);
+                if (btree_idx_range_ex(db_root, object, field, splits,
+                                       (const char *)buf1, len1, pc->min_exclusive,
+                                       (const char *)buf2, len2, pc->max_exclusive,
+                                       cb, ctx) != 0) { errno = EIO; return -1; }
             } else {
-                btree_idx_range(db_root, object, field, splits,
-                                (const char *)buf1, len1,
-                                (const char *)buf2, len2, cb, ctx);
+                if (btree_idx_range(db_root, object, field, splits,
+                                    (const char *)buf1, len1,
+                                    (const char *)buf2, len2, cb, ctx) != 0) { errno = EIO; return -1; }
             }
             break;
         case OP_IN:
             for (int iv = 0; iv < pc->in_count; iv++) {
                 if(encode_criterion_value_checked(literal_schema,tf,pc->in_values[iv],strlen(pc->in_values[iv]),buf1,sizeof(buf1),&len1)<0){return -1;}
-                btree_idx_search(db_root, object, field, splits,
-                                 (const char *)buf1, len1, cb, ctx);
+                if (btree_idx_search(db_root, object, field, splits,
+                                     (const char *)buf1, len1, cb, ctx) != 0) { errno = EIO; return -1; }
             }
             break;
         case OP_STARTS_WITH: {
@@ -1000,9 +1022,9 @@ int btree_dispatch_schema_checked(const TypedSchema *literal_schema,const char *
             }
             memcpy(buf2, buf1, plen);
             memset(buf2 + plen, 0xff, 4);
-            btree_idx_range(db_root, object, field, splits,
-                            (const char *)buf1, plen,
-                            (const char *)buf2, plen + 4, cb, ctx);
+            if (btree_idx_range(db_root, object, field, splits,
+                                (const char *)buf1, plen,
+                                (const char *)buf2, plen + 4, cb, ctx) != 0) { errno = EIO; return -1; }
             break;
         }
         case OP_LIKE: {
@@ -1025,8 +1047,8 @@ int btree_dispatch_schema_checked(const TypedSchema *literal_schema,const char *
             if (!lead && !trail && raw_prefix) {
                 /* Exact byte match — point lookup. */
                 if(encode_criterion_value_checked(literal_schema,tf,pat,pl,buf1,sizeof(buf1),&len1)<0){return -1;}
-                btree_idx_search(db_root, object, field, splits,
-                                 (const char *)buf1, len1, cb, ctx);
+                if (btree_idx_search(db_root, object, field, splits,
+                                     (const char *)buf1, len1, cb, ctx) != 0) { errno = EIO; return -1; }
                 break;
             }
             if (!lead && trail && raw_prefix) {
@@ -1036,17 +1058,20 @@ int btree_dispatch_schema_checked(const TypedSchema *literal_schema,const char *
                 memcpy(buf1, pat, needle_len);
                 memcpy(buf2, buf1, needle_len);
                 memset(buf2 + needle_len, 0xff, 4);
-                btree_idx_range(db_root, object, field, splits,
-                                (const char *)buf1, needle_len,
-                                (const char *)buf2, needle_len + 4, cb, ctx);
+                if (btree_idx_range(db_root, object, field, splits,
+                                    (const char *)buf1, needle_len,
+                                    (const char *)buf2, needle_len + 4, cb, ctx) != 0) { errno = EIO; return -1; }
                 break;
             }
             /* Substring / suffix / non-varchar → full leaf scan via O_DIRECT;
                per-entry filter via check_primary in the callback handles
                correctness.  Cache-bypassing: hot index pages for targeted
                reads (eq/range/prefix) are not evicted. */
-            btree_idx_full_leaf_scan_o_direct(db_root, object, field, splits,
-                                              cb, ctx);
+            if (btree_idx_full_leaf_scan_o_direct(db_root, object, field,
+                                                  splits, cb, ctx) != 0) {
+                if (!errno) errno = EIO;
+                return -1;
+            }
             break;
         }
         case OP_NOT_EQUAL:
@@ -1058,25 +1083,28 @@ int btree_dispatch_schema_checked(const TypedSchema *literal_schema,const char *
             if (tf && tf->type == FT_BOOL) {
                 int is_true = scalar_bool_value(search_criterion_value(pc));
                 uint8_t inv[1] = { (uint8_t)(is_true ? 0 : 1) };
-                btree_idx_search(db_root, object, field, splits,
-                                 (const char *)inv, 1, cb, ctx);
+                if (btree_idx_search(db_root, object, field, splits,
+                                     (const char *)inv, 1, cb, ctx) != 0) { errno = EIO; return -1; }
                 break;
             }
             /* General case: two exclusive ranges covering everything except X. */
             if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
-            btree_idx_range_ex(db_root, object, field, splits,
-                               "", 0, 0,
-                               (const char *)buf1, len1, 1, cb, ctx);
-            btree_idx_range_ex(db_root, object, field, splits,
-                               (const char *)buf1, len1, 1,
-                               "\xff\xff\xff\xff", 4, 0, cb, ctx);
+            if (btree_idx_range_ex(db_root, object, field, splits,
+                                   "", 0, 0,
+                                   (const char *)buf1, len1, 1, cb, ctx) != 0) { errno = EIO; return -1; }
+            if (btree_idx_range_ex(db_root, object, field, splits,
+                                   (const char *)buf1, len1, 1,
+                                   "\xff\xff\xff\xff", 4, 0, cb, ctx) != 0) { errno = EIO; return -1; }
             break;
         default:
             /* Full index scan: contains, like, ends_with, not_like,
                not_contains, not_in, exists — use O_DIRECT leaf walk to
                avoid polluting the btree page cache used by fast paths. */
-            btree_idx_full_leaf_scan_o_direct(db_root, object, field, splits,
-                                              cb, ctx);
+            if (btree_idx_full_leaf_scan_o_direct(db_root, object, field,
+                                                  splits, cb, ctx) != 0) {
+                if (!errno) errno = EIO;
+                return -1;
+            }
             break;
     }
     return 0;
@@ -1792,6 +1820,10 @@ typedef struct {
     void          *record_ctx;
     chunk_filter_cb filter;        /* NULL = every entry passes */
     void          *fctx;
+    int           walk_err;        /* set once (atomic CAS): btree_range_iter_open
+                                      failure inside any worker (the
+                                      walk must not silently end as an
+                                      empty stream) */
 } ChunkShared;
 
 typedef struct {
@@ -1806,7 +1838,14 @@ static void *chunk_walk_worker(void *raw) {
     ChunkShared *sh = w->sh;
 
     uint8_t (*batch)[16] = malloc(sh->cap * 16);
-    if (!batch) return NULL;
+    if (!batch) {
+        /* A worker that cannot allocate would otherwise drop its shard
+           silently: the walk would end as if that shard were empty. */
+        int none = 0;
+        __atomic_compare_exchange_n(&sh->walk_err, &none, ENOMEM, 0,
+                                    __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+        return NULL;
+    }
     size_t bn = 0;
 
     char last_val[BT_MAX_VAL_LEN];
@@ -1832,7 +1871,15 @@ static void *chunk_walk_worker(void *raw) {
                                                 lo, lo_len, lo_excl,
                                                 w->hi, w->hi_len, w->hi_excl,
                                                 0 /* ASC */);
-        if (!it) break;
+        if (!it) {
+            /* fail closed: the caller folds this into an error instead of
+               treating the stream as drained. First failure wins; workers
+               race, so the store is a CAS, not a plain write. */
+            int none = 0;
+            __atomic_compare_exchange_n(&sh->walk_err, &none, EIO, 0,
+                                        __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+            break;
+        }
 
         int exhausted = 0;
         while (bn < sh->cap) {
@@ -1887,16 +1934,17 @@ static void *chunk_walk_worker(void *raw) {
 /* Fan one range spec out across all idx shards. Blocking record fetches
  * happen exclusively inside chunk_walk_worker with the worker's own
  * iterator closed. Returns after every worker drained or stopped. */
-static void chunk_walk_fanout(const ChunkShared *sh_tmpl,
-                              const char *db_root, const char *object,
-                              const char *field, int splits,
-                              const char *lo, size_t lo_len, int lo_excl,
-                              const char *hi, size_t hi_len, int hi_excl) {
+static int chunk_walk_fanout(const ChunkShared *sh_tmpl,
+                             const char *db_root, const char *object,
+                             const char *field, int splits,
+                             const char *lo, size_t lo_len, int lo_excl,
+                             const char *hi, size_t hi_len, int hi_excl) {
     int n = index_splits_for(splits);
-    if (n <= 0) return;
+    if (n <= 0) return 0;
     ChunkShared sh = *sh_tmpl;
+    __atomic_store_n(&sh.walk_err, 0, __ATOMIC_RELAXED);
     ChunkWalkArg *args = calloc((size_t)n, sizeof(ChunkWalkArg));
-    if (!args) return;
+    if (!args) { errno = ENOMEM; return -1; }
     /* §2.4.2: every fanout caller passes RAW payload bounds; stored BTRI
        keys are [0x00][payload]. Prefix the 0x00 tier byte once here. The
        unbounded-above sentinel (\xff*4) becomes [0x00][\xff*4] — the
@@ -1926,6 +1974,9 @@ static void chunk_walk_fanout(const ChunkShared *sh_tmpl,
     }
     parallel_for_io(chunk_walk_worker, args, n, sizeof(ChunkWalkArg));
     free(args);
+    int werr = __atomic_load_n(&sh.walk_err, __ATOMIC_ACQUIRE);
+    if (werr) { errno = werr; return -1; }
+    return 0;
 }
 
 /* Per-worker batch cap: derived from the caller's pending_cap budget so
@@ -2183,9 +2234,12 @@ static int chunked_stream_dispatch(const TypedSchema *literal_schema,ChunkShared
 
 #define CHUNK_GO(LO, LLO, LLEX, HI, HLI, HIEX) \
     do { \
-        chunk_walk_fanout(sh, db_root, object, field, splits, \
-                          (const char *)(LO), (LLO), (LLEX), \
-                          (const char *)(HI), (HLI), (HIEX)); \
+        if (chunk_walk_fanout(sh, db_root, object, field, splits, \
+                              (const char *)(LO), (LLO), (LLEX), \
+                              (const char *)(HI), (HLI), (HIEX)) != 0) { \
+            errno = EIO; \
+            return -1; \
+        } \
         return 1; \
     } while (0)
 
@@ -2227,8 +2281,11 @@ static int chunked_stream_dispatch(const TypedSchema *literal_schema,ChunkShared
                 if(len1==0){
                     /* Present empty varchar has the exact stored key [0x00].
                        Keep the resumable worker path: no B-tree-held fetch. */
-                    chunk_walk_fanout(sh,db_root,object,field,splits,
-                                      "",0,0,"",0,0);
+                    if (chunk_walk_fanout(sh,db_root,object,field,
+                                          splits,"",0,0,"",0,0) != 0) {
+                        errno = EIO;
+                        return -1;
+                    }
                     if(sh->stop&&__atomic_load_n(sh->stop,__ATOMIC_ACQUIRE))return 1;
                     continue;
                 }
@@ -2236,10 +2293,14 @@ static int chunked_stream_dispatch(const TypedSchema *literal_schema,ChunkShared
                 memset(buf2 + len1, 0xff, 4);
                 if (iv == pc->in_count - 1)
                     CHUNK_GO(buf1, len1, 0, buf2, len1 + 4, 0);
-                else
-                    chunk_walk_fanout(sh, db_root, object, field, splits,
-                                      (const char *)buf1, len1, 0,
-                                      (const char *)buf2, len1 + 4, 0);
+                else if (chunk_walk_fanout(sh, db_root, object, field,
+                                           splits,
+                                           (const char *)buf1, len1, 0,
+                                           (const char *)buf2, len1 + 4,
+                                           0) != 0) {
+                    errno = EIO;
+                    return -1;
+                }
                 if (sh->stop &&
                     __atomic_load_n(sh->stop, __ATOMIC_ACQUIRE)) return 1;
             }
@@ -2292,8 +2353,11 @@ static int chunked_stream_dispatch(const TypedSchema *literal_schema,ChunkShared
             }
             if(encode_criterion_value_checked(literal_schema,tf,search_criterion_value(pc),strlen(search_criterion_value(pc)),buf1,sizeof(buf1),&len1)<0){return -1;}
             if (len1 == 0) return 0;
-            chunk_walk_fanout(sh, db_root, object, field, splits,
-                              "", 0, 0, (const char *)buf1, len1, 1);
+            if (chunk_walk_fanout(sh, db_root, object, field, splits,
+                                  "", 0, 0, (const char *)buf1, len1, 1) != 0) {
+                errno = EIO;
+                return -1;
+            }
             if (sh->stop &&
                 __atomic_load_n(sh->stop, __ATOMIC_ACQUIRE)) return 1;
             CHUNK_GO(buf1, len1, 1, CHUNK_HI_SENTINEL, 4, 0);
@@ -2827,10 +2891,12 @@ static int find_via_composite_prefix(const char *db_root,const char *object,
     ctx.tree=tree;ctx.excluded=excluded;ctx.proj_fields=proj_fields;ctx.proj_count=proj_count;
     ctx.dict_fmt=dict_fmt;ctx.skip_remaining=offset>0?offset:0;ctx.limit=limit>0?limit:INT_MAX;
     ctx.dl=dl;ctx.parent_out=g_out;pthread_mutex_init(&ctx.lock,NULL);
-    if(!merge_ranges)btree_idx_walk_ordered(db_root,object,composite_field,sch->splits,
+    int comp_wrc;
+    if(!merge_ranges)comp_wrc=btree_idx_walk_ordered(db_root,object,composite_field,sch->splits,
         (const char*)single_lo,single_ll,single_le,single_hl?(const char*)single_hi:NULL,single_hl,single_he,
         order_desc,composite_prefix_cb,&ctx);
-    else btree_walk_ordered_ranges(ranges,count,order_desc,composite_prefix_cb,&ctx);
+    else comp_wrc=btree_walk_ordered_ranges(ranges,count,order_desc,composite_prefix_cb,&ctx);
+    if(comp_wrc<0&&!ctx.predicate_error)ctx.predicate_error=errno?errno:EIO;
     pthread_mutex_destroy(&ctx.lock);free(ranges);free(storage);
     if(ctx.predicate_error){errno=ctx.predicate_error;return -1;}
     return ctx.printed;
@@ -2954,19 +3020,28 @@ static int find_via_composite_key(const char *db_root, const char *object,
             uint8_t hi[1024 + 4];
             memcpy(hi, key, klen);
             memset(hi + klen, 0xff, 4);
-            chunk_walk_fanout(&sh, db_root, object, composite_field,
-                              sch->splits, (const char *)key, klen, 0,
-                              (const char *)hi, klen + 4, 0);
+            if (chunk_walk_fanout(&sh, db_root, object, composite_field,
+                                  sch->splits, (const char *)key, klen, 0,
+                                  (const char *)hi, klen + 4, 0) != 0) {
+                if (!ctx.predicate_error)
+                ctx.predicate_error = errno ? errno : EIO;   /* fail closed:
+                                          the exact prefix walk lost a shard */
+            }
         } else {
-            btree_idx_search(db_root, object, composite_field, sch->splits,
-                             (const char *)key, klen, batch_buf_collect_cb,
-                             &bfb);
+            if (btree_idx_search(db_root, object, composite_field, sch->splits,
+                                 (const char *)key, klen, batch_buf_collect_cb,
+                                 &bfb) != 0)
+                ctx.predicate_error = EIO;   /* fail closed, as the fanout
+                                                branch above does */
         }
         batch_buf_destroy(&bfb);
+    } else {
+        ctx.predicate_error = errno ? errno : ENOMEM;   /* fail closed: no
+                                    batch buffer is not an empty result */
     }
 
     pthread_mutex_destroy(&ctx.lock);
-    if(ctx.predicate_error){errno=ctx.predicate_error;return -1;}
+    if(ctx.predicate_error){errno=ctx.predicate_error;t_find_rows_emitted=ctx.printed;return -1;}
     return ctx.printed;
 }
 
@@ -3141,10 +3216,12 @@ static int find_via_order_index_walk(const char *db_root, const char *object,
        delivers entries in (encoded_value, hash16) order — asc or desc
        per order_desc.  The callback post-filters each record against the
        full criteria tree and stops when limit is reached. */
-    btree_idx_walk_ordered(db_root, object, order_by, sch->splits,
-                           lo, lo_len, lo_excl,
-                           hi, hi_len, hi_excl,
-                           order_desc, order_index_walk_cb, &ctx);
+    if (btree_idx_walk_ordered(db_root, object, order_by, sch->splits,
+                               lo, lo_len, lo_excl,
+                               hi, hi_len, hi_excl,
+                               order_desc, order_index_walk_cb, &ctx) < 0 &&
+        !ctx.predicate_error)
+        ctx.predicate_error = errno ? errno : EIO;
 
     if(ctx.predicate_error){errno=ctx.predicate_error;return -1;}
     return ctx.printed;
@@ -4963,23 +5040,29 @@ static int tg_filter_cb(const char *value, size_t vlen,
    below — gives a small seed keyset and dramatic speedup on long
    patterns whose extracted trigrams have wildly varying selectivity
    (e.g. "alice.smith0" has common "ali" and rare "h0X"). */
-static size_t tg_posting_count(const char *db_root, const char *object,
-                               const char *field, int splits,
-                               const uint8_t trigram[3],
-                               QueryDeadline *dl) {
+static int tg_posting_count(const char *db_root, const char *object,
+                            const char *field, int splits,
+                            const uint8_t trigram[3],
+                            QueryDeadline *dl, size_t *out_total) {
     int idx_n = index_splits_for(splits);
     size_t total = 0;
+    *out_total = 0;
     for (int s = 0; s < idx_n; s++) {
         char tp[PATH_MAX];
         tg_build_path(tp, sizeof(tp), db_root, object, field, s);
         TgCountCtx cc = { 0, dl, 0 };
-        btree_range(tp, (const char *)trigram, 3,
-                    (const char *)trigram, 3,
-                    tg_count_cb, &cc);
+        errno = 0;
+        if (btree_range(tp, (const char *)trigram, 3,
+                        (const char *)trigram, 3,
+                        tg_count_cb, &cc) < 0) {
+            if (!errno) errno = EIO;
+            return -1;      /* an unreadable shard is not an empty one */
+        }
         if (cc.timed_out) return 0;
         total += cc.count;
     }
-    return total;
+    *out_total = total;
+    return 0;
 }
 
 /* Walk all .tg shards for `trigram`, filtering `running` via membership
@@ -5005,9 +5088,14 @@ static KeySet *tg_intersect_streaming(const char *db_root, const char *object,
     for (int s = 0; s < idx_n; s++) {
         char tp[PATH_MAX];
         tg_build_path(tp, sizeof(tp), db_root, object, field, s);
-        btree_range(tp, (const char *)trigram, 3,
-                    (const char *)trigram, 3,
-                    tg_filter_cb, &c);
+        errno = 0;
+        if (btree_range(tp, (const char *)trigram, 3,
+                        (const char *)trigram, 3,
+                        tg_filter_cb, &c) < 0) {
+            int saved = errno ? errno : EIO;
+            keyset_free(running); keyset_free(next);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
         if (c.reason != CBF_NONE) {
             keyset_free(running); keyset_free(next);
             return bm_build_fail(out, c.reason, 0);
@@ -5059,8 +5147,12 @@ static KeySet *build_keyset_from_trigram_b(const char *db_root, const char *obje
     }
     for (size_t i = 0; i < n; i++) {
         memcpy(order[i].tg, trigrams[i], 3);
-        order[i].count = tg_posting_count(db_root, object, leaf->field,
-                                          splits, trigrams[i], dl);
+        if (tg_posting_count(db_root, object, leaf->field, splits,
+                             trigrams[i], dl, &order[i].count) < 0) {
+            int saved = errno ? errno : EIO;
+            free(order);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
         if (candidate_deadline_expired(dl)) {
             free(order);
             return bm_build_fail(out, CBF_TIMEOUT, 0);
@@ -5101,9 +5193,14 @@ static KeySet *build_keyset_from_trigram_b(const char *db_root, const char *obje
     for (int s = 0; s < idx_n; s++) {
         char tp[PATH_MAX];
         tg_build_path(tp, sizeof(tp), db_root, object, leaf->field, s);
-        btree_range(tp, (const char *)order[0].tg, 3,
-                    (const char *)order[0].tg, 3,
-                    tg_collect_to_keyset_cb, &cc);
+        errno = 0;
+        if (btree_range(tp, (const char *)order[0].tg, 3,
+                        (const char *)order[0].tg, 3,
+                        tg_collect_to_keyset_cb, &cc) < 0) {
+            int saved = errno ? errno : EIO;
+            keyset_free(acc); free(order);
+            return bm_build_fail(out, CBF_HARD, saved);
+        }
         if (cc.reason != CBF_NONE) {
             keyset_free(acc); free(order);
             return bm_build_fail(out, cc.reason, 0);
@@ -5157,22 +5254,40 @@ static int find_via_trigram_starts_with(const char *db_root, const char *object,
         gram[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
     }
 
-    size_t posting_count = tg_posting_count(db_root, object, seed->field,
-                                            sch->splits, gram, dl);
+    size_t posting_count = 0;
+    if (tg_posting_count(db_root, object, seed->field, sch->splits, gram, dl,
+                         &posting_count) < 0)
+        return -2;          /* nothing emitted yet: caller closes + errors */
     if (dl->timed_out) return 0;
     if (posting_count == 0) return 0;
 
     KeySet *ks = keyset_new(posting_count);
-    if (!ks) return 0;
+    if (!ks) {
+        if (!errno) errno = ENOMEM;
+        return -2;      /* nothing emitted yet: not an empty page */
+    }
 
     int idx_n = index_splits_for(sch->splits);
     TgCollectCtx cc = { .ks = ks, .dl = dl };
     for (int s = 0; s < idx_n; s++) {
         char tp[PATH_MAX];
         tg_build_path(tp, sizeof(tp), db_root, object, seed->field, s);
-        btree_range(tp, (const char *)gram, 3, (const char *)gram, 3,
-                    tg_collect_to_keyset_cb, &cc);
+        errno = 0;
+        if (btree_range(tp, (const char *)gram, 3, (const char *)gram, 3,
+                        tg_collect_to_keyset_cb, &cc) < 0) {
+            keyset_free(ks);
+            if (!errno) errno = EIO;
+            return -2;      /* nothing emitted yet: caller closes + errors */
+        }
         if (cc.timed_out) { keyset_free(ks); return 0; }
+        if (cc.reason != CBF_NONE) {
+            /* the seed KeySet could not hold every posting (insert
+               capacity / hard): emitting it would present a partial set
+               as complete */
+            keyset_free(ks);
+            errno = cc.reason == CBF_INSERT_CAPACITY ? ENOBUFS : EIO;
+            return -2;
+        }
     }
     int rc = keyset_emit_find(db_root, object, sch, ks,
                               tree, excluded, offset, limit,
@@ -5262,6 +5377,8 @@ KeySet *build_keyset_from_leaf_ck(const char *db_root, const char *object,
 #ifdef TEST_BUILD
         /* Armed countdown (atomic): the worker whose tick reaches 0 sees
            the allocation fail with ENOMEM. */
+        /* __atomic_sub_fetch returns the NEW value: the countdown fires
+           on the tick that REACHES 0 (fail_n = the Nth build fails). */
         if (__atomic_load_n(&g_keyset_leaf_test_fail_alloc, __ATOMIC_ACQUIRE) > 0 &&
             __atomic_sub_fetch(&g_keyset_leaf_test_fail_alloc, 1,
                                __ATOMIC_ACQ_REL) == 0) {
@@ -6061,7 +6178,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
     if (cursor == ks->cap) return 0;         /* no candidate: no allocation, no registry */
 
     KefBatch *bt = KEF_SEAM(KEF_SEAM_SETUP_ALLOC) ? NULL : calloc(1, sizeof(*bt));
-    if (!bt) { errno = ENOMEM; return -1; }
+    if (!bt) { errno = ENOMEM; t_find_rows_emitted = 0; return -1; }
     bt->budget.limit = kef_copy_budget();
 
     SlotcaskSchemaInfo sinfo = {
@@ -6072,7 +6189,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
     SlotcaskDb *sdb SDB_REG_REF = KEF_SEAM(KEF_SEAM_REGISTRY)
         ? (errno = EIO, (SlotcaskDb *)NULL)
         : slotcask_registry_get(db_root, object, &sinfo);
-    if (!sdb) { int e = errno ? errno : EIO; free(bt); errno = e; return -1; }
+    if (!sdb) { int e = errno ? errno : EIO; free(bt); errno = e; t_find_rows_emitted = 0; return -1; }
 
     const Schema *kschema = fs && fs->auto_key != AK_NONE ? &fs->auto_key_schema_snapshot : NULL;
     size_t batch_cap = KEF_BATCH;            /* halved on budget overflow; never grows back */
@@ -6168,7 +6285,7 @@ static int keyset_emit_find(const char *db_root, const char *object,
         kef_batch_release(bt);
     }
     free(bt);
-    if (error) { errno = error; return -1; }
+    if (error) { errno = error; t_find_rows_emitted = printed; return -1; }
     return printed;
 }
 
@@ -6438,26 +6555,71 @@ static int keyset_find_from_intersect(const char *db_root, const char *object,
                                       const char **proj_fields, int proj_count,
                                       FieldSchema *fs, int rows_fmt, int dict_fmt, char csv_delim,
                                       JoinSpec *joins, int njoins, QueryDeadline *dl,
-                                      size_t *out_total) {
+                                      size_t *out_total, int *out_declined,
+                                      int *out_budget_exceeded) {
     int small_primary = 0;
-    KeySet *ks = intersect_indexed_leaves(db_root, object, sch->splits,
+    /* The checked builder reports WHY the build failed (deadline, buffer
+       budget, insertion capacity, hard I/O); the plain wrapper folds all
+       of that into errno and loses it. */
+    CandidateBuildOut cbo;
+    KeySet *ks = intersect_indexed_leaves_ck(db_root, object, sch->splits,
                                           (SearchCriterion **)fp->source_leaves,
                                           fp->n_source, dl,
-                                          &small_primary);
-    if (!ks) return errno?-1:0;
+                                          &small_primary, NULL, &cbo);
+    /* NULL is never a legitimate empty intersection (that is a non-NULL
+       empty KeySet): it means the build failed. The response envelope is
+       already open at this point, so the failure class decides the wire
+       shape and a bare -1 is never enough:
+         deadline     → deadline-style partial: return 0; nothing was
+                        emitted, the caller's tail closes the envelope
+                        with total:null (out_total stays untouched);
+         budget/cap   → *out_budget_exceeded = 1; the caller falls back to
+                        a streaming scan (the KeySet outgrew its tier cap —
+                        capacity, not a policy refusal), as count does;
+         hard (I/O…)  → fail closed with an error object after the same
+                        envelope close (returning an empty result would
+                        be fail-open; returning -1 alone leaves malformed
+                        JSON). */
+    if (!ks) {
+        if (out_budget_exceeded) *out_budget_exceeded = 0;
+        if (candidate_deadline_expired(dl) || dl->timed_out) {
+            if (out_declined) *out_declined = 1;
+            return 0;
+        }
+        /* Nothing was emitted: the caller may still close its envelope. */
+        t_find_rows_emitted = 0;
+        if (cbo.reason == CBF_BUDGET || cbo.reason == CBF_INSERT_CAPACITY) {
+            errno = ENOBUFS;
+            if (out_budget_exceeded) *out_budget_exceeded = 1;
+            return -1;
+        }
+        errno = cbo.reason == CBF_HARD ? (cbo.saved_errno ? cbo.saved_errno
+                                                          : EIO)
+                                       : EIO;
+        return -1;
+    }
     /* Small primary OR partial intersect: pass the full tree so emit
        re-checks every leaf (including any bitmap/OR/non-rangeable child
        the planner kept out of the intersect) via criteria_match_tree.
        Big primary with full intersect: intersection already exact, skip rematch. */
-    int need_rematch = small_primary || (fp->n_postfilter > 0);
+    /* has_subtree marks an OR / nested-AND sub-tree the plan
+       neither sourced nor postfiltered — without the rematch the record
+       phase runs with a NULL tree node and the sub-tree drops from rows. */
+    int need_rematch = small_primary || (fp->n_postfilter > 0) ||
+                       fp->has_subtree;
 
     /* For FP_INTERSECT total: |KeySet| is the exact match count only when the
-       full intersection was performed (big primary, no post-filter). When
-       small_primary=1 the KeySet is merely the first leaf's entries (upper bound,
-       not the intersection), and n_postfilter>0 means additional criteria were
-       not materialized into the keyset. In both imprecise cases, leave total=null
-       (out_total untouched) so the caller emits null rather than a wrong number. */
-    if (out_total && !small_primary && fp->n_postfilter == 0)
+       full intersection was performed (big primary, no post-filter, no
+       sub-tree). When small_primary=1 the KeySet is merely the
+       first leaf's entries (upper bound, not the intersection), and
+       n_postfilter>0 means additional criteria were not materialized into
+       the keyset. In all imprecise cases, leave total=null (out_total
+       untouched) so the caller emits null rather than a wrong number, and
+       report the decline via out_declined (the caller-visible
+       small_primary term of the null decision). */
+    int declined = small_primary || fp->n_postfilter > 0 || fp->has_subtree;
+    if (out_declined) *out_declined = declined;
+    if (out_total && !declined)
         *out_total = keyset_size(ks);
 
     int rc = keyset_emit_find(db_root, object, sch, ks,
@@ -7121,6 +7283,10 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
     FilterPlan fp = plan_filter(tree, db_root, object, &fs, sch.splits,
                                 N_live, NULL, 0, 0);
 
+    /* The planner never hands a no-fetch caller the composite-exact
+       plan (its gate sits at the single Phase-B decision point), so the
+       leaf dispatch below always sees a plan whose source leaf carries
+       its own standalone index. */
     if (fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) {
         SearchCriterion *pc = fp.source_leaves[0];
         enum SearchOp op = pc->op;
@@ -7171,6 +7337,11 @@ static int cmd_count_with_tree(const char *db_root, const char *object,
                     free(entries);
                     keyset_free(tg_ks);
                     return 0;
+                }
+                if (errno && !dl.timed_out) {
+                    OUT("{\"error\":\"count failed: index storage "
+                        "error\"}\n");
+                    return -1;
                 }
                 OUT("0\n");
                 return 0;
@@ -9436,7 +9607,11 @@ static int prepared_find_prepare(PreparedBitmapFind *p, const FilterPlan *fp,
             if (!p->ks && errno && !dl->timed_out) return -1;
             p->small_primary = sp;
             p->route = stream ? PREP_STREAM : PREP_INTERSECT;
-            p->need_rematch = stream || sp || fp->n_postfilter > 0;
+            /* has_subtree plans must rematch too. Plain finds with
+               bitmap-eq leaves never reach this prepared shape (they
+               postfilter instead), so the term is defense-in-depth. */
+            p->need_rematch = stream || sp || fp->n_postfilter > 0 ||
+                              fp->has_subtree;
         } else if (is_leafish) {
             SearchCriterion *pc = fp->n_source > 0 ? fp->source_leaves[0] : NULL;
             if (!find_leaf_is_bitmap(db_root, object, pc)) return 0;
@@ -9528,6 +9703,39 @@ static int prepared_find_prepare(PreparedBitmapFind *p, const FilterPlan *fp,
     }
     return 0;
 }
+
+/* Close the response envelope cmd_find_do_impl opened, for an exit that
+   has emitted NO row yet. Formats: rows and joined finds opened
+   {"columns":[..],"rows":[ ; dict opened { ({"rows":{ with total) ; the
+   default format opened [ ; CSV is a bare text body with nothing to
+   close. These are the normal tail's close strings with the total
+   rendered null (it was never computed).
+
+   Only exits whose contract is "close, then render an error" call this:
+   the budget refusals and collect-phase errors that already closed on
+   main, plus the AND-intersect build failure, the trigram walk failures
+   and the composite-exact walk (each gated on nothing but the prefix
+   being on the wire, t_find_rows_emitted == 0).
+   Every other failure after the response has started stays unterminated —
+   docs/query-protocol/find.md keeps that shape on purpose (a closed short
+   page can pass for success, a truncated one cannot). */
+static void find_close_envelope_on_error(int has_joins, int rows_fmt,
+                                         int dict_fmt, int csv_delim,
+                                         int want_total) {
+    if (csv_delim) return;
+    if (has_joins || rows_fmt)
+        OUT(want_total ? "],\"total\":null}\n" : "]}\n");
+    else if (dict_fmt)
+        OUT(want_total ? "},\"total\":null}\n" : "}\n");
+    else
+        OUT(want_total ? "],\"total\":null}\n" : "]\n");
+}
+
+/* Shorthand for cmd_find_do_impl's exits — it names that function's
+   format flags, so it is only valid inside it. */
+#define FIND_CLOSE_ENVELOPE() \
+    find_close_envelope_on_error(has_joins, rows_fmt, dict_fmt, csv_delim, \
+                                 want_total)
 
 static int cmd_find_do_impl(const char *db_root, const char *object,
                         CriteriaNode *tree,
@@ -10251,10 +10459,12 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
                              : (const char *)owb.lo;
             size_t lo_l = (has_cur_bytes || !owb.has_lo) ? 0 : owb.lo_len;
             int    lo_e = owb.has_lo ? owb.lo_excl : 0;
-            btree_idx_walk_ordered(db_root, object, walk_idx, sch.splits,
-                                   lo_b, lo_l, lo_e,
-                                   hi_b, hi_l, hi_e,
-                                   1, cursor_find_cb, &cc);
+            if (btree_idx_walk_ordered(db_root, object, walk_idx, sch.splits,
+                                       lo_b, lo_l, lo_e,
+                                       hi_b, hi_l, hi_e,
+                                       1, cursor_find_cb, &cc) < 0 &&
+                !cc.predicate_error)
+                cc.predicate_error = errno ? errno : EIO;
         } else {
             /* ASC: start (lower) = cursor when resuming, else window-low or "";
                stop (upper) = window-high or max. On resume BOTH unbounded
@@ -10269,10 +10479,12 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
                              : (const char *)owb.hi;
             size_t hi_l = (has_cur_bytes || !owb.has_hi) ? 0 : owb.hi_len;
             int    hi_e = owb.has_hi ? owb.hi_excl : 0;
-            btree_idx_walk_ordered(db_root, object, walk_idx, sch.splits,
-                                   lo_b, lo_l, lo_e,
-                                   hi_b, hi_l, hi_e,
-                                   0, cursor_find_cb, &cc);
+            if (btree_idx_walk_ordered(db_root, object, walk_idx, sch.splits,
+                                       lo_b, lo_l, lo_e,
+                                       hi_b, hi_l, hi_e,
+                                       0, cursor_find_cb, &cc) < 0 &&
+                !cc.predicate_error)
+                cc.predicate_error = errno ? errno : EIO;
         }
         if(cc.predicate_error){
             int error=cc.predicate_error;
@@ -10360,6 +10572,17 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
        Populated below for the kinds that can cheaply compute a total. */
     size_t find_total = 0;
     int    find_total_null = 1;
+    int    intersect_declined = 0;   /* executor decline out-channel (init 0: the
+                                        executor's early-return paths must
+                                        never feed the decision an
+                                        uninitialized read) */
+    int    find_total_error = 0;     /* idx_count_for_leaf's
+                                        SIZE_MAX hard error, handled at the
+                                        source (never written into the slot).
+                                        The tail's SIZE_MAX check stays LIVE:
+                                        fp_compute_total's own hard-error
+                                        path does return SIZE_MAX into the
+                                        slot on the buffered fallback. */
 
     PreparedBitmapFind prep;
     memset(&prep, 0, sizeof(prep));
@@ -10387,6 +10610,7 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
     bm_find_candidates_disabled = prep.record_fallback;
     /* Candidate-derived totals are invalid once recovery discarded them;
        prepared_find_recover already recomputed from the full record scan. */
+
 
     if (has_joins) {
         /* Joined queries are tabular by default (rows_fmt-style). format=csv
@@ -10432,12 +10656,30 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
        through to the existing ordered-collect + in-memory sort path. */
     if (fp.order == FP_ORDER_COMPOSITE_EXACT &&
         !has_joins && !rows_fmt && !csv_delim && fp.n_source >= 1) {
-        find_via_composite_key(
-            db_root, object, &sch,
-            (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
-            fp.composite_field, fp.source_leaves, fp.n_source,
-            tree, &excluded, offset, limit,
-            proj_fields, proj_count, dict_fmt, &dl);
+        /* The envelope is already open. A walk failure must never close
+           it as if the page were complete — that was the silently short
+           result this exit used to return. While no row is out it closes
+           the bare envelope and renders the error; after that the
+           documented contract applies and the page stays unterminated. */
+        t_find_rows_emitted = -1;
+        if (find_via_composite_key(
+                db_root, object, &sch,
+                (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
+                fp.composite_field, fp.source_leaves, fp.n_source,
+                tree, &excluded, offset, limit,
+                proj_fields, proj_count, dict_fmt, &dl) < 0) {
+            LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: composite-exact walk "
+                                    "failed (object=%s)", object);
+            if (t_find_rows_emitted != 0) {
+                free_excluded(&excluded); free_joins(joins, njoins);
+                return -1;   /* rows on the wire: leave it unterminated */
+            }
+            FIND_CLOSE_ENVELOPE();
+            free_excluded(&excluded); free_joins(joins, njoins);
+            OUT("{\"error\":\"indexed find failed: index storage "
+                "error\"}\n");
+            return -1;
+        }
         size_t ex_total = 0; int ex_null = 1;
         if (want_total) ex_total = prepared_or_fp_total(&prep, &fp, tree, db_root, object,
                                                     &sch, &driver_fs, &dl, &ex_null);
@@ -10778,8 +11020,7 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
 
                     if(sort_error){
                         sort_array_free(rows,n_pre,n_pre,&sort_owned_bytes);keyset_free(prefilter_ks);
-                        OUT(dict_fmt?(want_total?"},\"total\":null}\n":"}\n"):
-                            (want_total?"],\"total\":null}\n":"]\n"));
+                        FIND_CLOSE_ENVELOPE();
                         free_joins(joins,njoins);free_excluded(&excluded);return sort_request_error(sort_error);
                     }
                     qsort(rows, (size_t)n_kept, sizeof(SmallPrefilterRow),
@@ -10885,10 +11126,12 @@ static int cmd_find_do_impl(const char *db_root, const char *object,
                 const char *hi_b = owb.has_hi ? (const char *)owb.hi : NULL;
                 size_t hi_l = owb.has_hi ? owb.hi_len : 0;
                 int    hi_e = owb.has_hi ? owb.hi_excl : 0;
-                btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
-                                       lo_b, lo_l, lo_e,
-                                       hi_b, hi_l, hi_e,
-                                       desc, cursor_find_cb, &cc);
+                if (btree_idx_walk_ordered(db_root, object, order_by, sch.splits,
+                                           lo_b, lo_l, lo_e,
+                                           hi_b, hi_l, hi_e,
+                                           desc, cursor_find_cb, &cc) < 0 &&
+                    !cc.predicate_error)
+                    cc.predicate_error = errno ? errno : EIO;
             }
             if(cc.predicate_error){
                 int error=cc.predicate_error;if(prefilter_ks)keyset_free(prefilter_ks);
@@ -10950,8 +11193,7 @@ find_ordered_fallback: ;
             }
             free(oc.rows);
             pthread_mutex_destroy(&oc.lock);
-            OUT(dict_fmt?(want_total?"},\"total\":null}\n":"}\n"):
-                (want_total?"],\"total\":null}\n":"]\n"));
+            FIND_CLOSE_ENVELOPE();
             free_excluded(&excluded);free_joins(joins,njoins);
             return sort_request_error(oc.predicate_error?oc.predicate_error:ENOBUFS);
         }
@@ -11097,20 +11339,73 @@ find_ordered_fallback: ;
            intersection KeySet, so the primary-leaf count is only an upper bound
            (not the true intersection size). Emit null for FP_INTERSECT to stay
            consistent with keyset_find_from_intersect's small-primary behavior. */
-        if (want_total && fp.kind != FP_INTERSECT && fp.n_postfilter == 0) {
+        if (want_total && fp.kind != FP_INTERSECT && fp.n_postfilter == 0 &&
+            !fp.has_subtree) {
             find_total = idx_count_for_leaf(db_root, object, &sch, &driver_fs,
                                              primary, &dl);
-            if (!dl.timed_out) find_total_null = 0;
+            /* has_subtree plans are gated out above (the seed
+               leaf count is only an upper bound there). SIZE_MAX is the
+               helper's hard error: flag it for the tail check, never let
+               the sentinel ride in the slot. */
+            if (find_total == SIZE_MAX) find_total_error = 1;
+            else if (!dl.timed_out) find_total_null = 0;
         }
     } else if (fp.kind == FP_INTERSECT) {
         /* ===== AND INDEX-INTERSECTION FIND ===== */
-        if(keyset_find_from_intersect(db_root, object, &sch, &fp, tree,
+        int budget_exceeded = 0;
+        t_find_rows_emitted = -1;
+        int krc = keyset_find_from_intersect(db_root, object, &sch, &fp, tree,
                                    &excluded, offset, limit,
                                    proj_fields, proj_count,
                                    (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                                    rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl,
-                                   want_total ? &find_total : NULL)<0){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
-        if (want_total && !dl.timed_out) find_total_null = 0;
+                                   want_total ? &find_total : NULL,
+                                   &intersect_declined, &budget_exceeded);
+        if (krc < 0) {
+            /* A KeySet-build failure leaves nothing but the envelope
+               prefix on the wire: close it, then render the error the way
+               the OR-union path does — budget refusal with
+               QUERY_BUFFER_ERR, a hard build failure with a storage-error
+               object. Once the emit phase has put rows out, the documented
+               contract applies instead and the page stays unterminated. */
+            if (t_find_rows_emitted != 0) {
+                free_excluded(&excluded); free_joins(joins, njoins);
+                return -1;   /* rows on the wire: leave it unterminated */
+            }
+            if (budget_exceeded) {
+                /* The intersect KeySet outgrew its tier cap (the build runs
+                   with no query budget, so this is capacity, not a policy
+                   refusal). Count recovers with a whole-record scan; find
+                   does the same — the envelope prefix is the only thing on
+                   the wire, and the scan streams in bounded memory. */
+                LOG_WARN(LOG_SUB_QUERY,
+                         "cmd_find_do: AND intersect KeySet over capacity; "
+                         "falling back to a scan (object=%s)", object);
+                t_find_rows_emitted = -1;
+                if (want_total) find_total_null = 1;
+                goto find_full_scan;
+            }
+            LOG_WARN(LOG_SUB_QUERY,
+                     "cmd_find_do: intersect keyset build failed (object=%s)",
+                     object);
+            FIND_CLOSE_ENVELOPE();
+            free_excluded(&excluded); free_joins(joins, njoins);
+            OUT("{\"error\":\"indexed find failed: index storage "
+                "error\"}\n");
+            return -1;
+        }
+        /* decline rides find_total_null ALONE (the slot keeps
+           its 0 init; SIZE_MAX stays the pipeline's hard-error convention).
+           All three intersect decline conditions — small_primary (via the
+           out-channel), n_postfilter, has_subtree. The existing
+           !dl.timed_out guard survives: a mid-timeout decline keeps
+           emitting null via the untouched flag + the skipped fallback.
+           Declined totals upgrade to validated-exact at the tail's
+           fp_compute_total fallback (or stay null for shapes it cannot
+           compute) — never a wrong number. */
+        if (want_total && !dl.timed_out)
+            find_total_null = (intersect_declined || fp.n_postfilter > 0 ||
+                               fp.has_subtree);
     } else if (fp.kind == FP_PRIMARY_LEAF || fp.kind == FP_BITMAP_SMALLER) {
         /* ===== INDEXED FIND: collect → group by shard → parallel process ===== */
         SearchCriterion *pc = fp.n_source > 0 ? fp.source_leaves[0] : NULL;
@@ -11144,6 +11439,23 @@ find_ordered_fallback: ;
                     (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                     pc, tree, &excluded, offset, limit,
                     proj_fields, proj_count, dict_fmt, &dl);
+                if (trc == -2) {
+                    /* Index walk failed before any row was emitted: close
+                       the prefix and render a complete error. Capacity and
+                       allocation failures are not storage errors. */
+                    int terr = errno;
+                    FIND_CLOSE_ENVELOPE();
+                    free_excluded(&excluded); free_joins(joins, njoins);
+                    if (terr == ENOBUFS)
+                        OUT("{\"error\":\"query memory buffer exceeded; "
+                            "narrow the criteria\"}\n");
+                    else if (terr == ENOMEM)
+                        OUT("{\"error\":\"out of memory\"}\n");
+                    else
+                        OUT("{\"error\":\"indexed find failed: index "
+                            "storage error\"}\n");
+                    return -1;
+                }
                 if (trc < 0) { free_excluded(&excluded); free_joins(joins, njoins); return -1; }
                 /* Close the envelope opened above and return. */
                 if (dict_fmt)
@@ -11164,6 +11476,15 @@ find_ordered_fallback: ;
                                       rows_fmt, dict_fmt, csv_delim,
                                       joins, njoins, &dl);
                 keyset_free(tg_ks);
+            } else if (errno && !dl.timed_out) {
+                /* Hard build failure (unreadable trigram shard, OOM): not an
+                   empty result. Nothing but the prefix is out, so close it
+                   and render a complete error. */
+                FIND_CLOSE_ENVELOPE();
+                free_excluded(&excluded); free_joins(joins, njoins);
+                OUT("{\"error\":\"indexed find failed: index storage "
+                    "error\"}\n");
+                return -1;
             }
             goto find_emit_close;
         }
@@ -11180,7 +11501,13 @@ find_ordered_fallback: ;
            early-return paths; unreachable here unless has_joins/rows_fmt/csv_delim
            forced fall-through, in which case null is correct). */
         if (want_total && !dl.timed_out &&
-            (fp.order == FP_ORDER_NONE || fp.order == FP_ORDER_SORT)) {
+            (fp.order == FP_ORDER_NONE || fp.order == FP_ORDER_SORT) &&
+            /* the seed-leaf count is the exact total only for a
+               plan with no per-record post-filtering (postfilter siblings
+               or an OR/nested-AND sub-tree); otherwise it is an upper
+               bound — keep the null flag set so the tail's
+               fp_compute_total fallback computes a validated count. */
+            !fp.has_subtree && fp.n_postfilter == 0) {
             if (fp.kind == FP_BITMAP_SMALLER) {
                 /* Observable totals validate at the Kf boundary:
                    idx_count_for_leaf routes bitmap candidates through
@@ -11195,16 +11522,17 @@ find_ordered_fallback: ;
                                                 &driver_fs, pc, &dl);
                 if (!dl.timed_out) find_total_null = 0;
             }
+            /* SIZE_MAX is idx_count_for_leaf's hard error —
+               flag it for the tail check, never let the sentinel ride
+               in the slot. */
+            if (find_total == SIZE_MAX) find_total_error = 1;
         }
 
         find_emit_close:
         if(rc==-1){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
         if (rc == -2) {
             LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: scan dispatch returned rc=-2 (query buffer cap exceeded, object=%s)", object);
-            if (csv_delim) { /* nothing to close */ }
-            else if (has_joins || rows_fmt) OUT(want_total ? "],\"total\":null}}\n" : "]}\n");
-            else if (dict_fmt) OUT(want_total ? "},\"total\":null}\n" : "}\n");
-            else OUT(want_total ? "],\"total\":null}\n" : "]\n");
+            FIND_CLOSE_ENVELOPE();
             free_excluded(&excluded); free_joins(joins, njoins);
             OUT(QUERY_BUFFER_ERR);
             return -1;
@@ -11217,14 +11545,16 @@ find_ordered_fallback: ;
                             (driver_fs.ts || driver_fs.nfields > 0) ? &driver_fs : NULL,
                             rows_fmt, dict_fmt, csv_delim, joins, njoins, &dl, &budget_exceeded,
                             want_total ? &find_total : NULL)<0){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
-        if (!budget_exceeded && want_total && !dl.timed_out) find_total_null = 0;
+        /* a union plan carrying has_subtree (partial-union AND
+           with no indexed leaves) has a keyset total that is an upper
+           bound — keep the null flag set; the tail's fp_compute_total
+           fallback validates or stays null. */
+        if (!budget_exceeded && want_total && !dl.timed_out)
+            find_total_null = (fp.has_subtree);
         if (budget_exceeded) {
             LOG_WARN(LOG_SUB_QUERY, "cmd_find_do: query buffer cap exceeded during OR union (object=%s)", object);
             /* Already wrote no rows. Close the open envelope cleanly, then emit error. */
-            if (csv_delim) { /* no envelope to close */ }
-            else if (has_joins || rows_fmt) OUT(want_total ? "],\"total\":null}}\n" : "]}\n");
-            else if (dict_fmt) OUT(want_total ? "},\"total\":null}\n" : "}\n");
-            else OUT(want_total ? "],\"total\":null}\n" : "]\n");
+            FIND_CLOSE_ENVELOPE();
             free_excluded(&excluded);
             free_joins(joins, njoins);
             OUT(QUERY_BUFFER_ERR);
@@ -11232,6 +11562,7 @@ find_ordered_fallback: ;
         }
     } else {
     find_full_scan: ;  /* empty stmt: pre-C23 disallows label→declaration directly */
+
         /* ===== FULL SCAN FALLBACK ===== */
         /* Hoist single-leaf compiled criterion for inline matching
            (mirrors the COUNT FP_FULL_SCAN path). */
@@ -11269,7 +11600,9 @@ find_ordered_fallback: ;
         if(ctx.predicate_error){free_excluded(&excluded);free_joins(joins,njoins);errno=ctx.predicate_error;return -1;}
     }
 
-    if(find_total==SIZE_MAX){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
+    /* find_total_error = idx_count_for_leaf hard error (the
+       SIZE_MAX sentinel never rides in the slot; both abort the query). */
+    if(find_total==SIZE_MAX||find_total_error){free_excluded(&excluded);free_joins(joins,njoins);return -1;}
     if (csv_delim)
         { /* CSV body already ends with its own \n per row — nothing to close (joined or not) */ }
     else if (want_total) {

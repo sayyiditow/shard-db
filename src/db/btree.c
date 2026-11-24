@@ -396,8 +396,21 @@ static int bt_test_take_publish_failure(int stage) {
 }
 
 static _Atomic int g_bt_test_range_open_fail_shard = -1;
+static _Atomic int g_bt_test_range_open_fail_skip;
 
 void btree_test_fail_next_range_open_shard(int shard) {
+    btree_test_fail_nth_range_open_shard(shard, 0);
+}
+
+/* Fail the (skip+1)-th next open of the shard's .idx — the skip lets a
+   test reach a LATER route's open of the same numbered shard when an
+   earlier query phase opens it first (e.g. Pass-1 walks the group field
+   before Pass-2 walks the aggregated field). Skip is stored BEFORE the
+   shard so an armed shard is never visible with a stale skip; the take
+   consumes a skip via CAS so concurrent openers cannot double-decrement. */
+void btree_test_fail_nth_range_open_shard(int shard, int skip) {
+    atomic_store_explicit(&g_bt_test_range_open_fail_skip, skip,
+                          memory_order_relaxed);
     atomic_store_explicit(&g_bt_test_range_open_fail_shard, shard,
                           memory_order_release);
 }
@@ -412,9 +425,58 @@ static int bt_test_take_range_open_failure(const char *path) {
     if (path_len < suffix_len ||
         memcmp(path + path_len - suffix_len, suffix, suffix_len) != 0)
         return 0;
+    for (;;) {
+        int skip = atomic_load_explicit(&g_bt_test_range_open_fail_skip,
+                                        memory_order_acquire);
+        if (skip <= 0) break;
+        int expect = skip;
+        if (atomic_compare_exchange_strong_explicit(
+                &g_bt_test_range_open_fail_skip, &expect, skip - 1,
+                memory_order_acq_rel, memory_order_acquire))
+            return 0; /* this opener consumed one skip */
+        /* lost the race — another opener decremented first; re-decide */
+    }
     return atomic_compare_exchange_strong_explicit(
         &g_bt_test_range_open_fail_shard, &wanted, -1,
         memory_order_acq_rel, memory_order_acquire);
+}
+
+/* Shard-walker twin of the range-iterator seam above. Armed shard >= 0:
+   every btree_search / btree_range_ex open of that shard's .idx fails
+   with EIO; -1 disarms. Persistent rather than one-shot: a single query
+   can walk the same numbered shard of several fields (selectivity
+   estimates, then the driving leaf), and a test must not depend on which
+   of those walks runs first. Covers the hot eq/range shard walks that
+   never go through btree_range_iter_open. */
+static _Atomic int g_bt_test_walk_fail_shard = -1;
+
+void btree_test_fail_walk_open_shard(int shard) {
+    atomic_store_explicit(&g_bt_test_walk_fail_shard, shard,
+                          memory_order_release);
+}
+
+static int bt_test_take_walk_open_failure(const char *path) {
+    int wanted = atomic_load_explicit(&g_bt_test_walk_fail_shard,
+                                      memory_order_acquire);
+    if (wanted < 0) return 0;
+    /* Covers the btree shards (.idx) and the trigram posting shards (.tg):
+       both are walked through btree_search / btree_range_ex / btree_range. */
+    size_t path_len = strlen(path);
+    for (int k = 0; k < 2; k++) {
+        char suffix[16];
+        snprintf(suffix, sizeof(suffix), k ? "/%03x.tg" : "/%03x.idx", wanted);
+        size_t suffix_len = strlen(suffix);
+        if (path_len >= suffix_len &&
+            memcmp(path + path_len - suffix_len, suffix, suffix_len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Exported twin for the O_DIRECT leaf scan (io_direct.c), which opens the
+   shard without going through bt_acquire. */
+int btree_test_walk_open_fails(const char *path) {
+    return bt_test_take_walk_open_failure(path);
 }
 #endif
 
@@ -620,30 +682,43 @@ static int bt_open_file(const char *path, int writer,
         fd = open(path, O_RDWR);
     }
     if (fd < 0) {
-        if (!writer && errno == ENOENT)
-            LOG_DEBUG(LOG_SUB_BTREE, "bt_open_file %s: open failed (writer=0): %s", path, strerror(errno));
+        /* Logging runs localtime_r/strftime and may clobber errno; the
+           reader's ENOENT=absent rule needs it exact. */
+        int open_errno = errno;
+        if (!writer && open_errno == ENOENT)
+            LOG_DEBUG(LOG_SUB_BTREE, "bt_open_file %s: open failed (writer=0): %s", path, strerror(open_errno));
         else
-            LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: open failed (writer=%d): %s", path, writer, strerror(errno));
+            LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: open failed (writer=%d): %s", path, writer, strerror(open_errno));
+        errno = open_errno;
         return -1;
     }
 
     struct stat st;
     if (fstat(fd, &st) < 0) {
-        LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: fstat failed: %s", path, strerror(errno));
-        close(fd); return -1;
+        int e = errno;
+        LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: fstat failed: %s", path, strerror(e));
+        close(fd); errno = e; return -1;
     }
 
     int fresh = 0;
     size_t sz;
     if (st.st_size == 0) {
         if (!writer) {
-            LOG_WARN(LOG_SUB_BTREE, "bt_open_file %s: reader found zero-size file (never initialized by a writer)", path);
-            close(fd); return -1;
+            /* A writer creating this shard has open(O_CREAT)ed it but not yet
+               ftruncate()d it: nothing is committed, so for a reader the
+               shard does not exist yet. Classified as absent (ENOENT), not
+               as a failure — an index shard is lazily created and a
+               concurrent first write is an ordinary window. */
+            LOG_DEBUG(LOG_SUB_BTREE, "bt_open_file %s: reader found zero-size file (writer mid-create)", path);
+            close(fd);
+            errno = ENOENT;
+            return -1;
         }
         size_t init_size = (size_t)bt_page_size * 2;
         if (ftruncate(fd, init_size) < 0) {
-            LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: ftruncate to %zu failed: %s", path, init_size, strerror(errno));
-            close(fd); return -1;
+            int e = errno;
+            LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: ftruncate to %zu failed: %s", path, init_size, strerror(e));
+            close(fd); errno = e; return -1;
         }
         sz = init_size;
         fresh = 1;
@@ -653,8 +728,9 @@ static int bt_open_file(const char *path, int writer,
 
     uint8_t *map = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {
-        LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: mmap(%zu) failed: %s", path, sz, strerror(errno));
-        close(fd); return -1;
+        int e = errno;
+        LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: mmap(%zu) failed: %s", path, sz, strerror(e));
+        close(fd); errno = e; return -1;
     }
     madvise(map, sz, MADV_RANDOM);
 
@@ -669,6 +745,16 @@ static int bt_open_file(const char *path, int writer,
            upgrade by running `./shard-db reindex`, which rebuilds every
            object's btrees in the current format. */
         BtFileHeader *fh = (BtFileHeader *)map;
+        if (!writer && fh->magic == 0) {
+            /* Sized but not yet stamped: the creating writer has
+               ftruncate()d the file and not yet run bt_init_file. Also
+               "absent" — nothing is committed. A NONZERO foreign magic is
+               real format damage and falls through to the rejection. */
+            munmap(map, sz);
+            close(fd);
+            errno = ENOENT;
+            return -1;
+        }
         if (fh->magic != BT_MAGIC) {
             const char *which = (fh->magic == BT_MAGIC_V1) ? "V1 (string-keyed)"
                               : (fh->magic == BT_MAGIC_V2) ? "V2 (no prev_leaf)"
@@ -680,6 +766,7 @@ static int bt_open_file(const char *path, int writer,
             LOG_ERROR(LOG_SUB_BTREE, "bt_open_file %s: rejecting %s format — run `./shard-db reindex`", path, which);
             munmap(map, sz);
             close(fd);
+            errno = EINVAL;   /* no failing syscall set it — classify exactly */
             return -1;
         }
     }
@@ -1089,6 +1176,20 @@ static void bt_release(BtFile *bt) {
     bt->map = NULL;
     bt->fd = -1;
     bt->slot = -1;
+}
+
+/* Reader acquire for a lazily-created shard file. Index shards come into
+   being only when the first writer routes an entry to them, so a shard
+   nothing ever routed to has NO file: open() fails with ENOENT and the
+   shard is legitimately empty — never a failure of an existing shard.
+   Returns 1 = acquired (pair with bt_release), 0 = absent (nothing to
+   release), -1 = real failure (errno set). Exact only because
+   bt_open_file sets errno itself at its two non-syscall rejection sites:
+   a stale ENOENT from an earlier call cannot pass an uninitialized or
+   foreign-format file off as absent. */
+static int bt_acquire_shard_reader(BtFile *bt, const char *path) {
+    if (bt_acquire(bt, path, 0) == 0) return 1;
+    return errno == ENOENT ? 0 : -1;
 }
 
 #ifdef TEST_BUILD
@@ -2314,10 +2415,18 @@ done:
     return rc;
 }
 
-void btree_search(const char *path, const char *value, size_t vlen,
+int btree_search(const char *path, const char *value, size_t vlen,
                   bt_result_cb cb, void *ctx) {
     BtFile bt;
-    if (bt_acquire(&bt, path, 0) != 0) return;
+#ifdef TEST_BUILD
+    if (bt_test_take_walk_open_failure(path)) { errno = EIO; return -1; }
+#endif
+    /* Fail closed: a lost acquire must reach the caller as an error, not
+       as a silently-empty shard (the caller's callback never ran). An
+       absent shard file is the one non-failure — it IS empty. */
+    int acq = bt_acquire_shard_reader(&bt, path);
+    if (acq < 0) return -1;
+    if (acq == 0) return 0;
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
     /* Traverse to leaf */
@@ -2349,14 +2458,20 @@ void btree_search(const char *path, const char *value, size_t vlen,
     }
 done:
     bt_release(&bt);
+    return 0;
 }
 
-void btree_range_ex(const char *path,
+int btree_range_ex(const char *path,
                     const char *min_val, size_t min_len, int min_exclusive,
                     const char *max_val, size_t max_len, int max_exclusive,
                     bt_result_cb cb, void *ctx) {
     BtFile bt;
-    if (bt_acquire(&bt, path, 0) != 0) return;
+#ifdef TEST_BUILD
+    if (bt_test_take_walk_open_failure(path)) { errno = EIO; return -1; }
+#endif
+    int acq = bt_acquire_shard_reader(&bt, path);
+    if (acq < 0) return -1;   /* fail closed */
+    if (acq == 0) return 0;   /* absent shard: empty walk */
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
     /* Traverse to leaf for min_val */
@@ -2392,13 +2507,15 @@ void btree_range_ex(const char *path,
     }
 range_done:
     bt_release(&bt);
+    return 0;
 }
 
-void btree_range(const char *path,
+int btree_range(const char *path,
                  const char *min_val, size_t min_len,
                  const char *max_val, size_t max_len,
                  bt_result_cb cb, void *ctx) {
-    btree_range_ex(path, min_val, min_len, 0, max_val, max_len, 0, cb, ctx);
+    return btree_range_ex(path, min_val, min_len, 0, max_val, max_len, 0,
+                          cb, ctx);
 }
 
 /* Descending range scan. See header for rationale. */
@@ -2408,12 +2525,17 @@ typedef struct {
     uint8_t hash[BT_HASH_SIZE];
 } DescEntrySnap;
 
-void btree_range_desc_ex(const char *path,
+int btree_range_desc_ex(const char *path,
                          const char *min_val, size_t min_len, int min_exclusive,
                          const char *max_val, size_t max_len, int max_exclusive,
                          bt_result_cb cb, void *ctx) {
     BtFile bt;
-    if (bt_acquire(&bt, path, 0) != 0) return;
+#ifdef TEST_BUILD
+    if (bt_test_take_walk_open_failure(path)) { errno = EIO; return -1; }
+#endif
+    int acq = bt_acquire_shard_reader(&bt, path);
+    if (acq < 0) return -1;   /* fail closed */
+    if (acq == 0) return 0;   /* absent shard: empty walk */
     BtFileHeader *fh = (BtFileHeader *)bt.map;
 
     /* Step 1: descend to leftmost leaf, then walk next_leaf chain to collect
@@ -2434,7 +2556,7 @@ void btree_range_desc_ex(const char *path,
         if (leaf_count >= leaf_cap) {
             leaf_cap = leaf_cap ? leaf_cap * 2 : 1024;
             uint32_t *nl = realloc(leaves, leaf_cap * sizeof(uint32_t));
-            if (!nl) { free(leaves); bt_release(&bt); return; }
+            if (!nl) { free(leaves); bt_release(&bt); return -1; }
             leaves = nl;
         }
         leaves[leaf_count++] = page_id;
@@ -2505,6 +2627,7 @@ void btree_range_desc_ex(const char *path,
 
     free(leaves);
     bt_release(&bt);
+    return 0;
 }
 
 /* ========== Streaming range iterator ==========
@@ -2822,7 +2945,16 @@ BtRangeIter *btree_range_iter_open(const char *path,
         LOG_ERROR(LOG_SUB_BTREE, "btree_range_iter_open %s: calloc(BtRangeIter) failed", path);
         return NULL;
     }
-    if (bt_acquire(&it->bt, path, 0) != 0) { free(it); return NULL; }
+    int acq = bt_acquire_shard_reader(&it->bt, path);
+    if (acq < 0) { free(it); return NULL; }
+    if (acq == 0) {
+        /* Absent shard: hand back an exhausted iterator (valid == 0 —
+           next() yields nothing, close() has nothing to release) so every
+           consumer reads "no entries here" without a stat-first guard.
+           NULL stays reserved for a failure of an existing shard. */
+        errno = 0;
+        return it;
+    }
     it->valid = 1;
     it->desc = desc;
     if (min_len > BT_MAX_VAL_LEN) min_len = BT_MAX_VAL_LEN;
@@ -2870,7 +3002,11 @@ void btree_range_iter_close(BtRangeIter *it) {
    ~50ns (~3× faster on the cold-disk-bound `sum X` queries). */
 int btree_walk_all_values(const char *path, bt_value_only_cb cb, void *ctx) {
     BtFile bt;
-    if (bt_acquire(&bt, path, 0) != 0) return 0;
+    /* Absent shard file = empty shard; any other acquire failure is an
+       error the caller must see, not an empty walk. */
+    int acq = bt_acquire_shard_reader(&bt, path);
+    if (acq == 0) return 0;
+    if (acq < 0) return -1;
 
     /* Cold-walk readahead hint. The mmap is set to MADV_RANDOM at acquire
        time — correct for the dominant point-lookup workload, but it
@@ -3918,12 +4054,12 @@ static void or_merge_sift_down(int *heap, int n, int i,
     }
 }
 
-void btree_walk_ordered_ranges(const BtOrderedRangeSpec *ranges,
+int btree_walk_ordered_ranges(const BtOrderedRangeSpec *ranges,
                                size_t range_count,
                                int desc,
                                bt_ordered_result_cb cb,
                                void *ctx) {
-    if (!ranges || !cb || range_count == 0 || range_count > INT_MAX) return;
+    if (!ranges || !cb || range_count == 0 || range_count > INT_MAX) return 0;
 
     int n = (int)range_count;
     OrderedRangeCursor *cursors = calloc((size_t)n, sizeof(OrderedRangeCursor));
@@ -3932,8 +4068,11 @@ void btree_walk_ordered_ranges(const BtOrderedRangeSpec *ranges,
     OrderedRangeResume *resume = calloc((size_t)n, sizeof(OrderedRangeResume));
     if (!cursors || !heap || !slots || !resume) {
         free(cursors); free(heap); free(slots); free(resume);
-        return;
+        errno = ENOMEM;
+        return -1;
     }
+    int walk_rc = 0;
+    int reopening = 0;   /* 0 on the walk's first open pass, 1 after a release */
     for (int s = 0; s < n; s++) slots[s] = &cursors[s].iter;
     BtOrderedWalkHandle h = { .slots = slots, .n = n, .released = 0 };
 
@@ -3957,17 +4096,33 @@ void btree_walk_ordered_ranges(const BtOrderedRangeSpec *ranges,
                 else      { open_lo = resume[s].val; open_lo_len = resume[s].len; open_lo_excl = 0; }
             }
             cursors[s].tie_id = r->tie_id;
+            errno = 0;
             cursors[s].iter = btree_range_iter_open(r->path,
                                                     open_lo, open_lo_len, open_lo_excl,
                                                     open_hi, open_hi_len, open_hi_excl,
                                                     desc);
             if (!cursors[s].iter) {
+                /* NULL is a failed open (an absent shard yields an
+                   exhausted iterator). The walk's first open pass
+                   fails closed: dropping it would return a short walk
+                   with no error. A reopen after a release keeps the
+                   documented contract instead —
+                   the cursor is retired for the rest of the walk so it
+                   cannot reappear out of order, and the surviving ranges
+                   continue. */
+                if (!reopening) {
+                    walk_rc = -1;
+                    if (!errno) errno = EIO;
+                    resume[s].done = 1;
+                    break;
+                }
                 resume[s].done = 1;
                 continue;
             }
             or_pull(&cursors[s]);
             if (cursors[s].has_entry) heap[nh++] = s;
         }
+        if (walk_rc != 0) break;
         for (int i = nh / 2 - 1; i >= 0; i--)
             or_merge_sift_down(heap, nh, i, cursors, desc);
 
@@ -3997,7 +4152,7 @@ void btree_walk_ordered_ranges(const BtOrderedRangeSpec *ranges,
                     if (cursors[s].iter) btree_range_iter_close(cursors[s].iter);
                 free(cursors); free(heap); free(slots);
                 free(resume);
-                return;
+                return 0;       /* callback stop is not a failure */
             }
 
             resume[sid].len = bc->vlen > sizeof(resume[sid].val)
@@ -4019,12 +4174,16 @@ void btree_walk_ordered_ranges(const BtOrderedRangeSpec *ranges,
             }
         }
         if (!h.released) break;
+        reopening = 1;
     }
 
+    int saved_errno = errno;
     for (int s = 0; s < n; s++)
         if (cursors[s].iter) btree_range_iter_close(cursors[s].iter);
     free(cursors);
     free(heap);
     free(slots);
     free(resume);
+    if (walk_rc != 0) errno = saved_errno;
+    return walk_rc;
 }

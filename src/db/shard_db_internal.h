@@ -50,6 +50,11 @@ typedef struct {
     ino_t    file_ino;      /* detects rename-away-and-recreate at `path` */
     uint64_t bmfix_retry_ms;   /* kf-writer-only: no bitmap-remap retry before this time ... */
     uint64_t bmfix_retry_gen;  /* ... and only while gen still equals this (slot not reused) */
+    _Atomic int unbooked_reuse_warned; /* warn-once bit shared by the
+                                    open-time deleted>total warning and the
+                                    unbooked-tombstone reuse warning; reset at
+                                    install so an evicted-and-reopened entry
+                                    re-warns (accepted) */
 } KfCacheEntry;
 
 /* slotcask.c — kf_open_file() single-flight guard */

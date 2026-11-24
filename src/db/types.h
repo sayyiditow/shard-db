@@ -541,6 +541,10 @@ void    keyset_budget_release(KeySetBudget *budget, size_t bytes);
 /* Thread-local one-shot: the next budgeted allocation on this thread fails
    (ENOMEM) after its reservation, exercising the rollback. */
 void    keyset_test_fail_budgeted_alloc_next(int on);
+/* Pass-1 parallel-route observability (query_aggregate.c): the reset +
+   read pair lets the open-fail case pin which route served it. */
+void    igb_pass1_parallel_reset_for_test(void);
+int     igb_pass1_parallel_taken_for_test(void);
 #endif
 void    keyset_free(KeySet *ks);
 /* Returns 1 if newly inserted, 0 if duplicate, -1 if set is full. */
@@ -1367,18 +1371,18 @@ int btree_idx_delete(const char *db_root, const char *object,
                      const char *value, size_t vlen,
                      const uint8_t hash[BT_HASH_SIZE]);
 
-void btree_idx_search(const char *db_root, const char *object,
+int btree_idx_search(const char *db_root, const char *object,
                       const char *field, int splits,
                       const char *value, size_t vlen,
                       bt_result_cb cb, void *ctx);
 
-void btree_idx_range(const char *db_root, const char *object,
+int btree_idx_range(const char *db_root, const char *object,
                      const char *field, int splits,
                      const char *min_val, size_t min_len,
                      const char *max_val, size_t max_len,
                      bt_result_cb cb, void *ctx);
 
-void btree_idx_range_ex(const char *db_root, const char *object,
+int btree_idx_range_ex(const char *db_root, const char *object,
                         const char *field, int splits,
                         const char *min_val, size_t min_len, int min_exclusive,
                         const char *max_val, size_t max_len, int max_exclusive,
@@ -1388,7 +1392,7 @@ void btree_idx_range_ex(const char *db_root, const char *object,
    The implementation is a k-way streaming merge. Callbacks may release all
    iterator locks through the handle before a blocking nested fetch; the walk
    reopens and resumes after the last delivered (value,hash) pair. */
-void btree_idx_walk_ordered(const char *db_root, const char *object,
+int btree_idx_walk_ordered(const char *db_root, const char *object,
                             const char *field, int splits,
                             const char *min_val, size_t min_len, int min_exclusive,
                             const char *max_val, size_t max_len, int max_exclusive,

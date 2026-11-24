@@ -172,6 +172,7 @@ typedef struct {
     int         max_exclusive;
     bt_result_cb cb;
     void *ctx;
+    int walk_err;            /* walker acquire failure (fail closed) */
 } ShardWalkArg;
 
 /* §2.4.2/§2.4.5: every consumer-facing btree walk delivers the VALUE-TIER
@@ -221,18 +222,22 @@ static void *shard_walk_worker(void *arg) {
             hi = hi_buf; hi_len = sw->max_len + 1;
         }
     }
+    int wrc = 0;
     switch (sw->op) {
-        case 0: btree_search(sw->idx_path, (const char *)vkey, vlen,
-                             btri_value_tier_cb, sw); break;
-        case 1: btree_range(sw->idx_path,
-                            (const char *)lo, lo_len,
-                            (const char *)hi, hi_len,
-                            btri_value_tier_cb, sw); break;
-        case 2: btree_range_ex(sw->idx_path,
-                               (const char *)lo, lo_len, sw->min_exclusive,
-                               (const char *)hi, hi_len, sw->max_exclusive,
-                               btri_value_tier_cb, sw); break;
+        case 0: wrc = btree_search(sw->idx_path, (const char *)vkey, vlen,
+                                   btri_value_tier_cb, sw); break;
+        case 1: wrc = btree_range(sw->idx_path,
+                                  (const char *)lo, lo_len,
+                                  (const char *)hi, hi_len,
+                                  btri_value_tier_cb, sw); break;
+        case 2: wrc = btree_range_ex(sw->idx_path,
+                                     (const char *)lo, lo_len,
+                                     sw->min_exclusive,
+                                     (const char *)hi, hi_len,
+                                     sw->max_exclusive,
+                                     btri_value_tier_cb, sw); break;
     }
+    if (wrc != 0) sw->walk_err = EIO; /* fail closed */
     /* Flush any thread-local accumulator the callback populated while
        walking this shard. Today only idx_count_cb batches (it amortises
        per-match atomic-adds into one per-shard-worker atomic-add); if
@@ -248,6 +253,11 @@ static void shard_walk_dispatch(const char *db_root, const char *object,
                                 bt_result_cb cb, void *ctx) {
     int n = index_splits_for(splits);
     ShardWalkArg *args = malloc((size_t)n * sizeof(ShardWalkArg));
+    if (!args) {
+        /* no walk happened: report it, never an empty result */
+        tmpl->walk_err = ENOMEM;
+        return;
+    }
     for (int s = 0; s < n; s++) {
         args[s] = *tmpl;
         build_idx_path(args[s].idx_path, sizeof(args[s].idx_path),
@@ -256,52 +266,57 @@ static void shard_walk_dispatch(const char *db_root, const char *object,
         args[s].ctx = ctx;
     }
     parallel_for_io(shard_walk_worker, args, n, sizeof(ShardWalkArg));
+    for (int s = 0; s < n; s++)
+        if (args[s].walk_err) tmpl->walk_err = EIO;
     free(args);
 }
 
-void btree_idx_search(const char *db_root, const char *object,
-                      const char *field, int splits,
-                      const char *value, size_t vlen,
-                      bt_result_cb cb, void *ctx) {
+int btree_idx_search(const char *db_root, const char *object,
+                     const char *field, int splits,
+                     const char *value, size_t vlen,
+                     bt_result_cb cb, void *ctx) {
     ShardWalkArg t = {{0}, .op = 0, .value = value, .vlen = vlen};
     shard_walk_dispatch(db_root, object, field, splits, &t, cb, ctx);
+    return t.walk_err ? -1 : 0; /* walker acquire failure -> fail closed */
 }
 
-void btree_idx_range(const char *db_root, const char *object,
-                     const char *field, int splits,
-                     const char *min_val, size_t min_len,
-                     const char *max_val, size_t max_len,
-                     bt_result_cb cb, void *ctx) {
+int btree_idx_range(const char *db_root, const char *object,
+                    const char *field, int splits,
+                    const char *min_val, size_t min_len,
+                    const char *max_val, size_t max_len,
+                    bt_result_cb cb, void *ctx) {
     ShardWalkArg t = {{0}, .op = 1,
                       .min_val = min_val, .min_len = min_len,
                       .max_val = max_val, .max_len = max_len};
     shard_walk_dispatch(db_root, object, field, splits, &t, cb, ctx);
+    return t.walk_err ? -1 : 0;
 }
 
-void btree_idx_range_ex(const char *db_root, const char *object,
-                        const char *field, int splits,
-                        const char *min_val, size_t min_len, int min_exclusive,
-                        const char *max_val, size_t max_len, int max_exclusive,
-                        bt_result_cb cb, void *ctx) {
+int btree_idx_range_ex(const char *db_root, const char *object,
+                       const char *field, int splits,
+                       const char *min_val, size_t min_len, int min_exclusive,
+                       const char *max_val, size_t max_len, int max_exclusive,
+                       bt_result_cb cb, void *ctx) {
     ShardWalkArg t = {{0}, .op = 2,
                       .min_val = min_val, .min_len = min_len, .min_exclusive = min_exclusive,
                       .max_val = max_val, .max_len = max_len, .max_exclusive = max_exclusive};
     shard_walk_dispatch(db_root, object, field, splits, &t, cb, ctx);
+    return t.walk_err ? -1 : 0;
 }
 
 /* ----- Globally-ordered walk (for cursor pagination) =====
    Thin adapter: builds per-shard BtOrderedRangeSpec array and delegates
    to btree_walk_ordered_ranges (the single authoritative merge in btree.c). */
 
-void btree_idx_walk_ordered(const char *db_root, const char *object,
-                            const char *field, int splits,
-                            const char *min_val, size_t min_len, int min_exclusive,
-                            const char *max_val, size_t max_len, int max_exclusive,
-                            int desc, bt_ordered_result_cb cb, void *ctx) {
+int btree_idx_walk_ordered(const char *db_root, const char *object,
+                           const char *field, int splits,
+                           const char *min_val, size_t min_len, int min_exclusive,
+                           const char *max_val, size_t max_len, int max_exclusive,
+                           int desc, bt_ordered_result_cb cb, void *ctx) {
     int n = index_splits_for(splits);
     BtOrderedRangeSpec *ranges = calloc((size_t)n, sizeof(BtOrderedRangeSpec));
     char (*paths)[PATH_MAX] = calloc((size_t)n, sizeof(*paths));
-    if (!ranges || !paths) { free(ranges); free(paths); return; }
+    if (!ranges || !paths) { free(ranges); free(paths); errno = ENOMEM; return -1; }
 
     /* BTRI: prefix caller bounds with the 0x00 tier byte (same rule as
        shard_walk_worker) so explicit value bounds never reach into the
@@ -340,9 +355,12 @@ void btree_idx_walk_ordered(const char *db_root, const char *object,
         ranges[s].tie_id       = s;
     }
 
-    btree_walk_ordered_ranges(ranges, (size_t)n, desc, cb, ctx);
+    int wrc = btree_walk_ordered_ranges(ranges, (size_t)n, desc, cb, ctx);
+    int saved_errno = errno;
     free(ranges);
     free(paths);
+    if (wrc != 0) errno = saved_errno;
+    return wrc;
 }
 
 void btree_idx_unlink_all(const char *db_root, const char *object,

@@ -138,8 +138,12 @@ void btree_test_sync_reset(void);
 int  btree_test_sync_count(void);
 #endif
 
-/* Search for all entries matching value exactly. Calls cb for each. */
-void btree_search(const char *path, const char *value, size_t vlen,
+/* Search for all entries matching value exactly. Calls cb for each.
+   Returns 0 when the walk completed (cb saw every match — possibly none),
+   -1 when the tree could not be opened (errno set): fail closed, never a
+   silently-empty shard. One non-failure reads as empty: an ABSENT file
+   (ENOENT — a lazily-created shard nothing ever routed to) returns 0. */
+int btree_search(const char *path, const char *value, size_t vlen,
                   bt_result_cb cb, void *ctx);
 
 /* Guard-only strict equality enumeration (conditional-writes F2):
@@ -153,12 +157,14 @@ int btree_guard_eq(const char *path, const char *value, size_t vlen,
                    bt_result_cb cb, void *ctx);
 
 /* Range scan: all entries within [min, max].
-   min_exclusive/max_exclusive: if true, exclude the boundary value. */
-void btree_range(const char *path,
+   min_exclusive/max_exclusive: if true, exclude the boundary value.
+   Return contract as btree_search: 0 = complete (an absent file is an
+   empty walk), -1 = open failure of an existing file (errno set). */
+int btree_range(const char *path,
                  const char *min_val, size_t min_len,
                  const char *max_val, size_t max_len,
                  bt_result_cb cb, void *ctx);
-void btree_range_ex(const char *path,
+int btree_range_ex(const char *path,
                     const char *min_val, size_t min_len, int min_exclusive,
                     const char *max_val, size_t max_len, int max_exclusive,
                     bt_result_cb cb, void *ctx);
@@ -168,7 +174,7 @@ void btree_range_ex(const char *path,
    forward once to collect page IDs (no prev_leaf pointer in our header),
    then iterates leaves right-to-left; within each leaf, entries are
    decoded forward into a local array and played back in reverse. */
-void btree_range_desc_ex(const char *path,
+int btree_range_desc_ex(const char *path,
                          const char *min_val, size_t min_len, int min_exclusive,
                          const char *max_val, size_t max_len, int max_exclusive,
                          bt_result_cb cb, void *ctx);
@@ -234,8 +240,16 @@ typedef struct {
 } BtTestHoldRdlockArgs;
 void *btree_test_hold_rdlock(void *arg);
 
-/* Fail the next btree_range_iter_open for the selected index shard. */
+/* Fail the next btree_range_iter_open for the selected index shard
+   (skip = fire on the (skip+1)-th matching open instead of the first —
+   see btree.c). */
 void btree_test_fail_next_range_open_shard(int shard);
+void btree_test_fail_nth_range_open_shard(int shard, int skip);
+/* Persistent twin for the shard walkers (btree_search / btree_range_ex):
+   every open of the given shard's .idx fails with EIO until shard = -1
+   disarms it. */
+void btree_test_fail_walk_open_shard(int shard);
+int btree_test_walk_open_fails(const char *path);
 #endif
 
 /* Streaming bulk build — same output as btree_bulk_build but accepts entries
@@ -275,7 +289,13 @@ bt_publish_result bt_stream_build_finish(BtStreamBuilder *b);
    Holds the underlying btree's rdlock for the iterator's lifetime — callers
    must call btree_range_iter_close to release. Returned (value, vlen, hash)
    pointers are valid until the next btree_range_iter_next call on the same
-   iterator. */
+   iterator.
+
+   NULL means the file EXISTS but could not be opened (allocation or open
+   failure) — callers fail closed on it. An ABSENT file (ENOENT: a
+   lazily-created shard nothing ever routed to) is not a failure and opens
+   as an exhausted iterator: non-NULL, next() yields nothing immediately,
+   close() has nothing to release. No stat-first guard is needed. */
 typedef struct BtRangeIter BtRangeIter;
 
 BtRangeIter *btree_range_iter_open(const char *path,
@@ -344,8 +364,11 @@ void btree_ordered_walk_release_for_blocking(BtOrderedWalkHandle *handle);
    immutable, and valid until the synchronous call returns.  A bound pointer
    may be NULL only when its length is zero.  Callbacks may release iterator
    locks through the handle before a blocking nested fetch; the walk
-   reopens and resumes after the last delivered (value,hash) pair. */
-void btree_walk_ordered_ranges(const BtOrderedRangeSpec *ranges,
+   reopens and resumes after the last delivered (value,hash) pair.
+   Returns 0 on completion or callback stop, -1 (errno set) when a shard
+   could not be opened or memory ran out — the walk stops and the caller
+   must not treat what was delivered as a complete result. */
+int btree_walk_ordered_ranges(const BtOrderedRangeSpec *ranges,
                                size_t range_count,
                                int desc,
                                bt_ordered_result_cb cb,

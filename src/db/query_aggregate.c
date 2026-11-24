@@ -216,12 +216,16 @@ static int keyset_agg_from_intersect(const char *db_root, const char *object,
     }
     if (!ks){if(errno)agg_note_predicate_error(agg_ctx,errno);return 0;}
 
-    if (small_primary || fp->n_postfilter > 0) {
+    if (small_primary || fp->n_postfilter > 0 || fp->has_subtree) {
         /* Restore tree so agg_scan_cb post-filters via criteria_match_tree.
            AggCtx lives further down the file — caller passes &ctx.tree to
            avoid a forward decl. Partial intersect: at least one AND child
            (bitmap, non-rangeable op, OR sub-tree, …) was dropped from the
-           intersect and survives only in the criteria tree as a post-filter. */
+           intersect and survives only in the criteria tree as a post-filter.
+           has_subtree marks an OR / nested-AND sub-tree (or a
+           >MAX_INTERSECT_LEAVES leaf loss) that is in NEITHER
+           list — without the restore the record phase would run with a NULL
+           tree node and the sub-tree would be dropped silently. */
         *agg_ctx_tree_field = full_tree;
     }
     keyset_emit_agg(db_root, object, sch, ks, agg_ctx, dl);
@@ -971,6 +975,9 @@ static int agg_run_topn_stream_impl(const char *db_root, const char *object,
                                           sch->splits, topn_N,
                                           NULL /*order_by*/, 0 /*fetching*/,
                                           0 /*limit — top-N has its own limit semantics*/);
+        /* The planner serves no composite-exact plan to no-fetch callers
+           (its gate sits at the single Phase-B decision point); a scan
+           here means no source leaf had its own index. */
         if (topn_fp.kind == FP_FULL_SCAN) {
             topn_heap_destroy(heap);
             return -2;  /* criteria exist but no usable index — fall back */
@@ -978,9 +985,11 @@ static int agg_run_topn_stream_impl(const char *db_root, const char *object,
         /* The streaming walk has NO per-record post-filter step (no record is
            fetched), so it may only trust a prefilter that represents the
            ENTIRE criteria tree. n_postfilter == 0 means every leaf is in
-           the source set and nothing is left to verify. Fall back to the
-           scan+hashmap path when any postfilter leaf remains. */
-        if (topn_fp.n_postfilter > 0) {
+           the source set, and has_subtree == 0 means no OR / nested-AND
+           sub-tree (or >MAX_INTERSECT_LEAVES leaf loss) sits outside both
+           lists. Fall back to the scan+hashmap path
+           when anything is left to verify. */
+        if (topn_fp.n_postfilter > 0 || topn_fp.has_subtree) {
             topn_heap_destroy(heap);
             return -2;  /* prefilter wouldn't cover all criteria — scan applies the full tree */
         }
@@ -1089,14 +1098,16 @@ static int agg_run_topn_stream_impl(const char *db_root, const char *object,
 
     /* Open upper bound: the ordered walk must reach the NULL tier so a
        NULL group_by forms its own (tagged) group (§2.4.5/Task 8). */
-    /* btree_idx_walk_ordered is void; callback aborts surface through
-       dl->timed_out (deadline), walk_failed (scratch malloc) and
-       offer_failed (dropped group). */
-    btree_idx_walk_ordered(db_root, object, group_by_field, sch->splits,
+    /* Callback aborts surface through dl->timed_out (deadline),
+       walk_failed (scratch malloc) and offer_failed (dropped group); a
+       shard that cannot be opened is the walk's own failure return. */
+    int topn_walk_rc = btree_idx_walk_ordered(db_root, object, group_by_field,
+                            sch->splits,
                             NULL, 0, 0,
                             NULL, 0, 0,
                             0 /* asc */,
                             topn_walk_cb, &ctx);
+    int topn_walk_errno = topn_walk_rc < 0 ? (errno ? errno : EIO) : 0;
 
     topn_finalize_run(&ctx);
     free(ctx.current_key);  /* in case callback returned early */
@@ -1106,6 +1117,13 @@ static int agg_run_topn_stream_impl(const char *db_root, const char *object,
         LOG_WARN(LOG_SUB_QUERY, "top-N group-by aggregate: query deadline exceeded");
         topn_heap_destroy(heap);
         return -1;
+    }
+    if (topn_walk_errno && !ctx.walk_failed && !ctx.offer_failed) {
+        /* An index shard could not be opened: the heap holds a partial
+           top-N. Report the storage failure, never a partial body. */
+        topn_heap_destroy(heap);
+        agg_report_error(topn_walk_errno == ENOMEM ? ENOMEM : EIO);
+        return -3;
     }
     if (ctx.walk_failed || ctx.offer_failed) {
         /* The ordered walk or a group insert failed mid-stream: the heap
@@ -2188,9 +2206,14 @@ static void *wfc_worker(void *arg) {
         BtRangeIter *it = btree_range_iter_open(
             idx_path, lo, lo_len, 0, hi, hi_len, hi_excl, w->desc);
         if (!it) {
+            /* A NULL open is a failure of an EXISTING shard (an absent,
+               never-created shard opens as an exhausted iterator): it
+               must not fold into "no candidates" — flag it so the merge
+               fails the aggregate closed. */
             LOG_ERROR(LOG_SUB_QUERY,
                       "wfc_worker: btree_range_iter_open %s failed",
                       idx_path);
+            w->predicate_error = EIO;
             return NULL;
         }
 
@@ -4019,6 +4042,9 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
                                          sch->splits, agg_run_N,
                                          NULL /*order_by*/, 0 /*fetching*/,
                                          0 /*limit*/);
+    /* The planner serves no composite-exact plan to no-fetch callers
+       (its gate sits at the single Phase-B decision point); a scan here
+       means no source leaf had its own index. */
 
     SearchCriterion *agg_prim = (agg_run_fp.kind == FP_PRIMARY_LEAF ||
                                   agg_run_fp.kind == FP_BITMAP_SMALLER)
@@ -4045,6 +4071,11 @@ static int agg_run_plan(AggCtx *ctx, CriteriaNode *tree,
                 parallel_indexed_agg(ctx, db_root, object, sch, entries, (int)n);
                 free(entries);
                 keyset_free(tg_ks);
+            } else if (errno && !(ctx->deadline && ctx->deadline->timed_out)) {
+                /* not an empty aggregate; reported as a storage failure,
+                   not as "invalid typed record" */
+                ctx->agg_error = (errno == ENOMEM || errno == ENOBUFS)
+                                     ? errno : EIO;
             }
         } else {
             CollectCtx cc;
@@ -4169,10 +4200,20 @@ static void *sec_map_build_worker(void *arg) {
     char idx_path[PATH_MAX];
     build_idx_path(idx_path, sizeof(idx_path), w->db_root, w->object,
                    w->gfield_s, w->shard_id);
+    /* Stat-first (the igb_pass1_worker template): create-object-declared
+       index shards are lazy-created, so ENOENT is a legitimate empty
+       shard; an open failure on an EXISTING shard fails closed — a
+       silent NULL here drops that shard's secondary values from the map
+       and the records they route silently vanish from the groups. */
+    struct stat sm_st;
+    if (stat(idx_path, &sm_st) != 0 && errno == ENOENT)
+        return NULL;   /* legitimate empty shard */
     BtRangeIter *it = btree_range_iter_open(idx_path, "", 0, 0,
                                              "\xff\xff\xff\xff", 4, 0, 0);
     if (!it) {
         LOG_ERROR(LOG_SUB_QUERY, "sec_map_build_worker: btree_range_iter_open %s failed", idx_path);
+        w->err = EIO;          /* raw errno is untrustworthy post-log */
+        w->aborted = 1;        /* the post-join fold surfaces both */
         return NULL;
     }
     const char *val; size_t vlen; const uint8_t *hash16;
@@ -4233,8 +4274,24 @@ typedef struct {
     HashBktMap           local_hbk;    /* valid only if hbk_needs */
     int                  hbk_alloc_failed;
     int                  aborted;
+    int                  open_errno;   /* btree_range_iter_open failure
+                                            on an EXISTING shard —
+                                            zero-init (calloc) = no fault */
     int                  dl_counter;
 } IgbPass1Worker;
+
+#ifdef TEST_BUILD
+/* Route observability for the open-fail regression: the case that arms
+   the parallel variant asserts this counter moved (and that the serial
+   case did not move it). */
+static _Atomic int g_igb_pass1_parallel_taken;
+void igb_pass1_parallel_reset_for_test(void) {
+    __atomic_store_n(&g_igb_pass1_parallel_taken, 0, __ATOMIC_RELAXED);
+}
+int igb_pass1_parallel_taken_for_test(void) {
+    return __atomic_load_n(&g_igb_pass1_parallel_taken, __ATOMIC_ACQUIRE);
+}
+#endif
 
 static void *igb_pass1_worker(void *arg) {
     IgbPass1Worker *w = (IgbPass1Worker *)arg;
@@ -4248,10 +4305,31 @@ static void *igb_pass1_worker(void *arg) {
     char idx_path[PATH_MAX];
     build_idx_path(idx_path, sizeof(idx_path), w->db_root, w->object,
                    w->gfield, w->shard_id);
+    /* Stat-first: create-object-declared index shards are created
+       lazily (btree.c O_CREAT), so ENOENT is a legitimate empty shard
+       (agg_walk_worker's template); an open failure on an EXISTING
+       shard fails closed. The failure is normalized to EIO because the
+       error map renders a raw EACCES as the misleading "invalid typed
+       record" and EIO as "aggregate storage access failed". */
+    struct stat st7;
+    if (stat(idx_path, &st7) != 0) {
+        if (errno == ENOENT) return NULL;   /* empty shard */
+        w->open_errno = EIO;
+        w->aborted = 1;
+        return NULL;
+    }
     BtRangeIter *it = btree_range_iter_open(idx_path, "", 0, 0,
                                              "\xff\xff\xff\xff", 4, 0, 0);
     if (!it) {
         LOG_ERROR(LOG_SUB_QUERY, "igb_pass1_worker: btree_range_iter_open %s failed", idx_path);
+        /* Fail closed — returning NULL here would treat the
+           shard as empty and its groups would silently vanish. aborted alone
+           would mean "fall back to agg_run_plan" (the aborted-cleanup
+           path); ctx.agg_error (checked first at the emission) errors
+           instead — deliberate departure, matching the block's bitmap
+           precedent. */
+        w->open_errno = EIO;
+        w->aborted = 1;
         return NULL;
     }
     char prev_enc[64]; size_t prev_enc_len = 0;
@@ -4589,11 +4667,22 @@ static void vs_flush_pending(SlotcaskDb *sdb,
     /* Dense parallel hash matrix for the bulk resolver (pairs stride is
        24 B, not 16 B, so materialize contiguity explicitly). */
     uint8_t (*dense)[16] = malloc(pend_n * 16);
-    if (!dense) return;
+    if (!dense) {
+        /* The pending pairs would go unlooked-up — a silent return would
+           commit wrong counts. Fail the lookup context closed. */
+        if (lc && !lc->err) lc->err = ENOMEM;
+        return;
+    }
     for (size_t i = 0; i < pend_n; i++)
         memcpy(dense[i], pairs[i].h, 16);
-    slotcask_bulk_resolve_and_fetch(sdb, (const uint8_t (*)[16])dense,
-                                    pend_n, lc, vs_lookup_cb);
+    /* The checked variant also reports an unreadable kf shard or segment
+       (the plain one swallows them), so the aggregate fails closed. */
+    errno = 0;
+    if (slotcask_bulk_resolve_and_fetch_checked(
+            sdb, (const uint8_t (*)[16])dense, pend_n, lc,
+            vs_lookup_cb) != 0 &&
+        lc && !lc->err)
+        lc->err = errno ? errno : EIO;
     free(dense);
 
     if (!want_reopen) return;
@@ -4602,10 +4691,23 @@ static void vs_flush_pending(SlotcaskDb *sdb,
         char idx_path[PATH_MAX];
         build_idx_path(idx_path, sizeof(idx_path), db_root, object,
                        group_field, s);
+        /* Stat-first reopen: ENOENT is a legitimate empty shard; an
+           open failure on an EXISTING shard fails closed via lc->err
+           (the caller folds it into ctx.agg_error + aborted) — a silent
+           skip would drop the shard's remaining labels from the merge. */
+        struct stat vr_st;
+        if (stat(idx_path, &vr_st) != 0 && errno == ENOENT) {
+            has_cur[s] = 0;
+            continue;
+        }
         iters[s] = btree_range_iter_open(
             idx_path, cur_keys[s], cur_klens[s], 0,
             "\xff\xff\xff\xff", 4, 0, 0);
-        if (!iters[s]) { has_cur[s] = 0; continue; }
+        if (!iters[s]) {
+            if (lc && !lc->err) lc->err = EIO;   /* errno post-log: untrusted */
+            has_cur[s] = 0;
+            continue;
+        }
         /* Restore the head entry. Leaf order is monotone, so the first
          * yield is >= the snapshot; accept anything at-or-after it. */
         int restored = 0;
@@ -4710,21 +4812,49 @@ static int bm_hbk_insert_cb(const char *value, size_t vlen,
 }
 
 /* Callback + context for bitmap group_count dict-value collection.
-   bm_iter_values per shard; union unique raw values across shards. */
+   bm_iter_values per shard; union unique raw values across shards.
+   Collection caps at cap rows — a NEW distinct value beyond it sets overflow (dedup runs first, so no false positives) and the
+   bitmap group_by fast path routes to the record-scan executor, which
+   serves the full group set exactly. */
 typedef struct {
     uint8_t  (*vals)[1024];
     size_t   *vlens;
     int      *n;
     int       cap;
+    int       overflow;   /* a NEW distinct value arrived while
+                             at cap — the object's group set exceeds the
+                             collection; callers route to the record-scan
+                             executor. (Dedup precedes the cap check, so
+                             the latch never false-positives.) */
 } BmDictCollectCtx;
 
 static int bm_collect_uniq_cb(const uint8_t *value, size_t vlen, void *ctx) {
     BmDictCollectCtx *c = (BmDictCollectCtx *)ctx;
+    /* The collection rows are sizeof(*c->vals) bytes; a longer
+       dict value cannot be stored or compared without reading past the
+       row (the old code copied min(vlen, sizeof row) bytes but recorded
+       the full vlen, so this callback's dedup memcmp and every
+       dict-lookup consumer — bm_popcount_one_value, bm_walk, bm_test —
+       read vlen bytes from a narrower row). Latch the same overflow
+       signal the cap sets; the callers route to the record-scan
+       executor, which returns the documented E2BIG error for over-cap
+       labels — parity with a no-index object. Must precede the dedup
+       loop: that loop's memcmp IS the OOB site. */
+    if (vlen > sizeof(*c->vals)) {
+        c->overflow = 1;
+        return 1;   /* nonzero stops bm_iter_values — nothing more to collect */
+    }
     for (int i = 0; i < *c->n; i++) {
         if (c->vlens[i] == vlen && memcmp(c->vals[i], value, vlen) == 0)
             return 0;
     }
-    if (*c->n >= c->cap) return 0;
+    if (*c->n >= c->cap) {
+        /* A new distinct value beyond the collection cap — the bitmap
+           group_by fast path cannot serve this object's group set.
+           Callers route to the record-scan executor. */
+        c->overflow = 1;
+        return 1;   /* stop the shard's dict walk here */
+    }
     size_t cp = vlen < 1024 ? vlen : 1024;
     memcpy(c->vals[*c->n], value, cp);
     c->vlens[*c->n] = vlen;
@@ -5445,6 +5575,10 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
                                             sch.splits, aw_N,
                                             NULL /*order_by*/, 0 /*fetching*/,
                                             0 /*limit*/);
+            /* The planner serves no composite-exact plan to no-fetch
+               callers (its gate sits at the single Phase-B decision
+               point); a scan here means no source leaf had its own
+               index. */
             KeySet *crit_ks = NULL;
             int aw_indef = 0;
             if (aw_fp.kind == FP_PRIMARY_LEAF || aw_fp.kind == FP_BITMAP_SMALLER) {
@@ -5682,15 +5816,25 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             free(vs_nums); free(vs_counts);
             goto vs_skip;
         }
+        int vs_open_fail = 0;
         for (int s = 0; s < n_idx_g; s++) {
             char idx_path[PATH_MAX];
             build_idx_path(idx_path, sizeof(idx_path), db_root, object,
                             ctx.group_fields[0], s);
             /* Whole-index walk: must reach the NULL tier — group-by forms
-               a NULL bucket from [0x01] keys (§2.4.5/Task 8). */
+               a NULL bucket from [0x01] keys. Stat-first (the Pass-1
+               template): ENOENT is a legitimate empty shard (lazy-created
+               files); an open failure on an EXISTING shard fails closed —
+               a silent skip drops that shard's labels from the k-way
+               merge and the 200-OK group list comes back short. */
+            struct stat vs_st;
+            if (stat(idx_path, &vs_st) != 0 && errno == ENOENT) {
+                has_cur[s] = 0;
+                continue;
+            }
             iters[s] = btree_range_iter_open(
                 idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
-            if (!iters[s]) { has_cur[s] = 0; continue; }
+            if (!iters[s]) { vs_open_fail = 1; break; }
             const char *v; size_t vl; const uint8_t *h;
             /* BTRI: cursor state keeps the stored (tiered) key — k-way
                comparisons and the flush-reopen bounds stay internally
@@ -5709,12 +5853,35 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             }
         }
 
+        if (vs_open_fail) {
+            /* Fail closed: the staged accumulators were never committed
+               into ctx.ht, so releasing them here is clean; the shared
+               tail handler surfaces ctx.agg_error as the error object
+               (EIO — the raw errno is untrustworthy after the open path
+               logs). */
+            ctx.agg_error = EIO;
+            for (int s = 0; s < n_idx_g; s++)
+                if (iters[s]) { btree_range_iter_close(iters[s]);
+                                 iters[s] = NULL; }
+            free(iters); free(cur_keys); free(cur_klens);
+            free(has_cur); free(cur_hash16);
+            free(staged); free(vs_nums); free(vs_counts);
+            goto igb_skip;   /* the error is already set: skip the fast path */
+        }
+
         /* Deferred-lookup pending set (see VS_FLUSH_CAP above). */
         VSPendPair *pend = calloc(VS_PEND_CAP, sizeof(VSPendPair));
         if (!pend) {
+            ctx.agg_error = ENOMEM;   /* fail closed via igb_skip, never a
+                                         silently-short limited aggregate */
+            for (int s = 0; s < n_idx_g; s++)
+                if (iters[s]) { btree_range_iter_close(iters[s]);
+                                 iters[s] = NULL; }   /* release the bt
+                                         read locks the open cursors hold */
             free(iters); free(cur_keys); free(cur_klens);
             free(has_cur); free(cur_hash16); free(staged);
-            goto vs_skip;
+            free(vs_nums); free(vs_counts);
+            goto igb_skip;
         }
         size_t pend_n = 0;
         int emitted = 0;
@@ -5845,12 +6012,13 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
         free(has_cur); free(cur_hash16);
 
         if (aborted) {
-            /* Low-cardinality data — let IGB handle it. ctx.ht hasn't
-               been touched yet because we staged everything. Released
-               exact states were never committed into ctx buckets. */
+            /* Budget aborts (low-cardinality-style cap) fall through to
+               IGB; a REAL error (agg_error set by the flush/reopen path)
+               must not re-enter IGB — go straight to the error render. */
             for (size_t k = 0; k < (size_t)limit * (size_t)nspecs; k++)
                 if (vs_nums) agg_num_release(&vs_nums[k], ctx.spec_nums[k % nspecs].cls, &ctx.env);
             free(vs_counts); free(vs_nums); free(staged);
+            if (ctx.agg_error) goto igb_skip;
             goto vs_skip;
         }
 
@@ -5918,8 +6086,12 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
 
        Eligibility:
          - one or more group_by fields, each indexed (btree or bitmap),
-           non-composite (varchar OK); bitmap-only supports single field,
-           count-only, no criteria
+           non-composite (varchar OK); a bitmap-only group field is
+           served by the count-only shapes below (no-criteria popcount,
+           slot-eligible eq, no-criteria hbm) — any other shape on a
+           bitmap-only group field is routed to the per-record scan
+           executor at the bitmap-only guard below (the btree Pass-1
+           walk cannot serve it: the field has no btree)
          - every spec is one of:
              * AGG_COUNT (with no field, or non-varchar typed field)
              * AGG_SUM/AVG/MIN/MAX on an indexed non-varchar non-composite
@@ -6012,6 +6184,9 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                                    sch.splits, igb_N,
                                    NULL /*order_by*/, 0 /*fetching*/,
                                    0 /*limit*/);
+        /* The planner serves no composite-exact plan to no-fetch
+           callers (its gate sits at the single Phase-B decision point);
+           a scan here means no source leaf had its own index. */
         if (igb_crit_fp.kind == FP_FULL_SCAN) igb_eligible = 0;
     }
 
@@ -6029,12 +6204,19 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
              no criteria  → sum bm_count per value via parallel popcount;
              bitmap-criteria → slot-level walk testing group_by bitmap
              and criteria bitmaps simultaneously (no KeySet, no kf I/O).
-           Avoids 12.5M btree leaf entries at 25M. */
+           Avoids 12.5M btree leaf entries at 25M — for objects whose
+           group set fits the 256-row collection cap. An object with
+           MORE distinct group values than the cap latches
+           the collection overflow and the whole shape routes to the
+           record-scan executor (exact for every shape here); only
+           <=256-distinct objects keep this walk. */
         if (ctx.ngroups == 1 && !igb_needs_hbm && igb_group_uses_bitmap) {
             uint8_t  bm_vals[256][1024];
             size_t   bm_vlens[256];
             int      bm_n = 0;
             int      bm_dl = 0;
+            int      bm_over = 0;   /* dc.overflow OR-accumulated
+                                       in-loop (dc is per-shard) */
             for (int s = 0; s < sch.splits; s++) {
                 if (query_deadline_tick(&dl, &bm_dl)) goto igb_skip;
                 char bp[1024];
@@ -6052,7 +6234,20 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                 BmDictCollectCtx dc = { .vals = bm_vals, .vlens = bm_vlens,
                                         .n = &bm_n, .cap = 256 };
                 bm_iter_values(bms, bm_collect_uniq_cb, &dc);
+                bm_over |= dc.overflow;
                 bm_close(bms);
+                /* Overflow latched: the shape routes to the record-scan
+                   executor regardless — stop walking remaining shards. */
+                if (bm_over) break;
+            }
+            if (bm_over) {
+                /* >256 distinct group values, or any dict value
+                   longer than the 1024-byte collection rows (the
+                   old code recorded the full vlen on a truncated copy —
+                   OOB reads + silent group drops). The record-scan
+                   executor is exact for every shape (E2BIG for over-cap
+                   labels — the documented contract). */
+                goto igb_skip;
             }
             if (bm_n == 0) { igb_done = 1; goto igb_skip; }
 
@@ -6089,7 +6284,14 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                with source_is_bitmap). */
             int can_slot = 0;
             int n_crit = 0;
-            if (igb_crit_fp.source_is_bitmap && igb_crit_fp.n_postfilter == 0) {
+            /* has_subtree refusal — the slot walk reads only the plan's
+               source leaves and cannot verify an OR / nested-AND sub-tree
+               (or a >MAX_INTERSECT_LEAVES leaf loss); without it this
+               route served unfiltered leaf counts. Defense-in-depth
+               behind the fully_covered gate: kept because can_slot reads
+               the plan directly and must not relax if the gates change. */
+            if (igb_crit_fp.source_is_bitmap && igb_crit_fp.n_postfilter == 0 &&
+                !igb_crit_fp.has_subtree) {
                 can_slot = 1;
                 for (int i = 0; i < igb_crit_fp.n_source; i++) {
                     SearchCriterion *sc = igb_crit_fp.source_leaves[i];
@@ -6182,7 +6384,11 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                 }
             }
 
-            /* Not slot-eligible → fall through to btree/scan path. */
+            /* Not slot-eligible → fall through to the btree Pass-1 path.
+               (A bitmap-only group field never gets here: the guard
+               below already routed it to the scan executor, since
+               the Pass-1 walk opens the group field's btree, which does
+               not exist for a bitmap-only field.) */
         }
 
         /* Phase 1b: bitmap-only group field + hbm (sum/avg/min/max agg specs
@@ -6211,6 +6417,8 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
             size_t   bm_vlens_h[256];
             int      bm_n_h = 0;
             int      bm_dl_h = 0;
+            int      bm_over_h = 0;   /* dc.overflow OR-accumulated
+                                         in-loop (dc is per-shard) */
             for (int s = 0; s < sch.splits; s++) {
                 if (query_deadline_tick(&dl, &bm_dl_h)) goto igb_skip;
                 char bp[1024];
@@ -6226,7 +6434,18 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
                 BmDictCollectCtx dc = { .vals = bm_vals_h, .vlens = bm_vlens_h,
                                         .n = &bm_n_h, .cap = 256 };
                 bm_iter_values(bms, bm_collect_uniq_cb, &dc);
+                bm_over_h |= dc.overflow;
                 bm_close(bms);
+                /* Overflow latched: the shape routes to the record-scan
+                   executor regardless — stop walking remaining shards. */
+                if (bm_over_h) break;
+            }
+            if (bm_over_h) {
+                /* >256 distinct group values, or any dict value longer
+                   than the 1024-byte collection rows — the
+                   hbm buckets below would silently drop the rest. The
+                   record-scan executor is exact. */
+                goto igb_skip;
             }
             if (bm_n_h == 0) { igb_done = 1; goto igb_skip; }
 
@@ -6311,6 +6530,21 @@ vs_skip: ;  /* empty statement: pre-C23, a label cannot be followed
         }
         const TypedField *gtf = ctx.group_tfs[0];
         int n_idx_g = index_splits_for(sch.splits);
+        if (igb_group_uses_bitmap) {
+            /* Bitmap-only group field with criteria whose plan was not
+               slot-eligible. Every servable shape
+               (no-criteria popcount, no-criteria hbm, slot-eligible
+               count-only) has been handled above; control reaching
+               here means the btree Pass-1 walk below would read
+               indexes/<field>/NNN.idx, which does not exist for a
+               bitmap-only field, and silently emit zero (or partial)
+               groups. Route to the per-record scan executor — the
+               differential oracle. (crit_ks/hbk are not built yet at
+               this point; the frees are defensive no-ops.) */
+            if (crit_ks) keyset_free(crit_ks);
+            if (hbk_ready) hbk_free(&hbk);
+            goto igb_skip;
+        }
         if (igb_needs_hbm) {
             int live = get_live_count(db_root, object);
             if (live <= 0) live = 1024;
@@ -6573,13 +6807,23 @@ sec_aborted_label:
                         agg_ctx_clone_shared(&workers[s].local, &ctx);
                     }
 
+#ifdef TEST_BUILD
+                    __atomic_store_n(&g_igb_pass1_parallel_taken, 1,
+                                     __ATOMIC_RELAXED);
+#endif
                     parallel_for_io(igb_pass1_worker, workers, n_idx_g,
-                                   sizeof(IgbPass1Worker));
+                                    sizeof(IgbPass1Worker));
 
                     int budget_exceeded = 0;
                     for (int s = 0; s < n_idx_g; s++) {
                         if (workers[s].aborted) aborted = 1;
                         if (workers[s].local.budget_exceeded) budget_exceeded = 1;
+                        /* First-non-zero-wins (the sec_map worker
+                           pattern); ctx.agg_error checked first at the
+                           emission turns the fallback into the error
+                           object. */
+                        if (workers[s].open_errno && !ctx.agg_error)
+                            ctx.agg_error = workers[s].open_errno;
                     }
 
                     /* Merge phase. Three sub-phases:
@@ -6794,11 +7038,27 @@ sec_aborted_label:
                 char idx_path[PATH_MAX];
                 build_idx_path(idx_path, sizeof(idx_path), db_root,
                                object, ctx.group_fields[0], s);
-                /* Whole-index walk: must reach the NULL tier — group-by
-                   forms a NULL bucket from [0x01] keys (§2.4.5/Task 8). */
+                /* Stat-first: ENOENT is a legitimate empty shard
+                   (lazy-created files); an open failure on an EXISTING
+                   shard fails closed (silently `continue`-ing here would
+                   drop the shard's groups). Whole-index walk: must reach
+                   the NULL tier — group-by forms its own NULL bucket
+                   from the tagged NULL keys. */
+                struct stat st7;
+                if (stat(idx_path, &st7) != 0 && errno == ENOENT) continue;
                 BtRangeIter *it = btree_range_iter_open(
                     idx_path, "", 0, 0, "\xff\xff\xff\xff", 4, 0, 0);
-                if (!it) continue;
+                if (!it) {
+                    /* Fail closed (the sec_map worker's form):
+                       ctx.agg_error (checked first at the emission)
+                       errors instead of falling back, and aborted = 1
+                       routes through this block's aborted-cleanup (which
+                       frees hbk/crit_ks/sec_maps). A bare goto igb_skip
+                       here would SKIP that cleanup and leak. */
+                    ctx.agg_error = EIO;
+                    aborted = 1;
+                    break;
+                }
                 const char *val; size_t vlen; const uint8_t *hash16;
                 prev_enc_len = 0; prev_bkt = NULL;
                 while (btree_range_iter_next(it, &val, &vlen, &hash16) == 1) {
@@ -6951,9 +7211,22 @@ igb_pass2:
                     char idx_path[PATH_MAX];
                     build_idx_path(idx_path, sizeof(idx_path), db_root,
                                    object, fld, s);
-                    BtRangeIter *it = btree_range_iter_open(
+                    /* Stat-first (the Pass-1 template): ENOENT is a
+                       legitimate empty shard (lazy-created files); an
+                       open failure on an EXISTING shard fails closed —
+                       a silent continue drops that shard's values and
+                       under-counts every sum/avg/min/max bucket. */
+                    struct stat p2_st;
+                    BtRangeIter *it;
+                    if (stat(idx_path, &p2_st) != 0 && errno == ENOENT)
+                        continue;
+                    it = btree_range_iter_open(
                         idx_path, "", 0, 0, AGG_VALUE_TIER_CEIL, 1, 1, 0);
-                    if (!it) continue;
+                    if (!it) {
+                        ctx.agg_error = EIO;   /* errno untrustworthy */
+                        aborted = 1;
+                        break;
+                    }
                     const char *val; size_t vlen; const uint8_t *hash16;
                     int filled = 0;
                     while (1) {
