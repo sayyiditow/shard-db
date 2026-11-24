@@ -64,7 +64,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         free(buf);
         abort();  /* valid_filename accepted a traversal-capable name */
     }
-    if (is_valid_object(buf) && !invariant_ok(buf)) {
+    if (is_valid_object(buf) && (!invariant_ok(buf) || strchr(buf, ':'))) {
         free(buf);
         abort();  /* is_valid_object accepted a traversal-capable name */
     }

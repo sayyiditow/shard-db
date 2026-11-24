@@ -134,7 +134,8 @@ ssize_t write(int fd, const void *buf, size_t count) {
         errno = g_errno_val;
         return -1;
     }
-    return real_write ? real_write(fd, buf, count) : -1;
+    if (!real_write) { errno = ENOSYS; return -1; }
+    return real_write(fd, buf, count);
 }
 
 ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
@@ -144,7 +145,8 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
         errno = g_errno_val;
         return -1;
     }
-    return real_pwrite ? real_pwrite(fd, buf, count, offset) : -1;
+    if (!real_pwrite) { errno = ENOSYS; return -1; }
+    return real_pwrite(fd, buf, count, offset);
 }
 
 int fsync(int fd) {
@@ -152,7 +154,8 @@ int fsync(int fd) {
         errno = g_errno_val;
         return -1;
     }
-    return real_fsync ? real_fsync(fd) : -1;
+    if (!real_fsync) { errno = ENOSYS; return -1; }
+    return real_fsync(fd);
 }
 
 int fdatasync(int fd) {
@@ -160,7 +163,8 @@ int fdatasync(int fd) {
         errno = g_errno_val;
         return -1;
     }
-    return real_fdatasync ? real_fdatasync(fd) : -1;
+    if (!real_fdatasync) { errno = ENOSYS; return -1; }
+    return real_fdatasync(fd);
 }
 
 int open(const char *path, int flags, ...) {

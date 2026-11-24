@@ -232,9 +232,7 @@ static int aud_run_scenario(int seed, int n_ops, int seams, FILE *logf) {
     }
 
     TestClientCfg cfg = { .port = fc.port, .io_timeout_ms = 8000 };
-    TestClientCfg cfg_fast = { .port = fc.port, .io_timeout_ms = 4000 };
     TestClient *tc = spawn_bad ? NULL : tc_connect(&cfg);
-    TestClient *tc_fast = spawn_bad ? NULL : tc_connect(&cfg_fast);
 
 #ifdef AUD_SEAMS_COMPILED
     /* Engine-seam scenarios arm via the control channel after setup. */
@@ -380,7 +378,6 @@ static int aud_run_scenario(int seed, int n_ops, int seams, FILE *logf) {
     /* Teardown of the faulted daemon: wedged is expected (a parked/stuck
        window); kill unconditionally, then clean restart. */
     if (tc) tc_close(tc);
-    if (tc_fast) tc_close(tc_fast);
     test_env_kill(&env);
 
     /* Clean restart — recovery must bring the root back serveable. */
@@ -458,7 +455,6 @@ static int aud_run_scenario(int seed, int n_ops, int seams, FILE *logf) {
             test_env_stop(&env2);
         }
     }
-    (void)tc_fast;
     /* Reset the spawned-daemon registry per scenario: a long seed run
        (SHARD_AUDIT_FAULT_SEEDS=20 budget) would otherwise overflow
        AUD_MAX_SPAWNED and trip the loud-overflow abort. The sweep is a

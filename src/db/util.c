@@ -412,8 +412,9 @@ int valid_filename(const char *name) {
 /* Validate an object name arriving from a request. Object names are a single
    path component under $DB_ROOT/<dir>/; they are interpolated directly into
    filesystem paths, so they must never contain a separator or traversal.
-   Rejects: empty, > 255 bytes, "/" or "\", control chars, leading '.',
-   and the literal "." / "..". Mirrors valid_filename's contract but is named
+   Rejects: empty, > 255 bytes, "/" or "\", ':' (the schema.conf field
+   separator — a colon corrupts the schema line and the root fails to
+   start), control chars, leading '.', and the literal "." / "..". Mirrors valid_filename's contract but is named
    for the call sites so the intent is unambiguous. */
 int is_valid_object(const char *name) {
     if (!name || !name[0]) return 0;
@@ -422,7 +423,8 @@ int is_valid_object(const char *name) {
     if (name[0] == '.') return 0;  /* rejects ".", "..", and dotfiles */
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)name[i];
-        if (c == '/' || c == '\\' || c < 0x20 || c == 0x7F) return 0;
+        if (c == '/' || c == '\\' || c == ':' || c < 0x20 || c == 0x7F)
+            return 0;
     }
     return 1;
 }

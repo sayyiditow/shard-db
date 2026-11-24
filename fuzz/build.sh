@@ -23,7 +23,7 @@ INC="-Isrc/db"
 # atomics emit __atomic_load/__atomic_store libcalls). Locate it once.
 ATOMIC_LD=""
 if [ ! -e /usr/lib/libatomic.so ] && [ ! -e /usr/lib/x86_64-linux-gnu/libatomic.so ]; then
-    ATOMIC_DIR="$(ls -d /usr/lib/gcc/x86_64-*/[0-9]* 2>/dev/null | sort -V | tail -1)"
+    ATOMIC_DIR="$(ls -d /usr/lib/gcc/*-linux-gnu/[0-9]* /usr/lib/gcc/x86_64-*/[0-9]* 2>/dev/null | sort -V | tail -1)"
     [ -n "$ATOMIC_DIR" ] && ATOMIC_LD="-L$ATOMIC_DIR"
 fi
 

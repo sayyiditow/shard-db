@@ -52,6 +52,9 @@
  *
  * Audit case: excluded from default run-all (TEST_REGISTER_AUDIT).
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "test_runner.h"
 #include "test_assert.h"
 #include "audit_common.h"
@@ -59,7 +62,6 @@
 #include "slotcask.h"
 #include "types.h"    /* compute_hash_raw — crafted-mode key solve */
 #include "shard_test_ctl.h"
-#define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -994,6 +996,13 @@ static int aud_crafted_seed(int seed, FILE *logf) {
             if (aud_restart(&env, ec.db_root, ec.port, &tc, &tc_fast,
                             &cfg, &cfg_fast, models, logf, seed, &resolve_viol) != 0)
                 goto fail_env;
+        } else {
+            /* The gate's kill → validate → restart cycle did not run (park
+               missed or the pause seam did not arm): a pass would be
+               vacuous, so report it as a failure. */
+            fprintf(logf, "seed %d: crafted kill cycle did not run "
+                    "(biased kill returned 0): gate inconclusive\n", seed);
+            crafted_violations++;
         }
     }
 

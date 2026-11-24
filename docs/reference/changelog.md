@@ -6,6 +6,18 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Fix: an object name containing `:` made the whole DB root unstartable.**
+`create-object` accepted `:` in the object name, which is the `schema.conf`
+field separator, so `a:8` wrote a corrupt schema line and the next start
+refused with `crash recovery failed`. Object names containing `:` are now
+rejected (`invalid object name`). A root that already holds such an object
+must have that line removed from `schema.conf` (and the object directory
+renamed or removed) before it will start.
+
+**Fix: find with `format:"rows"` or a join plus `total:true` emitted a malformed envelope when the OR-union budget refused.**
+The error exit now closes the envelope (`…"total":null}`) before the error
+object, matching the other pre-row failure exits.
+
 **Fix: an aggregate `group_by` whose btree index shard fails to open silently returned short groups.**
 The indexed group-by Pass-1 walk — the parallel worker for large objects and
 the inline serial loop that serves every object under 100k records — treated a

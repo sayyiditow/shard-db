@@ -14,6 +14,13 @@ set -e
 SRC=${1:?usage: overlay-gate-163.sh <src-repo-with-harness> <gate-worktree>}
 DST=${2:?usage: overlay-gate-163.sh <src-repo-with-harness> <gate-worktree>}
 
+# The overlay rewrites files in place: refuse any worktree not at 163b36a.
+if [ "$(git -C "$DST" rev-parse HEAD 2>/dev/null)" != \
+     "$(git -C "$SRC" rev-parse 163b36a 2>/dev/null)" ]; then
+    echo "overlay-gate-163: $DST is not at 163b36a; refusing" >&2
+    exit 1
+fi
+
 cd "$SRC"
 mkdir -p "$DST/audit" "$DST/src/test/audit"
 for f in src/test/test_runner.c src/test/test_runner.h \
