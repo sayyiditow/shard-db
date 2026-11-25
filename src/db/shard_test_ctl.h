@@ -146,7 +146,10 @@ extern _Atomic size_t g_shard_test_kf_max_slots;
 enum {
     SHARD_TEST_BMFIX_PREPARE = 1,      /* fail bitmap prepare/stage */
     SHARD_TEST_BMFIX_COMMIT_SYNC = 2,  /* unconfirmed commit msync */
-    SHARD_TEST_BMFIX_RENAME = 3        /* fail the keyfile rename */
+    SHARD_TEST_BMFIX_RENAME = 3,       /* fail the keyfile rename */
+    SHARD_TEST_BMFIX_KF_MSYNC = 4,     /* fail the rebuilt keyfile's msync (resplit) */
+    SHARD_TEST_BMFIX_KF_DIRSYNC = 5,   /* fail the post-rename directory fsync */
+    SHARD_TEST_BMFIX_COMPACT_KFSYNC = 6 /* fail the keyfile sync before a compaction donor is dropped */
 };
 extern _Atomic int g_shard_test_bmfix_fault_mode;
 extern _Atomic int g_shard_test_bmfix_fault_count;

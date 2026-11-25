@@ -7,9 +7,10 @@
  * and asserts the contract every other sync in the engine follows: the
  * resplit is abandoned with the old keyfile still in place.
  *
- * Expected today: FAILS (the keyfile grows despite the failed sync). It
- * passes once the Phase 4 fix lands. Audit case: excluded from default
- * run-all (TEST_REGISTER_AUDIT); run with --include-audit.
+ * Regression case for docs/plans/2026-11-25-fix-resplit-compact-sync.md (the
+ * fix abandons the resplit). A second case fails the post-rename directory
+ * fsync via the SHARD_TEST_BMFIX_KF_DIRSYNC seam and asserts no write is
+ * acknowledged until the directory sync succeeds. Runs in the default suite.
  *
  * Mechanism: a test-binary msync() interposer (executable symbols win over
  * libc) that fails the first msync of a rebuilt keyfile. The resplit's
@@ -118,11 +119,62 @@ out:
     shard_test_ctl_reset();
     return t_ctx->failed > 0 ? 1 : 0;
 }
+/* Rename done but directory fsync fails: the swap stays (it cannot be
+   undone), and every write is refused until the directory sync is retried
+   successfully. */
+static int test_resplit_dirsync_gate(void) {
+    SlotcaskDb db;
+    char base[] = "/tmp/shard-db-rd-test-XXXXXX";
+    ASSERT_TRUE(mkdtemp(base) != NULL, "mkdtemp");
+    if (t_ctx->failed) return 1;
+    char d[PATH_MAX], k[PATH_MAX];
+    snprintf(d, sizeof(d), "%s/data", base);
+    snprintf(k, sizeof(k), "%s/data/kf", base);
+    ASSERT_TRUE(mkdir(d, 0755) == 0 && mkdir(k, 0755) == 0, "mkdir");
+    slotcask_init(64, 64);
+    shard_test_ctl_reset();
+    atomic_store(&g_shard_test_kf_initial_slots, 256);
+    memset(&db, 0, sizeof(db));
+    ASSERT_EQ_INT(slotcask_open(&db, base, 1, 1, 64), 0, "open db");
+    if (t_ctx->failed) goto out;
+    char kf[PATH_MAX];
+    kf_path_for(kf, base, 0);
+    off_t before = rs_size(kf);
+    atomic_store(&g_shard_test_bmfix_fault_mode, SHARD_TEST_BMFIX_KF_DIRSYNC);
+    atomic_store(&g_shard_test_bmfix_fault_count, 100000);   /* persistent: every directory sync fails */
+    int refused = 0, ok_after = 0;
+    uint64_t key = 1;
+    for (; key <= 600; key++) {
+        int rc = rs_upsert(&db, key);
+        if (rs_size(kf) > before) {           /* the resplit happened */
+            if (rc != 0) refused++;
+            break;
+        }
+    }
+    ASSERT_TRUE(rs_size(kf) > before, "the keyfile was resplit");
+    atomic_store(&g_shard_test_bmfix_fault_mode, 0);
+    for (int i = 0; i < 5; i++)
+        if (rs_upsert(&db, 100000 + (uint64_t)i) == 0) ok_after++;
+    ASSERT_TRUE(refused >= 1, "the write that follows an unsynced rename is not acknowledged");
+    ASSERT_EQ_INT(ok_after, 5, "writes succeed once the directory sync works again");
+out:
+    slotcask_close(&db);
+    {
+        char cmd[PATH_MAX + 16];
+        snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
+        if (system(cmd) != 0) { /* best effort */ }
+    }
+    slotcask_shutdown();
+    shard_test_ctl_reset();
+    return t_ctx->failed > 0 ? 1 : 0;
+}
 #else
+static int test_resplit_dirsync_gate(void) { return 0; }
 static int audit_repro_resplit_msync_run(void) {
     /* Sanitizer runtimes own msync; this repro runs in the normal build. */
     return 0;
 }
 #endif
 
-TEST_REGISTER_AUDIT("audit-repro-resplit-msync", audit_repro_resplit_msync_run)
+TEST_REGISTER("test-resplit-msync-failure", audit_repro_resplit_msync_run)
+TEST_REGISTER("test-resplit-dirsync-gate", test_resplit_dirsync_gate)

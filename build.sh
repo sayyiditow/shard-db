@@ -529,6 +529,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_bitmap_stream_find_flush_gate.c \
     src/test/cases/test_backup_restore_errors.c \
     src/test/cases/test_query_slot_all_grammars.c \
+    src/test/cases/test_compact_donor_kf_sync.c \
     src/test/audit/audit_crash_restart.c \
     src/test/audit/audit_planner_diff.c \
     src/test/audit/audit_fault_inject.c \

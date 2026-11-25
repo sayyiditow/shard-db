@@ -6,6 +6,14 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Fix: keyfile sync ordering in resplit and segment compaction.**
+A keyfile resplit now abandons itself (old keyfile kept) when the rebuilt file
+cannot be synced, and a rename whose directory sync failed blocks every write
+until the directory sync succeeds. Segment compaction makes the repointed
+keyfile entries durable before it deletes the donor file, so a power loss can
+no longer leave keys naming a deleted segment.
+
+
 **Fix: the query concurrency cap now covers NQL and the legacy text protocol.**
 `MAX_CONCURRENT_QUERIES` (and the memory bound derived from it) applied only
 to JSON requests; NQL `find`/`count`/`aggregate` and text-protocol commands

@@ -825,6 +825,7 @@ retry_kfcache_acquire:
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     atomic_store_explicit(&e->unbooked_reuse_warned, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->dir_unsynced, 0, memory_order_relaxed);
     atomic_store_explicit(&e->used, 1, memory_order_release);
     e->last_access = __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
     e->file_dev = dev;
@@ -1421,6 +1422,19 @@ static void commit_phase_us_record(uint64_t *counter, uint64_t t0) {
 /* Sync one page-aligned range spanning the given kf slots while h's writer
    lock remains held. header_changed extends the range through the 24-byte
    shard header. h must be a writer-acquired handle with non-NULL hdr/map. */
+#ifdef TEST_BUILD
+/* Test seam: fail the (retry of the) post-resplit directory fsync. */
+static int kf_dirsync_fault(void) {
+    if (atomic_load(&g_shard_test_bmfix_fault_mode) != SHARD_TEST_BMFIX_KF_DIRSYNC) return 0;
+    int c = atomic_load(&g_shard_test_bmfix_fault_count);
+    while (c > 0)
+        if (atomic_compare_exchange_weak(&g_shard_test_bmfix_fault_count, &c, c - 1)) return 1;
+    return 0;
+}
+#else
+#define kf_dirsync_fault() 0
+#endif
+
 static int kfcache_sync_slots_locked_impl(SlotcaskKfHandle *h,
                               const size_t *slots, size_t nslots,
                               int header_changed) {
@@ -1433,6 +1447,18 @@ static int kfcache_sync_slots_locked_impl(SlotcaskKfHandle *h,
         if (slots[i] >= h->capacity) { errno = EINVAL; return -1; }
         if (slots[i] < lo) lo = slots[i];
         if (slots[i] > hi) hi = slots[i];
+    }
+    if (h->slot >= 0 &&
+        atomic_load_explicit(&g_kfcache[h->slot].dir_unsynced, memory_order_acquire)) {
+        /* A resplit renamed this keyfile but its directory entry is not known
+           durable: retry the directory fsync before any write is acknowledged. */
+        KfCacheEntry *de = &g_kfcache[h->slot];
+        char dpath[PATH_MAX];
+        snprintf(dpath, sizeof(dpath), "%s", de->path);
+        char *sl = strrchr(dpath, '/');
+        if (sl) *sl = '\0';
+        if (!sl || fsync_dir(dpath) != 0 || kf_dirsync_fault()) return -1;
+        atomic_store_explicit(&de->dir_unsynced, 0, memory_order_release);
     }
     if (nslots == 0 && !header_changed) return 0;
 
@@ -2659,8 +2685,29 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     new_hdr->deleted = 0;
     uint64_t t_after_rebuild = kf_now_us();
 
-    /* === Phase C: msync(MS_SYNC) === */
-    msync(new_base, new_size, MS_SYNC);
+    /* === Phase C: msync(MS_SYNC) ===
+       The rebuilt table is about to replace the live keyfile: if it cannot be
+       made durable the resplit is abandoned with the old keyfile in place
+       (AUD-KF-RESPLIT-SYNC), delayed like a failed bitmap prepare. */
+    if (msync(new_base, new_size, MS_SYNC) != 0
+#ifdef TEST_BUILD
+        || kf_bmfix_fault(SHARD_TEST_BMFIX_KF_MSYNC)
+#endif
+        ) {
+        int perr = errno ? errno : EIO;
+        LOG_ERROR(LOG_SUB_SLOTCASK,
+                  "KF_RESPLIT_SYNC_FAILED path=%s new_cap=%zu: msync of the rebuilt keyfile failed (%s); resplit abandoned, old keyfile kept",
+                  e->path, new_cap, strerror(perr));
+        munmap(new_base, new_size);
+        close(new_fd);
+        unlink(new_path);
+        if (new_cap > old_cap) {
+            e->bmfix_retry_ms = kf_now_us() / 1000ULL + kf_bmfix_backoff_ms();
+            e->bmfix_retry_gen = atomic_load_explicit(&e->gen, memory_order_acquire);
+        }
+        errno = perr;
+        return -1;
+    }
 
     /* === Phase C2: prepare slot-remapped bitmaps (abortable) ===
        Entries just moved to new slot numbers and bitmap bits are slot
@@ -2715,7 +2762,12 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
         kf_dir_synced = 0;
         int dfd = open(parent, O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) { kf_dir_synced = fsync(dfd) == 0; close(dfd); }
+#ifdef TEST_BUILD
+        if (kf_bmfix_fault(SHARD_TEST_BMFIX_KF_DIRSYNC)) kf_dir_synced = 0;
+#endif
     }
+    if (!kf_dir_synced)
+        atomic_store_explicit(&e->dir_unsynced, 1, memory_order_release);
     uint64_t t_after_rename = kf_now_us();
 
     /* Apply the remapped bitmaps in place now, before Phase E, so disk state
@@ -12085,6 +12137,26 @@ static int compact_migrate_records_varlen(SlotcaskDb *db, int stream_id,
 
 /* Evict from segcache (msync + munmap + close under entry wrlock), unlink,
    fsync parent dir, drop pool entries pointing at this file_id. */
+/* Make every keyfile shard's repointed entries durable. Compaction moved
+   records out of a donor file by repointing kf entries in the mapping (page
+   cache only); the donor is about to be unlinked, so a power loss before
+   keyfile writeback would leave on-disk entries naming a deleted file
+   (AUD-COMPACT-ORDER). Returns 0, or -1 with errno set. */
+static int compact_sync_all_kf(SlotcaskDb *db) {
+    for (int s = 0; s < db->num_shards; s++) {
+        char kf_path[PATH_MAX];
+        kf_path_for(kf_path, db->data_dir, s);
+        SlotcaskKfHandle kh;
+        if (kfcache_acquire(&kh, kf_path, db->slots_per_shard, 1) != 0) return -1;
+        int rc = (kh.hdr && msync(kh.hdr, kh.map_size, MS_SYNC) != 0) ? -1 : 0;
+        int saved = errno;
+        kfcache_release(&kh);
+        if (rc == 0 && kf_bmfix_fault(SHARD_TEST_BMFIX_COMPACT_KFSYNC)) { rc = -1; saved = EIO; }
+        if (rc != 0) { errno = saved ? saved : EIO; return -1; }
+    }
+    return 0;
+}
+
 static int compact_drop_seg_file(SlotcaskDb *db, int stream_id,
                                   uint32_t file_id) {
     char path[PATH_MAX];
@@ -12100,14 +12172,16 @@ static int compact_drop_seg_file(SlotcaskDb *db, int stream_id,
     char parent[PATH_MAX];
     snprintf(parent, sizeof(parent), "%s", path);
     char *slash = strrchr(parent, '/');
+    int dir_rc = 0;
     if (slash) {
         *slash = '\0';
         int dfd = open(parent, O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) { fsync(dfd); close(dfd); }
+        if (dfd < 0 || fsync(dfd) != 0) dir_rc = -1;
+        if (dfd >= 0) close(dfd);
     }
 
     pool_drop_for_file(&db->streams[stream_id], (uint16_t)file_id);
-    return 0;
+    return dir_rc;   /* unlink not known durable: report it, vacuum surfaces the error */
 }
 
 /* Direction-C compaction for one stream. Returns # of files dropped. */
@@ -12205,6 +12279,7 @@ static int compact_one_stream(SlotcaskDb *db, int stream_id) {
                                                 files[j].file_id,
                                                 &kf_failed) != 0 ||
                 kf_failed != 0 ||
+                compact_sync_all_kf(db) != 0 ||
                 compact_drop_seg_file(db, stream_id,
                                       files[i].file_id) != 0) {
                 free(files);
