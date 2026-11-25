@@ -746,6 +746,18 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
    never the variable itself. */
 
 
+/* Server-local file/path parameters (bulk-* "file", put-file "path") open a
+   path on the daemon's filesystem as the daemon user. Only a trusted address
+   or a global admin token may use them; every other token must send the
+   data inline. */
+static int server_paths_allowed(const char *client_ip, JsonObj *req) {
+    if (is_ip_trusted(client_ip)) return 1;
+    char *auth = json_obj_strdup(req, "auth");
+    int ok = auth && is_token_valid(auth);
+    free(auth);
+    return ok;
+}
+
 void dispatch_json_query(const char *raw_db_root, const char *json, const char *client_ip) {
     /* Concurrency cap: take a slot up-front; release on any return path
        via the cleanup attribute. Bounds peak query-buffer RAM at
@@ -2045,6 +2057,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         if (records) {
             cmd_bulk_insert_string(db_root, object, records, ifne);
             free(records);
+        } else if (file && !server_paths_allowed(client_ip, &req)) {
+            OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
         } else if (file) {
             cmd_bulk_insert(db_root, object, file, ifne);
         } else {
@@ -2067,6 +2081,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         if (data) {
             cmd_bulk_insert_delimited_string(db_root, object, data, data_len, d, ifne);
             free(data);
+        } else if (file && !server_paths_allowed(client_ip, &req)) {
+            OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
         } else if (file) {
             cmd_bulk_insert_delimited(db_root, object, file, d, ifne);
         } else {
@@ -2091,6 +2107,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             if (keys) {
                 cmd_bulk_delete_string(db_root, object, keys);
                 /* keys ownership transferred — bulk_delete_run frees it. */
+            } else if (file && !server_paths_allowed(client_ip, &req)) {
+                OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
             } else if (file) {
                 cmd_bulk_delete(db_root, object, file);
             } else {
@@ -2122,6 +2140,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             char *file = json_obj_strdup(&req, "file");
             if (records)
                 cmd_bulk_update_json_string(db_root, object, records);
+            else if (file && !server_paths_allowed(client_ip, &req))
+                OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
             else if (file)
                 cmd_bulk_update_json(db_root, object, file);
             else
@@ -2137,6 +2157,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         if (data) {
             cmd_bulk_update_delimited_string(db_root, object, data, strlen(data), d);
             free(data);
+        } else if (file && !server_paths_allowed(client_ip, &req)) {
+            OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
         } else if (file) {
             cmd_bulk_update_delimited(db_root, object, file, d);
         } else {
@@ -2220,7 +2242,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             free(filename);
         } else {
             char *path = json_obj_strdup(&req, "path");
-            if (path) cmd_put_file(db_root, object, path);
+            if (path && !server_paths_allowed(client_ip, &req)) OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
+            else if (path) cmd_put_file(db_root, object, path);
             else OUT("{\"error\":\"put-file requires \\\"data\\\" (base64) or \\\"path\\\" (server-local)\"}\n");
             free(path);
         }
@@ -2479,7 +2502,15 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
         goto timing;
     }
 
-    /* Legacy \x1F protocol */
+    /* Legacy \x1F protocol. It carries no token field, so it can only be
+       authenticated by the peer address: trusted IPs (loopback unless
+       DISABLE_LOCALHOST_TRUST, plus allowed_ips.conf) only. Every other
+       peer must use the JSON grammar with a token. */
+    if (!is_ip_trusted(client_ip)) {
+        LOG_AUDIT(LOG_SUB_AUTH, "AUTH failed: ip=%s legacy text protocol from an untrusted address", client_ip);
+        OUT("{\"error\":\"auth failed\"}\n");
+        goto timing;
+    }
     char *args[MAX_ARGS];
     char linecopy[MAX_LINE * 2];
     strncpy(linecopy, line, sizeof(linecopy) - 1);

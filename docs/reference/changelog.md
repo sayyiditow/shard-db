@@ -6,6 +6,24 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Security fix: server-local file paths are admin-only.**
+`bulk-insert`, `bulk-insert-delimited`, `bulk-delete`, `bulk-update`,
+`bulk-update-delimited` (`file`) and `put-file` (`path`) read a path on the
+server's filesystem as the daemon user, and any token with write permission
+could use them; an object-scoped `rw` token could ingest `tokens.conf` and
+read the global admin token back. They now require a trusted address or a
+global rwx token; other tokens get an error and must send `records`, `keys`,
+`data` or base64 `data` inline. Breaking for token clients that used
+server-local paths.
+
+**Security fix: the legacy `\x1F` text protocol no longer runs unauthenticated.**
+The line protocol on `PORT` (non-JSON, non-NQL lines) had no token or address
+check, so any peer that could connect could read, write, truncate, vacuum,
+back up or restore objects. It is now served only to trusted addresses
+(loopback unless `DISABLE_LOCALHOST_TRUST=1`, plus `allowed_ips.conf`);
+other peers get `{"error":"auth failed"}` and must use the JSON grammar with a
+token. Breaking for remote clients that used the text grammar.
+
 **Fix: a replayed kf window commit double-booked the record counters.**
 The K phase is re-run on the same plan after a later-step failure (e.g. a K
 msync error on the legacy window path). `kf_commit_planned_slot` booked
