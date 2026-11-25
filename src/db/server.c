@@ -3697,6 +3697,24 @@ void bg_threads_stop(ShardDb *db) {
  *
  * Returns 0 on clean, count-of-errors otherwise.
  */
+/* Orderly teardown for a failed start after bg threads/pools are up. */
+static int server_startup_abort(const char *db_root, int sfd) {
+    remove_pid_file(db_root);
+    close(sfd);
+    bg_threads_stop(g_shard_db_instance);
+    parallel_io_pool_shutdown();
+    parallel_pool_shutdown();
+    counts_flush_all();
+    bt_cache_shutdown();
+    bm_cache_shutdown();
+    slotcask_shutdown();
+    schema_caches_shutdown();
+    tls_shutdown();
+    log_shutdown();
+    shard_db_destroy_after_storage(g_shard_db_instance);
+    return 1;
+}
+
 int cmd_server(const char *db_root, int daemonize) {
     /* Recovery mutates object directories, so DB-root ownership must be
        established before any instance initialization or recovery work. */
@@ -3982,20 +4000,7 @@ int cmd_server(const char *db_root, int daemonize) {
     if (bg_threads_start(g_shard_db_instance, BG_RUNTIME_DAEMON) != 0) {
         LOG_ERROR(LOG_SUB_DURABILITY,
                   "SERVER START aborted: required durability thread unavailable");
-        remove_pid_file(db_root);
-        close(sfd);
-        bg_threads_stop(g_shard_db_instance);
-        parallel_io_pool_shutdown();
-        parallel_pool_shutdown();
-        counts_flush_all();
-        bt_cache_shutdown();
-        bm_cache_shutdown();
-        slotcask_shutdown();
-        schema_caches_shutdown();
-        tls_shutdown();
-        log_shutdown();
-        shard_db_destroy_after_storage(g_shard_db_instance);
-        return 1;
+        return server_startup_abort(db_root, sfd);
     }
 
     int nthreads = g_workers > 0 ? g_workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
@@ -4008,14 +4013,36 @@ int cmd_server(const char *db_root, int daemonize) {
        Allocate before threads spawn so worker_thread can safely write to it
        and handle_shutdown can safely read. */
     g_worker_cfds = malloc(nthreads * sizeof(int));
+    pthread_t *pool = malloc(nthreads * sizeof(pthread_t));
+    if (!g_worker_cfds || !pool) {
+        fprintf(stderr, "shard-db: out of memory allocating worker pool\n");
+        LOG_ERROR(LOG_SUB_SERVER, "SERVER START aborted: worker pool allocation failed");
+        free(g_worker_cfds);
+        g_worker_cfds = NULL;
+        free(pool);
+        wq_destroy(&g_work_queue);
+        return server_startup_abort(db_root, sfd);
+    }
     for (int i = 0; i < nthreads; i++) g_worker_cfds[i] = -1;
     g_worker_cfds_n = nthreads;
-    pthread_t *pool = malloc(nthreads * sizeof(pthread_t));
     for (int i = 0; i < nthreads; i++) {
         WorkerArg *wa = malloc(sizeof(WorkerArg));
+        if (!wa) {
+            LOG_ERROR(LOG_SUB_SERVER,
+                      "worker %d: WorkerArg allocation failed; running with %d workers",
+                      i, i);
+            nthreads = i;   /* join only the workers actually started */
+            break;
+        }
         strncpy(wa->db_root, db_root, PATH_MAX - 1);
         wa->id = i;
         db_thread_create(&pool[i], worker_thread, wa);
+    }
+    if (nthreads == 0) {
+        LOG_ERROR(LOG_SUB_SERVER, "SERVER START aborted: no workers could start");
+        free(pool);
+        wq_destroy(&g_work_queue);
+        return server_startup_abort(db_root, sfd);
     }
 
     fprintf(stdout, "shard-db listening on port %d (pid=%d, workers=%d, timeout=%us, tls=%s)\n",

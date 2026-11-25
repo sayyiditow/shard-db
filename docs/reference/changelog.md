@@ -14,6 +14,11 @@ already-published slot, so `count` over-reported until the next header
 rebuild. A slot already committed with the same hash and location is now a
 no-op. Records were never affected, only the counts.
 
+**Fix: an NQL filter with a malformed IN-list leaked its partial list.**
+A parse error after some list values were collected dropped the partial
+`in_values` array (about 150 bytes per request, wire reachable, unbounded).
+It is now freed on every error path of the list reader.
+
 **Fix: an object name containing `:` made the whole DB root unstartable.**
 `create-object` accepted `:` in the object name, which is the `schema.conf`
 field separator, so `a:8` wrote a corrupt schema line and the next start

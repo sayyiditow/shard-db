@@ -177,26 +177,43 @@ static int read_value(NqlLexer *l, char *buf, size_t bufsz) {
     return -1;
 }
 
+/* Free a partially (or fully) built IN-list and reset it. */
+static void read_list_discard(SearchCriterion *c) {
+    for (size_t i = 0; i < (size_t)c->in_count; i++) free(c->in_values[i]);
+    free(c->in_values);
+    c->in_values = NULL;
+    c->in_count = 0;
+    c->in_cap = 0;
+}
+
+/* On any failure the partial list is freed before returning -1, so the
+   caller only has to release its node. */
 static int read_list(NqlLexer *l, SearchCriterion *c) {
     NqlToken open = lex_next(l);
     NqlTokenType close = (open.type == TOK_LPAREN) ? TOK_RPAREN : TOK_RBRACKET;
     c->in_cap = 8; c->in_count = 0;
     c->in_values = malloc(c->in_cap * sizeof(char *));
-    if (!c->in_values) return -1;
+    if (!c->in_values) { c->in_cap = 0; return -1; }
     while (1) {
         NqlToken t = lex_peek(l);
         if (t.type == close) { lex_next(l); break; }
-        if (t.type == TOK_EOF) { snprintf(l->err, sizeof l->err, "unterminated list"); return -1; }
+        if (t.type == TOK_EOF) {
+            snprintf(l->err, sizeof l->err, "unterminated list");
+            read_list_discard(c);
+            return -1;
+        }
         if (t.type == TOK_COMMA) { lex_next(l); continue; }
         char vbuf[1024];
-        if (read_value(l, vbuf, sizeof vbuf) < 0) return -1;
+        if (read_value(l, vbuf, sizeof vbuf) < 0) { read_list_discard(c); return -1; }
         if (c->in_count >= c->in_cap) {
             c->in_cap *= 2;
             char **tmp = realloc(c->in_values, c->in_cap * sizeof(char *));
-            if (!tmp) return -1;
+            if (!tmp) { c->in_cap /= 2; read_list_discard(c); return -1; }
             c->in_values = tmp;
         }
-        c->in_values[c->in_count++] = strdup(vbuf);
+        char *dup = strdup(vbuf);
+        if (!dup) { read_list_discard(c); return -1; }
+        c->in_values[c->in_count++] = dup;
     }
     return 0;
 }
