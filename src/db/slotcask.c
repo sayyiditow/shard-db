@@ -3269,10 +3269,9 @@ static int kf_plan_window_insert_slot(SlotcaskDb *db, SlotcaskKfHandle *kh,
 
 /* Warn once per cache entry when a reuse commits against a tombstone
    the counters never booked (on-disk state written before tombstones
-   were booked). It can also be reached when a replayed commit re-enters
-   on the same plan — that is a double-count of an already-booked
-   placement, not an unbooked tombstone, and the fallback below keeps the
-   live count from wrapping either way. Thread-safe marker: a
+   were booked). A replayed commit re-entering on the same plan is
+   absorbed earlier by kf_commit_planned_slot's already-committed check,
+   so it never reaches this fallback. Thread-safe marker: a
    per-KfCacheEntry atomic bit (a bare static array would be a TSan
    finding). The entry is reachable via the handle's cache slot; the
    uncached fallback (-1) stays silent. Cleared at install, so an
@@ -3304,6 +3303,18 @@ static void kf_commit_planned_slot(SlotcaskKfHandle *kh, const KfInsertPlan *pla
     SlotcaskKfEntry *kf = kh->map;
     SlotcaskKfHeader *hdr = kh->hdr;
     SlotcaskKfEntry *t = &kf[plan->target_slot];
+    /* The K phase is re-runnable (the coordinator replays it on the same
+       plan after a later-step failure). A slot this exact commit already
+       published (live, same hash, same location) must not book the header
+       counters or the window size a second time: a repeat would inflate
+       total (fresh placement) or deflate deleted (tombstone reuse). */
+    if (__atomic_load_n(&t->flag, __ATOMIC_ACQUIRE) == 1 &&
+        memcmp(t->hash, plan->hash, 16) == 0 &&
+        t->stream_id == stream_id && t->file_id == file_id &&
+        t->offset == offset) {
+        if (out_slot) *out_slot = plan->target_slot;
+        return;
+    }
     memcpy(t->hash, plan->hash, 16);
     t->stream_id = stream_id;
     t->file_id = file_id;
@@ -3316,11 +3327,7 @@ static void kf_commit_planned_slot(SlotcaskKfHandle *kh, const KfInsertPlan *pla
             } else {
                 /* The tombstone this reuse committed against was never
                    booked (deleted == 0 for a flag==2 slot): on-disk state
-                   written before tombstones were booked. A replayed
-                   commit re-entering on the same plan can land here too;
-                   that is a double-count of an already-booked placement
-                   (it over-counts live by one), not an unbooked
-                   tombstone. Decrementing would wrap
+                   written before tombstones were booked. Decrementing would wrap
                    deleted to UINT64_MAX and clamp the whole object's
                    live count to 0 (resolve_counts). Count the
                    resurrected slot as a fresh placement instead: live =

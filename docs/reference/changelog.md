@@ -6,6 +6,14 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Fix: a replayed kf window commit double-booked the record counters.**
+The K phase is re-run on the same plan after a later-step failure (e.g. a K
+msync error on the legacy window path). `kf_commit_planned_slot` booked
+`total++` (fresh placement) or `deleted--` (tombstone reuse) again on the
+already-published slot, so `count` over-reported until the next header
+rebuild. A slot already committed with the same hash and location is now a
+no-op. Records were never affected, only the counts.
+
 **Fix: an object name containing `:` made the whole DB root unstartable.**
 `create-object` accepted `:` in the object name, which is the `schema.conf`
 field separator, so `a:8` wrote a corrupt schema line and the next start

@@ -5,8 +5,14 @@ review directive; the campaign ID AUD-QRY-10 is already taken (the
 >MAX_INTERSECT_LEAVES AND-leaf finding, fixed in the QRY-2 branch), so this
 finding carries the next free ID, AUD-QRY-11.**
 
-**Status: PROPOSED — written at the round-2 blind review (2026-11-23), not
-implemented. Severity: MAJOR (live over-count), not DL.**
+**Status: EXECUTED 2026-11-25 (uncommitted until reviewed). Severity: MAJOR (live over-count), not DL.**
+
+As built: `kf_commit_planned_slot` returns early (no counters, no `used_delta`)
+when the slot is already live with the same hash, stream, file and offset.
+Repro: in-process `test-kf-window-replay-double-booking` (legacy window path,
+one non-sticky K failure): red on the base (total 2 vs 1 for a fresh insert;
+live 2 vs 1 for tombstone reuse), green with the guard. The wire/deferred-route
+variant in the repro section below was not built; the guard is route-agnostic.
 
 ## Finding
 
