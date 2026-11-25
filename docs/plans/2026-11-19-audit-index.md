@@ -714,7 +714,7 @@ vs load); flagged for the same Phase-4 fix branch.
   allocation failure crashes the daemon instead of returning an error.
   No test for allocation-failure paths exists (also listed under the
   existing no-alloc-failure-test gap).
-- **AUD-BULK-DEL-K (minor, bulk slice; found by the Opus blind review of
+- **AUD-BULK-DEL-K (minor, Phase 2 area 1; traced 2026-11-25, see 2026-11-25-audit-storage-k-reentry.md; found by the Opus blind review of
   AUD-QRY-11):** `bulk_apply_and_sync_kf_locked`'s delete branch is not
   idempotent on K re-entry: `kf_tombstone_entry_locked` returns -1 when the
   key's slot is already tombstoned, so a delete window whose first K
@@ -722,10 +722,17 @@ vs load); flagged for the same Phase-4 fix branch.
   (rc -2 / durability degraded; the marker gate finishes it). Counters stay
   correct. Fix: treat "slot already flag==2 at the expected old slot" as
   done on re-entry; add a delete variant of the K-failure test.
-- **AUD-BULK-DEFER-CONT (minor, bulk slice):** `slotcask_bulk_finalize_shard`
+- **AUD-BULK-DEFER-CONT (minor, Phase 2 area 1; traced correct, untested, see 2026-11-25-audit-storage-k-reentry.md):** `slotcask_bulk_finalize_shard`
   continues to later windows after one window failed finalize twice;
   correctness rests on the gate replay's lookup-based recovery. No
   counter corruption found; no test covers it.
+- **AUD-KF-RESPLIT-SYNC (suspected major, Phase 4; Phase 2 area 1 part 2,
+  2026-11-25):** `kfcache_resplit_locked` ignores the Phase C `msync` result
+  and a failed post-rename kf-dir fsync (the latter only guards bitmaps), so
+  a resplit can publish an unsynced keyfile. Details and proposed fix/test in
+  `2026-11-25-audit-storage-k-reentry.md`. Repro `audit-repro-resplit-msync`
+  is red on the current tree (engine proceeds after the injected msync EIO);
+  a second reviewer must still confirm severity before it counts as major.
 - AUD-QRY-11 test gap: only the legacy window path is covered, not the
   deferred `bulk_finalize_one_kf_window` retry.
 - Needs-look rows for the dispatch/auth slice: 60x `cert-err34-c`
