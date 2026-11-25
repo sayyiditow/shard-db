@@ -29,6 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#define IPB 128u   /* IP_SET_BUCKETS (shard_db_internal.h) */
 static unsigned tc_h(const char *s) {
     unsigned h = 5381;
     while (*s) h = h * 33 + (unsigned char)*s++;
@@ -147,6 +148,35 @@ static int audit_repro_token_chain_run(void) {
             free(r);
         }
         ASSERT_TRUE(ok > 0 && ok <= 64 && full > 0, "a full token table reports an error");
+
+        /* IP set: same tombstone rule. "127.0.0.1" is trusted once listed;
+           removing a colliding entry that was inserted before it must not
+           make it untrusted. */
+        char ipx[32] = "";
+        unsigned home = tc_h("127.0.0.1") % IPB;
+        for (int i = 0; i < 200000 && !ipx[0]; i++) {
+            char t[32]; snprintf(t, sizeof(t), "10.%d.%d.%d", (i >> 16) & 255, (i >> 8) & 255, i & 255);
+            if (strcmp(t, "127.0.0.1") != 0 && tc_h(t) % IPB == home) snprintf(ipx, sizeof(ipx), "%s", t);
+        }
+        ASSERT_TRUE(ipx[0], "found an IP colliding with 127.0.0.1");
+        snprintf(req, sizeof(req), "{\"mode\":\"add-ip\",\"auth\":\"%s\",\"ip\":\"%s\"}", gtok, ipx);
+        free(ta_req(port, req));
+        snprintf(req, sizeof(req), "{\"mode\":\"add-ip\",\"auth\":\"%s\",\"ip\":\"127.0.0.1\"}", gtok);
+        free(ta_req(port, req));
+        snprintf(req, sizeof(req), "{\"mode\":\"remove-ip\",\"auth\":\"%s\",\"ip\":\"%s\"}", gtok, ipx);
+        r = ta_req(port, req);
+        ASSERT_TRUE(r && strstr(r, "ip_removed"), "the colliding IP is removed");
+        free(r);
+        r = ta_req(port, "{\"mode\":\"db-dirs\"}");   /* no token: only a trusted address passes */
+        ASSERT_TRUE(r && !strstr(r, "\"error\""), "127.0.0.1 is still trusted after the colliding IP was removed");
+        free(r);
+        snprintf(req, sizeof(req), "{\"mode\":\"remove-ip\",\"auth\":\"%s\",\"ip\":\"127.0.0.1\"}", gtok);
+        r = ta_req(port, req);
+        ASSERT_TRUE(r && strstr(r, "ip_removed"), "127.0.0.1 can be removed again");
+        free(r);
+        r = ta_req(port, "{\"mode\":\"db-dirs\"}");
+        ASSERT_TRUE(r && strstr(r, "\"error\""), "127.0.0.1 is untrusted once removed");
+        free(r);
     }
     kill(pid, SIGTERM);
     waitpid(pid, NULL, 0);

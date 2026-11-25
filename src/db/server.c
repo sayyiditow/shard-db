@@ -717,6 +717,11 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
         }
     }
 
+    if (!is_valid_dir(cmd.dir)) {
+        OUT("{\"error\":\"Unknown dir: %s\"}\n", cmd.dir);
+        nql_free_command(&cmd);
+        return;
+    }
     if (!is_valid_object(cmd.obj)) {
         OUT("{\"error\":\"invalid object name\"}\n");
         nql_free_command(&cmd);
@@ -985,7 +990,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                         if (g_token_set_used[i] != 1) continue;
                         int tlen = (int)strlen(g_token_set[i]);
                         char this_fp[32];
-                        if (tlen > 10)
+                        if (tlen > 16)
                             snprintf(this_fp, sizeof(this_fp),
                                      "%.4s...%s", g_token_set[i], g_token_set[i] + tlen - 4);
                         else
@@ -1091,7 +1096,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 if (g_token_set_used[i] != 1) continue;
                 int tlen = strlen(g_token_set[i]);
                 char fp[32];
-                if (tlen > 10)
+                if (tlen > 16)
                     snprintf(fp, sizeof(fp), "%.4s...%s",
                              g_token_set[i], g_token_set[i] + tlen - 4);
                 else

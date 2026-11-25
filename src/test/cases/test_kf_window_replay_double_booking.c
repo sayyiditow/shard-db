@@ -146,3 +146,104 @@ static int test_kf_window_replay_double_booking(void) {
 }
 
 TEST_REGISTER("test-kf-window-replay-double-booking", test_kf_window_replay_double_booking)
+
+/* AUD-BULK-DEL-K: a delete window whose first K tombstoned the slot and then
+   failed its sync must converge on the inline replay (the replay used to find
+   no live entry, fail, and leave the window pending), with the counters
+   booked exactly once. */
+static int kr_del_prepare(SlotcaskBulkRec *r, const size_t *a, size_t n, void *c, void **ws) {
+    (void)r; (void)a; (void)n; (void)c;
+    *ws = NULL;
+    return 0;
+}
+static int kr_del_apply(SlotcaskBulkRec *r, const size_t *a, size_t n, void *c, void *ws) {
+    (void)r; (void)a; (void)n; (void)c; (void)ws;
+    return 0;
+}
+
+static int test_kf_window_delete_replay(void) {
+    KrDb w;
+    ASSERT_EQ_INT(kr_open(&w), 0, "open db");
+    if (t_ctx->failed) return 1;
+    uint64_t key = 4242;
+    uint8_t h[16];
+    compute_hash_raw((const char *)&key, sizeof(key), h);
+    int shard = compute_record_shard(h, 8);
+    ASSERT_EQ_INT(kr_upsert(&w, key, shard), 0, "seed insert");
+
+    SlotcaskBulkRec drec;
+    SlotcaskBulkDeleteOpts dopt;
+    memset(&drec, 0, sizeof(drec));
+    memset(&dopt, 0, sizeof(dopt));
+    drec.key = &key; drec.klen = sizeof(key);
+    dopt.has_indexed_fields = 1;
+    dopt.prepare_window = kr_del_prepare;
+    dopt.apply_window = kr_del_apply;
+    shard_test_ctl_reset();
+    g_shard_test_fail_phase = SHARD_TEST_PHASE_K;
+    g_shard_test_fail_occurrence = 1;
+    int rc = slotcask_bulk_delete_in_kfshard(&w.db, shard, &drec, 1, &dopt);
+    g_shard_test_fail_phase = -1; g_shard_test_fail_occurrence = 0;
+    ASSERT_EQ_INT(rc, 0, "delete converges inline after one K failure");
+    uint64_t total = 0, deleted = 0;
+    ASSERT_EQ_INT(slotcask_sum_kf_totals(&w.db, &total, &deleted), 0, "totals read");
+    ASSERT_EQ_INT((int)total, 1, "total unchanged");
+    ASSERT_EQ_INT((int)deleted, 1, "deleted booked once");
+    void *v = NULL; size_t vl = 0;
+    ASSERT_TRUE(slotcask_get(&w.db, &key, sizeof(key), &v, &vl) != 0, "key is gone");
+    free(v);
+    kr_close(&w);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+TEST_REGISTER("test-kf-window-delete-replay", test_kf_window_delete_replay)
+
+/* AUD-BULK-DEFER-CONT (test gap): the same key twice in one request, split
+   across two windows (window size 1), with a K failure on the first window.
+   Whatever the interleaving, the shard must end with exactly one live record
+   for the key, readable, and exact counters. */
+static int test_kf_window_duplicate_key_split(void) {
+    KrDb w;
+    ASSERT_EQ_INT(kr_open(&w), 0, "open db");
+    if (t_ctx->failed) return 1;
+    w.db.bulk_commit_window = 1;
+    uint64_t key = 9191;
+    uint8_t h[16];
+    compute_hash_raw((const char *)&key, sizeof(key), h);
+    int shard = compute_record_shard(h, 8);
+    SlotcaskBulkRec recs[2];
+    memset(recs, 0, sizeof(recs));
+    for (int i = 0; i < 2; i++) {
+        recs[i].key = &key; recs[i].klen = sizeof(key);
+        recs[i].value = i ? "second" : "first-"; recs[i].vlen = 6;
+    }
+    SlotcaskBulkOpts o;
+    memset(&o, 0, sizeof(o));
+    o.has_indexed_fields = 1;
+    o.prepare_window = kr_prepare;
+    o.apply_window = kr_apply;
+    shard_test_ctl_reset();
+    g_shard_test_fail_phase = SHARD_TEST_PHASE_K;
+    g_shard_test_fail_occurrence = 1;
+    (void)slotcask_bulk_upsert_in_kfshard(&w.db, shard, recs, 2, &o);
+    g_shard_test_fail_phase = -1; g_shard_test_fail_occurrence = 0;
+    /* A clean follow-up write replays anything pending. */
+    uint64_t other = 31337;
+    uint8_t h2[16];
+    compute_hash_raw((const char *)&other, sizeof(other), h2);
+    int shard2 = compute_record_shard(h2, 8);
+    (void)kr_upsert(&w, other, shard2);
+    void *v = NULL; size_t vl = 0;
+    int grc = slotcask_get(&w.db, &key, sizeof(key), &v, &vl);
+    ASSERT_EQ_INT(grc, 0, "the duplicated key is readable");
+    ASSERT_TRUE(grc == 0 && vl == 6 && (memcmp(v, "second", 6) == 0 || memcmp(v, "first-", 6) == 0),
+                "the key holds one of the two submitted values");
+    free(v);
+    uint64_t total = 0, deleted = 0;
+    ASSERT_EQ_INT(slotcask_sum_kf_totals(&w.db, &total, &deleted), 0, "totals read");
+    ASSERT_EQ_INT((int)(total - deleted), 2, "exactly two live records (the key once, plus the follow-up)");
+    kr_close(&w);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
+TEST_REGISTER("test-kf-window-duplicate-key-split", test_kf_window_duplicate_key_split)

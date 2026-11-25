@@ -13,6 +13,14 @@ until the directory sync succeeds. Segment compaction makes the repointed
 keyfile entries durable before it deletes the donor file, so a power loss can
 no longer leave keys naming a deleted segment.
 
+**Fix: bulk-delete replay, bulk-insert out-of-memory, and small hardening.**
+A bulk-delete window whose first keyfile sync failed now converges on the
+inline replay instead of staying pending; `bulk-insert` and
+`bulk-insert-delimited` answer `out of memory` and write nothing when an
+allocation fails (a record-array realloc failure used to report
+`{"inserted":0}`); NQL rejects unknown tenant dirs like the other grammars; and
+`list-tokens` shows the `abcd...wxyz` fingerprint only for tokens longer than
+16 characters.
 
 **Fix: the query concurrency cap now covers NQL and the legacy text protocol.**
 `MAX_CONCURRENT_QUERIES` (and the memory bound derived from it) applied only

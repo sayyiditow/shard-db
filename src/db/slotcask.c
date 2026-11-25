@@ -4502,11 +4502,11 @@ static int kf_repoint(SlotcaskKfHandle *kh, const uint8_t hash[16],
 
 /* Task 4 coordinator's K step for a delete entry — probe-and-verify the
    same way kf_repoint does, then flag=2 + bump the shard's deleted
-   counter. Idempotent: re-running on an already-tombstoned slot (forward
-   replay after a partial K) finds flag!=1 while probing and keeps
-   walking, so a second call over the same window is a safe no-op once
-   the target slot itself already reads flag=2 -- the probe simply will
-   not find a flag==1 match for this key.  */
+   counter. Idempotent (AUD-BULK-DEL-K): K is re-run on the same plan after
+   a failed K sync, and by then the first run already tombstoned the slot.
+   When no live entry matches, an already-tombstoned entry with the same
+   hash and stored key means "done by an earlier run" (0, counter untouched);
+   only a key with neither a live nor a tombstoned entry is an error. */
 static int kf_tombstone_entry_locked(SlotcaskKfHandle *kh,
                                      const uint8_t hash[16],
                                      const void *key, size_t klen,
@@ -4523,6 +4523,16 @@ static int kf_tombstone_entry_locked(SlotcaskKfHandle *kh,
             kf_tombstone_at_slot(kh, slot);
             return 0;
         }
+    }
+    /* No live match: the key may already be tombstoned by a prior K run. */
+    KfProbeIter it2; kf_probe_init(&it2, kh, hash);
+    while ((slot = kf_probe_next(&it2)) != (size_t)-1) {
+        SlotcaskKfEntry *e = &kh->map[slot];
+        if (e->flag != 2 || memcmp(e->hash, hash, 16) != 0) continue;
+        int km = verify_stored_key(data_dir, e->stream_id, e->file_id,
+                                   e->offset, key, klen);
+        if (km < 0) return -1;
+        if (km == 1) return 0;
     }
     return -1;
 }
