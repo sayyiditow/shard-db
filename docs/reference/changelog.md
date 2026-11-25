@@ -6,6 +6,17 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Fix: idle and half-open connections no longer starve the worker pool.**
+A worker serves one connection for its whole life and sockets had no
+timeouts, so `WORKERS` idle (even unauthenticated) connections made the
+server unresponsive. New `IDLE_TIMEOUT_SEC` (default 300, 0 = off) closes a
+connection that sends nothing for that long (a half-sent request is dropped,
+not executed; running queries are not interrupted) and `HANDSHAKE_TIMEOUT_SEC`
+(default 10) bounds the TLS handshake. A connection whose peer address cannot
+be read is now closed instead of being treated as loopback. Breaking for
+clients that idle longer than 300 s: they must reconnect (set
+`IDLE_TIMEOUT_SEC=0` to keep the old behavior).
+
 **Fix: removing a token or trusted IP no longer breaks other entries; auth files are written atomically.**
 The token and IP hash sets cleared a slot on removal, which ended the probe
 chain: a colliding entry became unreachable (the token answered `auth failed`,

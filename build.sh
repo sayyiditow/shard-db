@@ -689,6 +689,8 @@ export BULK_COMMIT_WINDOW=4096
 # Request + query limits
 export GLOBAL_LIMIT=100000
 export MAX_REQUEST_SIZE=33554432
+export IDLE_TIMEOUT_SEC=300      # close connections idle this long (0 = off)
+export HANDSHAKE_TIMEOUT_SEC=10   # TLS handshake timeout (0 = off)
 # Per-query intermediate buffer. With MAX_CONCURRENT_QUERIES bounding
 # fan-in, worst-case RAM stays predictable. 256 MB is sized for ~16
 # concurrent queries on a 16 GB host; auto-tunes upward on big-RAM

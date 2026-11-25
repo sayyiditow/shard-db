@@ -6,11 +6,10 @@
  * authentication, so WORKERS idle connections (default: CPU count) stop the
  * server from answering anyone.
  *
- * Contract asserted: with WORKERS idle unauthenticated connections open, an
- * authenticated request is still answered within a few seconds. Expected
- * today: FAILS (the request times out). Passes once the Phase 4 fix lands
- * (idle/read timeouts or a connection cap that never starves workers).
- * Audit case: excluded from default run-all (--include-audit).
+ * Regression case for docs/plans/2026-11-25-fix-conn-timeouts.md: with
+ * IDLE_TIMEOUT_SEC=2, WORKERS idle unauthenticated connections are closed and
+ * an authenticated request is then answered; a connection idle past the
+ * timeout is dropped. Runs in the default suite.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -65,7 +64,7 @@ static int audit_repro_idle_connections_run(void) {
         "export DB_ROOT=\"%s\"\nexport PORT=%d\nexport TIMEOUT=0\n"
         "export LOG_DIR=\"%s/logs\"\nexport LOG_LEVEL=2\nexport THREADS=2\n"
         "export FCACHE_MAX=4096\nexport TLS_ENABLE=0\n"
-        "export DISABLE_LOCALHOST_TRUST=1\nexport WORKERS=4\n", db_root, port, base);
+        "export DISABLE_LOCALHOST_TRUST=1\nexport WORKERS=4\nexport IDLE_TIMEOUT_SEC=2\n", db_root, port, base);
     fclose(f);
 
     char sdb[PATH_MAX];
@@ -91,7 +90,7 @@ static int audit_repro_idle_connections_run(void) {
         TestClientCfg icfg = { .port = port, .connect_timeout_ms = 2000 };
         for (int i = 0; i < 4; i++) idle[i] = tc_connect(&icfg);   /* send nothing */
         { struct timespec ts = { 1, 0 }; nanosleep(&ts, NULL); }
-        TestClientCfg cfg = { .port = port, .connect_timeout_ms = 2000, .io_timeout_ms = 3000 };
+        TestClientCfg cfg = { .port = port, .connect_timeout_ms = 2000, .io_timeout_ms = 6000 };
         TestClient *tc = tc_connect(&cfg);
         char *r = NULL;
         if (tc) { if (tc_request(tc, req, &r) != 0) r = NULL; tc_close(tc); }
@@ -99,6 +98,21 @@ static int audit_repro_idle_connections_run(void) {
                     "an authenticated request is answered while 4 idle connections are open");
         free(r);
         for (int i = 0; i < 4; i++) if (idle[i]) tc_close(idle[i]);
+
+        /* A connection idle past the timeout is dropped by the server. */
+        TestClient *late = tc_connect(&cfg);
+        { struct timespec ts = { 3, 0 }; nanosleep(&ts, NULL); }
+        char *r2 = NULL;
+        int rc2 = late ? tc_request(late, req, &r2) : -1;
+        ASSERT_TRUE(rc2 != 0 || !r2, "a connection idle past IDLE_TIMEOUT_SEC is closed");
+        free(r2);
+        if (late) tc_close(late);
+        /* ...and the server still serves new connections. */
+        TestClient *fresh = tc_connect(&cfg);
+        char *r3 = NULL;
+        if (fresh) { if (tc_request(fresh, req, &r3) != 0) r3 = NULL; tc_close(fresh); }
+        ASSERT_TRUE(r3 && strstr(r3, "default"), "a new connection is served afterwards");
+        free(r3);
     }
     kill(pid, SIGTERM);
     waitpid(pid, NULL, 0);
@@ -106,4 +120,4 @@ static int audit_repro_idle_connections_run(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-TEST_REGISTER_AUDIT("audit-repro-idle-connections", audit_repro_idle_connections_run)
+TEST_REGISTER("test-idle-connection-timeout", audit_repro_idle_connections_run)

@@ -45,6 +45,8 @@ void db_defaults_set(ShardDb *db) {
     db->port                      = 9199;
     db->global_limit              = 100000;
     db->max_request_size          = 33554432;
+    db->idle_timeout_sec          = 300;
+    db->handshake_timeout_sec     = 10;
     db->fcache_cap                = 4096;
     db->btcache_cap               = 1024;
     db->query_buffer_max_bytes    = 256ULL * 1024 * 1024;

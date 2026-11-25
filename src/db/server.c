@@ -2822,6 +2822,15 @@ typedef struct {
     int id;
 } WorkerArg;
 
+/* Socket-level read/write timeouts: a worker serves one connection for its
+   whole life, so without them idle or half-open peers pin every worker
+   (AUD-CONN-1). sec == 0 leaves the socket blocking. */
+static void set_conn_timeouts(int fd, int sec) {
+    struct timeval tv = { .tv_sec = sec > 0 ? sec : 0, .tv_usec = 0 };   /* 0 = no timeout */
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 void *worker_thread(void *arg) {
     WorkerArg *wa = (WorkerArg *)arg;
 
@@ -2844,9 +2853,20 @@ void *worker_thread(void *arg) {
         /* Get client IP for auth decisions */
         struct sockaddr_in peer_addr;
         socklen_t peer_len = sizeof(peer_addr);
-        char client_ip[INET_ADDRSTRLEN] = "127.0.0.1";
-        if (getpeername(cfd, (struct sockaddr *)&peer_addr, &peer_len) == 0)
-            inet_ntop(AF_INET, &peer_addr.sin_addr, client_ip, sizeof(client_ip));
+        char client_ip[INET_ADDRSTRLEN] = "0.0.0.0";   /* never a trusted address */
+        if (getpeername(cfd, (struct sockaddr *)&peer_addr, &peer_len) != 0 ||
+            !inet_ntop(AF_INET, &peer_addr.sin_addr, client_ip, sizeof(client_ip))) {
+            /* No peer address means no way to apply IP trust: drop the connection. */
+            __atomic_store_n(&g_worker_cfds[wa->id], -1, __ATOMIC_RELEASE);
+            close(cfd);
+            pthread_mutex_lock(&thread_count_lock);
+            active_threads--;
+            pthread_mutex_unlock(&thread_count_lock);
+            continue;
+        }
+        /* TLS handshake gets its own (short) timeout; the idle timeout takes
+           over once the session is up (or immediately for plain sockets). */
+        set_conn_timeouts(cfd, g_tls_enable ? g_handshake_timeout_sec : g_idle_timeout_sec);
 
         /* Per-connection streams — TLS wraps SSL via tls_fopen (one FILE*
            in r+ mode; reads and writes share the same SSL session); plain
@@ -2855,6 +2875,7 @@ void *worker_thread(void *arg) {
         FILE *cf = NULL, *out = NULL;
         if (g_tls_enable) {
             SSL *ssl = tls_accept(cfd);
+            if (ssl) set_conn_timeouts(cfd, g_idle_timeout_sec);
             if (!ssl) {
                 /* Handshake failed — drop the connection silently (logged in tls.c). */
                 __atomic_store_n(&g_worker_cfds[wa->id], -1, __ATOMIC_RELEASE);
@@ -2884,6 +2905,10 @@ void *worker_thread(void *arg) {
             int buf_size = g_max_request_size > 0 ? g_max_request_size : MAX_LINE;
             char *line = malloc(buf_size);
             while (line && fgets(line, buf_size, cf)) {
+                /* A read timeout (idle or slow peer) or socket error leaves the
+                   FILE in the error state with at most a partial line: drop the
+                   connection without executing the fragment. */
+                if (ferror(cf)) break;
                 /* Check for oversized request: fgets filled buffer without finding newline */
                 int len = strlen(line);
                 if (len > 0 && line[len - 1] != '\n' && len >= buf_size - 1) {

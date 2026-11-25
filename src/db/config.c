@@ -515,6 +515,12 @@ int load_db_root(char *out, size_t outlen) {
                 g_max_concurrent_queries = atoi(p + 23);
                 if (g_max_concurrent_queries < 0) g_max_concurrent_queries = 0;
             }
+        } else if (strncmp(p, "IDLE_TIMEOUT_SEC=", 17) == 0) {
+            long n = atol(p + 17);
+            if (n >= 0 && n <= 86400 && g_db) g_idle_timeout_sec = (int)n;
+        } else if (strncmp(p, "HANDSHAKE_TIMEOUT_SEC=", 22) == 0) {
+            long n = atol(p + 22);
+            if (n >= 0 && n <= 3600 && g_db) g_handshake_timeout_sec = (int)n;
         } else if (strncmp(p, "MAX_REQUEST_SIZE=", 17) == 0) {
             int sz = atoi(p + 17);
             if (sz >= 1024 && g_db) g_max_request_size = sz;

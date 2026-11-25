@@ -229,6 +229,8 @@ struct ShardDb {
     int      index_page_size;
     int      global_limit;
     int      max_request_size;
+    int      idle_timeout_sec;       /* IDLE_TIMEOUT_SEC: socket recv/send timeout, 0 = off */
+    int      handshake_timeout_sec;  /* HANDSHAKE_TIMEOUT_SEC: TLS handshake timeout, 0 = off */
     int      max_concurrent_queries;
     int      fcache_cap;
     int      btcache_cap;
@@ -440,6 +442,8 @@ extern ShardDb *g_shard_db_instance;
 #define g_index_page_size           (g_db->index_page_size)
 #define g_global_limit              (g_db->global_limit)
 #define g_max_request_size          (g_db->max_request_size)
+#define g_idle_timeout_sec          (g_db->idle_timeout_sec)
+#define g_handshake_timeout_sec     (g_db->handshake_timeout_sec)
 #define g_max_concurrent_queries    (g_db->max_concurrent_queries)
 #define g_fcache_cap                (g_db->fcache_cap)
 #define g_btcache_cap               (g_db->btcache_cap)
