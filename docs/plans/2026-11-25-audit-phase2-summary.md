@@ -30,3 +30,22 @@ Gates still owed before any push: ASan+UBSan x3 and TSan x3 (the diff touches
 `server.c` request dispatch only so far, no locks; the gate is still run once
 before the push per the repo rule), a blind review of the branch diff, and
 the human's raw-diff review.
+
+## Execution status (2026-11-25, later)
+
+Plans 1-5 approved and executed in one working tree (no per-plan branches;
+nothing committed), full suite 722 cases / 0 failed:
+
+| Plan | Result | Regression case |
+|---|---|---|
+| 1 vacuum vs pending markers | kf compaction skips while markers pending (`kf_skipped`), update replay verifies the slot key, replay helpers bounds-checked | `test-vacuum-kf-pending-markers` (the defense-in-depth check was also shown to fail closed with the guard disabled) |
+| 2 backup/restore | errors propagated, fsync, unique dirs, stage-then-swap restore with startup rollback | `test-backup-restore-failures`, `test-restore-swap-rollback` |
+| 3 auth sets | tombstone deletion, atomic 0600 saves, error on full table / save failure | `test-token-store-chain` |
+| 4 connection timeouts | `IDLE_TIMEOUT_SEC`, `HANDSHAKE_TIMEOUT_SEC`, fail-closed peer address | `test-idle-connection-timeout` |
+| 5 query slot | slot for NQL and text grammars | `test-query-slot-all-grammars` (red-proven by disabling the fix) |
+
+Also promoted to regular cases: `test-text-protocol-auth`,
+`test-server-file-paths-admin-only`. Not done: per-fix blind review, the
+ASan/TSan gate (once before push), revert-prove pastes for plans 2-4 (their
+asserts exercise outputs that cannot occur on the old code), the IP-set
+tombstone path has no dedicated wire test (the token table does).
