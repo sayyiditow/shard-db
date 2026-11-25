@@ -2561,6 +2561,11 @@ void handle_shutdown(int sig) {
 #define FIELD_SEP "\x1F"
 #define MAX_ARGS 8
 void server_process_fast(const char *db_root, const char *line, const char *client_ip) {
+    /* Concurrency slot for the non-JSON grammars (NQL find/count/aggregate
+       and the legacy text protocol); dispatch_json_query takes its own, so
+       JSON requests do not double-acquire. Released on every return path
+       (AUD-CAP-1). Declared before any goto so the cleanup is always valid. */
+    int slot_held __attribute__((cleanup(slot_cleanup))) = 0;
     const char *trimmed = line;
     while (*trimmed == ' ') trimmed++;
     uint64_t t0 = (g_slow_query_ms > 0) ? now_ms() : 0;
@@ -2591,6 +2596,16 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
         pthread_mutex_lock(&thread_count_lock);
         in_flight_writes++;
         pthread_mutex_unlock(&thread_count_lock);
+    }
+
+    if (!is_json) {
+        if (slot_try_acquire() == 0) {
+            slot_held = 1;
+        } else {
+            OUT("{\"error\":\"server at capacity\",\"max_concurrent_queries\":%d}\n",
+                g_max_concurrent_queries);
+            goto timing;
+        }
     }
 
     /* NQL path: first char is f/c/a (find/count/aggregate), not '{' or '\x1F' */

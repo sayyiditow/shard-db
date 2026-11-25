@@ -6,6 +6,12 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Fix: the query concurrency cap now covers NQL and the legacy text protocol.**
+`MAX_CONCURRENT_QUERIES` (and the memory bound derived from it) applied only
+to JSON requests; NQL `find`/`count`/`aggregate` and text-protocol commands
+took no slot. Every grammar now takes a slot and answers
+`{"error":"server at capacity",...}` when none is free.
+
 **Fix: idle and half-open connections no longer starve the worker pool.**
 A worker serves one connection for its whole life and sockets had no
 timeouts, so `WORKERS` idle (even unauthenticated) connections made the
