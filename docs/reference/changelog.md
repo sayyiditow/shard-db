@@ -6,6 +6,17 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Fix: removing a token or trusted IP no longer breaks other entries; auth files are written atomically.**
+The token and IP hash sets cleared a slot on removal, which ended the probe
+chain: a colliding entry became unreachable (the token answered `auth failed`,
+could not be revoked, and returned after a restart). Removal now leaves a
+tombstone. `tokens.conf` and `allowed_ips.conf` are written to a 0600 temp
+file, fsynced and renamed (a crash can no longer leave a truncated file),
+`add-token`/`remove-token`/`add-ip`/`remove-ip` return an error and leave the
+in-memory state unchanged when the file cannot be written, and a full table
+(`TOKEN_CAP`) is reported as `{"error":"token store full ..."}` instead of
+`token_added`.
+
 **Fix: `backup` and `restore` report copy failures and no longer wipe first.**
 Every copy error (ENOSPC, EIO, unreadable file) was swallowed and the modes
 answered `backed_up` / `restored` regardless; nothing was fsynced; `restore`

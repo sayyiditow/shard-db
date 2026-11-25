@@ -7,9 +7,10 @@
  * authenticating, remove-token reports token_not_found, and it stays in
  * tokens.conf (and works again after a restart). Same pattern in the IP set.
  *
- * Contract asserted: removing token A leaves colliding token B valid, and
- * B can then be revoked. Expected today: FAILS. Passes once the Phase 4 fix
- * lands. Audit case: excluded from default run-all (--include-audit).
+ * Regression case for docs/plans/2026-11-25-fix-auth-sets.md: removing token
+ * A leaves colliding token B valid, B can then be revoked and stays revoked
+ * on disk, tokens.conf is 0600, and a full table reports an error. Runs in
+ * the default suite.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -122,6 +123,30 @@ static int audit_repro_token_chain_run(void) {
         ASSERT_TRUE(r && strstr(r, "token_removed"),
                     "the colliding token can be revoked");
         free(r);
+
+        /* The revoked token is gone from disk, and the file is 0600. */
+        char tpath[512];
+        snprintf(tpath, sizeof(tpath), "%s/tokens.conf", db_root);
+        FILE *tf = fopen(tpath, "r");
+        char content[4096] = "";
+        if (tf) { size_t n = fread(content, 1, sizeof(content) - 1, tf); content[n] = '\0'; fclose(tf); }
+        ASSERT_TRUE(tf && !strstr(content, t2) && !strstr(content, t1) && strstr(content, gtok),
+                    "tokens.conf no longer lists the removed tokens");
+        struct stat tst;
+        ASSERT_TRUE(stat(tpath, &tst) == 0 && (tst.st_mode & 0777) == 0600,
+                    "tokens.conf is mode 0600");
+
+        /* A full table is an error, not a silent drop. */
+        int ok = 0, full = 0;
+        for (int i = 0; i < 80; i++) {
+            snprintf(req, sizeof(req),
+                "{\"mode\":\"add-token\",\"auth\":\"%s\",\"token\":\"fill%d\",\"perm\":\"r\"}", gtok, i);
+            r = ta_req(port, req);
+            if (r && strstr(r, "token_added")) ok++;
+            else if (r && strstr(r, "token store full")) full++;
+            free(r);
+        }
+        ASSERT_TRUE(ok > 0 && ok <= 64 && full > 0, "a full token table reports an error");
     }
     kill(pid, SIGTERM);
     waitpid(pid, NULL, 0);
@@ -129,4 +154,4 @@ static int audit_repro_token_chain_run(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-TEST_REGISTER_AUDIT("audit-repro-token-chain", audit_repro_token_chain_run)
+TEST_REGISTER("test-token-store-chain", audit_repro_token_chain_run)
