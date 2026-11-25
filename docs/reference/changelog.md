@@ -6,6 +6,15 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Fix: light `vacuum` no longer compacts keyfiles while commit markers are pending.**
+A retained commit marker names keyfile slot numbers; compaction moves entries
+to new slots, so the later replay repointed the wrong slot and tombstoned the
+real record (an updated key became unreadable and scans of the shard failed).
+Keyfile compaction is now skipped while markers are pending (reported as
+`"kf_skipped":"pending-markers"` in the vacuum response, like
+`segments_skipped`), the update replay verifies the slot's key before
+repointing, and the replay segment-flag helpers bounds-check their offsets.
+
 **Security fix: server-local file paths are admin-only.**
 `bulk-insert`, `bulk-insert-delimited`, `bulk-delete`, `bulk-update`,
 `bulk-update-delimited` (`file`) and `put-file` (`path`) read a path on the

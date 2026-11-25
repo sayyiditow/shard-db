@@ -219,13 +219,16 @@ int cmd_vacuum(const char *db_root, const char *object,
     /* kf-compact: rebuild each shard to drop tombstones so kf->deleted
        returns to 0 (kf-derived counts model — there's no separate
        counts file to lie via anymore). */
-    if (slotcask_compact_kf(sdb) != 0) {
+    int kf_skipped = 0;
+    if (slotcask_compact_kf(sdb, &kf_skipped) != 0) {
         OUT("{\"error\":\"keyfile compaction failed\"}\n");
         return 1;
     }
     reset_deleted_count(db_root, object);  /* v1 only; no-op for v2 */
-    if (skipped)
-        OUT("{\"status\":\"vacuumed\",\"cleaned\":%d,\"segments_skipped\":\"pending-markers\"}\n", dropped);
+    if (skipped || kf_skipped)
+        OUT("{\"status\":\"vacuumed\",\"cleaned\":%d%s%s}\n", dropped,
+            skipped ? ",\"segments_skipped\":\"pending-markers\"" : "",
+            kf_skipped ? ",\"kf_skipped\":\"pending-markers\"" : "");
     else
         OUT("{\"status\":\"vacuumed\",\"cleaned\":%d}\n", dropped);
     return 0;

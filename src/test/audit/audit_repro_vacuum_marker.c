@@ -17,9 +17,8 @@
  * the marker. Contract asserted: the updated key stays readable with one of
  * its two legal values, and a checked full walk still succeeds.
  *
- * Expected today: FAILS. Passes once the Phase 4 fix lands (compaction
- * refuses while markers are pending, or replay verifies the slot's key).
- * Audit case: excluded from default run-all; run with --include-audit.
+ * Regression case for the fix (docs/plans/2026-11-25-fix-vac-kf-marker.md):
+ * compaction now skips while markers are pending. Runs in the default suite.
  */
 #include "test_runner.h"
 #include "test_assert.h"
@@ -133,7 +132,9 @@ static int audit_repro_vacuum_marker_run(void) {
     ASSERT_EQ_INT(errno, EINPROGRESS, "pending errno");
 
     /* What cmd_vacuum's light path does when markers are pending. */
-    ASSERT_EQ_INT(slotcask_compact_kf(&db), 0, "kf compaction runs");
+    int kf_skipped = 0;
+    ASSERT_EQ_INT(slotcask_compact_kf(&db, &kf_skipped), 0, "kf compaction call succeeds");
+    ASSERT_EQ_INT(kf_skipped, 1, "kf compaction is skipped while a marker is pending");
 
     /* The next clean write gate-replays the marker. */
     int wrc = vm_upsert(&db, 900001, "tail", 1);
@@ -168,4 +169,4 @@ out:
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-TEST_REGISTER_AUDIT("audit-repro-vacuum-marker", audit_repro_vacuum_marker_run)
+TEST_REGISTER("test-vacuum-kf-pending-markers", audit_repro_vacuum_marker_run)

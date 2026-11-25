@@ -3661,6 +3661,11 @@ static int marker_record_tombstoned(const char *data_dir, uint8_t stream_id,
 
     seg_path_for(path, data_dir, stream_id, file_id);
     if (segcache_acquire(&h, path, 0, 0, 0) != 0) return -1;
+    if ((size_t)offset + 19 > h.map_size) {
+        segcache_release(&h);
+        errno = EILSEQ;
+        return -1;
+    }
     rc = (int)__atomic_load_n(&h.map[offset + 18], __ATOMIC_ACQUIRE);
     segcache_release(&h);
     return rc == 2 ? 1 : (rc == 1 ? 0 : -1);
@@ -3680,6 +3685,11 @@ static int seg_peek_flag(const char *data_dir, uint8_t stream_id,
 
     seg_path_for(path, data_dir, stream_id, file_id);
     if (segcache_acquire(&h, path, 0, 0, 0) != 0) return -1;
+    if ((size_t)offset + 19 > h.map_size) {
+        segcache_release(&h);
+        errno = EILSEQ;
+        return -1;
+    }
     rc = (int)__atomic_load_n(&h.map[offset + 18], __ATOMIC_ACQUIRE);
     segcache_release(&h);
     return rc;
@@ -3727,6 +3737,28 @@ static int kf_marker_verify_kf_old_at_slot(SlotcaskKfHandle *kh,
         found_slot != expected_slot || flag != 1 ||
         stream_id != marker->old_stream_id || file_id != marker->old_file_id ||
         offset != marker->old_offset) {
+        errno = EILSEQ;
+        return -1;
+    }
+    return 0;
+}
+
+/* True when the kf entry at `expected_slot` is the live entry for this
+   record's key (whatever segment location it currently names). Used by the
+   update replay, where the entry may legitimately name either the OLD or the
+   already-repointed NEW location. */
+static int kf_marker_verify_kf_key_at_slot(SlotcaskKfHandle *kh,
+        size_t expected_slot, const MarkerRecord *record,
+        const char *data_dir) {
+    uint8_t flag, stream_id;
+    uint16_t file_id;
+    uint32_t offset;
+    size_t found_slot;
+    if (!kh || !record ||
+        kf_lookup_with_slot(kh, record->hash, record->key, record->klen,
+                            data_dir, &flag, &stream_id, &file_id, &offset,
+                            &found_slot) != 0 ||
+        found_slot != expected_slot || flag != 1) {
         errno = EILSEQ;
         return -1;
     }
@@ -3912,7 +3944,11 @@ static int kf_marker_replay_upsert_entry_locked(const char *eff_root, const char
     if (marker->has_old) {
         /* Update: repoint to new record. */
         size_t slot = (size_t)marker->kf_slot;
-        if (marker->kf_slot >= kh->capacity) {
+        if (marker->kf_slot >= kh->capacity ||
+            kf_marker_verify_kf_key_at_slot(kh, slot, &new_rec, data_dir) != 0) {
+            /* The slot must still hold THIS key (at its old or new
+               location); anything else means the marker's slot number is
+               stale and must not be written. */
             step3_rc = -1;
         } else {
             kf_repoint_at_slot(kh, slot, marker->new_stream_id,
@@ -4680,6 +4716,11 @@ static int seg_write_flag_durable(const char *data_dir, uint8_t stream_id,
 
     seg_path_for(path, data_dir, stream_id, file_id);
     if (segcache_acquire(&h, path, 0, 0, 1) != 0) return -1;
+    if ((size_t)offset + 19 > h.map_size) {
+        segcache_release(&h);
+        errno = EILSEQ;
+        return -1;
+    }
     __atomic_store_n(&h.map[offset + 18], flag, __ATOMIC_RELEASE);
     if (h.slot >= 0) {
         SegCacheEntry *entry = &g_segcache[h.slot];
@@ -12399,8 +12440,23 @@ int slotcask_bmfix_clear(const char *data_dir) {
    for the rebuild duration; bypassed (silently) for shards that fail to
    acquire. Used by cmd_vacuum so the user-visible "orphaned" count drops
    to 0 after vacuum (matching pre-kf-derived-counts behavior). */
-int slotcask_compact_kf(SlotcaskDb *db) {
+int slotcask_compact_kf(SlotcaskDb *db, int *out_skipped) {
+    if (out_skipped) *out_skipped = 0;
     if (!db || db->num_shards <= 0) return -1;
+    /* A retained KFM2 marker names kf slot numbers; compaction moves live
+       entries to new slots, so replaying the marker afterwards would repoint
+       the wrong slot (AUD-VAC-KF-MARKER). Skip until the markers resolve:
+       the next write to the shard or a restart replays them. An unreadable
+       marker directory also skips (fail closed). */
+    int pend = object_has_pending_markers(db->data_dir);
+    if (pend != 0) {
+        LOG_WARN(LOG_SUB_SLOTCASK, pend < 0
+                 ? "kf compaction skipped: marker directory unreadable (%s)"
+                 : "kf compaction skipped: pending KFM2 markers%s",
+                 pend < 0 ? strerror(errno) : "");
+        if (out_skipped) *out_skipped = 1;
+        return 0;
+    }
     for (int s = 0; s < db->num_shards; s++) {
         char kf_path[PATH_MAX];
         kf_path_for(kf_path, db->data_dir, s);

@@ -398,7 +398,7 @@ int  slotcask_bucket_for(uint32_t capacity, int max_slot_size);
    shards. Used by cmd_vacuum so the kf-derived "orphaned" counter drops
    to 0 (matching the pre-kf-derived behavior of the legacy text counts
    file). Holds each shard's wrlock for the rebuild duration. */
-int  slotcask_compact_kf(SlotcaskDb *db);
+int  slotcask_compact_kf(SlotcaskDb *db, int *out_skipped);
 
 /* Path of the bitmap file for (object, field, kf shard) as used by the bulk chain commit flush.
    Must equal bm_build_path() for the same inputs. Exposed for tests. */

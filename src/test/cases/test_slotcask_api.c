@@ -79,7 +79,7 @@ static int test_slotcask_api_run(void) {
         ret = slotcask_upsert_with_hooks(&db, -1, k3, 4, v3, 4, &update_only, NULL);
     ASSERT_EQ_INT(ret, 0, "bulk_update existing");
 
-    ret = slotcask_compact_kf(&db);
+    ret = slotcask_compact_kf(&db, NULL);
     ASSERT_EQ_INT(ret, 0, "compact_kf");
 
     int dropped = 0;
