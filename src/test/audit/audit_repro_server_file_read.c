@@ -9,7 +9,7 @@
  * read back with "keys".
  *
  * Contract asserted: a low-privilege token cannot make the server read an
- * arbitrary local file. Expected today: FAILS. Passes once the Phase 4 fix
+ * arbitrary local file. Regression case (fixed; formerly failed). Passes once the Phase 4 fix
  * lands. Audit case: excluded from default run-all (--include-audit).
  */
 #ifndef _GNU_SOURCE
@@ -112,4 +112,4 @@ static int audit_repro_server_file_read_run(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-TEST_REGISTER_AUDIT("audit-repro-server-file-read", audit_repro_server_file_read_run)
+TEST_REGISTER("test-server-file-paths-admin-only", audit_repro_server_file_read_run)

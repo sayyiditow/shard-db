@@ -8,9 +8,9 @@
  * vacuum, back up and restore objects.
  *
  * Contract asserted: an unauthenticated text-protocol request is refused
- * and changes nothing. Expected today: FAILS (get returns the record and
+ * and changes nothing. Regression case (fixed; formerly failed) (get returns the record and
  * truncate empties the object). Passes once the Phase 4 fix lands.
- * Audit case: excluded from default run-all; run with --include-audit.
+ * Runs in the default suite.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -116,4 +116,4 @@ static int audit_repro_text_protocol_auth_run(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-TEST_REGISTER_AUDIT("audit-repro-text-protocol-auth", audit_repro_text_protocol_auth_run)
+TEST_REGISTER("test-text-protocol-auth", audit_repro_text_protocol_auth_run)
