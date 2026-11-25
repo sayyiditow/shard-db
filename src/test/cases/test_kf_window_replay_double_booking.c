@@ -57,6 +57,34 @@ static void kr_close(KrDb *w) {
     shard_test_ctl_reset();
 }
 
+/* Indexed-shape no-op hooks: has_indexed_fields routes the write through
+   the window coordinator (marker + K phase) without a real index. */
+static int kr_prepare(SlotcaskBulkRec *r, const size_t *a, size_t n, void *c,
+                      void **ws) {
+    (void)r; (void)a; (void)n; (void)c;
+    *ws = NULL;
+    return 0;
+}
+static int kr_apply(SlotcaskBulkRec *r, const size_t *a, size_t n, void *c,
+                    void *ws) {
+    (void)r; (void)a; (void)n; (void)c; (void)ws;
+    return 0;
+}
+
+static int kr_upsert(KrDb *w, uint64_t key, int shard) {
+    char v[8] = "replay";
+    SlotcaskBulkRec rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.key = &key; rec.klen = sizeof(key);
+    rec.value = v;  rec.vlen = 6;
+    SlotcaskBulkOpts o;
+    memset(&o, 0, sizeof(o));
+    o.has_indexed_fields = 1;
+    o.prepare_window = kr_prepare;
+    o.apply_window   = kr_apply;
+    return slotcask_bulk_upsert_in_kfshard(&w->db, shard, &rec, 1, &o);
+}
+
 static int test_kf_window_replay_double_booking(void) {
     KrDb w;
     ASSERT_EQ_INT(kr_open(&w), 0, "open db");
