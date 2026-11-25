@@ -532,6 +532,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/audit/audit_fault_inject.c \
     src/test/audit/audit_craft_grave_frontier.c \
     src/test/audit/audit_gate_resplit_bitmap.c \
+    src/test/audit/audit_repro_resplit_msync.c \
     src/db/util.c \
     src/db/durability.c \
     src/db/durability_epoch.c \
