@@ -34,6 +34,7 @@ esac
 #             error (baked-in strictness: no env options needed at the gate).
 #   tsan    - -O1 -g -fsanitize=thread        -fno-omit-frame-pointer
 #   debug   - -O0 -g (no sanitizers; just for stepping in gdb)
+#   lint    - audit triage build: -Wall -Wextra -Wconversion -Wshadow, no -Wno-*
 # The sanitizer modes use -O1 (not -O2) because aggressive optimisation
 # sometimes hides the very bugs the sanitizer is meant to find.
 # Common warning flags: -Wall -Wextra catch a wide net of real bugs (typos
@@ -98,8 +99,19 @@ case "$BUILD_MODE" in
         MODE_LDFLAGS="--coverage"
         DO_STRIP=0
         ;;
+    lint)
+        # Audit-only: a stricter warning set for triage (docs/plans/
+        # 2026-11-19-audit-campaign.md, Phase 1 step 1). Drops the -Wno-*
+        # suppressions and adds -Wconversion/-Wshadow; the deliberate
+        # big-endian narrowing makes -Wconversion noisy, so triage is by
+        # class x file, not zero-warning. Never used for shipping builds.
+        SKIP_TESTS=1
+        MODE_CFLAGS="-O1 -g -fno-PIE -no-pie -Wall -Wextra -Wconversion -Wshadow"
+        MODE_LDFLAGS="-no-pie"
+        DO_STRIP=0
+        ;;
     *)
-        echo "build.sh: unknown BUILD_MODE=$BUILD_MODE (release|asan|tsan|debug|coverage)" >&2
+        echo "build.sh: unknown BUILD_MODE=$BUILD_MODE (release|asan|tsan|debug|coverage|lint)" >&2
         exit 1
         ;;
 esac

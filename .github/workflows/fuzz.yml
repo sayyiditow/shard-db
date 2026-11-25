@@ -68,6 +68,8 @@ jobs:
 
       - name: Fuzz fuzz_frame (request framing loop) (FUZZ_TIME=${{ env.FUZZ_TIME }}s)
         run: ./fuzz/build/fuzz_frame -max_total_time=${{ env.FUZZ_TIME }} -print_final_stats=1 fuzz/corpora/frame/
+      - name: Fuzz fuzz_export (export / get-file re-parse) (FUZZ_TIME=${{ env.FUZZ_TIME }}s)
+        run: ./fuzz/build/fuzz_export -max_total_time=${{ env.FUZZ_TIME }} -print_final_stats=1 fuzz/corpora/export/
 
       - name: Upload crash artifacts (if any)
         if: failure()

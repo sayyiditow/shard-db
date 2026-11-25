@@ -171,6 +171,29 @@ clang $CFLAGS $INC \
     src/db/tls.c \
     -lpthread $ATOMIC_LD -latomic -lssl -lcrypto
 
+# fuzz_export: export / get-file response re-parse steps (server.c via
+# #include, same link set as fuzz_frame).
+echo "==> fuzz_export"
+clang $CFLAGS $INC \
+    -o "$OUT/fuzz_export" \
+    fuzz/fuzz_export.c \
+    src/db/nql.c src/db/embedded.c \
+    src/db/util.c src/db/keyset.c src/db/query.c \
+    src/db/query_find.c src/db/query_aggregate.c src/db/query_join.c \
+    src/db/query_plan.c src/db/query_bulk.c src/db/query_maint.c \
+    src/db/query_schema.c src/db/type_desc.c \
+    src/db/config.c src/db/storage.c src/db/index.c src/db/btree.c \
+    src/db/objlock.c src/db/parallel.c src/db/slotcask.c src/db/simd.c \
+    src/db/io_direct.c \
+    src/db/bitmap.c src/db/trigram.c \
+    src/db/durability.c src/db/durability_epoch.c \
+    src/db/typed_row.c src/db/typed_index.c src/db/typed_read_command.c \
+    src/db/typed_bulk_insert.c src/db/packed_record.c src/db/decnum.c \
+    src/db/agg_exact.c src/db/scalar_grammar.c src/db/schema_wire.c \
+    src/db/decimal_order.c src/db/packed_csv_command.c \
+    src/db/tls.c \
+    -lpthread $ATOMIC_LD -latomic -lssl -lcrypto
+
 echo
 echo "Built fuzzers in $OUT/:"
 ls -la "$OUT"
