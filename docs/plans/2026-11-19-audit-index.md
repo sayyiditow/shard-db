@@ -698,3 +698,68 @@ timeout under all-core load; the case passes solo (61/61) and neither it nor
 its inputs are touched by the tooling branch (`git diff main` touches only
 test-infra files). Recorded as AUD-CI-1 family evidence (fixed bounded waits
 vs load); flagged for the same Phase-4 fix branch.
+
+## Phase 1 steps 1-2 — lint + static analyzers (2026-11-25)
+
+- `BUILD_MODE=lint` added to `build.sh` (audit-only, never shipped).
+  584 unique warnings; dispositioned by class in
+  `docs/plans/audit-artifacts/lint-triage.md` (sign-conversion/conversion/
+  shadow/unused = benign-by-design; maybe-uninitialized = false positive).
+- gcc `-fanalyzer` + clang-tidy on util/config/server (+ clang-analyzer on
+  nql/schema_wire/query_bulk). Two unchecked mallocs fixed in place
+  (config.c typed field decode, server.c worker table).
+- **AUD-BULK-OOM (minor, not DL; bulk-insert slice):** `query_bulk.c`
+  `arena_new`/`calloc(records)`/`arena_alloc` results are used unchecked in
+  both bulk-insert parsers (1678, 2444 and the arena_alloc sites): an
+  allocation failure crashes the daemon instead of returning an error.
+  No test for allocation-failure paths exists (also listed under the
+  existing no-alloc-failure-test gap).
+- **AUD-BULK-DEL-K (minor, bulk slice; found by the Opus blind review of
+  AUD-QRY-11):** `bulk_apply_and_sync_kf_locked`'s delete branch is not
+  idempotent on K re-entry: `kf_tombstone_entry_locked` returns -1 when the
+  key's slot is already tombstoned, so a delete window whose first K
+  tombstoned and then failed msync fails again on the inline replay
+  (rc -2 / durability degraded; the marker gate finishes it). Counters stay
+  correct. Fix: treat "slot already flag==2 at the expected old slot" as
+  done on re-entry; add a delete variant of the K-failure test.
+- **AUD-BULK-DEFER-CONT (minor, bulk slice):** `slotcask_bulk_finalize_shard`
+  continues to later windows after one window failed finalize twice;
+  correctness rests on the gate replay's lookup-based recovery. No
+  counter corruption found; no test covers it.
+- AUD-QRY-11 test gap: only the legacy window path is covered, not the
+  deferred `bulk_finalize_one_kf_window` retry.
+- Needs-look rows for the dispatch/auth slice: 60x `cert-err34-c`
+  (atoi/strtol without error checks) in config.c/util.c; nql.c `ferr`
+  branch warnings.
+
+## Phase 1 step 3 — export-path fuzz (2026-11-25)
+
+`fuzz_export` added (build.sh, README, fuzz.yml, seed corpus
+`fuzz/corpora/export/`): the export / get-file response re-parse steps
+(walk_string_array, walk_object_array, field_obj_to_spec, get-file
+`"data"` + b64_decode). 60 s smoke: 2.29M execs, no findings. The
+`query_collect` socket round-trip itself is not fuzzed (the responses
+come from the daemon's own server). Step 3 is now complete except the
+plateau runs, which are the human's/CI's wall time.
+
+## Phase 1 step 8 — code-reduction candidates (2026-11-25)
+
+Artifact: `docs/plans/audit-artifacts/code-reduction-candidates.md`.
+**AUD-REDUCE-1 (refactor, Phase 4 lane):** 31 caller-less functions
+(~560 lines; recovery-adjacent ones held), duplication hot spots in
+`query_bulk.c` and `slotcask.c` (hold until oracle-covered), size hotspots
+listed. No code deleted.
+
+## Phase 1 leftovers executed (2026-11-25)
+
+- **AUD-QRY-11 (major, not DL): EXECUTED.** `kf_commit_planned_slot` is now
+  idempotent for an already-committed slot (same hash + location). New case
+  `test-kf-window-replay-double-booking` (in-process, legacy window path, one
+  K failure): red on base (total 2 vs 1; reuse live 2 vs 1), green fixed.
+  Full suite 714/0. Sanitizer gate: covered by the single pre-push run.
+- **AUD-RES-1 (major): EXECUTED.** `read_list` frees the partial IN-list on
+  every error path. New case `test-nql-filter-parse-error-leak`
+  (mallinfo2 growth; also an LSan signal under the asan gate): red on base
+  (704,000 bytes over 4000 parses), green fixed (0). Replaying
+  `AUD-RES-1-leak-input.bin` through `fuzz_frame` is the original repro.
+- AGENTS.md bench note updated (12 registered benches).

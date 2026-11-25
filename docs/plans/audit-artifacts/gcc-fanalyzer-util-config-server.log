@@ -1,0 +1,932 @@
+src/db/config.c: In function ‘typed_get_field_str’:
+src/db/config.c:4373:9: warning: use of possibly-NULL ‘out’ where non-null expected [CWE-690] [-Wanalyzer-possible-null-argument]
+ 4373 |         memcpy(out, p + 2, slen);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~
+  ‘typed_get_field_str’: events 1-8
+    │
+    │ 4333 | char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
+    │      |       ^~~~~~~~~~~~~~~~~~~
+    │      |       |
+    │      |       (1) entry to ‘typed_get_field_str’
+    │ 4334 |                            int data_len, int field_idx, uint8_t hdr2) {
+    │ 4335 |     if (!ts || field_idx < 0 || field_idx >= ts->nfields) return NULL;
+    │      |        ~
+    │      |        |
+    │      |        (2) following ‘false’ branch... ─>─┐
+    │      |                                           │
+    │      |                                           │
+    │      |┌──────────────────────────────────────────┘
+    │ 4336 |│    const TypedField *f = &ts->fields[field_idx];
+    │      |│                      ~
+    │      |│                      |
+    │      |└─────────────────────>(3) ...to here
+    │ 4337 |     if (f->removed) return NULL;
+    │      |        ~
+    │      |        |
+    │      |        (4) following ‘false’ branch... ─>─┐
+    │      |                                           │
+    │      |                                           │
+    │      |┌──────────────────────────────────────────┘
+    │ 4338 |│
+    │ 4339 |│    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
+    │      |│                   ~~~~~
+    │      |│                   |
+    │      |└──────────────────>(5) ...to here
+    │ 4340 |     int bm_bytes = 0; size_t field_region_len = 0;
+    │ 4341 |     if (data_len < 0 ||
+    │      |        ~
+    │      |        |
+    │      |        (6) following ‘false’ branch (when ‘data_len >= 0’)... ─>─┐
+    │      |                                                                  │
+    │      |                                                                  │
+    │      |┌─────────────────────────────────────────────────────────────────┘
+    │ 4342 |│        typed_record_view(data, (size_t)data_len, hdr2, &fbase, &bm,
+    │      |│        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |│        |
+    │      |└───────>(7) ...to here
+    │      |         (8) calling ‘typed_record_view’ from ‘typed_get_field_str’
+    │ 4343 |                           &bm_bytes, &field_region_len) != 0) {
+    │      |                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │
+    └──> ‘typed_record_view’: events 9-10
+           │
+           │ 4272 | int typed_record_view(const uint8_t *value, size_t vlen, uint8_t hdr2,
+           │      |     ^~~~~~~~~~~~~~~~~
+           │      |     |
+           │      |     (9) entry to ‘typed_record_view’
+           │......
+           │ 4275 |     if (!value || !out_base || !out_bm || !out_bm_bytes || !out_region)
+           │      |        ~
+           │      |        |
+           │      |        (10) following ‘false’ branch... ─>─┐
+           │      |                                            │
+           │
+         ‘typed_record_view’: events 11-12
+           │
+           │      |                                            │
+           │      |┌───────────────────────────────────────────┘
+           │ 4277 |│    *out_bm = NULL; *out_bm_bytes = 0;
+           │      |│            ^
+           │      |│            |
+           │      |└───────────>(11) ...to here
+           │ 4278 |     if (hdr2 & ~SREC_FLAG_NULLMAP) return -1;
+           │      |        ~     
+           │      |        |
+           │      |        (12) following ‘false’ branch (when ‘hdr2 <= 1’)... ─>─┐
+           │      |                                                               │
+           │
+         ‘typed_record_view’: events 13-15
+           │
+           │      |                                                               │
+           │      |┌──────────────────────────────────────────────────────────────┘
+           │ 4278 |│    if (hdr2 & ~SREC_FLAG_NULLMAP) return -1;
+           │      |│       ^
+           │      |│       |
+           │      |└──────>(13) ...to here
+           │ 4279 |     if (!(hdr2 & SREC_FLAG_NULLMAP)) {
+           │      |        ~
+           │      |        |
+           │      |        (14) following ‘true’ branch... ─>─┐
+           │      |                                           │
+           │      |                                           │
+           │      |┌──────────────────────────────────────────┘
+           │ 4280 |│        *out_base = value; *out_region = vlen; return 0;
+           │      |│        ~~~~~~~~~~~~~~~~~
+           │      |│                  |
+           │      |└─────────────────>(15) ...to here
+           │
+    <──────┘
+    │
+  ‘typed_get_field_str’: events 16-17
+    │
+    │ 4341 |     if (data_len < 0 ||
+    │      |         ~~~~~~~~~~~~~~~
+    │      |                      |
+    │      |                      (17) following ‘false’ branch... ─>─┐
+    │      |                                                          │
+    │      |                                                          │
+    │      |┌─────────────────────────────────────────────────────────┘
+    │ 4342 |│        typed_record_view(data, (size_t)data_len, hdr2, &fbase, &bm,
+    │      |│        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |│        |
+    │      |│        (16) returning to ‘typed_get_field_str’ from ‘typed_record_view’
+    │ 4343 |│                          &bm_bytes, &field_region_len) != 0) {
+    │      |│                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │
+  ‘typed_get_field_str’: events 18-19
+    │
+    │ 4341 |     if (data_len < 0 ||
+    │      |         ~~~~~~~~~~~~~^~
+    │      |                      |
+    │      |└────────────────────>(18) ...to here
+    │ 4342 |         typed_record_view(data, (size_t)data_len, hdr2, &fbase, &bm,
+    │      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │ 4343 |                           &bm_bytes, &field_region_len) != 0) {
+    │      |                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │......
+    │ 4351 |     if (typed_field_null(bm, bm_bytes, field_idx)) return NULL;
+    │      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |         |
+    │      |         (19) calling ‘typed_field_null’ from ‘typed_get_field_str’
+    │
+    └──> ‘typed_field_null’: events 20-21
+           │
+           │src/db/types.h:269:19:
+           │  269 | static inline int typed_field_null(const uint8_t *bm, int bm_bytes, int i) {
+           │      |                   ^~~~~~~~~~~~~~~~
+           │      |                   |
+           │      |                   (20) entry to ‘typed_field_null’
+           │  270 |     if (!bm || i < 0 || (i >> 3) >= bm_bytes) return 0;
+           │      |        ~           
+           │      |        |
+           │      |        (21) following ‘true’ branch... ─>─┐
+           │      |                                           │
+           │
+         ‘typed_field_null’: event 22
+           │
+           │      |                                           │
+           │      |┌──────────────────────────────────────────┘
+           │  270 |│    if (!bm || i < 0 || (i >> 3) >= bm_bytes) return 0;
+           │      |│       ^
+           │      |│       |
+           │      |└──────>(22) ...to here
+           │
+    <──────┘
+    │
+  ‘typed_get_field_str’: event 23
+    │
+    │src/db/config.c:4351:9:
+    │ 4351 |     if (typed_field_null(bm, bm_bytes, field_idx)) return NULL;
+    │      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |         |
+    │      |         (23) returning to ‘typed_get_field_str’ from ‘typed_field_null’
+    │
+  ‘typed_get_field_str’: events 24-29
+    │
+    │ 4351 |     if (typed_field_null(bm, bm_bytes, field_idx)) return NULL;
+    │      |        ^
+    │      |        |
+    │      |        (24) following ‘false’ branch... ─>─┐
+    │      |                                            │
+    │......
+    │      |                                            │
+    │      |┌───────────────────────────────────────────┘
+    │ 4358 |│    const uint8_t *src = ((size_t)f->offset + (size_t)f->size > field_region_len)
+    │      |│                                  ~~~~~~~~~
+    │      |│                                   |
+    │      |└──────────────────────────────────>(25) ...to here
+    │......
+    │ 4365 |     switch (f->type) {
+    │      |     ~~~~~~
+    │      |     |
+    │      |     (26) following ‘case 1:’ branch... ─>─┐
+    │      |                                           │
+    │      |                                           │
+    │      |┌──────────────────────────────────────────┘
+    │ 4366 |│    case FT_VARCHAR: {
+    │      |│    ~~~~
+    │      |│    |
+    │      |└───>(27) ...to here
+    │......
+    │ 4371 |         if (slen == 0) return render_zeros ? strdup("") : NULL;
+    │      |            ~
+    │      |            |
+    │      |            (28) following ‘false’ branch... ─>─┐
+    │      |                                                │
+    │      |                                                │
+    │      |┌───────────────────────────────────────────────┘
+    │ 4372 |│        char *out = malloc(slen + 1);
+    │      |│                           ~~~~~~~~
+    │      |│                                |
+    │      |└───────────────────────────────>(29) ...to here
+    │
+  ‘typed_get_field_str’: events 30-31
+    │
+    │ 4372 |         char *out = malloc(slen + 1);
+    │      |                     ^~~~~~~~~~~~~~~~
+    │      |                     |
+    │      |                     (30) this call could return NULL
+    │ 4373 |         memcpy(out, p + 2, slen);
+    │      |         ~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |         |
+    │      |         (31) ⚠️  argument 1 (‘out’) from (30) could be NULL where non-null expected
+    │
+In file included from src/db/types.h:9,
+                 from src/db/schema_wire.h:3,
+                 from src/db/config.c:1:
+/usr/include/string.h:47:14: note: argument 1 of ‘memcpy’ must be non-null
+   47 | extern void *memcpy (void *__restrict __dest, const void *__restrict __src,
+      |              ^~~~~~
+src/db/config.c: In function ‘cmd_remove_fields’:
+src/db/config.c:4979:9: warning: use of uninitialized value ‘rd_line’ [CWE-457] [-Wanalyzer-use-of-uninitialized-value]
+ 4979 |         memcpy(lines[nlines], rd_line, strlen(rd_line) + 1);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  ‘cmd_remove_fields’: events 1-2
+    │
+    │ 4945 | int cmd_remove_fields(const char *db_root, const char *object,
+    │      |     ^~~~~~~~~~~~~~~~~
+    │      |     |
+    │      |     (1) entry to ‘cmd_remove_fields’
+    │ 4946 |                       char names[][256], int nnames) {
+    │ 4947 |     if (nnames <= 0) {
+    │      |        ~
+    │      |        |
+    │      |        (2) following ‘false’ branch (when ‘nnames > 0’)... ─>─┐
+    │      |                                                               │
+    │
+  ‘cmd_remove_fields’: events 3-5
+    │
+    │      |                                                               │
+    │      |┌──────────────────────────────────────────────────────────────┘
+    │ 4947 |│    if (nnames <= 0) {
+    │      |│       ^
+    │      |│       |
+    │      |└──────>(3) ...to here
+    │......
+    │ 4951 |     for (int i = 0; i < nnames; i++) {
+    │      |                     ~~~~~~~~~~
+    │      |                       |
+    │      |                       (4) following ‘true’ branch (when ‘i < nnames’)... ─>─┐
+    │      |                                                                             │
+    │      |                                                                             │
+    │      |┌────────────────────────────────────────────────────────────────────────────┘
+    │ 4952 |│        if (!valid_field_name(names[i])) {
+    │      |│                                   ~
+    │      |│                                   |
+    │      |└──────────────────────────────────>(5) ...to here
+    │
+  ‘cmd_remove_fields’: event 6
+    │
+    │ 4952 |         if (!valid_field_name(names[i])) {
+    │      |            ^
+    │      |            |
+    │      |            (6) following ‘false’ branch... ─>─┐
+    │      |                                               │
+    │
+  ‘cmd_remove_fields’: events 7-10
+    │
+    │      |                                               │
+    │      |┌──────────────────────────────────────────────┘
+    │ 4951 |│    for (int i = 0; i < nnames; i++) {
+    │      |│                                ~^~
+    │      |│                                 |
+    │      |└────────────────────────────────>(7) ...to here
+    │......
+    │ 4961 |     if (!f) {
+    │      |        ~                          
+    │      |        |
+    │      |        (8) following ‘false’ branch (when ‘f’ is non-NULL)... ─>─┐
+    │      |                                                                  │
+    │......
+    │      |                                                                  │
+    │      |┌─────────────────────────────────────────────────────────────────┘
+    │ 4967 |│        calloc(MAX_FIELDS, MAX_FIELD_DEF);
+    │      |│        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |│        |
+    │      |└───────>(9) ...to here
+    │ 4968 |     if (!lines) {
+    │      |        ~                          
+    │      |        |
+    │      |        (10) following ‘false’ branch... ─>─┐
+    │      |                                            │
+    │
+  ‘cmd_remove_fields’: event 11
+    │
+    │      |                                            │
+    │      |┌───────────────────────────────────────────┘
+    │ 4968 |│    if (!lines) {
+    │      |│       ^
+    │      |│       |
+    │      |└──────>(11) ...to here
+    │
+  ‘cmd_remove_fields’: events 12-14
+    │
+    │ 4975 |     while (nlines < MAX_FIELDS) {
+    │ 4976 |         int e = 0;
+    │      |             ~      
+    │      |             |
+    │      |└───────────>(13) ...to here
+    │ 4977 |         char *rd_line = conf_read_line(f, MAX_FIELD_DEF, &e);
+    │      |                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |                         |
+    │      |                         (14) calling ‘conf_read_line’ from ‘cmd_remove_fields’
+    │
+    └──> ‘conf_read_line’: events 15-16
+           │
+           │ 1773 | char *conf_read_line(FILE *fp, size_t max_len, int *err) {
+           │      |       ^~~~~~~~~~~~~~
+           │      |       |
+           │      |       (15) entry to ‘conf_read_line’
+           │ 1774 |     if (err) *err = 0;
+           │      |        ~
+           │      |        |
+           │      |        (16) following ‘true’ branch (when ‘err’ is non-NULL)... ─>─┐
+           │      |                                                                    │
+           │
+         ‘conf_read_line’: events 17-18
+           │
+           │      |                                                                    │
+           │      |┌───────────────────────────────────────────────────────────────────┘
+           │ 1774 |│    if (err) *err = 0;
+           │      |│             ~~~~~^~~
+           │      |│                  |
+           │      |└─────────────────>(17) ...to here
+           │......
+           │ 1777 |     if (!buf) { if (err) *err = ENOMEM; return NULL; }
+           │      |        ~           
+           │      |        |
+           │      |        (18) following ‘false’ branch (when ‘buf’ is non-NULL)... ─>─┐
+           │      |                                                                     │
+           │
+         ‘conf_read_line’: events 19-21
+           │
+           │      |                                                                     │
+           │      |┌────────────────────────────────────────────────────────────────────┘
+           │ 1777 |│    if (!buf) { if (err) *err = ENOMEM; return NULL; }
+           │      |│       ^
+           │      |│       |
+           │      |└──────>(19) ...to here
+           │ 1778 |     for (;;) {
+           │ 1779 |         if (cap - len < 2 || len >= max_len) {
+           │      |            ~
+           │      |            |
+           │      |            (20) following ‘false’ branch... ─>─┐
+           │      |                                                │
+           │......
+           │      |                                                │
+           │      |┌───────────────────────────────────────────────┘
+           │ 1792 |│        if (!fgets(buf + len, (int)(cap - len), fp)) {
+           │      |│                                   ~~~~~~~~~~~
+           │      |│                                        |
+           │      |└───────────────────────────────────────>(21) ...to here
+           │
+         ‘conf_read_line’: events 22-31
+           │
+           │ 1780 |             if (len >= max_len) {
+           │      |                ~
+           │      |                |
+           │      |                (26) following ‘false’ branch (when ‘len < max_len’)... ─>─┐
+           │      |                                                                           │
+           │......
+           │      |                                                                           │
+           │      |┌──────────────────────────────────────────────────────────────────────────┘
+           │ 1787 |│            char *nb = realloc(buf, cap * 2);
+           │      |│                       ~~~~~~~~~~~~~~~~~~~~~
+           │      |│                       |
+           │      |└──────────────────────>(27) ...to here
+           │      |                        (28) when ‘realloc’ succeeds, moving buffer
+           │      |                        (29) region created on heap here
+           │      |                        (30) capacity: 1024 bytes
+           │ 1788 |             if (!nb) { free(buf); if (err) *err = ENOMEM; return NULL; }
+           │      |                ~
+           │      |                |
+           │      |                (31) following ‘false’ branch (when ‘nb’ is non-NULL)... ─>─┐
+           │      |                                                                            │
+           │......
+           │      |                                                                            │
+           │      |┌───────────────────────────────────────────────────────────────────────────┘
+           │ 1792 |│        if (!fgets(buf + len, (int)(cap - len), fp)) {
+           │      |│           ^
+           │      |│           |
+           │      |│           (22) following ‘false’ branch... ─>─┐
+           │      |│                                               │
+           │......
+           │      |│                                               │
+           │      |┌───────────────────────────────────────────────┘
+           │ 1802 |│        size_t chunk = strlen(buf + len);
+           │      |│                       ~~~~~~~~~~~~~~~~~
+           │      |│                       |
+           │      |└──────────────────────>(23) ...to here
+           │ 1803 |         char *nl = memchr(buf + len, '\n', chunk);
+           │ 1804 |         if (nl) {
+           │      |            ~
+           │      |            |
+           │      |            (24) following ‘false’ branch (when ‘nl’ is NULL)... ─>─┐
+           │      |                                                                    │
+           │......
+           │      |                                                                    │
+           │      |┌───────────────────────────────────────────────────────────────────┘
+           │ 1813 |│        len += chunk;
+           │      |│        ~~~~~~~~~~~~
+           │      |│            |
+           │      |└───────────>(25) ...to here
+           │
+         ‘conf_read_line’: events 32-37
+           │
+           │ 1792 |         if (!fgets(buf + len, (int)(cap - len), fp)) {
+           │      |                                    ~~~~~^~~~~~
+           │      |                                         |
+           │      |└───────────────────────────────────────>(32) ...to here
+           │ 1793 |             if (ferror(fp)) { int e = errno; free(buf); if (err) *err = e; return NULL; }
+           │      |                ~                         
+           │      |                |
+           │      |                (33) following ‘false’ branch... ─>─┐
+           │      |                                                    │
+           │      |                                                    │
+           │      |┌───────────────────────────────────────────────────┘
+           │ 1794 |│            if (len == 0) { free(buf); return NULL; }   /* clean EOF */
+           │      |│               ~                         
+           │      |│               |
+           │      |└──────────────>(34) ...to here
+           │      |                (35) following ‘false’ branch (when ‘len != 0’)... ─>─┐
+           │      |                                                                      │
+           │      |                                                                      │
+           │      |┌─────────────────────────────────────────────────────────────────────┘
+           │ 1795 |│            if (len >= max_len) {                       /* unterminated over-cap final line */
+           │      |│               ~                         
+           │      |│               |
+           │      |└──────────────>(36) ...to here
+           │      |                (37) following ‘false’ branch (when ‘len < max_len’)... ─>─┐
+           │      |                                                                           │
+           │
+         ‘conf_read_line’: event 38
+           │
+           │      |                                                                           │
+           │      |┌──────────────────────────────────────────────────────────────────────────┘
+           │ 1795 |│            if (len >= max_len) {                       /* unterminated over-cap final line */
+           │      |│               ^
+           │      |│               |
+           │      |└──────────────>(38) ...to here
+           │
+    <──────┘
+    │
+  ‘cmd_remove_fields’: events 39-41
+    │
+    │ 4977 |         char *rd_line = conf_read_line(f, MAX_FIELD_DEF, &e);
+    │      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |                         |
+    │      |                         (39) returning to ‘cmd_remove_fields’ from ‘conf_read_line’
+    │ 4978 |         if (!rd_line) { rderr = e; break; }
+    │      |            ~             
+    │      |            |
+    │      |            (40) following ‘false’ branch (when ‘rd_line’ is non-NULL)... ─>─┐
+    │      |                                                                             │
+    │      |                                                                             │
+    │      |┌────────────────────────────────────────────────────────────────────────────┘
+    │ 4979 |│        memcpy(lines[nlines], rd_line, strlen(rd_line) + 1);
+    │      |│                                       ~~~~~~~~~~~~~~~
+    │      |│                                       |
+    │      |└──────────────────────────────────────>(41) ...to here
+    │
+  ‘cmd_remove_fields’: event 42
+    │
+    │ 4979 |         memcpy(lines[nlines], rd_line, strlen(rd_line) + 1);
+    │      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |         |
+    │      |         (42) ⚠️  use of uninitialized value ‘rd_line’ here
+    │
+src/db/config.c: In function ‘cmd_rename_field’:
+src/db/config.c:5088:9: warning: use of uninitialized value ‘rd_line’ [CWE-457] [-Wanalyzer-use-of-uninitialized-value]
+ 5088 |         memcpy(lines[nlines], rd_line, strlen(rd_line) + 1);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  ‘cmd_rename_field’: events 1-3
+    │
+    │ 5052 | int cmd_rename_field(const char *db_root, const char *object,
+    │      |     ^~~~~~~~~~~~~~~~
+    │      |     |
+    │      |     (1) entry to ‘cmd_rename_field’
+    │ 5053 |                      const char *old_name, const char *new_name) {
+    │ 5054 |     if (!valid_field_name(old_name) || !valid_field_name(new_name)) {
+    │      |        ~
+    │      |        |
+    │      |        (2) following ‘false’ branch... ─>─┐
+    │      |                                           │
+    │......
+    │      |                                           │
+    │      |┌──────────────────────────────────────────┘
+    │ 5058 |│    if (strcmp(old_name, new_name) == 0) {
+    │      |│        ~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |│        |
+    │      |└───────>(3) ...to here
+    │
+  ‘cmd_rename_field’: events 4-8
+    │
+    │ 5058 |     if (strcmp(old_name, new_name) == 0) {
+    │      |        ^
+    │      |        |
+    │      |        (4) following ‘false’ branch (when the strings are non-equal)... ─>─┐
+    │      |                                                                            │
+    │......
+    │      |                                                                            │
+    │      |┌───────────────────────────────────────────────────────────────────────────┘
+    │ 5064 |│    snprintf(fpath, sizeof(fpath), "%s/%s/fields.conf", db_root, object);
+    │      |│    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |│    |
+    │      |└───>(5) ...to here
+    │ 5065 |     FILE *f = fopen(fpath, "r");
+    │ 5066 |     if (!f) {
+    │      |        ~
+    │      |        |
+    │      |        (6) following ‘false’ branch (when ‘f’ is non-NULL)... ─>─┐
+    │      |                                                                  │
+    │......
+    │      |                                                                  │
+    │      |┌─────────────────────────────────────────────────────────────────┘
+    │ 5074 |│        calloc(MAX_FIELDS, MAX_FIELD_DEF);
+    │      |│        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |│        |
+    │      |└───────>(7) ...to here
+    │ 5075 |     if (!lines) {
+    │      |        ~
+    │      |        |
+    │      |        (8) following ‘false’ branch... ─>─┐
+    │      |                                           │
+    │
+  ‘cmd_rename_field’: event 9
+    │
+    │      |                                           │
+    │      |┌──────────────────────────────────────────┘
+    │ 5075 |│    if (!lines) {
+    │      |│       ^
+    │      |│       |
+    │      |└──────>(9) ...to here
+    │
+  ‘cmd_rename_field’: events 10-12
+    │
+    │ 5084 |     while (nlines < MAX_FIELDS) {
+    │ 5085 |         int e = 0;
+    │      |             ~      
+    │      |             |
+    │      |└───────────>(11) ...to here
+    │ 5086 |         char *rd_line = conf_read_line(f, MAX_FIELD_DEF, &e);
+    │      |                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |                         |
+    │      |                         (12) calling ‘conf_read_line’ from ‘cmd_rename_field’
+    │
+    └──> ‘conf_read_line’: events 13-14
+           │
+           │ 1773 | char *conf_read_line(FILE *fp, size_t max_len, int *err) {
+           │      |       ^~~~~~~~~~~~~~
+           │      |       |
+           │      |       (13) entry to ‘conf_read_line’
+           │ 1774 |     if (err) *err = 0;
+           │      |        ~
+           │      |        |
+           │      |        (14) following ‘true’ branch (when ‘err’ is non-NULL)... ─>─┐
+           │      |                                                                    │
+           │
+         ‘conf_read_line’: events 15-16
+           │
+           │      |                                                                    │
+           │      |┌───────────────────────────────────────────────────────────────────┘
+           │ 1774 |│    if (err) *err = 0;
+           │      |│             ~~~~~^~~
+           │      |│                  |
+           │      |└─────────────────>(15) ...to here
+           │......
+           │ 1777 |     if (!buf) { if (err) *err = ENOMEM; return NULL; }
+           │      |        ~           
+           │      |        |
+           │      |        (16) following ‘false’ branch (when ‘buf’ is non-NULL)... ─>─┐
+           │      |                                                                     │
+           │
+         ‘conf_read_line’: events 17-19
+           │
+           │      |                                                                     │
+           │      |┌────────────────────────────────────────────────────────────────────┘
+           │ 1777 |│    if (!buf) { if (err) *err = ENOMEM; return NULL; }
+           │      |│       ^
+           │      |│       |
+           │      |└──────>(17) ...to here
+           │ 1778 |     for (;;) {
+           │ 1779 |         if (cap - len < 2 || len >= max_len) {
+           │      |            ~
+           │      |            |
+           │      |            (18) following ‘false’ branch... ─>─┐
+           │      |                                                │
+           │......
+           │      |                                                │
+           │      |┌───────────────────────────────────────────────┘
+           │ 1792 |│        if (!fgets(buf + len, (int)(cap - len), fp)) {
+           │      |│                                   ~~~~~~~~~~~
+           │      |│                                        |
+           │      |└───────────────────────────────────────>(19) ...to here
+           │
+         ‘conf_read_line’: events 20-29
+           │
+           │ 1780 |             if (len >= max_len) {
+           │      |                ~
+           │      |                |
+           │      |                (24) following ‘false’ branch (when ‘len < max_len’)... ─>─┐
+           │      |                                                                           │
+           │......
+           │      |                                                                           │
+           │      |┌──────────────────────────────────────────────────────────────────────────┘
+           │ 1787 |│            char *nb = realloc(buf, cap * 2);
+           │      |│                       ~~~~~~~~~~~~~~~~~~~~~
+           │      |│                       |
+           │      |└──────────────────────>(25) ...to here
+           │      |                        (26) when ‘realloc’ succeeds, moving buffer
+           │      |                        (27) region created on heap here
+           │      |                        (28) capacity: 1024 bytes
+           │ 1788 |             if (!nb) { free(buf); if (err) *err = ENOMEM; return NULL; }
+           │      |                ~
+           │      |                |
+           │      |                (29) following ‘false’ branch (when ‘nb’ is non-NULL)... ─>─┐
+           │      |                                                                            │
+           │......
+           │      |                                                                            │
+           │      |┌───────────────────────────────────────────────────────────────────────────┘
+           │ 1792 |│        if (!fgets(buf + len, (int)(cap - len), fp)) {
+           │      |│           ^
+           │      |│           |
+           │      |│           (20) following ‘false’ branch... ─>─┐
+           │      |│                                               │
+           │......
+           │      |│                                               │
+           │      |┌───────────────────────────────────────────────┘
+           │ 1802 |│        size_t chunk = strlen(buf + len);
+           │      |│                       ~~~~~~~~~~~~~~~~~
+           │      |│                       |
+           │      |└──────────────────────>(21) ...to here
+           │ 1803 |         char *nl = memchr(buf + len, '\n', chunk);
+           │ 1804 |         if (nl) {
+           │      |            ~
+           │      |            |
+           │      |            (22) following ‘false’ branch (when ‘nl’ is NULL)... ─>─┐
+           │      |                                                                    │
+           │......
+           │      |                                                                    │
+           │      |┌───────────────────────────────────────────────────────────────────┘
+           │ 1813 |│        len += chunk;
+           │      |│        ~~~~~~~~~~~~
+           │      |│            |
+           │      |└───────────>(23) ...to here
+           │
+         ‘conf_read_line’: events 30-35
+           │
+           │ 1792 |         if (!fgets(buf + len, (int)(cap - len), fp)) {
+           │      |                                    ~~~~~^~~~~~
+           │      |                                         |
+           │      |└───────────────────────────────────────>(30) ...to here
+           │ 1793 |             if (ferror(fp)) { int e = errno; free(buf); if (err) *err = e; return NULL; }
+           │      |                ~                         
+           │      |                |
+           │      |                (31) following ‘false’ branch... ─>─┐
+           │      |                                                    │
+           │      |                                                    │
+           │      |┌───────────────────────────────────────────────────┘
+           │ 1794 |│            if (len == 0) { free(buf); return NULL; }   /* clean EOF */
+           │      |│               ~                         
+           │      |│               |
+           │      |└──────────────>(32) ...to here
+           │      |                (33) following ‘false’ branch (when ‘len != 0’)... ─>─┐
+           │      |                                                                      │
+           │      |                                                                      │
+           │      |┌─────────────────────────────────────────────────────────────────────┘
+           │ 1795 |│            if (len >= max_len) {                       /* unterminated over-cap final line */
+           │      |│               ~                         
+           │      |│               |
+           │      |└──────────────>(34) ...to here
+           │      |                (35) following ‘false’ branch (when ‘len < max_len’)... ─>─┐
+           │      |                                                                           │
+           │
+         ‘conf_read_line’: event 36
+           │
+           │      |                                                                           │
+           │      |┌──────────────────────────────────────────────────────────────────────────┘
+           │ 1795 |│            if (len >= max_len) {                       /* unterminated over-cap final line */
+           │      |│               ^
+           │      |│               |
+           │      |└──────────────>(36) ...to here
+           │
+    <──────┘
+    │
+  ‘cmd_rename_field’: events 37-39
+    │
+    │ 5086 |         char *rd_line = conf_read_line(f, MAX_FIELD_DEF, &e);
+    │      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |                         |
+    │      |                         (37) returning to ‘cmd_rename_field’ from ‘conf_read_line’
+    │ 5087 |         if (!rd_line) { rderr = e; break; }
+    │      |            ~             
+    │      |            |
+    │      |            (38) following ‘false’ branch (when ‘rd_line’ is non-NULL)... ─>─┐
+    │      |                                                                             │
+    │      |                                                                             │
+    │      |┌────────────────────────────────────────────────────────────────────────────┘
+    │ 5088 |│        memcpy(lines[nlines], rd_line, strlen(rd_line) + 1);
+    │      |│                                       ~~~~~~~~~~~~~~~
+    │      |│                                       |
+    │      |└──────────────────────────────────────>(39) ...to here
+    │
+  ‘cmd_rename_field’: event 40
+    │
+    │ 5088 |         memcpy(lines[nlines], rd_line, strlen(rd_line) + 1);
+    │      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |         |
+    │      |         (40) ⚠️  use of uninitialized value ‘rd_line’ here
+    │
+src/db/server.c: In function ‘cmd_server’:
+src/db/server.c:4011:57: warning: dereference of possibly-NULL ‘g_worker_cfds’ [CWE-690] [-Wanalyzer-possible-null-dereference]
+ 4011 |     for (int i = 0; i < nthreads; i++) g_worker_cfds[i] = -1;
+      |                                        ~~~~~~~~~~~~~~~~~^~~~
+  ‘cmd_server’: events 1-17
+    │
+    │ 3700 | int cmd_server(const char *db_root, int daemonize) {
+    │      |     ^~~~~~~~~~
+    │      |     |
+    │      |     (1) entry to ‘cmd_server’
+    │......
+    │ 3705 |     if (db_root_lock_acquire(db_root, &lock_fd) != 0) return 1;
+    │      |        ~
+    │      |        |
+    │      |        (2) following ‘false’ branch... ─>─┐
+    │      |                                           │
+    │      |                                           │
+    │      |┌──────────────────────────────────────────┘
+    │ 3706 |│
+    │ 3707 |│    char disk_version[64] = {0};
+    │      |│         ~~~~~~~~~~~~
+    │      |│         |
+    │      |└────────>(3) ...to here
+    │......
+    │ 3710 |     if (version_decision < 0) {
+    │      |        ~
+    │      |        |
+    │      |        (4) following ‘false’ branch (when ‘version_decision >= 0’)... ─>─┐
+    │      |                                                                          │
+    │......
+    │      |                                                                          │
+    │      |┌─────────────────────────────────────────────────────────────────────────┘
+    │ 3739 |│    g_shard_db_instance = shard_db_open_internal(db_root);
+    │      |│                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |│                          |
+    │      |└─────────────────────────>(5) ...to here
+    │ 3740 |     if (!g_shard_db_instance) {
+    │      |        ~
+    │      |        |
+    │      |        (6) following ‘false’ branch... ─>─┐
+    │      |                                           │
+    │......
+    │      |                                           │
+    │      |┌──────────────────────────────────────────┘
+    │ 3746 |│    g_db = g_shard_db_instance;
+    │      |│    ~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |│         |
+    │      |└────────>(7) ...to here
+    │......
+    │ 3794 |     if (shard_db_recover_before_stamp(db_root, &markers_replayed) != 0) {
+    │      |        ~
+    │      |        |
+    │      |        (8) following ‘false’ branch... ─>─┐
+    │      |                                           │
+    │......
+    │      |                                           │
+    │      |┌──────────────────────────────────────────┘
+    │ 3801 |│    g_marker_recovery_ran = markers_replayed > 0 ? 1 : 0;
+    │      |│                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |│                                                     |
+    │      |└────────────────────────────────────────────────────>(9) ...to here
+    │ 3802 | 
+    │ 3803 |     if (shard_db_validate_before_stamp(db_root) != 0) {
+    │      |        ~
+    │      |        |
+    │      |        (10) following ‘false’ branch... ─>─┐
+    │      |                                            │
+    │......
+    │      |                                            │
+    │      |┌───────────────────────────────────────────┘
+    │ 3809 |│    if (stamp_required &&
+    │      |│       ~
+    │      |│       |
+    │      |└──────>(11) ...to here
+    │......
+    │ 3880 |     int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    │      |               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |               |
+    │      |               (12) when ‘socket’ succeeds
+    │ 3881 |     if (sfd < 0) { perror("socket"); return 1; }
+    │      |        ~
+    │      |        |
+    │      |        (13) following ‘false’ branch (when ‘sfd >= 0’)... ─>─┐
+    │      |                                                              │
+    │      |                                                              │
+    │      |┌─────────────────────────────────────────────────────────────┘
+    │ 3882 |│    int opt = 1;
+    │      |│        ~~~
+    │      |│        |
+    │      |└───────>(14) ...to here
+    │......
+    │ 3894 |     if (bind(sfd, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
+    │      |        ~
+    │      |        |
+    │      |        (15) following ‘false’ branch... ─>─┐
+    │      |                                            │
+    │......
+    │      |                                            │
+    │      |┌───────────────────────────────────────────┘
+    │ 3897 |│    if (listen(sfd, 128) < 0) { perror("listen"); close(sfd); return 1; }
+    │      |│        ~~~~~~~~~~~~~~~~
+    │      |│        |
+    │      |└───────>(16) ...to here
+    │      |         (17) when ‘listen’ succeeds
+    │
+  ‘cmd_server’: events 18-20
+    │
+    │ 3897 |     if (listen(sfd, 128) < 0) { perror("listen"); close(sfd); return 1; }
+    │      |        ^
+    │      |        |
+    │      |        (18) following ‘false’ branch... ─>─┐
+    │      |                                            │
+    │......
+    │      |                                            │
+    │      |┌───────────────────────────────────────────┘
+    │ 3900 |│    memset(&sa, 0, sizeof(sa));
+    │      |│    ~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |│    |
+    │      |└───>(19) ...to here
+    │......
+    │ 3982 |     if (bg_threads_start(g_shard_db_instance, BG_RUNTIME_DAEMON) != 0) {
+    │      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |         |
+    │      |         (20) calling ‘bg_threads_start’ from ‘cmd_server’
+    │
+    └──> ‘bg_threads_start’: events 21-22
+           │
+           │ 3574 | int bg_threads_start(ShardDb *db, BgRuntimeMode mode) {
+           │      |     ^~~~~~~~~~~~~~~~
+           │      |     |
+           │      |     (21) entry to ‘bg_threads_start’
+           │ 3575 |     if (!db) {
+           │      |        ~
+           │      |        |
+           │      |        (22) following ‘false’ branch (when ‘db’ is non-NULL)... ─>─┐
+           │      |                                                                    │
+           │
+         ‘bg_threads_start’: event 23
+           │
+           │      |                                                                    │
+           │      |┌───────────────────────────────────────────────────────────────────┘
+           │ 3580 |│    atomic_store_explicit(&server_running, 1, memory_order_release);
+           │      |│    ^~~~~~~~~~~~~~~~~~~~~
+           │      |│    |
+           │      |└───>(23) ...to here
+           │
+         ‘bg_threads_start’: events 24-25
+           │
+           │ 3623 |     if (mode == BG_RUNTIME_EMBEDDED && !db->warmup_explicit)
+           │      |        ^
+           │      |        |
+           │      |        (24) following ‘false’ branch (when ‘mode != 1’)... ─>─┐
+           │      |                                                               │
+           │      |                                                               │
+           │      |┌──────────────────────────────────────────────────────────────┘
+           │ 3624 |│        warmup_mode = "off";
+           │ 3625 |│    if (strcmp(warmup_mode, "off") != 0) {
+           │      |│        ~~~~~~~~~~~~~~~~~~~~~~~~~~
+           │      |│        |
+           │      |└───────>(25) ...to here
+           │
+    <──────┘
+    │
+  ‘cmd_server’: event 26
+    │
+    │ 3982 |     if (bg_threads_start(g_shard_db_instance, BG_RUNTIME_DAEMON) != 0) {
+    │      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |         |
+    │      |         (26) returning to ‘cmd_server’ from ‘bg_threads_start’
+    │
+  ‘cmd_server’: event 27
+    │
+    │ 3982 |     if (bg_threads_start(g_shard_db_instance, BG_RUNTIME_DAEMON) != 0) {
+    │      |        ^
+    │      |        |
+    │      |        (27) following ‘false’ branch... ─>─┐
+    │      |                                            │
+    │
+  ‘cmd_server’: event 28
+    │
+    │src/db/shard_db_internal.h:438:42:
+    │      |                                            │
+    │      |┌───────────────────────────────────────────┘
+    │  438 |│#define g_workers                   (g_db->workers)
+    │      |│                                         ^~
+    │      |│                                         |
+    │      |└────────────────────────────────────────>(28) ...to here
+src/db/server.c:4001:20: note: in expansion of macro ‘g_workers’
+    │ 4001 |     int nthreads = g_workers > 0 ? g_workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
+    │      |                    ^~~~~~~~~
+    │
+  ‘cmd_server’: events 29-30
+    │
+    │ 4010 |     g_worker_cfds = malloc(nthreads * sizeof(int));
+    │      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    │      |                     |
+    │      |                     (29) this call could return NULL
+    │ 4011 |     for (int i = 0; i < nthreads; i++) g_worker_cfds[i] = -1;
+    │      |                     ~~~~~~~~~~~~
+    │      |                       |
+    │      |                       (30) following ‘true’ branch... ─>─┐
+    │      |                                                          │
+    │
+  ‘cmd_server’: events 31-32
+    │
+    │      |                                                          │
+    │      |┌─────────────────────────────────────────────────────────┘
+    │ 4011 |│    for (int i = 0; i < nthreads; i++) g_worker_cfds[i] = -1;
+    │      |│                                       ~~~~~~~~~~~~~^~~~~~~~
+    │      |│                                                    |   |
+    │      |│                                                    |   (32) ⚠️  ‘malloc((long unsigned int)max(min(nthreads, 1024), 4) * 4) + (long unsigned int)i * 4’ could be NULL: unchecked value from (29)
+    │      |└───────────────────────────────────────────────────>(31) ...to here
+    │
