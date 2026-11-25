@@ -733,6 +733,52 @@ vs load); flagged for the same Phase-4 fix branch.
   `2026-11-25-audit-storage-k-reentry.md`. Repro `audit-repro-resplit-msync`
   is red on the current tree (engine proceeds after the injected msync EIO);
   a second reviewer must still confirm severity before it counts as major.
+- **AUD-VAC-KF-MARKER (DL, confirmed; Phase 2 area 1 part 3, 2026-11-25):**
+  light `vacuum` (manual and nightly) skips segment compaction while KFM2
+  markers are pending but still compacts the keyfiles, moving slots that the
+  retained update marker names; the later replay repoints the wrong slot and
+  tombstones the real record. Repro `audit-repro-vacuum-marker` red: updated
+  key unreadable, checked walk EUCLEAN. Fix plan pending your approval.
+  Sibling unverified: `rebuild_object_v2` with markers pending.
+- **AUD-AUTH-1 (CRITICAL, confirmed; Phase 2 area 2, 2026-11-25):** the legacy
+  `\x1F` text protocol on the main port is executed with no token and no
+  IP check (get/insert/delete/truncate/vacuum/backup/restore --force ...).
+  Live-confirmed in strict mode; repro `audit-repro-text-protocol-auth` red.
+  See `2026-11-25-audit-dispatch-auth.md`. Fixed 2026-11-25 (option 2, trusted IPs only), uncommitted, awaiting blind review.
+- **AUD-AUTH-2 (major, confirmed):** token and IP hash sets remove without a
+  tombstone, breaking probe chains; colliding tokens stop authenticating,
+  cannot be revoked at runtime, and revive after restart. Repro
+  `audit-repro-token-chain` red.
+- **AUD-AUTH-3 (minor-major):** `tokens.conf` / `allowed_ips.conf` saved in
+  place, no fsync/atomic rename/0600, errors ignored.
+- **AUD-AUTH-4 (minor):** `list-tokens` fingerprint leaks 8 chars of a token.
+- **AUD-CONN-1 (major, confirmed; Phase 2 area 3):** no socket/idle timeout
+  and one worker per connection for its lifetime: WORKERS idle
+  unauthenticated connections make the server unresponsive. Repro
+  `audit-repro-idle-connections` red. See
+  `2026-11-25-audit-connection-lifecycle.md`.
+- **AUD-CONN-2 (minor):** `client_ip` defaults to 127.0.0.1 if `getpeername`
+  fails (fails open while localhost trust is on).
+- **AUD-FILE-1 (CRITICAL, confirmed; Phase 2 area 4):** `file`/`path` params of
+  bulk-insert/-delimited/-delete/-update/-update-delimited and put-file read
+  arbitrary server files for any write token; an object-scoped rw token read
+  the global admin token via tokens.conf. Repro `audit-repro-server-file-read`
+  red. See `2026-11-25-audit-caps-and-files.md`. Fixed 2026-11-25 (option 1: trusted IP or global rwx token), uncommitted.
+- **AUD-CAP-1 (major, proof trace):** the query slot cap covers only the JSON
+  dispatcher; NQL and the text path are uncapped.
+- **Phase 2 areas 5-6 (2026-11-25):** lock order and planner reviewed against
+  Phase 1 evidence; no new defect; see `2026-11-25-audit-locks-and-planner.md`.
+- **Phase 2 summary and fix queue (2026-11-25):** `2026-11-25-audit-phase2-summary.md`.
+  **Phase 3 walkthrough plan:** `2026-11-25-audit-phase3-walkthrough-plan.md`.
+- **AUD-NQL-DIR (minor):** `dispatch_nql_query` does not call `is_valid_dir`.
+- **AUD-COMPACT-ORDER (suspected major, power-loss only; Phase 2 area 1
+  part 4):** segment compaction unlinks the donor file before the kf repoint
+  is durable. See the findings doc; needs an ordering-oracle repro.
+- **AUD-BACKUP-SILENT (major; proof trace):** `cmd_backup`/`cmd_restore`
+  swallow every copy error (`cprf` is void), never fsync, and restore wipes
+  the live subtrees before copying; both report success regardless.
+- **AUD-REPLAY-BOUNDS (minor hardening):** replay segment-flag helpers index
+  `map[offset+18]` without a bounds check. See the findings doc.
 - AUD-QRY-11 test gap: only the legacy window path is covered, not the
   deferred `bulk_finalize_one_kf_window` retry.
 - Needs-look rows for the dispatch/auth slice: 60x `cert-err34-c`
