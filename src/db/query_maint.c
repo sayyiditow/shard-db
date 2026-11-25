@@ -415,7 +415,7 @@ static int copy_file_sparse(int sfd, int dfd, const char *src, off_t size) {
     return 0;
 }
 
-static int copy_file(const char *src, const char *dst, mode_t mode) {
+static int copy_file_raw(const char *src, const char *dst, mode_t mode) {
     int sfd = open(src, O_RDONLY);
     if (sfd < 0) {
         LOG_ERROR(LOG_SUB_CONFIG, "copy_file: open(%s) failed: %s", src, strerror(errno));
@@ -481,6 +481,13 @@ done:
     return rc;
 }
 
+/* Copy one file and make the copy durable: a "backed up" / "restored"
+   answer must survive power loss (AUD-BACKUP-SILENT). */
+static int copy_file(const char *src, const char *dst, mode_t mode) {
+    if (copy_file_raw(src, dst, mode) != 0) return -1;
+    return fsync_file_path(dst);
+}
+
 #ifdef TEST_BUILD
 /* TEST_BUILD wrapper over the internal copy_file (the backup/restore
    file copy) so test-backup-copy-sparse can exercise the copy
@@ -495,24 +502,25 @@ void maint_test_copy_file(const char *src, const char *dst) {
    originates from a JSON request) cannot inject shell metacharacters.
    Replaces the previous `system("cp -r ...")` invocations that CodeQL
    flagged as "uncontrolled data used in OS command". */
-static void cprf(const char *src, const char *dst) {
+static int cprf(const char *src, const char *dst) {
     /* TOCTOU-safe: open by path once, then fstat the fd and fdopendir the
-       same fd. Avoids the classic lstat-then-opendir race where a symlink
-       swap between the two calls would steer the recursive copy at a
-       different filesystem object. O_NOFOLLOW rejects symlinks at the
-       open boundary, which is consistent with the existing "skip symlinks"
-       contract documented below. */
+       same fd. O_NOFOLLOW rejects symlinks at the open boundary (skipped,
+       the documented contract). A missing source means there is nothing to
+       copy (returns 0); every other failure returns -1 and stops. */
     int fd = open(src, O_RDONLY | O_NOFOLLOW);
-    if (fd < 0) return;
+    if (fd < 0) return (errno == ENOENT || errno == ELOOP) ? 0 : -1;
     struct stat st;
-    if (fstat(fd, &st) != 0) { close(fd); return; }
+    if (fstat(fd, &st) != 0) { close(fd); return -1; }
 
+    int rc = 0;
     if (S_ISDIR(st.st_mode)) {
         mkdirp(dst);
+        struct stat ds;
+        if (stat(dst, &ds) != 0 || !S_ISDIR(ds.st_mode)) { close(fd); return -1; }
         DIR *d = fdopendir(fd);          /* takes ownership of fd */
-        if (!d) { close(fd); return; }
+        if (!d) { close(fd); return -1; }
         struct dirent *e;
-        while ((e = readdir(d))) {
+        while (rc == 0 && (e = readdir(d))) {
             if (e->d_name[0] == '.' &&
                 (e->d_name[1] == '\0' ||
                  (e->d_name[1] == '.' && e->d_name[2] == '\0')))
@@ -521,23 +529,29 @@ static void cprf(const char *src, const char *dst) {
                never copy it into a backup. */
             if (strncmp(e->d_name, ".sdprobe-", 9) == 0) continue;
             char child_src[PATH_MAX], child_dst[PATH_MAX];
-            snprintf(child_src, sizeof(child_src), "%s/%s", src, e->d_name);
-            snprintf(child_dst, sizeof(child_dst), "%s/%s", dst, e->d_name);
-            cprf(child_src, child_dst);
+            if (snprintf(child_src, sizeof(child_src), "%s/%s", src, e->d_name) >= (int)sizeof(child_src) ||
+                snprintf(child_dst, sizeof(child_dst), "%s/%s", dst, e->d_name) >= (int)sizeof(child_dst)) {
+                errno = ENAMETOOLONG;
+                rc = -1;
+                break;
+            }
+            if (cprf(child_src, child_dst) != 0) rc = -1;
         }
-        closedir(d);                      /* closes the underlying fd */
+        if (closedir(d) != 0 && rc == 0) rc = -1;   /* closes the underlying fd */
+        if (rc == 0 && fsync_dir(dst) != 0) rc = -1;
     } else if (S_ISREG(st.st_mode)) {
         close(fd);                        /* copy_file opens its own fd */
-        copy_file(src, dst, st.st_mode);
+        rc = copy_file(src, dst, st.st_mode);
     } else {
         close(fd);
     }
     /* Symlinks, fifos, devices etc. are ignored — backup targets are
        always shard-db's own regular files / directories. */
+    return rc;
 }
 
 int cmd_backup(const char *db_root, const char *object) {
-    char src_dir[PATH_MAX], bak_dir[PATH_MAX];
+    char src_dir[PATH_MAX], bak_dir[PATH_MAX], bak_parent[PATH_MAX];
     snprintf(src_dir, sizeof(src_dir), "%s/%s", db_root, object);
     struct stat st;
     if (stat(src_dir, &st) != 0) {
@@ -545,13 +559,30 @@ int cmd_backup(const char *db_root, const char *object) {
         return 1;
     }
 
-    /* Create timestamped backup directory */
+    /* Create a uniquely named, timestamped backup directory: two backups in
+       the same second must never merge into one directory. */
     time_t now = time(NULL);
     struct tm tbuf; struct tm *t = localtime_r(&now, &tbuf);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", t);
-    snprintf(bak_dir, sizeof(bak_dir), "%s/%s/backup/%s", db_root, object, ts);
-    mkdirp(bak_dir);
+    snprintf(bak_parent, sizeof(bak_parent), "%s/%s/backup", db_root, object);
+    mkdirp(bak_parent);
+    int made = 0;
+    for (int n = 0; n < 1000 && !made; n++) {
+        if (n == 0) snprintf(bak_dir, sizeof(bak_dir), "%s/%s", bak_parent, ts);
+        else        snprintf(bak_dir, sizeof(bak_dir), "%s/%s_%d", bak_parent, ts, n);
+        if (mkdir(bak_dir, 0755) == 0) made = 1;
+        else if (errno != EEXIST) break;
+    }
+    if (!made) {
+        OUT("{\"error\":\"backup failed: cannot create backup directory: %s\"}\n", strerror(errno));
+        return 1;
+    }
+
+    /* Any failed step removes the partial backup and reports the error
+       instead of claiming success (AUD-BACKUP-SILENT). */
+    const char *failed = NULL;
+    int saved_errno = 0;
 
     /* Recursively copy data/, indexes/, and metadata/ (files/ and
        tokens.conf follow below). v2 stores kf shards + segments under
@@ -560,43 +591,69 @@ int cmd_backup(const char *db_root, const char *object) {
     Schema sch = load_schema(db_root, object);
     char src_sub[PATH_MAX], dst_sub[PATH_MAX];
     const char *subs[] = { "data", "indexes", "metadata" };
-    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
+    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]) && !failed; i++) {
         snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, subs[i]);
         snprintf(dst_sub, sizeof(dst_sub), "%s/%s", bak_dir, subs[i]);
-        cprf(src_sub, dst_sub);
+        if (cprf(src_sub, dst_sub) != 0) { failed = subs[i]; saved_errno = errno; }
     }
 
     /* files/ (put-file store) is part of the object; copy it as-is. cprf
-       returns silently when the source does not exist. */
-    snprintf(src_sub, sizeof(src_sub), "%s/files", src_dir);
-    snprintf(dst_sub, sizeof(dst_sub), "%s/files", bak_dir);
-    cprf(src_sub, dst_sub);
+       returns 0 when the source does not exist. */
+    if (!failed) {
+        snprintf(src_sub, sizeof(src_sub), "%s/files", src_dir);
+        snprintf(dst_sub, sizeof(dst_sub), "%s/files", bak_dir);
+        if (cprf(src_sub, dst_sub) != 0) { failed = "files"; saved_errno = errno; }
+    }
 
     /* The object's access tokens travel with it. They are secrets: the copy
        is 0600 regardless of the source mode. A missing file is fine. */
-    snprintf(src_sub, sizeof(src_sub), "%s/tokens.conf", src_dir);
-    snprintf(dst_sub, sizeof(dst_sub), "%s/tokens.conf", bak_dir);
-    if (access(src_sub, F_OK) == 0) copy_file(src_sub, dst_sub, 0600);
+    if (!failed) {
+        snprintf(src_sub, sizeof(src_sub), "%s/tokens.conf", src_dir);
+        snprintf(dst_sub, sizeof(dst_sub), "%s/tokens.conf", bak_dir);
+        if (access(src_sub, F_OK) == 0 && copy_file(src_sub, dst_sub, 0600) != 0) {
+            failed = "tokens.conf"; saved_errno = errno;
+        }
+    }
 
     /* Schema capture — make the backup directory self-contained. fields.conf
        has the typed-field layout; object.json carries splits + max_key (which
        live in the global schema.conf, not under <obj>/). Without these,
        cmd_restore couldn't recreate the object on a fresh DB. */
-    char src_fields[PATH_MAX], dst_fields[PATH_MAX];
-    snprintf(src_fields, sizeof(src_fields), "%s/fields.conf", src_dir);
-    snprintf(dst_fields, sizeof(dst_fields), "%s/fields.conf", bak_dir);
-    if (stat(src_fields, &st) == 0) copy_file(src_fields, dst_fields, st.st_mode);
+    if (!failed) {
+        char src_fields[PATH_MAX], dst_fields[PATH_MAX];
+        snprintf(src_fields, sizeof(src_fields), "%s/fields.conf", src_dir);
+        snprintf(dst_fields, sizeof(dst_fields), "%s/fields.conf", bak_dir);
+        if (stat(src_fields, &st) == 0 &&
+            copy_file(src_fields, dst_fields, st.st_mode) != 0) {
+            failed = "fields.conf"; saved_errno = errno;
+        }
+    }
 
-    char meta_path[PATH_MAX];
-    snprintf(meta_path, sizeof(meta_path), "%s/object.json", bak_dir);
-    FILE *mf = fopen(meta_path, "w");
-    if (mf) {
-        /* storage_version slot kept in the backup metadata for forward
-           compatibility — every object the daemon writes is v2. */
-        fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":2,\"streams\":%d,\"layout\":\"%s\",\"files\":1}\n",
-                sch.splits, sch.max_key, sch.streams,
-                sch.packed_layout ? "packed" : "legacy");
-        fclose(mf);
+    if (!failed) {
+        char meta_path[PATH_MAX];
+        snprintf(meta_path, sizeof(meta_path), "%s/object.json", bak_dir);
+        FILE *mf = fopen(meta_path, "w");
+        int ok = mf != NULL;
+        if (mf) {
+            /* storage_version slot kept in the backup metadata for forward
+               compatibility — every object the daemon writes is v2. */
+            ok = fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":2,\"streams\":%d,\"layout\":\"%s\",\"files\":1}\n",
+                         sch.splits, sch.max_key, sch.streams,
+                         sch.packed_layout ? "packed" : "legacy") > 0;
+            if (fflush(mf) != 0) ok = 0;
+            if (ok && fsync(fileno(mf)) != 0) ok = 0;
+            if (fclose(mf) != 0) ok = 0;
+        }
+        if (!ok) { failed = "object.json"; saved_errno = errno; }
+    }
+    if (!failed && (fsync_dir(bak_dir) != 0 || fsync_dir(bak_parent) != 0)) {
+        failed = "directory sync"; saved_errno = errno;
+    }
+    if (failed) {
+        rmrf(bak_dir);
+        OUT("{\"error\":\"backup failed at %s: %s\"}\n", failed,
+            strerror(saved_errno ? saved_errno : EIO));
+        return 1;
     }
 
     OUT("{\"status\":\"backed_up\",\"path\":\"%s\"}\n", bak_dir);
@@ -691,6 +748,40 @@ static int backup_manifest_has_files(const char *meta_path) {
     if (err) return 0;
     buf[n] = '\0';
     return strstr(buf, "\"files\":1") != NULL;
+}
+
+#define RESTORE_STAGE_PREFIX ".restore-"
+
+/* Startup/leftover recovery for the stage-then-swap restore. A staging
+   directory without a SWAP marker never touched the live object (delete it).
+   One with the marker means a crash during the swap: roll every subtree
+   back to its pre-restore state (the backup is intact, so the operator can
+   run the restore again), then delete the staging directory. */
+void maint_restore_swap_recover(const char *obj_dir) {
+    DIR *d = opendir(obj_dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (strncmp(e->d_name, RESTORE_STAGE_PREFIX, strlen(RESTORE_STAGE_PREFIX)) != 0) continue;
+        char stage[PATH_MAX], mark[PATH_MAX], old[PATH_MAX];
+        snprintf(stage, sizeof(stage), "%s/%s", obj_dir, e->d_name);
+        snprintf(mark, sizeof(mark), "%s/SWAP", stage);
+        snprintf(old, sizeof(old), "%s/old", stage);
+        if (access(mark, F_OK) == 0) {
+            static const char *names[] = { "data", "indexes", "metadata", "files" };
+            for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+                char aside[PATH_MAX], live[PATH_MAX];
+                snprintf(aside, sizeof(aside), "%s/%s", old, names[i]);
+                snprintf(live, sizeof(live), "%s/%s", obj_dir, names[i]);
+                if (access(aside, F_OK) == 0) { rmrf(live); (void)rename(aside, live); }
+            }
+            (void)fsync_dir(obj_dir);
+            LOG_WARN(LOG_SUB_CONFIG, "RESTORE: rolled back an interrupted restore in %s; run restore again", obj_dir);
+        }
+        rmrf(stage);
+    }
+    closedir(d);
+    (void)fsync_dir(obj_dir);
 }
 
 /* ========== RESTORE ==========
@@ -933,23 +1024,102 @@ int cmd_restore(const char *db_root, const char *object,
         slotcask_registry_invalidate(db_root, object);
     }
 
-    /* Wipe live subtrees, then copy from backup. */
-    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
-        snprintf(dst_sub, sizeof(dst_sub), "%s/%s", obj_dir, subs[i]);
-        rmrf(dst_sub);
-        snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, subs[i]);
-        if (stat(src_sub, &st) == 0) cprf(src_sub, dst_sub);
+    /* Stage, then swap (AUD-BACKUP-SILENT). The backup is copied into a
+       staging directory first; the live object is not touched until every
+       copy succeeded and was fsynced. The swap then renames each live
+       subtree aside and the staged one in. A SWAP marker makes a crash
+       mid-swap recoverable: startup (maint_restore_swap_recover) rolls the
+       object back to its pre-restore state. */
+    char stage[PATH_MAX], stage_new[PATH_MAX], stage_old[PATH_MAX], swap_mark[PATH_MAX];
+    snprintf(stage, sizeof(stage), "%s/%s%d", obj_dir, RESTORE_STAGE_PREFIX, (int)getpid());
+    snprintf(stage_new, sizeof(stage_new), "%s/new", stage);
+    snprintf(stage_old, sizeof(stage_old), "%s/old", stage);
+    snprintf(swap_mark, sizeof(swap_mark), "%s/SWAP", stage);
+    maint_restore_swap_recover(obj_dir);   /* clear leftovers of an earlier crash */
+    const char *rfail = NULL;
+    int rerrno = 0;
+    char subs_all[5][16];
+    size_t nsubs = 0;
+    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++)
+        snprintf(subs_all[nsubs++], sizeof(subs_all[0]), "%s", subs[i]);
+    if (bak_files) snprintf(subs_all[nsubs++], sizeof(subs_all[0]), "files");
+
+    if (mkdir(stage, 0755) != 0 || mkdir(stage_new, 0755) != 0 ||
+        mkdir(stage_old, 0755) != 0) {
+        rfail = "staging directory"; rerrno = errno;
+    }
+    for (size_t i = 0; !rfail && i < nsubs; i++) {
+        char sdst[PATH_MAX];
+        snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, subs_all[i]);
+        snprintf(sdst, sizeof(sdst), "%s/%s", stage_new, subs_all[i]);
+        if (stat(src_sub, &st) == 0 && cprf(src_sub, sdst) != 0) {
+            rfail = subs_all[i]; rerrno = errno;
+        }
+    }
+    if (!rfail && (fsync_dir(stage_new) != 0 || fsync_dir(stage) != 0)) {
+        rfail = "staging sync"; rerrno = errno;
+    }
+    if (rfail) {
+        rmrf(stage);
+        objlock_wrunlock(db_root, object);
+        OUT("{\"error\":\"restore failed at %s: %s; the live object was not changed\"}\n",
+            rfail, strerror(rerrno ? rerrno : EIO));
+        return 1;
     }
 
-    /* files/ follows the same wipe-and-copy pattern when the backup
-       governs it ("files":1 in its manifest). Older backups leave live
-       files/ untouched. */
-    if (bak_files) {
-        snprintf(dst_sub, sizeof(dst_sub), "%s/files", obj_dir);
-        rmrf(dst_sub);
-        snprintf(src_sub, sizeof(src_sub), "%s/files", src_dir);
-        if (stat(src_sub, &st) == 0) cprf(src_sub, dst_sub);
+    /* Swap. Marker first, durably, then renames. */
+    {
+        int mfd = open(swap_mark, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (mfd < 0 || fsync(mfd) != 0 || fsync_dir(stage) != 0) {
+            rerrno = errno;
+            if (mfd >= 0) close(mfd);
+            rmrf(stage);
+            objlock_wrunlock(db_root, object);
+            OUT("{\"error\":\"restore failed at swap marker: %s; the live object was not changed\"}\n",
+                strerror(rerrno ? rerrno : EIO));
+            return 1;
+        }
+        close(mfd);
     }
+    size_t swapped = 0;
+    for (; swapped < nsubs && !rfail; swapped++) {
+        char live[PATH_MAX], aside[PATH_MAX], fresh[PATH_MAX];
+        snprintf(live, sizeof(live), "%s/%s", obj_dir, subs_all[swapped]);
+        snprintf(aside, sizeof(aside), "%s/%s", stage_old, subs_all[swapped]);
+        snprintf(fresh, sizeof(fresh), "%s/%s", stage_new, subs_all[swapped]);
+        if (rename(live, aside) != 0 && errno != ENOENT) { rfail = subs_all[swapped]; rerrno = errno; break; }
+        if (stat(fresh, &st) == 0 && rename(fresh, live) != 0) {
+            rfail = subs_all[swapped]; rerrno = errno;
+            /* put this one back; earlier ones roll back below */
+            (void)rename(aside, live);
+            break;
+        }
+    }
+    if (rfail) {
+        /* Roll back every completed swap, newest first. */
+        for (size_t k = swapped; k-- > 0; ) {
+            char live[PATH_MAX], aside[PATH_MAX];
+            snprintf(live, sizeof(live), "%s/%s", obj_dir, subs_all[k]);
+            snprintf(aside, sizeof(aside), "%s/%s", stage_old, subs_all[k]);
+            if (access(aside, F_OK) == 0) { rmrf(live); (void)rename(aside, live); }
+        }
+        (void)fsync_dir(obj_dir);
+        rmrf(stage);
+        objlock_wrunlock(db_root, object);
+        OUT("{\"error\":\"restore failed at swap of %s: %s; rolled back\"}\n",
+            rfail, strerror(rerrno ? rerrno : EIO));
+        return 1;
+    }
+    if (fsync_dir(obj_dir) != 0) {
+        rerrno = errno;
+        /* The renames may not be durable; leave the staging dir and marker
+           so startup rolls back if the machine dies before they are. */
+        objlock_wrunlock(db_root, object);
+        OUT("{\"error\":\"restore failed at directory sync: %s\"}\n", strerror(rerrno ? rerrno : EIO));
+        return 1;
+    }
+    rmrf(stage);
+    (void)fsync_dir(obj_dir);
 
     /* The restored indexes/ replaces this object's flag/marker state with
        the backup's: a backup taken while bitmap planning was disabled

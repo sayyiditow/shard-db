@@ -833,6 +833,7 @@ int parent_dir_copy(const char *path, char *out, size_t out_size);
 /* Remove crash-abandoned index publication siblings without following links. */
 int index_rebuild_temp_sweep(const char *db_root);
 int fsync_file_path(const char *path);
+void maint_restore_swap_recover(const char *obj_dir);
 int fsync_parent_dir(const char *path);
 char *read_file(const char *path, size_t *out_len);
 int is_number(const char *s);

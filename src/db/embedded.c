@@ -1148,6 +1148,19 @@ int shard_db_recover_before_stamp(const char *db_root,
                                   int *out_markers_replayed) {
     if (!out_markers_replayed) return -1;
     *out_markers_replayed = 0;
+    /* A crash during a restore's directory swap is rolled back before anything
+       else reads the object (maint_restore_swap_recover). */
+    {
+        StartupSchemaEntry *rents = NULL;
+        size_t rcount = 0;
+        if (startup_read_schema(db_root, &rents, &rcount) != 0) return -1;
+        for (size_t i = 0; i < rcount; i++) {
+            char obj_dir[PATH_MAX];
+            snprintf(obj_dir, sizeof(obj_dir), "%s/%s/%s", db_root, rents[i].dir, rents[i].object);
+            maint_restore_swap_recover(obj_dir);
+        }
+        free(rents);
+    }
     if (shard_db_not_null_upgrade_audit(db_root) != 0) return -1;
     if (rebuild_recovery(db_root) != 0) return -1;
     /* Recovery may restore an older metadata file: re-audit before any

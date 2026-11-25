@@ -6,6 +6,18 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Fix: `backup` and `restore` report copy failures and no longer wipe first.**
+Every copy error (ENOSPC, EIO, unreadable file) was swallowed and the modes
+answered `backed_up` / `restored` regardless; nothing was fsynced; `restore`
+deleted the live subtrees before copying. Now: a failed backup removes its
+partial directory and returns `{"error":"backup failed at <step>: ..."}`,
+copies and directories are fsynced before success is reported, two backups in
+one second get distinct directories (`<ts>`, `<ts>_1`, ...), and `restore`
+copies the backup into a staging directory first and only then swaps it in
+(a failure leaves the live object unchanged; a crash mid-swap is rolled back
+at the next start). Restore now needs free space for a second copy of the
+object.
+
 **Fix: light `vacuum` no longer compacts keyfiles while commit markers are pending.**
 A retained commit marker names keyfile slot numbers; compaction moves entries
 to new slots, so the later replay repointed the wrong slot and tombstoned the
