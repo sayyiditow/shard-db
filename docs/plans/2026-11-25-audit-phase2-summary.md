@@ -49,3 +49,11 @@ Also promoted to regular cases: `test-text-protocol-auth`,
 ASan/TSan gate (once before push), revert-prove pastes for plans 2-4 (their
 asserts exercise outputs that cannot occur on the old code), the IP-set
 tombstone path has no dedicated wire test (the token table does).
+
+## Execution status, part 2 (2026-11-25)
+
+AUD-KF-RESPLIT-SYNC, AUD-COMPACT-ORDER and the minors batch are fixed (plan 6:
+`2026-11-25-fix-resplit-compact-sync.md`): AUD-BULK-DEL-K, AUD-BULK-DEFER-CONT
+(test added), AUD-BULK-OOM, AUD-AUTH-4, AUD-NQL-DIR, AUD-CONN-2 (earlier), the
+IP-set wire test. Accepted without change: the `cert-err34-c` rows (operator
+config), AUD-PLN-2/3, AUD-REDUCE-1. Sanitizer gate and blind review still owed.
