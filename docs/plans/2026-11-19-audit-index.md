@@ -816,3 +816,71 @@ listed. No code deleted.
   (704,000 bytes over 4000 parses), green fixed (0). Replaying
   `AUD-RES-1-leak-input.bin` through `fuzz_frame` is the original repro.
 - AGENTS.md bench note updated (12 registered benches).
+- **Phase 3 slice 1 findings (open, plans at slice end):** AUD-P3-1 (double reply
+  on guarded bad auto-key), AUD-P3-2 (empty key accepted, breaks keys/fetch),
+  AUD-P3-3 (oversize key: empty reply), AUD-P3-4 (find double-escapes keys).
+  Detail: `2026-11-25-audit-single-writes.md`.
+- **Pending findings from the legacy-removal plan reviews (for the schema slice, 5):**
+  AUD-P3-5 (silent-damage, pre-existing): `cmd_drop_object` removes the object
+  tree before stripping its schema.conf line, and swallows a failed rewrite;
+  a crash or failed rewrite leaves a stale line that the next `create-object`
+  of the same name keeps, so the new object runs with the old splits/streams/
+  max_key. AUD-P3-6 (pre-existing): `cmd_restore` can write a schema line the
+  startup parser refuses (`bak_streams` 0 from a hand-made `object.json`).
+  **Fixed for the restore path 2026-11-26** (`2026-11-26-fix-restore-swap-and-kf-dirsync.md`):
+  the line is installed only after the commit, and a manifest without a valid
+  `storage_version`/`streams` is refused when the line must be recreated. The
+  drop-object half (AUD-P3-5) remains open.
+- **Pre-merge blind review of the audit branch (2026-11-26), production diff:**
+  confirmed by reading `query_maint.c` unless marked unverified.
+  - AUD-RESTORE-B1 (blocker, silent-damage; mine, commit 8bbc821): restore success path
+    does `rmrf(stage)` with the SWAP marker still inside; a kill mid-delete leaves SWAP
+    plus a half-deleted `old/`, and `maint_restore_swap_recover` then deletes the live
+    restored tree and renames the half-deleted pre-restore tree into place. Fix:
+    `unlink(SWAP)` + `fsync_dir(stage)` before `rmrf(stage)`; recovery deletes
+    marker-less staging without rollback. **Fixed 2026-11-26** (the commit point is the
+    durable SWAP removal; stage cleanup is best-effort).
+  - AUD-RESTORE-M1 (major, silent-damage): on `fsync_dir(obj_dir)` failure the restored
+    object is live but reported failed, marker kept; acknowledged writes are then dropped
+    by the next startup/restore rollback. Fix: retry the dir fsync, or roll back now.
+    **Fixed 2026-11-26** (a failed commit sync rolls back and replies "rolled back").
+  - AUD-RESTORE-M2 (major, silent-damage): `ensure_schema_conf_line` and
+    `copy_file(fields.conf)` run before staging (return value ignored), so a staging
+    failure says "the live object was not changed" while schema/fields were rewritten.
+    Fix: apply both after the swap, include in rollback, check the return.
+    **Fixed 2026-11-26** (`fields.conf` is swapped with the data; the schema line and a
+    live-absent `fields.conf` are installed only after the commit, checked).
+  - AUD-KF-DIRSYNC (major, low probability; renamed from -EVICT; mine, 351c086): the
+    `dir_unsynced` flag lived in the kfcache entry, and Phase E never updated
+    `file_dev`/`file_ino`, so the next acquire dropped and reopened the entry and
+    reinstalled it clean; eviction and prefix invalidation lost it the same way, and a
+    later write was acknowledged without the directory fsync. **Fixed 2026-11-26** (a
+    process-wide pending table keyed by keyfile path + Phase E records the new inode;
+    sticky overflow syncs every keyfile's directory).
+  - AUD-RESTORE-BMCACHE (major, silent-damage; found while planning the restore fix):
+    restore dropped the btree cache but not the bitmap cache, and the bitmap cache has no
+    inode check, so a post-restore counted query could serve pre-restore bits.
+    **Fixed 2026-11-26** (`restore_invalidate_all` also calls `bm_cache_invalidate`).
+  - AUD-BT-REOPEN (major, pre-existing; unverified): `btree_walk_ordered_ranges`
+    retires a cursor silently when a reopen fails after a release; the walk returns 0
+    with a short page.
+  - Minors (unverified): zeroed header read as absent shard (btree.c, io_direct.c);
+    card_est ignores walk errors; ENOBUFS maps to "index storage error"; abandoned-
+    reservation tombstone zeroes the location of a reused tombstone; resplit vs
+    pending markers; per-chunk full-prefix msync; compact_sync_all_kf per donor; OOM
+    leaks in bulk-insert parse; add-token memory vs disk on failed save; token
+    tombstones never reclaim; error strings missing from error-codes.md.
+  Test-code review: no blockers/majors; minors listed in the conversation (assertions
+  that cannot fail, root-vacuous pass, cwd-relative binary, nested audit run, 3.6 MB of
+  artifacts). **Addressed 2026-11-26** (T5 of the restore/kf-dirsync plan).
+  - Notes for the restore/kf-dirsync fix (2026-11-26): an object whose schema.conf line
+    is missing is not visited by startup recovery (startup walks schema.conf), so its
+    stage is only handled by `cmd_restore`'s own recovery call — the object is not
+    servable without its line anyway. The keyfile pending-directory-sync table is never
+    pruned for dropped objects (bounded at 64 entries + sticky overflow; perf only, out
+    of scope).
+- **AUD-RESTORE-SPLITS (pre-existing, silent-damage; for the maintenance slice):** `cmd_restore`
+  with `force` and a backup whose splits/max_key differ copies the backup's keyfile shards under
+  the unchanged live schema line, silently breaking shard routing; refusing is not enough because
+  auto-reshard widens splits nightly (default on), so older backups would become unrestorable;
+  needs its own design (restore + reshard/reindex, or restore into a new object).
