@@ -1159,7 +1159,14 @@ int shard_db_recover_before_stamp(const char *db_root,
         for (size_t i = 0; i < rcount; i++) {
             char obj_dir[PATH_MAX];
             snprintf(obj_dir, sizeof(obj_dir), "%s/%s/%s", db_root, rents[i].dir, rents[i].object);
-            maint_restore_swap_recover(obj_dir);
+            if (maint_restore_swap_recover(obj_dir) < 0) {
+                LOG_ERROR(LOG_SUB_CONFIG, "RESTORE-RECOVER %s/%s: startup refused",
+                          rents[i].dir, rents[i].object);
+                fprintf(stderr, "RESTORE-RECOVER %s/%s: startup refused\n",
+                        rents[i].dir, rents[i].object);
+                free(rents);
+                return -1;
+            }
         }
         free(rents);
     }

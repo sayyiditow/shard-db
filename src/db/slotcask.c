@@ -286,6 +286,18 @@ static int kfcache_probe(const char *path, int *out_found) {
     return -1;
 }
 
+#ifdef TEST_BUILD
+/* 1 when `path` has a resident kfcache entry (no open, no lock on the entry). */
+int slotcask_test_kfcache_resident(const char *path) {
+    if (!g_db || !g_kfcache) return 0;
+    pthread_mutex_lock(&g_kfcache_lock);
+    int found = 0;
+    (void)kfcache_probe(path, &found);
+    pthread_mutex_unlock(&g_kfcache_lock);
+    return found;
+}
+#endif
+
 /* Caller holds g_kfcache_lock. Returns with it held. Lock entries before
    re-taking the table mutex so every cache path follows entry -> table and
    nested kf/segment walks cannot form a table -> entry -> table cycle. */
@@ -825,7 +837,6 @@ retry_kfcache_acquire:
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
     atomic_store_explicit(&e->unbooked_reuse_warned, 0, memory_order_relaxed);
-    atomic_store_explicit(&e->dir_unsynced, 0, memory_order_relaxed);
     atomic_store_explicit(&e->used, 1, memory_order_release);
     e->last_access = __atomic_add_fetch(&g_kfcache_clock, 1, __ATOMIC_RELAXED);
     e->file_dev = dev;
@@ -1435,6 +1446,85 @@ static int kf_dirsync_fault(void) {
 #define kf_dirsync_fault() 0
 #endif
 
+/* Keyfile renames whose directory fsync failed (AUD-KF-DIRSYNC). Kept outside
+   the cache entry so no drop, reopen or invalidation forgets them. */
+#define KF_DIRSYNC_PENDING_CAP 64
+typedef struct { char path[PATH_MAX]; uint64_t gen; int used; } KfDirsyncPending;
+static KfDirsyncPending g_kf_dirsync_pending[KF_DIRSYNC_PENDING_CAP];
+static pthread_mutex_t g_kf_dirsync_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_kf_dirsync_npending;
+static _Atomic int g_kf_dirsync_overflow;   /* sticky: every kf sync also syncs its dir */
+static uint64_t g_kf_dirsync_gen;           /* under g_kf_dirsync_lock */
+
+static void kf_dirsync_pending_add(const char *kf_path) {
+    pthread_mutex_lock(&g_kf_dirsync_lock);
+    int free_i = -1;
+    for (int i = 0; i < KF_DIRSYNC_PENDING_CAP; i++) {
+        KfDirsyncPending *p = &g_kf_dirsync_pending[i];
+        if (p->used && strcmp(p->path, kf_path) == 0) {
+            p->gen = ++g_kf_dirsync_gen;
+            pthread_mutex_unlock(&g_kf_dirsync_lock);
+            return;
+        }
+        if (!p->used && free_i < 0) free_i = i;
+    }
+    if (free_i >= 0) {
+        KfDirsyncPending *p = &g_kf_dirsync_pending[free_i];
+        snprintf(p->path, sizeof(p->path), "%s", kf_path);
+        p->gen = ++g_kf_dirsync_gen;
+        p->used = 1;
+        atomic_fetch_add(&g_kf_dirsync_npending, 1);
+    } else if (!atomic_exchange(&g_kf_dirsync_overflow, 1)) {
+        LOG_ERROR(LOG_SUB_SLOTCASK, "KF_DIRSYNC_PENDING_FULL: every keyfile sync now also "
+                  "syncs its directory until restart");
+    }
+    pthread_mutex_unlock(&g_kf_dirsync_lock);
+}
+
+/* 0 = nothing pending for kf_path, or the retried directory fsync succeeded;
+   -1 = still not known durable (errno set): the caller must not acknowledge. */
+static int kf_dirsync_pending_settle(const char *kf_path) {
+    int overflow = atomic_load(&g_kf_dirsync_overflow);
+    if (atomic_load(&g_kf_dirsync_npending) == 0 && !overflow) return 0;
+    int idx = -1; uint64_t gen = 0;
+    pthread_mutex_lock(&g_kf_dirsync_lock);
+    for (int i = 0; i < KF_DIRSYNC_PENDING_CAP; i++)
+        if (g_kf_dirsync_pending[i].used && strcmp(g_kf_dirsync_pending[i].path, kf_path) == 0) {
+            idx = i; gen = g_kf_dirsync_pending[i].gen; break;
+        }
+    pthread_mutex_unlock(&g_kf_dirsync_lock);
+    if (idx < 0 && !overflow) return 0;
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", kf_path);
+    char *sl = strrchr(dir, '/');
+    if (!sl) { errno = EINVAL; return -1; }
+    *sl = '\0';
+    if (fsync_dir(dir) != 0) { if (!errno) errno = EIO; return -1; }
+    if (kf_dirsync_fault()) { errno = EIO; return -1; }
+    if (idx >= 0) {
+        pthread_mutex_lock(&g_kf_dirsync_lock);
+        KfDirsyncPending *p = &g_kf_dirsync_pending[idx];
+        if (p->used && p->gen == gen && strcmp(p->path, kf_path) == 0) {
+            p->used = 0;
+            p->path[0] = '\0';
+            atomic_fetch_sub(&g_kf_dirsync_npending, 1);
+        }
+        pthread_mutex_unlock(&g_kf_dirsync_lock);
+    }
+    return 0;
+}
+
+#ifdef TEST_BUILD
+void slotcask_test_kf_dirsync_reset(void) {
+    pthread_mutex_lock(&g_kf_dirsync_lock);
+    memset(g_kf_dirsync_pending, 0, sizeof(g_kf_dirsync_pending));
+    g_kf_dirsync_gen = 0;
+    atomic_store(&g_kf_dirsync_npending, 0);
+    atomic_store(&g_kf_dirsync_overflow, 0);
+    pthread_mutex_unlock(&g_kf_dirsync_lock);
+}
+#endif
+
 static int kfcache_sync_slots_locked_impl(SlotcaskKfHandle *h,
                               const size_t *slots, size_t nslots,
                               int header_changed) {
@@ -1448,18 +1538,8 @@ static int kfcache_sync_slots_locked_impl(SlotcaskKfHandle *h,
         if (slots[i] < lo) lo = slots[i];
         if (slots[i] > hi) hi = slots[i];
     }
-    if (h->slot >= 0 &&
-        atomic_load_explicit(&g_kfcache[h->slot].dir_unsynced, memory_order_acquire)) {
-        /* A resplit renamed this keyfile but its directory entry is not known
-           durable: retry the directory fsync before any write is acknowledged. */
-        KfCacheEntry *de = &g_kfcache[h->slot];
-        char dpath[PATH_MAX];
-        snprintf(dpath, sizeof(dpath), "%s", de->path);
-        char *sl = strrchr(dpath, '/');
-        if (sl) *sl = '\0';
-        if (!sl || fsync_dir(dpath) != 0 || kf_dirsync_fault()) return -1;
-        atomic_store_explicit(&de->dir_unsynced, 0, memory_order_release);
-    }
+    if (h->slot >= 0 && kf_dirsync_pending_settle(g_kfcache[h->slot].path) != 0)
+        return -1;
     if (nslots == 0 && !header_changed) return 0;
 
     size_t range_lo = header_changed ? 0
@@ -2767,7 +2847,7 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
 #endif
     }
     if (!kf_dir_synced)
-        atomic_store_explicit(&e->dir_unsynced, 1, memory_order_release);
+        kf_dirsync_pending_add(e->path);
     uint64_t t_after_rename = kf_now_us();
 
     /* Apply the remapped bitmaps in place now, before Phase E, so disk state
@@ -2802,6 +2882,12 @@ static int kfcache_resplit_locked(SlotcaskKfHandle *kh, size_t new_cap) {
     e->base = (uint8_t *)fresh;
     e->map_size = new_size;
     e->capacity = new_cap;
+    /* Phase E swaps in the renamed inode's fd: record its identity too, or
+       the next acquire's identity check sees a mismatch, drops and reopens
+       the entry — the drop that used to forget dir_unsynced. */
+    struct stat nst;
+    if (fstat(reopen_fd, &nst) == 0) { e->file_dev = nst.st_dev; e->file_ino = nst.st_ino; }
+    else { e->file_dev = 0; e->file_ino = 0; }   /* one benign reopen on the next acquire */
     atomic_store_explicit(&e->dirty, 0, memory_order_relaxed);
     atomic_store_explicit(&e->dirty_since_ms, 0, memory_order_relaxed);
 

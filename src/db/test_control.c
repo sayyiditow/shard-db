@@ -86,6 +86,13 @@ enum {
  * the same numbered shard of several fields. a = shard number as
  * (int64_t); -1 disarms. */
 #define TEST_HOOK_SET_GLOBALS_BT_WALK_OPEN_FAIL 13
+/* Restore fault seams: a = mask (SHARD_TEST_RF_*), b = swap-rename index.
+   b is stored first so the armed index is visible before the mask. */
+#define TEST_HOOK_SET_GLOBALS_RESTORE_FAULT 14
+/* Restore park sites (INSTALL .phase): SWAPPED = after the renames, before
+   the commit fsyncs; COMMITTED = after the commit, before the stage delete. */
+#define TEST_HOOK_KIND_RESTORE_PARK_SWAPPED 5
+#define TEST_HOOK_KIND_RESTORE_PARK_COMMITTED 6
 
 typedef struct {
     uint32_t kind;   /* INSTALL..REACHED; SET_GLOBALS=6 */
@@ -258,6 +265,44 @@ static void test_control_find_flush_gate_block(void *ctx_ptr) {
     pthread_mutex_unlock(&c->lock);
 }
 
+/* Runs on the request thread inside a restore park site (installed by
+   INSTALL kind 5/6 via shard_db_test_set_restore_park_hook): reports
+   REACHED with the site's phase (5 = swapped, 6 = committed) and blocks
+   until the control thread broadcasts a release (or the daemon stops).
+   Same contract as test_control_guard_block. */
+static void test_control_restore_park_block(void *ctx_ptr, int phase) {
+    TestControl *c = ctx_ptr;
+    TestHookMessage reached = { .kind = TEST_HOOK_REACHED, .phase = phase };
+    pthread_mutex_lock(&c->lock);
+    c->waiting_for_release = 1;
+    c->release = 0;
+    pthread_cond_broadcast(&c->cond);
+    pthread_mutex_unlock(&c->lock);
+
+    if (test_control_write_full(c->fd, &reached, sizeof(reached)) != 0) {
+        pthread_mutex_lock(&c->lock);
+        c->release = 1;
+        pthread_cond_broadcast(&c->cond);
+        c->waiting_for_release = 0;
+        pthread_mutex_unlock(&c->lock);
+        return;
+    }
+
+    pthread_mutex_lock(&c->lock);
+    while (c->running && !c->release)
+        pthread_cond_wait(&c->cond, &c->lock);
+    c->waiting_for_release = 0;
+    pthread_mutex_unlock(&c->lock);
+}
+
+static void test_control_restore_park_swapped(void *ctx_ptr) {
+    test_control_restore_park_block(ctx_ptr, 5);
+}
+
+static void test_control_restore_park_committed(void *ctx_ptr) {
+    test_control_restore_park_block(ctx_ptr, 6);
+}
+
 static void *test_control_thread_main(void *arg) {
     TestControl *c = arg;
     for (;;) {
@@ -282,6 +327,14 @@ static void *test_control_thread_main(void *arg) {
                     test_control_find_flush_gate_block, c);
             } else if (msg.phase == TEST_HOOK_KIND_GUARD_CHECK) {
                 shard_db_test_set_guard_hook(test_control_guard_block, c);
+            } else if (msg.phase == TEST_HOOK_KIND_RESTORE_PARK_SWAPPED) {
+                shard_db_test_set_restore_park_hook(
+                    SHARD_TEST_RESTORE_PARK_SWAPPED,
+                    test_control_restore_park_swapped, c);
+            } else if (msg.phase == TEST_HOOK_KIND_RESTORE_PARK_COMMITTED) {
+                shard_db_test_set_restore_park_hook(
+                    SHARD_TEST_RESTORE_PARK_COMMITTED,
+                    test_control_restore_park_committed, c);
             } else {
                 slotcask_test_set_after_old_hook(test_control_after_old, c);
             }
@@ -392,6 +445,9 @@ static void *test_control_thread_main(void *arg) {
             } else if (msg.phase == TEST_HOOK_SET_GLOBALS_KF_SEAMS) {
                 atomic_store(&g_shard_test_kf_initial_slots, (size_t)msg.a);
                 atomic_store(&g_shard_test_kf_max_slots, (size_t)msg.b);
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_RESTORE_FAULT) {
+                atomic_store(&g_restore_test_swap_rename_at, (int)msg.b);
+                atomic_store(&g_restore_test_fault_mask, (int)msg.a);
             }
             /* an unknown selector is ignored (still ACKed): it must never
                fall through into the kf seams */
@@ -401,6 +457,7 @@ static void *test_control_thread_main(void *arg) {
             shard_db_test_set_count_gap_hook(NULL, NULL);
             shard_db_test_set_find_flush_gate_hook(NULL, NULL);
             shard_db_test_set_guard_hook(NULL, NULL);
+            shard_db_test_set_restore_park_hook(0, NULL, NULL);
             atomic_store(&g_shard_test_count_gap, 0);
             atomic_store(&g_shard_test_find_flush_gate, 0);
             pthread_mutex_lock(&c->lock);
@@ -462,6 +519,7 @@ void shard_db_test_control_stop(void) {
     shard_db_test_set_count_gap_hook(NULL, NULL);
     shard_db_test_set_find_flush_gate_hook(NULL, NULL);
     shard_db_test_set_guard_hook(NULL, NULL);
+    shard_db_test_set_restore_park_hook(0, NULL, NULL);
     pthread_mutex_lock(&g_test_control.lock);
     g_test_control.running = 0;
     g_test_control.release = 1;

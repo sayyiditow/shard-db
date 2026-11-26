@@ -35,11 +35,9 @@ $DB_ROOT/<dir>/<obj>/backup/20260418_153012/
 
 `tokens.conf` holds token secrets in plaintext — the backup copy is created with mode `0600`, but protecting the backup directory itself is the operator's responsibility. Backup runs under the object's exclusive lock and the copy time now grows with the stored-file volume, so backups of objects holding large stored files take correspondingly longer.
 
-### Known windows (files/)
+### Known window (files/)
 
-- `copy_file`/`cprf` errors are not reported: a backup whose `files/` copy partly failed (ENOSPC/EIO) still carries the `"files":1` marker, and a later `restore --force` wipes live `files/` and copies back the partial set.
-- If an operator pruned `<backup>/files/` but kept the manifest, `restore --force` wipes live `files/` and copies nothing back.
-- If a `restore --force` crashes after wiping live `files/` but before the copy completes, live `files/` stays empty (or partial) until `restore --force` is re-run; the backup itself is intact.
+- A backup whose `<backup>/files/` was pruned but whose manifest still carries `"files":1` replaces the live `files/` with nothing: after a forced restore the live `files/` is absent (see the placeholder note under Restore).
 
 ### When to use
 
@@ -71,7 +69,24 @@ Use the `restore` mode (shipped 2026.05.1):
 - **Tokens:** restore **adds** the backup's object tokens to the running daemon immediately (no restart) and rewrites the object's `tokens.conf`. It adds only tokens that are not already present — an existing token is never changed — and never removes any. Consequence: a token revoked after the backup was taken comes back if the backup contains it. Live tokens absent from the backup are kept. The object's `tokens.conf` is rewritten from the in-memory token set, so hand edits made after startup are lost — same as `add-token`. A full token table (`TOKEN_CAP`) makes the merge skip the remaining tokens and log it. This merge runs on the JSON protocol only.
 - **Authorization:** `restore` requires an object-admin (`rwx`) token whose scope covers the object on the JSON protocol. The legacy text-wire protocol has no authentication at all (pre-existing), never restores tokens (a text-path restore leaves the object's `tokens.conf` and the running token set untouched — use the JSON `restore` to bring tokens back), and is not covered by that requirement.
 - The schema in the backup's `object.json` is reconciled with `schema.conf` and `fields.conf`. If the live versions were deleted (operator wiped metadata), restore recreates them from the backup manifest.
+- **How it works (2026.11.3):** restore copies the backup into a staging directory `<obj>/.restore-<pid>-<n>/new/` first (free space about the size of the backup is required), writes a durable `SWAP` marker, renames each live entry (`data/`, `indexes/`, `metadata/`, `files/` when the backup governs it, `fields.conf`) aside into `old/`, and the staged entry in. The **commit point** is the durable removal of the `SWAP` marker after the object, `old/` and `new/` directories are synced. A crash before the commit rolls the object back at the next start; after it the restored data stays (the stage cleanup is best-effort).
+- **`fields.conf` travels with the data** in the same swap, so a backup taken before an `add-field` restores the older field set — reads stop showing the dropped field.
+- A live-absent `fields.conf`, or a missing `schema.conf` line, is installed only after the commit. If that write fails the reply is `restore committed but <file> could not be installed: …; the backup data is live; re-run restore with force=true` — the restored data is already live and a re-run is idempotent.
+- If the `schema.conf` line must be recreated and the backup's `object.json` lacks a valid `storage_version`/`streams`, restore refuses before changing anything (`… lacks a valid storage_version/streams; cannot recreate the schema.conf line; restore refused`).
+- **`force` with different splits:** a forced restore from a backup with different `splits`/`max_key` keeps the live `schema.conf` line, so the object keeps its current sizing. The data is restored but the sizing mismatch is not fixed — re-run `vacuum --splits N` or `reindex` afterwards (AUD-RESTORE-SPLITS; do not rely on restore to resize).
 - Caches are invalidated post-restore so subsequent reads see the restored state — no daemon restart required.
+
+### Interrupted restores
+
+A restore that loses its process before the commit leaves a staging directory `<obj>/.restore-<pid>-<n>/` behind; the next start (or the next restore of that object) rolls it back automatically. While it exists, `old/<name>` holds the pre-restore copy and `new/`/`rb/` hold restored copies.
+
+If the rollback itself cannot complete (an I/O error), the daemon aborts rather than serve a half-swapped object, and **startup refuses** the object until the stage can be rolled back. Manual recovery, with the daemon stopped:
+
+1. Inside `<obj>/.restore-<pid>-<n>/`, for every `old/<name>`: move the live `<obj>/<name>` aside (or delete it — it is a restored copy), then move `old/<name>` back to `<obj>/<name>`.
+2. Delete the staging directory.
+3. Start the daemon.
+
+A rolled-back restore into an object that was missing a subtree (typically `files/`) leaves that subtree as an empty live directory — an inert placeholder, safe to remove when the object has no stored files.
 
 Listed backup directories:
 
@@ -84,7 +99,7 @@ Errors you might see:
 - `{"error":"backup not found ..."}` — bad `from` value.
 - `{"error":"invalid from ..."}` — `from` contained `/`, `..`, or other unsafe characters.
 - `{"error":"files/ is not empty (use force=true to overwrite)"}` — the backup governs `files/` and live `files/` is non-empty; pass `force:true` to overwrite.
-- `{"error":"refusing to overwrite non-empty live object; pass force=true to proceed"}` — exactly that.
+- `{"error":"refusing to overwrite non-empty live object; pass force=true to proceed"}` — no longer emitted; the refusal names the subdirectory: `{"error":"<sub>/ is not empty (use force=true to overwrite)"}`.
 
 ## 2. Filesystem snapshots
 

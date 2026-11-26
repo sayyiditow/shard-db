@@ -55,10 +55,6 @@ typedef struct {
                                     unbooked-tombstone reuse warning; reset at
                                     install so an evicted-and-reopened entry
                                     re-warns (accepted) */
-    _Atomic int dir_unsynced;   /* a resplit renamed the keyfile but the parent-directory
-                                   fsync failed: every kf sync retries it and fails until it
-                                   succeeds, so no write is acknowledged on a rename that may
-                                   not survive power loss (AUD-KF-RESPLIT-SYNC) */
 } KfCacheEntry;
 
 /* slotcask.c — kf_open_file() single-flight guard */

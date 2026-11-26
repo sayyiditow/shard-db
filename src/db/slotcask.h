@@ -346,6 +346,13 @@ int slotcask_test_set_kf_total(SlotcaskDb *db, int shard_id,
    unit-tests the adaptive pass count above 2^24. */
 void slotcask_test_radix_sort_sizes(size_t *a, size_t *scratch, size_t n);
 
+#ifdef TEST_BUILD
+/* 1 when `path` has a resident kfcache entry (read-only probe). */
+int slotcask_test_kfcache_resident(const char *path);
+/* Clear the process-wide pending-directory-sync table (AUD-KF-DIRSYNC). */
+void slotcask_test_kf_dirsync_reset(void);
+#endif
+
 /* Sum the per-shard kf headers into total/deleted. live = total - deleted.
    Reads the 24-byte header of each kf shard under the rdlock — at splits=4096
    that's 4096 × 24B = 96 KB read, sub-millisecond once mmap'd. Returns 0 on

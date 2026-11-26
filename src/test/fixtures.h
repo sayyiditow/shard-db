@@ -146,6 +146,10 @@ int test_env_ctl_set_bmfix_backoff(TestEnv *env, long ms);
    (static-fallback emission). fail=0 disarms. Requires a test-server
    daemon (test_control_fd >= 0). */
 int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail);
+/* Restore fault seams (SHARD_TEST_RF_*): mask of one-shot faults plus the
+   0-based swap-name index for SHARD_TEST_RF_SWAP_RENAME. mask=0 disarms.
+   Requires a test-server daemon (test_control_fd >= 0). */
+int test_env_ctl_set_restore_fault(TestEnv *env, int mask, int swap_index);
 
 /* SIGKILL the daemon immediately and reap. Does NOT clean up db_root.
    Mirrors a crash — no graceful drain, no in-flight write completion.

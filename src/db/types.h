@@ -591,6 +591,9 @@ extern _Thread_local uint32_t g_request_timeout_ms;
    callers don't drift apart; emit via OUT() at any of the 7 collection sites. */
 #define QUERY_BUFFER_ERR "{\"error\":\"query memory buffer exceeded; narrow criteria, add limit/offset, or stream via fetch+cursor\"}\n"
 extern char g_log_dir[PATH_MAX];
+/* Open today's log file for `level` (0 = error, 1 = warn, 2 = info, 3 = audit,
+   4 = slow); NULL when no log directory is configured or the open fails. */
+FILE *open_log_for_level(int level);
 
 /* Process-global log handler slot — see config.c for the full rationale. */
 typedef void (*log_handler_fn)(int type, const char *msg, void *ud);
@@ -833,7 +836,7 @@ int parent_dir_copy(const char *path, char *out, size_t out_size);
 /* Remove crash-abandoned index publication siblings without following links. */
 int index_rebuild_temp_sweep(const char *db_root);
 int fsync_file_path(const char *path);
-void maint_restore_swap_recover(const char *obj_dir);
+int maint_restore_swap_recover(const char *obj_dir);
 int fsync_parent_dir(const char *path);
 char *read_file(const char *path, size_t *out_len);
 int is_number(const char *s);

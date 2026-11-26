@@ -1201,6 +1201,12 @@ int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
     return ctl_set_globals(env, 1, (uint64_t)(fail ? 1 : 0), 0);
 }
 
+int test_env_ctl_set_restore_fault(TestEnv *env, int mask, int swap_index) {
+    /* phase 14 = TEST_HOOK_SET_GLOBALS_RESTORE_FAULT (test_control.c).
+       a = mask (SHARD_TEST_RF_*), b = 0-based swap-name index. */
+    return ctl_set_globals(env, 14, (uint64_t)mask, (uint64_t)swap_index);
+}
+
 int test_env_test_hook_wait(TestEnv *env, int *out_phase) {
     if (!env || env->test_control_fd < 0 || !out_phase) return -1;
     TestHookMessage rep = {0};
@@ -1210,8 +1216,10 @@ int test_env_test_hook_wait(TestEnv *env, int *out_phase) {
     /* phase: 0 = stale snapshot, 1 = under kf wrlock (after-old hook),
        2 = count worker parked in the pass-1 gap (probe reader held),
        3 = find worker parked at the batch-fetch gate,
-       4 = guarded write parked after its guard check. */
-    if (rep.phase < 0 || rep.phase > 4) return -1;
+       4 = guarded write parked after its guard check,
+       5 = restore parked after the renames (before the commit fsyncs),
+       6 = restore parked after the commit (before the stage delete). */
+    if (rep.phase < 0 || rep.phase > 6) return -1;
     *out_phase = rep.phase;
     return 0;
 }

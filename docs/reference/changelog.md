@@ -6,6 +6,23 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Fix: restore commits atomically, rolls back cleanly, and no longer loses `fields.conf`.**
+`restore` now stage-copies the backup, writes a durable `SWAP` marker, swaps
+each entry (`data/`, `indexes/`, `metadata/`, `files/`, `fields.conf`), syncs
+both directories, and only then durably removes the marker: a crash during
+the final cleanup keeps the restored data instead of reinstalling a
+half-deleted original (the old code deleted the stage while `SWAP` still
+existed). A failed commit directory sync now rolls back and says so; a
+rollback that cannot complete aborts the daemon, and startup finishes it and
+refuses to serve when it cannot. `fields.conf` (now swapped with the data)
+and a missing `schema.conf` line are installed only after the commit; a
+manifest without a valid `storage_version`/`streams` is refused when the
+line must be recreated. The bitmap cache is dropped on restore. The keyfile
+directory-sync block (set when a resplit's rename is not known durable) is
+kept in a process-wide table, so a reopen, an LRU eviction or a prefix
+invalidation no longer forgets it and acknowledges a write on a rename that
+may not survive power loss.
+
 **Fix: keyfile sync ordering in resplit and segment compaction.**
 A keyfile resplit now abandons itself (old keyfile kept) when the rebuilt file
 cannot be synced, and a rename whose directory sync failed blocks every write

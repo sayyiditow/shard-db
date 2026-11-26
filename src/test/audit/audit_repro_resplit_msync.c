@@ -12,11 +12,17 @@
  * fsync via the SHARD_TEST_BMFIX_KF_DIRSYNC seam and asserts no write is
  * acknowledged until the directory sync succeeds. Runs in the default suite.
  *
+ * AUD-KF-DIRSYNC (docs/plans/2026-11-26-fix-restore-swap-and-kf-dirsync.md,
+ * T4): the pending directory sync must survive a cache reacquire, an LRU
+ * eviction and a prefix invalidation, so the block cannot be forgotten by a
+ * drop that cannot refuse. Three cases below pin that (they do not use the
+ * msync interposer, so they run under the sanitizers too).
+ *
  * Mechanism: a test-binary msync() interposer (executable symbols win over
  * libc) that fails the first msync of a rebuilt keyfile. The resplit's
  * msync is identified by shape: MS_SYNC, length over two pages and not a
- * page multiple (per-slot syncs are page-aligned multiples). Skipped under
- * ASan/TSan, whose runtimes own msync.
+ * page multiple (per-slot syncs are page-aligned multiples). The interposer
+ * itself is skipped under ASan/TSan, whose runtimes own msync.
  */
 #define _GNU_SOURCE
 #include "test_runner.h"
@@ -25,6 +31,7 @@
 #include "slotcask.h"
 #include "fixtures.h"
 #include "shard_test_ctl.h"
+#include "shard_db_internal.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -38,6 +45,26 @@
 
 extern void compute_hash_raw(const char *key, size_t key_len,
                              uint8_t hash_out[16]);
+
+static off_t rs_size(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? st.st_size : -1;
+}
+
+static int rs_upsert_shard(SlotcaskDb *db, int shard, uint64_t key) {
+    char v[8] = "resplit";
+    SlotcaskBulkRec rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.key = &key; rec.klen = sizeof(key);
+    rec.value = v;  rec.vlen = 7;
+    SlotcaskBulkOpts o;
+    memset(&o, 0, sizeof(o));
+    return slotcask_bulk_upsert_in_kfshard(db, shard, &rec, 1, &o);
+}
+
+static int rs_upsert(SlotcaskDb *db, uint64_t key) {
+    return rs_upsert_shard(db, 0, key);
+}
 
 #if !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
 static _Atomic int g_rs_arm;    /* fail the next big msync */
@@ -54,22 +81,6 @@ int msync(void *addr, size_t len, int flags) {
         return -1;
     }
     return real(addr, len, flags);
-}
-
-static int rs_upsert(SlotcaskDb *db, uint64_t key) {
-    char v[8] = "resplit";
-    SlotcaskBulkRec rec;
-    memset(&rec, 0, sizeof(rec));
-    rec.key = &key; rec.klen = sizeof(key);
-    rec.value = v;  rec.vlen = 7;
-    SlotcaskBulkOpts o;
-    memset(&o, 0, sizeof(o));
-    return slotcask_bulk_upsert_in_kfshard(db, 0, &rec, 1, &o);
-}
-
-static off_t rs_size(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 ? st.st_size : -1;
 }
 
 static int audit_repro_resplit_msync_run(void) {
@@ -119,10 +130,20 @@ out:
     shard_test_ctl_reset();
     return t_ctx->failed > 0 ? 1 : 0;
 }
+#else
+static int audit_repro_resplit_msync_run(void) {
+    /* Sanitizer runtimes own msync; this repro runs in the normal build. */
+    return 0;
+}
+#endif
+
 /* Rename done but directory fsync fails: the swap stays (it cannot be
    undone), and every write is refused until the directory sync is retried
-   successfully. */
+   successfully. The refusal must survive a reacquire of the cache entry: a
+   dropped flag would reopen the keyfile and acknowledge the write on a
+   rename that may not survive power loss (AUD-KF-DIRSYNC). */
 static int test_resplit_dirsync_gate(void) {
+    slotcask_test_kf_dirsync_reset();
     SlotcaskDb db;
     char base[] = "/tmp/shard-db-rd-test-XXXXXX";
     ASSERT_TRUE(mkdtemp(base) != NULL, "mkdtemp");
@@ -152,6 +173,18 @@ static int test_resplit_dirsync_gate(void) {
         }
     }
     ASSERT_TRUE(rs_size(kf) > before, "the keyfile was resplit");
+
+    /* Persistence across a cache reacquire: the identity recorded in Phase E
+       matches the renamed inode, so no reopen clears the pending sync. */
+    uint64_t opens = g_kf_open_file_call_count;
+    int refused_after_reacquire = 0;
+    for (int i = 0; i < 3; i++)
+        if (rs_upsert(&db, 200000 + (uint64_t)i) != 0) refused_after_reacquire++;
+    ASSERT_EQ_INT(refused_after_reacquire, 3,
+                  "three further writes are refused while the dir sync fails");
+    ASSERT_TRUE(g_kf_open_file_call_count == opens,
+                "the refusal does not reopen the keyfile (Phase E identity)");
+
     atomic_store(&g_shard_test_bmfix_fault_mode, 0);
     for (int i = 0; i < 5; i++)
         if (rs_upsert(&db, 100000 + (uint64_t)i) == 0) ok_after++;
@@ -166,15 +199,131 @@ out:
     }
     slotcask_shutdown();
     shard_test_ctl_reset();
+    slotcask_test_kf_dirsync_reset();
     return t_ctx->failed > 0 ? 1 : 0;
 }
-#else
-static int test_resplit_dirsync_gate(void) { return 0; }
-static int audit_repro_resplit_msync_run(void) {
-    /* Sanitizer runtimes own msync; this repro runs in the normal build. */
-    return 0;
+
+/* The pending directory sync survives LRU eviction of the keyfile's cache
+   entry: a write to the evicted (then reacquired) shard is still refused. */
+static int test_kf_dirsync_pending_survives_eviction(void) {
+    slotcask_test_kf_dirsync_reset();
+    SlotcaskDb db;
+    char base[] = "/tmp/shard-db-rd-evict-XXXXXX";
+    ASSERT_TRUE(mkdtemp(base) != NULL, "mkdtemp");
+    if (t_ctx->failed) return 1;
+    char d[PATH_MAX], k[PATH_MAX];
+    snprintf(d, sizeof(d), "%s/data", base);
+    snprintf(k, sizeof(k), "%s/data/kf", base);
+    ASSERT_TRUE(mkdir(d, 0755) == 0 && mkdir(k, 0755) == 0, "mkdir");
+    /* 128 cache slots, eviction from 64 residents. */
+    slotcask_shutdown();
+    slotcask_init(64, 64);
+    shard_test_ctl_reset();
+    atomic_store(&g_shard_test_kf_initial_slots, 256);
+    memset(&db, 0, sizeof(db));
+    ASSERT_EQ_INT(slotcask_open(&db, base, 128, 1, 64), 0, "open db");
+    if (t_ctx->failed) goto out;
+
+    char kf0[PATH_MAX];
+    kf_path_for(kf0, base, 0);
+    off_t before = rs_size(kf0);
+    atomic_store(&g_shard_test_bmfix_fault_mode, SHARD_TEST_BMFIX_KF_DIRSYNC);
+    atomic_store(&g_shard_test_bmfix_fault_count, 100000);
+    for (uint64_t key = 1; key <= 600; key++) {
+        (void)rs_upsert(&db, key);
+        if (rs_size(kf0) > before) break;     /* shard 0 was resplit */
+    }
+    ASSERT_TRUE(rs_size(kf0) > before, "shard 0 was resplit");
+
+    /* Touch the other 127 shards until shard 0 is evicted. */
+    int evicted = 0;
+    for (int s = 1; s <= 127 && !evicted; s++) {
+        (void)rs_upsert_shard(&db, s, 1000 + (uint64_t)s);
+        evicted = !slotcask_test_kfcache_resident(kf0);
+    }
+    ASSERT_TRUE(evicted, "the keyfile's cache entry was evicted");
+
+    ASSERT_TRUE(rs_upsert(&db, 300000) != 0,
+                "the write after eviction is still refused");
+    atomic_store(&g_shard_test_bmfix_fault_mode, 0);
+    ASSERT_EQ_INT(rs_upsert(&db, 300001), 0,
+                  "the write succeeds once the directory sync works again");
+out:
+    slotcask_close(&db);
+    {
+        char cmd[PATH_MAX + 16];
+        snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
+        if (system(cmd) != 0) { /* best effort */ }
+    }
+    slotcask_shutdown();
+    shard_test_ctl_reset();
+    slotcask_test_kf_dirsync_reset();
+    return t_ctx->failed > 0 ? 1 : 0;
 }
-#endif
+
+/* The pending directory sync survives a prefix invalidation of the object's
+   keyfile cache entries. */
+static int test_kf_dirsync_pending_survives_invalidate(void) {
+    slotcask_test_kf_dirsync_reset();
+    SlotcaskDb db;
+    char base[] = "/tmp/shard-db-rd-inval-XXXXXX";
+    ASSERT_TRUE(mkdtemp(base) != NULL, "mkdtemp");
+    if (t_ctx->failed) return 1;
+    char d[PATH_MAX], k[PATH_MAX];
+    snprintf(d, sizeof(d), "%s/data", base);
+    snprintf(k, sizeof(k), "%s/data/kf", base);
+    ASSERT_TRUE(mkdir(d, 0755) == 0 && mkdir(k, 0755) == 0, "mkdir");
+    slotcask_init(64, 64);
+    shard_test_ctl_reset();
+    atomic_store(&g_shard_test_kf_initial_slots, 256);
+    memset(&db, 0, sizeof(db));
+    ASSERT_EQ_INT(slotcask_open(&db, base, 1, 1, 64), 0, "open db");
+    if (t_ctx->failed) goto out;
+
+    char kf0[PATH_MAX];
+    kf_path_for(kf0, base, 0);
+    off_t before = rs_size(kf0);
+    atomic_store(&g_shard_test_bmfix_fault_mode, SHARD_TEST_BMFIX_KF_DIRSYNC);
+    atomic_store(&g_shard_test_bmfix_fault_count, 100000);
+    for (uint64_t key = 1; key <= 600; key++) {
+        (void)rs_upsert(&db, key);
+        if (rs_size(kf0) > before) break;
+    }
+    ASSERT_TRUE(rs_size(kf0) > before, "the keyfile was resplit");
+
+    char parent[PATH_MAX], object[PATH_MAX];
+    snprintf(parent, sizeof(parent), "%s", base);
+    char *slash = strrchr(parent, '/');
+    ASSERT_NOT_NULL(slash, "split the temporary path");
+    if (slash) {
+        snprintf(object, sizeof(object), "%s", slash + 1);
+        *slash = '\0';
+        slotcask_registry_invalidate(parent, object);
+    }
+    ASSERT_TRUE(!slotcask_test_kfcache_resident(kf0),
+                "the invalidation dropped the cache entry");
+
+    ASSERT_TRUE(rs_upsert(&db, 300000) != 0,
+                "the write after invalidation is still refused");
+    atomic_store(&g_shard_test_bmfix_fault_mode, 0);
+    ASSERT_EQ_INT(rs_upsert(&db, 300001), 0,
+                  "the write succeeds once the directory sync works again");
+out:
+    slotcask_close(&db);
+    {
+        char cmd[PATH_MAX + 16];
+        snprintf(cmd, sizeof(cmd), "rm -rf %s", base);
+        if (system(cmd) != 0) { /* best effort */ }
+    }
+    slotcask_shutdown();
+    shard_test_ctl_reset();
+    slotcask_test_kf_dirsync_reset();
+    return t_ctx->failed > 0 ? 1 : 0;
+}
 
 TEST_REGISTER("test-resplit-msync-failure", audit_repro_resplit_msync_run)
 TEST_REGISTER("test-resplit-dirsync-gate", test_resplit_dirsync_gate)
+TEST_REGISTER("test-kf-dirsync-pending-survives-eviction",
+              test_kf_dirsync_pending_survives_eviction)
+TEST_REGISTER("test-kf-dirsync-pending-survives-invalidate",
+              test_kf_dirsync_pending_survives_invalidate)
