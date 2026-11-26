@@ -8059,7 +8059,7 @@ static int parse_cursor_object(const char *cursor_json, const char *order_by,
            order_by part, fail-closed on shape errors. */
         const char *tiers_key = strstr(cursor_json, "\"tiers\"");
         if (!tiers_key) { *err = "cursor missing 'tiers' array"; return -1; }
-        const char *arr = strchr(tiers_key + 8, '[');
+        const char *arr = strchr(tiers_key + 7, '[');
         const char *arr_end = arr ? strchr(arr, ']') : NULL;
         if (!arr || !arr_end) { *err = "cursor malformed 'tiers' array"; return -1; }
         int ti = 0;

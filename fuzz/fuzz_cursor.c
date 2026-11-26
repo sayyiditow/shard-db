@@ -62,8 +62,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 abort();  /* nonzero length with no backing buffer */
             }
         }
-        find_cursor_release(&cur);
     }
+    /* Production callers hold the cursor under a cleanup attribute, so a
+       failed parse may leave owned part buffers behind; release on every
+       path, as they do. */
+    find_cursor_release(&cur);
 
     free(buf);
     return 0;

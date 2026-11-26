@@ -4284,7 +4284,7 @@ typedef struct {
 /* Route observability for the open-fail regression: the case that arms
    the parallel variant asserts this counter moved (and that the serial
    case did not move it). */
-static _Atomic int g_igb_pass1_parallel_taken;
+static int g_igb_pass1_parallel_taken;   /* accessed via __atomic builtins only (clang rejects them on _Atomic) */
 void igb_pass1_parallel_reset_for_test(void) {
     __atomic_store_n(&g_igb_pass1_parallel_taken, 0, __ATOMIC_RELAXED);
 }
