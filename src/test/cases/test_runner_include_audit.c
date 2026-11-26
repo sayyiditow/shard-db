@@ -5,17 +5,9 @@
  * by another argument, so a trailing `--include-audit` was silently
  * dropped and the audit cases never ran.
  *
- * Check: re-invoke the runner binary itself (resolved from
- * /proc/self/exe) with a --filter selecting exactly one cheap audit case
- * (audit-planner-diff at minimum budget), with and without the flag:
- *   without → the filter matches nothing that runs: "1..0"
- *   with    → the audit case is selected and runs: "1..1"
- * The probe asserts SELECTION only — the inner audit case's own pass /
- * fail is that case's gate, not this CLI probe's, so the default suite
- * stays decoupled from audit-case health (a failure is surfaced as a
- * diagnostic). Non-Linux (no /proc/self/exe): pass with a diagnostic —
- * the runner CLI itself is platform-neutral; only this probe mechanism
- * is Linux-only.
+ * The case asserts the parser and the selection IN PROCESS (no nested
+ * runner invocation): the argv vectors are built from char arrays so the
+ * build stays warning-free.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -23,79 +15,85 @@
 #include "test_runner.h"
 #include "test_assert.h"
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #define AUD_CASE "audit-planner-diff"
 
-static int invoke_runner(char *out, size_t outcap, const char *flag) {
-    char exe[1024];
-    ssize_t r = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (r <= 0) return -1;
-    exe[r] = '\0';
-    char cmd[1400];
-    snprintf(cmd, sizeof(cmd),
-             "SHARD_AUDIT_DIFF_ROWS=10 SHARD_AUDIT_DIFF_CRITERIA=4 "
-             "%s run-all --jobs 1 --filter " AUD_CASE " %s 2>/dev/null",
-             exe, flag);
-    FILE *p = popen(cmd, "r");
-    if (!p) return -1;
-    size_t got = 0;
-    size_t n;
-    while ((n = fread(out + got, 1, outcap - got - 1, p)) > 0) got += n;
-    out[got] = '\0';
-    int rc = pclose(p);
-    return rc;
-}
-
 static int test_runner_include_audit_run(void) {
-    static char out[8192];
-
-    /* Skip at entry on platforms without /proc/self/exe (macOS): the
-     * runner CLI itself is platform-neutral; only this probe mechanism
-     * is Linux-specific. */
-#ifndef __linux__
-    TAP_DIAG("# non-Linux platform: no /proc/self/exe; skipping the "
-             "run-all --include-audit CLI probe\n");
-    return 0;
-#else
+    /* A value flag followed by the standalone flag: the filter is captured,
+       the audit flag survives. */
     {
-        char exe[1024];
-        ssize_t r = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-        if (r <= 0) {
-            TAP_DIAG("# /proc/self/exe unavailable; skipping the "
-                     "run-all --include-audit CLI probe\n");
-            return 0;
-        }
+        char a0[] = "shard-db-test";
+        char a1[] = "run-all";
+        char a2[] = "--filter";
+        char a3[] = AUD_CASE;
+        char a4[] = "--include-audit";
+        char *argv[] = { a0, a1, a2, a3, a4, NULL };
+        const char *filter = NULL, *exclude = NULL;
+        int jobs = 0, include_audit = 0;
+        int rc = test_parse_run_all_args(5, argv, 2, &filter, &exclude,
+                                         &jobs, &include_audit);
+        ASSERT_EQ_INT(rc, 0, "filter + trailing --include-audit parses");
+        ASSERT_EQ_INT(include_audit, 1,
+                      "the trailing --include-audit is not dropped");
+        ASSERT_TRUE(filter && strcmp(filter, AUD_CASE) == 0,
+                    "the filter value is captured");
     }
-#endif
 
-    /* Without the flag: the audit case is skipped — an empty plan. */
-    int rc = invoke_runner(out, sizeof(out), "");
-    ASSERT_TRUE(rc == 0, "filtered run-all without the flag exits 0");
-    ASSERT_TRUE(strstr(out, "1..0") != NULL,
-                "without --include-audit the audit case is skipped (1..0)");
-
-    /* With the flag as the LAST argument (the exact position the old
-     * parser dropped): the audit case is selected and RUNS. Selection is
-     * the assertion — the inner case's pass/fail is its own gate and is
-     * only surfaced as a diagnostic, so the default suite does not
-     * depend on audit-case health. */
-    rc = invoke_runner(out, sizeof(out), "--include-audit");
-    if (rc < 0 && out[0] == '\0') {
-        /* popen/read unavailable: skip with a diag. */
-        TAP_DIAG("# /proc/self/exe unavailable; skipping the CLI probe\n");
-        return 0;
+    /* Standalone flag before a value flag. */
+    {
+        char a0[] = "shard-db-test";
+        char a1[] = "run-all";
+        char a2[] = "--include-audit";
+        char a3[] = "--jobs";
+        char a4[] = "3";
+        char *argv[] = { a0, a1, a2, a3, a4, NULL };
+        const char *filter = NULL, *exclude = NULL;
+        int jobs = 0, include_audit = 0;
+        int rc = test_parse_run_all_args(5, argv, 2, &filter, &exclude,
+                                         &jobs, &include_audit);
+        ASSERT_EQ_INT(rc, 0, "--include-audit --jobs 3 parses");
+        ASSERT_EQ_INT(include_audit, 1, "the audit flag is set");
+        ASSERT_EQ_INT(jobs, 3, "the job count is captured");
     }
-    ASSERT_TRUE(strstr(out, "1..1") != NULL,
-                "with --include-audit the audit case is selected and runs "
-                "(1..1)");
-    int inner_passed = (rc == 0);
-    TAP_DIAG("# inner audit-planner-diff %s (its own gate; the CLI probe "
-             "asserts selection only)\n",
-             inner_passed ? "passed" : "FAILED");
-    return 0;
+
+    /* A value flag followed by another option consumes no value. */
+    {
+        char a0[] = "shard-db-test";
+        char a1[] = "run-all";
+        char a2[] = "--jobs";
+        char a3[] = "--include-audit";
+        char *argv[] = { a0, a1, a2, a3, NULL };
+        const char *filter = NULL, *exclude = NULL;
+        int jobs = 0, include_audit = 0;
+        int rc = test_parse_run_all_args(4, argv, 2, &filter, &exclude,
+                                         &jobs, &include_audit);
+        ASSERT_EQ_INT(rc, 0, "--jobs --include-audit parses");
+        ASSERT_EQ_INT(jobs, 0, "the next option is not taken as a value");
+        ASSERT_EQ_INT(include_audit, 1, "the audit flag is kept");
+    }
+
+    /* A typo must be refused, not silently ignored. */
+    {
+        char a0[] = "shard-db-test";
+        char a1[] = "run-all";
+        char a2[] = "--include_audit";
+        char *argv[] = { a0, a1, a2, NULL };
+        const char *filter = NULL, *exclude = NULL;
+        int jobs = 0, include_audit = 0;
+        int rc = test_parse_run_all_args(3, argv, 2, &filter, &exclude,
+                                         &jobs, &include_audit);
+        ASSERT_EQ_INT(rc, 2, "an unknown option is refused");
+    }
+
+    /* Selection: the audit case is invisible by default and selected with
+       the flag. */
+    ASSERT_EQ_INT(test_count_selected(AUD_CASE, NULL, 0), 0,
+                  "without --include-audit the audit case is not selected");
+    ASSERT_EQ_INT(test_count_selected(AUD_CASE, NULL, 1), 1,
+                  "with --include-audit the audit case is selected");
+
+    return t_ctx->failed > 0 ? 1 : 0;
 }
 
 TEST_REGISTER("test-runner-include-audit", test_runner_include_audit_run)

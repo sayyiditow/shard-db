@@ -19,13 +19,10 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
-#include <limits.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -40,12 +37,12 @@ static char *ta_req(int port, const char *line) {
 }
 
 static int audit_repro_text_protocol_auth_run(void) {
-    char base[256], db_root[256];
-    snprintf(base, sizeof(base), "/tmp/shard-db-ta-%d", (int)getpid());
+    char base[] = "/tmp/shard-db-ta-XXXXXX";
+    ASSERT_TRUE(mkdtemp(base) != NULL, "mkdtemp");
+    if (t_ctx->failed) return 1;
+    char db_root[256];
     snprintf(db_root, sizeof(db_root), "%s/db", base);
-    tu_run_cmd("rm -rf %s", base);
-    mkdir(base, 0755);
-    mkdir(db_root, 0755);
+    ASSERT_EQ_INT(mkdir(db_root, 0755), 0, "mkdir db root");
     int port = test_pick_port();
     ASSERT_TRUE(port >= 0, "pick port");
     if (port < 0) { tu_run_cmd("rm -rf %s", base); return 1; }
@@ -68,25 +65,13 @@ static int audit_repro_text_protocol_auth_run(void) {
         "export DISABLE_LOCALHOST_TRUST=1\n", db_root, port, base);
     fclose(f);
 
-    char sdb[PATH_MAX];
-    const char *rel = "./build/bin/shard-db";
-    if (access(rel, X_OK) != 0) rel = "./shard-db";
-    if (!realpath(rel, sdb)) { ASSERT_TRUE(0, "shard-db"); tu_run_cmd("rm -rf %s", base); return 1; }
-    pid_t pid = fork();
-    if (pid == 0) { if (chdir(base) != 0) _exit(126); execl(sdb, sdb, "server", (char *)NULL); _exit(127); }
-    if (pid < 0) { ASSERT_TRUE(0, "fork"); tu_run_cmd("rm -rf %s", base); return 1; }
+    TestEnv env = {0};
+    ASSERT_EQ_INT(test_env_start_at(&env, db_root, port), 0, "start the daemon");
+    if (env.daemon_pid <= 0) { tu_run_cmd("rm -rf %s", base); return 1; }
 
     char req[1024];
     snprintf(req, sizeof(req), "{\"mode\":\"db-dirs\",\"auth\":\"%s\"}", gtok);
-    int ready = 0;
-    for (int i = 0; i < 100 && !ready; i++) {
-        char *r = ta_req(port, req);
-        if (r && !strstr(r, "\"error\"")) ready = 1;
-        free(r);
-        if (!ready) { struct timespec ts = { 0, 50 * 1000000L }; nanosleep(&ts, NULL); }
-    }
-    ASSERT_TRUE(ready, "daemon ready");
-    if (ready) {
+    {
         char *r;
         snprintf(req, sizeof(req),
             "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"t1\","
@@ -110,8 +95,7 @@ static int audit_repro_text_protocol_auth_run(void) {
                     "unauthenticated text-protocol truncate must not destroy data");
         free(r);
     }
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
+    test_env_stop_keep(&env);
     tu_run_cmd("rm -rf %s", base);
     return t_ctx->failed > 0 ? 1 : 0;
 }

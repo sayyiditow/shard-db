@@ -35,6 +35,8 @@ Raw: `cppcheck-unusedFunction.txt` (222 findings over `src/db` only; 105 are
 `*_test_*` seams, kept). The remaining 117 include everything with no caller
 inside `src/db` — which also flags the embedded public API (`shard_db_open`,
 `shard_db_query`, …), functions used only by `src/test` / `src/bench`
+
+(raw log removed 2026-11-26; regenerate with the command above).
 (`slotcask_get`, `slotcask_exists`, `index_parallel`, `reindex_object`,
 `slotcask_count_live`, …) and legacy planner helpers
 (`compile_criteria_tree`, `criteria_match_tree`, `match_typed`, `card_est_*`).

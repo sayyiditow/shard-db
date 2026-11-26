@@ -32,6 +32,7 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -267,7 +268,7 @@ static int test_kf_deleted_underflow_run(void) {
     ASSERT_NOT_NULL(resp, "case A count response");
     snprintf(msg, sizeof(msg), "case A: count == live model (%ld)",
              live_model);
-    ASSERT_TRUE(resp && atol(resp) == live_model, msg);
+    ASSERT_TRUE(resp && isdigit((unsigned char)resp[0]) && atol(resp) == live_model, msg);
     free(resp); resp = NULL;
 
     /* orphaned >= 0 (base returns -1: (int) of the wrapped u64). */
@@ -277,7 +278,7 @@ static int test_kf_deleted_underflow_run(void) {
     tc_request(tc, req, &resp);
     ASSERT_NOT_NULL(resp, "case A orphaned response");
     snprintf(msg, sizeof(msg), "case A: orphaned >= 0");
-    ASSERT_TRUE(resp && atol(resp) >= 0, msg);
+    ASSERT_TRUE(resp && isdigit((unsigned char)resp[0]) && atol(resp) >= 0, msg);
     free(resp); resp = NULL;
 
     /* Per-shard kf headers: total >= deleted (no wrap). */
@@ -391,7 +392,7 @@ static int test_kf_deleted_underflow_run(void) {
              "\"object\":\"" OBJ_B "\"}");
     tc_request(tc, req, &resp);
     ASSERT_NOT_NULL(resp, "case B count response");
-    ASSERT_TRUE(resp && atol(resp) == 1,
+    ASSERT_TRUE(resp && isdigit((unsigned char)resp[0]) && atol(resp) == 1,
                 "case B: count == 1 (live exact, no wrap)");
     free(resp); resp = NULL;
 

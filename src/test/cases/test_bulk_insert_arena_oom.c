@@ -38,7 +38,11 @@ static int test_bulk_insert_arena_oom(void) {
     size_t cap = n_rec * 80 + 256;
     char *json = malloc(cap), *csv = malloc(cap);
     ASSERT_TRUE(json && csv, "buffers");
-    if (!json || !csv) { free(json); free(csv); return 1; }
+    if (!json || !csv) {
+        free(json); free(csv);
+        tu_pdb_drop_object(db, "default", "bao_t");
+        return 1;
+    }
     size_t jo = 0, co = 0;
     jo += (size_t)snprintf(json + jo, cap - jo, "{\"mode\":\"bulk-insert\",\"dir\":\"default\",\"object\":\"bao_t\",\"records\":{");
     co += (size_t)snprintf(csv + co, cap - co, "{\"mode\":\"bulk-insert-delimited\",\"dir\":\"default\",\"object\":\"bao_t\",\"data\":\"");
@@ -64,7 +68,8 @@ static int test_bulk_insert_arena_oom(void) {
         }
         /* Nothing was written by the failed attempts. */
         tu_pdb_request(db, "{\"mode\":\"count\",\"dir\":\"default\",\"object\":\"bao_t\"}", &resp);
-        ASSERT_TRUE(resp && strcmp(resp, "0\n") == 0 || (resp && resp[0] == '0'), "failed attempts wrote nothing");
+        ASSERT_TRUE(resp && resp[0] == '0' && (resp[1] == '\n' || resp[1] == '\0'),
+                    "failed attempts wrote nothing");
         shard_db_free_result(resp); resp = NULL;
         /* Control: no injection inserts every record. */
         tu_pdb_request(db, reqs[f], &resp);
@@ -74,6 +79,7 @@ static int test_bulk_insert_arena_oom(void) {
         shard_db_free_result(resp); resp = NULL;
     }
     free(json); free(csv);
+    tu_pdb_drop_object(db, "default", "bao_t");
     return t_ctx->failed > 0 ? 1 : 0;
 }
 

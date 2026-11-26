@@ -67,4 +67,17 @@ int test_run_one(const char *name);
 int test_run_all(const char *filter, const char *exclude, int jobs,
                  int include_audit);
 
+/* Parse `run-all` options starting at argv[first] (same semantics and stderr
+   message as the CLI always had). *filter / *exclude start NULL, *jobs and
+   *include_audit start at the caller's defaults and are updated in place.
+   Returns 0 on success, 2 for an unknown or incomplete option. */
+int test_parse_run_all_args(int argc, char **argv, int first,
+                            const char **filter, const char **exclude,
+                            int *jobs, int *include_audit);
+
+/* Number of registered cases the same filter/exclude/include_audit selection
+   would run (the CLI probe's in-process selection count). */
+int test_count_selected(const char *filter, const char *exclude,
+                        int include_audit);
+
 #endif

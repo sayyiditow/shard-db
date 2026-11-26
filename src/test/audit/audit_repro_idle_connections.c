@@ -18,33 +18,20 @@
 #include "test_assert.h"
 #include "test_client.h"
 #include "fixtures.h"
-#include <limits.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-static char *ta_req(int port, const char *line) {
-    TestClientCfg cfg = { .port = port, .io_timeout_ms = 10000 };
-    TestClient *tc = tc_connect(&cfg);
-    if (!tc) return NULL;
-    char *resp = NULL;
-    if (tc_request(tc, line, &resp) != 0) resp = NULL;
-    tc_close(tc);
-    return resp;
-}
-
 static int audit_repro_idle_connections_run(void) {
-    char base[256], db_root[256];
-    snprintf(base, sizeof(base), "/tmp/shard-db-ta-%d", (int)getpid());
+    char base[] = "/tmp/shard-db-ta-XXXXXX";
+    ASSERT_TRUE(mkdtemp(base) != NULL, "mkdtemp");
+    if (t_ctx->failed) return 1;
+    char db_root[256];
     snprintf(db_root, sizeof(db_root), "%s/db", base);
-    tu_run_cmd("rm -rf %s", base);
-    mkdir(base, 0755);
-    mkdir(db_root, 0755);
+    ASSERT_EQ_INT(mkdir(db_root, 0755), 0, "mkdir db root");
     int port = test_pick_port();
     ASSERT_TRUE(port >= 0, "pick port");
     if (port < 0) { tu_run_cmd("rm -rf %s", base); return 1; }
@@ -67,29 +54,18 @@ static int audit_repro_idle_connections_run(void) {
         "export DISABLE_LOCALHOST_TRUST=1\nexport WORKERS=4\nexport IDLE_TIMEOUT_SEC=2\n", db_root, port, base);
     fclose(f);
 
-    char sdb[PATH_MAX];
-    const char *rel = "./build/bin/shard-db";
-    if (access(rel, X_OK) != 0) rel = "./shard-db";
-    if (!realpath(rel, sdb)) { ASSERT_TRUE(0, "shard-db"); tu_run_cmd("rm -rf %s", base); return 1; }
-    pid_t pid = fork();
-    if (pid == 0) { if (chdir(base) != 0) _exit(126); execl(sdb, sdb, "server", (char *)NULL); _exit(127); }
-    if (pid < 0) { ASSERT_TRUE(0, "fork"); tu_run_cmd("rm -rf %s", base); return 1; }
+    TestEnv env = {0};
+    ASSERT_EQ_INT(test_env_start_at(&env, db_root, port), 0, "start the daemon");
+    if (env.daemon_pid <= 0) { tu_run_cmd("rm -rf %s", base); return 1; }
 
     char req[1024];
     snprintf(req, sizeof(req), "{\"mode\":\"db-dirs\",\"auth\":\"%s\"}", gtok);
-    int ready = 0;
-    for (int i = 0; i < 100 && !ready; i++) {
-        char *r = ta_req(port, req);
-        if (r && !strstr(r, "\"error\"")) ready = 1;
-        free(r);
-        if (!ready) { struct timespec ts = { 0, 50 * 1000000L }; nanosleep(&ts, NULL); }
-    }
-    ASSERT_TRUE(ready, "daemon ready");
-    if (ready) {
+    {
         TestClient *idle[4];
         TestClientCfg icfg = { .port = port, .connect_timeout_ms = 2000 };
         for (int i = 0; i < 4; i++) idle[i] = tc_connect(&icfg);   /* send nothing */
-        { struct timespec ts = { 1, 0 }; nanosleep(&ts, NULL); }
+        /* No settle sleep: accept order is FIFO, so the four idle
+           connections reach the four workers first. */
         TestClientCfg cfg = { .port = port, .connect_timeout_ms = 2000, .io_timeout_ms = 6000 };
         TestClient *tc = tc_connect(&cfg);
         char *r = NULL;
@@ -99,12 +75,19 @@ static int audit_repro_idle_connections_run(void) {
         free(r);
         for (int i = 0; i < 4; i++) if (idle[i]) tc_close(idle[i]);
 
-        /* A connection idle past the timeout is dropped by the server. */
+        /* A connection idle past the timeout is closed by the server, not by
+           the client deadline: the recv fails well inside the 6 s budget. */
         TestClient *late = tc_connect(&cfg);
-        { struct timespec ts = { 3, 0 }; nanosleep(&ts, NULL); }
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         char *r2 = NULL;
-        int rc2 = late ? tc_request(late, req, &r2) : -1;
+        int rc2 = late ? tc_recv(late, &r2) : -1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000L
+                        + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
         ASSERT_TRUE(rc2 != 0 || !r2, "a connection idle past IDLE_TIMEOUT_SEC is closed");
+        ASSERT_TRUE(elapsed_ms < 5000,
+                    "the server closed it, not the 6000 ms client timeout");
         free(r2);
         if (late) tc_close(late);
         /* ...and the server still serves new connections. */
@@ -114,8 +97,7 @@ static int audit_repro_idle_connections_run(void) {
         ASSERT_TRUE(r3 && strstr(r3, "default"), "a new connection is served afterwards");
         free(r3);
     }
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
+    test_env_stop_keep(&env);
     tu_run_cmd("rm -rf %s", base);
     return t_ctx->failed > 0 ? 1 : 0;
 }

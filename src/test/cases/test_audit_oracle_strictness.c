@@ -92,12 +92,15 @@ static int test_audit_oracle_strictness_run(void) {
     ASSERT_NOT_NULL(tc, "connect");
     if (!tc) { test_env_stop(&env); return 1; }
 
-    mkdir("/tmp/shard-db-audit-logs", 0755);
-    char logpath[256];
-    snprintf(logpath, sizeof(logpath),
-             "/tmp/shard-db-audit-logs/oracle-selftest-%d.log", (int)getpid());
+    char logpath[512];
+    snprintf(logpath, sizeof(logpath), "%s/../oracle-selftest.log", env.db_root);
     FILE *logf = fopen(logpath, "w");
     ASSERT_NOT_NULL(logf, "open self-test log");
+    if (!logf) {
+        tc_close(tc);
+        test_env_stop(&env);
+        return 1;
+    }
 
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
@@ -232,7 +235,7 @@ static int test_audit_oracle_strictness_run(void) {
     fclose(logf);
     tc_close(tc);
     test_env_stop(&env);
-    return 0;
+    return t_ctx->failed > 0 ? 1 : 0;
 }
 
 TEST_REGISTER("test-audit-oracle-strictness", test_audit_oracle_strictness_run)

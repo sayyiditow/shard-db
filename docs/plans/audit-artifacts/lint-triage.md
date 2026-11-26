@@ -6,6 +6,8 @@ Raw output: `lint-raw.log` (`BUILD_MODE=lint ./build.sh`: -Wall -Wextra
 data-loss defect. CI history (CodeQL, cppcheck, scan-build) is green on
 f19b17d; Coverity is fully triaged by the human (0 open).
 
+(raw log removed 2026-11-26; regenerate with the command above).
+
 ## Lint build: 584 unique warnings (3774 raw lines)
 
 | Class | Count | Disposition rule |
