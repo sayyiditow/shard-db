@@ -597,7 +597,21 @@ static int packed_crash_case(int op, const char *phase) {
     ASSERT_TRUE(child > 0, "spawn request");
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker), "%s/default/%s/.rebuild-test-%s.active", root, object, phase);
-    ASSERT_EQ_INT(wait_for_path(marker, 60000), 0, "rebuild reaches the pause");
+    int pause_rc = wait_for_path(marker, 60000);
+    if (pause_rc != 0) {
+        /* Evidence for a CI-only failure: did the request already finish
+           (and with what status), and what does the daemon log say? */
+        int wst = 0;
+        pid_t w = waitpid(child, &wst, WNOHANG);
+        fprintf(stderr, "pause-miss: child pid=%d waitpid=%d exited=%d status=%d port=%d\n",
+                (int)child, (int)w, w > 0 && WIFEXITED(wst), w > 0 && WIFEXITED(wst) ? WEXITSTATUS(wst) : -1,
+                saved_port);
+        char base[PATH_MAX];
+        snprintf(base, sizeof(base), "%s", root);
+        char *sl = strrchr(base, '/');
+        if (sl) { *sl = '\0'; tu_run_cmd("tail -30 '%s/daemon.log' 2>&1; ls -la '%s/default/%s' 2>&1", base, root, object); }
+    }
+    ASSERT_EQ_INT(pause_rc, 0, "rebuild reaches the pause");
     test_env_kill(&env);          /* unconditional: a live paused daemon would hold the DB lock */
     unlink(marker);
     if (child > 0) waitpid(child, NULL, 0);
