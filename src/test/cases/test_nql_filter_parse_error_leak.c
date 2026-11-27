@@ -18,7 +18,10 @@
 #include "test_runner.h"
 #include "test_assert.h"
 #include "types.h"
+#if defined(__linux__) && defined(__GLIBC__)
 #include <malloc.h>
+#define HAVE_MALLINFO2 1
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,9 +38,11 @@ static int test_nql_filter_parse_error_leak_run(void) {
 
     const int N = 4000;
     for (int i = 0; i < 64; i++) (void)nql_parse_filter(bad, err, sizeof err);
-#if defined(__SANITIZE_ADDRESS__)
+#if defined(__SANITIZE_ADDRESS__) || !defined(HAVE_MALLINFO2)
+    /* No glibc mallinfo2 (macOS) or sanitizer allocator: heap-growth
+       detection is unavailable; the sanitizer leak check covers it. */
     return t_ctx->failed > 0 ? 1 : 0;
-#endif
+#else
     size_t before = mallinfo2().uordblks;
     for (int i = 0; i < N; i++) {
         CriteriaNode *r = nql_parse_filter(bad, err, sizeof err);
@@ -50,6 +55,7 @@ static int test_nql_filter_parse_error_leak_run(void) {
              after > before ? after - before : 0);
     ASSERT_TRUE(after < before + 64 * 1024, msg);
     return t_ctx->failed > 0 ? 1 : 0;
+#endif
 }
 
 TEST_REGISTER("test-nql-filter-parse-error-leak", test_nql_filter_parse_error_leak_run)

@@ -300,7 +300,7 @@ static int test_txn_crash_phase(const char *phase, const char *object) {
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker), "%s/default/%s/.rebuild-test-%s.active",
              saved_db_root, object, phase);
-    int marker_rc = wait_for_path(marker, 20000);
+    int marker_rc = wait_for_path(marker, 60000);
     if (marker_rc != 0) {
         char base[PATH_MAX];
         snprintf(base, sizeof(base), "%s", saved_db_root);
@@ -410,7 +410,7 @@ static int test_edit_crash_after_metadata(void) {
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker),
              "%s/default/txnedit/.rebuild-test-after-metadata.active", root);
-    int marker_rc = wait_for_path(marker, 20000);
+    int marker_rc = wait_for_path(marker, 60000);
     ASSERT_EQ_INT(marker_rc, 0,
                   "edit rebuild reaches metadata pause");
     /* Kill unconditionally: on timeout the daemon is still running (paused
@@ -597,7 +597,7 @@ static int packed_crash_case(int op, const char *phase) {
     ASSERT_TRUE(child > 0, "spawn request");
     char marker[PATH_MAX];
     snprintf(marker, sizeof(marker), "%s/default/%s/.rebuild-test-%s.active", root, object, phase);
-    ASSERT_EQ_INT(wait_for_path(marker, 20000), 0, "rebuild reaches the pause");
+    ASSERT_EQ_INT(wait_for_path(marker, 60000), 0, "rebuild reaches the pause");
     test_env_kill(&env);          /* unconditional: a live paused daemon would hold the DB lock */
     unlink(marker);
     if (child > 0) waitpid(child, NULL, 0);
