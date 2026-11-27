@@ -1,0 +1,10 @@
+# AUD-QRY-5 Task 4.1 revert-prove-paste (2026-11-20)
+# Method: git stash push -m 'AUD-QRY-5 fix revert-proof' -- src/db/query_aggregate.c (path-limited).
+# NOTE (per the plan's Task 4.1): the stash lifted the still-uncommitted QRY-1/QRY-2/QRY-8 hunks in the
+# same file too — the reds are UNAFFECTED (this plan's assertion shapes never reach QRY-1's guard, and
+# the cap truncation predates all of them), exactly as the round-2 review verified.
+
+=== RED (fix stashed): 236 passed, 3 failed — identical to the Task 1 base proof
+  (cases 1,2,3: cap truncation 300 vs 256 / 300 vs 256 / can_slot wrong labels 150 vs 132)
+
+=== GREEN (git stash pop): 2339 passed, 0 failed (case rc=0)

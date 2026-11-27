@@ -22,6 +22,8 @@ Placed in the working directory where you run shard-db (usually `build/bin/db.en
 | `GLOBAL_LIMIT` | `100000` | Default `limit` applied when a query omits one. Per-query `limit` is **not clamped** — pass any value to override. |
 | `MAX_CONCURRENT_QUERIES` | `0` (auto) | Hard cap on queries in-flight simultaneously. `0` = `max(4, min(nproc, 32))`. When the cap is reached, additional requests get `{"error":"server at capacity","max_concurrent_queries":N}` and the client should retry. Worst-case query-buffer RAM = `MAX_CONCURRENT_QUERIES × QUERY_BUFFER_MB`. |
 | `MAX_REQUEST_SIZE` | `33554432` (32 MB) | Maximum JSON request size per line. Oversized requests get `{"error":"Request too large (max N bytes)"}`. Every connection allocates a read buffer of this size, so total per-conn memory = N × `MAX_REQUEST_SIZE`. |
+| `IDLE_TIMEOUT_SEC` | `300` | Socket read/write timeout per connection (0 = off). A connection that sends nothing for this long is closed, so idle or half-open clients cannot pin the worker pool; a running query is not interrupted. Pooled clients idle longer than this must reconnect. |
+| `HANDSHAKE_TIMEOUT_SEC` | `10` | TLS handshake timeout (0 = off); applies before the idle timeout takes over. |
 | `FCACHE_MAX` | `4096` | Entry capacity for each of `kfcache` and `segcache`. **Strict allow-list:** `{4096, 8192, 12288, 16384}`. Invalid values fall back to default with a warning. Also derives `BT_CACHE_MAX = FCACHE_MAX / 4`; see [Tuning](../operations/tuning.md). |
 | `BT_CACHE_MAX` | derived | **Not configurable as of 2026.05.1.** Derived as `FCACHE_MAX / 4` (so `{1024, 2048, 3072, 4096}`). Setting it in db.env emits a stderr warning and is ignored. |
 | `QUERY_BUFFER_MB` | `256` | Per-query intermediate buffer cap. With `MAX_CONCURRENT_QUERIES` bounding fan-in, worst-case RAM stays predictable. Auto-tunes upward on big-RAM hosts with low slot counts (floor: 256 MB). |
@@ -62,6 +64,8 @@ export WORKERS=0
 export GLOBAL_LIMIT=100000
 export MAX_CONCURRENT_QUERIES=0
 export MAX_REQUEST_SIZE=33554432
+export IDLE_TIMEOUT_SEC=300
+export HANDSHAKE_TIMEOUT_SEC=10
 export FCACHE_MAX=4096
 # BT_CACHE_MAX is no longer configurable — derived as FCACHE_MAX / 4
 export QUERY_BUFFER_MB=256

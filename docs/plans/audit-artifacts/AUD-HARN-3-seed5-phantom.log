@@ -1,0 +1,5 @@
+scenario 5: kind=6 op=fdatasync hit=4 errno=28
+VIOLATION [fo]: count 2 != model live 1 + probes 0 (phantom or lost records)
+VIOLATION [fo]: key f000 is dead in the model but reads back (resurrection/phantom)
+scenario 5 SUMMARY: 2 violation(s)
+scenario 5: kind=6 op=pwrite hit=2 errno=28

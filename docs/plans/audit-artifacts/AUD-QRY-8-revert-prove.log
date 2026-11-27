@@ -1,0 +1,13 @@
+# AUD-QRY-8 Task 4.1 revert-prove-paste (patch-based — QRY-1/QRY-2 uncommitted in query_aggregate.c/query_plan.c, so no whole-file stash; see PLAN_NOTES)
+# 2026-11-20. QRY-8 delta = /tmp/qry8.patch (7 hunks: query.c, query_plan.c, query_aggregate.c) vs the
+# pre-Task-2 snapshot (/tmp/qry8-base-snap/). RED = git apply -R; GREEN = git apply. Both builds rc=0.
+
+=== RED (fix reverted; QRY-1/QRY-2 hunks intact): 88 passed, 5 failed
+not ok 23 - case1: count composite-exact
+not ok 25 - case2: aggregate count composite-exact
+not ok 27 - case3: aggregate count ce_mix
+not ok 30 - case4: group_by=c composite-exact
+not ok 33 - case5: TopN composite-exact
+(identical to the Task 1 base proof — cases 1-5 only)
+
+=== GREEN (fix restored): 161 passed, 0 failed (case rc=0)

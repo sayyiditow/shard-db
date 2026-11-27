@@ -178,6 +178,13 @@ typedef struct FilterPlan {
     CriteriaNode    *or_node;                            /* FP_UNION */
     SearchCriterion *postfilter_leaves[MAX_INTERSECT_LEAVES]; /* leaves not covered by source */
     int              n_postfilter;
+    int              has_subtree;   /* criteria not fully represented
+                                     * by the plan — an OR / nested-AND sub-tree
+                                     * beside the source leaves, or an AND with
+                                     * more than MAX_INTERSECT_LEAVES LEAF
+                                     * children (leaves 9+ are dropped by
+                                     * collect_and_leaves and appear in neither
+                                     * list). No-fetch consumers must refuse. */
     int              total_cheap;                        /* plan materializes a KeySet → |KeySet| is a free total (1d) */
     int              fetching;                           /* dimension this plan was computed for */
     char             composite_field[256];               /* set when order==FP_ORDER_COMPOSITE_EXACT */

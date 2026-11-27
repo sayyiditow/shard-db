@@ -45,6 +45,13 @@ static int test_object_name_validation_run(void) {
     ASSERT_CONTAINS(resp, "invalid object name", "get rejects traversal object");
     ASSERT_TRUE(SAFE_STRSTR(resp, "topsecret") == NULL, "secret must not leak"); free(resp); resp = NULL;
 
+    /* ':' is the schema.conf field separator: an object named "a:8" wrote a
+       corrupt schema line and made the whole DB root unstartable. */
+    tc_request(tc,
+        "{\"mode\":\"create-object\",\"dir\":\"tenant_a\",\"object\":\"a:8\","
+        "\"splits\":16,\"max_key\":16,\"fields\":[\"v:varchar:32\"]}", &resp);
+    ASSERT_CONTAINS(resp, "invalid object name", "create-object rejects ':' in name"); free(resp); resp = NULL;
+
     /* Sanity: a normal object name still works. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"tenant_a\",\"object\":\"orders\","

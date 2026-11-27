@@ -1,7 +1,7 @@
 <!--
   GENERATED FILE — do not hand-edit.
-  Source: https://github.com/sayyiditow/dev-standards/blob/5a779c1/CORE-PROCESS.md
-  Synced: 2026-11-08
+  Source: https://github.com/sayyiditow/dev-standards/blob/54decd6/CORE-PROCESS.md
+  Synced: 2026-11-25
   To update: edit CORE-PROCESS.md in dev-standards, then re-run sync.sh against this repo.
 -->
 
@@ -135,22 +135,53 @@ Specify behavior, not keystrokes. A plan is complete when:
 
 #### 1c. Blind review loop (before the human sees it)
 
-Review the plan until it converges. Each round:
+Review the plan until it converges, without losing findings and without
+re-paying for what is already settled.
 
-1. Spawn a **fresh** reviewer that sees only the plan file and the repo —
-   not the planner's reasoning, not earlier rounds' findings. Fresh each
-   round, so it cannot anchor.
-2. Run two lenses: (a) the **Review lenses** above applied to the plan,
-   plus missed call sites and wrong assumptions about the code; (b) an
-   **executor dry-run**: "could you implement this without asking a
-   question or improvising?" Every point where it would have to guess is a
-   finding.
-3. The planner fixes blockers and majors (minors at discretion), updates
-   the Brief's decision table and review log, and starts the next round.
+**Findings ledger.** Keep one working file for the reviews only: every
+finding from every round, with its severity, the code evidence behind it, and
+how it was resolved. Findings are never dropped; the ledger is the record.
+It is a review aid, not a deliverable: keep it out of version control (a
+scratch directory, or a locally ignored path such as one listed in
+`.git/info/exclude`) and never commit or push it. **Delete it once the human
+approves the plan** (step 2); the Brief's review log, which is committed with
+the plan, carries the summary, so no review files are left behind.
 
-Exit when a round returns **zero blockers and zero majors**. Cap at 4
-rounds; if it hasn't converged, stop and escalate to the human with the
-unresolved disagreement rather than looping.
+**Severity tags.** Besides blocker / major / minor, tag every blocker and
+major as **silent-damage** (lock-out of a valid existing state, data lost or
+hidden, a downgrade or rollback that corrupts, a security hole, a wrong result
+nobody would notice) or **clarity** (an executor would have to guess or ask,
+or a test would go red, but the failure is loud: a halt, a compile error, a
+failing test).
+
+**Round 1 (full).** Spawn a **fresh** reviewer that sees only the plan file
+and the repo — not the planner's reasoning, not earlier findings. Two lenses:
+(a) the **Review lenses** above applied to the plan, plus missed call sites
+and wrong assumptions about the code; (b) an **executor dry-run**: "could you
+implement this without asking a question or improvising?" Every point where it
+would have to guess is a finding.
+
+**Later rounds (delta).** Spawn a fresh reviewer that sees the plan file, the
+repo, the ledger, and the diff of the plan since the previous round. It checks
+the changed text and everything that text depends on, in full, under both
+lenses; it does not re-verify ledger items (it may reopen one only with
+contradicting evidence); it reports anything wrong it happens to notice
+elsewhere. Use the strongest model for round 1 and for the round that is
+expected to be final; a cheaper model is acceptable in between.
+
+After each round the planner fixes blockers and majors (minors at
+discretion), updates the ledger, the Brief's decision table and review log.
+
+**Exit** when a round returns **zero blockers and zero silent-damage
+majors**. Clarity majors and minors found in that round are fixed in place
+without another round, unless a fix changes behaviour (then it is a changed
+section and gets a delta round). Cap at 4 rounds; if it hasn't converged,
+stop and escalate to the human with the unresolved disagreement rather than
+looping. The human may request extra rounds.
+
+A plan whose factual claims about the code are turned into diagnostic tasks
+with a halt condition (see 1b) lets the executor catch loud errors cheaply;
+that does not replace review of silent-damage risks.
 
 #### 1d. Ready for approval
 

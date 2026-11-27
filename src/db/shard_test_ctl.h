@@ -41,6 +41,11 @@ typedef enum {
                                        caller's queue push and before the
                                        blocking lock — a hit proves the
                                        caller is queued. */
+    SHARD_TEST_PHASE_ABANDONED,       /* the durable abandoned-reservation
+                                       tombstone sync that runs BEFORE a
+                                       publishing window's marker; a fault
+                                       here must leave the window
+                                       unpublished. */
     SHARD_TEST_PHASE_COUNT
 } ShardTestPhase;
 
@@ -141,7 +146,10 @@ extern _Atomic size_t g_shard_test_kf_max_slots;
 enum {
     SHARD_TEST_BMFIX_PREPARE = 1,      /* fail bitmap prepare/stage */
     SHARD_TEST_BMFIX_COMMIT_SYNC = 2,  /* unconfirmed commit msync */
-    SHARD_TEST_BMFIX_RENAME = 3        /* fail the keyfile rename */
+    SHARD_TEST_BMFIX_RENAME = 3,       /* fail the keyfile rename */
+    SHARD_TEST_BMFIX_KF_MSYNC = 4,     /* fail the rebuilt keyfile's msync (resplit) */
+    SHARD_TEST_BMFIX_KF_DIRSYNC = 5,   /* fail the post-rename directory fsync */
+    SHARD_TEST_BMFIX_COMPACT_KFSYNC = 6 /* fail the keyfile sync before a compaction donor is dropped */
 };
 extern _Atomic int g_shard_test_bmfix_fault_mode;
 extern _Atomic int g_shard_test_bmfix_fault_count;
@@ -160,6 +168,22 @@ extern _Atomic int g_shard_test_bmlock_log;
 extern _Atomic int g_shard_test_json_escape_fail;
 typedef void (*shard_db_test_gate_fn)(void *ctx);
 void shard_db_test_set_find_flush_gate_hook(shard_db_test_gate_fn fn, void *ctx);
+
+/* Restore fault seams (query_maint.c); one-shot per bit. */
+enum {
+    SHARD_TEST_RF_COMMIT_DIRSYNC   = 1,   /* commit: dir syncs after the renames */
+    SHARD_TEST_RF_UNSWAP_DIRSYNC   = 2,   /* commit: fsync_dir(stage) after unlink(SWAP) */
+    SHARD_TEST_RF_SWAP_RECREATE    = 4,   /* re-creating SWAP after 2 failed */
+    SHARD_TEST_RF_ROLLBACK_RENAME  = 8,   /* rollback: rename(old/<name>, live) */
+    SHARD_TEST_RF_ROLLBACK_DIRSYNC = 16,  /* rollback: closing dir syncs */
+    SHARD_TEST_RF_SWAP_RENAME      = 32,  /* forward swap: rename(new/<name>, live) at index */
+    SHARD_TEST_RF_STAGE_COPY       = 64,  /* staging copy fails before any copy */
+    SHARD_TEST_RF_SCHEMA_INSTALL   = 128  /* schema.conf line install fails */
+};
+enum { SHARD_TEST_RESTORE_PARK_SWAPPED = 1, SHARD_TEST_RESTORE_PARK_COMMITTED = 2 };
+extern _Atomic int g_restore_test_fault_mask;
+extern _Atomic int g_restore_test_swap_rename_at;   /* 0-based swap-name index */
+void shard_db_test_set_restore_park_hook(int site, shard_db_test_gate_fn fn, void *ctx);
 
 static inline void shard_test_ctl_reset(void) {
     for (int i = 0; i < SHARD_TEST_PHASE_COUNT; i++)
@@ -184,6 +208,8 @@ static inline void shard_test_ctl_reset(void) {
     atomic_store(&g_shard_test_bmfix_backoff_ms, 0);
     atomic_store(&g_shard_test_bmlock_log, 0);
     atomic_store(&g_shard_test_json_escape_fail, 0);
+    atomic_store(&g_restore_test_fault_mask, 0);
+    atomic_store(&g_restore_test_swap_rename_at, 0);
     atomic_store(&g_shard_test_gate_held_max, 0);
     atomic_store(&g_shard_test_bulk_chains, 0);
     atomic_store(&g_shard_test_res_checks, 0);

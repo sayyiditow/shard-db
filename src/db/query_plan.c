@@ -3617,6 +3617,17 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
         CriteriaNode *orn = find_fully_indexed_or(tree, db_root, object);
         if (orn) {
             fp.kind = FP_UNION; fp.or_node = orn;
+            /* (nL==0 rule): for a pure CNODE_OR root the union is
+             * exact and has_subtree stays 0 (memset). But this block also
+             * serves a CNODE_AND whose children are ALL OR nodes;
+             * find_fully_indexed_or unions only the FIRST fully-indexed OR
+             * child, so with more than one child the union is PARTIAL — the
+             * other conjuncts are not narrowed anywhere. Mark the plan
+             * "not fully represented" so the no-fetch fast paths refuse it
+             * (the common array form [{"or":[...]}] is an AND with a single
+             * OR child: exact union, flag stays 0, fast paths retained). */
+            if (tree->kind == CNODE_AND && tree->n_children > 1)
+                fp.has_subtree = 1;
             goto order_overlay;
         }
         fp.kind = FP_FULL_SCAN; return fp;
@@ -3629,13 +3640,25 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
      * sub-tree is present (the seed leaf still uses its index; the OR is
      * verified on each fetched record). */
     int has_subtree = 0;
+    int n_leaf_children = 0;
     if (tree->kind == CNODE_AND)
-        for (int i = 0; i < tree->n_children; i++)
+        for (int i = 0; i < tree->n_children; i++) {
             if (tree->children[i]->kind != CNODE_LEAF) has_subtree = 1;
-    /* has_subtree forces full-tree recheck in 1c; add a FilterPlan field then.
-     * The single-seed block below already post-filters all non-source leaves,
-     * and 1c will recheck the whole tree on each fetched record. */
-    (void)has_subtree;
+            else n_leaf_children++;
+        }
+    /* An AND with more than MAX_INTERSECT_LEAVES LEAF children
+     * loses leaves 9+ in collect_and_leaves — they appear in NEITHER the
+     * source nor the postfilter list (n_postfilter == 0), exactly like an OR
+     * sub-tree. Mark the plan "not fully represented" so the no-fetch fast
+     * paths refuse it. (Inside the has_subtree computation, BEFORE the store
+     * below: the composite-exact and FULL_SCAN early returns further down
+     * must carry the flag too.) */
+    if (tree->kind == CNODE_AND && n_leaf_children > MAX_INTERSECT_LEAVES)
+        has_subtree = 1;
+    /* Carry the flag on the plan (replaces (void)has_subtree).
+     * Consumers: agg_criteria_fully_covered, IGB can_slot, TopN refusal,
+     * keyset_agg_from_intersect's restore condition. */
+    fp.has_subtree = has_subtree;
 
     CardEst est[MAX_INTERSECT_LEAVES];
 
@@ -3727,8 +3750,22 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
 
     /* Phase B: a composite fully pinned by eq leaves → exact key lookup,
      * skipping the two-index intersect. Only without order_by (Phase A owns
-     * ordered prefix scans). */
-    if (!(order_by && order_by[0]) && nL >= 2) {
+     * ordered prefix scans).
+     *
+     * Only record-FETCHING callers may receive this plan: find serves it
+     * via find_via_composite_key (D1). Callers that fetch no records
+     * (count, aggregate, the bulk keyset materializer, cursor totals —
+     * all pass fetching=0) have no composite-exact executor, so the
+     * composite-exact step is turned OFF for them right here, at the
+     * single decision point: the composite-covered eq leaves compete as
+     * ordinary leaves instead, and the normal ranking picks the best
+     * plan that still uses indexes — a standalone-index leaf or an
+     * intersect (FULL_SCAN only if nothing is indexed). Re-planning here
+     * replaced the former per-consumer normalizations, which forced
+     * those callers to FULL_SCAN after the fact — needlessly slow
+     * whenever a covered leaf is independently indexed, and it
+     * duplicated the same explanation at every consumer. */
+    if (fetching && !(order_by && order_by[0]) && nL >= 2) {
         char cname[256];
         if (find_exact_covering_composite(db_root, object, fs, leaves, nL, cname)) {
             fp.kind = FP_PRIMARY_LEAF;
@@ -3745,7 +3782,59 @@ FilterPlan plan_filter(CriteriaNode *tree, const char *db_root,
                 for (int i=0;i<nL;i++)
                     if (leaves[i]->op==OP_EQUAL && strcmp(leaves[i]->field,sub)==0)
                         { fp.source_leaves[fp.n_source++]=leaves[i]; break; }
-            return fp;
+            /* Find shapes the D1 executor does not serve (format=csv,
+             * format=rows, joins) fall through to the generic leaf
+             * dispatch, which drives on source_leaves[0]: if the first
+             * covered part has no standalone index, that dispatch
+             * collects nothing and the response comes back empty
+             * (header-only CSV / [] / empty join) while default format
+             * returns the rows. Put a covered leaf that HAS its own
+             * standalone index first — the generic dispatch seeds on it
+             * and the siblings post-filter. build_exact_composite_key
+             * matches leaves by FIELD NAME, so D1's key rebuild is
+             * order-agnostic and the swap is safe there.
+             *
+             * If NO covered leaf has a standalone index, KEEP the exact
+             * plan anyway (dropping it demoted e.g. indexes ["a+b","c"]
+             * with criteria a=1,b=0,c>=0 to a full scan when the
+             * remaining range leaf is broad): the default format serves
+             * it via D1 unchanged. Give the generic dispatch a real
+             * seed by putting leaves[prim] — the ranking's chosen leaf,
+             * indexed by construction (prim is only ever set on an
+             * indexed leaf, and prim >= 0 is required to reach Phase B)
+             * — at source_leaves[0], the covered leaves after it.
+             * build_exact_composite_key matches parts by FIELD NAME, so
+             * D1's rebuild is order-agnostic and tolerates the extra
+             * seed leaf; the covered leaves stay in the tree for
+             * post-filtering. n_source cannot overflow: prim is a
+             * NON-covered leaf here (no covered leaf is indexed), so
+             * covered <= nL-1 <= MAX_INTERSECT_LEAVES-1. */
+            int covered_standalone = -1;
+            for (int i = 0; i < fp.n_source; i++)
+                if (pick_index_for_leaf_schema(fs ? fs->ts : NULL, db_root,
+                                               object,
+                                               fp.source_leaves[i]) >= 0) {
+                    covered_standalone = i;
+                    break;
+                }
+            if (covered_standalone < 0) {
+                if (fp.n_source < MAX_INTERSECT_LEAVES && prim >= 0 &&
+                    prim < nL) {
+                    SearchCriterion *seed = leaves[prim];
+                    for (int i = fp.n_source; i > 0; i--)
+                        fp.source_leaves[i] = fp.source_leaves[i - 1];
+                    fp.source_leaves[0] = seed;
+                    fp.n_source++;
+                }
+                return fp;
+            } else if (covered_standalone != 0) {
+                SearchCriterion *sw = fp.source_leaves[0];
+                fp.source_leaves[0] = fp.source_leaves[covered_standalone];
+                fp.source_leaves[covered_standalone] = sw;
+                return fp;
+            } else {
+                return fp;
+            }
         }
     }
 
@@ -4034,15 +4123,18 @@ int agg_criteria_fully_covered(const char *db_root, const char *object,
     if (!tree) return 1;
     /* Phase 1c.5: equivalent to (PRIMARY_INTERSECT && !partial) ||
      * PRIMARY_KEYSET || (PRIMARY_LEAF && single_leaf).
-     * n_postfilter == 0 means every leaf is in the source set; nothing
-     * is left to verify per-record, so the index walk alone covers the
-     * full criteria tree. */
+     * n_postfilter == 0 means every leaf is in the source set, and
+     * has_subtree == 0 means the tree carries no OR / nested-AND
+     * sub-tree and lost no leaves to the MAX_INTERSECT_LEAVES cap —
+     * nothing is left to verify per-record, so the index walk alone
+     * covers the full criteria tree. */
     FieldSchema fs; init_field_schema(&fs, db_root, object);
     Schema sc = load_schema(db_root, object);
     size_t N = (size_t)get_live_count(db_root, object);
     FilterPlan fp = plan_filter(tree, db_root, object, &fs, sc.splits, N,
                                 NULL /*order_by*/, 0 /*fetching*/, 0 /*limit*/);
-    return (fp.kind != FP_FULL_SCAN && fp.n_postfilter == 0);
+    return (fp.kind != FP_FULL_SCAN && fp.n_postfilter == 0 &&
+            !fp.has_subtree);
 }
 
 #ifdef TEST_BUILD

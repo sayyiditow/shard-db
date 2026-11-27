@@ -1,0 +1,1078 @@
+# audit-fault-inject
+shard-db listening on port 58293 (pid=684122, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 58293 (pid=684216, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-1/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db stopped (pid=684216)
+# fault scenario 1: ok (kind=0, ops acked 24, model live 0)shard-db: failed to stamp compatible database version
+shard-db listening on port 55335 (pid=684508, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=684508)
+# fault scenario 2: ok (kind=0, ops acked 0, model live 0)shard-db listening on port 42025 (pid=684598, workers=16, timeout=0s, tls=off)
+shard-db listening on port 42025 (pid=684684, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=684684)
+# fault scenario 3: ok (kind=0, ops acked 24, model live 8)shard-db listening on port 41143 (pid=684773, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 41143 (pid=684885, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-4/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db stopped (pid=684885)
+# fault scenario 4: ok (kind=4, ops acked 24, model live 0)shard-db listening on port 54493 (pid=685051, workers=16, timeout=0s, tls=off)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+2026-11-19 11:19:03 ERROR [durability] kf shard 4: retained commit marker /tmp/shard-db-auditfault-684120-5/db/default/fo/data/kf/004_batch_0_marker.dat; attempting synchronous forward replay
+shard-db listening on port 54493 (pid=685138, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=685138)
+shard-db listening on port 53191 (pid=685227, workers=16, timeout=0s, tls=off)
+shard-db listening on port 53191 (pid=685313, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=685313)
+# fault scenario 6: ok (kind=1, ops acked 24, model live 9)shard-db listening on port 60119 (pid=685402, workers=16, timeout=0s, tls=off)
+1 errors during bulk insert (see info log for dropped keys)
+1 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 60119 (pid=685488, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=685488)
+shard-db listening on port 55013 (pid=685577, workers=16, timeout=0s, tls=off)
+shard-db listening on port 55013 (pid=685663, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=685663)
+# fault scenario 8: ok (kind=2, ops acked 24, model live 17)shard-db listening on port 34745 (pid=685752, workers=16, timeout=0s, tls=off)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 34745 (pid=685838, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=685838)
+# fault scenario 9: ok (kind=6, ops acked 24, model live 1)shard-db: refusing to start: crash recovery failed; manual investigation required
+shard-db listening on port 59679 (pid=686091, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=686091)
+# fault scenario 10: ok (kind=3, ops acked 0, model live 0)shard-db listening on port 49027 (pid=686180, workers=16, timeout=0s, tls=off)
+shard-db listening on port 49027 (pid=686266, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=686266)
+# fault scenario 11: ok (kind=7, ops acked 24, model live 15)shard-db listening on port 43859 (pid=686355, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db listening on port 43859 (pid=686447, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-12/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db stopped (pid=686447)
+# fault scenario 12: ok (kind=5, ops acked 24, model live 0)shard-db listening on port 40363 (pid=686552, workers=16, timeout=0s, tls=off)
+1 errors during bulk insert (see info log for dropped keys)
+1 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 40363 (pid=686638, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=686638)
+shard-db: refusing to start: crash recovery failed; manual investigation required
+shard-db listening on port 40649 (pid=686777, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=686777)
+# fault scenario 14: ok (kind=1, ops acked 0, model live 0)shard-db listening on port 43285 (pid=686866, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 43285 (pid=687000, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-15/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db stopped (pid=687000)
+# fault scenario 15: ok (kind=4, ops acked 24, model live 0)shard-db listening on port 55337 (pid=687094, workers=16, timeout=0s, tls=off)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 55337 (pid=687180, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=687180)
+# fault scenario 16: ok (kind=6, ops acked 24, model live 0)shard-db: failed to stamp compatible database version
+shard-db listening on port 37345 (pid=687317, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=687317)
+# fault scenario 17: ok (kind=3, ops acked 0, model live 0)shard-db: cannot open DB root lock /tmp/shard-db-auditfault-684120-18/db/.shard-db.lock: Too many open files
+shard-db listening on port 50671 (pid=687479, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=687479)
+# fault scenario 18: ok (kind=3, ops acked 0, model live 0)shard-db listening on port 33459 (pid=687568, workers=16, timeout=0s, tls=off)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 33459 (pid=687654, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=687654)
+shard-db listening on port 53775 (pid=687743, workers=16, timeout=0s, tls=off)
+1 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 53775 (pid=687829, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=687829)
+shard-db listening on port 45767 (pid=687918, workers=16, timeout=0s, tls=off)
+1 errors during bulk insert (see info log for dropped keys)
+1 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 45767 (pid=688004, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=688004)
+shard-db listening on port 56109 (pid=688093, workers=16, timeout=0s, tls=off)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+2026-11-19 11:21:41 ERROR [durability] kf shard 7: retained commit marker /tmp/shard-db-auditfault-684120-22/db/default/fo/data/kf/007_batch_0_marker.dat; attempting synchronous forward replay
+shard-db listening on port 56109 (pid=688179, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=688179)
+shard-db listening on port 60593 (pid=688268, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db listening on port 60593 (pid=688389, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-23/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db stopped (pid=688389)
+# fault scenario 23: ok (kind=5, ops acked 24, model live 0)shard-db listening on port 39073 (pid=688511, workers=16, timeout=0s, tls=off)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+4 errors during bulk insert (see info log for dropped keys)
+2026-11-19 11:22:00 ERROR [durability] kf shard 3: retained commit marker /tmp/shard-db-auditfault-684120-24/db/default/fo/data/kf/003_batch_0_marker.dat; attempting synchronous forward replay
+shard-db listening on port 39073 (pid=688597, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=688597)
+shard-db: index temporary cleanup failed for DB_ROOT=/tmp/shard-db-auditfault-684120-25/db: Input/output error
+shard-db: shard_db_open_internal failed for DB_ROOT=/tmp/shard-db-auditfault-684120-25/db
+shard-db listening on port 43201 (pid=688787, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=688787)
+# fault scenario 25: ok (kind=1, ops acked 0, model live 0)shard-db listening on port 59429 (pid=688876, workers=16, timeout=0s, tls=off)
+1 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 59429 (pid=688962, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=688962)
+shard-db listening on port 53185 (pid=689051, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db listening on port 53185 (pid=689141, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-27/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db stopped (pid=689141)
+# fault scenario 27: ok (kind=1, ops acked 24, model live 0)shard-db listening on port 54185 (pid=689242, workers=16, timeout=0s, tls=off)
+1 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 54185 (pid=689330, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=689330)
+shard-db: refusing to start: crash recovery failed; manual investigation required
+shard-db listening on port 45647 (pid=689454, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=689454)
+# fault scenario 29: ok (kind=2, ops acked 0, model live 0)shard-db listening on port 60515 (pid=689543, workers=16, timeout=0s, tls=off)
+shard-db listening on port 60515 (pid=689629, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=689629)
+# fault scenario 30: ok (kind=0, ops acked 24, model live 18)shard-db listening on port 55725 (pid=689718, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db listening on port 55725 (pid=689808, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-31/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db stopped (pid=689808)
+# fault scenario 31: ok (kind=1, ops acked 24, model live 0)shard-db listening on port 35359 (pid=689909, workers=16, timeout=0s, tls=off)
+1 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 35359 (pid=689995, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=689995)
+shard-db: failed to stamp compatible database version
+shard-db listening on port 50517 (pid=690167, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=690167)
+# fault scenario 33: ok (kind=6, ops acked 0, model live 0)shard-db listening on port 52961 (pid=690257, workers=16, timeout=0s, tls=off)
+shard-db listening on port 52961 (pid=690343, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=690343)
+# fault scenario 34: ok (kind=7, ops acked 24, model live 12)shard-db listening on port 60403 (pid=690432, workers=16, timeout=0s, tls=off)
+shard-db listening on port 60403 (pid=690518, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=690518)
+# fault scenario 35: ok (kind=4, ops acked 24, model live 16)shard-db listening on port 53463 (pid=690607, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db listening on port 53463 (pid=690699, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-36/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db stopped (pid=690699)
+# fault scenario 36: ok (kind=4, ops acked 24, model live 0)shard-db: index temporary cleanup failed for DB_ROOT=/tmp/shard-db-auditfault-684120-37/db: Too many open files
+shard-db: shard_db_open_internal failed for DB_ROOT=/tmp/shard-db-auditfault-684120-37/db
+shard-db listening on port 46133 (pid=690875, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=690875)
+# fault scenario 37: ok (kind=4, ops acked 0, model live 0)shard-db listening on port 48915 (pid=690964, workers=16, timeout=0s, tls=off)
+shard-db listening on port 48915 (pid=691050, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=691050)
+# fault scenario 38: ok (kind=7, ops acked 24, model live 15)shard-db listening on port 52279 (pid=691139, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db listening on port 52279 (pid=691237, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-39/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db stopped (pid=691237)
+# fault scenario 39: ok (kind=5, ops acked 24, model live 0)shard-db: cannot open DB root lock /tmp/shard-db-auditfault-684120-40/db/.shard-db.lock: Too many open files
+shard-db listening on port 60945 (pid=691400, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=691400)
+# fault scenario 40: ok (kind=5, ops acked 0, model live 0)shard-db listening on port 36815 (pid=691489, workers=16, timeout=0s, tls=off)
+shard-db listening on port 36815 (pid=691575, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=691575)
+# fault scenario 41: ok (kind=5, ops acked 24, model live 18)shard-db listening on port 35937 (pid=691664, workers=16, timeout=0s, tls=off)
+shard-db listening on port 35937 (pid=691750, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=691750)
+# fault scenario 42: ok (kind=4, ops acked 24, model live 9)shard-db: failed to stamp compatible database version
+shard-db listening on port 53205 (pid=691891, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=691891)
+# fault scenario 43: ok (kind=3, ops acked 0, model live 0)shard-db listening on port 42393 (pid=691981, workers=16, timeout=0s, tls=off)
+1 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 42393 (pid=692067, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=692067)
+shard-db listening on port 51061 (pid=692156, workers=16, timeout=0s, tls=off)
+shard-db listening on port 51061 (pid=692242, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=692242)
+# fault scenario 45: ok (kind=7, ops acked 24, model live 17)shard-db listening on port 59285 (pid=692331, workers=16, timeout=0s, tls=off)
+shard-db listening on port 59285 (pid=692417, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=692417)
+# fault scenario 46: ok (kind=0, ops acked 24, model live 12)shard-db listening on port 33731 (pid=692506, workers=16, timeout=0s, tls=off)
+1 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 33731 (pid=692592, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=692592)
+shard-db: failed to stamp compatible database version
+shard-db listening on port 54351 (pid=692749, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=692749)
+# fault scenario 48: ok (kind=1, ops acked 0, model live 0)shard-db listening on port 41801 (pid=692838, workers=16, timeout=0s, tls=off)
+2 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 41801 (pid=692924, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=692924)
+shard-db listening on port 37895 (pid=693013, workers=16, timeout=0s, tls=off)
+4 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 37895 (pid=693099, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=693099)
+# fault scenario 50: ok (kind=6, ops acked 24, model live 1)shard-db listening on port 52245 (pid=693195, workers=16, timeout=0s, tls=off)
+shard-db listening on port 52245 (pid=693281, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=693281)
+# fault scenario 51: ok (kind=7, ops acked 24, model live 17)shard-db: stamp commit uncertain; retry startup to verify .version
+shard-db listening on port 58191 (pid=693408, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=693408)
+# fault scenario 52: ok (kind=6, ops acked 0, model live 0)shard-db listening on port 59367 (pid=693497, workers=16, timeout=0s, tls=off)
+shard-db listening on port 59367 (pid=693583, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=693583)
+# fault scenario 53: ok (kind=1, ops acked 24, model live 16)shard-db listening on port 53359 (pid=693672, workers=16, timeout=0s, tls=off)
+shard-db listening on port 53359 (pid=693758, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=693758)
+# fault scenario 54: ok (kind=7, ops acked 24, model live 12)shard-db listening on port 56549 (pid=693847, workers=16, timeout=0s, tls=off)
+shard-db listening on port 56549 (pid=693933, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=693933)
+# fault scenario 55: ok (kind=5, ops acked 24, model live 15)shard-db listening on port 39731 (pid=694022, workers=16, timeout=0s, tls=off)
+shard-db listening on port 39731 (pid=694108, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=694108)
+# fault scenario 56: ok (kind=7, ops acked 24, model live 11)shard-db listening on port 55055 (pid=694197, workers=16, timeout=0s, tls=off)
+1 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 55055 (pid=694283, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=694283)
+shard-db listening on port 42941 (pid=694372, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+4 errors during bulk insert (see info log for dropped keys)
+shard-db listening on port 42941 (pid=694461, workers=16, timeout=0s, tls=off)
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+slotcask_registry: open failed for /tmp/shard-db-auditfault-684120-58/db/default/fo: Invalid or incomplete multibyte or wide character
+shard-db stopped (pid=694461)
+# fault scenario 58: ok (kind=4, ops acked 24, model live 0)shard-db: stamp commit uncertain; retry startup to verify .version
+shard-db listening on port 53185 (pid=694619, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=694619)
+# fault scenario 59: ok (kind=3, ops acked 0, model live 0)shard-db: stamp commit uncertain; retry startup to verify .version
+shard-db listening on port 43511 (pid=694768, workers=16, timeout=0s, tls=off)
+shard-db stopped (pid=694768)
+# fault scenario 60: ok (kind=1, ops acked 0, model live 0)not ok 1 - audit-fault-inject: 45/60 scenarios passed (log: /tmp/shard-db-audit-logs)
+#   expected 0 got 15
+# audit-fault-inject: 0 passed, 1 failed

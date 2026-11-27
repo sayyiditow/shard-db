@@ -1,0 +1,22 @@
+# AUD-QRY-4 Task 3 revert-prove (2026-11-22)
+# Method: whole-file `git stash push -m 'AUD-QRY-4 revert-prove ...' -- src/db/query.c`
+# (per the plan's sanctioned method: no pre-fix snapshot existed for query.c because
+# QRY-8's count guard was already uncommitted in it).
+# LIFT-NOTE: the stash lifts BOTH fix sets in query.c — QRY-8's count-branch guard
+# (query.c:~7124) AND QRY-4's find-total changes. The QRY-4 reds are UNAFFECTED by
+# QRY-8's absence: that guard is count-mode-only and never touches any find path
+# (verified in the plan's Task 0; the red shapes below are all find+total).
+
+=== GREEN (fix in tree, pre-stash): 9888 passed, 0 failed
+   (case1 total 100→20 fixed; case2 160→106; case3 rows+total 6000→3250;
+    case4 "total":0→27 exact; case3b controls green; pure-OR / leaf-only controls green)
+
+=== RED (fix stashed, base query.c): 6633 passed, 5 failed — identical to the
+#   Task 1 base proof (reviewer's exact numbers):
+not ok 116 - case1: total (100) == oracle count (20)          [streaming gate, FP_PRIMARY_LEAF + OR sub-tree]
+not ok 119 - case2: total (160) == oracle count (106)         [partial union inside AND]
+not ok 122 - case3: rows (6000) == oracle rows (3250)         [large intersect >MAX_INTERSECT_LEAVES]
+not ok 125 - case3: total (6000) == oracle count (3250)       [same shape, total field]
+not ok 6631 - case4: total exact (0 == 27) or null — never wrong   [declined-total class]
+
+=== GREEN (git stash pop, fix restored): 9888 passed, 0 failed (rebuild clean)

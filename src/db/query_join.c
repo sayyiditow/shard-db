@@ -239,16 +239,22 @@ static int join_candidate_components(const JoinSpec *j,const char *root,
     const uint8_t *key,size_t keylen,const JoinComponent *parts,size_t count,
     size_t budget,RecordRef *out){
     JoinCandidates candidates={0};
-    btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
-                     (const char*)key+1,keylen-1,join_candidate_cb,&candidates);
+    if(btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
+                        (const char*)key+1,keylen-1,join_candidate_cb,&candidates)!=0){
+        errno=EIO;   /* a remote index shard could not be opened — never
+                        render as "invalid typed record" */
+        return -1;
+    }
     size_t capacity=atomic_load_explicit(&candidates.count,memory_order_relaxed);
     if(!capacity)return 0;
     if(capacity>budget/sizeof(*candidates.hashes)){errno=ENOBUFS;return -1;}
     candidates.hashes=malloc(capacity*sizeof(*candidates.hashes));
     if(!candidates.hashes)return -1;
     candidates.cap=capacity;atomic_store_explicit(&candidates.count,0,memory_order_relaxed);
-    btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
-                     (const char*)key+1,keylen-1,join_candidate_cb,&candidates);
+    if(btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
+                        (const char*)key+1,keylen-1,join_candidate_cb,&candidates)!=0){
+        int error=errno;free(candidates.hashes);errno=error?error:EIO;return -1;
+    }
     size_t actual=atomic_load_explicit(&candidates.count,memory_order_relaxed);
     if(actual>capacity){free(candidates.hashes);errno=ENOBUFS;return -1;}
     int found=0;
@@ -360,8 +366,13 @@ int resolve_join_record(const JoinSpec *j,const char *root,
     if(l||r||!used)return 0;
     if(ambiguous)return join_candidate_components(j,root,key,used,parts,count,budget,out);
     JoinBtHit hit={{0},0};
-    btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
-                     (const char*)key+1,used-1,join_bt_first_cb,&hit);
+    if(btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
+                        (const char*)key+1,used-1,join_bt_first_cb,&hit)!=0){
+        errno=EIO;   /* fail closed: a remote index shard could not be
+                        opened, and "no match" would silently drop the row
+                        (inner) or emit a false null (left) */
+        return -1;
+    }
     if(!atomic_load_explicit(&hit.found,memory_order_acquire))return 0;
     return read_record_ref(root,j->object,&j->remote_sch,hit.hash,out)==0;
 }

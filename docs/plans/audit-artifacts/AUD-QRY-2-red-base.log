@@ -1,0 +1,23 @@
+# AUD-QRY-2 Task 1 RED proof on base (audit-base + QRY-1 branch state, uncommitted)
+# 2026-11-20; build rc=0; run rc=17 (17 failed as planned)
+
+RED (17): cases 1, 2, 3, 4, 5, 7, 9, 10, 12, 13 — exactly the plan's predicted red set:
+not ok 105 - case1: scalar OR mixed-indexed matches oracle
+not ok 108 - case2: scalar OR all-indexed matches oracle
+not ok 111 - case3: label 0 vector match
+not ok 113 - case3: label 2 vector match
+not ok 114 - case3: label 3 vector match
+not ok 115 - case3: label 4 vector match
+not ok 119 - case4: label 1 vector match
+not ok 127 - case5: TopN OR matches oracle
+not ok 128 - case5: TopN OR matches oracle
+not ok 134 - case7: AND-of-ORs matches oracle
+not ok 137 - case9: large intersect+OR matches oracle
+not ok 141 - case10: label 1 vector match
+not ok 156 - case12: label 0 vector match
+not ok 157 - case12: label 1 vector match
+not ok 159 - case12: label 3 vector match
+not ok 160 - case12: label 4 vector match
+not ok 168 - case13: label 1 vector match
+
+GREEN as planned: case 6 (intersect relocation — small_primary restores the tree at fixture scale), case 11 (array-form union control: explain plan=union + exact result), all controls (postfilter-leaf scalar, fully-indexed AND, no-criteria popcount), and case 12's count-MODE cross-check (count executor re-checks; the AGGREGATE count(*) fast path is the defect itself — the first draft used it as the oracle and got the expected extra red, corrected to mode-count before this final run).

@@ -56,7 +56,7 @@ Offset  Size  Field        Notes
 
 `total` is the resplit trigger — tombstones still create probe-chain pressure, so the shard doubles based on `total`, not `total − deleted`. `live = total − deleted` is computed when callers need it (no separate counter).
 
-Updates to the header happen under the shard's wrlock (acquired via `kfcache_acquire(writer=1)`); no atomics required. This is the single source of truth for record counts in v2 — `size`, `orphaned`, `recount` all read it directly. `recount` is no longer needed post-crash because the header is durable in the page cache.
+Updates to the header happen under the shard's wrlock (acquired via `kfcache_acquire(writer=1)`); no atomics required. This is the single source of truth for record counts in v2 — `size`, `orphaned`, `recount` all read it directly. `recount` is no longer needed post-crash because the header is durable in the page cache. `deleted` counts every tombstoned slot, including the reservation of a record a bulk insert rejected after reserving its slot (for example by a bitmap distinct-value cap): those records never existed, yet `orphaned`, `vacuum-check` and the auto-vacuum thresholds count them until the next `vacuum` (or reshard) rebuilds the header. `count` is unaffected (`live = total − deleted`).
 
 ### Slot entry (24 bytes)
 

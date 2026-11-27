@@ -1,0 +1,20 @@
+# AUD-QRY-8 Task 1 RED proof on base (2026-11-20) — build rc=0, case rc=5; 88 passed / 5 failed
+# Final clean run. (Two earlier drafts had test-only bugs: a %s-NULL in scalar_count's no-criteria
+#  call and a wrong "deleted": parse offset — both verified against a standalone-daemon probe where
+#  bulk-delete behaved CORRECTLY ({"matched":50,"deleted":50,"skipped":0}, post-count 250).
+#  Decision 3's bulk-delete extension is NOT needed: safe-by-accident confirmed on this base.)
+
+RED (5) — exactly the plan's prediction:
+not ok 23 - case1: count composite-exact
+not ok 25 - case2: aggregate count composite-exact
+not ok 27 - case3: aggregate count ce_mix
+not ok 30 - case4: group_by=c composite-exact
+not ok 33 - case5: TopN composite-exact
+  case1: count composite-exact      (0 vs oracle 50)
+  case2: aggregate count ce_comp    (0 vs 50)
+  case3: aggregate count ce_mix     (100 vs 50 — b ignored via the standalone-index variant)
+  case4: group_by=c vector          (phantom-leaf walk vs oracle vector)
+  case5: TopN sequence              ([] vs oracle top-3)
+
+GREEN (as planned): case 6 find control (D1 path exact), case 7 explain composite_exact control,
+case 8 bulk-delete (50 deleted, 250 remain), case 9 single-leaf control.

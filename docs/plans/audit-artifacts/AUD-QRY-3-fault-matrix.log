@@ -1,0 +1,10 @@
+# AUD-QRY-3 Task 4.2/4.5 fault-harness cross-checks (2026-11-20, post-fix)
+
+=== Seed-3 cross-check (the original repro): SHARD_AUDIT_FAULT_FIRST_SEED=3 SEEDS=1 OPS=24
+# audit-fault-inject: 1 passed, 0 failed — the count violation is GONE
+
+=== 15-seed matrix: SHARD_AUDIT_FAULT_SEEDS=15 OPS=24 -> 13/15 ok
+# Failing: scenarios 5 and 7 — exactly the AUD-HARN-3 phantom class the index records
+# ('current code 2/15 — seeds 5/7/13 phantoms are values from unacked ops that landed');
+# seed 13 now passes. ZERO count-violation/resurrection lines in the matrix log —
+# per the plan: 'AUD-HARN-3 phantoms may remain; they are the harness gap, not this bug.'

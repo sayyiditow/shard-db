@@ -1,0 +1,24 @@
+# AUD-QRY-3 Task 1 RED proof on base (2026-11-20) — the bitmap-cap wrap REPRODUCED on base
+# per the human's directive (verify before coding). Build rc=0; case rc=8; 195 passed / 8 failed.
+# (Two earlier drafts had test bugs only — a use-after-free of the request buffer, the kf entry flag
+#  byte at offset 16 not 18, and non-probe-tolerant re-insert values; the wire behavior was verified
+#  with standalone daemons between drafts. This run is the clean final proof.)
+
+=== Case A (bitmap(4) wire repro): 12 of 80 records rejected after kf reservation (inserted=68, errors=12);
+    all 12 rejected keys re-inserted successfully (probe-tolerant values); every key readable; then:
+not ok 181 - case A: count == live model (80)
+not ok 183 - case A: orphaned >= 0
+not ok 185 - case A: shard 001 header total(11) >= deleted(18446744073709551614)
+not ok 187 - case A: shard 003 header total(10) >= deleted(18446744073709551615)
+not ok 188 - case A: shard 004 header total(5) >= deleted(18446744073709551612)
+not ok 189 - case A: shard 005 header total(13) >= deleted(18446744073709551613)
+not ok 191 - case A: shard 007 header total(10) >= deleted(18446744073709551614)
+not ok 203 - case B: count == 1 (live exact, no wrap)
+
+count == live model(80) RED  -> count clamped to 0 by the object-level clamp over the wrapped shard sums
+orphaned >= 0 RED            -> (int)deleted = -1
+five shards' headers wrapped -> shard 003: deleted = 2^64-1 (-1); 004: -4; 005: -3; 001/007: -2
+
+=== Case B (crafted never-counted inert tombstone: kf slot flag=2 + header total=0, deleted=0;
+    reopen; re-insert the same key -> reused_tomb with deleted==0):
+count == 1 RED -> wrapped to 0 (the reuse guard is what post-fix keeps live exact)

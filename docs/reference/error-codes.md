@@ -105,6 +105,38 @@ The `remove-index` response `{"status":"not_indexed","field":"x"}` is **not an e
 | `some_records_dropped` | `bulk-insert` rejected some records (type mismatch, missing required). Response includes `errors` count. | Check logs for detail; re-submit rejected rows. |
 | `Missing criteria or value` | `bulk-update` without both. | Provide both. |
 
+### Restore (2026.11.3)
+
+Restore is stage-then-swap with a durable commit point; see
+[backup.md](../operations/backup.md#interrupted-restores) for the on-disk
+staging layout and manual recovery.
+
+| `error` | Cause | Recovery |
+|---|---|---|
+| `from is required` | `restore` without `from`. | Pass the backup directory name. |
+| `invalid from (no slashes or '..' allowed)` | `from` contained `/` or `..`. | Pass a plain timestamp directory name. |
+| `object not found` | The object directory does not exist. | Create the object first. |
+| `backup not found: <from>` | No such directory under `<obj>/backup/`. | List `<obj>/backup/`. |
+| `objlock_wrlock failed for restore` | The object lock could not be taken. | Retry. |
+| `restore refused: an earlier interrupted restore of this object could not be rolled back; see the error log` | A leftover staging directory cannot be rolled back (e.g. a non-directory `rb/`). Nothing was changed by this call. | Recover manually (backup.md → Interrupted restores), then retry. |
+| `<sub>/ is not empty (use force=true to overwrite)` | The live subtree is non-empty and `force` was not set. | Pass `force:true`. |
+| `files/ is not empty (use force=true to overwrite)` | The backup governs `files/` and live `files/` is non-empty. | Pass `force:true`. |
+| `backup has no layout metadata (object.json); restore refused` | The backup predates layout capture. | Restore it with the release that wrote it. |
+| `backup layout (<a>) does not match the live object's layout (<b>); restore refused — …` | A pre-migration backup into a migrated object. | Restore into a scratch object, then migrate. |
+| `schema mismatch: live splits=… max_key=…, backup splits=… max_key=… (use force=true to overwrite)` | Layout differs and `force` was not set. | Pass `force:true` (the live sizing is kept). |
+| `live fields.conf is not a regular file; restore refused` | `fields.conf` exists but is not a regular file. | Repair the object directory. |
+| `fields.conf differs between live and backup (use force=true to overwrite)` | Field sets differ and `force` was not set. | Pass `force:true`. |
+| `cannot read schema.conf: <errno>; restore refused` | `schema.conf` is unreadable. | Check permissions/disk. |
+| `backup manifest (object.json) lacks a valid storage_version/streams; cannot recreate the schema.conf line; restore refused` | The line is missing and the manifest cannot recreate it. | Repair `schema.conf` by hand or restore a newer backup. |
+| `restore failed at <step>: <errno>; the live object was not changed` | A pre-commit step failed (staging directory/copy/sync, directory preparation, swap marker, fields.conf). | Fix the cause (disk space, permissions) and retry. |
+| `restore failed at <step>: <errno>; rolled back, the live object was not changed` | A post-SWAP step failed (swap of `<name>`, directory sync, swap-marker removal/sync); the rollback completed. | Fix the cause and retry. |
+| `restore committed but <file> could not be installed: <errno>; the backup data is live; re-run restore with force=true` | The data is committed but a live-absent `fields.conf` or the `schema.conf` line could not be written. | Fix the cause and re-run the same restore (idempotent). |
+
+A daemon `abort()` during an unrecoverable rollback is logged as
+`RESTORE …: <step> failed (…) and the rollback could not be completed (…);
+aborting, startup recovery finishes the rollback`, and startup refuses the
+object if it cannot finish it (`RESTORE-RECOVER …: startup refused`).
+
 ### Auth
 
 | `error` | Cause | Recovery |

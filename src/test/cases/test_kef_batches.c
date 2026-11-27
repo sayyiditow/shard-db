@@ -12,6 +12,7 @@
  *   7. wide splits with a running IO pool       (concurrent callbacks)
  *   8. real find routes                         (rows + left join)
  *   9. A3 trigram starts_with route             (unterminated page on failure)
+ *  10. AND-intersect route after rows           (unterminated page on failure)
  *
  * Counters/seams are process-wide (kef_test_reset before each measured call
  * and on every exit path, so nothing survives into later cases under
@@ -903,6 +904,113 @@ cleanup:
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+/* ---- Case 10: AND-intersect route keeps the mid-stream contract ---- */
+
+/* The AND-intersect exit may CLOSE a bare envelope and render an error
+   object, but only for a KeySet-build failure, where nothing but the
+   envelope prefix is on the wire (round-4 M2). That must not carry into
+   the emission phase: once a row is out, the documented contract applies
+   and the response stays unterminated (docs/query-protocol/find.md,
+   "Bitmap-source errors…") — the same rule case 9 pins for the trigram
+   route. With twice one fetch batch of candidates, a fetch failure on the
+   SECOND batch fires after the first batch's rows were written. */
+
+/* Occurrences of a quoted key with the `k0` prefix (this case's keys). */
+static int kef_rows_on_wire(const char *resp) {
+    int n = 0;
+    const char *p = resp;
+    while (p && (p = strstr(p, "\"k0")) != NULL) { n++; p += 3; }
+    return n;
+}
+
+static int test_kef_intersect_midstream_error_run(void) {
+    KefFix f;
+    memset(&f, 0, sizeof(f));
+    char *resp = NULL;
+    KefTestStats st;
+
+    f.db = test_get_process_db();
+    ASSERT_NOT_NULL(f.db, "setup: process db");
+    if (!f.db) goto cleanup;
+    snprintf(f.obj, sizeof(f.obj), "kfi");
+    snprintf(f.eff, sizeof(f.eff), "%s/default", test_get_process_db_root());
+
+    char req[1024];
+    tu_pdb_request(f.db, "{\"mode\":\"add-dir\",\"dir\":\"default\"}", &resp);
+    shard_db_free_result(resp); resp = NULL;
+
+    tu_pdb_request(f.db,
+        "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"kfi\","
+        "\"splits\":8,\"max_key\":16,\"fields\":[\"a:int\",\"b:int\"],"
+        "\"indexes\":[\"a\",\"b\"]}", &resp);
+    ASSERT_TRUE(resp && !strstr(resp, "\"error\""), "setup: kfi create");
+    if (!resp || strstr(resp, "\"error\"")) { shard_db_free_result(resp); resp = NULL; goto cleanup; }
+    shard_db_free_result(resp); resp = NULL;
+
+    {
+        /* 2 x KEF_BATCH records, so the second fetch batch follows rows. */
+        enum { NREC = 2048, NCHUNK = 512 };
+        char body[NCHUNK * 64 + 256];
+        for (int base = 0; base < NREC; base += NCHUNK) {
+            size_t p = (size_t)snprintf(body, sizeof(body),
+                    "{\"mode\":\"bulk-insert\",\"dir\":\"default\","
+                    "\"object\":\"kfi\",\"records\":[");
+            for (int i = base; i < base + NCHUNK; i++)
+                p = tappendf(body, sizeof(body), p, "%s{\"key\":\"k%05d\",\"value\":{\"a\":%d,\"b\":%d}}",
+                             i > base ? "," : "", i, i, i);
+            p = tappendf(body, sizeof(body), p, "]}");
+            tu_pdb_request(f.db, body, &resp);
+            ASSERT_TRUE(resp && !strstr(resp, "\"error\""), "setup: kfi bulk insert");
+            if (!resp || strstr(resp, "\"error\"")) { shard_db_free_result(resp); resp = NULL; goto cleanup; }
+            shard_db_free_result(resp); resp = NULL;
+        }
+    }
+
+    /* Two broad indexed leaves, no limit, total requested: the intersect
+       executor (test_keyset_intersect_envelope pins the same shape). */
+    snprintf(req, sizeof(req),
+             "{\"mode\":\"find\",\"dir\":\"default\",\"object\":\"kfi\","
+             "\"criteria\":[{\"field\":\"a\",\"op\":\"between\",\"value\":0,\"value2\":100000},"
+             "{\"field\":\"b\",\"op\":\"between\",\"value\":0,\"value2\":100000}],"
+             "\"total\":true}");
+
+    kef_test_reset();
+    tu_pdb_request(f.db, req, &resp);
+    kef_test_stats(&st);
+    TAP_DIAG("# intersect control diag: calls=%ld fetch_calls=%ld rows=%d closed=%d\n",
+             (long)st.calls, (long)st.fetch_calls, kef_rows_on_wire(resp),
+             resp ? (strchr(resp, ']') != NULL) : -1);
+    ASSERT_TRUE(resp && strstr(resp, "\"k00000\"") != NULL,
+                "intersect route: control find returns rows");
+    ASSERT_TRUE(resp && strstr(resp, "\"total\":2048") != NULL,
+                "intersect route: control find is a closed page with the total");
+    if (!resp) goto cleanup;
+    shard_db_free_result(resp); resp = NULL;
+
+    kef_test_reset();
+    kef_test_arm(KEF_SEAM_FETCH, 2);
+    tu_pdb_request(f.db, req, &resp);
+    kef_test_stats(&st);
+    TAP_DIAG("# intersect mid-stream diag: calls=%ld fetch_calls=%ld rows=%d closed=%d err=%d\n",
+             (long)st.calls, (long)st.fetch_calls, kef_rows_on_wire(resp),
+             resp ? (strchr(resp, ']') != NULL) : -1,
+             resp ? (strstr(resp, "\"error\"") != NULL) : -1);
+    ASSERT_EQ_INT(st.calls, 1, "intersect route: find entered keyset_emit_find once");
+    ASSERT_EQ_INT(st.fetch_calls, 2, "intersect route: the seam fired on the second batch");
+    ASSERT_TRUE(resp && kef_rows_on_wire(resp) > 0,
+                "intersect route: rows were on the wire when the failure hit");
+    ASSERT_TRUE(resp && strchr(resp, ']') == NULL,
+                "intersect route: a failure after rows leaves the page unterminated");
+    ASSERT_TRUE(resp && strstr(resp, "\"error\"") == NULL,
+                "intersect route: no error object is appended mid-stream");
+
+cleanup:
+    kef_test_reset();
+    shard_db_free_result(resp);
+    kef_fix_free(&f);
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
 TEST_REGISTER("test-kef-early-stop-after-first-batch", test_kef_early_stop_run)
 TEST_REGISTER("test-kef-stale-candidates-offset", test_kef_stale_candidates_run)
 TEST_REGISTER("test-kef-exclusions-and-joins", test_kef_exclusions_joins_run)
@@ -912,3 +1020,4 @@ TEST_REGISTER("test-kef-differential", test_kef_differential_run)
 TEST_REGISTER("test-kef-wide-splits", test_kef_wide_splits_run)
 TEST_REGISTER("test-kef-find-route-early-stop", test_kef_find_route_run)
 TEST_REGISTER("test-kef-trigram-starts-error", test_kef_trigram_starts_error_run)
+TEST_REGISTER("test-kef-intersect-midstream-error", test_kef_intersect_midstream_error_run)

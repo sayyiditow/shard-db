@@ -1,0 +1,4 @@
+# AUD-QRY-2 case 15 base red (field absent — expected compile failure)
+# 2026-11-20; SKIP_TESTS=1 ./build.sh rc=1 with test_agg_subtree_flag_fields.c wired:
+src/test/cases/test_agg_subtree_flag_fields.c:78:18: error: too few arguments to function ‘load_schema’; expected 2, have 1
+# (From Task 2 onward the field exists; this case then asserts the flag/gate values.)

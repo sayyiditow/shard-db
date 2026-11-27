@@ -1,0 +1,121 @@
+AUD-QRY-3 evidence — kf deleted-counter underflow -> object count reads 0 (records intact)
+Harness: audit-fault-inject seed 3 (deterministic; 3/3 reproductions), ops=24, fdatasync fault hit=1 errno=EMFILE(24), SIGKILL, clean restart
+Code sites: slotcask.c:3268 (hdr->deleted-- on reused_tomb), rejected-reservation tombstone block (~3281: 'No header total/deleted bookkeeping'), slotcask_sum_kf_totals slotcask.c:5282 (raw object-level sum), get_live_count clamp
+
+Recovery WARN from the faulted root:
+2026-11-19 11:42:43 WARN [slotcask] recovery: 1 staged, not-activated record(s) (skipped as dead space; vacuum reclaims the inert ones once the segment rotates) in active segment of stream 000 under /tmp/shard-db-auditfault-708418-3/db/default/fo
+
+kf shard headers (24B) after clean restart — total/deleted LE u64 at bytes 8..24:
+000.kf: 534b46310100000000000000000000000000000000000000
+001.kf: 534b46310100000002000000000000000000000000000000
+002.kf: 534b4631010000000100000000000000ffffffffffffffff
+003.kf: 534b46310100000000000000000000000000000000000000
+004.kf: 534b46310100000001000000000000000000000000000000
+005.kf: 534b46310100000002000000000000000000000000000000
+006.kf: 534b46310100000000000000000000000000000000000000
+007.kf: 534b46310100000001000000000000000000000000000000
+
+shard 002: total=1, deleted=0xffffffffffffffff (underflow from 0)
+sum: total=7, deleted=2^64-1 -> get_live_count clamp (7 > 2^64-1 false) -> count=0
+
+Daemon raw responses at verify: count -> 0 ; describe -> record_count:0 ; all 8 model-live keys read back with correct values (zero per-key violations)
+
+seed-3 violation log:
+scenario 3: kind=0 op=fdatasync hit=1 errno=24
+scenario 3: kind=2 op=fdatasync hit=1 errno=24
+VIOLATION [fo]: count 0 != model live 8 + probes 0 (phantom or lost records)
+scenario 3 SUMMARY: 1 violation(s)
+scenario 3: kind=2 op=fdatasync hit=1 errno=24
+VIOLATION [fo]: count 0 != model live 8 + probes 0 (phantom or lost records)
+scenario 3 SUMMARY: 1 violation(s)
+op log ([A]=acked [u]=unacked):
+  0 [u] update f011 v=u3_43
+  1 [u] insert k013 v=s3_13
+  2 [A] insert k028 v=s3_28
+  3 [u] update f009 v=u3_41
+  4 [A] delete k015
+  5 [u] update k003 v=u3_3
+  6 [u] update k012 v=u3_12
+  7 [u] update k023 v=u3_23
+  8 [A] insert k022 v=s3_22
+  9 [A] delete f007
+ 10 [A] delete k027
+ 11 [A] insert k023 v=s3_23
+ 12 [A] insert k031 v=s3_31
+ 13 [u] update k002 v=u3_2
+ 14 [A] insert k021 v=s3_21
+ 15 [A] delete f001
+ 16 [A] insert k023 v=s3_23
+ 17 [u] update k027 v=u3_27
+ 18 [A] bulk4 bject":"fo","records":[{"key":"k031","value":{"v":"bi3_31"}},{"key":"k013","value":{"v":"bi3_13"}},{"key":"f011","value":{"v":"bi3_43"}},{"key":"f006","v
+ 19 [A] insert k028 v=s3_28
+ 20 [A] update k023 v=u3_23
+ 21 [A] insert k023 v=s3_23
+ 22 [u] update k010 v=u3_10
+ 23 [u] update k018 v=u3_18
+model live at verify: k013 k021 k022 k023 k028 k031 f006 f011 
+scenario 3: kind=2 op=fdatasync hit=1 errno=24
+VIOLATION [fo]: count 0 != model live 8 + probes 0 (phantom or lost records)
+scenario 3 SUMMARY: 1 violation(s)
+op log ([A]=acked [u]=unacked):
+  0 [u] update f011 v=u3_43
+  1 [u] insert k013 v=s3_13
+  2 [A] insert k028 v=s3_28
+  3 [u] update f009 v=u3_41
+  4 [A] delete k015
+  5 [u] update k003 v=u3_3
+  6 [u] update k012 v=u3_12
+  7 [u] update k023 v=u3_23
+  8 [A] insert k022 v=s3_22
+  9 [A] delete f007
+ 10 [A] delete k027
+ 11 [A] insert k023 v=s3_23
+ 12 [A] insert k031 v=s3_31
+ 13 [u] update k002 v=u3_2
+ 14 [A] insert k021 v=s3_21
+ 15 [A] delete f001
+ 16 [A] insert k023 v=s3_23
+ 17 [u] update k027 v=u3_27
+ 18 [A] bulk4 bject":"fo","records":[{"key":"k031","value":{"v":"bi3_31"}},{"key":"k013","value":{"v":"bi3_13"}},{"key":"f011","value":{"v":"bi3_43"}},{"key":"f006","v
+ 19 [A] insert k028 v=s3_28
+ 20 [A] update k023 v=u3_23
+ 21 [A] insert k023 v=s3_23
+ 22 [u] update k010 v=u3_10
+ 23 [u] update k018 v=u3_18
+model live at verify: k013 k021 k022 k023 k028 k031 f006 f011 
+scenario 3: kind=2 op=fdatasync hit=1 errno=24
+VIOLATION [fo]: count 0 != model live 8 + probes 0 (phantom or lost records)
+raw count resp: 0
+
+raw describe resp: {"dir":"default","object":"fo","splits":8,"max_key":16,"max_value":58,"slot_size":104,"fields":[{"name":"v","type":"varchar","size":8,"spec":"v:varchar:48","capacity":48,"bare":false}],"streams":8,"declaration_layout":"packed","indexes":[],"record_count":0}
+
+TRIAGE-KEEP base=/tmp/shard-db-auditfault-708418-3
+scenario 3 SUMMARY: 1 violation(s)
+op log ([A]=acked [u]=unacked):
+  0 [u] update f011 v=u3_43
+  1 [u] insert k013 v=s3_13
+  2 [A] insert k028 v=s3_28
+  3 [u] update f009 v=u3_41
+  4 [A] delete k015
+  5 [u] update k003 v=u3_3
+  6 [u] update k012 v=u3_12
+  7 [u] update k023 v=u3_23
+  8 [A] insert k022 v=s3_22
+  9 [A] delete f007
+ 10 [A] delete k027
+ 11 [A] insert k023 v=s3_23
+ 12 [A] insert k031 v=s3_31
+ 13 [u] update k002 v=u3_2
+ 14 [A] insert k021 v=s3_21
+ 15 [A] delete f001
+ 16 [A] insert k023 v=s3_23
+ 17 [u] update k027 v=u3_27
+ 18 [A] bulk4 bject":"fo","records":[{"key":"k031","value":{"v":"bi3_31"}},{"key":"k013","value":{"v":"bi3_13"}},{"key":"f011","value":{"v":"bi3_43"}},{"key":"f006","v
+ 19 [A] insert k028 v=s3_28
+ 20 [A] update k023 v=u3_23
+ 21 [A] insert k023 v=s3_23
+ 22 [u] update k010 v=u3_10
+ 23 [u] update k018 v=u3_18
+model live at verify: k013 k021 k022 k023 k028 k031 f006 f011 
+
+CORRECTION (post-artifact run): the bulk op was re-verified with rc/ack verdict logging — 'bulk4 rc=0 ack=1': the bulk WAS acknowledged; all 13 acked ops landed; 8/8 model-live keys read back correct; count still 0 via the deleted-counter underflow. An earlier dump in this file shows [u] for the bulk — that was a different run where the interposer hit landed in a different thread (call-count races across daemon threads make scenario placement probabilistic; the count-zero outcome reproduced 3/3 regardless).

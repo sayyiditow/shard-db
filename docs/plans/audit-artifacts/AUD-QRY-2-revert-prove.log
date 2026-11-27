@@ -1,0 +1,24 @@
+# AUD-QRY-2 Task 5.1 revert-prove-paste (patch-based — QRY-1 uncommitted in query_aggregate.c, so no stash)
+# 2026-11-20. Method: base snapshot taken BEFORE Task 2 (/tmp/qry2-base.patch + /tmp/qry2-base-snap/);
+# QRY-2 delta = /tmp/qry2.patch (7 hunks: query_aggregate.c, query_plan.c, query_internal.h; generated vs the snapshot).
+# Case 15's file (test_agg_subtree_flag_fields.c) was temporarily unwired from build.sh during the RED phase:
+# with the fix reverted it cannot compile ('FilterPlan' has no member named 'has_subtree' — its own recorded red),
+# and a failing build cannot produce file A's binary. Sequence: git apply -R -> unwire file B -> rebuild -> file A RED;
+# git apply -> re-wire file B -> rebuild -> both cases GREEN.
+
+=== RED (git apply -R /tmp/qry2.patch; case 15 unwired) ===
+# test-agg-or-subtree-full-tree: 171 passed, 17 failed
+(identical 17 failures to the base proof: cases 1,2,3,4,5,7,9,10,12,13 — AUD-QRY-2-red-base.log)
+
+=== GREEN (git apply /tmp/qry2.patch; case 15 re-wired) ===
+# test-agg-or-subtree-full-tree: 189 passed, 0 failed
+# test-agg-subtree-flag-fields: 20 passed, 0 failed
+
+=== Case 9 necessity proof (manual one-term revert: || fp->has_subtree removed from
+    keyset_agg_from_intersect's restore condition; a stash/patch cannot select one hunk) ===
+# test-agg-or-subtree-full-tree: 188 passed, 1 failed
+not ok 138 - case9: large intersect+OR matches oracle
+(exactly ONE failure: case 9 alone — the restore term is its sole guard)
+
+=== Restored ===
+# test-agg-or-subtree-full-tree: 189 passed, 0 failed

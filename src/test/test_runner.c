@@ -90,13 +90,17 @@ static int is_excluded(const char *name, const char *exclude) {
 }
 
 /* Builds a flat array of registered cases matching `filter` (NULL = all)
-   except exact names in `exclude`. Returns the count; *out receives a
-   malloc'd array the caller must free. Both scheduler paths share this. */
+   except exact names in `exclude`. Audit cases (TEST_REGISTER_AUDIT) are
+   skipped unless include_audit is set — default `run-all` and every
+   CI/sanitizer workflow keep their pre-audit behavior. Returns the count;
+   *out receives a malloc'd array the caller must free. Both scheduler
+   paths share this. */
 static int collect_matching(const char *filter, const char *exclude,
-                            TestCaseEntry ***out) {
+                            int include_audit, TestCaseEntry ***out) {
     int cap = 16, n = 0;
     TestCaseEntry **arr = malloc((size_t)cap * sizeof(*arr));
     for (TestCaseEntry *p = g_head; p; p = p->next) {
+        if (p->audit && !include_audit) continue;
         if (filter && !strstr(p->name, filter)) continue;
         if (is_excluded(p->name, exclude)) continue;
         if (n == cap) {
@@ -109,6 +113,66 @@ static int collect_matching(const char *filter, const char *exclude,
     }
     *out = arr;
     return n;
+}
+
+int test_count_selected(const char *filter, const char *exclude,
+                        int include_audit) {
+    TestCaseEntry **cases = NULL;
+    int n = collect_matching(filter, exclude, include_audit, &cases);
+    free(cases);
+    return n;
+}
+
+/* Value flags consume the following argument; --include-audit is a
+   standalone flag so it works in any position, including last. A value flag
+   followed by another option does not consume it — `--jobs
+   --include-audit` keeps the audit flag and leaves jobs at its default
+   (this is what the code comment always described; the pre-move loop
+   refused the combination with "unknown or incomplete option"). A value
+   flag at end of argv is still an incomplete option (rc 2), so a bare
+   `--filter` cannot silently select everything. A value may itself start
+   with '-' (`--filter -foo`); only a known flag name is refused as a
+   value. */
+int test_parse_run_all_args(int argc, char **argv, int first,
+                            const char **filter, const char **exclude,
+                            int *jobs, int *include_audit) {
+    for (int i = first; i < argc; i++) {
+        int is_value_flag = strcmp(argv[i], "--filter") == 0 ||
+                            strcmp(argv[i], "--exclude") == 0 ||
+                            strcmp(argv[i], "--jobs") == 0;
+        if (strcmp(argv[i], "--include-audit") == 0) {
+            *include_audit = 1;
+            continue;
+        }
+        if (is_value_flag) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "run-all: unknown or incomplete option: %s\n",
+                        argv[i]);
+                return 2;
+            }
+            const char *val = argv[i + 1];
+            if (strcmp(val, "--filter") == 0 ||
+                strcmp(val, "--exclude") == 0 ||
+                strcmp(val, "--jobs") == 0 ||
+                strcmp(val, "--include-audit") == 0)
+                continue;
+            if (strcmp(argv[i], "--filter") == 0) {
+                *filter = val;
+            } else if (strcmp(argv[i], "--exclude") == 0) {
+                *exclude = val;
+            } else {
+                *jobs = atoi(val);
+            }
+            i++;
+            continue;
+        }
+        /* a typo such as --include_audit must not silently skip
+           the audit cases (or filter nothing) */
+        fprintf(stderr, "run-all: unknown or incomplete option: %s\n",
+                argv[i]);
+        return 2;
+    }
+    return 0;
 }
 
 /* Strictly sequential — byte-identical output to the pre-parallel
@@ -399,10 +463,11 @@ static int run_all_parallel(TestCaseEntry **cases, int n, int jobs) {
     return total_failed;
 }
 
-int test_run_all(const char *filter, const char *exclude, int jobs) {
+int test_run_all(const char *filter, const char *exclude, int jobs,
+                 int include_audit) {
     test_fixture_set_jobs(jobs);
     TestCaseEntry **cases = NULL;
-    int n = collect_matching(filter, exclude, &cases);
+    int n = collect_matching(filter, exclude, include_audit, &cases);
 
     int result = jobs <= 1 ? run_all_sequential(cases, n)
                            : run_all_parallel(cases, n, jobs);

@@ -4,6 +4,357 @@ This is the maintained per-release summary. The root [`CHANGELOG.md`](https://gi
 
 Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that month.
 
+## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
+
+**Fix: restore commits atomically, rolls back cleanly, and no longer loses `fields.conf`.**
+`restore` now stage-copies the backup, writes a durable `SWAP` marker, swaps
+each entry (`data/`, `indexes/`, `metadata/`, `files/`, `fields.conf`), syncs
+both directories, and only then durably removes the marker: a crash during
+the final cleanup keeps the restored data instead of reinstalling a
+half-deleted original (the old code deleted the stage while `SWAP` still
+existed). A failed commit directory sync now rolls back and says so; a
+rollback that cannot complete aborts the daemon, and startup finishes it and
+refuses to serve when it cannot. `fields.conf` (now swapped with the data)
+and a missing `schema.conf` line are installed only after the commit; a
+manifest without a valid `storage_version`/`streams` is refused when the
+line must be recreated. The bitmap cache is dropped on restore. The keyfile
+directory-sync block (set when a resplit's rename is not known durable) is
+kept in a process-wide table, so a reopen, an LRU eviction or a prefix
+invalidation no longer forgets it and acknowledges a write on a rename that
+may not survive power loss.
+
+**Fix: keyfile sync ordering in resplit and segment compaction.**
+A keyfile resplit now abandons itself (old keyfile kept) when the rebuilt file
+cannot be synced, and a rename whose directory sync failed blocks every write
+until the directory sync succeeds. Segment compaction makes the repointed
+keyfile entries durable before it deletes the donor file, so a power loss can
+no longer leave keys naming a deleted segment.
+
+**Fix: bulk-delete replay, bulk-insert out-of-memory, and small hardening.**
+A bulk-delete window whose first keyfile sync failed now converges on the
+inline replay instead of staying pending; `bulk-insert` and
+`bulk-insert-delimited` answer `out of memory` and write nothing when an
+allocation fails (a record-array realloc failure used to report
+`{"inserted":0}`); NQL rejects unknown tenant dirs like the other grammars; and
+`list-tokens` shows the `abcd...wxyz` fingerprint only for tokens longer than
+16 characters.
+
+**Fix: the query concurrency cap now covers NQL and the legacy text protocol.**
+`MAX_CONCURRENT_QUERIES` (and the memory bound derived from it) applied only
+to JSON requests; NQL `find`/`count`/`aggregate` and text-protocol commands
+took no slot. Every grammar now takes a slot and answers
+`{"error":"server at capacity",...}` when none is free.
+
+**Fix: idle and half-open connections no longer starve the worker pool.**
+A worker serves one connection for its whole life and sockets had no
+timeouts, so `WORKERS` idle (even unauthenticated) connections made the
+server unresponsive. New `IDLE_TIMEOUT_SEC` (default 300, 0 = off) closes a
+connection that sends nothing for that long (a half-sent request is dropped,
+not executed; running queries are not interrupted) and `HANDSHAKE_TIMEOUT_SEC`
+(default 10) bounds the TLS handshake. A connection whose peer address cannot
+be read is now closed instead of being treated as loopback. Breaking for
+clients that idle longer than 300 s: they must reconnect (set
+`IDLE_TIMEOUT_SEC=0` to keep the old behavior).
+
+**Fix: removing a token or trusted IP no longer breaks other entries; auth files are written atomically.**
+The token and IP hash sets cleared a slot on removal, which ended the probe
+chain: a colliding entry became unreachable (the token answered `auth failed`,
+could not be revoked, and returned after a restart). Removal now leaves a
+tombstone. `tokens.conf` and `allowed_ips.conf` are written to a 0600 temp
+file, fsynced and renamed (a crash can no longer leave a truncated file),
+`add-token`/`remove-token`/`add-ip`/`remove-ip` return an error and leave the
+in-memory state unchanged when the file cannot be written, and a full table
+(`TOKEN_CAP`) is reported as `{"error":"token store full ..."}` instead of
+`token_added`.
+
+**Fix: `backup` and `restore` report copy failures and no longer wipe first.**
+Every copy error (ENOSPC, EIO, unreadable file) was swallowed and the modes
+answered `backed_up` / `restored` regardless; nothing was fsynced; `restore`
+deleted the live subtrees before copying. Now: a failed backup removes its
+partial directory and returns `{"error":"backup failed at <step>: ..."}`,
+copies and directories are fsynced before success is reported, two backups in
+one second get distinct directories (`<ts>`, `<ts>_1`, ...), and `restore`
+copies the backup into a staging directory first and only then swaps it in
+(a failure leaves the live object unchanged; a crash mid-swap is rolled back
+at the next start). Restore now needs free space for a second copy of the
+object.
+
+**Fix: light `vacuum` no longer compacts keyfiles while commit markers are pending.**
+A retained commit marker names keyfile slot numbers; compaction moves entries
+to new slots, so the later replay repointed the wrong slot and tombstoned the
+real record (an updated key became unreadable and scans of the shard failed).
+Keyfile compaction is now skipped while markers are pending (reported as
+`"kf_skipped":"pending-markers"` in the vacuum response, like
+`segments_skipped`), the update replay verifies the slot's key before
+repointing, and the replay segment-flag helpers bounds-check their offsets.
+
+**Security fix: server-local file paths are admin-only.**
+`bulk-insert`, `bulk-insert-delimited`, `bulk-delete`, `bulk-update`,
+`bulk-update-delimited` (`file`) and `put-file` (`path`) read a path on the
+server's filesystem as the daemon user, and any token with write permission
+could use them; an object-scoped `rw` token could ingest `tokens.conf` and
+read the global admin token back. They now require a trusted address or a
+global rwx token; other tokens get an error and must send `records`, `keys`,
+`data` or base64 `data` inline. Breaking for token clients that used
+server-local paths.
+
+**Security fix: the legacy `\x1F` text protocol no longer runs unauthenticated.**
+The line protocol on `PORT` (non-JSON, non-NQL lines) had no token or address
+check, so any peer that could connect could read, write, truncate, vacuum,
+back up or restore objects. It is now served only to trusted addresses
+(loopback unless `DISABLE_LOCALHOST_TRUST=1`, plus `allowed_ips.conf`);
+other peers get `{"error":"auth failed"}` and must use the JSON grammar with a
+token. Breaking for remote clients that used the text grammar.
+
+**Fix: a replayed kf window commit double-booked the record counters.**
+The K phase is re-run on the same plan after a later-step failure (e.g. a K
+msync error on the legacy window path). `kf_commit_planned_slot` booked
+`total++` (fresh placement) or `deleted--` (tombstone reuse) again on the
+already-published slot, so `count` over-reported until the next header
+rebuild. A slot already committed with the same hash and location is now a
+no-op. Records were never affected, only the counts.
+
+**Fix: an NQL filter with a malformed IN-list leaked its partial list.**
+A parse error after some list values were collected dropped the partial
+`in_values` array (about 150 bytes per request, wire reachable, unbounded).
+It is now freed on every error path of the list reader.
+
+**Fix: an object name containing `:` made the whole DB root unstartable.**
+`create-object` accepted `:` in the object name, which is the `schema.conf`
+field separator, so `a:8` wrote a corrupt schema line and the next start
+refused with `crash recovery failed`. Object names containing `:` are now
+rejected (`invalid object name`). A root that already holds such an object
+must have that line removed from `schema.conf` (and the object directory
+renamed or removed) before it will start.
+
+**Fix: find with `format:"rows"` or a join plus `total:true` emitted a malformed envelope when the OR-union budget refused.**
+The error exit now closes the envelope (`…"total":null}`) before the error
+object, matching the other pre-row failure exits.
+
+**Fix: an aggregate `group_by` whose btree index shard fails to open silently returned short groups.**
+The indexed group-by Pass-1 walk — the parallel worker for large objects and
+the inline serial loop that serves every object under 100k records — treated a
+failed `btree_range_iter_open` as an empty shard on both routes, so a shard
+whose index file exists but cannot be opened (permissions, corruption) had its
+entries silently dropped: a 200-OK with present-but-undercounted groups. Both
+routes now follow the block's own `agg_walk_worker` template: `stat` the
+shard's index file first — a missing file is a legitimate empty shard
+(create-object-declared index files are lazy-created), while an open failure on
+an existing file fails closed, and the query returns the honest
+`{"error":"aggregate storage access failed"}` (EIO, normalized because the raw
+errno is untrustworthy after the open path logs). Healthy objects are
+unchanged: the stat adds one syscall per shard per query. **Behavior change:**
+a broken index shard now errors a `group_by` instead of silently shorting it —
+run `reindex` to repair. Found by the 2026-11-19 audit campaign (AUD-QRY-7);
+regression case `test-igb-pass1-open-fail` (faults the open through the test
+build's range-iterator open-failure seam on both Pass-1 routes — the serial
+fallback and the 100k-row per-shard workers; the sibling Pass-2/sec_map
+fail-opens are AUD-QRY-9, own branch).
+
+**Fix: `group_by` over a bitmap field holding dict values longer than 1024 bytes read out of bounds and silently dropped groups.**
+The indexed group-by bitmap fast path collects distinct group values into fixed
+1024-byte rows: the collection callback copied `min(vlen, 1024)` bytes but
+recorded the **full** value length, so for any bitmap dict value longer than the
+row — legal up to 65535 bytes, and ordinary inserts reach the dict — the
+callback's own dedup `memcmp` and every downstream dict-lookup consumer read
+the recorded length from the narrower row (stack out-of-bounds read), and the
+truncated copy never matches its value, so the group counted 0 and was silently
+dropped at emission: a 200-OK with missing groups, while the identical query on
+a no-index twin returns the documented E2BIG error for over-511-byte labels.
+The callback now refuses values longer than the row width — latching the same
+overflow signal AUD-QRY-5 introduced, placed before the dedup loop, which is
+itself the out-of-bounds site — and both bitmap fast-path blocks route the
+query to the record-scan executor, which returns the documented E2BIG error:
+error parity with the no-index twin, never a wrong answer. Objects whose values
+all fit the rows keep the fast path unchanged. Found by the 2026-11-19 audit
+campaign (AUD-QRY-6); regression case `test-igb-bitmap-long-value` — its
+`lv_wide` fixture probe-routes keys to the last-walked shard and updates them
+in place, the placement engineering that makes the out-of-bounds read
+ASan-detectable (see the plan's Task 0 detectability boundary and PLAN_NOTES).
+
+**Fix: `find` returned wrong rows and wrong (or wrongly exact) `total` whenever the plan did not represent the whole predicate.**
+Three manifestations, one root — find treated leaf-derived counts as exact while
+per-record filtering was still pending. An indexed leaf beside an OR sub-tree
+printed the leaf count as `total` (an upper bound: 100 vs the true 20); an AND
+containing an OR child printed the partial union (160 vs 106); an AND wider than
+`MAX_INTERSECT_LEAVES` (8) streamed the primary leaf with only the post-filter
+siblings attached, so leaves 9+ were never verified and both rows and `total`
+over-counted (6000 rows vs 3250); and a small-primary intersect printed
+`total: 0` — a wrong exact number — where the true count was 27. The planner's
+`has_subtree` flag now gates every find total decision: sub-tree-bearing plans
+decline the leaf-derived total (upgrading to a validated count at the tail's
+shared fallback, or emitting `null` — never a wrong number), and the intersect
+executor re-matches the full tree per record, restoring wide-AND finds to every
+matching row. Leaf-only, pure-OR and exact plans are unchanged. Found by the
+2026-11-19 audit campaign (AUD-QRY-4); regression case `test-find-subtree-totals`.
+
+**Fix: aggregate `group_by` over a bitmap field holding more than 256 distinct values silently returned at most 256 groups.**
+The indexed group-by bitmap fast path collects distinct group values into a fixed
+256-row context (both collection call sites pass cap 256), and `bitmap(N)` is
+legal for N up to 65535 — so an object with `v:bitmap(300)` legitimately holds
+300 distinct dict values on disk while group_by truncated its group set to the
+first 256 collected, silently, on every served shape (no-criteria popcount,
+bitmap-eq slot-level walk, and the sum/avg branch). The collection now latches
+an overflow signal when a new distinct value arrives at the cap (dedup runs
+first, so it never false-positives), and the whole fast path routes to the
+per-record scan executor, which serves the full group set exactly. Objects with
+≤256 distinct group values keep the fast path unchanged. Perf note: at large
+row counts the record scan costs more than the bitmap walk it replaces —
+correct-but-slower was chosen over silently-wrong; a dynamic-growth collection
+(own plan) restores the fast path. Found by the 2026-11-19 audit campaign
+(AUD-QRY-5); regression case `test-igb-bitmap-dict-cap`.
+
+**Fix: `count` returned 0 and aggregates returned 0/`[]`/wrong counts for criteria served by the composite-exact plan.**
+When a composite index fully covers the eq leaves (`a+b` for `[a eq x, b eq y]`),
+the planner planned `FP_PRIMARY_LEAF` + `FP_ORDER_COMPOSITE_EXACT` with source
+leaves in composite order — fields that may have no standalone index. Only `find`
+can serve that plan (it rebuilds the exact composite key); every other consumer
+was composite-exact-blind: `count`'s primary-leaf branch dispatched the phantom
+leaf and printed `0` (the dispatch succeeds with zero entries), and the scalar
+aggregate, indexed group-by, streaming top-N and scan-executor plan sites all
+drove the same leaf — with a standalone index on the first field, `count(*)`
+returned the first leaf's match count with the second half silently ignored.
+The planner now serves the composite-exact plan only to record-fetching callers
+(`find`); no-fetch callers (`count`, aggregate, bulk keyset materialization,
+cursor totals) get the plan re-computed with the composite-exact step off at
+the single Phase-B decision point, so the composite-covered eq leaves compete
+as ordinary leaves — a standalone-index leaf or intersect serves them, and the
+scan fallback appears only when no source leaf has its own index. Composite-only
+objects trade a wrong answer for a scan; composite+standalone-indexed counts
+keep an index-driven fast path (no longer forced to a scan). `find` is
+untouched: its plan, `explain` output and `total:null` behavior are unchanged.
+Found by the 2026-11-19 audit campaign (AUD-QRY-8); regression case
+`test-composite-exact-count-agg` (includes the `explain` perf-shape control
+pinning non-scan, non-composite-exact plans when standalone indexes exist).
+
+**Fix: three indexed-aggregate routes treated an index open failure as an empty shard.**
+Pass-2's aggregated-field walk (sum/avg/min/max over an indexed numeric field),
+the multi-field group-by secondary-map builder, and the limited/streamed
+group-by k-way merge (initial open and mid-query flush-reopen) all treated a
+`btree_range_iter_open` failure as an empty shard: that shard's values never
+reached their buckets/maps, so sums under-counted and group lists came back
+present-but-short in a 200-OK. All three now use the same template as the
+Pass-1 group walk: `stat` the shard's index file first — a missing file is a
+legitimate empty shard (index shards are lazy-created), an open failure on an
+existing file fails closed with the pinned
+`{"error":"aggregate storage access failed"}`. Found by the 2026-11-19 audit
+campaign (AUD-QRY-9, extended by the round-2 review); regression case
+`test-igb-agg-open-fail-routes` (one fault seam per route, red on base).
+
+**Fix: composite-exact finds returned zero rows for `format=csv`, `format=rows` and joins when the composite's first covered part had no standalone index.**
+When a composite index fully covered the criteria's eq leaves, the planner
+ordered the plan's source leaves in composite order; the find shapes the
+composite-key executor does not serve (csv, rows, joins) fall through to the
+generic leaf dispatch, which drives on the first source leaf — a field with no
+standalone index collects zero candidates, so those shapes returned a
+header-only CSV, an empty rows array, or an empty join while default format
+returned the rows. The planner now puts a covered leaf that has its own
+standalone index first (the composite-key executor matches leaves by field
+name, so the reordering cannot affect it). When no covered leaf is
+standalone-indexed the exact plan is kept (default format still does the exact
+composite-key lookup) and csv/rows/join seed on the one indexed leaf that is
+not part of the composite. Found by the round-2 review of the
+composite-exact branch (AUD-QRY-12); regression case
+`test-composite-exact-formats` (default/csv/rows/join parity, red on base).
+
+**Fix (data loss): bulk-insert acknowledged records that could not be read back when an earlier window of the same request left kf slots reserved but never resolved.**
+A bulk window that reserved kf slots for its records and then did not publish a
+marker — every record rejected after reservation (reachable from ordinary input:
+the bitmap distinct-value cap), a hard plan failure, or a payload/marker I/O
+error — never tombstoned those reservations. They stayed `flag==0`, the only
+stop condition of the kf probe walk, while later windows of the same request had
+already been placed *beyond* them (the request's reservation map makes them
+probe past). Once the request finished every such later record sat behind a
+hole: `get`/`exists` returned absent for an acknowledged insert, and nothing
+healed it across restarts. Three changes close it: (1) every exit of a window
+without a marker now tombstones all of its reservations and msyncs them before
+the next window can publish (no allocation on that path); if that sync fails,
+the rest of the shard's records fail instead of committing behind the hole;
+(2) a window that DOES publish now makes its abandoned-reservation tombstones
+durable *before* its marker — previously they waited for the commit barrier, so
+a power cut between marker durability and that barrier would forward-replay the
+active entries and leave the abandoned slots at `flag==0` ahead of them; (3) the
+shared tombstone pass is one helper used by the abort, the pre-marker and the K
+paths. Found by the audit campaign (the all-rejected-window shape, then two
+sibling gaps from blind review); regression cases `test-abort-pre-marker-holes`
+(16 of 16 later inserts unreachable on the previous code),
+`test-unpublished-window-holes` (marker publication fault, same shape) and
+`test-publishing-window-abandoned-sync` (the pre-marker sync ordering: a failed
+sync must leave the window unpublished). Keyfiles already holding such holes are
+repaired by `vacuum`.
+
+**Fix: index walkers that treated an unreadable shard as an empty one now fail closed.**
+Trigram posting walks (contains/like finds, counts and aggregates, and the
+starts_with leading-gram walk), the O_DIRECT full-leaf scan behind
+contains/ends/like/regex/exists predicates, the ordered k-way walks behind
+cursor and `order_by` finds and composite prefix walks, the chunked find
+stream's allocation-failure paths, and join lookups returned short or empty
+answers with a 200 when one index shard could not be opened or read. They now
+return an error (an absent shard file is still an empty shard — index files are
+created lazily). Find answers with a closed envelope plus an error object while
+nothing but the prefix is on the wire, and stays unterminated once rows are out,
+per the find contract. An AND-intersect KeySet that outgrows its tier cap now
+falls back to a scan, as `count` already did. A shard file a writer is still
+creating (zero-size, or sized with a not-yet-stamped header) reads as an empty
+shard, not as an error — otherwise the new fail-closed rule would turn the
+ordinary first write to a lazily created shard into a false "index storage
+error" for concurrent readers. The O_DIRECT leaf scan also reported a
+`pthread_create` failure as success (it returns the code, not errno); fixed.
+Regression case `test-failclosed-walkers`.
+
+**Fix: kf `deleted` counter underflow on tombstone-slot reuse made `count` return 0 for an intact object.**
+An insert window that rejects a record AFTER its kf slot was reserved — reachable
+from ordinary client input via a bitmap distinct-value cap, not only I/O faults —
+tombstones that slot with no counter bookkeeping. Any later insert reusing a
+flag==2 slot commits with `hdr->deleted--`; when the shard's `deleted` was 0 (the
+unbooked case), it wrapped to UINT64_MAX, and the object-level clamp turned one
+wrapped shard into `count` = 0 for the whole object (`orphaned` = −1) while every
+record stayed intact and readable. Inert tombstones are now booked as
+lived-and-died at the write (`total++`/`deleted++`, exactly once — only on the
+non-flag==2 transition, so forward-replay re-entry cannot double-count — and
+marked on the plan so the header flushes with the tombstone bytes). Reuse is
+non-wrapping: a tombstone the counters never booked (legacy roots can already
+hold these) increments `total` instead of decrementing `deleted`, keeping
+`live = total − deleted` exact. Shards whose headers are already wrapped warn at
+kf open (`deleted > total`; run `vacuum` — its kf-compact step and resplit
+recompute the counters and heal; `recount`/`reindex` do not repair). Side effect:
+shards holding booked inert tombstones now enter the startup free-pool rebuild
+and count toward vacuum thresholds. **Observable accounting change:** records
+rejected by the bitmap distinct-value cap are now counted as lived-and-died, so
+`orphaned`, `vacuum-check`'s dead-record figures and the auto-vacuum
+thresholds all include bitmap-cap-rejected records until a reuse (or
+vacuum's kf-compact) reclaims their slots; `count` stays exact throughout. Found by the 2026-11-19 audit campaign
+(AUD-QRY-3); regression case `test-kf-deleted-underflow` (deterministic
+bitmap-cap wire repro + a crafted-legacy-tombstone reuse case).
+
+**Fix: aggregate silently dropped OR / nested-AND sub-trees (and leaves 9+ of a wide AND) on every no-fetch fast path.**
+The planner computed a local `has_subtree` flag for criteria trees whose plan does
+not represent the full predicate — an OR / nested-AND sub-tree beside indexed
+leaves, or an AND with more than `MAX_INTERSECT_LEAVES` (8) LEAF children, whose
+extra leaves are dropped into neither the source nor the post-filter list — and
+then threw it away (`(void)has_subtree;`). Every fast path that answers from the
+source leaves alone therefore over-counted: the scalar KeySet aggregate
+(`count(*) = |KeySet|`), the indexed group-by walk, the bitmap slot-level walk
+and the streaming top-N prefilter. The flag is now carried on `FilterPlan`; the
+no-fetch gates refuse sub-tree-bearing plans (falling back to the record-scan
+executors, which verify the whole tree per record), the intersect aggregate
+restores the tree for its record phase whenever the flag is set, and the bitmap
+slot-walk refuses it directly. Criteria shapes that never carried sub-trees keep
+their fast paths unchanged. Found by the 2026-11-19 audit campaign (AUD-QRY-2,
+AUD-QRY-10); regression cases `test-agg-or-subtree-full-tree` and
+`test-agg-subtree-flag-fields`.
+
+**Fix: aggregate `group_by` on a bitmap-only group field with criteria silently returned zero groups.**
+The indexed group-by fast path admits bitmap-only group fields but could only serve
+them for count-only, no-criteria and slot-eligible (bitmap eq, no post-filter) shapes.
+Any other criteria shape fell through to the btree Pass-1 walk, which opens
+`indexes/<group_field>/NNN.idx` — files a bitmap-only field never has — so the walk
+found nothing and the response was an empty group list while `find` and the same
+aggregate on an unindexed twin returned correct groups. The fast path now routes
+exactly those unservable shapes to the per-record scan executor (the differential
+oracle), so results match the no-index twin. Found by the 2026-11-19 audit campaign
+(AUD-QRY-1); regression case `test-igb-bitmap-group-fallback`.
+
 ## 2026.11.2
 
 **Fix: recovery/stat/O_DIRECT scans break on abandoned staged records ("graves").**

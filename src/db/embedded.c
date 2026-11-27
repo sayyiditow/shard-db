@@ -45,6 +45,8 @@ void db_defaults_set(ShardDb *db) {
     db->port                      = 9199;
     db->global_limit              = 100000;
     db->max_request_size          = 33554432;
+    db->idle_timeout_sec          = 300;
+    db->handshake_timeout_sec     = 10;
     db->fcache_cap                = 4096;
     db->btcache_cap               = 1024;
     db->query_buffer_max_bytes    = 256ULL * 1024 * 1024;
@@ -1148,6 +1150,26 @@ int shard_db_recover_before_stamp(const char *db_root,
                                   int *out_markers_replayed) {
     if (!out_markers_replayed) return -1;
     *out_markers_replayed = 0;
+    /* A crash during a restore's directory swap is rolled back before anything
+       else reads the object (maint_restore_swap_recover). */
+    {
+        StartupSchemaEntry *rents = NULL;
+        size_t rcount = 0;
+        if (startup_read_schema(db_root, &rents, &rcount) != 0) return -1;
+        for (size_t i = 0; i < rcount; i++) {
+            char obj_dir[PATH_MAX];
+            snprintf(obj_dir, sizeof(obj_dir), "%s/%s/%s", db_root, rents[i].dir, rents[i].object);
+            if (maint_restore_swap_recover(obj_dir) < 0) {
+                LOG_ERROR(LOG_SUB_CONFIG, "RESTORE-RECOVER %s/%s: startup refused",
+                          rents[i].dir, rents[i].object);
+                fprintf(stderr, "RESTORE-RECOVER %s/%s: startup refused\n",
+                        rents[i].dir, rents[i].object);
+                free(rents);
+                return -1;
+            }
+        }
+        free(rents);
+    }
     if (shard_db_not_null_upgrade_audit(db_root) != 0) return -1;
     if (rebuild_recovery(db_root) != 0) return -1;
     /* Recovery may restore an older metadata file: re-audit before any

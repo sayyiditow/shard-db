@@ -656,7 +656,8 @@ int test_env_start_at(TestEnv *env, const char *db_root, int port) {
     memcpy(base, db_root, base_len);
     base[base_len] = '\0';
 
-    snprintf(env->db_root, sizeof(env->db_root), "%s", db_root);
+    if (env->db_root != db_root)
+        snprintf(env->db_root, sizeof(env->db_root), "%s", db_root);
     env->port = port;
 
     /* Write db.env at <base>/ ONLY if no existing one is there. Persistent
@@ -1136,6 +1137,60 @@ int test_env_ctl_set_fail_phase(TestEnv *env, int phase, int occurrence,
     return 0;
 }
 
+int test_env_ctl_set_pause_phase(TestEnv *env, int phase, int occurrence) {
+    /* phase 8 = TEST_HOOK_SET_GLOBALS_PAUSE_PHASE (test_control.c). a
+       round-trips -1 (disarm) through (int64_t); b = 1-based occurrence. */
+    return ctl_set_globals(env, 8, (uint64_t)(int64_t)phase,
+                           (uint64_t)occurrence);
+}
+
+int test_env_ctl_set_bt_range_open_fail(TestEnv *env, int shard) {
+    return test_env_ctl_set_bt_range_open_fail_nth(env, shard, 0);
+}
+
+int test_env_ctl_set_bt_range_open_fail_nth(TestEnv *env, int shard,
+                                            int skip) {
+    /* phase 9 = TEST_HOOK_SET_GLOBALS_BT_RANGE_OPEN_FAIL (test_control.c).
+       a = index shard number; the daemon's (skip+1)-th next
+       btree_range_iter_open on that shard's .idx fails with EIO
+       (one-shot). a = -1 disarms a pending shot. */
+    return ctl_set_globals(env, 9, (uint64_t)(int64_t)shard,
+                           (uint64_t)skip);
+}
+
+int test_env_ctl_set_bt_walk_open_fail(TestEnv *env, int shard) {
+    /* phase 13 = TEST_HOOK_SET_GLOBALS_BT_WALK_OPEN_FAIL (test_control.c).
+       a = index shard number; every btree_search / btree_range_ex open
+       of that shard's .idx fails with EIO until a = -1 disarms. */
+    return ctl_set_globals(env, 13, (uint64_t)(int64_t)shard, 0);
+}
+
+int test_env_ctl_reset_pass1_parallel(TestEnv *env) {
+    /* phase 12 = TEST_HOOK_SET_GLOBALS_PASS1_RESET (test_control.c). */
+    return ctl_set_globals(env, 12, 1, 0);
+}
+
+int test_env_ctl_get_pass1_parallel(TestEnv *env) {
+    /* kind 7 = TEST_HOOK_GET_GLOBALS, phase 11: the daemon's ACK carries
+       the Pass-1 parallel-route counter in .a. */
+    if (!env || env->test_control_fd < 0) return -1;
+    TestHookMessage msg = { .kind = 7 /* TEST_HOOK_GET_GLOBALS */,
+                            .phase = 11, .a = 0, .b = 0 };
+    if (test_hook_write_full(env->test_control_fd, &msg, sizeof(msg)) != 0)
+        return -1;
+    TestHookMessage rep = {0};
+    if (test_hook_read_full(env->test_control_fd, &rep, sizeof(rep)) != 0)
+        return -1;
+    return rep.kind == 4 /* TEST_HOOK_ACK */ ? (int)rep.a : -1;
+}
+
+int test_env_ctl_set_keyset_leaf_fail_alloc(TestEnv *env, int fail_n) {
+    /* phase 10 = TEST_HOOK_SET_GLOBALS_KEYSET_LEAF_FAIL_ALLOC
+       (test_control.c). a = countdown of per-leaf KeySet-build
+       allocations to fail with ENOMEM; 0 disarms. */
+    return ctl_set_globals(env, 10, (uint64_t)(int64_t)fail_n, 0);
+}
+
 int test_env_ctl_set_bmfix_backoff(TestEnv *env, long ms) {
     /* phase 7 = TEST_HOOK_SET_GLOBALS_BMFIX_BACKOFF (test_control.c). */
     return ctl_set_globals(env, 7, (uint64_t)(int64_t)ms, 0);
@@ -1144,6 +1199,12 @@ int test_env_ctl_set_bmfix_backoff(TestEnv *env, long ms) {
 int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
     /* phase 1 = TEST_HOOK_SET_GLOBALS_ESCAPE_FAIL (test_control.c). */
     return ctl_set_globals(env, 1, (uint64_t)(fail ? 1 : 0), 0);
+}
+
+int test_env_ctl_set_restore_fault(TestEnv *env, int mask, int swap_index) {
+    /* phase 14 = TEST_HOOK_SET_GLOBALS_RESTORE_FAULT (test_control.c).
+       a = mask (SHARD_TEST_RF_*), b = 0-based swap-name index. */
+    return ctl_set_globals(env, 14, (uint64_t)mask, (uint64_t)swap_index);
 }
 
 int test_env_test_hook_wait(TestEnv *env, int *out_phase) {
@@ -1155,8 +1216,10 @@ int test_env_test_hook_wait(TestEnv *env, int *out_phase) {
     /* phase: 0 = stale snapshot, 1 = under kf wrlock (after-old hook),
        2 = count worker parked in the pass-1 gap (probe reader held),
        3 = find worker parked at the batch-fetch gate,
-       4 = guarded write parked after its guard check. */
-    if (rep.phase < 0 || rep.phase > 4) return -1;
+       4 = guarded write parked after its guard check,
+       5 = restore parked after the renames (before the commit fsyncs),
+       6 = restore parked after the commit (before the stage delete). */
+    if (rep.phase < 0 || rep.phase > 6) return -1;
     *out_phase = rep.phase;
     return 0;
 }

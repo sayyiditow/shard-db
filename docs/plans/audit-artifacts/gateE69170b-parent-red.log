@@ -1,0 +1,13 @@
+# RB post-resplit bitmap/plaint equality cat_0: plain=500 bitmap=153not ok 173 - post-resplit bitmap/plaint equality
+# RB post-resplit bitmap/plaint equality cat_1: plain=500 bitmap=181not ok 178 - post-resplit bitmap/plaint equality
+# RB post-resplit bitmap/plaint equality cat_2: plain=500 bitmap=170not ok 183 - post-resplit bitmap/plaint equality
+# RB post-resplit bitmap/plaint equality cat_3: plain=500 bitmap=153not ok 188 - post-resplit bitmap/plaint equality
+# RB post-delete bitmap/plain equality cat_0: plain=400 bitmap=123not ok 204 - post-delete bitmap/plain equality
+# RB post-delete bitmap/plain equality cat_1: plain=400 bitmap=146not ok 209 - post-delete bitmap/plain equality
+# RB post-delete bitmap/plain equality cat_2: plain=400 bitmap=142not ok 214 - post-delete bitmap/plain equality
+# RB post-delete bitmap/plain equality cat_3: plain=400 bitmap=124not ok 219 - post-delete bitmap/plain equality
+# RB post-restart bitmap/plain equality cat_0: plain=400 bitmap=123not ok 232 - post-restart bitmap/plain equality
+# RB post-restart bitmap/plain equality cat_1: plain=400 bitmap=146not ok 237 - post-restart bitmap/plain equality
+# RB post-restart bitmap/plain equality cat_2: plain=400 bitmap=142not ok 242 - post-restart bitmap/plain equality
+# RB post-restart bitmap/plain equality cat_3: plain=400 bitmap=124not ok 247 - post-restart bitmap/plain equality
+# audit-gate-resplit-bitmap: 242 passed, 12 failed

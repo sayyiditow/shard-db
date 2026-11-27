@@ -78,28 +78,38 @@ static uint32_t str_hash(const char *s) {
 /* --- IP allowlist: hash set, loaded from $DB_ROOT/allowed_ips.conf --- */
 /* IP_SET_BUCKETS, g_ip_set*, g_ip_lock moved to ShardDb struct */
 
-static void ip_set_add(const char *ip) {
+/* Open-addressed tables below use used[]: 0 = never used (ends a probe),
+   1 = live, 2 = tombstone (removed; probes continue past it). A removed slot
+   must never end a probe chain or every colliding entry inserted after it
+   becomes unreachable (AUD-AUTH-2). Lookups are lock-free, so a slot is
+   marked 2 (readers skip it) before its bytes are cleared, and a reused slot
+   is filled before it is published as 1. */
+static int ip_set_add(const char *ip) {
     uint32_t idx = str_hash(ip) % IP_SET_BUCKETS;
+    int first_free = -1;
     for (int i = 0; i < IP_SET_BUCKETS; i++) {
         int slot = (idx + i) % IP_SET_BUCKETS;
-        if (!g_ip_set_used[slot]) {
-            strncpy(g_ip_set[slot], ip, 45);
-            g_ip_set[slot][45] = '\0';
-            g_ip_set_used[slot] = 1;
-            g_ip_set_count++;
-            return;
-        }
-        if (strcmp(g_ip_set[slot], ip) == 0) return;
+        int u = __atomic_load_n(&g_ip_set_used[slot], __ATOMIC_ACQUIRE);
+        if (u == 0) { if (first_free < 0) first_free = slot; break; }
+        if (u == 2) { if (first_free < 0) first_free = slot; continue; }
+        if (strcmp(g_ip_set[slot], ip) == 0) return 0;
     }
+    if (first_free < 0) return -1;
+    strncpy(g_ip_set[first_free], ip, 45);
+    g_ip_set[first_free][45] = '\0';
+    __atomic_store_n(&g_ip_set_used[first_free], 1, __ATOMIC_RELEASE);
+    g_ip_set_count++;
+    return 0;
 }
 
 static int ip_set_remove(const char *ip) {
     uint32_t idx = str_hash(ip) % IP_SET_BUCKETS;
     for (int i = 0; i < IP_SET_BUCKETS; i++) {
         int slot = (idx + i) % IP_SET_BUCKETS;
-        if (!g_ip_set_used[slot]) return 0;
-        if (strcmp(g_ip_set[slot], ip) == 0) {
-            g_ip_set_used[slot] = 0;
+        int u = __atomic_load_n(&g_ip_set_used[slot], __ATOMIC_ACQUIRE);
+        if (u == 0) return 0;
+        if (u == 1 && strcmp(g_ip_set[slot], ip) == 0) {
+            __atomic_store_n(&g_ip_set_used[slot], 2, __ATOMIC_RELEASE);
             g_ip_set[slot][0] = '\0';
             g_ip_set_count--;
             return 1;
@@ -117,20 +127,53 @@ void load_allowed_ips_conf(const char *db_root) {
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\n\r")] = '\0';
         char *p = line; while (*p == ' ') p++;
-        if (*p && *p != '#') ip_set_add(p);
+        if (*p && *p != '#' && ip_set_add(p) != 0)
+            fprintf(stderr, "load_allowed_ips_conf: IP table full; skipping %s\n", p);
     }
     fclose(f);
 }
 
-static void save_allowed_ips_conf(const char *db_root) {
+/* Replace `path` atomically with `len` bytes: write a 0600 temp file in the
+   same directory, fsync it, rename over the target, fsync the directory.
+   These files hold secrets and trust decisions; a crash must leave either the
+   old or the new content, never a truncated file (AUD-AUTH-3). Returns 0 or
+   -1 with errno set. */
+static int write_conf_atomic(const char *path, const char *buf, size_t len) {
+    char tmp[PATH_MAX], dir[PATH_MAX];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid()) >= (int)sizeof(tmp)) {
+        errno = ENAMETOOLONG; return -1;
+    }
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = '\0'; else snprintf(dir, sizeof(dir), ".");
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, len - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) { int e = errno ? errno : EIO; close(fd); unlink(tmp); errno = e; return -1; }
+        off += (size_t)w;
+    }
+    if (fsync(fd) != 0) { int e = errno; close(fd); unlink(tmp); errno = e; return -1; }
+    if (close(fd) != 0) { int e = errno; unlink(tmp); errno = e; return -1; }
+    if (rename(tmp, path) != 0) { int e = errno; unlink(tmp); errno = e; return -1; }
+    return fsync_dir(dir);
+}
+
+static int save_allowed_ips_conf(const char *db_root) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/allowed_ips.conf", db_root);
-    FILE *f = fopen(path, "w");
-    if (!f) return;
+    char *buf = NULL; size_t blen = 0;
+    FILE *f = open_memstream(&buf, &blen);
+    if (!f) return -1;
     for (int i = 0; i < IP_SET_BUCKETS; i++) {
-        if (g_ip_set_used[i]) fprintf(f, "%s\n", g_ip_set[i]);
+        if (g_ip_set_used[i] == 1) fprintf(f, "%s\n", g_ip_set[i]);
     }
-    fclose(f);
+    if (fclose(f) != 0) { free(buf); return -1; }
+    int rc = write_conf_atomic(path, buf ? buf : "", buf ? blen : 0);
+    free(buf);
+    return rc;
 }
 
 int is_ip_trusted(const char *ip) {
@@ -145,8 +188,9 @@ int is_ip_trusted(const char *ip) {
     uint32_t idx = str_hash(ip) % IP_SET_BUCKETS;
     for (int i = 0; i < IP_SET_BUCKETS; i++) {
         int slot = (idx + i) % IP_SET_BUCKETS;
-        if (!g_ip_set_used[slot]) return 0;
-        if (strcmp(g_ip_set[slot], ip) == 0) return 1;
+        int u = __atomic_load_n(&g_ip_set_used[slot], __ATOMIC_ACQUIRE);
+        if (u == 0) return 0;
+        if (u == 1 && strcmp(g_ip_set[slot], ip) == 0) return 1;
     }
     return 0;
 }
@@ -179,24 +223,21 @@ static void token_store_init(void) {
     }
 }
 
-static void token_set_add_full(const char *token,
-                               const char *dir_scope,
-                               const char *obj_scope,
-                               uint8_t perm) {
+/* Returns 0 on success (added or an existing token's scope/perm replaced),
+   -1 when the table has no free slot (the caller reports it). */
+static int token_set_add_full(const char *token,
+                              const char *dir_scope,
+                              const char *obj_scope,
+                              uint8_t perm) {
     uint32_t idx = str_hash(token) % g_token_cap;
     const char *ds = dir_scope ? dir_scope : "";
     const char *os = obj_scope ? obj_scope : "";
+    int first_free = -1;
     for (int i = 0; i < g_token_cap; i++) {
         int slot = (idx + i) % g_token_cap;
-        if (!g_token_set_used[slot]) {
-            strncpy(g_token_set[slot], token, 255);       g_token_set[slot][255] = '\0';
-            strncpy(g_token_scope[slot], ds, 255);        g_token_scope[slot][255] = '\0';
-            strncpy(g_token_scope_obj[slot], os, 255);    g_token_scope_obj[slot][255] = '\0';
-            g_token_perm[slot] = perm;
-            __atomic_store_n(&g_token_set_used[slot], 1, __ATOMIC_RELEASE);
-            g_token_count++;
-            return;
-        }
+        int u = __atomic_load_n(&g_token_set_used[slot], __ATOMIC_ACQUIRE);
+        if (u == 0) { if (first_free < 0) first_free = slot; break; }
+        if (u == 2) { if (first_free < 0) first_free = slot; continue; }
         if (strcmp(g_token_set[slot], token) == 0) {
             /* Token already present. Duplicate tokens must be unique across
                scopes; later writes silently overwrite scope+perm. In practice
@@ -205,22 +246,33 @@ static void token_set_add_full(const char *token,
             strncpy(g_token_scope[slot], ds, 255);        g_token_scope[slot][255] = '\0';
             strncpy(g_token_scope_obj[slot], os, 255);    g_token_scope_obj[slot][255] = '\0';
             g_token_perm[slot] = perm;
-            return;
+            return 0;
         }
     }
+    if (first_free < 0) return -1;
+    int slot = first_free;
+    strncpy(g_token_set[slot], token, 255);       g_token_set[slot][255] = '\0';
+    strncpy(g_token_scope[slot], ds, 255);        g_token_scope[slot][255] = '\0';
+    strncpy(g_token_scope_obj[slot], os, 255);    g_token_scope_obj[slot][255] = '\0';
+    g_token_perm[slot] = perm;
+    __atomic_store_n(&g_token_set_used[slot], 1, __ATOMIC_RELEASE);
+    g_token_count++;
+    return 0;
 }
 
 static int token_set_remove(const char *token) {
     uint32_t idx = str_hash(token) % g_token_cap;
     for (int i = 0; i < g_token_cap; i++) {
         int slot = (idx + i) % g_token_cap;
-        if (!g_token_set_used[slot]) return 0;
-        if (strcmp(g_token_set[slot], token) == 0) {
+        int u = __atomic_load_n(&g_token_set_used[slot], __ATOMIC_ACQUIRE);
+        if (u == 0) return 0;
+        if (u == 1 && strcmp(g_token_set[slot], token) == 0) {
+            /* Tombstone first (lock-free readers skip it), then clear. */
+            __atomic_store_n(&g_token_set_used[slot], 2, __ATOMIC_RELEASE);
             g_token_set[slot][0] = '\0';
             g_token_scope[slot][0] = '\0';
             g_token_scope_obj[slot][0] = '\0';
             g_token_perm[slot] = 0;
-            __atomic_store_n(&g_token_set_used[slot], 0, __ATOMIC_RELEASE);
             g_token_count--;
             return 1;
         }
@@ -266,7 +318,7 @@ static int token_find_slot(const char *token) {
         int slot = (idx + i) % g_token_cap;
         uint32_t used = __atomic_load_n(&g_token_set_used[slot], __ATOMIC_ACQUIRE);
         if (!used) return -1;
-        if (token_compare(g_token_set[slot], token)) return slot;
+        if (used == 1 && token_compare(g_token_set[slot], token)) return slot;
     }
     return -1;
 }
@@ -392,7 +444,8 @@ static void load_one_tokens_file(const char *path, const char *dir_scope,
         if (!*p || *p == '#') continue;
         char tokbuf[256]; uint8_t perm;
         if (parse_token_line(p, tokbuf, sizeof(tokbuf), &perm)) {
-            token_set_add_full(tokbuf, dir_scope, obj_scope, perm);
+            if (token_set_add_full(tokbuf, dir_scope, obj_scope, perm) != 0)
+                fprintf(stderr, "load_tokens_conf: token store full (TOKEN_CAP); skipping a token in %s\n", path);
         } else {
             fprintf(stderr, "load_tokens_conf: skipping malformed line '%s' in %s\n", p, path);
         }
@@ -465,7 +518,7 @@ static void save_token_line(FILE *f, int slot) {
 
 /* Rewrite the tokens.conf file for a specific scope (global, tenant, or
    object). Writes only tokens whose (dir, obj) matches the requested scope. */
-static void save_tokens_conf_full(const char *db_root,
+static int save_tokens_conf_full(const char *db_root,
                                   const char *dir_scope,
                                   const char *obj_scope) {
     char path[PATH_MAX];
@@ -476,17 +529,21 @@ static void save_tokens_conf_full(const char *db_root,
     else
         snprintf(path, sizeof(path), "%s/%s/%s/tokens.conf",
                  db_root, dir_scope, obj_scope);
-    FILE *f = fopen(path, "w");
-    if (!f) return;
+    char *buf = NULL; size_t blen = 0;
+    FILE *f = open_memstream(&buf, &blen);
+    if (!f) return -1;
     const char *wd = dir_scope ? dir_scope : "";
     const char *wo = obj_scope ? obj_scope : "";
     for (int i = 0; i < g_token_cap; i++) {
-        if (!g_token_set_used[i]) continue;
+        if (g_token_set_used[i] != 1) continue;
         if (strcmp(g_token_scope[i], wd) != 0) continue;
         if (strcmp(g_token_scope_obj[i], wo) != 0) continue;
         save_token_line(f, i);
     }
-    fclose(f);
+    if (fclose(f) != 0) { free(buf); return -1; }
+    int rc = write_conf_atomic(path, buf ? buf : "", buf ? blen : 0);
+    free(buf);
+    return rc;
 }
 
 /* After a successful restore: add the backup's object tokens (if the backup
@@ -522,11 +579,14 @@ static void restore_merge_object_tokens(const char *raw_db_root, const char *dir
         if (!parse_token_line(p, tokbuf, sizeof(tokbuf), &perm)) continue;
         if (token_find_slot(tokbuf) >= 0) { skipped_present++; continue; }
         if (g_token_count >= g_token_cap) { skipped_full++; continue; }
-        token_set_add_full(tokbuf, dir, object, perm);
+        if (token_set_add_full(tokbuf, dir, object, perm) != 0) { skipped_full++; continue; }
         added++;
     }
     fclose(f);
-    if (added > 0) save_tokens_conf_full(raw_db_root, dir, object);   /* no rewrite when nothing was added */
+    if (added > 0 &&
+        save_tokens_conf_full(raw_db_root, dir, object) != 0)   /* no rewrite when nothing was added */
+        LOG_ERROR(LOG_SUB_AUTH, "restore-tokens: could not persist %s/%s tokens.conf: %s",
+                  dir, object, strerror(errno));
     pthread_mutex_unlock(&g_token_lock);
     LOG_AUDIT(LOG_SUB_AUTH, "AUTH restore-tokens scope=%s/%s from=%s added=%d present=%d full=%d",
               dir, object, from, added, skipped_present, skipped_full);
@@ -657,6 +717,11 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
         }
     }
 
+    if (!is_valid_dir(cmd.dir)) {
+        OUT("{\"error\":\"Unknown dir: %s\"}\n", cmd.dir);
+        nql_free_command(&cmd);
+        return;
+    }
     if (!is_valid_object(cmd.obj)) {
         OUT("{\"error\":\"invalid object name\"}\n");
         nql_free_command(&cmd);
@@ -745,6 +810,18 @@ static void dispatch_nql_query(const char *raw_db_root, const char *line,
    a pointer to the row pointer and the heap block is *lines — free(that),
    never the variable itself. */
 
+
+/* Server-local file/path parameters (bulk-* "file", put-file "path") open a
+   path on the daemon's filesystem as the daemon user. Only a trusted address
+   or a global admin token may use them; every other token must send the
+   data inline. */
+static int server_paths_allowed(const char *client_ip, JsonObj *req) {
+    if (is_ip_trusted(client_ip)) return 1;
+    char *auth = json_obj_strdup(req, "auth");
+    int ok = auth && is_token_valid(auth);
+    free(auth);
+    return ok;
+}
 
 void dispatch_json_query(const char *raw_db_root, const char *json, const char *client_ip) {
     /* Concurrency cap: take a slot up-front; release on any return path
@@ -850,9 +927,22 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 const char *ds = (dir_scope && dir_scope[0]) ? dir_scope : NULL;
                 const char *os = (obj_scope && obj_scope[0]) ? obj_scope : NULL;
                 pthread_mutex_lock(&g_token_lock);
-                token_set_add_full(token, ds, os, perm);
-                save_tokens_conf_full(raw_db_root, ds, os);
+                int existed = token_find_slot(token) >= 0;
+                int add_rc = token_set_add_full(token, ds, os, perm);
+                int save_rc = add_rc == 0 ? save_tokens_conf_full(raw_db_root, ds, os) : 0;
+                int save_errno = errno;
+                if (add_rc == 0 && save_rc != 0 && !existed) token_set_remove(token);  /* memory must match disk */
                 pthread_mutex_unlock(&g_token_lock);
+                if (add_rc != 0) {
+                    OUT("{\"error\":\"token store full (raise TOKEN_CAP)\"}\n");
+                    free(token); free(dir_scope); free(obj_scope); free(perm_str); free(mode);
+                    return;
+                }
+                if (save_rc != 0) {
+                    OUT("{\"error\":\"token not persisted: %s\"}\n", strerror(save_errno ? save_errno : EIO));
+                    free(token); free(dir_scope); free(obj_scope); free(perm_str); free(mode);
+                    return;
+                }
                 const char *pstr = (perm == PERM_R) ? "r" : (perm == PERM_RW) ? "rw" : "rwx";
                 LOG_AUDIT(LOG_SUB_AUTH, "AUTH add-token scope=%s/%s perm=%s from %s",
                         ds ? ds : "global", os ? os : "", pstr, client_ip);
@@ -887,7 +977,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                     for (int i = 0; i < g_token_cap; i++) {
                         int slot = (idx + i) % g_token_cap;
                         if (!g_token_set_used[slot]) break;
-                        if (strcmp(g_token_set[slot], token) == 0) {
+                        if (g_token_set_used[slot] == 1 && strcmp(g_token_set[slot], token) == 0) {
                             strncpy(rm_token, g_token_set[slot],       sizeof(rm_token) - 1);
                             strncpy(rm_dir,   g_token_scope[slot],     sizeof(rm_dir)   - 1);
                             strncpy(rm_obj,   g_token_scope_obj[slot], sizeof(rm_obj)   - 1);
@@ -897,10 +987,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                     }
                 } else {
                     for (int i = 0; i < g_token_cap; i++) {
-                        if (!g_token_set_used[i]) continue;
+                        if (g_token_set_used[i] != 1) continue;
                         int tlen = (int)strlen(g_token_set[i]);
                         char this_fp[32];
-                        if (tlen > 10)
+                        if (tlen > 16)
                             snprintf(this_fp, sizeof(this_fp),
                                      "%.4s...%s", g_token_set[i], g_token_set[i] + tlen - 4);
                         else
@@ -914,15 +1004,30 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                     }
                 }
 
-                int removed = 0;
+                int removed = 0, rm_save_failed = 0, rm_errno = 0;
                 if (matches == 1) {
+                    int slot_rm = token_find_slot(rm_token);
+                    uint8_t rm_perm = slot_rm >= 0 ? g_token_perm[slot_rm] : PERM_RW;
                     removed = token_set_remove(rm_token);
-                    if (removed)
+                    if (removed &&
                         save_tokens_conf_full(raw_db_root,
                                               rm_dir[0] ? rm_dir : NULL,
-                                              rm_obj[0] ? rm_obj : NULL);
+                                              rm_obj[0] ? rm_obj : NULL) != 0) {
+                        rm_errno = errno;
+                        rm_save_failed = 1;
+                        /* memory must match disk: put the token back */
+                        (void)token_set_add_full(rm_token, rm_dir[0] ? rm_dir : NULL,
+                                                 rm_obj[0] ? rm_obj : NULL, rm_perm);
+                        removed = 0;
+                    }
                 }
                 pthread_mutex_unlock(&g_token_lock);
+                if (rm_save_failed) {
+                    OUT("{\"error\":\"token not removed (could not persist): %s\"}\n", strerror(rm_errno ? rm_errno : EIO));
+                    free(token); free(fp);
+                    free(mode);
+                    return;
+                }
 
                 if (matches > 1)
                     OUT("{\"error\":\"ambiguous fingerprint — multiple tokens match\"}\n");
@@ -941,11 +1046,19 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             char *ip = json_obj_strdup(&req, "ip");
             if (ip && ip[0]) {
                 pthread_mutex_lock(&g_ip_lock);
-                ip_set_add(ip);
-                save_allowed_ips_conf(raw_db_root);
+                int add_rc = ip_set_add(ip);
+                int sv_rc = add_rc == 0 ? save_allowed_ips_conf(raw_db_root) : 0;
+                int sv_errno = errno;
+                if (add_rc == 0 && sv_rc != 0) (void)ip_set_remove(ip);   /* memory must match disk */
                 pthread_mutex_unlock(&g_ip_lock);
-                LOG_AUDIT(LOG_SUB_AUTH, "AUTH add-ip %s from %s", ip, client_ip);
-                OUT("{\"status\":\"ip_added\"}\n");
+                if (add_rc != 0)
+                    OUT("{\"error\":\"IP table full\"}\n");
+                else if (sv_rc != 0)
+                    OUT("{\"error\":\"ip not persisted: %s\"}\n", strerror(sv_errno ? sv_errno : EIO));
+                else {
+                    LOG_AUDIT(LOG_SUB_AUTH, "AUTH add-ip %s from %s", ip, client_ip);
+                    OUT("{\"status\":\"ip_added\"}\n");
+                }
             } else {
                 OUT("{\"error\":\"Missing ip\"}\n");
             }
@@ -955,8 +1068,19 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             if (ip && ip[0]) {
                 pthread_mutex_lock(&g_ip_lock);
                 int removed = ip_set_remove(ip);
-                if (removed) save_allowed_ips_conf(raw_db_root);
+                int ip_save_failed = 0, ip_errno = 0;
+                if (removed && save_allowed_ips_conf(raw_db_root) != 0) {
+                    ip_errno = errno;
+                    ip_save_failed = 1;
+                    (void)ip_set_add(ip);          /* memory must match disk */
+                    removed = 0;
+                }
                 pthread_mutex_unlock(&g_ip_lock);
+                if (ip_save_failed) {
+                    OUT("{\"error\":\"ip not removed (could not persist): %s\"}\n", strerror(ip_errno ? ip_errno : EIO));
+                    free(ip); free(mode);
+                    return;
+                }
                 if (removed)
                     LOG_AUDIT(LOG_SUB_AUTH, "AUTH remove-ip %s from %s", ip, client_ip);
                 OUT("{\"status\":\"%s\"}\n", removed ? "ip_removed" : "ip_not_found");
@@ -969,10 +1093,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             OUT("[");
             int printed = 0;
             for (int i = 0; i < g_token_cap; i++) {
-                if (!g_token_set_used[i]) continue;
+                if (g_token_set_used[i] != 1) continue;
                 int tlen = strlen(g_token_set[i]);
                 char fp[32];
-                if (tlen > 10)
+                if (tlen > 16)
                     snprintf(fp, sizeof(fp), "%.4s...%s",
                              g_token_set[i], g_token_set[i] + tlen - 4);
                 else
@@ -996,7 +1120,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             OUT("[");
             int printed = 0;
             for (int i = 0; i < IP_SET_BUCKETS; i++) {
-                if (!g_ip_set_used[i]) continue;
+                if (g_ip_set_used[i] != 1) continue;
                 OUT("%s\"%s\"", printed ? "," : "", g_ip_set[i]);
                 printed++;
             }
@@ -2045,6 +2169,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         if (records) {
             cmd_bulk_insert_string(db_root, object, records, ifne);
             free(records);
+        } else if (file && !server_paths_allowed(client_ip, &req)) {
+            OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
         } else if (file) {
             cmd_bulk_insert(db_root, object, file, ifne);
         } else {
@@ -2067,6 +2193,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         if (data) {
             cmd_bulk_insert_delimited_string(db_root, object, data, data_len, d, ifne);
             free(data);
+        } else if (file && !server_paths_allowed(client_ip, &req)) {
+            OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
         } else if (file) {
             cmd_bulk_insert_delimited(db_root, object, file, d, ifne);
         } else {
@@ -2091,6 +2219,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             if (keys) {
                 cmd_bulk_delete_string(db_root, object, keys);
                 /* keys ownership transferred — bulk_delete_run frees it. */
+            } else if (file && !server_paths_allowed(client_ip, &req)) {
+                OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
             } else if (file) {
                 cmd_bulk_delete(db_root, object, file);
             } else {
@@ -2122,6 +2252,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             char *file = json_obj_strdup(&req, "file");
             if (records)
                 cmd_bulk_update_json_string(db_root, object, records);
+            else if (file && !server_paths_allowed(client_ip, &req))
+                OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
             else if (file)
                 cmd_bulk_update_json(db_root, object, file);
             else
@@ -2137,6 +2269,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         if (data) {
             cmd_bulk_update_delimited_string(db_root, object, data, strlen(data), d);
             free(data);
+        } else if (file && !server_paths_allowed(client_ip, &req)) {
+            OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
         } else if (file) {
             cmd_bulk_update_delimited(db_root, object, file, d);
         } else {
@@ -2220,7 +2354,8 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             free(filename);
         } else {
             char *path = json_obj_strdup(&req, "path");
-            if (path) cmd_put_file(db_root, object, path);
+            if (path && !server_paths_allowed(client_ip, &req)) OUT("{\"error\":\"server-local file paths require a trusted address or a global admin token; send the data inline\"}\n");
+            else if (path) cmd_put_file(db_root, object, path);
             else OUT("{\"error\":\"put-file requires \\\"data\\\" (base64) or \\\"path\\\" (server-local)\"}\n");
             free(path);
         }
@@ -2431,6 +2566,11 @@ void handle_shutdown(int sig) {
 #define FIELD_SEP "\x1F"
 #define MAX_ARGS 8
 void server_process_fast(const char *db_root, const char *line, const char *client_ip) {
+    /* Concurrency slot for the non-JSON grammars (NQL find/count/aggregate
+       and the legacy text protocol); dispatch_json_query takes its own, so
+       JSON requests do not double-acquire. Released on every return path
+       (AUD-CAP-1). Declared before any goto so the cleanup is always valid. */
+    int slot_held __attribute__((cleanup(slot_cleanup))) = 0;
     const char *trimmed = line;
     while (*trimmed == ' ') trimmed++;
     uint64_t t0 = (g_slow_query_ms > 0) ? now_ms() : 0;
@@ -2463,6 +2603,16 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
         pthread_mutex_unlock(&thread_count_lock);
     }
 
+    if (!is_json) {
+        if (slot_try_acquire() == 0) {
+            slot_held = 1;
+        } else {
+            OUT("{\"error\":\"server at capacity\",\"max_concurrent_queries\":%d}\n",
+                g_max_concurrent_queries);
+            goto timing;
+        }
+    }
+
     /* NQL path: first char is f/c/a (find/count/aggregate), not '{' or '\x1F' */
     if (!is_json && (trimmed[0]=='f' || trimmed[0]=='c' || trimmed[0]=='a') &&
         !strchr(trimmed, '\x1F')) {
@@ -2479,7 +2629,15 @@ void server_process_fast(const char *db_root, const char *line, const char *clie
         goto timing;
     }
 
-    /* Legacy \x1F protocol */
+    /* Legacy \x1F protocol. It carries no token field, so it can only be
+       authenticated by the peer address: trusted IPs (loopback unless
+       DISABLE_LOCALHOST_TRUST, plus allowed_ips.conf) only. Every other
+       peer must use the JSON grammar with a token. */
+    if (!is_ip_trusted(client_ip)) {
+        LOG_AUDIT(LOG_SUB_AUTH, "AUTH failed: ip=%s legacy text protocol from an untrusted address", client_ip);
+        OUT("{\"error\":\"auth failed\"}\n");
+        goto timing;
+    }
     char *args[MAX_ARGS];
     char linecopy[MAX_LINE * 2];
     strncpy(linecopy, line, sizeof(linecopy) - 1);
@@ -2684,6 +2842,15 @@ typedef struct {
     int id;
 } WorkerArg;
 
+/* Socket-level read/write timeouts: a worker serves one connection for its
+   whole life, so without them idle or half-open peers pin every worker
+   (AUD-CONN-1). sec == 0 leaves the socket blocking. */
+static void set_conn_timeouts(int fd, int sec) {
+    struct timeval tv = { .tv_sec = sec > 0 ? sec : 0, .tv_usec = 0 };   /* 0 = no timeout */
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 void *worker_thread(void *arg) {
     WorkerArg *wa = (WorkerArg *)arg;
 
@@ -2706,9 +2873,20 @@ void *worker_thread(void *arg) {
         /* Get client IP for auth decisions */
         struct sockaddr_in peer_addr;
         socklen_t peer_len = sizeof(peer_addr);
-        char client_ip[INET_ADDRSTRLEN] = "127.0.0.1";
-        if (getpeername(cfd, (struct sockaddr *)&peer_addr, &peer_len) == 0)
-            inet_ntop(AF_INET, &peer_addr.sin_addr, client_ip, sizeof(client_ip));
+        char client_ip[INET_ADDRSTRLEN] = "0.0.0.0";   /* never a trusted address */
+        if (getpeername(cfd, (struct sockaddr *)&peer_addr, &peer_len) != 0 ||
+            !inet_ntop(AF_INET, &peer_addr.sin_addr, client_ip, sizeof(client_ip))) {
+            /* No peer address means no way to apply IP trust: drop the connection. */
+            __atomic_store_n(&g_worker_cfds[wa->id], -1, __ATOMIC_RELEASE);
+            close(cfd);
+            pthread_mutex_lock(&thread_count_lock);
+            active_threads--;
+            pthread_mutex_unlock(&thread_count_lock);
+            continue;
+        }
+        /* TLS handshake gets its own (short) timeout; the idle timeout takes
+           over once the session is up (or immediately for plain sockets). */
+        set_conn_timeouts(cfd, g_tls_enable ? g_handshake_timeout_sec : g_idle_timeout_sec);
 
         /* Per-connection streams — TLS wraps SSL via tls_fopen (one FILE*
            in r+ mode; reads and writes share the same SSL session); plain
@@ -2717,6 +2895,7 @@ void *worker_thread(void *arg) {
         FILE *cf = NULL, *out = NULL;
         if (g_tls_enable) {
             SSL *ssl = tls_accept(cfd);
+            if (ssl) set_conn_timeouts(cfd, g_idle_timeout_sec);
             if (!ssl) {
                 /* Handshake failed — drop the connection silently (logged in tls.c). */
                 __atomic_store_n(&g_worker_cfds[wa->id], -1, __ATOMIC_RELEASE);
@@ -2746,6 +2925,10 @@ void *worker_thread(void *arg) {
             int buf_size = g_max_request_size > 0 ? g_max_request_size : MAX_LINE;
             char *line = malloc(buf_size);
             while (line && fgets(line, buf_size, cf)) {
+                /* A read timeout (idle or slow peer) or socket error leaves the
+                   FILE in the error state with at most a partial line: drop the
+                   connection without executing the fragment. */
+                if (ferror(cf)) break;
                 /* Check for oversized request: fgets filled buffer without finding newline */
                 int len = strlen(line);
                 if (len > 0 && line[len - 1] != '\n' && len >= buf_size - 1) {
@@ -3697,6 +3880,24 @@ void bg_threads_stop(ShardDb *db) {
  *
  * Returns 0 on clean, count-of-errors otherwise.
  */
+/* Orderly teardown for a failed start after bg threads/pools are up. */
+static int server_startup_abort(const char *db_root, int sfd) {
+    remove_pid_file(db_root);
+    close(sfd);
+    bg_threads_stop(g_shard_db_instance);
+    parallel_io_pool_shutdown();
+    parallel_pool_shutdown();
+    counts_flush_all();
+    bt_cache_shutdown();
+    bm_cache_shutdown();
+    slotcask_shutdown();
+    schema_caches_shutdown();
+    tls_shutdown();
+    log_shutdown();
+    shard_db_destroy_after_storage(g_shard_db_instance);
+    return 1;
+}
+
 int cmd_server(const char *db_root, int daemonize) {
     /* Recovery mutates object directories, so DB-root ownership must be
        established before any instance initialization or recovery work. */
@@ -3982,20 +4183,7 @@ int cmd_server(const char *db_root, int daemonize) {
     if (bg_threads_start(g_shard_db_instance, BG_RUNTIME_DAEMON) != 0) {
         LOG_ERROR(LOG_SUB_DURABILITY,
                   "SERVER START aborted: required durability thread unavailable");
-        remove_pid_file(db_root);
-        close(sfd);
-        bg_threads_stop(g_shard_db_instance);
-        parallel_io_pool_shutdown();
-        parallel_pool_shutdown();
-        counts_flush_all();
-        bt_cache_shutdown();
-        bm_cache_shutdown();
-        slotcask_shutdown();
-        schema_caches_shutdown();
-        tls_shutdown();
-        log_shutdown();
-        shard_db_destroy_after_storage(g_shard_db_instance);
-        return 1;
+        return server_startup_abort(db_root, sfd);
     }
 
     int nthreads = g_workers > 0 ? g_workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
@@ -4008,14 +4196,36 @@ int cmd_server(const char *db_root, int daemonize) {
        Allocate before threads spawn so worker_thread can safely write to it
        and handle_shutdown can safely read. */
     g_worker_cfds = malloc(nthreads * sizeof(int));
+    pthread_t *pool = malloc(nthreads * sizeof(pthread_t));
+    if (!g_worker_cfds || !pool) {
+        fprintf(stderr, "shard-db: out of memory allocating worker pool\n");
+        LOG_ERROR(LOG_SUB_SERVER, "SERVER START aborted: worker pool allocation failed");
+        free(g_worker_cfds);
+        g_worker_cfds = NULL;
+        free(pool);
+        wq_destroy(&g_work_queue);
+        return server_startup_abort(db_root, sfd);
+    }
     for (int i = 0; i < nthreads; i++) g_worker_cfds[i] = -1;
     g_worker_cfds_n = nthreads;
-    pthread_t *pool = malloc(nthreads * sizeof(pthread_t));
     for (int i = 0; i < nthreads; i++) {
         WorkerArg *wa = malloc(sizeof(WorkerArg));
+        if (!wa) {
+            LOG_ERROR(LOG_SUB_SERVER,
+                      "worker %d: WorkerArg allocation failed; running with %d workers",
+                      i, i);
+            nthreads = i;   /* join only the workers actually started */
+            break;
+        }
         strncpy(wa->db_root, db_root, PATH_MAX - 1);
         wa->id = i;
         db_thread_create(&pool[i], worker_thread, wa);
+    }
+    if (nthreads == 0) {
+        LOG_ERROR(LOG_SUB_SERVER, "SERVER START aborted: no workers could start");
+        free(pool);
+        wq_destroy(&g_work_queue);
+        return server_startup_abort(db_root, sfd);
     }
 
     fprintf(stdout, "shard-db listening on port %d (pid=%d, workers=%d, timeout=%us, tls=%s)\n",

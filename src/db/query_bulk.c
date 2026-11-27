@@ -3,6 +3,7 @@
 #include "typed_bulk_insert.h"
 #include "slotcask.h"
 #include "query_internal.h"
+#include <stdatomic.h>
 #include <dirent.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -218,7 +219,28 @@ typedef struct BulkArena {
     size_t cap;
 } BulkArena;
 
+#ifdef TEST_BUILD
+/* Deterministic OOM injection (like bulk_upd_json_test_set_fail_alloc):
+   the Nth arena_new call after arming fails (N=1 is the next call). */
+static _Atomic int g_arena_fail_n = 0;
+void bulk_arena_test_set_fail(int n) { atomic_store(&g_arena_fail_n, n); }
+static int arena_test_should_fail(void) {
+    int c = atomic_load(&g_arena_fail_n);
+    while (c > 0) {
+        if (atomic_compare_exchange_weak(&g_arena_fail_n, &c, c - 1))
+            return c == 1;
+    }
+    return 0;
+}
+#else
+#define arena_test_should_fail() 0
+#endif
+
 static BulkArena *arena_new(size_t cap) {
+    if (arena_test_should_fail()) {
+        LOG_ERROR(LOG_SUB_QUERY, "arena_new: injected allocation failure");
+        return NULL;
+    }
     BulkArena *a = malloc(sizeof(BulkArena));
     if (!a) {
         LOG_ERROR(LOG_SUB_QUERY, "arena_new: malloc BulkArena header failed");
@@ -1678,8 +1700,10 @@ static int bulk_ins_run(const char *db_root, const char *object,
     BulkArena *arena = arena_new(256 * 1024);
     size_t rec_cap = 1024, rec_count = 0;
     BulkInsRecord *records = calloc(rec_cap, sizeof(BulkInsRecord));
+    int oom = 0;   /* an allocation failed: refuse the whole batch (AUD-BULK-OOM) */
+    if (!arena || !records) oom = 1;
 
-    while (*p) {
+    while (!oom && *p) {
         if (query_deadline_tick(&dl, &dl_counter)) break;
         p = json_skip(p);
         if (*p == ']' || *p == '}') break;
@@ -1703,6 +1727,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
             while (*p && *p != '"') p++;
             klen = p - key_start;
             id = arena_strndup(&arena, key_start, klen);
+            if (!id) { oom = 1; goto parse_done_json; }
             if (*p == '"') p++;
             p = json_skip(p);
             if (*p == ':') p = json_skip(p + 1);
@@ -1724,6 +1749,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
                 obj_str = obj_buf;
             } else {
                 obj_str = malloc(obj_len + 1);
+                if (!obj_str) { oom = 1; goto parse_done_json; }
                 memcpy(obj_str, obj_start, obj_len);
                 obj_str[obj_len] = '\0';
                 obj_heap = 1;
@@ -1735,6 +1761,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
             if (json_obj_unquoted(&rec, "key", &iv, &ivl)) {
                 id = arena_strndup(&arena, iv, ivl);
                 klen = ivl;
+                if (!id) { oom = 1; if (obj_heap) free(obj_str); goto parse_done_json; }
             }
             const char *dv; size_t dl;
             if (json_obj_get(&rec, "value", &dv, &dl)) {
@@ -1761,6 +1788,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
                     uint8_t bin[16];
                     if (parse_uuid_string(id, bin) == 0) {
                         id = (char *)arena_alloc(&arena, 16);
+                        if (!id) { oom = 1; free(wire_for_record); if (obj_heap) free(obj_str); goto parse_done_json; }
                         memcpy(id, bin, 16);
                         klen = 16;
                     } else {
@@ -1777,6 +1805,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
                     int64_t v;
                     if (parse_seq_key(id, &v) == 0) {
                         id = (char *)arena_alloc(&arena, 8);
+                        if (!id) { oom = 1; free(wire_for_record); if (obj_heap) free(obj_str); goto parse_done_json; }
                         for (int b = 7; b >= 0; b--) { id[b] = (char)(v & 0xFF); v >>= 8; }
                         klen = 8;
                     } else {
@@ -1790,6 +1819,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
             } else {
                 /* Omit-key record — placeholder; id+klen filled in post-parse. */
                 id = (char *)arena_alloc(&arena, auto_key_mode == AK_UUID ? 16 : 8);
+                if (!id) { oom = 1; if (obj_heap) free(obj_str); goto parse_done_json; }
                 memset(id, 0, auto_key_mode == AK_UUID ? 16 : 8);
                 klen = auto_key_mode == AK_UUID ? 16 : 8;
                 n_omits++;
@@ -1810,6 +1840,7 @@ static int bulk_ins_run(const char *db_root, const char *object,
                    too-long), unlike auto-key parse failures which abort
                    the whole bulk because the key isn't usable. */
                 uint8_t *payload = arena_alloc(&arena, ts->total_size);
+                if (!payload) { oom = 1; free(wire_for_record); if (obj_heap) free(obj_str); goto parse_done_json; }
                 int _enc = typed_encode_defaults(ts, data_ptr, payload,
                                                   ts->total_size,
                                                   db_root, object, NULL, 0);
@@ -1830,7 +1861,10 @@ static int bulk_ins_run(const char *db_root, const char *object,
                            set instead of dereferencing NULL records. */
                         records = NULL;
                         rec_count = 0;
-                        break;
+                        oom = 1;
+                        free(wire_for_record);
+                        if (obj_heap) free(obj_str);
+                        goto parse_done_json;
                     }
                     records = t;
                 }
@@ -1861,9 +1895,11 @@ static int bulk_ins_run(const char *db_root, const char *object,
         if (obj_heap) free(obj_str);
     }
 
+parse_done_json:
     /* Validation failure: refuse the whole batch up front so we don't
-       half-write some records with mangled keys. */
-    if (validation_failed_idx >= 0) {
+       half-write some records with mangled keys. An allocation failure
+       refuses it the same way. */
+    if (validation_failed_idx >= 0 || oom) {
         if (wire_keys) {
             for (size_t i = 0; i < rec_count; i++) free(wire_keys[i]);
         }
@@ -1871,8 +1907,11 @@ static int bulk_ins_run(const char *db_root, const char *object,
         arena_free(arena);
         for (int i = 0; i < nfields; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        OUT("{\"error\":\"bulk-insert validation failed at record %d: malformed key for auto_key mode\"}\n",
-            validation_failed_idx);
+        if (oom)
+            OUT("{\"error\":\"bulk-insert aborted: out of memory; nothing was written\"}\n");
+        else
+            OUT("{\"error\":\"bulk-insert validation failed at record %d: malformed key for auto_key mode\"}\n",
+                validation_failed_idx);
         return 1;
     }
 
@@ -2444,8 +2483,10 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
     BulkArena *arena = arena_new(256 * 1024);
     size_t rec_cap = 1024, rec_count = 0;
     BulkInsRecord *records = calloc(rec_cap, sizeof(BulkInsRecord));
+    int oom = 0;   /* an allocation failed: refuse the whole batch (AUD-BULK-OOM) */
+    if (!arena || !records) oom = 1;
 
-    while (rp < data_end) {
+    while (!oom && rp < data_end) {
         if (query_deadline_tick(&dl, &dl_counter)) break;
         /* Find end of line without modifying the buffer */
         const char *eol = rp;
@@ -2485,6 +2526,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
                 is_omit = 1;
                 auto_klen = (auto_key_mode == AK_UUID) ? 16 : 8;
                 auto_id = (char *)arena_alloc(&arena, auto_klen);
+                if (!auto_id) { oom = 1; goto parse_done_delim; }
                 memset(auto_id, 0, auto_klen);
                 n_omits++;
             } else {
@@ -2500,6 +2542,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
                         memcpy(tmp, id_start, klen); tmp[klen] = '\0';
                         if (parse_uuid_string(tmp, bin) == 0) {
                             auto_id = (char *)arena_alloc(&arena, 16);
+                            if (!auto_id) { oom = 1; free(wbuf); goto parse_done_delim; }
                             memcpy(auto_id, bin, 16);
                             auto_klen = 16;
                         }
@@ -2518,6 +2561,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
                         memcpy(tmp, id_start, klen); tmp[klen] = '\0';
                         if (parse_seq_key(tmp, &v) == 0) {
                             auto_id = (char *)arena_alloc(&arena, 8);
+                            if (!auto_id) { oom = 1; free(wbuf); goto parse_done_delim; }
                             for (int b = 7; b >= 0; b--) {
                                 auto_id[b] = (char)(v & 0xFF); v >>= 8;
                             }
@@ -2575,6 +2619,7 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
         if (auto_id) { id = auto_id; klen = auto_klen; }
         else         { id = arena_strndup(&arena, id_start, klen); }
         uint8_t *payload = arena_alloc(&arena, ts->total_size);
+        if (!id || !payload) { oom = 1; free(wire_for_record); goto parse_done_delim; }
         memset(payload, 0, ts->total_size);
         /* Delimited rows encode into nullmap records like every other
            writer (§2.1): head byte + bitmap, fields at prefix+offset. An
@@ -2628,7 +2673,8 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
                 records = NULL;
                 rec_count = 0;
                 free(wire_for_record);
-                break;
+                oom = 1;
+                goto parse_done_delim;
             }
             records = t;
         }
@@ -2660,9 +2706,10 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
                     r->shard_id = compute_record_shard(r->hash, sc.splits);
     }
 
+parse_done_delim:
     /* Validation failure: refuse the whole batch before any write.
-       Matches the JSON path. */
-    if (validation_failed_idx >= 0) {
+       Matches the JSON path. An allocation failure refuses it the same way. */
+    if (validation_failed_idx >= 0 || oom) {
         if (wire_keys) {
             for (size_t i = 0; i < rec_count; i++) free(wire_keys[i]);
             free(wire_keys);
@@ -2671,8 +2718,11 @@ static int bulk_ins_delim_run(const char *db_root, const char *object,
         arena_free(arena);
         for (int i = 0; i < nidx; i++) free(idx_pairs[i]);
         free(idx_pairs); free(idx_pair_counts); free(idx_pair_caps);
-        OUT("{\"error\":\"bulk-insert-delimited validation failed at record %d: malformed key for auto_key mode\"}\n",
-            validation_failed_idx);
+        if (oom)
+            OUT("{\"error\":\"bulk-insert-delimited aborted: out of memory; nothing was written\"}\n");
+        else
+            OUT("{\"error\":\"bulk-insert-delimited validation failed at record %d: malformed key for auto_key mode\"}\n",
+                validation_failed_idx);
         return 1;
     }
 

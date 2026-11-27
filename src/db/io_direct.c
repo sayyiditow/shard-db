@@ -1042,8 +1042,9 @@ int seg_scan_o_direct(const char *seg_path, size_t max_slot_size,
     pthread_t worker_tid = (pthread_t)0;
     if (!single_shot) {
         int e2;
-        if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
-            e2 = errno;
+        int prc = pthread_create(&worker_tid, NULL, prefetch_worker, &dc);
+        if (prc != 0) {
+            e2 = prc;   /* pthread_create returns the code; errno is unset */
             free(carry);
             free(dc.buf[0]); free(dc.buf[1]);
             pthread_mutex_destroy(&dc.lock);
@@ -1303,8 +1304,9 @@ do_resync:
 
         if (!single_shot) {
             int e2;
-            if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
-                e2 = errno;
+            int prc = pthread_create(&worker_tid, NULL, prefetch_worker, &dc);
+            if (prc != 0) {
+                e2 = prc;   /* pthread_create returns the code; errno is unset */
                 free(dc.buf[0]); free(dc.buf[1]);
                 pthread_mutex_destroy(&dc.lock);
                 pthread_cond_destroy(&dc.prefetch_needed);
@@ -1364,6 +1366,7 @@ static int btree_decode_leaves_in_range(const uint8_t *range, size_t range_len,
     if (start_off == 0 && range_len >= sizeof(BtFileHeader)) {
         const BtFileHeader *fh = (const BtFileHeader *)range;
         uint32_t magic; memcpy(&magic, &fh->magic, 4);
+        if (magic == 0) { *stop_out = 1; return 0; }  /* creating writer has not stamped it yet: empty */
         if (magic != BT_MAGIC) return -EINVAL;
         uint64_t ec; memcpy(&ec, &fh->entry_count, 8);
         if (ec == 0) { *stop_out = 1; return 0; }   /* empty btree → done */
@@ -1432,6 +1435,9 @@ int btree_leaf_scan_o_direct(const char *btree_path,
                              od_leaf_cb cb, void *ctx)
 {
     if (!btree_path || !cb) return -EINVAL;
+#ifdef TEST_BUILD
+    if (btree_test_walk_open_fails(btree_path)) return -EIO;
+#endif
 
     struct stat st;
     if (stat(btree_path, &st) != 0) return -errno;
@@ -1482,8 +1488,9 @@ int btree_leaf_scan_o_direct(const char *btree_path,
     int carry_len = 0;
 
     pthread_t worker_tid;
-    if (pthread_create(&worker_tid, NULL, prefetch_worker, &dc) != 0) {
-        int e = errno;
+    int prc = pthread_create(&worker_tid, NULL, prefetch_worker, &dc);
+    if (prc != 0) {
+        int e = prc;   /* pthread_create returns the code; errno is unset */
         free(carry);
         free(dc.buf[0]); free(dc.buf[1]);
         pthread_mutex_destroy(&dc.lock);

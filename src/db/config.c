@@ -515,6 +515,12 @@ int load_db_root(char *out, size_t outlen) {
                 g_max_concurrent_queries = atoi(p + 23);
                 if (g_max_concurrent_queries < 0) g_max_concurrent_queries = 0;
             }
+        } else if (strncmp(p, "IDLE_TIMEOUT_SEC=", 17) == 0) {
+            long n = atol(p + 17);
+            if (n >= 0 && n <= 86400 && g_db) g_idle_timeout_sec = (int)n;
+        } else if (strncmp(p, "HANDSHAKE_TIMEOUT_SEC=", 22) == 0) {
+            long n = atol(p + 22);
+            if (n >= 0 && n <= 3600 && g_db) g_handshake_timeout_sec = (int)n;
         } else if (strncmp(p, "MAX_REQUEST_SIZE=", 17) == 0) {
             int sz = atoi(p + 17);
             if (sz >= 1024 && g_db) g_max_request_size = sz;
@@ -4347,7 +4353,8 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
     int render_zeros = (hdr2 & SREC_FLAG_NULLMAP) ? 1 : 0;
     /* NULL bit ⇒ absent string (the CAS/match_criterion convention — same
        as a trim-absent field). Callers distinguishing corruption from
-       absence check errno. */
+       absence check errno (EILSEQ = corrupt record, ENOMEM = allocation
+       failure; both mean the caller must fail, not treat it as NULL). */
     if (typed_field_null(bm, bm_bytes, field_idx)) return NULL;
 
     /* For trim-encoded records: any field that ends past stored bytes → treat as zero/empty.
@@ -4370,6 +4377,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         if (slen > content_max) slen = content_max;
         if (slen == 0) return render_zeros ? strdup("") : NULL;
         char *out = malloc(slen + 1);
+        if (!out) { errno = ENOMEM; return NULL; }
         memcpy(out, p + 2, slen);
         out[slen] = '\0';
         return out;
@@ -4382,6 +4390,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
                     ((int32_t)d[2] << 8) | d[3];
         if (v == 0) return render_zeros ? strdup("00000000") : NULL;
         char *out = malloc(9);
+        if (!out) { errno = ENOMEM; return NULL; }
         snprintf(out, 9, "%08d", v);
         return out;
     }
@@ -4395,6 +4404,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
             return render_zeros ? strdup("00000000000000") : NULL;
         int hh = t / 3600, mm = (t % 3600) / 60, ss = t % 60;
         char *out = malloc(15);
+        if (!out) { errno = ENOMEM; return NULL; }
         snprintf(out, 15, "%08d%02d%02d%02d", dv, hh, mm, ss);
         return out;
     }
@@ -4411,6 +4421,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         char *out = malloc(18);
         if (!out) {
             LOG_ERROR(LOG_SUB_CONFIG, "typed_get_field_str: malloc(18) failed for field [%s]", f->name);
+            errno = ENOMEM;
             return NULL;
         }
         snprintf(out, 18, "%08d%02d%02d%02d%03d", dv, hh, mm, ss, fff);
@@ -4423,6 +4434,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
             return render_zeros ? strdup("00:00:00") : NULL;
         int hh = secs / 3600, mm = (secs % 3600) / 60, ss = secs % 60;
         char *out = malloc(9);
+        if (!out) { errno = ENOMEM; return NULL; }
         snprintf(out, 9, "%02d:%02d:%02d", hh, mm, ss);
         return out;
     }
@@ -4432,6 +4444,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
             return render_zeros
                 ? strdup("00000000-0000-0000-0000-000000000000") : NULL;
         char *out = malloc(37);
+        if (!out) { errno = ENOMEM; return NULL; }
         uuid_format_canonical(out, 37, b);
         return out;
     }
@@ -4442,6 +4455,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         char *out = malloc(INET_ADDRSTRLEN);
         if (!out) {
             LOG_ERROR(LOG_SUB_CONFIG, "typed_get_field_str: malloc(INET_ADDRSTRLEN) failed for field [%s]", f->name);
+            errno = ENOMEM;
             return NULL;
         }
         if (!inet_ntop(AF_INET, ip, out, INET_ADDRSTRLEN)) {
@@ -4459,6 +4473,7 @@ char *typed_get_field_str(const TypedSchema *ts, const uint8_t *data,
         char *out = malloc(INET6_ADDRSTRLEN);
         if (!out) {
             LOG_ERROR(LOG_SUB_CONFIG, "typed_get_field_str: malloc(INET6_ADDRSTRLEN) failed for field [%s]", f->name);
+            errno = ENOMEM;
             return NULL;
         }
         if (!inet_ntop(AF_INET6, ip, out, INET6_ADDRSTRLEN)) {
