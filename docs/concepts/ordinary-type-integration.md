@@ -1,8 +1,8 @@
 # Ordinary typed writes, reads and schema transfer
 
-Packed storage remains inactive in public loaders/create-object. These internal
-adapters prepare the ordinary routes for activation after criteria/indexes,
-aggregates, other type grammars and durable migration are complete.
+Packed storage is the only object layout (2026.11.3 removed the legacy
+layout and its creation/loading paths). This page documents the ordinary
+write, read and schema-transfer routes on packed objects.
 
 Ordinary readers retain the existing per-shard KF/segment read-handle lifetime.
 Multi-key reads keep shard buckets, one I/O-pool job per touched shard and the
@@ -23,24 +23,21 @@ request order and duplicate members; missing records render null. Bounded owned
 response chunks share the request budget with selector copies and temporary
 rendering allocations. Packed rendering reserves conservative decimal/join
 workspace before validation; its length admission scan does not replace record
-validation. Legacy decoder allocations are charged by capacity, not strlen.
-Borrowed input/cache mappings and fixed automatic frames are not response heap.
+validation. Borrowed input/cache mappings and fixed automatic frames are not response heap.
 Failed output streams return I/O failure without attempting another JSON envelope
 following bytes already accepted by the stream.
 
 Single computed updates evaluate every operand against immutable OLD, then
 compose complete NEW. Numeric addition uses the decimal core and applies the
 column's rounding once on assignment; `$copy` retains type/declaration compatibility.
-Legacy scaled-int64 numeric uses exact addition and its real width/scale limit;
-its historically informational P is not retroactively enforced. Every duplicate
+The declared `numeric:P,S` precision and scale are enforced exactly. Every duplicate
 computed occurrence is validated, including one later overwritten by a literal.
 Memory admission covers retained payload owners, OLD numeric validation,
 generated text plus its copied payload, and aligned decimal/result workspace
-before allocation. Allocation failures preserve their resource-error identity.  Migration audits
-that metadata separately. Bulk updates retain their existing literal-only contract;
-R2 integrates criteria/per-row guards through the existing protected callbacks. Packed bulk input rejects repeated
-normalized storage keys before request submission, preserving its approved private
-policy; the older public legacy bulk duplicate policy is unchanged. Auto-key bulk
+before allocation. Allocation failures preserve their resource-error identity. Criteria-form bulk
+update remains a packed gap (`packed criteria updates await query integration`);
+per-key JSON bulk updates keep their literal/`if` contract. Packed bulk input rejects repeated
+normalized storage keys before request submission. Auto-key bulk
 inserts return generated keys in input order. Generator/sequence gaps after a
 failed command are allowed; consumed sequence numbers are never rolled back.
 Bulk accounting uses conservative request admission and thread-safe byte counters
@@ -49,22 +46,17 @@ inside existing worker callbacks; it changes no worker scheduling or lock protoc
 New create/add/edit declarations consume their complete JSON strings and type
 parameters. Defaults have one modifier; literal defaults retain the 255-byte limit.
 Malformed generators, overlength declarations, duplicate fields and currently
-invalid scalar literal defaults fail before schema publication. Existing legacy
-metadata retains its historical read interpretation. Malformed legacy default
-syntax is marked unsafe for generation rather than making old stored records
-unreadable. Calendar/bool/UUID/IP/string grammar expansion remains R4; these checks
-reuse current checked encoders and do not claim those later contracts complete.
+invalid scalar literal defaults fail before schema publication. Calendar/bool/
+UUID/IP/string grammar is checked by the same strict encoders used on write.
 
 Describe includes the exact original `spec`, streams, auto-key identity and
 `declaration_layout`. Logical varchar capacity is independent of descriptor width.
 Argv/TUI schema export copies the exact spec; it never guesses numeric P=18.
 Exports stage their complete manifest and preserve an existing destination on
-failure. A packed manifest cannot be imported as legacy: create-object refuses
-its layout marker until authoritative packed publication/migration arrives in R5.
-Tagged schema manifests with a differing imported stream count are refused
-explicitly until R5 can honor geometry; ordinary untagged create requests keep
-their historical handling. No migration, schema binding or activation is
-introduced here.
+failure. A legacy manifest cannot be imported: `create-object` refuses
+`declaration_layout:"legacy"` in every build. Tagged schema manifests with a
+differing imported stream count are refused explicitly (geometry import awaits
+migration integration).
 
 Ordinary CSV uses the approved reversible byte-escape layer after CSV decoding:
 backslash doubles; control bytes use `\u00xx`. JSON remains the typed interchange
@@ -78,10 +70,9 @@ string route remains UTF-8 text; it is not a new binary transport API.
 ## Query predicates, keys and streamed rows
 
 Query operands retain their complete bytes. Numeric filters compare exact
-decimal values, including operands outside a legacy column's assignment scale;
-they are not rounded to the column merely to construct an index bound. A valid
-bound that cannot be represented by that legacy index uses exact record
-filtering. For example, a scale-2 assignment of `0.145` stores `0.15`;
+decimal values, including operands outside a column's assignment scale; they
+are not rounded to the column merely to construct an index bound. A valid bound
+that cannot be represented by that index uses exact record filtering. For example, a scale-2 assignment of `0.145` stores `0.15`;
 `eq 0.145` does not match it, while `eq 0.15` does. Malformed predicates fail before planning, including count shortcuts
 that would otherwise avoid record access. Runtime matcher failures travel
 separately from a false match. Write checks retain the engine's boolean callback

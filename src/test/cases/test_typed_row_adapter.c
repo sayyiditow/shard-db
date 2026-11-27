@@ -124,23 +124,6 @@ static void updates_and_reuse(void){
         ASSERT_TRUE(same,"tail canary untouched");free(buf);}
     typed_prepared_free(&p);free(old);schema_free(ts);
 }
-static void legacy_views(void){
-    TypedSchema *ts=calloc(1,sizeof(*ts));ASSERT_NOT_NULL(ts,"legacy schema");if(!ts)return;
-    ts->typed=1;ts->nfields=2;ts->nullmap_prefix=2;ts->total_size=10;
-    parse_field_type("int",&ts->fields[0]);ts->fields[0].offset=0;
-    parse_field_type("date",&ts->fields[1]);ts->fields[1].offset=4;
-    uint8_t trimmed[]={1};TypedRowView view;
-    ASSERT_EQ_INT(typed_row_open(ts,trimmed,sizeof(trimmed),0,&view),0,"legacy trimmed generation");
-    TypedRowSpan span;ASSERT_EQ_INT(typed_row_span(&view,0,&span),0,"legacy partial span");
-    ASSERT_EQ_INT(span.len,1,"actual stored partial bytes");
-    const uint8_t *read=NULL;ASSERT_EQ_INT(typed_span_read(ts,0,&span,&read),0,"legacy reader zero substitute");
-    if(read)ASSERT_EQ_INT(read[0],0,"reader requires whole field");
-    uint8_t carried[4]={0xA5,0xA5,0xA5,0xA5};ASSERT_EQ_INT(typed_span_copy_legacy(ts,0,&span,carried,sizeof(carried)),0,"legacy carry materialization");
-    ASSERT_EQ_INT(carried[0],1,"carry preserves partial leading byte");
-    ASSERT_EQ_INT(carried[1],0,"carry zero fills suffix");
-    ASSERT_EQ_INT(typed_row_open(ts,trimmed,sizeof(trimmed),PKR_FLAGS,&view),-1,"legacy schema rejects packed generation");
-    free(ts);
-}
 static void maximum_and_binary(void){
     const char *types[MAX_FIELDS];for(int i=0;i<MAX_FIELDS;i++)types[i]="varchar";
     TypedSchema *ts=schema_new(types,MAX_FIELDS);ASSERT_NOT_NULL(ts,"maximum packed schema");if(!ts)return;
@@ -332,7 +315,7 @@ static void automatic_fields(void){
 }
 
 static void blind_review_boundaries(void){
-    char err[256];uint8_t *out=NULL;size_t len=0;
+    char err[256];
     const char *types[]={"int"};TypedSchema *ts=schema_new(types,1);
     ASSERT_NOT_NULL(ts,"blind packed scalar schema");
     if(ts){
@@ -358,44 +341,8 @@ static void blind_review_boundaries(void){
             }free(before);
         }schema_free(ts);
     }
-    ts=calloc(1,sizeof(*ts));ASSERT_NOT_NULL(ts,"blind legacy schema");if(!ts)return;
-    ts->typed=1;ts->nfields=1;ts->nullmap_prefix=2;ts->total_size=6;
-    parse_field_type("int",&ts->fields[0]);strcpy(ts->fields[0].name,"f0");ts->fields[0].name_len=2;
-    for(int defaults=0;defaults<=1;defaults++){
-        out=(void*)1;len=99;errno=ENOMEM;
-        ASSERT_TRUE(typed_encode_alloc(ts,"{\"f0\":\"bad\"}",defaults,NULL,NULL,&out,&len,err,sizeof(err))<0,"legacy scalar encoding fails");
-        ASSERT_TRUE(!out&&!len,"legacy encode failure clears owned output");
-        ASSERT_EQ_INT(errno,EINVAL,"legacy scalar encoding sets fresh errno");
-    }
-    uint8_t bytes[]={1,0,0,0,0,1};SlotcaskOldRecord old={bytes,sizeof(bytes),1};
-    TypedInput in[MAX_FIELDS]={0};in[0]=(TypedInput){"bad",3,1,0,0};errno=0;
-    ASSERT_EQ_INT(typed_update_alloc(ts,&old,in,0,&out,&len,err,sizeof(err)),-1,"legacy scalar update fails");
-    ASSERT_TRUE(!out&&!len,"legacy update failure clears output");
-    ASSERT_EQ_INT(errno,EINVAL,"legacy scalar update sets errno");
-    in[0]=(TypedInput){NULL,1,1,0,0};errno=0;
-    ASSERT_EQ_INT(typed_update_alloc(ts,&old,in,0,&out,&len,err,sizeof(err)),-1,"invalid legacy span fails");
-    ASSERT_EQ_INT(errno,EINVAL,"invalid legacy span sets errno");
-    uint8_t broken[]={0};SlotcaskOldRecord malformed={broken,sizeof(broken),1};errno=0;
-    ASSERT_EQ_INT(typed_update_alloc(ts,&malformed,NULL,0,&out,&len,err,sizeof(err)),-1,"malformed legacy OLD fails");
-    ASSERT_TRUE(!out&&!len,"malformed OLD clears output");
-    ASSERT_EQ_INT(errno,EILSEQ,"malformed OLD reports corruption");
-    /* Keep a bad-input crash isolated from the runner. No global fixture or
-       environment is changed; the child touches only this inherited schema. */
-    pid_t child=fork();
-    if(child!=0)ASSERT_TRUE(child>=0,"fork NULL JSON boundary probe");
-    if(child==0){
-        alarm(5);
-        for(int defaults=0;defaults<=1;defaults++){
-            uint8_t *value=(void*)1;size_t n=99;errno=0;
-            int rc=typed_encode_alloc(ts,NULL,defaults,NULL,NULL,&value,&n,NULL,0);
-            if(rc>=0||errno!=EINVAL||value||n)_exit(1);
-        }
-        _exit(0);
-    }
-    if(child>0){int status=0;pid_t got=waitpid(child,&status,0);
-        ASSERT_TRUE(got==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0,"NULL JSON rejects without crashing in both modes");}
-    free(ts);
 }
+
 static void enum_membership_regressions(void){
     const char *types[]={"enum(red,blue)"};
     TypedSchema *ts=schema_new(types,1);ASSERT_NOT_NULL(ts,"enum membership schema");if(!ts)return;
@@ -472,7 +419,7 @@ static void enum_membership_regressions(void){
 }
 
 static int test_typed_row_adapter_run(void){
-    encoding();updates_and_reuse();legacy_views();maximum_and_binary();review_regressions();schema_and_failure_contracts();decimal_limits_and_types();json_contracts();automatic_fields();blind_review_boundaries();enum_membership_regressions();
+    encoding();updates_and_reuse();maximum_and_binary();review_regressions();schema_and_failure_contracts();decimal_limits_and_types();json_contracts();automatic_fields();blind_review_boundaries();enum_membership_regressions();
     return t_ctx->failed?1:0;
 }
 TEST_REGISTER("test-typed-row-adapter",test_typed_row_adapter_run)

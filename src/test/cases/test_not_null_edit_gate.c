@@ -297,57 +297,6 @@ static int test_not_null_edit_gate_run(void) {
     ASSERT_TRUE(fc && !strstr(fc, "not_null"), "callback refusal preserves schema");
     free(fc);
 
-    /* === gl: legacy-generation record (hdr2 = 0, long 0 → absent →
-           NULL) → refuse; present legacy value → succeed. ========== */
-    tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"gl\","
-        "\"splits\":8,\"max_key\":16,\"fields\":[\"t:long\"]}", &resp);
-    free(resp); resp = NULL;
-    tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"gl\","
-                   "\"key\":\"gl1\",\"value\":{\"t\":5}}", &resp);
-    free(resp); resp = NULL;
-    tc_close(tc);
-    test_env_stop_keep(&env);
-    static const uint8_t legacy_zero[8] = {0};
-    snprintf(objdir, sizeof(objdir), "%s/default/gl", db_root);
-    ASSERT_EQ_INT(nn_surgery(objdir, "gl1", 0x00, legacy_zero, 8), 1,
-                  "legacy record written");
-    ASSERT_EQ_INT(test_env_start_at(&env, db_root, port), 0, "restart gl");
-    tc = tc_connect(&cfg);
-    ASSERT_NOT_NULL(tc, "reconnect gl");
-    if (!tc) { test_env_stop_keep(&env); return 1; }
-    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"gl\","
-                   "\"key\":\"gl1\"}", &resp);
-    ASSERT_TRUE(resp && !SAFE_STRSTR(resp, "\"t\":"),
-                "legacy long-0 is omitted before nullmap conversion");
-    free(resp); resp = NULL;
-    tc_request(tc, "{\"mode\":\"edit-field\",\"dir\":\"default\","
-                   "\"object\":\"gl\",\"fields\":[\"t:long:not_null\"]}",
-               &resp);
-    ASSERT_CONTAINS(resp, "1 record(s) have NULL",
-                    "legacy absence counts as NULL");
-    free(resp); resp = NULL;
-    tc_close(tc);
-    test_env_stop_keep(&env);
-    static const uint8_t legacy_nine[8] = {0, 0, 0, 0, 0, 0, 0, 9};
-    ASSERT_EQ_INT(nn_surgery(objdir, "gl1", 0x00, legacy_nine, 8), 1,
-                  "legacy present value written");
-    ASSERT_EQ_INT(test_env_start_at(&env, db_root, port), 0, "restart gl 2");
-    tc = tc_connect(&cfg);
-    ASSERT_NOT_NULL(tc, "reconnect gl 2");
-    if (!tc) { test_env_stop_keep(&env); return 1; }
-    tc_request(tc, "{\"mode\":\"edit-field\",\"dir\":\"default\","
-                   "\"object\":\"gl\",\"fields\":[\"t:long:not_null\"]}",
-               &resp);
-    ASSERT_CONTAINS(resp, "\"status\":\"edited\"",
-                    "clean legacy field admits the constraint");
-    free(resp); resp = NULL;
-    tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"gl\","
-                   "\"key\":\"gl2\",\"value\":{}}", &resp);
-    ASSERT_CONTAINS(resp, "field 't' is not nullable",
-                    "omission now refused (no default)");
-    free(resp); resp = NULL;
-
     /* === gx: composite index control — the constraint is per-field. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"dir\":\"default\",\"object\":\"gx\","

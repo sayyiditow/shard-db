@@ -87,7 +87,7 @@ Two on-disk layers per object (under `<db_root>/<dir>/<object>/`):
 - **Segment files** (`data/streams/NNN/NNNNNN.dat`): append-only rotating files, one stream per the object's `streams` schema field. Each segment record is 24B header (16B hash, 2B key_len, 1B flag, 1B reserved, 4B vlen) + key bytes + value bytes, at the record's **actual size** rounded up to 8 bytes (variable-length records); a rewrite may reuse a larger tombstoned slot from the stream's size-bucketed free pool, leaving zero-filled padding. This is what the sequential reindex scan reads via `seg_scan_o_direct`.
 - **Addressing**: kf shard = `hash[0..1] % splits`; slot = `hash[2..5] % slots_per_shard`, linear probing; segment stream = `hash[15] % num_streams` (hash-routed so a key's insert/update history stays in one stream, maximising free-pool slot reuse).
 - **Dynamic growth**: at 75–80% kf load the shard doubles `slots_per_shard` **in place** (per-shard, no global rehash; pre-grow targets ≤75%, inline resplit fires at 80%) with **no ceiling** — growth continues for the life of the object and inserts never refuse for capacity, except when a shard's growth is temporarily impossible (a failed bitmap remap puts growth on a 5 s back-off, or resplit I/O fails): the affected bulk-insert stage then fails closed with `BULK_STAGE_UNGROWN` and its records are retried by the client, rather than committing into an under-sized table. `MAX_SPLITS=4096` caps shard *files*, not slots; the nightly auto-reshard sweep (default on) widens objects whose record counts outgrow their splits, and a `RESHARD-HINT` log line fires inline when the sizing table says they have.
-- **Bitmap slot coherence**: bitmap bit `i` of shard `s` is "kf slot `i`". Every keyfile rebuild (growth resplit, `slotcask_compact_kf`) goes through `kfcache_resplit_locked`, which, after the keyfile msync, takes the shard's bitmap writer locks in canonical path order (`bm_open_many_ro` order; every multi-bitmap lock holder except the bulk-insert window uses it), writes a slot-remapped, fsynced copy of each `.bm`, reserves space and maps it, writes a durable `indexes/.bmfix-NNN` marker, renames the keyfile, then copies the remapped images over the live mappings in place and msyncs them (no rename, nothing that can fail but the msync), and drops the marker. A leftover marker makes startup (`bmfix_recover_all`; before the KFM2 replay on an unclean start, like the BTRI migration) rebuild only the named shards' bitmaps for every bitmap field (`bitmap_rebuild_shards_durable`: temp files + `bm_publish_replace`; a 1–8 lowercase-hex suffix below the object's splits names those shards, any other `.bmfix-*` name selects all). If that repair or the marker cleanup fails, the daemon still starts: with no pending KFM2 commit marker it writes `indexes/.bmfix-disabled` and serves the object with bitmap planning disabled — reads fall back to btree or scan, every record mutation and every `mode_is_schema` mutation (except `backup`) is refused up front (`{"error":"object writes disabled: bitmap repair failed at startup; run reindex"}`), background auto-vacuum/auto-reshard skip the object, and a full (non-composites-only) `reindex` runs the strict durable rebuild, clears the markers and re-enables (startup retries the repair first, and success there also clears both; a stale flag with no markers is removed at startup). The residual refuse-to-start cases: a repair failure with pending KFM2 markers for the object (replay would write the torn bitmap), a failed flag write, an unreadable marker directory, or an unloadable schema for a marked object. A failed remap prepare abandons the resplit and delays the next growth attempt of that shard by 5 s, so bitmap trouble can delay (not corrupt) kf growth. A marker left by an unconfirmed commit is never removed by a later rebuild — startup or a full `reindex` clears it.
+- **Bitmap slot coherence**: bitmap bit `i` of shard `s` is "kf slot `i`". Every keyfile rebuild (growth resplit, `slotcask_compact_kf`) goes through `kfcache_resplit_locked`, which, after the keyfile msync, takes the shard's bitmap writer locks in canonical path order (`bm_open_many_ro` order; every multi-bitmap lock holder except the bulk-insert window uses it), writes a slot-remapped, fsynced copy of each `.bm`, reserves space and maps it, writes a durable `indexes/.bmfix-NNN` marker, renames the keyfile, then copies the remapped images over the live mappings in place and msyncs them (no rename, nothing that can fail but the msync), and drops the marker. A leftover marker makes startup (`bmfix_recover_all`; before the KFM2 replay on an unclean start) rebuild only the named shards' bitmaps for every bitmap field (`bitmap_rebuild_shards_durable`: temp files + `bm_publish_replace`; a 1–8 lowercase-hex suffix below the object's splits names those shards, any other `.bmfix-*` name selects all). If that repair or the marker cleanup fails, the daemon still starts: with no pending KFM2 commit marker it writes `indexes/.bmfix-disabled` and serves the object with bitmap planning disabled — reads fall back to btree or scan, every record mutation and every `mode_is_schema` mutation (except `backup`) is refused up front (`{"error":"object writes disabled: bitmap repair failed at startup; run reindex"}`), background auto-vacuum/auto-reshard skip the object, and a full (non-composites-only) `reindex` runs the strict durable rebuild, clears the markers and re-enables (startup retries the repair first, and success there also clears both; a stale flag with no markers is removed at startup). The residual refuse-to-start cases: a repair failure with pending KFM2 markers for the object (replay would write the torn bitmap), a failed flag write, an unreadable marker directory, or an unloadable schema for a marked object. A failed remap prepare abandons the resplit and delays the next growth attempt of that shard by 5 s, so bitmap trouble can delay (not corrupt) kf growth. A marker left by an unconfirmed commit is never removed by a later rebuild — startup or a full `reindex` clears it.
 - **I/O**: kf writes use slotcask's kfcache (mmap MAP_SHARED); segment writes append-only; reindex reads segments via O_DIRECT double-buffered scan.
 - **Crash safety**: write flag=0 → activate batch flag=1; recovery sweeps stale `*.new`/`*.old` on startup. Since 2026.11.2, recovery, vacuum stat/compaction and the O_DIRECT scanner step over abandoned staged (flag=0 with content) records — hash-verified before each step or harvest — and a tail break requires a hole-aware full-remainder search to find no hash-valid record ahead (`docs/plans/2026-11-17-kf-grave-frontier-fix.md`).
 - **Indexed-write crash safety**: indexed mutations persist a durable commit-intent marker (KFM2 **V2** batch marker — 16-byte header + one 32-byte `KfMarkerSlot` per record, exact-size validated, `1 ≤ count ≤ 16384`; replay re-derives record bytes from the named segment records) before secondary-index apply. Bulk commands run as deferred requests (one IO-pool pipeline task per touched shard under per-kf-shard writer gates — a task holds only its own gate and never waits on another while holding it — see `docs/concepts/concurrency.md`); single writes keep per-window immediate durability. Per-file durability syncs coalesce across concurrent pipelines. Recovery is forward-replay-only: a crash at any point after the marker is durable causes startup to forward-replay it and apply the window to completion, never roll it back. Marker identity is the exact on-disk path (`MarkerRef`, nonce-bearing names); corrupt, unparseable, or pre-V2 marker evidence fails closed.
@@ -99,7 +99,7 @@ Deep dives: [docs/concepts/storage-model.md](docs/concepts/storage-model.md), [d
 
 ## Typed binary record format
 
-Driven by fields.conf. New objects (and every object migrated by 2026.11.1) use the **packed layout**: fixed-width scalars plus an 8-byte descriptor per varchar/numeric field whose payload is stored at its actual size (varchar up to 4 MiB; numeric:P,S exact up to P=1000; bare numeric up to 131 072 integer + 16 383 fractional digits). The widths in the table below are the legacy fixed widths. Every
+Driven by fields.conf. Every object uses the **packed layout** (2026.11.3 removed the legacy layout and its creation/loading paths); fixed-width scalars plus an 8-byte descriptor per varchar/numeric field whose payload is stored at its actual size (varchar up to 4 MiB; numeric:P,S exact up to P=1000; bare numeric up to 131 072 integer + 16 383 fractional digits). The widths in the table below are the legacy fixed widths. Every
 record carries a per-record null bitmap (`1 + ceil(nfields/8)` bytes at
 the head of the value region; bit set = NULL) — see
 docs/concepts/typed-records.md for NULL write/read/index/aggregate
@@ -192,28 +192,25 @@ any v1 object at load.
 
 2026.05.5 also rolls B+ tree magic `'BTRG'` → `'BTRH'` for the
 `(value, hash)` sort order. 2026.09.2 introduced strict compatibility
-gating, and 2026.10.1 keeps it while dropping startup migration entirely:
-an empty root initializes directly; a populated root must contain
-2026.09.2 clean-open evidence — such roots open as-is and are re-stamped
-to the current version. Populated roots with evidence older than
-2026.09.2 refuse with an upgrade hint: install 2026.09.2, start it once
-against the DB_ROOT (it migrates legacy 6-byte `datetime` fields to the
-7-byte representation and rebuilds their indexes), then upgrade. Use
-`./shard-db reindex` explicitly for unrelated index maintenance. The
-standalone `./migrate`, `migrate-varlen`, and storage migration JSON
-modes are removed, as is the in-binary migration path. The minimum
-supported source release is 2026.09.2.
+gating; 2026.10.1 removed the in-binary migration path, and the
+standalone `./migrate`, `migrate-varlen` and storage migration JSON
+modes are gone. 2026.10.2 added real NULL for typed fields (per-record
+null bitmap, `1 + ceil(nfields/8)` bytes; see
+docs/concepts/typed-records.md) and the `'BTRI'` index format.
 
-2026.10.2 adds real NULL for typed fields (per-record null bitmap,
-`1 + ceil(nfields/8)` bytes; see docs/concepts/typed-records.md) and
-rolls B+ tree magic `'BTRH'` → `'BTRI'` for tiered NULL index keys. The
-upgrade is a **startup migration**: on first start the daemon reindexes
-every indexed object through a strict durability-checked entry point
-(any failure or unconfirmed publication fails startup; partially
-published shards retry whole), replays pending KFM2 markers against the
-rebuilt indexes, then durably stamps completion (`.btri-migrated` at
-the DB_ROOT) and serves. Subsequent starts skip the migration. No
-operator action; the 2026.09.2 eligibility gate is unchanged.
+The minimum supported source release is **2026.11.2**. A populated root
+must carry 2026.11.2 clean-open evidence or start is refused with an
+upgrade hint: install 2026.11.2, start it once to completion against
+the DB_ROOT, then upgrade. 2026.11.3 removes the legacy object layout
+and both startup migrations: every object is packed, `create-object`
+refuses `declaration_layout:"legacy"` in every build, and startup runs
+no layout or BTRI reindex migration (stale `.layout-migrated` /
+`.btri-migrated` files are ignored). A root holding any non-packed
+object, any token-less `schema.conf` line, or an unusable rebuild-txn
+meta is refused at start with a named error (see
+docs/reference/error-codes.md); the operator fix is to install 2026.11.2,
+start it once to completion (it converts legacy objects), then upgrade.
+Use `./shard-db reindex` explicitly for unrelated index maintenance.
 
 **Bulk-insert at scale**: pre-grow (2026.05.x) makes bulk-insert ~2× faster on every path. Parallel still wins for max throughput — C-bench (2026-09-14, post-B3b) shows CSV K/V at 2.09 M/sec single vs **3.17 M/sec at 5 conns × 2M** (1.52× single; absolute numbers sit ~2.5× below the pre-2026.09 headlines because every commit window now fsyncs markers, segments, and kf). The "single beats parallel" claim that briefly appeared in earlier docs was a bash-bench artifact (shell forked `$BIN query` subprocesses per chunk ×5; each fork costs 10–30 ms). With C pthreads, the original `R ≈ N/200K, 5 ≤ conns` rule still holds, and ingest peaks at `splits ≈ core count` — over-splitting taxes every request (see docs/operations/tuning.md).
 

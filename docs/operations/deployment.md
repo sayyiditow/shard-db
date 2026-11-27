@@ -260,11 +260,13 @@ systemctl stop shard-db
 systemctl start shard-db
 ```
 
-**2026.11.1** requires a cleanly stopped 2026.10.2 root. The runbook is: backup → stop writes → cleanly stop 2026.10.2 → replace with 2026.11.1 → start and verify; the first start migrates every object to the packed record layout (crash-safe) before serving, and a root from before 2026.10.2 is refused with an upgrade hint.
+**2026.11.3** removes the legacy object layout and both startup migrations. The minimum supported source release is **2026.11.2**; the runbook is: backup → stop writes → cleanly stop the current instance → install 2026.11.2 → start it once to completion (it converts legacy objects to the packed layout) → cleanly stop → replace with this version → start and verify. Startup refuses a root holding a non-packed object, a token-less `schema.conf` line, or an unusable rebuild-txn meta, naming the offending entry; stale `.layout-migrated` / `.btri-migrated` files are ignored. A pre-2026.11.2 root is refused with an upgrade hint.
+
+**2026.11.1** required a cleanly stopped 2026.10.2 root. The runbook was: backup → stop writes → cleanly stop 2026.10.2 → replace with 2026.11.1 → start and verify; the first start migrated every object to the packed record layout (crash-safe) before serving.
 
 ### Refused: `invalid live kf references`
 
-The 2026.11.x layout migration (and the same check at every embedded open) refuses an object with `{"error":"invalid live kf references in <object>"}` when one or more of its live keyfile entries points at a segment record that is missing, tombstoned, another key's, or structurally dead. The migration never modifies the object's data when it refuses — the check is read-only and fails closed, so the refusal itself causes no damage.
+The startup gate (and the same check at every embedded open) refuses an object with `{"error":"invalid live kf references in <object>"}` when one or more of its live keyfile entries points at a segment record that is missing, tombstoned, another key's, or structurally dead. The check never modifies the object's data when it refuses — it is read-only and fails closed, so the refusal itself causes no damage.
 
 This state can occur on roots written by **2026.10.2 or earlier** because of an append-frontier recovery bug fixed in **2026.11.2**: startup recovery could park the append frontier at a run of inert "staged, not-activated" records (struct-valid flag=0 records whose write window died before activation), and later appends then overwrote live records beyond that run. 2026.11.2 prevents new damage; it does **not** repair existing damage.
 

@@ -287,19 +287,11 @@ static inline void typed_clear_null(uint8_t *bm, int bm_bytes, int i) {
    bm_nbytes — 0, >32, or 1+bm_nbytes > vlen — must never reach pointer
    math; the update-path old_region subtraction underflows otherwise).
    Returns 0 and fills the outs on success; -1 on a structurally
-   invalid record (unknown hdr2 bits, bad bm_nbytes, short vlen).
-   Legacy records (hdr2 without SREC_FLAG_NULLMAP) always succeed:
-   base = value, bm = NULL, region = vlen. Implemented in config.c. */
+   invalid record (unknown hdr2 bits, bad bm_nbytes, short vlen). Packed
+   records always carry the nullmap flag. Implemented in config.c. */
 int typed_record_view(const uint8_t *value, size_t vlen, uint8_t hdr2,
                       const uint8_t **out_base, const uint8_t **out_bm,
                       int *out_bm_bytes, size_t *out_region);
-/* Rendering predicate for legacy records: 1 if the legacy decoder would
-   SKIP this field's bytes. Used ONLY to port a legacy record into
-   nullmap form (§2.7 update conversion, §2.10 rebuild conversion)
-   without changing what clients see — query existence uses
-   legacy_field_query_exists (query_plan.c) instead. Implemented in
-   storage.c. */
-int legacy_field_absent(const TypedField *f, const uint8_t *p);
 #define MAX_LINE    65536
 
 /* Max bytes of one field-definition spec (fields.conf line grammar:
@@ -343,10 +335,6 @@ typedef struct {
        `auto_key=seq(<name>)` token. */
     enum AutoKeyKind { AK_NONE = 0, AK_UUID, AK_SEQ } auto_key;
     char auto_key_seq_name[128];   /* meaningful only when auto_key == AK_SEQ */
-    /* 0 = legacy layout, 1 = packed layout. Set from the strict
-       `layout=packed` schema.conf token (schema_tail_layout); a malformed
-       token makes load_schema refuse the object instead of defaulting. */
-    int packed_layout;
 } Schema;
 
 
@@ -814,7 +802,7 @@ void durability_test_fsync_fail_on_call(int call_number, int err);
 void index_test_spill_open_fail_errno(int err);
 void index_test_conf_publish_fail_stage(int stage);
 /* One-shot: the next checked reindex build fails with this errno before
-   touching any index file (BTRI startup-migration failure case). */
+   touching any index file (checked-reindex failure cases). */
 void index_test_fail_next_build(int en);
 /* One-shot: the next bmfix startup bitmap repair fails with this errno
    before touching any index file (consumed only by
@@ -983,13 +971,7 @@ int schema_tail_layout(const char *tail, int *out);
    0 when the object has no line or the root is outside DB_ROOT), -1 when
    schema.conf is unreadable, -2 for a malformed token. *out is 0 on error. */
 int schema_conf_layout(const char *effective_root, const char *object, int *out);
-/* Sets (packed=1) or clears (packed=0) the `layout=packed` token on the
-   object's schema.conf line, preserving every other token; checked
-   publication; -1 when the line is absent or anything fails. */
-int update_schema_conf_layout(const char *effective_root, const char *object, int packed);
-/* fields.conf legacy->packed declaration rewrite and the uncached packed
-   builder used by create-object and the startup migration. */
-int layout_packed_decl_line(const char *line, char *out, size_t cap);
+/* Uncached packed builder used by create-object. */
 int typed_schema_build_packed(const char *const *lines, size_t nlines,
                               TypedSchema *out, char *err, size_t errsz);
 void typed_schema_release(TypedSchema *ts);
@@ -1011,15 +993,6 @@ int  fields_line_is_removed(const char *line);
    packed_free_decl_lines. */
 int  packed_read_decl_lines(const char *obj_dir, char ***lines_out, size_t *n_out);
 void packed_free_decl_lines(char **lines, size_t n);
-/* Startup migration of ONE legacy object to the packed layout. dry_run=1:
-   read-only audit (nothing is written). Returns 0 ok, 1 when records do not
-   fit their packed declaration (diag lists up to 8, one per line), -1 on
-   any other failure (diag has the reason). Caller holds objlock_wrlock. */
-int layout_migrate_object(const char *effective_root, const char *object,
-                          int dry_run, char *diag, size_t diagsz);
-/* No-op outside TEST_BUILD; in TEST_BUILD raises SIGKILL when the db.env
-   knob LAYOUT_MIGRATE_TEST_CRASH names this phase. */
-void layout_test_crash_point(const char *phase);
 int load_splits(const char *db_root, const char *object);
 int load_index_fields(const char *db_root, const char *object, char fields[][256], int max_fields);
 /* Companion to load_index_fields — fills `types[i]` with the IndexType for
@@ -1443,11 +1416,10 @@ int reindex_object_checked(const char *eff_root, const char *object,
 int reindex_object_checked_ex(const char *eff_root, const char *object,
                               int composites_only, int *out_count,
                               int *out_errno);
-/* Strict form for the 2026.10.2 BTRI startup migration: succeeds only
+/* Strict form used by reindex and the rebuild-txn paths: succeeds only
    when the build reports INDEX_BUILD_OK AND every requested shard was
    durably published (all_requested_shards_published). An unconfirmed
-   build is a failure here, never a pass — the startup migration stamps
-   completion only on this strict result. */
+   build is a failure here, never a pass. */
 int reindex_object_durable_checked_ex(const char *eff_root, const char *object,
                                       int composites_only, int *out_count,
                                       int *out_errno);
@@ -1676,7 +1648,7 @@ int cmd_list_files(const char *db_root, const char *object,
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
-                      const char *auto_key_spec, int packed);
+                      const char *auto_key_spec);
 /* Drops an object entirely: data, metadata, indexes, fields.conf, indexes/,
    counts, and the schema.conf line. Invalidates caches. if_exists=1 makes
    the call idempotent (no-op if the object is already gone). */
@@ -1741,7 +1713,6 @@ int shard_db_version_check(const char *db_root,
 int shard_db_version_stamp(const char *db_root);
 int shard_db_version_file_read(const char *db_root, char *out, size_t out_sz);
 /* Read-only ambiguity check before interpreting pre-2026.10.2 schemas. */
-int shard_db_not_null_upgrade_audit(const char *db_root);
 int shard_db_version_file_write(const char *db_root, const char *version);
 int shard_db_recover_before_stamp(const char *db_root,
                                   int *out_markers_replayed);
@@ -1750,6 +1721,9 @@ int shard_db_mark_clean_if_safe(const char *db_root);
 
 typedef struct RebuildTxn RebuildTxn;
 
+/* Startup layout gate: -1 no active txn, 0 active with old_layout missing/0,
+   1 active with old_layout=1, -2 unusable active path/meta. */
+int rebuild_txn_active_layout(const char *eff_root, const char *object);
 RebuildTxn *rebuild_txn_begin(const char *db_root, const char *object,
                               int old_splits, int old_streams,
                               int indexes_may_change);

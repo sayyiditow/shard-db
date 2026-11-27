@@ -61,12 +61,7 @@ static int test_r2_predicate_verification_run(void){
     TypedSchema *ts=calloc(1,sizeof(*ts));ts->typed=1;ts->nfields=2;
     for(int i=0;i<2;i++){TypedField *f=&ts->fields[i];f->type=FT_NUMERIC;f->size=8;f->offset=8*i;f->numeric_scale=i?2:1;f->numeric_scale_mult=i?100:10;snprintf(f->name,sizeof(f->name),"n%d",i);}
     uint8_t record[16]={0};record[7]=10;record[15]=100;
-    SearchCriterion raw={0};strcpy(raw.field,"n0");strcpy(raw.value,"1.04");raw.op=OP_EQUAL;
-    CHECK(matches(record,sizeof(record),&raw,ts,0)==0,"numeric eq literal is exact, never rounded to field scale");
-    raw.op=OP_GREATER;strcpy(raw.value,"0.96");
-    CHECK(matches(record,sizeof(record),&raw,ts,0)==1,"numeric range literal exact between storage quanta");
-    raw.op=OP_EQ_FIELD;strcpy(raw.value,"n1");
-    CHECK(matches(record,sizeof(record),&raw,ts,0)==1,"mixed-scale numeric field equality");
+    SearchCriterion raw={0};
 #ifndef R2_BASE
     SearchCriterion *oom_criteria = NULL;
     int oom_count = -1;
@@ -99,15 +94,6 @@ static int test_r2_predicate_verification_run(void){
               "failed recompile cannot silently become a false condition");
     }
     free_criteria_tree(recompiled);
-    strcpy(raw.field,"n0+n1");raw.op=OP_EQUAL;strcpy(raw.value,"11");
-    CHECK(matches(record,sizeof(record),&raw,ts,0)==1,"checked legacy composite preserves display concatenation");
-    uint8_t null_record[18]={1,1};memcpy(null_record+2,record,sizeof(record));strcpy(raw.value,"1");
-    CHECK(matches(null_record,sizeof(null_record),&raw,ts,SREC_FLAG_NULLMAP)==1,"checked legacy composite skips NULL components");
-    strcpy(raw.field,"n0");raw.op=OP_EQUAL;strcpy(raw.value,"1.0");
-    CHECK(search_criterion_indexable(ts,&raw)==1,"representable legacy numeric keeps index eligibility");
-    strcpy(raw.value,"1.04");CHECK(search_criterion_indexable(ts,&raw)==0,"nonrepresentable legacy numeric exact-scan fallback");
-    raw.op=OP_BETWEEN;strcpy(raw.value,"0.0");strcpy(raw.value2,"1.04");
-    CHECK(search_criterion_indexable(ts,&raw)==0,"second nonrepresentable bound rejects index shortcut");
 #endif
     char *needle=malloc(70001);memset(needle,'a',70000);needle[70000]=0;
     size_t jcap=70100;char *json=malloc(jcap);snprintf(json,jcap,"{\"field\":\"v\",\"op\":\"eq\",\"value\":\"%s\"}",needle);

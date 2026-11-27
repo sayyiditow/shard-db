@@ -87,7 +87,7 @@ static int br_connect(Br *b) {
     return b->tc ? 0 : -1;
 }
 
-static int br_open(Br *b, int legacy) {
+static int br_open(Br *b) {
     memset(b, 0, sizeof(*b));
     for (int i = 0; i < BR_N; i++) {
         b->rows[i].flag = (i % 3 == 0) || (i % 7 == 0);
@@ -101,10 +101,9 @@ static int br_open(Br *b, int legacy) {
     char *r = br_q(b, "{\"mode\":\"add-dir\",\"dir\":\"br\"}");
     free(r);
     r = br_q(b,
-        "{\"mode\":\"create-object\",%s\"dir\":\"br\",\"object\":\"t\",\"splits\":8,\"max_key\":16,"
+        "{\"mode\":\"create-object\",\"dir\":\"br\",\"object\":\"t\",\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"flag:bool\",\"kind:enum(a,b,c)\",\"n:int\"],"
-        "\"indexes\":[\"flag:bitmap\",\"kind:bitmap\",\"n\"]}",
-        legacy ? "\"declaration_layout\":\"legacy\"," : "");
+        "\"indexes\":[\"flag:bitmap\",\"kind:bitmap\",\"n\"]}");
     ASSERT_CONTAINS(r, "\"status\":\"created\"", "create object");
     free(r);
     return 0;
@@ -231,11 +230,11 @@ static void br_check_tc(Br *b, TestClient *tc, const char *when) {
 static void br_check(Br *b, const char *when) { br_check_tc(b, b->tc, when); }
 
 /* Bulk windows: growth happens inside later chunks while earlier chunks' bits exist. */
-static int br_run_bulk(int legacy) {
+static int br_run_bulk(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, legacy) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     for (int from = 0; from < BR_N; from += 500)
         ASSERT_EQ_INT(br_bulk(b, from, from + 500), 0, "bulk-insert chunk");
     br_check(b, "after growth");
@@ -259,15 +258,14 @@ static int br_run_bulk(int legacy) {
     free(b);
     return t_ctx->failed > 0 ? 1 : 0;
 }
-static int test_bitmap_resplit_bulk(void)   { return br_run_bulk(0); }
-static int test_bitmap_resplit_legacy(void) { return br_run_bulk(1); }
+static int test_bitmap_resplit_bulk(void)   { return br_run_bulk(); }
 
 /* Single-record inserts: kf_plan_insert_slot resplits with older rows' bits present. */
 static int test_bitmap_resplit_single(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     for (int i = 0; i < 1200; i++)
         ASSERT_EQ_INT(br_single(b, i), 0, "single insert");
     br_check(b, "after single-insert growth");
@@ -281,7 +279,7 @@ static int test_bitmap_resplit_vacuum(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     for (int from = 0; from < BR_N; from += 500)
         ASSERT_EQ_INT(br_bulk(b, from, from + 500), 0, "bulk-insert chunk");
     ASSERT_EQ_INT(br_bulk_delete(b, 2), 0, "bulk-delete every 2nd");
@@ -322,7 +320,7 @@ static int test_bitmap_resplit_restart(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     for (int from = 0; from < BR_N; from += 500)
         ASSERT_EQ_INT(br_bulk(b, from, from + 500), 0, "bulk-insert chunk");
     ASSERT_EQ_INT(br_restart(b), 0, "restart daemon on the same root");
@@ -338,7 +336,7 @@ static int test_bitmap_resplit_marker_recovery(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     for (int from = 0; from < BR_N; from += 500)
         ASSERT_EQ_INT(br_bulk(b, from, from + 500), 0, "bulk-insert chunk");
     int port = b->env.port;
@@ -403,7 +401,7 @@ static int test_bitmap_resplit_concurrent_readers(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     enum { NRD = 4 };
     BrReader rd[NRD];
     pthread_t th[NRD];
@@ -535,7 +533,7 @@ static int test_bitmap_resplit_fault_prepare(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     ASSERT_EQ_INT(br_bulk(b, 0, 220), 0, "seed records before the fault");
     br_check(b, "before failed prepares");
     ASSERT_EQ_INT(test_env_ctl_set_bmfix_backoff(&b->env, BR_BACKOFF_MS), 0, "shorten the growth back-off (F7d seam)");
@@ -593,7 +591,7 @@ static int test_bitmap_resplit_fault_rename(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     ASSERT_EQ_INT(br_bulk(b, 0, 220), 0, "seed records before the fault");
     br_check(b, "before failed renames");
     ASSERT_EQ_INT(test_env_ctl_set_bmfix_backoff(&b->env, BR_BACKOFF_MS), 0, "shorten the growth back-off (F7d seam)");
@@ -647,7 +645,7 @@ static int br_run_fault_commit(int kill) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, SHARD_TEST_BMFIX_COMMIT_SYNC, 1000), 0, "arm: commit msync unconfirmed");
     for (int from = 0; from < 1000; from += 250)
         ASSERT_EQ_INT(br_bulk(b, from, from + 250), 0, "bulk-insert chunk");
@@ -695,7 +693,7 @@ static int test_bitmap_resplit_chain(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     enum { NCL = 4 };
     BrChainArg arg[NCL];
     pthread_t th[NCL];
@@ -721,7 +719,7 @@ static int test_bitmap_resplit_corrupt_bitmap(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     ASSERT_EQ_INT(br_bulk(b, 0, 300), 0, "load before the damage");
     ASSERT_EQ_INT(br_bulk_delete(b, 2), 0, "delete every 2nd row (shards now have tombstones)");
     char root[256], bm[600];
@@ -1015,7 +1013,7 @@ static int test_bmfix_repair_shard_scoped(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     br_seed_1500(b);
     int port = b->env.port;
     char root[256];
@@ -1070,7 +1068,7 @@ static int test_bmfix_repair_bad_marker_name(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     br_seed_1500(b);
     int port = b->env.port;
     char root[256];
@@ -1287,7 +1285,7 @@ static int test_bmfix_escape_flag_write_fails(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     br_seed_1500(b);
     char root[256];
     snprintf(root, sizeof(root), "%s", b->env.db_root);
@@ -1317,7 +1315,7 @@ static int test_bmfix_flag_without_markers(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     br_seed_1500(b);
     int port = b->env.port;
     char root[256];
@@ -1362,7 +1360,7 @@ static int test_bmfix_reindex_clears_serving_markers(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     br_seed_1500(b);
     ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, SHARD_TEST_BMFIX_COMMIT_SYNC, 100000),
                   0, "arm: commit msync unconfirmed");
@@ -1388,7 +1386,7 @@ static int test_bmfix_unclean_with_kfm2(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     br_seed_1500(b);
     /* Probe step 1: commit-sync fault leaves a durable .bmfix marker; the
        window itself commits and clears its own KFM2 marker (see P1b
@@ -1440,7 +1438,7 @@ static int test_bmfix_unclean_repair_fails_with_kfm2(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { free(b); return 1; }
+    if (br_open(b) != 0) { free(b); return 1; }
     br_seed_1500(b);
     ASSERT_EQ_INT(test_env_ctl_set_bmfix_fault(&b->env, SHARD_TEST_BMFIX_COMMIT_SYNC, 100000),
                   0, "arm: commit msync unconfirmed");
@@ -1485,7 +1483,7 @@ static int test_bmfix_test_knobs_independent(void) {
     if (!b) return 1;
 
     /* ---- Part A: the build knob does not hit the repair path ---- */
-    if (br_open(b, 0) != 0) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    if (br_open(b) != 0) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
     br_seed_1500(b);
     int port = b->env.port;
     char root[256];
@@ -1589,7 +1587,7 @@ static int test_bitmap_resplit_log_scope(void) {
     Br *b = calloc(1, sizeof(*b));
     ASSERT_NOT_NULL(b, "alloc");
     if (!b) return 1;
-    if (br_open(b, 0) != 0) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
+    if (br_open(b) != 0) { br_close(b); free(b); return t_ctx->failed > 0 ? 1 : 0; }
     char root[256];
     snprintf(root, sizeof(root), "%s", b->env.db_root);
     ASSERT_EQ_INT(tu_run_cmd("echo 'CANARY-SERVING' >> \"$(dirname '%s')/logs/zz-canary.log\"", root),
@@ -1848,7 +1846,6 @@ static int test_bmfix_remap_clear_with_marker(void) {
 }
 
 TEST_REGISTER("test-bitmap-resplit-bulk", test_bitmap_resplit_bulk)
-TEST_REGISTER("test-bitmap-resplit-legacy", test_bitmap_resplit_legacy)
 TEST_REGISTER("test-bitmap-resplit-single", test_bitmap_resplit_single)
 TEST_REGISTER("test-bitmap-resplit-vacuum", test_bitmap_resplit_vacuum)
 TEST_REGISTER("test-bitmap-resplit-restart", test_bitmap_resplit_restart)

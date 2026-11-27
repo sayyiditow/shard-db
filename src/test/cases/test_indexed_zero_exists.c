@@ -159,7 +159,7 @@ static int zex_packed_run(void) {
     snprintf(path, sizeof(path), "%s/schema.conf", root);
     FILE *f = fopen(path, "w");
     ASSERT_NOT_NULL(f, "schema.conf");
-    if (f) { fputs(":obj:8:32:2:1\n", f); fclose(f); }
+    if (f) { fputs(":obj:8:32:2:1:layout=packed\n", f); fclose(f); }
     snprintf(path, sizeof(path), "%s/obj/fields.conf", root);
     f = fopen(path, "w");
     ASSERT_NOT_NULL(f, "fields.conf");

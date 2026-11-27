@@ -6,6 +6,26 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Breaking: the legacy object layout and both startup migrations are removed.**
+Every object is now packed. `create-object` refuses `declaration_layout:"legacy"`
+in every build (the TEST_BUILD fixture seam is gone too), `describe-object`
+always reports `"declaration_layout":"packed"`, and the daemon no longer loads
+a legacy `fields.conf`. The BTRI reindex migration and the layout-conversion
+migration are deleted; stale `.btri-migrated` / `.layout-migrated` /
+`.layout-migration-report` files are ignored. Startup now refuses, with a named
+error, a root holding any non-packed object, any token-less `schema.conf` line
+(including a stale line whose object directory does not exist), an unusable
+rebuild-txn meta, or an unreadable/malformed `schema.conf`; the minimum
+supported source release is **2026.11.2**. Upgrade path: install 2026.11.2,
+start it once to completion against the DB_ROOT (it converts legacy objects and
+rebuilds BTRI indexes), stop it cleanly, then install this version. `restore`
+refuses a backup that is not a packed v2 object with
+`backup is not a packed v2 object; restore with shard-db 2026.11.2 first`.
+`bulk-update` with `criteria` still returns
+`packed criteria updates await query integration` (pre-existing packed gap,
+pinned by a test). The full refusal strings are in
+[error codes](error-codes.md#layout-and-startup-compatibility).
+
 **Fix: restore commits atomically, rolls back cleanly, and no longer loses `fields.conf`.**
 `restore` now stage-copies the backup, writes a durable `SWAP` marker, swaps
 each entry (`data/`, `indexes/`, `metadata/`, `files/`, `fields.conf`), syncs
@@ -365,7 +385,7 @@ faulty tail heuristic: resync within one `slot_size`, and if no live/tombstone h
 sat in that window, break as an ordinary unwritten tail. A run of graves longer than one
 slot size parked the startup append frontier (`recover_one_stream`) mid-file, so later
 appends overwrote live records beyond the graves — dangling live keyfile entries, which
-the 2026.11.x layout migration refuses (`invalid live kf references`). The same break
+the startup integrity check refuses (`invalid live kf references`). The same break
 made vacuum undercount live records behind graves (`seg_stat_one_varlen`), stop the
 compaction recipient free-list walk early, and stop the O_DIRECT scanner
 (`seg_scan_o_direct`) — segments were dropped or under-migrated with live records still

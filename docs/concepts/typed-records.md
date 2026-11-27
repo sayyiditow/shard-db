@@ -1,6 +1,6 @@
 # Typed records
 
-Every object has a **typed binary schema**, declared once at `create-object` time and stored in `<object>/fields.conf`. Records on disk are a fixed-width packed layout driven by this schema — not JSON.
+Every object has a **typed binary schema**, declared once at `create-object` time and stored in `<object>/fields.conf`. Records on disk are a packed binary layout driven by this schema — not JSON.
 
 On the v2 slotcask engine these typed records are the **value payload** of each segment record (`<obj>/data/streams/<stream>/<file>.dat`), prefixed by a 24-byte segment record header (hash + klen + flag + vlen) and followed by `klen` bytes of raw key.
 
@@ -45,7 +45,7 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 
 | Type | Spec | On-disk bytes | Notes |
 |---|---|---|---|
-| `varchar` | `name:varchar:N` (N = 1..4194304) or bare `name:varchar` | descriptor + content | Packed objects store an 8-byte descriptor plus the content bytes at their **actual length**; the cap is N bytes (bare = 4 MiB, 4 194 304). Legacy objects keep `N + 2` bytes (`[uint16 BE length][content]`, N ≤ 65535). |
+| `varchar` | `name:varchar:N` (N = 1..4194304) or bare `name:varchar` | descriptor + content | An 8-byte descriptor plus the content bytes at their **actual length**; the cap is N bytes (bare = 4 MiB, 4 194 304). |
 | `int` | `age:int` | 4 | Signed 32-bit, big-endian. Range ±2.1 B. |
 | `long` | `id:long` | 8 | Signed 64-bit, big-endian. |
 | `short` | `flags:short` | 2 | Signed 16-bit, big-endian. Range ±32 k. |
@@ -54,7 +54,7 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 | `bool` | `active:bool` | 1 | `0` = false, `1` = true. Wire accepts exactly: `1 t tr tru true y ye yes on` (true) and `0 f fa fal fals false n no of off` (false), in any letter case; `o` alone is ambiguous and rejected. |
 | `byte` | `level:byte` | 1 | Unsigned 8-bit. |
 | `date` | `dob:date` | 4 | `yyyyMMdd` as int32 BE (e.g., `20260418`). Input: `YYYYMMDD` or `YYYY-MM-DD`, years 1..9999, real Gregorian calendar check. |
-| `datetime` | `created:datetime` | 7 | `yyyyMMdd` (int32 BE) + seconds-of-day (uint24 BE, 0..86399). Widened from 6 bytes in 2026.09.2; startup migration rewrites old objects. Input: `YYYYMMDDHHMMSS`, `YYYY-MM-DD HH:MM:SS` or `YYYY-MM-DDTHH:MM:SS` (HH 0..23, MM/SS 0..59 — no leap second). |
+| `datetime` | `created:datetime` | 7 | `yyyyMMdd` (int32 BE) + seconds-of-day (uint24 BE, 0..86399). Widened from 6 bytes in 2026.09.2 (roots older than 2026.11.2 must be upgraded through 2026.11.2). Input: `YYYYMMDDHHMMSS`, `YYYY-MM-DD HH:MM:SS` or `YYYY-MM-DDTHH:MM:SS` (HH 0..23, MM/SS 0..59 — no leap second). |
 | `datetimems` | `created_at:datetimems` | 8 | `yyyyMMdd` (int32 BE) + `ms-of-day` (uint32 BE, `0..86399999`). Wire format is the 17-digit string `"yyyyMMddHHmmssfff"`. Input: `YYYYMMDDHHMMSSfff` or `YYYY-MM-DD HH:MM:SS.fff` — exactly 3 fraction digits. |
 | `time` | `t:time` | 3 | Seconds-of-day packed as 3 big-endian bytes. Parsed from `HH:MM:SS` (exactly — `00:00:00`..`23:59:59`, no leap second). Anything else is rejected with a field-named error (R4). |
 | `timestamp` | `created_at:timestamp` | 8 | Unix epoch **milliseconds** as int64 BE. Storage layout is identical to `long`; the type carries the additional semantic that `:auto_create` / `:auto_update` emit `clock_gettime(CLOCK_REALTIME)` in ms. Suitable for API timelines, event ordering, telemetry — anything where `Date.now()`-style values are the lingua franca. Distinct from `datetime` (which is calendar-packed and can't represent pre-1970 / post-9999). Available since 2026.05.6. |
@@ -97,16 +97,16 @@ changes introduced by R4.
 
 ### varchar sizing
 
-`varchar:N` reserves `N + 2` bytes per record. Content longer than N is rejected on insert. Pick N carefully:
+`varchar:N` caps content at N bytes; each record stores an 8-byte descriptor plus the bytes actually used, so short strings do not pay the full N. Content longer than N is rejected on insert. Pick N carefully:
 
-- Too small → insert errors later. Migrating to a larger N requires `add-field` + manual repopulation.
-- Too large → record payload bloats. Every record pays the full reserved size, even for short strings — both inside the segment file and in the slot-size accounting used to estimate disk budget.
+- Too small → insert errors later. `edit-field` can widen N (it rebuilds the object).
+- Too large → no per-row penalty, but N participates in the slot-size bound and in validation; choose a realistic ceiling.
 
 Typical patterns:
 - `email:varchar:200`
 - `name:varchar:100`
 - `sku:varchar:32`
-- Notes/freeform: `varchar:1000`, up to the 4 MiB packed ceiling (65535 on legacy-layout objects).
+- Notes/freeform: `varchar:1000`, up to the 4 MiB packed ceiling.
 
 For larger blobs — images, PDFs — store them via [put-file](../query-protocol/files.md) and reference them by filename in a varchar.
 
@@ -198,11 +198,8 @@ NULL field's stored bytes are canonical zeros that never decode.
   predicates (`neq`, `not_in`, `not_like`, …) don't match it either — a
   NULL belongs to neither a positive value predicate nor its negation.
 - `exists` is true when the field holds any non-NULL value; `not_exists`
-  matches NULL. On legacy (pre-2026.10.2) records the query-existence
-  predicate is generation-correct: zero-value markers (`""` varchar,
-  midnight, zero date) read as absent for text-style checks exactly as
-  they always have, so indexed and unindexed results agree on
-  mixed-generation data.
+  matches NULL. Zero-value markers (`""` varchar, midnight, zero date) are
+  present values; indexed and unindexed results agree.
 
 ### NULLs and indexes (BTRI)
 
@@ -221,10 +218,9 @@ interleave one tier byte per component). Practical consequences:
 - Bitmap-indexed fields store no entry for NULL (a bitmap cannot
   enumerate "no bit set"): `exists`/`not_exists` and NULL groups on
   bitmap-indexed fields fall back to full scans. Documented, rare.
-- An object whose indexes are still `'BTRH'` is upgraded automatically:
-  the **2026.10.2 startup migration** reindexes every indexed object
-  (strictly, fail-closed) before serving and stamps completion; a
-  `'BTRH'` index file also refuses per-request as defense-in-depth.
+- Startup requires 2026.11.2 clean-open evidence (which guarantees every
+  index was rebuilt to `'BTRI'`); 2026.11.3 runs no startup migration. A
+  `'BTRH'` index file still refuses per-request as defense-in-depth.
 
 ### NULLs in aggregates
 
@@ -234,18 +230,14 @@ interleave one tier byte per component). Practical consequences:
   `NULL`, `""`, and the literal `"null"` are three distinct buckets.
 - `count(field)` counts non-NULL values; `count(*)` is a row count.
 
-### Legacy conversion
+### Record rewrites
 
-Rewriting a legacy record into the nullmap format (bulk-update merge,
-vacuum recompose, schema-mutation rebuilds) follows one rule: an explicit
-null beats the old value; an omitted field carries the old value forward;
-a legacy **absent** marker (field bytes beyond the record region) converts
-to NULL. On legacy-layout
-objects, fields added by add-field are never NULL — existing records read
-zeros/backfill. On packed objects a new field reads its declared default, or
-NULL if it is nullable and has none (a `:not_null` field with no default is
-refused while the object has records); explicit NULLs in other fields survive
-the rebuild.
+Bulk-update merge, vacuum recompose and schema-mutation rebuilds follow one
+rule: an explicit null beats the old value; an omitted field carries the old
+value forward. A field added by add-field reads its declared default, or NULL
+if it is nullable and has none (a `:not_null` field with no default is refused
+while the object has records); explicit NULLs in other fields survive the
+rebuild.
 
 ### NOT NULL constraint (`:not_null`, 2026.10.2)
 
@@ -293,8 +285,7 @@ new grammar directly.
 
 Enabling the constraint on existing data: `edit-field` adding `:not_null`
 first runs a read-only, fail-closed NULL scan over the object's live
-records (legacy-generation records count as NULL exactly when the next
-rewrite would convert them to NULL). Nonzero NULLs refuse the edit with
+records. Nonzero NULLs refuse the edit with
 a count; an unreadable record or invalid live reference refuses it too.
 See [schema-mutations](../query-protocol/schema-mutations.md) for the
 edit-field rules.
@@ -303,15 +294,16 @@ edit-field rules.
 
 Record payloads are encoded by `typed_encode()` (in `config.c`), which packs each field in declaration order. A reader uses `typed_decode()` — also cached per object via `g_typed_cache` — to unpack without re-reading the schema.
 
-The fixed-field description below is the currently public legacy format.
-The private [whole-record JSON reader bridge](whole-record-readers.md) also
-recognizes explicitly bound packed schemas; it does not activate their loaders,
-projection/query consumers or migration. GET validates and builds its actual
-JSON response before output, with checked allocation/write errors.
+Every object uses the packed format described below. GET validates and builds
+its actual JSON response before output, with checked allocation/write errors.
 
-**Legacy layout:** no field-separator bytes, no length tags (varchar has its own uint16 length prefix, but nothing separates fields from each other). Position is everything: field `i` starts at the sum of sizes of fields `0..i-1`. This makes `typed_get_field_str(ts, raw, field_index)` a direct memcpy of a known byte range.
-
-**Packed layout (default):** fixed-width scalars sit at fixed offsets; each `varchar`/`numeric` field has an 8-byte descriptor at its fixed offset pointing at its payload, which is stored at its actual length after the fixed region. Readers resolve a field through its descriptor rather than a prefix sum.
+**Packed layout:** fixed-width scalars sit at fixed offsets; each
+`varchar`/`numeric` field has an 8-byte descriptor at its fixed offset pointing
+at its payload, which is stored at its actual length after the fixed region.
+Readers resolve a field through its descriptor rather than a prefix sum.
+(The pre-2026.11.3 legacy layout had no field separators — field `i` started at
+the sum of the sizes of fields `0..i-1`, with a uint16 length prefix on
+varchar. No object uses it now.)
 
 ## Schema mutations
 

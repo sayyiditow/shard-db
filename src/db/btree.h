@@ -38,7 +38,7 @@
 #define BT_MAGIC_V3  0x42545247u  /* legacy: BTRG, prev_leaf + last_leaf_page */
 #define BT_MAGIC     0x42545249u  /* current: BTRI — (tier, value, hash) keys
                                        (2026.10.2 null plan; BTRH files refuse
-                                       on open — startup migration reindexes) */
+                                       on open — upgrade through 2026.11.2) */
 
 /* Configurable page size — set before first use */
 extern int bt_page_size; /* default 4096, set from db.env INDEX_PAGE_SIZE */

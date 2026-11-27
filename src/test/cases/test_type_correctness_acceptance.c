@@ -149,14 +149,6 @@ static int test_type_correctness_acceptance_run(void) {
         "{\"mode\":\"add-dir\",\"dir\":\"type_accept\"}");
     free(response);
 
-    /* Negative control: the harness can tell legacy from packed, so the
-       "packed" assertions below cannot pass vacuously. TEST_BUILD only. */
-    int control = type_accept_create(tc,
-        "{\"mode\":\"create-object\",\"dir\":\"type_accept\","
-        "\"object\":\"control\",\"splits\":8,\"max_key\":16,"
-        "\"declaration_layout\":\"legacy\",\"fields\":[\"i:int\"]}");
-    if (control) type_accept_expect_layout(tc, "control", "legacy");
-
     int fixed = type_accept_create(tc,
         "{\"mode\":\"create-object\",\"dir\":\"type_accept\","
         "\"object\":\"fixed\",\"splits\":8,\"max_key\":64,"

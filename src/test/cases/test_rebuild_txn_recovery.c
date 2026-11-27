@@ -31,8 +31,8 @@ static int create_object_with_records(TestEnv *env, const char *object,
 
     char req[768];
     snprintf(req, sizeof(req),
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\","
-        "\"object\":\"%s\",\"splits\":8,\"streams\":1,\"max_key\":16,"
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\","
+        "\"object\":\"%s\",\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"score:int\",\"title:varchar:64\"]}", object);
     resp = NULL;
     if (tc_request(tc, req, &resp) != 0 ||
@@ -97,6 +97,30 @@ static int read_schema_splits(const char *db_root, const char *object) {
     }
     fclose(f);
     return splits;
+}
+
+/* Stream count recorded for the object in schema.conf (host-derived at create
+   time; the hand-written 2026.11.2 meta must match it). */
+static int read_schema_streams(const char *db_root, const char *object) {
+    char conf_path[PATH_MAX];
+    snprintf(conf_path, sizeof(conf_path), "%s/schema.conf", db_root);
+    FILE *f = fopen(conf_path, "r");
+    if (!f) return -1;
+    char prefix[300];
+    snprintf(prefix, sizeof(prefix), "default:%s:", object);
+    size_t plen = strlen(prefix);
+    char line[512];
+    int splits = -1, max_key = -1, engine = -1, streams = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, prefix, plen) == 0) {
+            if (sscanf(line + plen, "%d:%d:%d:%d", &splits, &max_key, &engine,
+                       &streams) != 4)
+                streams = -1;
+            break;
+        }
+    }
+    fclose(f);
+    return streams;
 }
 
 static int append_pause_config(const char *db_root, const char *phase) {
@@ -462,9 +486,13 @@ static int test_recovery_idempotent(void) {
                   "construct rollback-after-data-rename state");
     ASSERT_EQ_INT(tu_run_cmd("cp '%s' '%s'", fields, rollback), 0,
                   "retain fields rollback copy");
-    ASSERT_EQ_INT(write_text_file(meta,
-                  "version=1\nold_splits=8\nold_streams=1\n"
-                  "indexes_may_change=0\n"), 0,
+    int idem_streams = read_schema_streams(root, "txnidempotent");
+    ASSERT_TRUE(idem_streams > 0, "schema.conf records the object stream count");
+    char idem_meta[256];
+    snprintf(idem_meta, sizeof(idem_meta),
+             "version=1\nold_splits=8\nold_streams=%d\n"
+             "indexes_may_change=0\nold_layout=1\n", idem_streams);
+    ASSERT_EQ_INT(write_text_file(meta, idem_meta), 0,
                   "write valid transaction manifest");
 
     ASSERT_EQ_INT(test_env_start_at(&env, root, saved_port), 0,
@@ -788,6 +816,57 @@ static int pk_bitmap_after_indexes_run(int pause_wait_ms, int expect_pause_reach
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
+/* 2026.11.2 wrote every rebuild-txn meta with `old_layout=1`. A root
+   upgraded from that release can still carry an interrupted vacuum, so the
+   hand-written 2026.11.2 manifest must recover. Must pass before and after
+   the T3 tightening (parse_meta requires old_layout=1; the gate's raw reader
+   keeps treating absent/0 as a pre-2026.11.1 artifact). */
+static int test_2026_11_2_meta(void) {
+    TestEnv env = {0};
+    if (test_env_start(&env) != 0) return 1;
+    int saved_port = env.port;
+    char root[256];
+    snprintf(root, sizeof(root), "%s", env.db_root);
+    ASSERT_EQ_INT(create_object_with_records(&env, "txn112", 12), 0,
+                  "create packed fixture");
+    test_env_stop_keep(&env);
+
+    char obj[PATH_MAX], active[PATH_MAX], rollback[PATH_MAX], fields[PATH_MAX],
+         meta[PATH_MAX], data[PATH_MAX], staged[PATH_MAX];
+    snprintf(obj, sizeof(obj), "%s/default/txn112", root);
+    snprintf(active, sizeof(active), "%s/.rebuild_txn.active", obj);
+    snprintf(rollback, sizeof(rollback), "%s/fields.conf.rollback", active);
+    snprintf(fields, sizeof(fields), "%s/fields.conf", obj);
+    snprintf(meta, sizeof(meta), "%s/meta", active);
+    snprintf(data, sizeof(data), "%s/data", obj);
+    snprintf(staged, sizeof(staged), "%s/data", active);
+    ASSERT_EQ_INT(mkdir(active, 0755), 0,
+                  "stage the interrupted 2026.11.2 transaction");
+    ASSERT_EQ_INT(tu_run_cmd("cp '%s' '%s'", fields, rollback), 0,
+                  "retain fields rollback copy");
+    ASSERT_EQ_INT(tu_run_cmd("mv '%s' '%s'", data, staged), 0,
+                  "move data into the active transaction");
+    int streams = read_schema_streams(root, "txn112");
+    ASSERT_TRUE(streams > 0, "schema.conf records the object stream count");
+    char m[256];
+    snprintf(m, sizeof(m),
+             "version=1\nold_splits=8\nold_streams=%d\n"
+             "indexes_may_change=0\nold_layout=1\n", streams);
+    ASSERT_EQ_INT(write_text_file(meta, m), 0,
+                  "write the exact 2026.11.2 manifest");
+
+    ASSERT_EQ_INT(test_env_start_at(&env, root, saved_port), 0,
+                  "restart recovers the interrupted 2026.11.2 transaction");
+    if (env.daemon_pid > 0) {
+        ASSERT_EQ_INT(request_count(&env, "txn112"), 12,
+                      "every record is served after recovery");
+        ASSERT_TRUE(access(active, F_OK) != 0,
+                    "the active state is consumed");
+        test_env_stop(&env);
+    }
+    return t_ctx->failed > 0 ? 1 : 0;
+}
+
 static int test_pk_bitmap_after_indexes(void) {
     return pk_bitmap_after_indexes_run(60000, 1);
 }
@@ -824,6 +903,7 @@ TEST_REGISTER("test-rebuild-txn-crash-after-metadata-splits", test_txn_crash_aft
 TEST_REGISTER("test-rebuild-txn-edit-field-after-metadata", test_edit_crash_after_metadata)
 TEST_REGISTER("test-rebuild-txn-done-cleanup-never-restores", test_done_cleanup)
 TEST_REGISTER("test-rebuild-txn-recovery-idempotent", test_recovery_idempotent)
+TEST_REGISTER("test-rebuild-txn-2026-11-2-meta", test_2026_11_2_meta)
 TEST_REGISTER("test-rebuild-txn-embedded-lock", test_embedded_open_respects_daemon_lock)
 TEST_REGISTER("test-rebuild-txn-packed-add-after-stage", test_pk_add_stage)
 TEST_REGISTER("test-rebuild-txn-packed-add-after-walk", test_pk_add_walk)

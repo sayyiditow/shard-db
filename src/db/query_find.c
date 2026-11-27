@@ -477,23 +477,9 @@ char *json_projected_value(char *v, const TypedField *field) {
 
 char *json_projected_field(const char *raw, size_t raw_len, const char *field,
                            FieldSchema *fs, uint8_t hdr2) {
-    if(fs&&fs->ts&&fs->ts->packed.nfields)
+    if(fs&&fs->ts)
         return typed_packed_named_json(fs->ts,(const uint8_t*)raw,raw_len,hdr2,field,SIZE_MAX);
-    errno = 0;   /* distinguish corruption (EILSEQ) from a NULL field */
-    char *v = decode_field(raw, raw_len, field, fs, hdr2);
-    const TypedField *tf = NULL;
-    if (fs && fs->ts && field && !strchr(field, '+')) {
-        int idx = typed_field_index(fs->ts, field);
-        if (idx >= 0) tf = &fs->ts->fields[idx];
-    }
-    char *out = json_projected_value(v, tf);
-    if (!out && v == NULL && (hdr2 & SREC_FLAG_NULLMAP) && errno != EILSEQ) {
-        /* §2.3: a NULL field on a nullmap record renders as JSON null —
-           key present. Legacy records keep the omit-on-absent convention;
-           corrupt flagged records (EILSEQ) stay omitted/fail upstream. */
-        return strdup("null");
-    }
-    return out;
+    return NULL;
 }
 
 /* Unprojected rows-format cell for typed field idx: the JSON-quoted
@@ -505,17 +491,8 @@ char *json_projected_field(const char *raw, size_t raw_len, const char *field,
 char *json_typed_row_cell(const TypedSchema *ts, const uint8_t *raw,
                           int raw_len, int idx, uint8_t hdr2) {
     if (!ts || idx < 0 || idx >= ts->nfields) return NULL;
-    if(ts->packed.nfields){
-        if(raw_len<0){errno=EILSEQ;return NULL;}
-        return typed_packed_projected_cell(ts,raw,(size_t)raw_len,hdr2,(size_t)idx,SIZE_MAX);
-    }
-    errno = 0;
-    char *v = typed_get_field_str(ts, raw, raw_len, idx, hdr2);
-    char *out = json_projected_value(v, &ts->fields[idx]);
-    if (!out && v == NULL && errno != EILSEQ &&
-        (hdr2 & SREC_FLAG_NULLMAP))
-        return strdup("null");
-    return out;
+    if(raw_len<0){errno=EILSEQ;return NULL;}
+    return typed_packed_projected_cell(ts,raw,(size_t)raw_len,hdr2,(size_t)idx,SIZE_MAX);
 }
 
 char *json_escape_const(const char *v) {
@@ -688,81 +665,6 @@ int update_schema_conf_splits_streams(const char *db_root, const char *object,
     return ok ? 0 : -1;
 }
 
-int update_schema_conf_layout(const char *effective_root, const char *object, int packed) {
-    size_t rootlen = strlen(g_db_root);
-    if (strncmp(effective_root, g_db_root, rootlen) != 0) return -1;   /* same guard as schema_conf_layout */
-    const char *dir = effective_root + rootlen;
-    if (*dir == '/') dir++;
-    char conf[PATH_MAX], tmp[PATH_MAX], prefix[512];
-    snprintf(conf, sizeof(conf), "%s/schema.conf", g_db_root);
-    snprintf(tmp, sizeof(tmp), "%s/schema.conf.layout.tmp.%d", g_db_root, (int)getpid());
-    int pfxlen = snprintf(prefix, sizeof(prefix), "%s:%s:", dir, object);
-    if (pfxlen < 0 || (size_t)pfxlen >= sizeof(prefix)) return -1;
-
-    FILE *fin = fopen(conf, "r");
-    if (!fin) return -1;
-    int lockfd = fileno(fin);
-    flock(lockfd, LOCK_EX);
-    FILE *fout = fopen(tmp, "w");
-    if (!fout) { flock(lockfd, LOCK_UN); fclose(fin); return -1; }
-
-    char line[4096];
-    int replaced = 0, ok = 1;
-    while (ok && fgets(line, sizeof(line), fin)) {
-        size_t ll = strlen(line);
-        if (ll == sizeof(line) - 1 && line[ll - 1] != '\n') { ok = 0; break; } /* never split a line */
-        if (!replaced && strncmp(line, prefix, (size_t)pfxlen) == 0) {
-            line[strcspn(line, "\r\n")] = '\0';
-            char rebuilt[4096];
-            size_t o = 0;
-            int first = 1;
-            char *p = line;
-            while (p) {
-                char *next = strchr(p, ':');
-                size_t tl = next ? (size_t)(next - p) : strlen(p);
-                int is_layout = tl >= 6 && strncmp(p, "layout", 6) == 0 &&
-                                (tl == 6 || p[6] == '=');
-                if (!is_layout) {
-                    if (o + tl + 2 >= sizeof(rebuilt)) { ok = 0; break; }
-                    if (!first) rebuilt[o++] = ':';
-                    memcpy(rebuilt + o, p, tl);
-                    o += tl;
-                    first = 0;
-                }
-                p = next ? next + 1 : NULL;
-            }
-            if (ok && packed) {
-                if (o + 16 >= sizeof(rebuilt)) ok = 0;
-                else { memcpy(rebuilt + o, ":layout=packed", 14); o += 14; }
-            }
-            if (ok) {
-                rebuilt[o] = '\0';
-                if (fprintf(fout, "%s\n", rebuilt) < 0) ok = 0;
-                replaced = 1;
-            }
-        } else if (fputs(line, fout) < 0) {
-            ok = 0;
-        }
-    }
-    if (ferror(fin) || !replaced) ok = 0;
-    if (fflush(fout) != 0 || ferror(fout)) ok = 0;
-    if (fclose(fout) != 0) ok = 0;
-    if (ok) {
-        int prc = durability_publish_replace(conf, tmp, NULL, NULL);
-        if (prc < 0) { unlink(tmp); ok = 0; }
-        else if (prc > 0) {
-            LOG_ERROR(LOG_SUB_CONFIG,
-                      "update_schema_conf_layout: schema.conf renamed but parent-dir sync failed: %s",
-                      strerror(errno));
-            ok = 0;
-        }
-    } else {
-        unlink(tmp);
-    }
-    flock(lockfd, LOCK_UN);
-    fclose(fin);
-    return ok ? 0 : -1;
-}
 
 /* Defined in config.c — see header doc-comment there. Declared locally
    because config.c's helpers live across the layering boundary and the
@@ -1064,6 +966,17 @@ inline int field_needs_transform(const TypedField *old_f,
 /* ===================== Packed recompose (R5b) ===================== */
 
 static void layout_diag_key(char *out, size_t cap, const void *key, size_t klen);
+static void layout_diag_key(char *out, size_t cap, const void *key, size_t klen) {
+    const uint8_t *k = (const uint8_t *)key;
+    size_t n = klen < 32 ? klen : 32;
+    int printable = 1;
+    for (size_t i = 0; i < n; i++) if (k[i] < 0x20 || k[i] > 0x7e) printable = 0;
+    size_t o = 0;
+    for (size_t i = 0; i < n && o + 3 < cap; i++)
+        o += (size_t)snprintf(out + o, cap - o, printable ? "%c" : "%02x", k[i]);
+    if (klen > n && o + 4 < cap) snprintf(out + o, cap - o, "...");
+    else if (o < cap) out[o] = '\0';
+}
 
 /* Replace every byte that could break the {"error":"..."} envelope. */
 static void packed_json_safe(char *s) {
@@ -1500,192 +1413,7 @@ int v2_rebuild_walk_cb(const uint8_t hash16[16],
         return 0;
     }
 
-    if (ctx->old_ts->packed.nfields)
-        return packed_rebuild_walk(ctx, key, klen, value, vlen, hdr2);
-
-    /* Slot layout changed (compact, add-field, edit-field, or any combo):
-       recompose typed payload by mapping new field offsets ← old field
-       offsets. §2.10: OLD is read through its own generation view and the
-       NULL bits are remapped through new_to_old (bit indices are schema
-       indices — removal shifts them); legacy OLD converts per-field via
-       the rendering predicate legacy_field_absent, same as §2.7. New
-       fields (new_to_old == -1) get backfilled from ctx->backfill[k] when
-       default_kind is set; otherwise they stay zero and are never NULL.
-       Edited fields (size or numeric scale changed) go through
-       transform_field_value on non-NULL bytes only; a NULL stays NULL
-       through a size/scale change. The recomposed record is always
-       nullmap generation (SREC_FLAG_NULLMAP). */
-    const uint8_t *old_base = NULL, *old_bm = NULL;
-    int old_bm_bytes = 0;
-    size_t old_region = 0;
-    int old_is_nullmap = (hdr2 & SREC_FLAG_NULLMAP) != 0;
-    if (typed_record_view((const uint8_t *)value, vlen, hdr2,
-                          &old_base, &old_bm, &old_bm_bytes,
-                          &old_region) != 0) {
-        /* Malformed flagged record — fail the rebuild closed (§2.10). */
-        LOG_ERROR(LOG_SUB_CONFIG,
-                  "rebuild_v2: malformed record view (hdr2=%u vlen=%zu) — failing rebuild",
-                  hdr2, vlen);
-        ctx->error = 1;
-        return 1;
-    }
-    int new_bm_bytes = typed_nullmap_bytes(ctx->new_ts->nfields);
-    uint8_t *buf = calloc(1, ctx->new_ts->total_size);
-    if (!buf) { ctx->error = 1; return 1; }
-    buf[0] = (uint8_t)new_bm_bytes;
-    uint8_t *new_bm = buf + 1;
-    for (int k = 0; k < ctx->new_ts->nfields; k++) {
-        int oi = ctx->new_to_old[k];
-        const TypedField *nf = &ctx->new_ts->fields[k];
-        if (oi < 0) {
-            /* Newly-added field — apply computed default if any.
-               DK_AUTO_CREATE / DK_AUTO_UPDATE stay zero by design: they're
-               insert/update-time generators, not backfill stamps. The
-               original record's creation time is unknown so backfilling
-               "now" would lie. Same reasoning for explicit DK_NONE.
-               New fields are never NULL (§2.10) — bit stays clear. */
-            BackfillSpec *bf = ctx->backfill ? &ctx->backfill[k] : NULL;
-            if (!bf || bf->kind == DK_NONE) continue;
-            switch (bf->kind) {
-            case DK_LITERAL:
-                /* Re-use the insert-time encoder so the literal goes
-                   through the same type-aware path (varchar length
-                   prefix, int BE, numeric scaling, etc.). */
-                if (encode_field_checked(nf, nf->default_val,
-                                          strlen(nf->default_val),
-                                          buf + ctx->new_ts->nullmap_prefix + nf->offset,
-                                          NULL, 0) != 0) {
-                    LOG_ERROR(LOG_SUB_CONFIG,
-                              "rebuild_v2: declared default for field [%s] "
-                              "is not a valid %s value; refusing rebuild",
-                              nf->name, typed_type_name(nf->type));
-                    free(buf);
-                    ctx->error = 1;
-                    return 1;   /* rebuild aborts; old object stays live */
-                }
-                break;
-            case DK_SEQ: {
-                int64_t v = atomic_fetch_add_explicit(&bf->seq_next, 1,
-                                                       memory_order_relaxed);
-                /* Render to decimal then run through encode_field so the
-                   bytes match what an insert-time DK_SEQ generates
-                   (consistency between backfilled and freshly-inserted
-                   rows). */
-                char numbuf[24];
-                snprintf(numbuf, sizeof(numbuf), "%lld", (long long)v);
-                encode_field(nf, numbuf, buf + ctx->new_ts->nullmap_prefix + nf->offset);
-                break;
-            }
-            case DK_UUID: {
-                uint8_t raw[16];
-                if (gen_uuid4_raw(raw) != 0) { free(buf); ctx->error = 1; return 1; }
-                if (nf->type == FT_UUID && nf->size == 16) {
-                    /* Native uuid type: store raw 16 bytes. */
-                    memcpy(buf + ctx->new_ts->nullmap_prefix + nf->offset, raw, 16);
-                } else {
-                    /* varchar:36 (or wider) — render as dashed 36-char
-                       string and run through encode_field so the
-                       uint16 length prefix is set. */
-                    char uuidstr[37];
-                    snprintf(uuidstr, sizeof(uuidstr),
-                             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5],
-                             raw[6], raw[7], raw[8], raw[9], raw[10], raw[11],
-                             raw[12], raw[13], raw[14], raw[15]);
-                    encode_field(nf, uuidstr, buf + ctx->new_ts->nullmap_prefix + nf->offset);
-                }
-                break;
-            }
-            case DK_RANDOM: {
-                /* N raw bytes → 2N hex chars. The pre-flight check in
-                   cmd_add_fields already refused a config that would
-                   overflow the field's storage. */
-                int nbytes = bf->random_bytes;
-                if (nbytes <= 0 || nbytes > 256) break; /* defensive */
-                uint8_t raw[256];
-                if (fill_random(raw, (size_t)nbytes) != 0) {
-                    free(buf); ctx->error = 1; return 1;
-                }
-                char hexbuf[513];
-                for (int b = 0; b < nbytes; b++)
-                    snprintf(hexbuf + b * 2, 3, "%02x", raw[b]);
-                hexbuf[nbytes * 2] = '\0';
-                encode_field(nf, hexbuf, buf + ctx->new_ts->nullmap_prefix + nf->offset);
-                break;
-            }
-            default:
-                /* DK_AUTO_CREATE / DK_AUTO_UPDATE / DK_NONE — leave zero. */
-                break;
-            }
-            continue;
-        }
-        const TypedField *of = &ctx->old_ts->fields[oi];
-        /* NULL-bit remap through new_to_old (§2.10): schema indices move
-           when fields are removed; a NULL at old index oi lands on new
-           index k. */
-        if (old_is_nullmap) {
-            if (typed_field_null(old_bm, old_bm_bytes, oi)) {
-                typed_set_null(new_bm, new_bm_bytes, k);
-                continue;
-            }
-        } else if (of->offset + (size_t)of->size > old_region) {
-            /* Legacy OLD, field beyond the stored region (trailing zero
-               bytes were trimmed): the §2.7 composer materializes the
-               zero-padded bytes and runs the rendering predicate on them —
-               a trimmed skip-on-zero field becomes NULL, a trimmed
-               always-render zero (int/short/byte/numeric/bool/enum) keeps
-               the zero VALUE the legacy record rendered. Blanket-NULLing
-               the field here would change what clients see. */
-            size_t off = of->offset;
-            size_t sz  = (size_t)of->size;
-            uint8_t scratch[64];
-            uint8_t *mat = (sz <= sizeof(scratch)) ? scratch : malloc(sz);
-            if (!mat) { free(buf); ctx->error = 1; return 1; }
-            memset(mat, 0, sz);
-            size_t avail = (old_region > off) ? old_region - off : 0;
-            size_t copyn = avail < sz ? avail : sz;
-            if (copyn) memcpy(mat, old_base + off, copyn);
-            uint8_t *dst = buf + ctx->new_ts->nullmap_prefix + nf->offset;
-            if (legacy_field_absent(of, mat)) {
-                memset(dst, 0, (size_t)nf->size);
-                typed_set_null(new_bm, new_bm_bytes, k);
-            } else if (field_needs_transform(of, nf)) {
-                transform_field_value(of, nf, mat, dst);
-            } else {
-                memcpy(dst, mat, sz);
-            }
-            if (mat != scratch) free(mat);
-            continue;
-        } else if (legacy_field_absent(of, old_base + of->offset)) {
-            typed_set_null(new_bm, new_bm_bytes, k);
-            continue;
-        }
-        size_t off = of->offset;
-        size_t sz  = of->size;
-        if (off + sz > old_region) continue;  /* nullmap trimmed tail, bit clear — stays zero */
-        const uint8_t *src = old_base + off;
-        if (field_needs_transform(of, nf)) {
-            transform_field_value(of, nf, src,
-                                   buf + ctx->new_ts->nullmap_prefix + nf->offset);
-        } else {
-            memcpy(buf + ctx->new_ts->nullmap_prefix + nf->offset, src, sz);
-        }
-    }
-    SlotcaskUpsertOpts ropts = {0};
-    ropts.record_hdr2 = SREC_FLAG_NULLMAP;
-    int rc = slotcask_insert_with_hooks(ctx->new_db, -1, key, klen,
-                                         buf, ctx->new_ts->total_size,
-                                         &ropts, NULL);
-    free(buf);
-    if (rc != 0) {
-        LOG_ERROR(LOG_SUB_CONFIG,
-                  "rebuild_v2: insert failed at copied record %llu (klen=%zu)",
-                  (unsigned long long)(ctx->live_count + 1u), klen);
-        ctx->error = 1;
-        return 1;
-    }
-    ctx->live_count++;
-    return 0;
+    return packed_rebuild_walk(ctx, key, klen, value, vlen, hdr2);
 }
 
 static void rebuild_test_pause(const char *obj_dir, const char *phase) {
@@ -1707,218 +1435,6 @@ static void rebuild_test_pause(const char *obj_dir, const char *phase) {
     unlink(marker);
 }
 
-/* ===== Legacy → packed conversion (R5 Task 8) ===== */
-
-#ifdef TEST_BUILD
-static char g_layout_crash_phase[32];
-void layout_migrate_test_crash_phase(const char *phase) {
-    snprintf(g_layout_crash_phase, sizeof(g_layout_crash_phase), "%s", phase ? phase : "");
-}
-#endif
-
-void layout_test_crash_point(const char *phase) {
-#ifdef TEST_BUILD
-    if (g_layout_crash_phase[0] && strcmp(g_layout_crash_phase, phase) == 0)
-        raise(SIGKILL);
-#else
-    (void)phase;
-#endif
-}
-
-typedef struct {
-    SlotcaskDb        *new_db;       /* NULL in dry-run (audit) mode */
-    const TypedSchema *old_ts;       /* legacy snapshot */
-    const TypedSchema *new_ts;       /* packed */
-    uint64_t           live_count;   /* records converted (or convertible) */
-    uint64_t           bad;          /* records whose value does not fit */
-    int                error;        /* hard failure */
-    int                ndiag;
-    char               diag[8][192];
-    char               hard[192];
-} LayoutWalkCtx;
-
-static void layout_diag_key(char *out, size_t cap, const void *key, size_t klen) {
-    const uint8_t *k = (const uint8_t *)key;
-    size_t n = klen < 32 ? klen : 32;
-    int printable = 1;
-    for (size_t i = 0; i < n; i++) if (k[i] < 0x20 || k[i] > 0x7e) printable = 0;
-    size_t o = 0;
-    for (size_t i = 0; i < n && o + 3 < cap; i++)
-        o += (size_t)snprintf(out + o, cap - o, printable ? "%c" : "%02x", k[i]);
-    if (klen > n && o + 4 < cap) snprintf(out + o, cap - o, "...");
-    else if (o < cap) out[o] = '\0';
-}
-
-/* 0 ok (*out and *outlen owned), 1 value does not fit the packed declaration
-   (*bad_field, why), -1 hard error (why). */
-static int layout_convert_record(const LayoutWalkCtx *ctx, size_t klen,
-                                 const void *value, size_t vlen, uint8_t hdr2,
-                                 uint8_t **out, size_t *outlen,
-                                 int *bad_field, char *why, size_t whysz) {
-    const TypedSchema *ots = ctx->old_ts, *nts = ctx->new_ts;
-    *out = NULL; *outlen = 0; *bad_field = -1;
-    TypedRowView view;
-    if (typed_row_open(ots, (const uint8_t *)value, vlen, hdr2, &view) != 0) {
-        snprintf(why, whysz, "malformed source record (hdr2=%u vlen=%zu)", hdr2, vlen);
-        return -1;
-    }
-    int nullmap = (hdr2 & SREC_FLAG_NULLMAP) != 0;
-    PkrCell cells[MAX_FIELDS];
-    uint8_t *owned[MAX_FIELDS] = {0};
-    uint8_t *leg = malloc(65537);
-    uint8_t *composed = NULL;
-    int rc = -1;
-    if (!leg) { snprintf(why, whysz, "out of memory"); return -1; }
-    for (int k = 0; k < nts->nfields; k++) {
-        const TypedField *of = &ots->fields[k];
-        const PkrField *pf = &nts->packed.fields[k];
-        memset(&cells[k], 0, sizeof(cells[k]));
-        if (of->removed) { cells[k].is_null = 1; continue; }   /* tombstoned: slot retained as NULL */
-        TypedRowSpan span;
-        if (typed_row_span(&view, (size_t)k, &span) != 0 ||
-            typed_span_copy_legacy(ots, (size_t)k, &span, leg, 65537) != 0) {
-            snprintf(why, whysz, "malformed source field '%s'", of->name);
-            goto done;
-        }
-        int is_null = nullmap ? span.is_null : legacy_field_absent(of, leg);
-        if (is_null) { cells[k].is_null = 1; continue; }
-        if (pf->kind == PKR_FIXED) {
-            if (pf->width != (uint32_t)of->size) {
-                snprintf(why, whysz, "field '%s': width mismatch %u vs %d", of->name, pf->width, of->size);
-                goto done;
-            }
-            owned[k] = malloc(pf->width);
-            if (!owned[k]) { snprintf(why, whysz, "out of memory"); goto done; }
-            memcpy(owned[k], leg, pf->width);
-            cells[k] = (PkrCell){owned[k], pf->width, 0};
-        } else if (pf->kind == PKR_VARCHAR) {
-            size_t len = ((size_t)leg[0] << 8) | leg[1];
-            size_t cap = of->size >= 2 ? (size_t)of->size - 2 : 0;
-            if (len > cap) len = cap;
-            if (len > pf->payload_max) {
-                *bad_field = k;
-                snprintf(why, whysz, "varchar length %zu exceeds packed capacity %u", len, pf->payload_max);
-                rc = 1;
-                goto done;
-            }
-            owned[k] = malloc(len ? len : 1);
-            if (!owned[k]) { snprintf(why, whysz, "out of memory"); goto done; }
-            if (len) memcpy(owned[k], leg + 2, len);
-            cells[k] = (PkrCell){owned[k], len, 0};
-        } else { /* PKR_NUMERIC: legacy int64 BE scaled by 10^scale → exact decimal text */
-            int scale = of->numeric_scale;
-            if (scale < 0 || scale > 18 || pf->scale != scale) {
-                *bad_field = k;
-                snprintf(why, whysz, "legacy numeric scale %d is not representable (packed scale %d)", scale, pf->scale);
-                rc = 1;
-                goto done;
-            }
-            uint64_t u = 0;
-            for (int b = 0; b < 8; b++) u = (u << 8) | leg[b];
-            int neg = (int64_t)u < 0;
-            uint64_t mag = neg ? (0u - u) : u;
-            char ds[32], padded[48], text[80];
-            int nd = snprintf(ds, sizeof(ds), "%llu", (unsigned long long)mag);
-            int pn = 0;
-            for (int i = nd; i <= scale; i++) padded[pn++] = '0';
-            memcpy(padded + pn, ds, (size_t)nd);
-            pn += nd;
-            int ip = pn - scale;
-            size_t o = 0;
-            if (neg) text[o++] = '-';
-            memcpy(text + o, padded, (size_t)ip);
-            o += (size_t)ip;
-            if (scale > 0) {
-                text[o++] = '.';
-                memcpy(text + o, padded + ip, (size_t)scale);
-                o += (size_t)scale;
-            }
-            text[o] = '\0';
-            uint8_t payload[DEC_PAYLOAD_MAX];
-            size_t used = 0;
-            char perr[96] = {0};
-            if (pkr_numeric_encode(pf, text, o, payload, sizeof(payload), &used,
-                                   perr, sizeof(perr)) != DEC_OK) {
-                *bad_field = k;
-                snprintf(why, whysz, "value %s does not fit numeric(%d,%d)%s%s",
-                         text, pf->precision, pf->scale, perr[0] ? ": " : "", perr);
-                rc = 1;
-                goto done;
-            }
-            owned[k] = malloc(used ? used : 1);
-            if (!owned[k]) { snprintf(why, whysz, "out of memory"); goto done; }
-            memcpy(owned[k], payload, used);
-            cells[k] = (PkrCell){owned[k], used, 0};
-        }
-    }
-    size_t need = 0;
-    if (pkr_measure(&nts->packed, cells, (size_t)nts->nfields, &need) != DEC_OK) {
-        snprintf(why, whysz, "packed measure failed");
-        goto done;
-    }
-    size_t record_bytes = 0;
-    if (pkr_record_fits(&nts->packed, need, klen, SLOTCASK_SEG_MAX_BYTES, &record_bytes) != DEC_OK) {
-        snprintf(why, whysz, "packed record exceeds the segment limit");
-        goto done;
-    }
-    composed = malloc(need ? need : 1);
-    size_t used = 0;
-    if (!composed ||
-        pkr_compose(&nts->packed, cells, (size_t)nts->nfields, composed, need, &used) != DEC_OK) {
-        snprintf(why, whysz, "packed compose failed");
-        goto done;
-    }
-    *out = composed; *outlen = used; composed = NULL;
-    rc = 0;
-done:
-    for (int k = 0; k < nts->nfields; k++) free(owned[k]);
-    free(composed);
-    free(leg);
-    return rc;
-}
-
-static int layout_walk_cb(const uint8_t hash16[16], const void *key, size_t klen,
-                          const void *value, size_t vlen, uint8_t hdr2, void *ctxp) {
-    (void)hash16;
-    LayoutWalkCtx *ctx = (LayoutWalkCtx *)ctxp;
-    if (ctx->error) return 1;
-    uint8_t *out = NULL;
-    size_t outlen = 0;
-    int bad_field = -1;
-    char why[160] = {0};
-    int rc = layout_convert_record(ctx, klen, value, vlen, hdr2, &out, &outlen,
-                                   &bad_field, why, sizeof(why));
-    if (rc < 0) {
-        snprintf(ctx->hard, sizeof(ctx->hard), "%s", why);
-        ctx->error = 1;
-        return 1;
-    }
-    if (rc > 0) {
-        ctx->bad++;
-        if (ctx->ndiag < 8) {
-            char k[128];
-            layout_diag_key(k, sizeof(k), key, klen);
-            snprintf(ctx->diag[ctx->ndiag++], sizeof(ctx->diag[0]),
-                     "field '%s' key '%s': %s",
-                     ctx->old_ts->fields[bad_field].name, k, why);
-        }
-        return 0;
-    }
-    if (ctx->new_db) {
-        SlotcaskUpsertOpts o = {0};
-        o.record_hdr2 = typed_schema_hdr2(ctx->new_ts);
-        if (slotcask_insert_with_hooks(ctx->new_db, -1, key, klen, out, outlen, &o, NULL) != 0) {
-            snprintf(ctx->hard, sizeof(ctx->hard), "insert into the packed copy failed");
-            ctx->error = 1;
-            free(out);
-            return 1;
-        }
-    }
-    free(out);
-    ctx->live_count++;
-    return 0;
-}
-
 int packed_schema_same(const PkrSchema *a, const PkrSchema *b) {
     if (a->nfields != b->nfields || a->prefix != b->prefix ||
         a->directory != b->directory || a->maximum != b->maximum) return 0;
@@ -1929,206 +1445,6 @@ int packed_schema_same(const PkrSchema *a, const PkrSchema *b) {
             x->bare != y->bare || x->currency != y->currency) return 0;
     }
     return 1;
-}
-
-static int layout_write_fields_checked(const char *fpath, char *const *all, size_t nall) {
-    char tmp[PATH_MAX];
-    if (snprintf(tmp, sizeof(tmp), "%s.layout.tmp", fpath) >= (int)sizeof(tmp)) return -1;
-    FILE *f = fopen(tmp, "w");
-    if (!f) return -1;
-    int ok = 1;
-    for (size_t i = 0; i < nall; i++) if (fprintf(f, "%s\n", all[i]) < 0) ok = 0;
-    if (fflush(f) != 0 || ferror(f)) ok = 0;
-    if (fclose(f) != 0) ok = 0;
-    if (!ok) { unlink(tmp); return -1; }
-    int prc = durability_publish_replace(fpath, tmp, NULL, NULL);
-    if (prc < 0) { unlink(tmp); return -1; }
-    return prc == 0 ? 0 : -1;
-}
-
-int layout_migrate_object(const char *eff_root, const char *object, int dry_run,
-                          char *diag, size_t diagsz) {
-    if (diag && diagsz) diag[0] = '\0';
-#define LM_FAIL(...) do { if (diag && diagsz) snprintf(diag, diagsz, __VA_ARGS__); rc = -1; goto out; } while (0)
-    int rc = 0;
-    char **all = NULL;
-    char **decl = NULL;
-    size_t nall = 0, ndecl = 0;
-    TypedSchema *old_ts = NULL, *new_ts = NULL;
-    RebuildTxn *txn = NULL;
-    SlotcaskDb legacy_db, new_db;
-    int legacy_open = 0, new_open = 0;
-    LayoutWalkCtx wc;
-    memset(&wc, 0, sizeof(wc));
-
-    Schema old_sch = load_schema(eff_root, object);
-    if (old_sch.splits <= 0) LM_FAIL("schema.conf entry for %s is unreadable", object);
-    if (old_sch.packed_layout) goto out;   /* already converted: idempotent */
-    TypedSchema *cached = load_typed_schema(eff_root, object);
-    if (!cached) LM_FAIL("fields.conf for %s is unreadable", object);
-    if (cached->packed.nfields) goto out;
-    old_ts = malloc(sizeof(*old_ts));
-    new_ts = calloc(1, sizeof(*new_ts));
-    if (!old_ts || !new_ts) LM_FAIL("out of memory");
-    *old_ts = *cached;   /* snapshot: the cache slot may be reused after invalidation; enum lists stay cache-owned and are never touched here */
-
-    /* Rewritten fields.conf (comments/blank lines kept verbatim). */
-    char fpath[PATH_MAX], obj_dir[PATH_MAX];
-    snprintf(fpath, sizeof(fpath), "%s/%s/fields.conf", eff_root, object);
-    snprintf(obj_dir, sizeof(obj_dir), "%s/%s", eff_root, object);
-    FILE *fin = fopen(fpath, "r");
-    if (!fin) LM_FAIL("cannot read fields.conf");
-    all = calloc(4096, sizeof(char *));
-    decl = calloc(MAX_FIELDS, sizeof(char *));
-    if (!all || !decl) { fclose(fin); LM_FAIL("out of memory"); }
-    for (;;) {
-        int rderr = 0;
-        char *line = conf_read_line(fin, MAX_FIELD_DEF, &rderr);
-        if (!line) {
-            if (rderr) { fclose(fin); LM_FAIL("fields.conf line exceeds the limit"); }
-            break;
-        }
-        char *use = line;
-        if (line[0] != '\0' && line[0] != '#') {
-            char buf[MAX_FIELD_DEF + 8];
-            if (layout_packed_decl_line(line, buf, sizeof(buf)) != 0) {
-                free(line); fclose(fin); LM_FAIL("field declaration too long");
-            }
-            use = strdup(buf);
-            free(line);
-            if (!use) { fclose(fin); LM_FAIL("out of memory"); }
-        }
-        if (nall >= 4096) { free(use); fclose(fin); LM_FAIL("fields.conf has too many lines"); }
-        all[nall++] = use;
-        if (use[0] != '\0' && use[0] != '#') {
-            if (ndecl >= MAX_FIELDS) { fclose(fin); LM_FAIL("too many fields"); }
-            decl[ndecl++] = use;
-        }
-    }
-    fclose(fin);
-
-    char berr[160] = {0};
-    if (typed_schema_build_packed((const char *const *)decl, ndecl, new_ts, berr, sizeof(berr)) != 0)
-        LM_FAIL("cannot express %s in the packed layout: %s", object, berr);
-    if (new_ts->nfields != old_ts->nfields) LM_FAIL("field count changed (%d → %d)", old_ts->nfields, new_ts->nfields);
-    for (int i = 0; i < old_ts->nfields; i++)
-        if (strcmp(old_ts->fields[i].name, new_ts->fields[i].name) != 0 ||
-            old_ts->fields[i].removed != new_ts->fields[i].removed)
-            LM_FAIL("field %d changed identity (%s → %s)", i, old_ts->fields[i].name, new_ts->fields[i].name);
-
-    size_t bound = 0;
-    if (pkr_slot_bound(&new_ts->packed, (size_t)old_sch.max_key, &bound) != DEC_OK || bound > INT_MAX)
-        LM_FAIL("packed slot size exceeds the supported maximum");
-    Schema new_sch = old_sch;
-    new_sch.max_value = new_ts->total_size;
-    new_sch.slot_size = (int)bound;
-    new_sch.packed_layout = 1;
-
-    wc.old_ts = old_ts;
-    wc.new_ts = new_ts;
-
-    if (dry_run) {
-        legacy_open = slotcask_open(&legacy_db, obj_dir, old_sch.splits, old_sch.streams, old_sch.slot_size) == 0;
-        if (!legacy_open) LM_FAIL("cannot open %s for audit", object);
-        uint64_t invalid_refs = 0;
-        if (slotcask_validate_live_refs(&legacy_db, &invalid_refs) != 0) LM_FAIL("invalid live kf references in %s", object);
-        slotcask_walk_live(&legacy_db, layout_walk_cb, &wc);
-        slotcask_close(&legacy_db);
-        legacy_open = 0;
-        if (wc.error) LM_FAIL("%s", wc.hard);
-        if (wc.bad) {
-            size_t o = 0;
-            for (int i = 0; i < wc.ndiag && diag && o + 1 < diagsz; i++)
-                o += (size_t)snprintf(diag + o, diagsz - o, "  %s\n", wc.diag[i]);
-            if (wc.bad > (uint64_t)wc.ndiag && diag && o + 1 < diagsz)
-                snprintf(diag + o, diagsz - o, "  ... and %llu more\n",
-                         (unsigned long long)(wc.bad - (uint64_t)wc.ndiag));
-            rc = 1;
-        }
-        goto out;
-    }
-
-    /* ---- real conversion ---- */
-    txn = rebuild_txn_begin(eff_root, object, old_sch.splits, old_sch.streams, 1);
-    if (!txn) LM_FAIL("cannot begin the conversion transaction for %s", object);
-    layout_test_crash_point("after-stage");
-    legacy_open = slotcask_open(&legacy_db, rebuild_txn_legacy_root(txn), old_sch.splits, old_sch.streams, old_sch.slot_size) == 0;
-    new_open = slotcask_open(&new_db, obj_dir, new_sch.splits, new_sch.streams, new_sch.slot_size) == 0;
-    if (!legacy_open || !new_open) { snprintf(diag, diagsz, "cannot open slotcask handles for %s", object); rc = -1; goto abort_txn; }
-    uint64_t invalid_refs = 0;
-    if (slotcask_validate_live_refs(&legacy_db, &invalid_refs) != 0) { snprintf(diag, diagsz, "invalid live kf references in %s", object); rc = -1; goto abort_txn; }
-    uint64_t src_total = 0, src_deleted = 0;
-    if (slotcask_sum_kf_totals(&legacy_db, &src_total, &src_deleted) != 0 || src_deleted > src_total) { snprintf(diag, diagsz, "cannot read the source record count of %s", object); rc = -1; goto abort_txn; }
-    uint64_t expected = src_total - src_deleted;
-    wc.new_db = &new_db;
-    slotcask_walk_live(&legacy_db, layout_walk_cb, &wc);
-    slotcask_close(&legacy_db); legacy_open = 0;
-    slotcask_close(&new_db);    new_open = 0;
-    layout_test_crash_point("after-walk");
-    if (wc.error || wc.bad || wc.live_count != expected) {
-        snprintf(diag, diagsz, "conversion of %s failed: %s (converted %llu of %llu, %llu unfit)", object,
-                 wc.hard[0] ? wc.hard : "count mismatch", (unsigned long long)wc.live_count,
-                 (unsigned long long)expected, (unsigned long long)wc.bad);
-        rc = -1; goto abort_txn;
-    }
-    if (layout_write_fields_checked(fpath, all, nall) != 0) { snprintf(diag, diagsz, "cannot publish fields.conf for %s", object); rc = -1; goto abort_txn; }
-    if (update_schema_conf_layout(eff_root, object, 1) != 0) { snprintf(diag, diagsz, "cannot publish the layout token for %s", object); rc = -1; goto abort_txn; }
-    layout_test_crash_point("after-publish");
-    invalidate_schema_caches(eff_root, object);
-    invalidate_idx_cache(eff_root, object);
-    slotcask_registry_invalidate(eff_root, object);
-    {
-        Schema chk_sch = load_schema(eff_root, object);
-        TypedSchema *chk = load_typed_schema(eff_root, object);
-        if (!chk_sch.packed_layout || !chk || chk_sch.slot_size != new_sch.slot_size ||
-            !packed_schema_same(&chk->packed, &new_ts->packed)) {
-            snprintf(diag, diagsz, "the loader disagrees with the converted layout of %s", object);
-            rc = -1; goto abort_txn;
-        }
-    }
-    {
-        int nidx = 0, eno = 0;
-        if (reindex_object_durable_checked_ex(eff_root, object, 0, &nidx, &eno) != 0) {
-            snprintf(diag, diagsz, "strict reindex of %s failed (errno=%d)", object, eno);
-            rc = -1; goto abort_txn;
-        }
-    }
-    layout_test_crash_point("after-reindex");
-    invalidate_schema_caches(eff_root, object);
-    invalidate_idx_cache(eff_root, object);
-    slotcask_registry_invalidate(eff_root, object);
-    if (rebuild_txn_commit(txn) != 0) { snprintf(diag, diagsz, "cannot commit the conversion of %s", object); rc = -1; goto abort_txn; }
-    layout_test_crash_point("after-commit");
-    rebuild_txn_cleanup_committed(txn);
-    rebuild_txn_free(txn);
-    txn = NULL;
-    reset_deleted_count(eff_root, object);
-    set_count(eff_root, object, wc.live_count > INT_MAX ? INT_MAX : (int)wc.live_count);
-    LOG_AUDIT(LOG_SUB_CONFIG, "LAYOUT-MIGRATE %s/%s: %llu records → packed, slot_size=%d→%d",
-              eff_root, object, (unsigned long long)wc.live_count, old_sch.slot_size, new_sch.slot_size);
-    goto out;
-
-abort_txn:
-    if (legacy_open) slotcask_close(&legacy_db);
-    if (new_open) slotcask_close(&new_db);
-    slotcask_registry_invalidate(eff_root, object);
-    if (rebuild_txn_abort(txn) != 0) {
-        if (diag && diagsz) {
-            size_t l = strlen(diag);
-            snprintf(diag + l, diagsz - l, "; rollback incomplete — startup recovery required");
-        }
-    }
-    rebuild_txn_free(txn);
-    txn = NULL;
-out:
-    if (legacy_open) slotcask_close(&legacy_db);
-    if (new_open) slotcask_close(&new_db);
-    if (all) { for (size_t i = 0; i < nall; i++) free(all[i]); free(all); }
-    free(decl);
-    if (new_ts) { typed_schema_release(new_ts); free(new_ts); }
-    free(old_ts);
-    return rc;
-#undef LM_FAIL
 }
 
 /* Bitmap bits are keyfile slot numbers. A recompose re-inserts every record
@@ -2219,15 +1535,9 @@ int rebuild_object_v2(const char *db_root, const char *object,
         return 1;
     }
 
-    /* R5b: packed objects recompose through packed_rebuild_walk. The layout
-       never changes inside this function; the slot bound must be the one the
-       loader will derive (load_schema: 24 + max_key + maximum, aligned). */
-    const int packed = old_ts->packed.nfields != 0;
-    if (packed != (new_ts->packed.nfields != 0)) {
-        OUT("{\"error\":\"internal: layout mismatch between old and new schema\"}\n");
-        return 1;
-    }
-    if (packed) {
+    /* Every object is packed: the slot bound must be the one the loader will
+       derive (load_schema: 24 + max_key + maximum, aligned). */
+    {
         size_t bound = 0;
         if (pkr_slot_bound(&new_ts->packed, (size_t)old_sch->max_key, &bound) != DEC_OK ||
             bound > INT_MAX || (int)bound != new_sch->slot_size) {
@@ -2238,7 +1548,7 @@ int rebuild_object_v2(const char *db_root, const char *object,
     /* A-1: a :not_null field with no usable default cannot be backfilled into
        existing rows. Refuse before the transaction stages anything (the
        per-row refusal in packed_fill_added stays as defence in depth). */
-    if (packed && n_added > 0 && get_live_count_ll(db_root, object) > 0) {
+    if (n_added > 0 && get_live_count_ll(db_root, object) > 0) {
         for (int k = 0; k < new_ts->nfields; k++) {
             if (new_to_old[k] != -1) continue;
             const TypedField *nf = &new_ts->fields[k];
@@ -2352,7 +1662,7 @@ int rebuild_object_v2(const char *db_root, const char *object,
                 walk_ctx.backfill[k].seq_count = pf_live;
                 atomic_store_explicit(&walk_ctx.backfill[k].seq_next,
                                        start, memory_order_relaxed);
-                if (packed) {
+                {
                     /* A-3: the reserved range is already consumed (documented);
                        prove its LAST value is storable before any row is written. */
                     char last[32], perr[160] = {0};
@@ -2484,7 +1794,7 @@ int rebuild_object_v2(const char *db_root, const char *object,
     invalidate_idx_cache(db_root, object);
     slotcask_registry_invalidate(db_root, object);
 
-    if (packed) {
+    {
         /* F5: the schema the walk composed against must be exactly what the
            loader now reads from the swapped fields.conf. old_ts may alias a
            cache slot that this load can reuse — it is not touched below. */
@@ -2711,104 +2021,10 @@ int rebuild_object(const char *db_root, const char *object,
     int old_streams = old_sch.streams;
     int new_streams = (new_streams_arg > 0 )
                       ? new_streams_arg : old_streams;
-    int streams_changed = (new_streams != old_streams);
 
-    /* A packed object never goes through the legacy-shaped construction below
-       (it would re-sum descriptor widths and mis-size the slot). */
-    if (old_ts->packed.nfields)
-        return rebuild_object_packed(db_root, object, &old_sch, old_ts,
-                                     new_splits, splits_changed, new_streams,
-                                     drop_tombstoned, added_lines, n_added);
-
-    /* Build new TypedSchema:
-         1. Copy existing fields (skip tombstoned if drop_tombstoned).
-         2. Append any added fields at the end. */
-    TypedSchema new_ts;
-    memset(&new_ts, 0, sizeof(new_ts));
-    new_ts.typed = 1;
-    int new_to_old[MAX_FIELDS];
-    int noff = 0;
-    for (int i = 0; i < old_ts->nfields; i++) {
-        if (drop_tombstoned && old_ts->fields[i].removed) continue;
-        new_to_old[new_ts.nfields] = i;
-        new_ts.fields[new_ts.nfields] = old_ts->fields[i];
-        new_ts.fields[new_ts.nfields].offset = noff;
-        noff += old_ts->fields[i].size;
-        new_ts.nfields++;
-    }
-    /* Append newly-added fields — they start zero-valued in existing records. */
-    int appended_at = new_ts.nfields;
-    for (int a = 0; a < n_added; a++) {
-        if (new_ts.nfields >= MAX_FIELDS) {
-            OUT("{\"error\":\"Too many fields (max %d)\"}\n", MAX_FIELDS);
-            return 1;
-        }
-        TypedField tf;
-        memset(&tf, 0, sizeof(tf));
-        if (!parse_field_line(added_lines[a], &tf)) {
-            free_enum_values(&tf);
-            OUT_ERR_ESC("{\"error\":\"Invalid field line: %s\"}\n", added_lines[a]);
-            return 1;
-        }
-        /* Reject duplicate names against existing active fields */
-        for (int i = 0; i < new_ts.nfields; i++) {
-            if (strcmp(new_ts.fields[i].name, tf.name) == 0) {
-                free_enum_values(&tf);
-                OUT("{\"error\":\"Field [%s] already exists\"}\n", tf.name);
-                return 1;
-            }
-        }
-        tf.offset = noff;
-        tf.removed = 0;
-        new_to_old[new_ts.nfields] = -1;  /* -1 = not present in old layout */
-        new_ts.fields[new_ts.nfields] = tf;
-        noff += tf.size;
-        new_ts.nfields++;
-    }
-    new_ts.total_size = noff;
-    /* §2.10: hand-built schemas must carry the nullmap prefix and the
-       prefix-inclusive total_size (matching load_typed_schema) — the
-       rebuild's trim/encode hooks and v2_rebuild_walk_cb run against
-       THIS schema. */
-    new_ts.nullmap_prefix = 1 + typed_nullmap_bytes(new_ts.nfields);
-    new_ts.total_size += new_ts.nullmap_prefix;
-
-    Schema new_sch = old_sch;
-    new_sch.splits = new_splits;
-    new_sch.streams = new_streams;
-    new_sch.max_value = new_ts.total_size;
-    /* slot_size = 24B inline header + max_key + max_value, rounded to 8, floor 32. */
-    new_sch.slot_size = (24 + new_sch.max_key + new_sch.max_value + 7) & ~7;
-    if (new_sch.slot_size < 32) new_sch.slot_size = 32;
-
-    /* slot_changed drives v2_rebuild_walk_cb's "recompose typed payload"
-       branch vs. the fast "verbatim re-insert" branch. Any add-field call
-       must force the recompose path even when the new fields happen to
-       fit within the existing 8-byte-aligned slot_size — without that,
-       the new fields are never written (verbatim re-insert truncates at
-       the old vlen) AND computed defaults are never stamped. */
-    int slot_changed = (new_sch.slot_size != old_sch.slot_size) || (n_added > 0);
-
-    /* Explicit compact is itself work: it must rebuild the data generation
-       even when no schema, split, or stream setting changes. */
-    if (!drop_tombstoned && !splits_changed && !slot_changed &&
-        !streams_changed && n_added == 0) {
-        OUT("{\"status\":\"noop\",\"reason\":\"no change requested\"}\n");
-        return 0;
-    }
-
-    /* v2 path runs an entirely separate rebuild over slotcask files. */
-    int rc = rebuild_object_v2(db_root, object, &old_sch, old_ts,
-                               &new_sch, &new_ts, new_to_old,
-                               slot_changed, splits_changed,
-                               drop_tombstoned, added_lines, n_added, NULL);
-    /* new_ts's appended fields own heap enum value lists (parse_field_line),
-       and v2 needs them alive while it recomposes records — free only the
-       appended tail, on success and failure. The copied prefix aliases the
-       cached old_ts and must never be freed here. */
-    for (int a = 0; a < n_added; a++)
-        free_enum_values(&new_ts.fields[appended_at + a]);
-    return rc;
+    return rebuild_object_packed(db_root, object, &old_sch, old_ts,
+                                 new_splits, splits_changed, new_streams,
+                                 drop_tombstoned, added_lines, n_added);
 }
 
 int is_number(const char *s) {

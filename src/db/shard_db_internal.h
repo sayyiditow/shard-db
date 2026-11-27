@@ -692,6 +692,11 @@ int marker_recovery_sweep_object(const char *eff_root, const char *data_dir, con
    .shard-db.clean is safe, without walking every marker's contents. */
 int object_has_pending_markers(const char *data_dir);
 
+/* Refuse a DB_ROOT that is not entirely in the packed layout (T1). Runs
+   before shard_db_open_internal, so it must not use g_db, LOG_* or any
+   helper that logs; caller reports err to stderr. 0 = pass, -1 = refuse. */
+int shard_db_layout_gate(const char *db_root, char *err, size_t errsz);
+
 /* Test-visible counter: set to 1 by cmd_server when the startup marker
    recovery sweep actually ran (unclean shutdown detected), left at 0 on a
    clean-shutdown startup. Declared here so TEST_BUILD cases can assert on
@@ -699,19 +704,10 @@ int object_has_pending_markers(const char *data_dir);
 extern int g_marker_recovery_ran;
 
 #ifdef TEST_BUILD
-/* Test-only injection for the BTRI migration completion stamp (db.env
-   BTRI_STAMP_TEST_FAIL): 1 = stamp-file fsync failure, 2 = post-rename
-   stamp-directory fsync failure. Armed by the startup-migration cases in
-   test_null_migration.c; no-op at 0. */
-void btri_stamp_test_inject(int mode);
 /* Test-only (db.env SCHEMA_CONF_TEST_FSYNC_FAIL_CALL): arm the n-th
    durability_fsync call made inside the NEXT schema.conf rewrite to fail
    with EIO; no-op at 0. */
 void schema_conf_test_fsync_fail_call(int n);
-/* Test-only (db.env LAYOUT_MIGRATE_TEST_CRASH=<phase>): the startup layout
-   migration raises SIGKILL at the named phase — after-recovery, after-audit,
-   after-stage, after-walk, after-publish, after-reindex, after-commit. */
-void layout_migrate_test_crash_phase(const char *phase);
 #endif
 
 #endif /* SHARD_DB_INTERNAL_H */

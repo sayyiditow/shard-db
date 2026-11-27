@@ -681,9 +681,8 @@ int cmd_backup(const char *db_root, const char *object) {
         if (mf) {
             /* storage_version slot kept in the backup metadata for forward
                compatibility — every object the daemon writes is v2. */
-            ok = fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":2,\"streams\":%d,\"layout\":\"%s\",\"files\":1}\n",
-                         sch.splits, sch.max_key, sch.streams,
-                         sch.packed_layout ? "packed" : "legacy") > 0;
+            ok = fprintf(mf, "{\"splits\":%d,\"max_key\":%d,\"storage_version\":2,\"streams\":%d,\"layout\":\"packed\",\"files\":1}\n",
+                         sch.splits, sch.max_key, sch.streams) > 0;
             if (fflush(mf) != 0) ok = 0;
             if (ok && fsync(fileno(mf)) != 0) ok = 0;
             if (fclose(mf) != 0) ok = 0;
@@ -770,13 +769,11 @@ static int schema_conf_line_present(const char *db_root, const char *object) {
     return rc;
 }
 
-/* Append a `dir:object:splits:max_key[:storage_version:streams]` line to
+/* Append a `dir:object:splits:max_key:2:streams:layout=packed` line to
    schema.conf if it isn't already there. Caller holds objlock_wrlock.
-   storage_version=0 omits the trailing fields (legacy v1 form).
    Returns 0 on success, -1 on IO failure (errno preserved). */
 static int ensure_schema_conf_line(const char *db_root, const char *object,
-                                   int splits, int max_key,
-                                   int storage_version, int streams, int packed) {
+                                   int splits, int max_key, int streams) {
     const char *dir = db_root + strlen(g_db_root);
     if (*dir == '/') dir++;
 
@@ -812,10 +809,8 @@ static int ensure_schema_conf_line(const char *db_root, const char *object,
     int append_failed = 0;
     if (!found) {
         if (fseek(f, 0, SEEK_END) != 0) append_failed = 1;
-        else if ((storage_version >= 2
-                  ? fprintf(f, "%s%d:%d:%d:%d%s\n", prefix, splits, max_key,
-                            storage_version, streams, packed ? ":layout=packed" : "")
-                  : fprintf(f, "%s%d:%d\n", prefix, splits, max_key)) < 0) append_failed = 1;
+        else if (fprintf(f, "%s%d:%d:2:%d:layout=packed\n", prefix, splits,
+                         max_key, streams) < 0) append_failed = 1;
         else if (fflush(f) != 0) append_failed = 1;
         else if (fsync(fileno(f)) != 0) append_failed = 1;
         if (append_failed) {
@@ -1273,16 +1268,16 @@ int cmd_restore(const char *db_root, const char *object,
         OUT("{\"error\":\"backup has no layout metadata (object.json); restore refused\"}\n");
         return 1;
     }
-    if (have_meta) {
+    if (!bak_packed || bak_sv != 2) {
+        /* Every object this binary writes is packed v2. A backup taken by a
+           pre-layout binary carries no packed manifest (or an older storage
+           version); converting it is no longer supported. */
+        objlock_wrunlock(db_root, object);
+        OUT("{\"error\":\"backup is not a packed v2 object; restore with shard-db 2026.11.2 first\"}\n");
+        return 1;
+    }
+    {
         Schema live = load_schema(db_root, object);
-        if ((live.splits > 0 && (live.packed_layout ? 1 : 0) != bak_packed) ||
-            (live.splits <= 0 && !bak_packed)) {
-            objlock_wrunlock(db_root, object);
-            OUT("{\"error\":\"backup layout (%s) does not match the live object's layout (%s); restore refused — a backup taken before the layout migration cannot be restored into a migrated object\"}\n",
-                bak_packed ? "packed" : "legacy",
-                live.splits > 0 ? (live.packed_layout ? "packed" : "legacy") : "absent");
-            return 1;
-        }
         if (live.splits > 0 && (live.splits != bak_splits || live.max_key != bak_max_key) && !force) {
             objlock_wrunlock(db_root, object);
             OUT("{\"error\":\"schema mismatch: live splits=%d max_key=%d, "
@@ -1537,7 +1532,7 @@ int cmd_restore(const char *db_root, const char *object,
     }
     if ((restore_test_fault(SHARD_TEST_RF_SCHEMA_INSTALL) ||
          ensure_schema_conf_line(db_root, object, bak_splits, bak_max_key,
-                                 bak_sv, bak_streams, bak_packed) != 0) && !install_fail) {
+                                 bak_streams) != 0) && !install_fail) {
         install_fail = "the schema.conf line"; ierr = errno;
     }
 

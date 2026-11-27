@@ -21,7 +21,7 @@ static int test_varchar_overflow_run(void) {
     char *resp = NULL;
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vo\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vo\",\"object\":\"t\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vo\",\"object\":\"t\","
         "\"splits\":16,\"max_key\":16,\"fields\":[\"name:varchar:8\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"created\"", "create obj"); free(resp); resp = NULL;
 
@@ -29,7 +29,7 @@ static int test_varchar_overflow_run(void) {
     tc_request(tc,
         "{\"mode\":\"insert\",\"dir\":\"vo\",\"object\":\"t\",\"key\":\"k1\","
         "\"value\":{\"name\":\"abcdefghijklmnopqrst\"}}", &resp);
-    ASSERT_CONTAINS(resp, "exceeds max", "over-length insert rejected"); free(resp); resp = NULL;
+    ASSERT_CONTAINS(resp, "varchar content exceeds declaration", "over-length insert rejected"); free(resp); resp = NULL;
 
     /* The record must NOT exist (reject means no write). */
     tc_request(tc, "{\"mode\":\"exists\",\"dir\":\"vo\",\"object\":\"t\",\"key\":\"k1\"}", &resp);
@@ -45,7 +45,7 @@ static int test_varchar_overflow_run(void) {
     tc_request(tc,
         "{\"mode\":\"update\",\"dir\":\"vo\",\"object\":\"t\",\"key\":\"k2\","
         "\"value\":{\"name\":\"abcdefghijklmnopqrst\"}}", &resp);
-    ASSERT_CONTAINS(resp, "exceeds max", "over-length update rejected"); free(resp); resp = NULL;
+    ASSERT_CONTAINS(resp, "varchar content exceeds declaration", "over-length update rejected"); free(resp); resp = NULL;
 
     /* k2's original at-cap value must be unchanged (reject means no write). */
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"vo\",\"object\":\"t\",\"key\":\"k2\"}", &resp);

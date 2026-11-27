@@ -1,14 +1,13 @@
 # Storage model
 
-## Current segment contract (2026.09.2)
+## Current segment contract (2026.11.3)
 
-All newly created objects use VARIABLE-length segment records directly. A
-fresh stream may begin at `000000.dat`; a file beginning at `048000.dat` is
-also valid legacy output from the 2026.08.1 conversion. Filename ranges are
-not format markers, and 2026.09.1 does not rename or convert segments at
-startup. The 2026.09.2 startup path additionally widens legacy typed
-`datetime` records from the 6-byte representation used by 2026.09.1 to the
-7-byte full-day representation, before stamping the root.
+All objects use VARIABLE-length segment records directly. A fresh stream may
+begin at `000000.dat`; a file beginning at `048000.dat` is also valid output
+from the 2026.08.1 conversion. Filename ranges are not format markers, and
+startup does not rename or convert segments. 2026.11.3 runs no startup
+migration: a root must already carry 2026.11.2 clean-open evidence (that
+release widened 6-byte `datetime` records and rebuilt their indexes).
 
 shard-db's storage engine is **slotcask** — a bitcask-style key/value layout where keys and values live in separate files. Slotcask has been the default for new objects since 2026.05.1 and is the only supported engine as of 2026.05.5; the legacy probe-into-slot engine (historically "v1") was removed in that release. Operators upgrading from a pre-2026.05.5 install with v1 objects on disk must first run 2026.05.4's `./migrate` to convert them.
 

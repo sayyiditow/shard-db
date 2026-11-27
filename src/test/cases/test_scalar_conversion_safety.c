@@ -41,7 +41,7 @@ static void exact_threshold_matrix(TestClient *tc) {
     for (int route = 0; route < 2; route++) {
         char query[2048];
         snprintf(query, sizeof(query),
-            "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"conv\",\"object\":\"%s\","
+            "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"conv\",\"object\":\"%s\","
             "\"splits\":8,\"max_key\":16,\"fields\":[\"n:numeric:12,2\"]%s}",
             objects[route], route ? ",\"indexes\":[\"n\"]" : "");
         char *r = req(tc, query);
@@ -84,10 +84,10 @@ static int test_scalar_conversion_safety_run(void) {
 
     char *r = req(tc, "{\"mode\":\"add-dir\",\"dir\":\"conv\"}"); free(r);
     exact_threshold_matrix(tc);
-    r = req(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"conv\","
+    r = req(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"conv\","
         "\"object\":\"t\",\"splits\":8,\"max_key\":64,\"fields\":["
         "\"s:short\",\"i:int\",\"l:long\",\"b:byte\",\"n:numeric:26,10\","
-        "\"r:numeric:12,2\",\"z:numeric:10,0\",\"f:double\",\"g:float\","
+        "\"r:numeric:12,2\",\"z:numeric:19,0\",\"f:double\",\"g:float\","
         "\"v:varchar:32\"]}");
     ASSERT_NOT_NULL(r, "create responds");
     ASSERT_TRUE(r && strstr(r, "\"error\"") == NULL, "create ok");
@@ -102,8 +102,8 @@ static int test_scalar_conversion_safety_run(void) {
         {"k4","l","9223372036854775808","out of signed 64-bit range"},
         {"k5","b","256","out of byte range"},
         {"k6","b","-1","out of byte range"},
-        {"k7","n","1234567890123456.1234567890",
-         "out of range for numeric scale 10"},
+        {"k7","n","12345678901234567.1234567890",
+         "numeric field overflow"},
         {"k8","f","1e999","only finite values are accepted"},
         {"k9","f","1e-999","underflows to zero"},
         {"k10","g","nan","only finite values are accepted"},
@@ -354,7 +354,7 @@ static int test_scalar_conversion_safety_run(void) {
     free(r);
 
     /* R1 validates literal defaults before publishing any schema. */
-    r = req(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"conv\","
+    r = req(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"conv\","
         "\"object\":\"dflt\",\"splits\":8,\"max_key\":64,"
         "\"fields\":[\"x:int:default=99999999999\"]}");
     ASSERT_TRUE(r && strstr(r, "\"error\"") != NULL,
@@ -366,7 +366,7 @@ static int test_scalar_conversion_safety_run(void) {
     free(r);
 
     /* Float→double widening preserves the exact stored value. */
-    r = req(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"conv\","
+    r = req(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"conv\","
         "\"object\":\"w\",\"splits\":8,\"max_key\":64,"
         "\"fields\":[\"x:float\"]}");
     ASSERT_TRUE(r && strstr(r, "\"error\"") == NULL, "widen create"); free(r);
@@ -398,7 +398,7 @@ static int test_scalar_conversion_safety_run(void) {
 
     /* Aggregate text must agree with ordinary reads, before and after
        index creation. A dedicated object keeps each group unambiguous. */
-    r = req(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"conv\","
+    r = req(tc, "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"conv\","
         "\"object\":\"ag\",\"splits\":8,\"max_key\":64,"
         "\"fields\":[\"n:numeric:19,0\",\"d:double\",\"f:float\"]}");
     ASSERT_TRUE(r && strstr(r, "\"error\"") == NULL, "aggregate object created");

@@ -884,3 +884,32 @@ listed. No code deleted.
   the unchanged live schema line, silently breaking shard routing; refusing is not enough because
   auto-reshard widens splits nightly (default on), so older backups would become unrestorable;
   needs its own design (restore + reshard/reindex, or restore into a new object).
+
+## Finding found during the legacy-removal T0.5 halt (2026-11-27)
+
+- **AUD-PACKED-BULKUPDATE (major, pre-existing, product gap):** `cmd_bulk_update`
+  (`query_bulk.c`) refuses every packed object with `{"error":"packed criteria updates
+  await query integration"}`, so `bulk-update` with `criteria` (including `dry_run`) does not
+  work on the default and, after the gate, only layout, while `docs/query-protocol/bulk.md`
+  documents it as supported. Per-key (array) bulk-update is separate. Packed computed
+  updates (`$incr` on numeric renders `136.00`, different error texts) also differ from the
+  legacy route. Needs a feature plan; the legacy-removal refactor pins the refusal with a test
+  and does not fix it. Add to the slice-3 (bulk-update) walkthrough.
+
+- **AUD-PACKED-GAPS (found at legacy-removal T0.5, 2026-11-27; packed behaviours that differ
+  from the legacy route, none fixed by the refactor; pinned or recorded in the `-packed` test
+  copies; add to the slice-3 bulk walkthrough):**
+  - per-key bulk `if` refuses with `packed bulk conditions await integration`;
+  - per-record computed bulk update returns `invalid packed update`; computed-update error
+    text collapses source/policy detail to `malformed or incompatible computed value`;
+  - bulk-insert-delimited drops a row whose middle cell is empty (legacy zero-filled it);
+  - per-key bulk-update reports a rejected NULL patch in `errors[]`, not `skipped`, and a
+    malformed input rejects the whole request (`invalid packed bulk input`) instead of
+    skipping the bad record;
+  - the aggregate limiter picks a different group subset than legacy; sum/avg render
+    exact-decimal (`10000.00`, 16-decimal avg);
+  - no packed equivalent exists for the legacy composite-key bounds, arena-OOM and per-key
+    OOM fault-injection tests (`test-composite-varchar-bound`, `test-bulk-insert-arena-oom`,
+    `test-bulk-update-json-oom`), nor for the criteria-timeout route (`test-request-timeout`);
+  - `test_scalar_conversion_safety` k7: the packed "scale out of range" rejection is no longer
+    exercised (input changed to hit `numeric field overflow`).

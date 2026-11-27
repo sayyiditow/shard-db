@@ -1,16 +1,6 @@
-/* test_slotcask_v2_bulk.c — Phase-4 E2E for bulk paths over v2 objects.
- *
- * Exercises:
- *   - bulk-insert (JSON wire form) on a fresh v2 object → keys land,
- *     indexes consistent (status / amount counts match per-status counts).
- *   - bulk-insert as upsert: rewrites change indexed fields → old idx
- *     entries dropped; AND-intersect doesn't return ghost candidates.
- *   - bulk-insert with if_not_exists → existing key skipped.
- *   - bulk-update-json (partial-field) → only touched fields move,
- *     indexes for moved fields rebuild.
- *   - bulk-update with criteria → all matched records get the same patch.
- *   - bulk-delete (key list) → records gone, idx counts drop.
- *   - bulk-delete-criteria → matched records gone.
+/* Packed copy of test_slotcask_v2_bulk.c (class K original stays legacy
+ * until T3). The criteria bulk-update block is dropped; all other bulk
+ * paths and index-consistency assertions are copied.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -27,7 +17,7 @@
 static int count_where(TestClient *tc, const char *criteria) {
     char req[1024];
     snprintf(req, sizeof(req),
-        "{\"mode\":\"count\",\"dir\":\"bulk2\",\"object\":\"orders\","
+        "{\"mode\":\"count\",\"dir\":\"bulk2\",\"object\":\"ordersp\","
         "\"criteria\":%s}", criteria);
     char *resp = NULL;
     tc_request(tc, req, &resp);
@@ -39,13 +29,13 @@ static int count_where(TestClient *tc, const char *criteria) {
 static int count_total(TestClient *tc) {
     char *resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"count\",\"dir\":\"bulk2\",\"object\":\"orders\"}", &resp);
+        "{\"mode\":\"count\",\"dir\":\"bulk2\",\"object\":\"ordersp\"}", &resp);
     int n = tu_parse_count(resp);
     free(resp);
     return n;
 }
 
-static int test_slotcask_v2_bulk_run(void) {
+static int test_slotcask_v2_bulk_packed_run(void) {
     TestEnv env = {0};
     if (test_env_start(&env) != 0) return 1;
 
@@ -60,7 +50,7 @@ static int test_slotcask_v2_bulk_run(void) {
 
     /* v2 object */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"bulk2\",\"object\":\"orders\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"bulk2\",\"object\":\"ordersp\","
         "\"splits\":8,\"max_key\":40,"
         "\"fields\":[\"status:varchar:16\",\"amount:int\",\"region:varchar:16\","
                     "\"note:varchar:32\"],"
@@ -69,7 +59,7 @@ static int test_slotcask_v2_bulk_run(void) {
 
     /* ===== bulk-insert: 6 records ===== */
     tc_request(tc,
-        "{\"mode\":\"bulk-insert\",\"dir\":\"bulk2\",\"object\":\"orders\","
+        "{\"mode\":\"bulk-insert\",\"dir\":\"bulk2\",\"object\":\"ordersp\","
         "\"records\":["
         "{\"key\":\"o1\",\"value\":{\"status\":\"paid\",\"amount\":100,\"region\":\"NA\",\"note\":\"a\"}},"
         "{\"key\":\"o2\",\"value\":{\"status\":\"paid\",\"amount\":200,\"region\":\"EU\",\"note\":\"b\"}},"
@@ -92,7 +82,7 @@ static int test_slotcask_v2_bulk_run(void) {
     /* ===== bulk-insert as upsert: rewrite o2 — status NA→AS, amount 200→999.
        Validates that v2 pre_commit hook drops stale btree entries on upsert. */
     tc_request(tc,
-        "{\"mode\":\"bulk-insert\",\"dir\":\"bulk2\",\"object\":\"orders\","
+        "{\"mode\":\"bulk-insert\",\"dir\":\"bulk2\",\"object\":\"ordersp\","
         "\"records\":[{\"key\":\"o2\",\"value\":{\"status\":\"refunded\",\"amount\":999,\"region\":\"AS\",\"note\":\"bX\"}}]}",
         &resp);
     free(resp); resp = NULL;
@@ -114,7 +104,7 @@ static int test_slotcask_v2_bulk_run(void) {
 
     /* ===== if_not_exists skips existing key ===== */
     tc_request(tc,
-        "{\"mode\":\"bulk-insert\",\"dir\":\"bulk2\",\"object\":\"orders\","
+        "{\"mode\":\"bulk-insert\",\"dir\":\"bulk2\",\"object\":\"ordersp\","
         "\"if_not_exists\":true,"
         "\"records\":[{\"key\":\"o1\",\"value\":{\"status\":\"X\",\"amount\":1,\"region\":\"X\",\"note\":\"x\"}},"
                      "{\"key\":\"o7\",\"value\":{\"status\":\"new\",\"amount\":10,\"region\":\"NA\",\"note\":\"g\"}}]}",
@@ -126,14 +116,14 @@ static int test_slotcask_v2_bulk_run(void) {
     ASSERT_EQ_INT(count_total(tc), 7, "count total = 7 after if_not_exists insert");
 
     /* o1 untouched */
-    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"bulk2\",\"object\":\"orders\",\"key\":\"o1\"}", &resp);
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"bulk2\",\"object\":\"ordersp\",\"key\":\"o1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"status\":\"paid\"", "o1 still paid after CAS skip");
     ASSERT_CONTAINS(resp, "\"region\":\"NA\"", "o1 still NA after CAS skip");
     free(resp); resp = NULL;
 
     /* ===== bulk-update-json: partial-field patch (note only on o3, o5) ===== */
     tc_request(tc,
-        "{\"mode\":\"bulk-update\",\"dir\":\"bulk2\",\"object\":\"orders\","
+        "{\"mode\":\"bulk-update\",\"dir\":\"bulk2\",\"object\":\"ordersp\","
         "\"records\":[{\"key\":\"o3\",\"value\":{\"note\":\"c-patched\"}},"
                      "{\"key\":\"o5\",\"value\":{\"note\":\"e-patched\"}},"
                      "{\"key\":\"missing\",\"value\":{\"note\":\"never\"}}]}",
@@ -143,7 +133,7 @@ static int test_slotcask_v2_bulk_run(void) {
     free(resp); resp = NULL;
 
     /* note moved on o3, indexed fields unchanged → indexes still consistent */
-    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"bulk2\",\"object\":\"orders\",\"key\":\"o3\"}", &resp);
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"bulk2\",\"object\":\"ordersp\",\"key\":\"o3\"}", &resp);
     ASSERT_CONTAINS(resp, "\"note\":\"c-patched\"", "o3 note patched");
     ASSERT_CONTAINS(resp, "\"status\":\"pending\"", "o3 status untouched");
     ASSERT_CONTAINS(resp, "\"amount\":50", "o3 amount untouched");
@@ -156,7 +146,7 @@ static int test_slotcask_v2_bulk_run(void) {
 
     /* ===== bulk-update-json: change indexed field (status) ===== */
     tc_request(tc,
-        "{\"mode\":\"bulk-update\",\"dir\":\"bulk2\",\"object\":\"orders\","
+        "{\"mode\":\"bulk-update\",\"dir\":\"bulk2\",\"object\":\"ordersp\","
         "\"records\":[{\"key\":\"o3\",\"value\":{\"status\":\"paid\"}}]}",
         &resp);
     ASSERT_CONTAINS(resp, "\"updated\":1", "bulk-update indexed: 1 updated");
@@ -167,22 +157,12 @@ static int test_slotcask_v2_bulk_run(void) {
     ASSERT_EQ_INT(count_where(tc, "[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}]"),
                   3, "paid count rises 2->3 (o3 joined)");
 
-    /* ===== bulk-update with criteria: zero out amount for region=AS ===== */
-    tc_request(tc,
-        "{\"mode\":\"bulk-update\",\"dir\":\"bulk2\",\"object\":\"orders\","
-        "\"criteria\":[{\"field\":\"region\",\"op\":\"eq\",\"value\":\"AS\"}],"
-        "\"value\":{\"amount\":0}}", &resp);
-    ASSERT_CONTAINS(resp, "\"updated\":2", "bulk-update criteria: 2 updated (o2, o4)");
-    free(resp); resp = NULL;
-
-    ASSERT_EQ_INT(count_where(tc, "[{\"field\":\"amount\",\"op\":\"eq\",\"value\":\"0\"}]"),
-                  2, "amount=0 count = 2");
-    ASSERT_EQ_INT(count_where(tc, "[{\"field\":\"amount\",\"op\":\"eq\",\"value\":\"300\"}]"),
-                  0, "amount=300 count = 0 (o4 zeroed)");
+    /* Criteria bulk-update dropped: packed objects refuse it
+       (AUD-PACKED-BULKUPDATE). Later counts do not depend on it. */
 
     /* ===== bulk-delete key list ===== */
     tc_request(tc,
-        "{\"mode\":\"bulk-delete\",\"dir\":\"bulk2\",\"object\":\"orders\","
+        "{\"mode\":\"bulk-delete\",\"dir\":\"bulk2\",\"object\":\"ordersp\","
         "\"keys\":[\"o5\",\"o7\"]}", &resp);
     ASSERT_CONTAINS(resp, "\"deleted\":2", "bulk-delete key list: 2 deleted");
     free(resp); resp = NULL;
@@ -195,7 +175,7 @@ static int test_slotcask_v2_bulk_run(void) {
 
     /* ===== bulk-delete-criteria: drop all status=paid ===== */
     tc_request(tc,
-        "{\"mode\":\"bulk-delete\",\"dir\":\"bulk2\",\"object\":\"orders\","
+        "{\"mode\":\"bulk-delete\",\"dir\":\"bulk2\",\"object\":\"ordersp\","
         "\"criteria\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"paid\"}]}", &resp);
     ASSERT_CONTAINS(resp, "\"deleted\":3", "bulk-delete-criteria: 3 deleted (o1, o2, o3)");
     free(resp); resp = NULL;
@@ -209,4 +189,4 @@ static int test_slotcask_v2_bulk_run(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-TEST_REGISTER("test-slotcask-v2-bulk", test_slotcask_v2_bulk_run)
+TEST_REGISTER("test-slotcask-v2-bulk-packed", test_slotcask_v2_bulk_packed_run)

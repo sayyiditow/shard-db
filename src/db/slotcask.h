@@ -521,17 +521,15 @@ typedef struct {
 struct TypedSchema;
 
 /* §2.7 NEW-from-OLD composition core, shared by single update and every
-   bulk-update form so the legacy→nullmap conversion cannot drift.
-   Composes NEW (always the current nullmap layout) into out_buf — caller
-   guarantees ts->total_size writable bytes — from OLD plus dense per-field
-   patches. Per field i (out_null ordering rule: explicit null beats a
-   value; field_vals[i] is NULL whenever field_null[i] is set):
+   bulk-update form. Composes NEW (always the current nullmap layout) into
+   out_buf — caller guarantees ts->total_size writable bytes — from OLD
+   plus dense per-field patches. Per field i (out_null ordering rule:
+   explicit null beats a value; field_vals[i] is NULL whenever
+   field_null[i] is set):
      field_null && field_null[i]  → NULL: bit set, field bytes zero
      field_vals && field_vals[i]  → encode at prefix+offset (bit clear)
-     neither                      → carry OLD forward, preserving rendering:
-                                    OLD nullmap bit ⇒ NULL; legacy
-                                    legacy_field_absent ⇒ NULL (bytes
-                                    zeroed); else bounded copy.
+     neither                      → carry OLD forward: OLD nullmap bit
+                                    ⇒ NULL; else bounded copy.
    Returns 0, or -1 when OLD's view is structurally invalid (fail closed;
    the caller must reject the write). Implemented in storage.c. */
 int update_compose_new_from_old(const struct TypedSchema *ts,

@@ -41,9 +41,9 @@ void shard_db_close(ShardDb *db);
    only one ShardDb instance per process (V1), so this is a single
    process-wide slot, not a per-handle setting — it may be called any time,
    including before shard_db_open() returns. Registering before
-   shard_db_open() is the only way to observe startup-migration
-   diagnostics, which can fire before the caller holds a ShardDb* to pass
-   to shard_db_set_log_handler().
+   shard_db_open() is the only way to observe startup diagnostics, which
+   can fire before the caller holds a ShardDb* to pass to
+   shard_db_set_log_handler().
    fn is called synchronously on the emitting thread for every log event.
    Pass NULL to unregister. The handler must be thread-safe — shard-db
    parallel workers can emit log events from threads other than the caller.

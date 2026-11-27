@@ -110,18 +110,6 @@ static void p_failures(void){
     ASSERT_TRUE(!out&&errno==EILSEQ,"negative rows length rejects");free(out);
     free(bytes);p_free(ts);
 }
-static void p_legacy_controls(void){
-    TypedSchema *ts=calloc(1,sizeof(*ts));ASSERT_NOT_NULL(ts,"legacy control schema");if(!ts)return;
-    ts->typed=1;ts->nfields=2;ts->total_size=7;ts->nullmap_prefix=2;
-    ts->fields[0].type=FT_INT;ts->fields[0].size=4;strcpy(ts->fields[0].name,"f0");ts->fields[0].name_len=2;
-    ts->fields[1].type=FT_BOOL;ts->fields[1].size=1;ts->fields[1].offset=4;strcpy(ts->fields[1].name,"f1");ts->fields[1].name_len=2;
-    uint8_t bytes[]={1,0,0,0,0,7,1};FieldSchema fs={.ts=ts};
-    char *out=json_projected_field((const char*)bytes,sizeof(bytes),"f0",&fs,SREC_FLAG_NULLMAP);ASSERT_EQ_STR(out,"7","legacy numeric remains bare");free(out);
-    out=json_typed_row_cell(ts,bytes,sizeof(bytes),1,SREC_FLAG_NULLMAP);ASSERT_EQ_STR(out,"\"true\"","legacy bool cell stays quoted");free(out);
-    out=json_projected_field((const char*)bytes,sizeof(bytes),"f0+f1",&fs,SREC_FLAG_NULLMAP);ASSERT_EQ_STR(out,"\"7true\"","legacy composite unchanged");free(out);
-    out=json_projected_field((const char*)bytes,sizeof(bytes),"missing",&fs,SREC_FLAG_NULLMAP);ASSERT_EQ_STR(out,"null","legacy flagged unknown null");free(out);
-    free(ts);
-}
 static void p_limits(void){
     TypedSchema *ts=p_schema(1);if(!ts)return;uint8_t *bytes=NULL;size_t n=0;
     if(!p_encode(ts,"{\"f127\":\"tiny\"}",&bytes,&n)){
@@ -179,5 +167,5 @@ static void p_schema_widths(void){
     ts->fields[0].type=FT_BOOL;ts->fields[0].n_enum_values=0;ts->fields[0].enum_width=0;
     ASSERT_EQ_INT(typed_row_open(ts,bytes,n,PKR_FLAGS,&view),0,"restored schema remains readable");free(ts);
 }
-static int test_packed_json_projection_run(void){p_basics();p_failures();p_legacy_controls();p_limits();p_schema_widths();return t_ctx->failed?1:0;}
+static int test_packed_json_projection_run(void){p_basics();p_failures();p_limits();p_schema_widths();return t_ctx->failed?1:0;}
 TEST_REGISTER("test-packed-json-projection",test_packed_json_projection_run)

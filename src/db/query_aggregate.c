@@ -1371,7 +1371,9 @@ static int agg_row_open(AggCtx *ctx, const uint8_t *raw, size_t len,
         r->ok = 1;
         return 0;
     }
-    if (ctx->fs->ts && ctx->fs->ts->packed.nfields) {
+    if (ctx->fs->ts) {
+        /* Every loaded schema is packed (T3 invariant): a row that does not
+           open is an error, never a legacy record to skip. */
         ctx->agg_error = errno ? errno : EILSEQ;
         return -1;
     }
@@ -1386,7 +1388,7 @@ static int agg_row_span(const AggRow *r, size_t idx, TypedRowSpan *s) {
 
 static int agg_row_unset(const AggCtx *ctx, const TypedField *f,
                          const TypedRowSpan *s) {
-    if (f->type == FT_VARCHAR && ctx->fs->ts->packed.nfields) return s->len == 0;
+    if (f->type == FT_VARCHAR) return s->len == 0;
     if (!s->complete) return 1;
     return agg_field_is_unset(f, s->data);
 }
@@ -1405,14 +1407,7 @@ static int agg_row_label(AggCtx *ctx, const AggRow *r, int gi, char *buf,
     if (!agg_row_span(r, (size_t)ctx->group_idx[gi], &s)) return 0;
     if (s.is_null) { *is_null = 1; return 0; }
     if (f->type == FT_VARCHAR) {
-        const uint8_t *c; size_t n;
-        if (ctx->fs->ts->packed.nfields) { c = s.data; n = s.len; }
-        else {
-            if (!s.complete) return 0;
-            int len = varchar_eff_len(s.data, f->size);
-            c = s.data + 2;
-            n = len > 0 ? (size_t)len : 0;
-        }
+        const uint8_t *c = s.data; size_t n = s.len;
         if (n >= cap || (n && memchr(c, 0, n))) { ctx->agg_error = E2BIG; return -1; }
         if (n) memcpy(buf, c, n);
         buf[n] = '\0';
@@ -2327,15 +2322,8 @@ static int agg_span_text(const AggCtx *ctx, const TypedField *f,
                          const TypedRowSpan *s, char *buf, size_t cap,
                          const char **text, size_t *len) {
     if (f->type == FT_VARCHAR) {
-        if (ctx->fs->ts->packed.nfields) {
-            *text = (const char *)s->data;
-            *len = s->len;
-        } else {
-            if (!s->complete) return 0;
-            int n = varchar_eff_len(s->data, f->size);
-            *text = (const char *)s->data + 2;
-            *len = n > 0 ? (size_t)n : 0;
-        }
+        *text = (const char *)s->data;
+        *len = s->len;
         return *len > 0;
     }
     if (!s->complete) return 0;
@@ -2873,7 +2861,7 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
         if (ctx->group_tfs[i]) {
             if (agg_row_label(ctx, &row, i, gbuf[i], sizeof gbuf[i], &gnulls[i]) < 0)
                 return 1;
-        } else if (ctx->fs->ts && ctx->fs->ts->packed.nfields) {
+        } else if (ctx->fs->ts) {
             size_t tl = 0;
             errno = 0;
             char *s = typed_packed_named_text(ctx->fs->ts, raw, hdr->value_len,
@@ -2881,15 +2869,6 @@ static int agg_scan_cb(const SlotHeader *hdr, const uint8_t *block, void *raw_ct
                                               sizeof gbuf[i], &tl);
             if (!s && errno) { ctx->agg_error = errno == ENOBUFS ? E2BIG : errno; return 1; }
             if (s) { memcpy(gbuf[i], s, tl); gbuf[i][tl] = '\0'; free(s); }
-        } else {
-            char *s = decode_field((const char *)raw, hdr->value_len,
-                                   ctx->group_fields[i], ctx->fs, hdr2);
-            if (s) {
-                size_t sl = strlen(s);
-                if (sl >= sizeof gbuf[i]) { free(s); ctx->agg_error = E2BIG; return 1; }
-                memcpy(gbuf[i], s, sl); gbuf[i][sl] = '\0';
-                free(s);
-            }
         }
         gvals[i] = gbuf[i];
     }
@@ -5209,12 +5188,11 @@ static int cmd_aggregate_do(const char *db_root, const char *object,
             ctx.group_is_num[i] = (uint8_t)(agg_num_spec_for(
                 fs.ts, (size_t)ctx.group_idx[i], &ctx.group_nums[i]) &&
                 ctx.group_tfs[i]->type != FT_BOOL);
-    /* Packed decimals are variable-width values. Legacy numeric's 8-byte
-       raw grouping shortcut would collide or disagree with index keys. */
-    if (fs.ts && fs.ts->packed.nfields)
-        for (int i = 0; i < ctx.ngroups; i++)
-            if (ctx.group_is_num[i] && ctx.group_nums[i].cls == AGC_DEC)
-                ctx.use_int_keys = 0;
+    /* Packed decimals are variable-width values, so the 8-byte raw grouping
+       shortcut would collide or disagree with index keys. */
+    for (int i = 0; i < ctx.ngroups; i++)
+        if (ctx.group_is_num[i] && ctx.group_nums[i].cls == AGC_DEC)
+            ctx.use_int_keys = 0;
 
     /* Pre-scan having validation: every leaf's field must resolve to an
        aggregate alias or group_by field, and its operator must fit the

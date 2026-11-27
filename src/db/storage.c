@@ -15,11 +15,6 @@
 _Atomic int g_shard_test_json_escape_fail;
 #endif
 
-int legacy_field_absent(const TypedField *f, const uint8_t *p);
-
-/* Hashing & shard derivation live in util.c (compute_hash_raw) and
-   slotcask.c (compute_record_shard) — single source of truth across the
-   engine and storage layer. */
 
 /* Canonical layout for per-shard indexes:
        <db_root>/<object>/indexes/<field>/<NNN>.idx
@@ -433,7 +428,6 @@ static char *single_write_decode(const TypedSchema *ts,const uint8_t *b,size_t n
 }
 static int single_write_finish(const TypedSchema *ts,SlotcaskDb *db,size_t klen,
     uint8_t *b,size_t *n,int want_record,char **record,char *err,size_t cap){
-    if(!ts->packed.nfields)*n=schema_trim_fn(b,*n,(void *)ts);
     if(*n>UINT32_MAX||*n>SIZE_MAX-24-klen-7||
        ((24+klen+*n+7)&~(size_t)7)>(size_t)db->slot_size||
        ((24+klen+*n+7)&~(size_t)7)>slotcask_seg_max_bytes()){
@@ -515,24 +509,8 @@ static int v2_insert_owned(const SlotcaskOldRecord *old,uint8_t **out,
     if(old){TypedRowView view;
         if(typed_row_open(ts,old->value,old->vlen,old->hdr2,&view)){
             snprintf(c->err_buf,sizeof(c->err_buf),"invalid OLD generation or value");errno=EILSEQ;return -1;}}
-    int has_ac=0;
-    for(int i=0;i<ts->nfields;i++)if(!ts->fields[i].removed&&
-        ts->fields[i].default_kind==DK_AUTO_CREATE){has_ac=1;break;}
-    if(ts->packed.nfields){
-        if(typed_insert_alloc(ts,old,c->value_json,c->db_root,c->object,
-            out,n,c->err_buf,sizeof(c->err_buf)))return -1;
-    }else{
-        *out=c->incoming;*n=c->incoming_len;c->incoming=NULL;
-        if(has_ac){
-            const uint8_t *base=NULL,*bm=NULL;int bmn=0;size_t region=0;
-            int ok=old&&typed_record_view(old->value,old->vlen,old->hdr2,
-                &base,&bm,&bmn,&region)==0;
-            for(int i=0;i<ts->nfields;i++)if(!ts->fields[i].removed&&
-                ts->fields[i].default_kind==DK_AUTO_CREATE)
-                auto_create_field_transfer(ts,*out,i,old!=NULL,ok,base,bm,bmn,
-                    region,old?old->hdr2:0);
-        }
-    }
+    if(typed_insert_alloc(ts,old,c->value_json,c->db_root,c->object,
+        out,n,c->err_buf,sizeof(c->err_buf)))return -1;
     if(typed_index_validate_new(ts,*out,*n,typed_schema_hdr2(ts),
         c->fields,c->idx_types,c->nfields)){
         snprintf(c->err_buf,sizeof(c->err_buf),"invalid NEW index key: %s",strerror(errno));return -1;
@@ -1027,12 +1005,7 @@ static int cmd_insert_v2_impl(const char *db_root, const char *object,
         return 1;
     }
 
-    uint8_t *typed_buf=NULL;size_t vlen=0;char enc_err[512]={0};
-    if(!ts->packed.nfields&&typed_encode_alloc(ts,value,1,db_root,object,&typed_buf,&vlen,enc_err,sizeof(enc_err))){
-        single_write_error(enc_err[0]?enc_err:"Typed encode failed","Typed encode failed");return 1;
-    }
-    if(vlen>(size_t)sc->max_value){free(typed_buf);
-        OUT("{\"error\":\"value exceeds schema bound\"}\n");return 1;}
+    uint8_t *typed_buf=NULL;size_t vlen=0;
 
     SlotcaskSchemaInfo info = {
         .splits = sc->splits, .slot_size = sc->slot_size,
@@ -1046,22 +1019,6 @@ static int cmd_insert_v2_impl(const char *db_root, const char *object,
         return 1;
     }
 
-    /* Wire up compact trim for VARIABLE-format typed objects. sdb is a
-       registry-cached SlotcaskDb shared across all concurrent request
-       threads for this object (only guarded by a shared objlock rdlock
-       here), so first-publish must be serialized and trim_fn must be
-       published via release so any thread that observes it non-NULL also
-       sees trim_ctx. */
-    if (!ts->packed.nfields && !atomic_load_explicit(&sdb->trim_fn, memory_order_acquire)) {
-        pthread_mutex_lock(&sdb->trim_init_lock);
-        if (!sdb->trim_fn) {
-            sdb->trim_ctx = (void *)ts;
-            atomic_store_explicit(&sdb->trim_fn, schema_trim_fn,
-                                  memory_order_release);
-        }
-        pthread_mutex_unlock(&sdb->trim_init_lock);
-    }
-
     /* Index fields + criteria (only parsed if if_json is present). */
     char fields[MAX_FIELDS][256];
     int nfields = load_index_fields(db_root, object, fields, MAX_FIELDS);
@@ -1072,7 +1029,6 @@ static int cmd_insert_v2_impl(const char *db_root, const char *object,
 
     FieldSchema cas_fs;
     memset(&cas_fs,0,sizeof(cas_fs));cas_fs.ts=ts;
-    if(!ts->packed.nfields)init_field_schema(&cas_fs, db_root, object);
     char cas_err[256];
     CriteriaNode *cas_tree = NULL;
     if (if_json) {
@@ -1267,9 +1223,6 @@ typedef struct {
     int  src_idx;        /* $copy: sibling TypedField index */
 } V2FieldCompute;
 typedef struct {V2FieldCompute fields[MAX_FIELDS];} V2ComputeSet;
-static void v2_compute_free(V2ComputeSet *set){
-    for(int i=0;i<MAX_FIELDS;i++)free(set->fields[i].literal);
-}
 
 
 /* NEW-from-OLD constructor for single partial updates. Runs inside
@@ -1279,64 +1232,6 @@ static void v2_compute_free(V2ComputeSet *set){
    overwrite, never from a stale caller-side snapshot. Copies every
    untouched field, applies only fields present in the request, preserves
    removed fields, and stamps auto_update fields exactly once. */
-/* Rendering predicate for legacy records: 1 if the legacy decoder would
-   SKIP this field's bytes. Used ONLY to port a legacy record into
-   nullmap form without changing what clients see — query existence uses
-   legacy_field_query_exists (query_plan.c) instead, and indexed-exists
-   verification likewise (a legacy long 0 renders absent but query-
-   exists true). */
-int legacy_field_absent(const TypedField *f, const uint8_t *p) {
-    switch (f->type) {
-    case FT_VARCHAR: {
-        int len = ((int)p[0] << 8) | p[1];
-        return len == 0;
-    }
-    case FT_LONG: case FT_TIMESTAMP: {
-        int64_t v = (int64_t)(((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
-                              ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
-                              ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
-                              ((uint64_t)p[6] << 8) | p[7]);
-        return v == 0;
-    }
-    case FT_DOUBLE: { double v; memcpy(&v, p, 8); return v == 0.0; }
-    case FT_FLOAT:  { float v;  memcpy(&v, p, 4); return v == 0.0f; }
-    case FT_DATE: {
-        int32_t v = (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                              ((uint32_t)p[2] << 8) | p[3]);
-        return v == 0;
-    }
-    case FT_DATETIME: {
-        int32_t d = (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                              ((uint32_t)p[2] << 8) | p[3]);
-        uint32_t t = ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 8) | p[6];
-        return d == 0 && t == 0;
-    }
-    case FT_DATETIMEMS: {
-        int32_t d = (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-                              ((uint32_t)p[2] << 8) | p[3]);
-        uint32_t ms = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
-                      ((uint32_t)p[6] << 8) | p[7];
-        return d == 0 && ms == 0;
-    }
-    case FT_TIME:
-        return p[0] == 0 && p[1] == 0 && p[2] == 0;
-    case FT_UUID: {
-        int allzero = 1;
-        for (int i = 0; i < 16; i++) if (p[i]) { allzero = 0; break; }
-        return allzero;
-    }
-    case FT_IPV4:
-        return p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0;
-    case FT_IPV6: {
-        int allzero = 1;
-        for (int i = 0; i < 16; i++) if (p[i]) { allzero = 0; break; }
-        return allzero;
-    }
-    default:  /* int/short/byte/numeric/currency/bool/enum always rendered */
-        return 0;
-    }
-}
-
 void auto_create_field_transfer(const TypedSchema *ts, uint8_t *out_buf, int i,
                                 int existed, int o_view_ok,
                                 const uint8_t *o_base, const uint8_t *o_bm,
@@ -1359,9 +1254,6 @@ void auto_create_field_transfer(const TypedSchema *ts, uint8_t *out_buf, int i,
             size_t avail = (o_region > off) ? o_region - off : 0;
             size_t copyn = avail < w ? avail : w;
             if (copyn) memcpy(dst, o_base + off, copyn);
-            if (!(o_hdr2 & SREC_FLAG_NULLMAP) &&
-                legacy_field_absent(&ts->fields[i], dst))
-                preserve_null = 1;
         }
         if (preserve_null) {
             memset(dst, 0, w);
@@ -1443,14 +1335,6 @@ int update_compose_new_from_old(const TypedSchema *ts,
             ? old_region - (size_t)f->offset : 0;
         size_t copyn = avail < (size_t)f->size ? avail : (size_t)f->size;
         if (copyn) memcpy(dst, old_base + f->offset, copyn);
-        if (!(old->hdr2 & SREC_FLAG_NULLMAP) && legacy_field_absent(f, dst)) {
-            /* legacy skip-on-zero ⇒ NULL. Zero dst even when OLD bytes
-               were nonzero-but-omitted (float/double -0.0) — NULL bytes
-               are canonically all-zero. dst is fully materialized, so the
-               predicate is safe for trimmed/short OLD records too. */
-            memset(dst, 0, (size_t)f->size);
-            typed_set_null(nbm, nbm_bytes, i);
-        }
     }
     return 0;
 }
@@ -1506,108 +1390,6 @@ void update_stamp_auto_update_fields(const TypedSchema *ts, uint8_t *out_buf) {
    whole-request error in err_buf. is_computed marks fields already
    parsed as computed in this request — a $copy source may not name
    one. */
-static int parse_computed_span(const TypedSchema *ts,
-                               const char *field_name, const char *span,
-                               const uint8_t *is_computed,
-                               V2FieldCompute *out,
-                               char *err_buf, size_t err_sz) {
-    JsonObj o;
-    if (json_parse_object(span, strlen(span), &o) != 1 || o.n != 1)
-        goto malformed;
-    char *incr = json_obj_strdup_raw(&o, "$incr");
-    char *copy = json_obj_strdup_raw(&o, "$copy");
-    if (incr && copy) {
-        free(incr); free(copy);
-        snprintf(err_buf, err_sz,
-                 "field '%s': computed value must hold exactly one of "
-                 "$incr / $copy", field_name);
-        return -1;
-    }
-    if (!incr && !copy) {
-        snprintf(err_buf, err_sz,
-                 "field '%s': computed value must hold exactly one of "
-                 "$incr / $copy", field_name);
-        return -1;
-    }
-    memset(out, 0, sizeof(*out));
-    int fi = typed_field_index((TypedSchema *)ts, field_name);
-    if (fi < 0) { free(incr); free(copy); goto malformed; }
-    const TypedField *f = &ts->fields[fi];
-    int unsupported = f->type != FT_SHORT && f->type != FT_INT &&
-                      f->type != FT_LONG && f->type != FT_NUMERIC &&
-                      f->type != FT_FLOAT && f->type != FT_DOUBLE;
-    if (unsupported) {
-        free(incr); free(copy);
-        snprintf(err_buf, err_sz,
-                 "field '%s': unsupported type for computed update",
-                 f->name);
-        return -1;
-    }
-    if (incr) {
-        out->op = 1;
-        size_t n = strlen(incr);
-        if (n >= 2 && incr[0] == '"' && incr[n - 1] == '"') {
-            char *decoded=NULL;size_t decoded_len=0;
-            if(json_unescape_cstring(incr+1,n-2,&decoded,&decoded_len)){
-                free(incr);free(copy);return -1;
-            }
-            free(incr);incr=decoded;
-        }
-        if(!incr[0]||strlen(incr)>=g_query_buffer_max_bytes) {
-            free(incr); free(copy);
-            snprintf(err_buf, err_sz,
-                     "field '%s': bad computed literal", f->name);
-            return -1;
-        }
-        out->literal=incr;incr=NULL;
-    } else {
-        out->op = 2;
-        size_t n = strlen(copy);
-        char src[256]; char *decoded = NULL; size_t dlen = 0;
-        if (n < 2 || copy[0] != '"' || copy[n - 1] != '"' ||
-            json_unescape_cstring(copy + 1, n - 2, &decoded, &dlen) != 0 ||
-            dlen >= sizeof(src)) {
-            free(decoded); free(incr); free(copy); goto malformed;
-        }
-        memcpy(src, decoded, dlen); src[dlen] = '\0'; free(decoded);
-        int si = typed_field_index((TypedSchema *)ts, src);
-        if (si < 0) {
-            free(incr); free(copy);
-            /* src is client-controlled text — formatted RAW here; the wire
-               emission JSON-escapes err_buf once, after any truncation, so
-               an escape sequence can never be cut in half. */
-            snprintf(err_buf, err_sz,
-                     "field '%s': $copy source '%s' is not a field",
-                     f->name, src);
-            return -1;
-        }
-        if (is_computed && is_computed[si]) {
-            free(incr); free(copy);
-            snprintf(err_buf, err_sz,
-                     "field '%s': $copy source '%s' is itself computed",
-                     f->name, src);
-            return -1;
-        }
-        const TypedField *sf = &ts->fields[si];
-        if (sf->type != f->type || sf->size != f->size ||
-            (f->type == FT_NUMERIC &&
-             sf->numeric_scale != f->numeric_scale)) {
-            free(incr); free(copy);
-            snprintf(err_buf, err_sz,
-                     "field '%s': $copy type mismatch with '%s'",
-                     f->name, src);
-            return -1;
-        }
-        out->src_idx = si;
-    }
-    free(incr);
-    free(copy);
-    return 0;
-malformed:
-    snprintf(err_buf, err_sz,
-             "field '%s': malformed computed value object", field_name);
-    return -1;
-}
 
 /* Apply parsed computed fields to NEW (out_value), reading currents
    from the lock-protected OLD. Called after
@@ -1617,265 +1399,8 @@ malformed:
    integer/numeric, host order for float/double (the record layout's
    own convention). Returns 0, or -1 with err_buf set — the caller
    aborts the whole update (nothing has been written yet). */
-static int legacy_numeric_increment(const TypedField *f,const uint8_t *old,
-    const char *literal,uint8_t *out,char *err,size_t cap){
-    if(f->numeric_scale<0||f->numeric_scale>18||f->numeric_scale_mult<=0){errno=EINVAL;return -1;}
-    char current[96];int n=decode_field_to_buf(f,old,current,sizeof(current),1);
-    if(n<1||(size_t)n>=sizeof(current)){errno=EILSEQ;return -1;}
-    dec_t a,b,sum,rounded;dec_init(&a);dec_init(&b);dec_init(&sum);dec_init(&rounded);
-    dec_status st=dec_parse(current,(size_t)n,&a,err,cap);
-    if(st==DEC_OK)st=dec_parse(literal,strlen(literal),&b,err,cap);
-    if(st==DEC_OK)st=dec_add(&a,&b,&sum);
-    /* Legacy P is informational. Only its actual int64/scale interpretation
-     * constrains assignment; migration audits the declared P separately. */
-    if(st==DEC_OK)st=dec_apply_precision(&sum,DEC_MAX_PRECISION,f->numeric_scale,&rounded,err,cap);
-    int rc=-1;
-    if(st==DEC_OK){
-        size_t bytes=dec_text_len(&rounded);
-        char *text=bytes&&bytes<=g_query_buffer_max_bytes?malloc(bytes):NULL;
-        if(!text)st=DEC_ERR_NOMEM;
-        else{
-            size_t used=0;st=dec_to_text(&rounded,text,bytes,&used);
-            int64_t value;
-            if(st==DEC_OK&&!conv_numeric_text(f,text,used,&value,err,cap)){
-                uint64_t bits=(uint64_t)value;
-                for(int i=7;i>=0;i--){out[i]=(uint8_t)bits;bits>>=8;}rc=0;
-            }
-            free(text);
-        }
-    }
-    dec_free(&rounded);dec_free(&sum);dec_free(&b);dec_free(&a);
-    if(st!=DEC_OK){errno=st==DEC_ERR_NOMEM?ENOMEM:EINVAL;}
-    return rc;
-}
 
-static int apply_computed_fields(const TypedSchema *ts,
-                                 const SlotcaskOldRecord *old,
-                                 uint8_t *out_value,
-                                 const V2FieldCompute *comp,
-                                 char *err_buf, size_t err_sz) {
-    const uint8_t *o_base; const uint8_t *o_bm; int o_bm_bytes;
-    size_t o_region;
-    if (typed_record_view(old->value, (size_t)old->vlen, old->hdr2,
-                          &o_base, &o_bm, &o_bm_bytes, &o_region) != 0) {
-        snprintf(err_buf, err_sz, "corrupt record header on update target");
-        return -1;
-    }
-    int nbm_bytes = typed_nullmap_bytes(ts->nfields);
-    for (int i = 0; i < ts->nfields; i++) {
-        if (ts->fields[i].removed || comp[i].op == 0) continue;
-        const TypedField *f = &ts->fields[i];
-        uint8_t *dst = out_value + ts->nullmap_prefix + (size_t)f->offset;
-        const uint8_t *src = ((size_t)f->offset + (size_t)f->size > o_region)
-            ? NULL : o_base + f->offset;
-        uint8_t cur[16];
-        memset(cur, 0, sizeof(cur));
-        if (src) memcpy(cur, src, (size_t)f->size);
-        int old_is_null = (old->hdr2 & SREC_FLAG_NULLMAP)
-            ? typed_field_null(o_bm, o_bm_bytes, i)
-            : legacy_field_absent(f, cur);
-        if (comp[i].op == 2) {
-            int si = comp[i].src_idx;
-            const TypedField *sf = &ts->fields[si];
-            const uint8_t *ssrc =
-                ((size_t)sf->offset + (size_t)sf->size > o_region)
-                ? NULL : o_base + sf->offset;
-            uint8_t source_bytes[16] = {0};
-            if (ssrc) memcpy(source_bytes, ssrc, (size_t)sf->size);
-            int src_null = (old->hdr2 & SREC_FLAG_NULLMAP)
-                ? typed_field_null(o_bm, o_bm_bytes, si)
-                : legacy_field_absent(sf, source_bytes);
-            if (src_null) {
-                snprintf(err_buf, err_sz,
-                         "field '%s' is NULL; cannot apply computed update",
-                         sf->name);
-                return -1;
-            }
-            /* D4: a NULL current value rejects computed ops — $copy
-               included. Copying over NULL would silently clear NULL. */
-            if (old_is_null) {
-                snprintf(err_buf, err_sz,
-                         "field '%s' is NULL; cannot apply computed update",
-                         f->name);
-                return -1;
-            }
-            /* Non-finite source bytes would silently move NaN/Inf into
-               the target — the computed-update guarantee rejects
-               non-finite values, copying included. */
-            if (f->type == FT_FLOAT || f->type == FT_DOUBLE) {
-                double sv = 0.0;
-                if (f->type == FT_FLOAT) {
-                    float fv;
-                    memcpy(&fv, source_bytes, 4);
-                    sv = (double)fv;
-                } else {
-                    memcpy(&sv, source_bytes, 8);
-                }
-                if (!isfinite(sv)) {
-                    snprintf(err_buf, err_sz,
-                             "field '%s' is not finite; cannot apply "
-                             "computed update", sf->name);
-                    return -1;
-                }
-            }
-            memcpy(dst, source_bytes, (size_t)f->size);
-            typed_clear_null(out_value + 1, nbm_bytes, i);
-            continue;
-        }
-        /* $incr */
-        if (old_is_null) {
-            snprintf(err_buf, err_sz,
-                     "field '%s' is NULL; cannot apply computed update",
-                     f->name);
-            return -1;
-        }
-        if (f->type == FT_SHORT || f->type == FT_INT || f->type == FT_LONG) {
-            int w = f->size;
-            uint64_t raw = 0;
-            for (int b = 0; b < w; b++) raw = (raw << 8) | cur[b];
-            /* Extend the sign in unsigned space before copying bits.
-               Shifting unsigned left then right would ZERO-extend. */
-            if (w < 8 && (cur[0] & 0x80)) raw |= UINT64_MAX << (w * 8);
-            int64_t v;
-            memcpy(&v, &raw, sizeof(v));
-            errno = 0;
-            char *end = NULL;
-            long long d = strtoll(comp[i].literal, &end, 10);
-            if (end == comp[i].literal || *end || errno == ERANGE) goto badliteral;
-            int64_t r;
-            if (__builtin_add_overflow(v, (int64_t)d, &r)) goto overflow;
-            int64_t hi = (w == 2) ? INT16_MAX
-                       : (w == 4) ? INT32_MAX : INT64_MAX;
-            int64_t lo = (w == 2) ? INT16_MIN
-                       : (w == 4) ? INT32_MIN : INT64_MIN;
-            if (r < lo || r > hi) goto overflow;
-            uint64_t be = (uint64_t)r;
-            for (int b = 0; b < w; b++)
-                dst[b] = (uint8_t)(be >> (8 * (w - 1 - b)));
-            typed_clear_null(out_value + 1, nbm_bytes, i);
-        } else if(f->type==FT_NUMERIC){
-            if(legacy_numeric_increment(f,cur,comp[i].literal,dst,err_buf,err_sz))return -1;
-            typed_clear_null(out_value+1,nbm_bytes,i);
-        } else {   /* FT_FLOAT / FT_DOUBLE */
-            double v;
-            if (f->type == FT_FLOAT) {
-                float fv = 0.0f;
-                memcpy(&fv, cur, 4);
-                v = (double)fv;
-            } else {
-                memcpy(&v, cur, 8);
-            }
-            errno = 0;
-            char *end = NULL;
-            double d = strtod(comp[i].literal, &end);
-            if (end == comp[i].literal || *end || errno == ERANGE) goto badliteral;
-            v += d;
-            if (!isfinite(v)) goto overflow;
-            if (f->type == FT_FLOAT) {
-                float fv = (float)v;
-                if (!isfinite(fv)) goto overflow;
-                memcpy(dst, &fv, 4);
-            } else {
-                memcpy(dst, &v, 8);
-            }
-            typed_clear_null(out_value + 1, nbm_bytes, i);
-        }
-        continue;
-overflow:
-        snprintf(err_buf, err_sz,
-                 "field '%s': computed update overflows %s", f->name,
-                 f->type == FT_NUMERIC ? "numeric" : "integer");
-        return -1;
-badliteral:
-        snprintf(err_buf, err_sz, "field '%s': bad computed literal",
-                 f->name);
-        return -1;
-    }
-    return 0;
-}
 
-static int v2_update_new_from_old(const SlotcaskOldRecord *old,
-                                  uint8_t *out_value, size_t out_capacity,
-                                  size_t *out_vlen, void *ctx_ptr) {
-    V2UpdateCtx *c = ctx_ptr;
-    if (!old || !out_value || !out_vlen ||
-        (size_t)c->idx_ts->total_size > out_capacity) return -1;
-    c->saved_old_value = old->value;
-    c->saved_old_vlen = old->vlen;
-    c->old_hdr2 = old->hdr2;
-#ifdef TEST_BUILD
-    slotcask_test_after_old(1);
-#endif
-    JsonObj patch;
-    if (json_parse_object(c->partial_json, strlen(c->partial_json), &patch) < 0) {
-        snprintf(c->err_buf, sizeof(c->err_buf), "invalid update value");
-        return -1;
-    }
-    V2ComputeSet set __attribute__((cleanup(v2_compute_free)))={0};
-    V2FieldCompute *comp=set.fields;
-    uint8_t is_computed[MAX_FIELDS] = {0};
-    for (int i = 0; i < c->idx_ts->nfields; i++) {
-        const char *v; size_t n;
-        if (!c->idx_ts->fields[i].removed &&
-            json_obj_get(&patch, c->idx_ts->fields[i].name, &v, &n) && n && *v == '{')
-            is_computed[i] = 1;
-    }
-    for (int i = 0; i < c->idx_ts->nfields; i++) {
-        if (!is_computed[i]) continue;
-        char *span = json_obj_strdup_raw(&patch, c->idx_ts->fields[i].name);
-        if (!span) { snprintf(c->err_buf, sizeof(c->err_buf), "oom"); return -1; }
-        int rc = parse_computed_span(c->idx_ts, c->idx_ts->fields[i].name,
-                                     span, is_computed, &comp[i],
-                                     c->err_buf, sizeof(c->err_buf));
-        free(span);
-        if (rc != 0) return -1;
-    }
-    const char *names[MAX_FIELDS];
-    enum FieldType types[MAX_FIELDS];
-    char *values[MAX_FIELDS] = {0}; uint8_t nulls[MAX_FIELDS] = {0};
-    for (int i = 0; i < c->idx_ts->nfields; i++) {
-        names[i] = c->idx_ts->fields[i].name;
-        types[i] = c->idx_ts->fields[i].type;
-    }
-    int parse_rc = json_get_fields_null_aware(c->partial_json, names,
-                         c->idx_ts->nfields, types, values, nulls);
-    if (parse_rc != 0) {
-        snprintf(c->err_buf, sizeof(c->err_buf), "malformed JSON escape in field values");
-        goto reject;
-    }
-    for (int i = 0; i < c->idx_ts->nfields; i++) {
-        const TypedField *f = &c->idx_ts->fields[i];
-        if (f->removed) continue;
-        if (comp[i].op) { free(values[i]); values[i] = NULL; continue; }
-        if (f->type == FT_VARCHAR && values[i] && strlen(values[i]) > (size_t)f->size - 2) {
-            snprintf(c->err_buf, sizeof(c->err_buf),
-                     "value for field '%s' is %zu bytes; exceeds max %d for varchar",
-                     f->name, strlen(values[i]), f->size - 2);
-            goto reject;
-        }
-        if (nulls[i] && f->not_null) {
-            fmt_not_null_err(f, c->err_buf, sizeof(c->err_buf)); goto reject;
-        }
-    }
-    int compose_rc = update_compose_new_from_old(c->idx_ts, old, out_value,
-                                                 values, nulls,
-                                                 c->err_buf, sizeof(c->err_buf));
-    if (compose_rc == -2)
-        goto reject;                     /* validation message in err_buf */
-    if (compose_rc != 0) {
-        snprintf(c->err_buf, sizeof(c->err_buf), "corrupt record header on update target");
-        goto reject;
-    }
-    for (int i = 0; i < c->idx_ts->nfields; i++) { free(values[i]); values[i] = NULL; }
-    if (apply_computed_fields(c->idx_ts, old, out_value, comp,
-                              c->err_buf, sizeof(c->err_buf)) != 0) return -1;
-    update_stamp_auto_update_fields(c->idx_ts, out_value);
-    *out_vlen = (size_t)c->idx_ts->total_size;
-    return 0;
-reject:
-    for (int i = 0; i < c->idx_ts->nfields; i++) free(values[i]);
-    return -1;
-}
 static int v2_update_owned(const SlotcaskOldRecord *old,uint8_t **out,
     size_t *n,void *ptr){
     V2UpdateCtx *c=ptr;TypedSchema *ts=c->idx_ts;
@@ -1885,20 +1410,10 @@ static int v2_update_owned(const SlotcaskOldRecord *old,uint8_t **out,
         snprintf(c->err_buf,sizeof(c->err_buf),"invalid OLD generation or value");errno=EILSEQ;return -1;}
     c->saved_old_value=old->value;c->saved_old_vlen=old->vlen;c->old_hdr2=old->hdr2;
     int rc;
-    if(ts->packed.nfields){
 #ifdef TEST_BUILD
-        slotcask_test_after_old(1);
+    slotcask_test_after_old(1);
 #endif
-        rc=typed_update_computed_alloc(ts,old,c->partial_json,out,n,c->err_buf,sizeof(c->err_buf));
-    }else{
-        size_t budget=g_query_buffer_max_bytes;
-        size_t source=strnlen(c->partial_json,budget);
-        if(source==budget||(size_t)ts->total_size>budget||
-            source>(budget-(size_t)ts->total_size)/4){errno=ENOMEM;return -1;}
-        *out=malloc((size_t)ts->total_size);
-        if(!*out){snprintf(c->err_buf,sizeof(c->err_buf),"oom");errno=ENOMEM;return -1;}
-        rc=v2_update_new_from_old(old,*out,(size_t)ts->total_size,n,c);
-    }
+    rc=typed_update_computed_alloc(ts,old,c->partial_json,out,n,c->err_buf,sizeof(c->err_buf));
     if(rc)return -1;
     if(typed_index_validate_new(ts,*out,*n,typed_schema_hdr2(ts),
         c->idx_fields,c->idx_types,c->nidx)){
@@ -2168,22 +1683,6 @@ static int cmd_update_v2_impl(const char *db_root, const char *object,
 
     if (!ts) { OUT("{\"error\":\"Object not found\"}\n"); return 1; }
 
-    /* Wire up compact trim for VARIABLE-format typed objects. sdb is a
-       registry-cached SlotcaskDb shared across all concurrent request
-       threads for this object (only guarded by a shared objlock rdlock
-       here), so first-publish must be serialized and trim_fn must be
-       published via release so any thread that observes it non-NULL also
-       sees trim_ctx. */
-    if (!ts->packed.nfields && !atomic_load_explicit(&sdb->trim_fn, memory_order_acquire)) {
-        pthread_mutex_lock(&sdb->trim_init_lock);
-        if (!sdb->trim_fn) {
-            sdb->trim_ctx = (void *)ts;
-            atomic_store_explicit(&sdb->trim_fn, schema_trim_fn,
-                                  memory_order_release);
-        }
-        pthread_mutex_unlock(&sdb->trim_init_lock);
-    }
-
     /* dry_run validates criteria but doesn't write — race-tolerant. It is
        the only remaining user of the up-front slotcask_get snapshot: a
        normal update builds NEW from the lock-protected OLD inside
@@ -2209,7 +1708,6 @@ static int cmd_update_v2_impl(const char *db_root, const char *object,
         if (if_json) {
             FieldSchema cas_fs;
             memset(&cas_fs,0,sizeof(cas_fs));cas_fs.ts=ts;
-        if(!ts->packed.nfields)init_field_schema(&cas_fs, db_root, object);
             char cas_err[256];
             CriteriaNode *cas_tree = cas_prepare_tree(if_json, cas_fs.ts, 1,
                                                       cas_err, sizeof(cas_err));
@@ -2250,7 +1748,6 @@ static int cmd_update_v2_impl(const char *db_root, const char *object,
        parsing happens inside the callback under the lock. */
     FieldSchema cas_fs;
     memset(&cas_fs,0,sizeof(cas_fs));cas_fs.ts=ts;
-        if(!ts->packed.nfields)init_field_schema(&cas_fs, db_root, object);
     char cas_err[256];
     CriteriaNode *cas_tree = NULL;
     if (if_json) {

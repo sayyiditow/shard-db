@@ -647,18 +647,16 @@ static int test_packed_compact(void) {
 }
 
 /* A-4 regression: a LIVE field whose default literal contains ":removed" mid-line
-   must survive compaction on both layouts. */
+   must survive compaction. */
 static int test_compact_removed_literal(void) {
     Pr p;
     if (pr_open(&p) != 0) return 1;
-    const char *layouts[] = { "packed", "legacy" };
-    for (int L = 0; L < 2; L++) {
-        char obj[16];
-        snprintf(obj, sizeof(obj), "o_%s", layouts[L]);
+    {
+        const char *obj = "o_packed";
         char *r = pr_q(&p,
-            "{\"mode\":\"create-object\",\"declaration_layout\":\"%s\",\"dir\":\"default\",\"object\":\"%s\","
+            "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"%s\","
             "\"splits\":8,\"max_key\":16,\"fields\":[\"note:varchar:20:default=a:removed:x\",\"gone:int\"]}",
-            layouts[L], obj);
+            obj);
         pr_expect(r, "\"status\":\"created\"", "create");
         pr_ins(&p, obj, "k1", "{\"note\":\"hello\",\"gone\":1}");
         pr_expect(pr_q(&p, "{\"mode\":\"remove-field\",\"dir\":\"default\",\"object\":\"%s\",\"fields\":[\"gone\"]}", obj),
@@ -683,14 +681,12 @@ static int test_compact_removed_literal(void) {
 static int test_removed_literal_remove_rename_edit(void) {
     Pr p;
     if (pr_open(&p) != 0) return 1;
-    const char *layouts[] = { "packed", "legacy" };
-    for (int L = 0; L < 2; L++) {
-        char obj[16];
-        snprintf(obj, sizeof(obj), "o_%s", layouts[L]);
+    {
+        const char *obj = "o_packed";
         pr_expect(pr_q(&p,
-            "{\"mode\":\"create-object\",\"declaration_layout\":\"%s\",\"dir\":\"default\",\"object\":\"%s\","
+            "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"%s\","
             "\"splits\":8,\"max_key\":16,\"fields\":[\"note:varchar:20:default=a:removed:x\",\"other:int\",\"n2:varchar:20:default=b:removed:y\"]}",
-            layouts[L], obj), "\"status\":\"created\"", "create");
+            obj), "\"status\":\"created\"", "create");
         pr_ins(&p, obj, "k1", "{\"note\":\"hello\",\"other\":1,\"n2\":\"w\"}");
         pr_expect(pr_q(&p, "{\"mode\":\"rename-field\",\"dir\":\"default\",\"object\":\"%s\",\"old\":\"other\",\"new\":\"n2x\"}", obj),
                   "\"status\":\"renamed\"", "rename succeeds beside a ':removed' literal");

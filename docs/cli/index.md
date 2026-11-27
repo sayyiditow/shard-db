@@ -94,7 +94,7 @@ Size bounded by `MAX_REQUEST_SIZE` (default 32 MB ⇒ ~24 MB effective file). Fo
 | `vacuum-check` | — | List objects where tombstoned ≥ 10 % AND live ≥ 1000. Suggests candidates for `vacuum`. |
 | `reindex` | `[dir] [obj]` | Rebuild indexes — wipes per-field idx directories and rebuilds at the current `index_splits_for(splits)` shard count. No args = all tenants. |
 | `orphaned` | `<dir> <obj>` | Bare integer count of tombstoned-but-not-vacuumed slots. O(1) metadata read. New in 2026.05.1. |
-| `(./migrate)` | — | Removed. 2026.09.2 automatically widens legacy datetime fields at startup; pre-2026.05.5 v1 objects still require the historical 2026.05.4 migration. |
+| `(./migrate)` | — | Removed. Startup runs no migration since 2026.11.3: install 2026.11.2, start it once to completion (it converts legacy objects), then upgrade. Pre-2026.05.5 v1 objects still require the historical 2026.05.4 migration. |
 
 ## JSON query mode
 

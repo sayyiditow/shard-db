@@ -59,7 +59,7 @@ static int force_big_stream_mismatch(const char *schema_path) {
         if (sscanf(line, "default:big:%d:%d:%d:%d", &splits, &max_key,
                    &version, &streams) == 4) {
             int wrong = streams == 16 ? 15 : streams + 1;
-            fprintf(out, "default:big:%d:%d:%d:%d\n",
+            fprintf(out, "default:big:%d:%d:%d:%d:layout=packed\n",
                     splits, max_key, version, wrong);
             changed = 1;
         } else {

@@ -131,11 +131,11 @@ static void r_schema_routes(void){
     ASSERT_NOT_NULL(client,"schema route connect");if(!client){test_env_stop(&env);return;}
     char *response=NULL;
     tc_request(client,"{\"mode\":\"add-dir\",\"dir\":\"r1\"}",&response);free(response);
-    tc_request(client,"{\"mode\":\"create-object\",\"dir\":\"r1\",\"object\":\"roundtrip\",\"declaration_layout\":\"legacy\",\"fields\":[\"\\u0063ash:numeric:26,10:default=0:not_null\",\"note:varchar:30:default=a\\\\b\"]}",&response);
+    tc_request(client,"{\"mode\":\"create-object\",\"dir\":\"r1\",\"object\":\"roundtrip\",\"declaration_layout\":\"packed\",\"fields\":[\"\\u0063ash:numeric:26,10:default=0:not_null\",\"note:varchar:30:default=a\\\\b\"]}",&response);
     ASSERT_TRUE(response&&!strstr(response,"\"error\""),"escaped declarations accepted");free(response);
     tc_request(client,"{\"mode\":\"describe-object\",\"dir\":\"r1\",\"object\":\"roundtrip\"}",&response);
     ASSERT_CONTAINS(response,"\"spec\":\"cash:numeric:26,10:default=0:not_null\"","original precision and modifier declaration preserved");
-    ASSERT_CONTAINS(response,"\"declaration_layout\":\"legacy\"","legacy layout identity explicit");free(response);
+    ASSERT_CONTAINS(response,"\"declaration_layout\":\"packed\"","layout identity explicit");free(response);
     tc_request(client,"{\"mode\":\"add-field\",\"dir\":\"r1\",\"object\":\"roundtrip\",\"fields\":[\"escaped:varchar:30:default=x\\\\y\"]}",&response);
     ASSERT_TRUE(response&&!strstr(response,"\"error\""),"add-field unescapes once");free(response);
     tc_request(client,"{\"mode\":\"edit-field\",\"dir\":\"r1\",\"object\":\"roundtrip\",\"fields\":[\"escaped:varchar:30:default=random(2)junk\"]}",&response);
@@ -204,23 +204,10 @@ static int r_fetch_page(CFixture *f, const char *format, int offset,
     return rc;
 }
 
-static void r_fetch_skip_layout(int packed) {
+static void r_fetch_skip_layout(void) {
     CFixture f;
     if (c_open(&f, 0)) { c_close(&f); return; }
-    if (!packed) {
-        memset(f.ts, 0, sizeof(*f.ts));
-        f.ts->typed = 1;
-        f.ts->nfields = 1;
-        f.ts->nullmap_prefix = 2;
-        f.ts->total_size = 6;
-        strcpy(f.ts->fields[0].name, "f0");
-        f.ts->fields[0].name_len = 2;
-        f.ts->fields[0].type = FT_INT;
-        f.ts->fields[0].size = 4;
-        f.sc.max_value = f.ts->total_size;
-        f.fs.auto_key_schema_snapshot = f.sc;
-    }
-    uint8_t flags = packed ? PKR_FLAGS : SREC_FLAG_NULLMAP;
+    uint8_t flags = PKR_FLAGS;
     if (c_seed(&f, "a", 1, "{\"f0\":7}", flags) ||
         c_seed(&f, "b", 1, "{\"f0\":7}", flags)) {
         c_close(&f); return;
@@ -291,8 +278,7 @@ static void r_fetch_skip_layout(int packed) {
 }
 
 static int test_r1_fetch_skip(void) {
-    r_fetch_skip_layout(0);
-    r_fetch_skip_layout(1);
+    r_fetch_skip_layout();
     return t_ctx->failed ? 1 : 0;
 }
 TEST_REGISTER("test-r1-fetch-skip", test_r1_fetch_skip)

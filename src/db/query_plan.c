@@ -1328,58 +1328,6 @@ static int match_typed_field(const uint8_t *p,const TypedField *f,const Compiled
     return 0;
 }
 
-static int match_typed_legacy(const uint8_t *rec, size_t data_len, const CompiledCriterion *cc, FieldSchema *fs,
-                uint8_t hdr2) {
-    if (cc->composite || !cc->tf) {
-        char *attr = decode_field((const char *)rec, data_len, cc->raw->field, fs, hdr2);
-        int r = match_criterion(attr, cc->raw);
-        free(attr);
-        return r;
-    }
-
-    /* Field-vs-field: compare LHS bytes against the sibling RHS field on
-       the same record. cc->rhs_tf is NULL when types didn't match at
-       compile time — every record fails (caller's fault). */
-    if (cc->op == OP_EQ_FIELD || cc->op == OP_NEQ_FIELD ||
-        cc->op == OP_LT_FIELD || cc->op == OP_GT_FIELD ||
-        cc->op == OP_LTE_FIELD || cc->op == OP_GTE_FIELD) {
-        if (!cc->rhs_tf) return 0;
-        const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-        int bm_bytes = 0; size_t region = 0;
-        if (typed_record_view(rec, data_len, hdr2, &fbase, &bm,
-                              &bm_bytes, &region) != 0) return 0;
-        int lhs_idx = (int)(cc->tf - fs->ts->fields);
-        int rhs_idx = (int)(cc->rhs_tf - fs->ts->fields);
-        if ((hdr2 & SREC_FLAG_NULLMAP) &&
-            (typed_field_null(bm, bm_bytes, lhs_idx) ||
-             typed_field_null(bm, bm_bytes, rhs_idx))) return 0;
-        const uint8_t *lhs = ((size_t)cc->tf->offset + (size_t)cc->tf->size > region)
-            ? g_zero_field_65537 : fbase + cc->tf->offset;
-        const uint8_t *rhs = ((size_t)cc->rhs_tf->offset + (size_t)cc->rhs_tf->size > region)
-            ? g_zero_field_65537 : fbase + cc->rhs_tf->offset;
-        int r = cmp_typed_field_pair(lhs, rhs, cc->tf);
-        return field_vs_field_match(r, cc->op);
-    }
-
-    const TypedField *f = cc->tf;
-    const uint8_t *fbase = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t region = 0;
-    if (typed_record_view(rec, data_len, hdr2, &fbase, &bm,
-                          &bm_bytes, &region) != 0) return 0;
-    /* NULL field: every value op false; exists/not_exists are the null
-       tests (§2.4.2 truth table). Legacy records keep their semantics. */
-    if (hdr2 & SREC_FLAG_NULLMAP) {
-        int is_null = typed_field_null(bm, bm_bytes, (int)(f - fs->ts->fields));
-        if (cc->op == OP_EXISTS)     return !is_null;
-        if (cc->op == OP_NOT_EXISTS) return is_null;
-        if (is_null) return 0;
-        /* fall through — bit clear ⇒ pure value semantics, no zero gates */
-    }
-    const uint8_t *p = ((size_t)f->offset + (size_t)f->size > region)
-        ? g_zero_field_65537 : fbase + f->offset;
-
-    return match_typed_field(p,f,cc,hdr2);
-}
 
 /* ========== Criteria parsers + tree planner ========== */
 /* ========== Reusable criteria parser ========== */
@@ -1732,21 +1680,13 @@ static int parse_one_criterion(const char *obj_buf, SearchCriterion *c,Criterion
 }
 
 static int predicate_span_decimal(const TypedRowView *v,size_t i,const TypedRowSpan *span,dec_t *out){
-    if(v->schema->packed.nfields&&v->schema->packed.fields[i].kind==PKR_NUMERIC){
+    (void)v;
+    if(v->schema->packed.fields[i].kind==PKR_NUMERIC){
         dec_status st=dec_unpack(span->data,span->len,out);
         if(st==DEC_OK)return 0;
-    errno=st==DEC_ERR_NOMEM?ENOMEM:EILSEQ;return -1;
+        errno=st==DEC_ERR_NOMEM?ENOMEM:EILSEQ;return -1;
     }
-    const uint8_t *data;if(typed_span_read(v->schema,i,span,&data))return -1;
-    const TypedField *f=&v->schema->fields[i];int64_t raw=ld_be_i64(data);
-    uint64_t magnitude=raw<0?(uint64_t)(-(raw+1))+1:(uint64_t)raw;
-    char digits[32],text[128];int n=snprintf(digits,sizeof(digits),"%llu",(unsigned long long)magnitude);
-    int scale=f->numeric_scale;
-    if(scale<0||scale>18||f->numeric_scale_mult<=0){errno=EILSEQ;return -1;}
-    size_t pos=0;if(raw<0)text[pos++]='-';
-    if(scale>=n){text[pos++]='0';if(scale)text[pos++]='.';for(int j=n;j<scale;j++)text[pos++]='0';memcpy(text+pos,digits,(size_t)n);pos+=(size_t)n;}
-    else{size_t whole=(size_t)(n-scale);memcpy(text+pos,digits,whole);pos+=whole;if(scale){text[pos++]='.';memcpy(text+pos,digits+whole,(size_t)scale);pos+=(size_t)scale;}}
-    return predicate_decimal_parse(text,pos,out,NULL,0);
+    errno=EILSEQ;return -1;
 }
 static int predicate_decimal_match(const dec_t *value,const CompiledCriterion *cc){
     int cmp=dec_cmp(value,&cc->numeric1);
@@ -1770,60 +1710,6 @@ static int predicate_regex_match(const uint8_t *data,size_t len,const CompiledCr
 }
 /* Legacy display fallback without unchecked heap allocation or skipped errors.
  * The view and its borrowed spans stay inside the original callback lifetime. */
-static int predicate_legacy_text_span(const TypedRowView *view,size_t index,
-    const char **text,size_t *len,char fixed[512]){
-    *text=NULL;*len=0;
-    const TypedField *f=&view->schema->fields[index];TypedRowSpan span;
-    if(typed_row_span(view,index,&span))return -1;
-    if(span.is_null||f->removed)return 0;
-    const uint8_t *data;if(typed_span_read(view->schema,index,&span,&data))return -1;
-    if(f->type==FT_VARCHAR){
-        if(f->size<2){errno=EILSEQ;return -1;}
-        size_t n=(size_t)varchar_eff_len(data,f->size);
-        if(!n&&!(view->hdr2&SREC_FLAG_NULLMAP))return 0;
-        *text=(const char*)data+2;*len=strnlen(*text,n);return 0;
-    }
-    if(f->type==FT_ENUM){
-        if(!f->enum_values||f->n_enum_values<=0)return 0;
-        if(f->enum_width==2&&f->size<2){errno=EILSEQ;return -1;}
-        int value=f->enum_width==2?(int)(((uint16_t)data[0]<<8)|data[1]):data[0];
-        *text=value>=0&&value<f->n_enum_values&&f->enum_values[value]?f->enum_values[value]:"";
-        *len=strlen(*text);return 0;
-    }
-    int n=decode_field_to_buf(f,data,fixed,512,(view->hdr2&SREC_FLAG_NULLMAP)!=0);
-    if(n<0||n>=512){errno=EILSEQ;return -1;}
-    if(!n)return 0;
-    *text=fixed;*len=(size_t)n;
-    if(n>=2&&fixed[0]=='"'&&fixed[n-1]=='"'){(*text)++;*len-=2;}
-    return 0;
-}
-static int predicate_legacy_named_text(const TypedRowView *view,const char *name,size_t budget,char **out){
-    *out=NULL;int composite=strchr(name,'+')!=NULL;
-    char names[256];size_t name_len=strnlen(name,sizeof(names));
-    if(name_len==sizeof(names)){errno=E2BIG;return -1;}
-    size_t total=0;
-    for(int pass=0;pass<2;pass++){
-        memcpy(names,name,name_len+1);char *save=NULL,*token=strtok_r(names,"+",&save);size_t pos=0;
-        while(token){int index=typed_field_index(view->schema,token);
-            if(index>=0){char fixed[512];const char *text=NULL;size_t n=0;
-                if(predicate_legacy_text_span(view,(size_t)index,&text,&n,fixed))goto fail;
-                if(text){
-                    if(pass==0){if(n>SIZE_MAX-total-1){errno=EOVERFLOW;goto fail;}total+=n;}
-                    else{if(n)memcpy(*out+pos,text,n);pos+=n;}
-                }
-            }
-            token=strtok_r(NULL,"+",&save);
-        }
-        if(pass==0){
-            if(!total&&composite)return 0;
-            if(!composite&&typed_field_index(view->schema,name)<0)return 0;
-            if(total>=budget){errno=ENOMEM;return -1;}
-            *out=malloc(total+1);if(!*out)return -1;
-        }else (*out)[pos]=0;
-    }
-    return 0;
-fail:free(*out);*out=NULL;return -1;
-}
 
 int match_typed_checked(const uint8_t *rec,size_t len,const CompiledCriterion *cc,FieldSchema *fs,uint8_t flags,int *matched){
     if(!matched){errno=EINVAL;return -1;}*matched=0;
@@ -1831,20 +1717,16 @@ int match_typed_checked(const uint8_t *rec,size_t len,const CompiledCriterion *c
     size_t workspace=cc->workspace_budget<g_query_buffer_max_bytes?cc->workspace_budget:g_query_buffer_max_bytes;
     TypedRowView view;if(typed_row_open(fs->ts,rec,len,flags,&view))return -1;
     if(!cc->tf||cc->composite){
-        if(fs->ts->packed.nfields){size_t textlen=0;errno=0;size_t allowance=typed_packed_render_allowance(fs->ts,rec,len,flags,cc->raw->field,workspace);if(!allowance)return -1;char *text=typed_packed_named_text(fs->ts,rec,len,flags,cc->raw->field,allowance,&textlen);
-            if(!text&&errno)return -1;
-            *matched=match_criterion(text,cc->raw);free(text);return 0;}
-        char *text=NULL;if(predicate_legacy_named_text(&view,cc->raw->field,workspace,&text))return -1;
+        size_t textlen=0;errno=0;size_t allowance=typed_packed_render_allowance(fs->ts,rec,len,flags,cc->raw->field,workspace);if(!allowance)return -1;char *text=typed_packed_named_text(fs->ts,rec,len,flags,cc->raw->field,allowance,&textlen);
+        if(!text&&errno)return -1;
         *matched=match_criterion(text,cc->raw);free(text);return 0;
     }
     size_t i=(size_t)(cc->tf-fs->ts->fields);TypedRowSpan lhs;
     if(typed_row_span(&view,i,&lhs))return -1;
-    int nullmap=(flags&SREC_FLAG_NULLMAP)||fs->ts->packed.nfields;
-    if(nullmap){
-        if(cc->op==OP_EXISTS){*matched=!lhs.is_null;return 0;}
-        if(cc->op==OP_NOT_EXISTS){*matched=lhs.is_null;return 0;}
-        if(lhs.is_null)return 0;
-    }
+    /* Packed records always carry the nullmap generation. */
+    if(cc->op==OP_EXISTS){*matched=!lhs.is_null;return 0;}
+    if(cc->op==OP_NOT_EXISTS){*matched=lhs.is_null;return 0;}
+    if(lhs.is_null)return 0;
     if(predicate_is_field(cc->op)){
         if(!cc->rhs_tf)return 0;
         size_t j=(size_t)(cc->rhs_tf-fs->ts->fields);TypedRowSpan rhs;
@@ -1857,10 +1739,9 @@ int match_typed_checked(const uint8_t *rec,size_t len,const CompiledCriterion *c
             int status=predicate_span_decimal(&view,i,&lhs,&a);if(!status)status=predicate_span_decimal(&view,j,&rhs,&b);
             if(!status)cmp=dec_cmp(&a,&b);
             dec_free(&a);dec_free(&b);if(status)return -1;
-        }else if(fs->ts->packed.nfields&&cc->ftype==FT_VARCHAR){cmp=predicate_bytes_cmp(lhs.data,lhs.len,rhs.data,rhs.len);}
+        }else if(cc->ftype==FT_VARCHAR){cmp=predicate_bytes_cmp(lhs.data,lhs.len,rhs.data,rhs.len);}
         else{const uint8_t *a,*b;if(typed_span_read(fs->ts,i,&lhs,&a)||typed_span_read(fs->ts,j,&rhs,&b))return -1;
-            if(cc->ftype==FT_VARCHAR){cmp=predicate_bytes_cmp(a+2,(size_t)varchar_eff_len(a,cc->tf->size),b+2,(size_t)varchar_eff_len(b,cc->rhs_tf->size));}
-            else cmp=cmp_typed_field_pair(a,b,cc->tf);}
+            cmp=cmp_typed_field_pair(a,b,cc->tf);}
         *matched=field_vs_field_match(cmp,cc->op);return 0;
     }
     if(cc->ftype==FT_NUMERIC&&predicate_numeric_comparison(cc->op)){
@@ -1870,11 +1751,8 @@ int match_typed_checked(const uint8_t *rec,size_t len,const CompiledCriterion *c
         dec_free(&value);return status;
     }
     if(cc->ftype==FT_VARCHAR&&(cc->op==OP_REGEX||cc->op==OP_NOT_REGEX)){
-        const uint8_t *data=lhs.data;size_t bytes=lhs.len;
-        if(!fs->ts->packed.nfields){if(typed_span_read(fs->ts,i,&lhs,&data))return -1;bytes=(size_t)varchar_eff_len(data,cc->tf->size);data+=2;}
-        return predicate_regex_match(data,bytes,cc,matched);
+        return predicate_regex_match(lhs.data,lhs.len,cc,matched);
     }
-    if(!fs->ts->packed.nfields){*matched=match_typed_legacy(rec,len,cc,fs,flags);return 0;}
     if(cc->ftype==FT_VARCHAR){
         *matched=match_typed_varchar_span(lhs.data,lhs.len,cc);return 0;
     }
