@@ -50,7 +50,7 @@ char *typed_schema_fields_json(const char *root,const char *object,
            modifiers.not_null!=f->not_null||strcmp(modifiers.default_val,f->default_val)){
             free(clean);free(line);error=EILSEQ;break;}
         PkrField declaration={0};int has_decl=pkr_field_parse(clean,&declaration)==DEC_OK;
-        if(ts->packed.nfields&&(f->type==FT_NUMERIC||f->type==FT_VARCHAR)){
+        if(f->type==FT_NUMERIC||f->type==FT_VARCHAR){
             const PkrField *bound=&ts->packed.fields[index];
             if(!has_decl||bound->kind!=declaration.kind||bound->payload_max!=declaration.payload_max||
                bound->bare!=declaration.bare||bound->currency!=declaration.currency||
@@ -71,9 +71,9 @@ char *typed_schema_fields_json(const char *root,const char *object,
             }
         }
         if(!error&&f->type==FT_VARCHAR){
-            uint32_t capacity=ts->packed.nfields?ts->packed.fields[index].payload_max:(uint32_t)(f->size-2);
+            uint32_t capacity=ts->packed.fields[index].payload_max;
             if(fprintf(out,",\"capacity\":%u,\"bare\":%s",capacity,
-                ts->packed.nfields&&declaration.bare?"true":"false")<0)error=EIO;
+                declaration.bare?"true":"false")<0)error=EIO;
         }
         if(!error&&f->default_kind!=DK_NONE){
             char default_text[300];const char *value=f->default_val;

@@ -55,116 +55,10 @@ typedef struct {
    seeded negative accumulator was UB (strict UBSan gate, 2026-08-28 —
    edit-field int→long aborts the daemon on negative values). The
    arithmetic >> on the re-signed value is the canonical extension. */
-static int64_t decode_be_signed(const uint8_t *src, int sz) {
-    uint64_t u = 0;
-    for (int i = 0; i < sz; i++) u = (u << 8) | src[i];
-    unsigned sext = (unsigned)(64 - sz * 8);
-    return (int64_t)(u << sext) >> sext;
-}
 
 /* Return 1 if value will fit the new field's bounds; 0 otherwise. Writes
    the human-readable reason into reason[reason_cap] on failure. */
-static int field_value_fits_new(const TypedField *old_f,
-                                const TypedField *new_f,
-                                const uint8_t *src,
-                                char *reason, size_t reason_cap) {
-    switch (old_f->type) {
-    case FT_VARCHAR: {
-        uint16_t old_clen = ((uint16_t)src[0] << 8) | (uint16_t)src[1];
-        int new_cap = new_f->size - 2;
-        if (new_cap < 0) new_cap = 0;
-        if ((int)old_clen > new_cap) {
-            snprintf(reason, reason_cap,
-                "varchar shrink: value of length %u exceeds new cap %d",
-                (unsigned)old_clen, new_cap);
-            return 0;
-        }
-        return 1;
-    }
-    case FT_INT:
-    case FT_LONG:
-    case FT_SHORT: {
-        if (new_f->size >= old_f->size) return 1;  /* widen always fits */
-        int64_t v = decode_be_signed(src, old_f->size);
-        int64_t lo = -(1LL << (new_f->size * 8 - 1));
-        int64_t hi =  (1LL << (new_f->size * 8 - 1)) - 1;
-        if (v < lo || v > hi) {
-            snprintf(reason, reason_cap,
-                "integer narrow: value %lld out of range [%lld, %lld]",
-                (long long)v, (long long)lo, (long long)hi);
-            return 0;
-        }
-        return 1;
-    }
-    case FT_NUMERIC: {
-        int delta = new_f->numeric_scale - old_f->numeric_scale;
-        if (delta <= 0) return 1;  /* scale-down truncates, never overflows */
-        int64_t v = decode_be_signed(src, old_f->size);
-        int64_t mult = 1;
-        for (int i = 0; i < delta; i++) {
-            /* Multiply with overflow detection. INT64_MAX/10 = 922337203685477580. */
-            if (v > 922337203685477580LL || v < -922337203685477580LL) {
-                snprintf(reason, reason_cap,
-                    "numeric scale-up: value %lld overflows int64 after ×10^%d",
-                    (long long)v, delta);
-                return 0;
-            }
-            mult *= 10;
-            (void)mult;  /* mult itself can't overflow at delta<=18 */
-        }
-        /* Final check — v * 10^delta */
-        int64_t scaled = v;
-        for (int i = 0; i < delta; i++) scaled *= 10;
-        (void)scaled;
-        return 1;
-    }
-    default:
-        /* Same-size paths are handled by field_needs_transform short-circuit;
-           any other type that reaches here has the same byte layout so it fits. */
-        return 1;
-    }
-}
 
-static int edit_preflight_walk_cb(const uint8_t hash16[16],
-                                  const void *key, size_t klen,
-                                  const void *value, size_t vlen,
-                                  uint8_t hdr2, void *ctx_v) {
-    (void)hash16; (void)key; (void)klen;
-    EditPreflightCtx *ctx = (EditPreflightCtx *)ctx_v;
-    if (ctx->failed) return 1;
-    /* §2.7: field bytes sit nullmap_prefix into the record for nullmap
-       generations — resolve the field-region base through the record's
-       own view before any per-field read. */
-    const uint8_t *fbase = (const uint8_t *)value;
-    const uint8_t *bm = NULL;
-    int bm_bytes = 0;
-    size_t region = vlen;
-    if (hdr2) {
-        if (typed_record_view((const uint8_t *)value, vlen, hdr2,
-                              &fbase, &bm, &bm_bytes, &region) != 0)
-            return 0;   /* corrupt record — not this edit's problem */
-    }
-    for (int e = 0; e < ctx->n_edits; e++) {
-        int oi = ctx->edited_old_idx[e];
-        const TypedField *of = &ctx->old_ts->fields[oi];
-        const TypedField *nf = &ctx->new_ts->fields[oi];
-        /* NULL fields stay NULL through the resize (§2.10) — always fit. */
-        if ((hdr2 & SREC_FLAG_NULLMAP) && typed_field_null(bm, bm_bytes, oi))
-            continue;
-        if (of->offset + (size_t)of->size > region) continue;  /* defensive */
-        char reason[192];
-        if (!field_value_fits_new(of, nf, fbase + of->offset,
-                                   reason, sizeof(reason))) {
-            strncpy(ctx->fail_field, of->name, sizeof(ctx->fail_field) - 1);
-            ctx->fail_field[sizeof(ctx->fail_field) - 1] = '\0';
-            strncpy(ctx->fail_reason, reason, sizeof(ctx->fail_reason) - 1);
-            ctx->fail_reason[sizeof(ctx->fail_reason) - 1] = '\0';
-            ctx->failed = 1;
-            return 1;  /* stop walk */
-        }
-    }
-    return 0;
-}
 
 /* Lightweight name validator, mirrors valid_field_name in config.c. */
 static int edit_valid_name(const char *name) {
@@ -481,8 +375,6 @@ static void packed_json_safe_edit(char *s) {
 
 /* True when an edit changes the field's stored encoding (drives reindex). */
 static int edit_field_dirty(const TypedSchema *old_ts, const TypedSchema *new_ts, int i) {
-    if (!old_ts->packed.nfields)
-        return field_needs_transform(&old_ts->fields[i], &new_ts->fields[i]);
     const PkrField *a = &old_ts->packed.fields[i], *b = &new_ts->packed.fields[i];
     return a->kind != b->kind || a->width != b->width || a->payload_max != b->payload_max ||
            a->precision != b->precision || a->scale != b->scale || a->bare != b->bare ||
@@ -596,7 +488,7 @@ static int not_null_scan_cb(const uint8_t hash16[16], const void *key,
                             uint8_t hdr2, void *ud) {
     (void)hash16; (void)key; (void)klen;
     NotNullScanCtx *c = (NotNullScanCtx *)ud;
-    if (c->ts && c->ts->packed.nfields) {
+    if (c->ts) {
         TypedRowView rv;
         TypedRowSpan sp;
         if (typed_row_open(c->ts, (const uint8_t *)value, vlen, hdr2, &rv) != 0 ||
@@ -607,31 +499,9 @@ static int not_null_scan_cb(const uint8_t hash16[16], const void *key,
         if (sp.is_null) c->nulls++;
         return 0;
     }
-    const uint8_t *base = NULL; const uint8_t *bm = NULL;
-    int bm_bytes = 0; size_t region = 0;
-    if (typed_record_view((const uint8_t *)value, vlen, hdr2,
-                          &base, &bm, &bm_bytes, &region) != 0) {
-        c->broken = 1;
-        return 1;   /* stop the walk — caller fails closed */
-    }
-    int is_null;
-    if (hdr2 & SREC_FLAG_NULLMAP) {
-        is_null = typed_field_null(bm, bm_bytes, c->field_idx);
-    } else {
-        /* Legacy: bounded zero-padded copy, exactly how
-           update_compose_new_from_old materializes dst — short or
-           trim-compacted records scan as absent (NULL), matching what
-           the next rewrite would render. */
-        size_t avail = (region > (size_t)c->fld->offset)
-            ? region - (size_t)c->fld->offset : 0;
-        size_t copyn = avail < (size_t)c->fld->size ? avail
-                                                    : (size_t)c->fld->size;
-        memset(c->scratch, 0, (size_t)c->fld->size);
-        if (copyn) memcpy(c->scratch, base + c->fld->offset, copyn);
-        is_null = legacy_field_absent(c->fld, c->scratch);
-    }
-    if (is_null) c->nulls++;
-    return 0;
+    /* No typed schema means the object cannot be validated: fail closed. */
+    c->broken = 1;
+    return 1;
 }
 
 /* Returns 0 and sets *out_nulls on a clean scan; -1 when the object
@@ -728,8 +598,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
             for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
         }
-        if (!(old_ts->packed.nfields ? parse_field_line_packed(lines[e], &parsed[e], NULL)
-                                     : parse_field_line(lines[e], &parsed[e]))) {
+        if (!parse_field_line_packed(lines[e], &parsed[e], NULL)) {
             OUT_ERR_ESC("{\"error\":\"Invalid field line: %s\"}\n", lines[e]);
             for (int _i = 0; _i <= e; _i++) free_enum_values(&parsed[_i]);
             return 1;
@@ -844,7 +713,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
     TypedSchema new_ts;
     TypedSchema *packed_new_owner __attribute__((cleanup(edit_release_packed_ts))) = NULL;
     int new_to_old[MAX_FIELDS];
-    if (old_ts->packed.nfields) {
+    {
         char berr[192] = {0};
         if (edit_build_packed_ts(db_root, object, old_ts, lines, edited_old_idx, n_edits,
                                  &new_ts, new_to_old, berr, sizeof(berr)) != 0) {
@@ -890,63 +759,6 @@ int cmd_edit_fields(const char *db_root, const char *object,
             }
         }
     }
-    /* Legacy: clone old_ts, overlay each edit, recompute offsets (not reindented
-       on purpose — the packed schema above replaces this whole block). */
-    int noff = 0;
-    if (!old_ts->packed.nfields) {
-    memset(&new_ts, 0, sizeof(new_ts));
-    new_ts.typed = 1;
-    new_ts.nfields = old_ts->nfields;
-    for (int i = 0; i < old_ts->nfields; i++) {
-        new_ts.fields[i] = old_ts->fields[i];
-        int edit_for_i = -1;
-        for (int e = 0; e < n_edits; e++) {
-            if (edited_old_idx[e] == i) { edit_for_i = e; break; }
-        }
-        if (edit_for_i >= 0) {
-            /* Overlay the edit's parsed type info; keep name + removed flag. */
-            new_ts.fields[i].type             = parsed[edit_for_i].type;
-            new_ts.fields[i].size             = parsed[edit_for_i].size;
-            new_ts.fields[i].numeric_scale    = parsed[edit_for_i].numeric_scale;
-            new_ts.fields[i].numeric_scale_mult = parsed[edit_for_i].numeric_scale_mult;
-            /* FT_ENUM: overlay the new value list + width. Pointer is
-               shared with parsed[edit_for_i] which lives on this stack
-               frame; that's safe because new_ts is also stack-local and
-               doesn't outlive parsed[]. The on-disk fields.conf rewrite
-               (lines[]) carries the canonical spec; load_typed_schema
-               will re-allocate enum_values from disk on next read. */
-            new_ts.fields[i].enum_values    = parsed[edit_for_i].enum_values;
-            new_ts.fields[i].n_enum_values  = parsed[edit_for_i].n_enum_values;
-            new_ts.fields[i].enum_width     = parsed[edit_for_i].enum_width;
-            /* default_kind / default_val: as of PR #66 parse_field_line
-               strips the default-modifier suffix into parsed[].default_kind
-               / default_val, so we can carry the edit's new default through
-               into the in-memory new_ts. The on-disk fields.conf rewrite
-               replaces the whole line below, so load_typed_schema will
-               re-read the same default on the next request. */
-            new_ts.fields[i].default_kind = parsed[edit_for_i].default_kind;
-            memcpy(new_ts.fields[i].default_val,
-                   parsed[edit_for_i].default_val,
-                   sizeof(new_ts.fields[i].default_val));
-            /* Nullability resolves exactly like the on-disk rewrite
-               below: an explicit token wins, omission carries the
-               old state forward. */
-            if (parsed[edit_for_i].not_null_set)
-                new_ts.fields[i].not_null = parsed[edit_for_i].not_null;
-            else
-                new_ts.fields[i].not_null = old_ts->fields[i].not_null;
-        }
-        new_ts.fields[i].offset = noff;
-        noff += new_ts.fields[i].size;
-        new_to_old[i] = i;
-    }
-    new_ts.total_size = noff;
-    /* §2.10: hand-built schemas must carry the nullmap prefix and the
-       prefix-inclusive total_size (matching load_typed_schema) — the
-       rebuild's trim/encode hooks run against THIS schema. */
-    new_ts.nullmap_prefix = 1 + typed_nullmap_bytes(new_ts.nfields);
-    new_ts.total_size += new_ts.nullmap_prefix;
-    }   /* end legacy overlay */
 
     /* Per-edit dirty tracking. A field is dirty when its encoding actually
        changed; only those fields' indexes need to be rebuilt. */
@@ -962,9 +774,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
             n_dirty++;
         }
     }
-    int needs_rebuild = old_ts->packed.nfields
-        ? !packed_schema_same(&old_ts->packed, &new_ts.packed)   /* F4 */
-        : (n_dirty > 0);
+    int needs_rebuild = !packed_schema_same(&old_ts->packed, &new_ts.packed);   /* F4 */
 
     char obj_dir[PATH_MAX];
     snprintf(obj_dir, sizeof(obj_dir), "%s/%s", db_root, object);
@@ -1035,7 +845,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
     pf.new_ts        = &new_ts;
     pf.edited_old_idx = edited_old_idx;
     pf.n_edits       = n_edits;
-    if (old_ts->packed.nfields) {
+    {
         /* Same converter as the rebuild (D-3). edit_preflight_walk_cb cannot be
            used: typed_record_view rejects packed records and would skip them. */
         int prc = packed_preflight_walk(sdb, old_ts, &new_ts, new_to_old,
@@ -1048,8 +858,6 @@ int cmd_edit_fields(const char *db_root, const char *object,
             return 1;
         }
         pf.failed = prc;
-    } else {
-        slotcask_walk_live(sdb, edit_preflight_walk_cb, &pf);
     }
     if (pf.failed) {
         OUT("{\"error\":\"Pre-flight failed on field [%s]: %s\"}\n",
@@ -1073,7 +881,7 @@ int cmd_edit_fields(const char *db_root, const char *object,
     /* Compute the new slot_size and run the v2 rebuild. */
     Schema new_sch = old_sch;
     new_sch.max_value = new_ts.total_size;
-    if (old_ts->packed.nfields) {
+    {
         size_t bound = 0;
         if (pkr_slot_bound(&new_ts.packed, (size_t)new_sch.max_key, &bound) != DEC_OK || bound > INT_MAX) {
             OUT("{\"error\":\"packed schema exceeds the maximum slot size\"}\n");
@@ -1081,9 +889,6 @@ int cmd_edit_fields(const char *db_root, const char *object,
             return 1;
         }
         new_sch.slot_size = (int)bound;
-    } else {
-        new_sch.slot_size = (24 + new_sch.max_key + new_sch.max_value + 7) & ~7;
-        if (new_sch.slot_size < 32) new_sch.slot_size = 32;
     }
 
     /* v2_rebuild_walk_cb takes the verbatim re-insert path when
@@ -1135,27 +940,7 @@ static void free_field_specs(char *(*specs)[MAX_FIELDS]) {
 }
 
 
-/* Validate a field type spec like "name:varchar:30" or "age:int".
-   Returns the storage size (>0) on success, 0 on invalid. */
-static int validate_field_type(const char *field_spec) {
-    const char *colon = strchr(field_spec, ':');
-    if (!colon || colon == field_spec) return 0; /* no type separator or empty name */
-
-    /* Heap copy so the type portion can be MAX_FIELD_DEF-sized (enum value
-       lists). _clean mutates buf in place (strips modifiers). */
-    char *buf = strdup(colon + 1);
-    if (!buf) return 0;
-    TypedField modifiers={0};
-    int parsed=parse_default_modifier_checked(buf,&modifiers);
-    int rc=parsed<0?0:typed_legacy_decl_size(buf);
-    if(rc){parse_field_type(buf,&modifiers);if(modifiers.type!=FT_ENUM&&typed_default_validate(&modifiers))rc=0;}
-    free_enum_values(&modifiers);free(buf);
-    return rc;
-}
-
-
-
-/* Packed-grammar counterpart of validate_field_type: returns > 0 on a valid
+/* Validate a packed field declaration: returns > 0 on a valid
    declaration, 0 otherwise. Bare `varchar` / `numeric` are legal; numeric
    precision/scale and varchar capacity are validated by the packed parser;
    every other type keeps the existing fixed-width grammar. */
@@ -1278,7 +1063,7 @@ static void typed_schema_release_p(TypedSchema *ts) { typed_schema_release(ts); 
 int cmd_create_object(const char *db_root, const char *dir, const char *object,
                       const char *fields_json, const char *indexes_json,
                       int splits, int max_key, int if_not_exists,
-                      const char *auto_key_spec, int packed) {
+                      const char *auto_key_spec) {
     if (!dir || !dir[0]) {
         OUT("{\"error\":\"dir is required\"}\n");
         return 1;
@@ -1322,8 +1107,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
     }
     int nfields=0,total_value_size=0;
     for(;nfields<(int)parsed_fields;nfields++){
-        int field_size = packed ? validate_packed_field_type(field_specs[nfields])
-                                : validate_field_type(field_specs[nfields]);
+        int field_size = validate_packed_field_type(field_specs[nfields]);
         if (field_size <= 0) {
             OUT("{\"error\":\"invalid field type: \\\"%s\\\" — valid types: varchar:N, int, long, short, double, float, bool, byte, date, datetime, datetimems, time, timestamp, uuid, ipv4, ipv6, currency, numeric:P,S, enum(v1,v2,...)\"}\n",
                    field_specs[nfields]);
@@ -1377,9 +1161,6 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
             return 1;
         }
 
-        if (packed) continue;   /* packed sizes come from the bound codec below */
-        if(field_size>INT_MAX-total_value_size){OUT("{\"error\":\"schema size overflow\"}\n");return 1;}
-        total_value_size+=field_size;
     }
 
     if (nfields == 0) {
@@ -1387,14 +1168,14 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
 
-    /* Packed: bind the codec once from the declared field lines so slot_size
-       and value_size come from pkr (single source of truth, same builder the
-       loader and the migration use). The cleanup attribute releases the enum
-       value lists on every return path (no-op on a zeroed schema). */
+    /* Bind the codec once from the declared field lines so slot_size and
+       value_size come from pkr (single source of truth, same builder the
+       loader uses). The cleanup attribute releases the enum value lists on
+       every return path (no-op on a zeroed schema). */
     TypedSchema packed_ts __attribute__((cleanup(typed_schema_release_p)));
     memset(&packed_ts, 0, sizeof(packed_ts));
     size_t packed_slot = 0;
-    if (packed) {
+    {
         char perr[160] = {0};
         if (typed_schema_build_packed((const char *const *)field_specs,
                                       (size_t)nfields, &packed_ts,
@@ -1422,12 +1203,10 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         return 1;
     }
 
-    if (packed) {
-        if (pkr_slot_bound(&packed_ts.packed, (size_t)max_key, &packed_slot) != DEC_OK ||
-            packed_slot > INT_MAX) {
-            OUT("{\"error\":\"packed schema exceeds the maximum slot size\"}\n");
-            return 1;
-        }
+    if (pkr_slot_bound(&packed_ts.packed, (size_t)max_key, &packed_slot) != DEC_OK ||
+        packed_slot > INT_MAX) {
+        OUT("{\"error\":\"packed schema exceeds the maximum slot size\"}\n");
+        return 1;
     }
 
     /* Parse + validate `indexes` into an in-memory list of (name, type) so
@@ -1725,7 +1504,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
             snprintf(extra, sizeof(extra), ":auto_key=uuid");
         else if (auto_key_kind == 2)
             snprintf(extra, sizeof(extra), ":auto_key=seq(%s)", auto_seq_name);
-        if (packed) {
+        {
             size_t el = strlen(extra);
             snprintf(extra + el, sizeof(extra) - el, ":layout=packed");
         }
@@ -1772,9 +1551,7 @@ int cmd_create_object(const char *db_root, const char *dir, const char *object,
         char obj_data_dir[PATH_MAX];
         snprintf(obj_data_dir, sizeof(obj_data_dir), "%s/%s", eff_root, object);
         /* slot_size includes the 24B per-record inline header. */
-        int slot_size = (24 + max_key + total_value_size + 7) & ~7;
-        if (slot_size < 32) slot_size = 32;
-        if (packed) slot_size = (int)packed_slot;
+        int slot_size = (int)packed_slot;
         SlotcaskDb sdb;
         if (slotcask_open(&sdb, obj_data_dir, splits, streams, slot_size) != 0) {
             OUT("{\"error\":\"slotcask_open failed for %s/%s\"}\n", dir, object);
@@ -2029,8 +1806,7 @@ int cmd_describe_object(const char *db_root, const char *dir, const char *object
     OUT("{\"dir\":\"%s\",\"object\":\"%s\",\"splits\":%d,\"max_key\":%d,\"max_value\":%d,\"slot_size\":%d,\"fields\":%s",
         dir,object,sch.splits,sch.max_key,sch.max_value,sch.slot_size,fields_json);
     free(fields_json);
-    OUT(",\"streams\":%d,\"declaration_layout\":\"%s\"",sch.streams,
-        ts&&ts->packed.nfields?"packed":"legacy");
+    OUT(",\"streams\":%d,\"declaration_layout\":\"packed\"",sch.streams);
     if(sch.auto_key!=AK_NONE){
         char automatic[300];
         if(sch.auto_key==AK_UUID)snprintf(automatic,sizeof(automatic),"uuid");

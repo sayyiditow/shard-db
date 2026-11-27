@@ -292,7 +292,6 @@ struct RebuildTxn {
     int old_splits;
     int old_streams;
     int indexes_may_change;
-    int old_layout_packed;   /* layout token at begin; restored by abort (F19) */
 };
 
 static int path_join2(char *out, size_t cap, const char *a, const char *b) {
@@ -397,12 +396,14 @@ static int write_meta(RebuildTxn *txn, const char *dir) {
         return -1;
     FILE *f = fopen(tmp, "w");
     if (!f) return -1;
+    /* old_layout is a wire constant: every object this binary rebuilds is
+       packed, and a 2026.11.2 reader must still see a packed transaction
+       (it strips `:layout=packed` on a meta without the line). */
     int rc = fprintf(f,
                      "version=1\nold_splits=%d\nold_streams=%d\n"
-                     "indexes_may_change=%d\nold_layout=%d\n",
+                     "indexes_may_change=%d\nold_layout=1\n",
                      txn->old_splits, txn->old_streams,
-                     txn->indexes_may_change ? 1 : 0,
-                     txn->old_layout_packed ? 1 : 0) < 0 ? -1 : 0;
+                     txn->indexes_may_change ? 1 : 0) < 0 ? -1 : 0;
     if (rc == 0 && (fflush(f) != 0 || fsync(fileno(f)) != 0)) rc = -1;
     if (fclose(f) != 0) rc = -1;
     if (rc == 0 && rename(tmp, meta) != 0) rc = -1;
@@ -415,10 +416,19 @@ static int valid_old_splits(int n) {
     return n > 0 && n <= 4096 && (n & (n - 1)) == 0;
 }
 
-static int parse_meta(RebuildTxn *txn) {
-    char path[PATH_MAX];
-    if (path_join2(path, sizeof(path), txn->active, "meta") != 0) return -1;
-    int fd = open(path, O_RDONLY | O_NOFOLLOW);
+/* Shared raw meta parser. Grammar: version=1, a power-of-two old_splits,
+   old_streams > 0, indexes_may_change 0/1, optional old_layout 0/1, no
+   duplicate or unknown key, at most 1024 bytes, O_NOFOLLOW. Returns 0 and
+   fills every out-param on success, -1 otherwise. Callers: parse_meta
+   (requires old_layout=1) and rebuild_txn_active_layout (the startup layout
+   gate's raw reader, which keeps treating absent/0 as a pre-2026.11.1
+   artifact). */
+static int parse_meta_fields(const char *meta_path, int *out_splits,
+                             int *out_streams, int *out_indexes,
+                             int *out_layout, int *out_seen_layout) {
+    if (!meta_path || !out_splits || !out_streams || !out_indexes ||
+        !out_layout || !out_seen_layout) return -1;
+    int fd = open(meta_path, O_RDONLY | O_NOFOLLOW);
     if (fd < 0) return -1;
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
@@ -432,7 +442,7 @@ static int parse_meta(RebuildTxn *txn) {
         return -1;
     }
     int seen_version = 0, seen_splits = 0, seen_streams = 0, seen_indexes = 0;
-    int seen_layout = 0, layout = 0;   /* old_layout is optional: absent = legacy (pre-2026.11.1 meta) */
+    int seen_layout = 0, layout = 0;   /* optional here: rebuild_txn_active_layout needs absent/0 evidence */
     int version = 0, splits = 0, streams = 0, indexes = -1;
     int bad = 0;
     char line[256];
@@ -462,11 +472,49 @@ static int parse_meta(RebuildTxn *txn) {
         seen_indexes != 1 || version != 1 || !valid_old_splits(splits) ||
         streams <= 0 || (indexes != 0 && indexes != 1) ||
         (layout != 0 && layout != 1)) return -1;
+    *out_splits = splits;
+    *out_streams = streams;
+    *out_indexes = indexes;
+    *out_layout = layout;
+    *out_seen_layout = seen_layout;
+    return 0;
+}
+
+static int parse_meta(RebuildTxn *txn) {
+    char path[PATH_MAX];
+    if (path_join2(path, sizeof(path), txn->active, "meta") != 0) return -1;
+    int splits = 0, streams = 0, indexes = -1, layout = 0, seen_layout = 0;
+    if (parse_meta_fields(path, &splits, &streams, &indexes, &layout,
+                          &seen_layout) != 0) return -1;
+    /* After the layout gate every recoverable transaction was written by a
+       packed binary, which always emits old_layout=1. Absent or 0 is the
+       signature of the removed layout converter: fail closed (the caller
+       preserves the directory untouched). */
+    if (!seen_layout || layout != 1) return -1;
     txn->old_splits = splits;
     txn->old_streams = streams;
     txn->indexes_may_change = indexes;
-    txn->old_layout_packed = layout;
     return 0;
+}
+
+/* Startup layout gate's raw reader. -1 = no active transaction;
+   0 = active with old_layout missing/0 (a layout-conversion artifact);
+   1 = active with old_layout=1 (a valid 2026.11.2 vacuum state);
+   -2 = the active path or its meta is unusable. No logging and no g_db:
+   this runs before shard_db_open_internal. */
+int rebuild_txn_active_layout(const char *eff_root, const char *object) {
+    char obj_dir[PATH_MAX], active[PATH_MAX], meta[PATH_MAX];
+    if (!eff_root || !object ||
+        path_join2(obj_dir, sizeof(obj_dir), eff_root, object) != 0 ||
+        path_join2(active, sizeof(active), obj_dir, ".rebuild_txn.active") != 0 ||
+        path_join2(meta, sizeof(meta), active, "meta") != 0) return -2;
+    struct stat st;
+    if (lstat(active, &st) != 0) return errno == ENOENT ? -1 : -2;
+    if (!S_ISDIR(st.st_mode)) return -2;
+    int splits = 0, streams = 0, indexes = -1, layout = 0, seen_layout = 0;
+    if (parse_meta_fields(meta, &splits, &streams, &indexes, &layout,
+                          &seen_layout) != 0) return -2;
+    return (seen_layout && layout == 1) ? 1 : 0;
 }
 
 RebuildTxn *rebuild_txn_begin(const char *db_root, const char *object,
@@ -478,14 +526,6 @@ RebuildTxn *rebuild_txn_begin(const char *db_root, const char *object,
     txn->old_splits = old_splits;
     txn->old_streams = old_streams;
     txn->indexes_may_change = indexes_may_change ? 1 : 0;
-    {
-        int lp = 0;
-        if (schema_conf_layout(db_root, object, &lp) != 0) {
-            rebuild_txn_free(txn);
-            return NULL;   /* layout unreadable: do not stage anything */
-        }
-        txn->old_layout_packed = lp;
-    }
 
     struct stat st;
     if (lstat(txn->active, &st) == 0 || errno != ENOENT ||
@@ -602,13 +642,6 @@ int rebuild_txn_abort(RebuildTxn *txn) {
     if (update_schema_conf_splits_streams(txn->db_root, txn->object,
                                           txn->old_splits,
                                           txn->old_streams) != 0) return -1;
-    {
-        int cur = 0;
-        if (schema_conf_layout(txn->db_root, txn->object, &cur) != 0) return -1;
-        if (cur != txn->old_layout_packed &&
-            update_schema_conf_layout(txn->db_root, txn->object,
-                                      txn->old_layout_packed) != 0) return -1;
-    }
     invalidate_schema_caches(txn->db_root, txn->object);
     invalidate_idx_cache(txn->db_root, txn->object);
     slotcask_registry_invalidate(txn->db_root, txn->object);

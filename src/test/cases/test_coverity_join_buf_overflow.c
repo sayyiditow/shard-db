@@ -16,6 +16,7 @@
 #include "types.h"
 #include "slotcask.h"
 #include "query_internal.h"
+#include "typed_row.h"
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
@@ -27,37 +28,37 @@ static int test_coverity_join_buf_overflow_run(void) {
     memset(&ts, 0, sizeof(ts));
     ts.typed = 1;
     ts.nfields = 4;
-    int off = 0;
     for (int i = 0; i < ts.nfields; i++) {
         TypedField *f = &ts.fields[i];
         memset(f, 0, sizeof(*f));
         snprintf(f->name, sizeof(f->name), "f%d", i);
         f->name_len = (int)strlen(f->name);
         f->type = FT_VARCHAR;
-        f->size = 64; /* on-disk: 2-byte length prefix + 62 content bytes */
-        f->offset = off;
-        off += f->size;
     }
-    ts.total_size = off;
+    const char *types[4] = {"varchar:64", "varchar:64", "varchar:64", "varchar:64"};
+    ASSERT_EQ_INT(typed_schema_bind_packed(&ts, types, 4, NULL, 0), 0,
+                  "bind packed schema");
 
     FieldSchema fs;
     memset(&fs, 0, sizeof(fs));
     fs.ts = &ts;
 
-    /* Build a raw record buffer with each field filled to near its cap
-       with distinct content, so JSON-escaping renders a value clearly
-       longer than the destination buffer used below. */
-    uint8_t *raw = calloc(1, (size_t)ts.total_size);
+    /* Build a packed record whose varchar values are near their declared
+       cap, so JSON-escaping renders each value clearly longer than the
+       destination buffer used below. */
+    char value[64];
+    memset(value, 'A', 62);
+    value[62] = '\0';
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{\"f0\":\"%s\",\"f1\":\"%s\",\"f2\":\"%s\",\"f3\":\"%s\"}",
+             value, value, value, value);
+    uint8_t *raw = NULL;
+    size_t raw_len = 0;
+    ASSERT_EQ_INT(typed_encode_alloc(&ts, json, 0, NULL, NULL, &raw, &raw_len,
+                                     NULL, 0), 0, "encode packed record");
     ASSERT_NOT_NULL(raw, "alloc raw record");
     if (!raw) return 1;
-    for (int i = 0; i < ts.nfields; i++) {
-        TypedField *f = &ts.fields[i];
-        int content_len = f->size - 2;
-        uint8_t *p = raw + f->offset;
-        p[0] = (uint8_t)((content_len >> 8) & 0xff);
-        p[1] = (uint8_t)(content_len & 0xff);
-        memset(p + 2, 'A' + i, (size_t)content_len);
-    }
 
     /* Destination buffer tiny enough that not all 4 fields fit, followed
        by a canary region — any OOB write past bufsz shows up here. */
@@ -68,7 +69,7 @@ static int test_coverity_join_buf_overflow_run(void) {
     if (!region) { free(raw); return 1; }
     memset(region + BUF_SZ, 0xAB, CANARY_SZ);
 
-    int pos = buf_driver_values(raw, (size_t)ts.total_size, &fs, NULL, 0, 0, region, BUF_SZ);
+    int pos = buf_driver_values(raw, raw_len, &fs, NULL, 0, PKR_FLAGS, region, BUF_SZ);
 
     ASSERT_TRUE(pos == -1 && errno == ENOBUFS, "undersized buffer explicitly fails");
     ASSERT_TRUE(region[0] == 0, "failed output has no truncated prefix");

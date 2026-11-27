@@ -28,9 +28,9 @@ static int index_test_should_fail_after_success(void) { return 0; }
 /* One-shot "fail the next reindex build" seam (db.env
    INDEX_TEST_FAIL_NEXT_BUILD): the checked reindex implementation
    returns INDEX_BUILD_FAILED with this errno before touching any
-   index file. Drives the BTRI startup-migration failure case — the
-   merge path legitimately succeeds on small data without ever
-   opening a spill file, so the spill seam cannot reach it. */
+   index file. Drives the checked-reindex failure cases — the merge path
+   legitimately succeeds on small data without ever opening a spill file,
+   so the spill seam cannot reach it. */
 static _Atomic int g_index_test_fail_next_build;
 
 void index_test_fail_next_build(int en) {
@@ -1315,200 +1315,10 @@ int index_parallel(const char *db_root, const char *object, int splits,
                    char fields[][256], int nfields,
                    const enum IndexType *types) {
     if (nfields <= 0) return 0;
-
     TypedSchema *ts = load_typed_schema(db_root, object);
-    if(ts&&ts->packed.nfields)
-        return index_parallel_packed(db_root,object,splits,value,hash16,fields,nfields,types,ts);
-
-    /* Collect all unique sub-field names from single + composite indexes */
-    const char *unique_keys[MAX_FIELDS * 4];
-    int unique_count = 0;
-    for (int i = 0; i < nfields; i++) {
-        if (strchr(fields[i], '+')) {
-            char fbuf[256];
-            strncpy(fbuf, fields[i], 255); fbuf[255] = '\0';
-            char *_tok_save = NULL; char *tok = strtok_r(fbuf, "+", &_tok_save);
-            while (tok) {
-                int found = 0;
-                for (int j = 0; j < unique_count; j++)
-                    if (strcmp(unique_keys[j], tok) == 0) { found = 1; break; }
-                if (!found && unique_count < MAX_FIELDS * 4)
-                    unique_keys[unique_count++] = strdup(tok);
-                tok = strtok_r(NULL, "+", &_tok_save);
-            }
-        } else {
-            int found = 0;
-            for (int j = 0; j < unique_count; j++)
-                if (strcmp(unique_keys[j], fields[i]) == 0) { found = 1; break; }
-            if (!found && unique_count < MAX_FIELDS * 4)
-                unique_keys[unique_count++] = fields[i];
-        }
-    }
-
-    char *extracted[MAX_FIELDS * 4] = {0};
-    enum FieldType extracted_types[MAX_FIELDS * 4];
-    for (int j = 0; j < unique_count; j++) {
-        int fidx = ts ? typed_field_index(ts, unique_keys[j]) : -1;
-        extracted_types[j] = fidx >= 0 ? ts->fields[fidx].type : FT_COUNT;
-    }
-    errno = 0;
-    if (json_get_fields_unescaped(value, unique_keys, unique_count,
-                                  extracted_types, extracted) != 0) {
-        int decode_errno = errno == ENOMEM ? ENOMEM : EINVAL;
-        for (int k = 0; k < unique_count; k++) free(extracted[k]);
-        for (int k = 0; k < unique_count; k++) {
-            int is_field = 0;
-            for (int m = 0; m < nfields; m++)
-                if (unique_keys[k] == fields[m]) { is_field = 1; break; }
-            if (!is_field) free((char *)unique_keys[k]);
-        }
-        errno = decode_errno;
-        return -1;
-    }
-
-    IndexThreadArg args[MAX_FIELDS];
-    int tcount = 0;
-
-    /* Heap-owned per-index key buffers — freed after parallel_for returns. */
-    uint8_t *idx_keys[MAX_FIELDS];
-    memset(idx_keys, 0, sizeof(idx_keys));
-
-    for (int i = 0; i < nfields; i++) {
-        /* Skip fields whose index type isn't btree — they're maintained
-           via update_idx_fn's type-dispatch path. Composites are always
-           btree (the non-btree composite case is rejected upstream at
-           create-object). */
-        if (types && types[i] != IT_BTREE) continue;
-
-        uint8_t *key_buf = NULL;
-        size_t key_len = 0;
-
-        if (strchr(fields[i], '+')) {
-            /* Composite — typed binary concat of sub-field values. */
-            char fbuf[256];
-            strncpy(fbuf, fields[i], 255); fbuf[255] = '\0';
-            char result[4096];
-            int pos = 0;
-            int all_present = 1;
-            char *_tok_save = NULL; char *tok = strtok_r(fbuf, "+", &_tok_save);
-            while (tok) {
-                int fidx = ts ? typed_field_index(ts, tok) : -1;
-                /* Find the extracted text value */
-                char *txt = NULL;
-                for (int j = 0; j < unique_count; j++) {
-                    if (strcmp(unique_keys[j], tok) == 0) {
-                        txt = extracted[j];
-                        break;
-                    }
-                }
-                if (!txt || txt[0] == '\0') { all_present = 0; break; }
-                if (fidx >= 0) {
-                    const TypedField *f = &ts->fields[fidx];
-                    size_t blen = 0;
-                    encode_field_text_for_index(f, txt, strlen(txt),
-                                            (uint8_t *)result + pos, &blen);
-                    if (blen == 0) { all_present = 0; break; }
-                    if (pos + (int)blen < (int)sizeof(result)) { pos += (int)blen; }
-                    else { all_present = 0; break; }
-                } else {
-                    /* No schema — pass raw bytes */
-                    int len = strlen(txt);
-                    if (pos + len < (int)sizeof(result)) {
-                        memcpy(result + pos, txt, len);
-                        pos += len;
-                    }
-                }
-                tok = strtok_r(NULL, "+", &_tok_save);
-            }
-            if (all_present && pos > 0) {
-                key_buf = malloc((size_t)pos);
-                memcpy(key_buf, result, (size_t)pos);
-                key_len = (size_t)pos;
-            }
-        } else {
-            /* Single field — encode textual JSON value as index-key bytes. */
-            const char *txt = NULL;
-            for (int j = 0; j < unique_count; j++) {
-                if (strcmp(unique_keys[j], fields[i]) == 0) {
-                    txt = extracted[j];
-                    break;
-                }
-            }
-            if (txt && txt[0]) {
-                int fidx = ts ? typed_field_index(ts, fields[i]) : -1;
-                if (fidx >= 0) {
-                    const TypedField *f = &ts->fields[fidx];
-                    size_t cap = (size_t)(f->size > 8 ? f->size : 8);
-                    key_buf = malloc(cap);
-                    encode_field_text_for_index(f, txt, strlen(txt), key_buf, &key_len);
-                    if (key_len == 0) { free(key_buf); key_buf = NULL; }
-                } else {
-                    /* Unknown to typed schema (e.g. legacy untyped object) —
-                       fall back to raw bytes so index still builds. */
-                    size_t sl = strlen(txt);
-                    key_buf = malloc(sl);
-                    memcpy(key_buf, txt, sl);
-                    key_len = sl;
-                }
-            }
-        }
-
-        if (!key_buf || key_len == 0) { free(key_buf); continue; }
-
-        idx_keys[tcount] = key_buf;
-        args[tcount].db_root = db_root;
-        args[tcount].object = object;
-        args[tcount].field = fields[i];
-        args[tcount].splits = splits;
-        args[tcount].val = key_buf;
-        args[tcount].vlen = key_len;
-        args[tcount].hash16 = hash16;
-        args[tcount].out_error = 0;
-        args[tcount].out_errno = 0;
-        tcount++;
-    }
-
-    parallel_for(index_thread_fn, args, tcount, sizeof(IndexThreadArg));
-
-    int rc = 0;
-    int saved_errno = 0;
-    for (int i = 0; i < tcount; i++) {
-        if (args[i].out_error && rc == 0) {
-            rc = -1;
-            saved_errno = args[i].out_errno;
-        }
-        free(idx_keys[i]);
-    }
-    if (tcount > 0) {
-        /* Flush only the files this call actually wrote. Syncing a
-           never-written field would O_CREAT an empty .idx via the writer
-           acquire path. */
-        const char *sync_fields[MAX_FIELDS];
-        enum IndexType sync_types[MAX_FIELDS];
-        for (int i = 0; i < tcount; i++) {
-            sync_fields[i] = args[i].field;
-            sync_types[i] = IT_BTREE;
-        }
-        if (index_sync_record_fields(db_root, object, splits, hash16,
-                                     sync_fields, sync_types, tcount) != 0) {
-            /* Capture the flush's real errno (e.g. ENOSPC) so the
-               rc != 0 handler below doesn't mask it to generic EIO — but
-               never overwrite a prior mutation error already in
-               saved_errno. Diagnostics only; failure fails closed either
-               way. */
-            if (!saved_errno) saved_errno = errno;
-            rc = -1;
-        }
-    }
-    for (int i = 0; i < unique_count; i++) free(extracted[i]);
-    for (int i = 0; i < unique_count; i++) {
-        int is_field = 0;
-        for (int j = 0; j < nfields; j++)
-            if (unique_keys[i] == fields[j]) { is_field = 1; break; }
-        if (!is_field) free((char *)unique_keys[i]);
-    }
-    if (rc != 0) errno = saved_errno ? saved_errno : EIO;
-    return rc;
+    if (!ts) return 0;
+    return index_parallel_packed(db_root, object, splits, value, hash16,
+                                 fields, nfields, types, ts);
 }
 
 /* ========== In-process sort+dedup for index files ========== */
@@ -1567,101 +1377,11 @@ int build_index_key_from_json(const TypedSchema *ts, const char *json,
                               uint8_t **out_val, size_t *out_len) {
     if(out_val)*out_val=NULL;
     if(out_len)*out_len=0;
-    if(ts && ts->packed.nfields){
-        if(!out_val||!out_len){errno=EINVAL;return -1;}
-        uint8_t *record=NULL;size_t n=0;
-        if(typed_encode_alloc(ts,json,0,NULL,NULL,&record,&n,NULL,0))return -1;
-        int rc=typed_index_record_alloc(ts,record,n,typed_schema_hdr2(ts),spec,0,544,out_val,out_len);
-        free(record);return rc;
-    }
-    if (!json || !spec || !out_val || !out_len) return 0;
-    *out_val = NULL;
-    *out_len = 0;
-
-    if (strchr(spec, '+')) {
-        /* Composite — extract each sub-field and encode to index-key bytes. */
-        char fb[256]; strncpy(fb, spec, 255); fb[255] = '\0';
-        const char *subs[16]; int nsub = 0;
-        char *_tok_save = NULL; char *tok = strtok_r(fb, "+", &_tok_save);
-        while (tok && nsub < 16) { subs[nsub++] = tok; tok = strtok_r(NULL, "+", &_tok_save); }
-        char *vals[16];
-        enum FieldType sub_types[16] = {0};
-        for (int i = 0; i < nsub; i++) {
-            int fi = ts ? typed_field_index(ts, subs[i]) : -1;
-            /* FT_COUNT is a sentinel that can never equal FT_VARCHAR;
-               unknown/legacy fields therefore retain json_get_fields'
-               original raw-text behavior. */
-            sub_types[i] = (fi >= 0) ? ts->fields[fi].type : FT_COUNT;
-        }
-        errno = 0;
-        if (json_get_fields_unescaped(json, subs, nsub, sub_types, vals) != 0) {
-            /* Upstream content validation cannot guarantee this second
-               allocation succeeds. Preserve the index/record invariant by
-               returning the tri-state error, not "field absent". */
-            for (int i = 0; i < nsub; i++) free(vals[i]);
-            if (errno != ENOMEM) errno = EINVAL;
-            return -1;
-        }
-        char cat[4096]; int cp = 0; int ok = 1;
-        for (int i = 0; i < nsub; i++) {
-            if (!vals[i] || vals[i][0] == '\0') { ok = 0; break; }
-            int fi = ts ? typed_field_index(ts, subs[i]) : -1;
-            if (fi >= 0) {
-                const TypedField *f = &ts->fields[fi];
-                size_t blen = 0;
-                encode_field_text_for_index(f, vals[i], strlen(vals[i]),
-                                        (uint8_t *)cat + cp, &blen);
-                if (blen == 0) { ok = 0; break; }
-                if (cp + (int)blen < (int)sizeof(cat)) { cp += (int)blen; }
-                else { ok = 0; break; }
-            } else {
-                /* No schema → fall back to raw string (backward compat) */
-                int sl = strlen(vals[i]);
-                if (cp + sl < (int)sizeof(cat)) { memcpy(cat + cp, vals[i], sl); cp += sl; }
-                else { ok = 0; break; }
-            }
-        }
-        for (int i = 0; i < nsub; i++) free(vals[i]);
-        if (!ok || cp == 0) return 0;
-        *out_val = malloc((size_t)cp);
-        memcpy(*out_val, cat, (size_t)cp);
-        *out_len = (size_t)cp;
-        return 1;
-    }
-
-    /* Single field — extract and decode a quoted typed value once. */
-    int fi = ts ? typed_field_index(ts, spec) : -1;
-    enum FieldType text_type = fi >= 0 ? ts->fields[fi].type : FT_COUNT;
-    const char *text_key = spec;
-    char *txt = NULL;
-    errno = 0;
-    if (json_get_fields_unescaped(json, &text_key, 1, &text_type, &txt) != 0) {
-        free(txt);
-        if (errno != ENOMEM) errno = EINVAL;
-        return -1;
-    }
-    if (!txt || !txt[0]) { free(txt); return 0; }
-
-    if (fi >= 0) {
-        const TypedField *f = &ts->fields[fi];
-        size_t cap = (size_t)(f->size > 8 ? f->size : 8);
-        uint8_t *buf = malloc(cap);
-        size_t blen = 0;
-        encode_field_text_for_index(f, txt, strlen(txt), buf, &blen);
-        free(txt);
-        if (blen == 0) { free(buf); return 0; }
-        *out_val = buf;
-        *out_len = blen;
-        return 1;
-    }
-
-    /* Untyped — passthrough raw bytes. txt was just malloc'd by
-       json_obj_strdup; hand ownership to the caller instead of
-       malloc+memcpy+free. The output contract is (bytes, length),
-       not a C-string, so the missing null terminator is intentional. */
-    *out_len = strlen(txt);
-    *out_val = (uint8_t *)txt;
-    return 1;
+    if(!ts||!json||!spec||!out_val||!out_len){errno=EINVAL;return -1;}
+    uint8_t *record=NULL;size_t n=0;
+    if(typed_encode_alloc(ts,json,0,NULL,NULL,&record,&n,NULL,0))return -1;
+    int rc=typed_index_record_alloc(ts,record,n,typed_schema_hdr2(ts),spec,0,544,out_val,out_len);
+    free(record);return rc;
 }
 
 /* Comparators for raw structs (used by add-index sort). Length-aware so
@@ -3843,12 +3563,6 @@ static void mf_append_field(MFWorkerField *f, const MFFieldDesc *d,
         if(span.is_null)return;
         if(typed_span_read(ts,(size_t)tidx,&span,&vb)){f->had_error=1;return;}
         size_t al=span.len;
-        if(!ts->packed.nfields){
-            al=((size_t)vb[0]<<8)|vb[1];
-            size_t max=(size_t)ts->fields[tidx].size-2;
-            if(al>max)al=max;
-            vb+=2;
-        }
         if(!al)return;
         uint8_t tg[TG_MAX_DISTINCT][3];
         size_t n = tg_extract_distinct(vb, al, tg, TG_MAX_DISTINCT);

@@ -22,7 +22,7 @@ code on the startup path of every daemon.
 
 ### Logical flow
 
-0. **Convert/delete the legacy-fixture tests first** (T0.5) so every later
+0. **Convert the fixture-only legacy tests first** (T0.5; legacy-route tests stay on legacy until T3) so every later
    step can end green.
 1. **Tighten the open gate first** (T1): required source version becomes
    2026.11.2, and a root is refused unless every `schema.conf` entry carries
@@ -50,7 +50,8 @@ code on the startup path of every daemon.
 | D1 | `SHARD_DB_REQUIRED_SOURCE_VERSION` = `2026.11.2` | 2026.11.1 | 2026.11.1 and 2026.11.2 carry identical migration code; 2026.11.2 is the released version users run, and the D2 data gate (not the version floor) is the safety net | DECIDED 2026-11-25: 2026.11.2 is released and is what users run |
 | D2 | Gate on data as well as version: refuse any `schema.conf` entry without `layout=packed`, and any leftover layout-conversion artifact | version gate alone | F16 stamps the version before converting; a root interrupted mid-conversion would otherwise be opened as packed with legacy objects | DEFAULT |
 | D3 | Restoring a backup whose object is legacy-layout refuses with "restore with shard-db 2026.11.2 first" (`cmd_restore` already refuses a backup lacking `"layout":"packed"`; only the message changes) | convert on restore | converting means keeping the converter | DECIDED 2026-11-25: refuse, no legacy support at all |
-| D4 | Tests that only use legacy objects as a fixture are converted to packed; tests whose subject is the removed code are deleted, each listed with a reason | delete all 38 | keeps behavioural coverage | DEFAULT |
+| D4 | Tests that only use legacy objects as a fixture are converted to packed; tests whose subject is the removed code are deleted, each listed with a reason; tests whose subject is a route that exists only on the legacy layout (class K, see T0.5 and D12) keep their legacy original until T3 beside an additive packed copy | delete all 38 | keeps behavioural coverage | DEFAULT (amended 2026-11-27 after the T0.5 halt) |
+| D12 | Legacy-route tests (class K) keep their legacy original through T0.5-T2, gain an additive packed copy in T0.5, and the original is deleted at T3. Packed `bulk-update` with `criteria` is a pre-existing product gap (recorded as AUD-PACKED-BULKUPDATE in the audit index), not fixed here; T0.5 adds one test pinning the packed refusal | convert them and drop assertions (B); implement packed criteria update first (C) | the legacy route is the only place the behaviour exists; removing it cannot make packed objects worse than they already are | DECIDED 2026-11-27: option A, human |
 | D5 | Record-level legacy handling (records without the nullmap flag, `legacy_field_absent`, legacy `hdr2` views) is removed too, **only if T0 proves** the layout conversion rewrote every live record | keep record readers | conversion rewrites every live record through a fresh slotcask (T0-P1 confirms); keeping them leaves dead branches | DEFAULT, conditional on T0 |
 | D6 | Stale `.btri-migrated`, `.layout-migrated`, `.layout-migration-report` files are ignored, not deleted | delete on start | no new startup writes; harmless | DEFAULT |
 | D7 | Do this before Phase 3 slice 1 continues | after the audit | slices 1-3 walk the write paths, every function has a legacy branch; auditing then deleting wastes review | DECIDED 2026-11-25: yes, before slice 1 continues |
@@ -80,6 +81,8 @@ code on the startup path of every daemon.
 
 ### Test strategy
 
+- Packed-copy coverage: every class K test has an additive packed copy from T0.5 (unless its whole subject is the legacy route, then its gap is reported); dropped assertions are listed with their packed coverage or recorded gap; `test-packed-bulk-update-criteria-refused` pins the packed refusal.
+
 - Gate (shared function, see T1): version below 2026.11.2 refused; 2026.11.2 root with a schema line
   lacking `layout=packed` refused; leftover conversion artifact refused; clean
   packed 2026.11.2 root opens (NOOP, no re-stamp), data intact; an interrupted-
@@ -100,6 +103,8 @@ Behaviour fixes (AUD-P3-*), planner work, deleting stamp files, downgrade
 support, any change to record or index formats of packed objects, bench code.
 
 ### Review log
+
+**2026-11-27 amendment (T0.5 halt; delta review 1: 0 blockers, 3 silent-damage majors fixed - K detection rule, dropped-assertion mapping, additive split at T0.5 - plus T3/refusal-pin clarity, 5 minors; round 2: 0 blockers, 1 silent-damage major (shared helpers between K and C cases: per-case split, duplicated helpers, unique `-packed` names) and 3 clarity majors, 4 minors, all fixed in place):** the executor's conversion attempt failed 148 assertions because many tests' subject is a legacy-only route (packed refuses `bulk-update` with `criteria`). D4 amended, D12 added, T0.5 rewritten with classes C/K/D, T3 gains a refusal-pin test. Needs a delta review round (changed test policy).
 
 Round 1 (fresh Opus reviewer): 3 blockers, 8 majors, 7 minors, all
 addressed in this revision: task order (T0.5 added), gate must cover
@@ -240,17 +245,95 @@ Halt if P1-P6 contradict this plan.
 
 ### T0.5 Tests first
 
-Convert fixture-only tests to packed creation (drop `declaration_layout`
-legacy; fix expectations that depended on the 65535 varchar cap or fixed-width
-sizes, each named in `PLAN_NOTES.md`); dual-layout comparison tests keep their packed half. **Deletion policy (one
-rule):** a subject-removed test is deleted in the task that removes its
-subject (migration tests T1/T2, legacy-codec tests the named T4 step, etc.),
-except that a test which restarts a daemon or calls `shard_db_open` on a
-root holding a legacy object, or writes a `.version` below 2026.11.2, breaks
-at T1 and is deleted (or, if not subject-removed, converted) there. Also fix schema.conf fixtures lacking
+Classify every legacy-fixture test from the T0 table into one of three classes
+and handle it as follows. Suite green at the end.
+
+- **Class C (convert).** The legacy object is only a fixture. Switch it to
+  packed creation (drop `declaration_layout` legacy) and fix expectations that
+  depended on the legacy format. Known expectation-only differences (each
+  converted test names what it changed in `PLAN_NOTES.md`): packed varchar
+  over-length text is `varchar content exceeds declaration`; malformed numeric
+  is `expected a decimal number`; packed varchar is NUL-exact; `describe-object`
+  reports varchar `"size":8` with `"capacity":N`; `numeric:P,S` precision is
+  enforced (legacy `numeric:N` ignored it, scale 2 becomes 0). A numeric
+  precision/round-trip test is converted so that it asserts the packed contract
+  (still pinning the int64 boundary the test was about, with a declaration wide
+  enough, e.g. `numeric:19,0`); if it cannot, it is class K and is split per the K rule.
+- **Class K (legacy-route; original stays until T3).** The test's subject
+  or part of its assertions exists only on the legacy layout: `bulk-update`
+  with `criteria` (packed refuses it: `cmd_bulk_update` in `query_bulk.c`),
+  legacy computed-update accounting, legacy composite-key bounds, legacy
+  numeric semantics that cannot be re-expressed on packed, or arena/OOM fault
+  indices into the legacy bulk path. **Detection rule (authoritative; the T0
+  table and any name list are overridden by it), applied only to tests that
+  create a legacy object (never to already-packed tests, e.g.
+  `test_idx_absent_shard.c`, which already pins the refusal):** a case is
+  class K if any request it sends is a `bulk-update` carrying `criteria`
+  (inspect each request, including requests split across string literals and
+  `dry_run` forms; a `bulk-update` with `records` or `records`+`if` is NOT a
+  criteria update), or if its conversion fails for one of the reasons above
+  (the executor shows the failing assertions in `PLAN_NOTES.md`).
+  Initial names from the first attempt (confirm and extend with the grep):
+  `test-bulk-cas`, `test-or-logic`,
+  `test-not-null-updates`, `test-computed-update`, `test-slotcask-v2-bulk`,
+  `test-length-ops`, `test-field-vs-field`, `test-regex`,
+  `test-agg-varchar-groupby-sum`, `test-index-oversized-varchar`,
+  `bulk-update-criteria-varchar-unescape`, `test-bulk-update-json`,
+  `test-bulk-update-json-oom`, `test-bulk-insert-arena-oom`,
+  `test-composite-varchar-bound`, `test-cas-tree-if` (the last four and
+  `test-cas-tree-if` are K only if their conversion fails; show it); known additions that sit under "convert" in
+  the T0 table but send a criteria `bulk-update`:
+  `varchar-malformed-escape-policies` and `test-request-timeout` (a converted
+  copy of either would pass vacuously or fail on the refusal: never convert
+  one while it still sends that request). Update the T0 table so it agrees.
+  **Original K tests are not edited in T0.5**: they stay on their legacy
+  fixture, pass unchanged, and are listed in `PLAN_NOTES.md` with the
+  legacy-only route each depends on. **The split is per case, not per file.** A file holding both K and C cases
+  (e.g. `test_index_varchar_unescape.c`) keeps its legacy helpers for the K
+  originals untouched, and the converted C cases and every packed copy use a
+  duplicated packed helper; never convert a shared helper in place. Packed
+  copy case names must be unique: `<original-name>-packed`. **Additive split, done in T0.5:** for each
+  K test, copy every assertion that does NOT use the legacy-only route into a
+  new packed case (new file `test_<name>_packed.c`, registered in `build.sh`),
+  so packed coverage of find/count/aggregate/index/CAS operators (with the class C expectation fixes applied to the copy and recorded in `PLAN_NOTES.md`; never loosen an assertion to make it pass) is exercised
+  now and a packed surprise halts here, not at T3. Where a later assertion
+  depends on state produced by a criteria update, replace that update in the
+  packed copy with the equivalent per-key updates (packed supports them);
+  if no equivalent exists, drop the assertion. **Every dropped assertion is
+  listed in `PLAN_NOTES.md` with (a) the named existing or new packed test that
+  covers it, or (b) the recorded reason it is a packed gap or an intended
+  packed difference** (e.g. computed `$incr` renders `136.00`, per-key `records`
+  shape, composite varchar key bounds, OOM fault points). Items under (b) are
+  reported to the human at the T0.5 stop for the audit index; none is silently
+  dropped. A K test whose entire subject is the legacy route (e.g.
+  `test-request-timeout` on a criteria `bulk-update` timeout) may have no
+  packed copy; its gap is reported the same way. Because a packed copy exists from T0.5 on, a K original that breaks
+  at T1 (restarts a daemon, calls `shard_db_open` on a legacy root, writes a
+  `.version` below 2026.11.2) is simply deleted there.
+- **Refusal pin, added in T0.5 (a packed object is already creatable):** new
+  daemon case `test_packed_bulk_update_criteria_refused.c`
+  (`test-packed-bulk-update-criteria-refused`, registered in `build.sh`):
+  create a packed object, insert two records, then send `bulk-update` with
+  `criteria`, a `value` (without `value` the server returns `Missing value`
+  instead) and, in a second request, `dry_run:true`; assert both responses
+  equal `{"error":"packed criteria updates await query integration"}` and that
+  `get` and `count` before and after are identical. It documents
+  AUD-PACKED-BULKUPDATE and is flipped by a later feature plan. T4's
+  `query_bulk.c` step MUST keep the `cmd_bulk_update` packed guard (it is the
+  behaviour this test pins; do not treat it as a removable dispatch branch).
+- **Class D (delete in the owning task).** Subject is removed code: deleted in
+  the task that removes it (migration tests T1/T2, legacy-codec tests the named
+  T4 step, etc.).
+
+**Deletion policy (one rule):** a subject-removed test is deleted in the task
+that removes its subject, except that a test which restarts a daemon or calls
+`shard_db_open` on a root holding a legacy object, or writes a `.version` below
+2026.11.2, breaks at T1 and is deleted (or, if not subject-removed, converted)
+there; this applies to class K tests too. Exception: class K originals whose
+subject is removed in T4 are deleted at T3 (below), not at T4. Also fix schema.conf fixtures lacking
 `layout=packed` and the rebuild-meta fixture (`old_layout=1`) now, since they
-are wrong on the base tree too. Suite green. `declaration_layout:"legacy"`
-still works in TEST_BUILD here (removed in T3).
+are wrong on the base tree too. `declaration_layout:"legacy"` still works in
+TEST_BUILD here (removed in T3).
 
 **Rule for every later task:** it converts or deletes exactly the tests the
 T0 table assigns to it, listed in `PLAN_NOTES.md`, and ends with a green full
@@ -416,6 +499,7 @@ Tests assigned to T2 by the T0 table are deleted/converted here.
   a packed object; `"legacy"` keeps the existing production error "legacy
   layout objects can no longer be created" in every build; other values keep
   "unknown declaration_layout". `describe-object` prints constant `"packed"`.
+- **First in T3, before removing legacy creation:** delete any class K originals still present (some were deleted at T1); for each, verify its `PLAN_NOTES.md` entry lists every assertion that is not present in its `-packed` copy with its coverage or gap, and that the packed copy is green. Then build and run the suite.
 - `load_schema` / `load_typed_schema` rules per case. `load_typed_schema`: a
   line present without the token, no matching line, ENOENT `schema.conf`, or
   `effective_root` outside `g_db_root` -> return NULL, NEVER cache, LOG_ERROR
@@ -476,7 +560,7 @@ removed in this step is deleted in the same step (no warning results). An
 extern helper and its declaration (in `types.h`, `typed_row.h`, `slotcask.h`,
 `schema_wire.h` etc.) are deleted in the step that removes its LAST caller;
 extern functions produce no unused warning, so check with grep. Any new
-warning fails the step; never suppress one. Order callers-first: `query_aggregate.c`, `agg_exact.c`,
+warning fails the step; never suppress one. **`query_bulk.c` end state:** `cmd_bulk_update` keeps its signature and its `server.c` dispatch and reduces to the packed refusal (`{"error":"packed criteria updates await query integration"}`, pinned by `test-packed-bulk-update-criteria-refused`); a NULL typed schema (no/unloadable schema) must return an error and never run a legacy body: the executor copies the not-found error text the `bulk-update` dispatch in `server.c` already emits for a missing object and records it in `PLAN_NOTES.md`; the legacy body and the static helpers whose last caller it was (`bulk_upd_shard_worker*` etc.) are deleted in that step. Order callers-first: `query_aggregate.c`, `agg_exact.c`,
 `query_join.c`, `query_bulk.c` + `typed_bulk_insert.c`, `query_plan.c`,
 `query.c`, `query_schema.c`, `query_find.c` (`rebuild_object*`), `storage.c`,
 `index.c`, `typed_read_command.c`, `typed_index.c`, `packed_csv_command.c`,
@@ -490,7 +574,7 @@ build shows a different dependency, noting it in `PLAN_NOTES.md`.
 
 ### T5 Final test table
 
-Nothing new beyond T1/T3. Write the final table in `PLAN_NOTES.md`: cases
+Cases added: the T1 gate tests, the T0.5 `-packed` copies and `test-packed-bulk-update-criteria-refused`. Write the final table in `PLAN_NOTES.md`: cases
 before, deleted (reason), converted, added, after.
 
 ### T6 Docs

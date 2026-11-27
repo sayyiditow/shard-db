@@ -47,17 +47,13 @@ int agg_num_spec_for(const TypedSchema *ts, size_t idx, AggNumSpec *out) {
     case FT_DOUBLE: case FT_FLOAT:
         out->cls = AGC_FLT;
         return 1;
-    case FT_NUMERIC:
-        if (ts->packed.nfields) {
-            const PkrField *p = &ts->packed.fields[idx];
-            out->cls = AGC_DEC;
-            out->bare = p->bare;
-            out->dscale = (!p->bare && p->scale > 0) ? p->scale : 0;
-            return 1;
-        }
-        out->cls = AGC_INT;
-        out->scale = f->numeric_scale_mult > 0 ? f->numeric_scale : 0;
+    case FT_NUMERIC: {
+        const PkrField *p = &ts->packed.fields[idx];
+        out->cls = AGC_DEC;
+        out->bare = p->bare;
+        out->dscale = (!p->bare && p->scale > 0) ? p->scale : 0;
         return 1;
+    }
     default:
         return 0;
     }

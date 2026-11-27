@@ -26,7 +26,7 @@ static int test_idx_varchar_find_eq(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"idx1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"idx1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"category:varchar:64\"],\"indexes\":[\"category\"]}", &resp);
     free(resp); resp = NULL;
@@ -66,7 +66,7 @@ static int test_update_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"upd1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"upd1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"category:varchar:64\"],\"indexes\":[\"category\"]}", &resp);
     free(resp); resp = NULL;
@@ -99,49 +99,6 @@ static int test_update_varchar_unescape(void) {
     return t_ctx->failed > 0 ? 1 : 0;
 }
 
-/* 1c. bulk-update (criteria+value shape) record-corruption regression (site 5). */
-static int test_bulk_update_criteria_varchar_unescape(void) {
-    TestEnv env = {0};
-    if (test_env_start(&env) != 0) return 1;
-    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
-    TestClient *tc = tc_connect(&cfg);
-    ASSERT_NOT_NULL(tc, "connect");
-    if (!tc) { test_env_stop(&env); return 1; }
-    char *resp = NULL;
-
-    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
-    tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"bu1\","
-        "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\",\"tag:varchar:16\"]}", &resp);
-    free(resp); resp = NULL;
-
-    tc_request(tc,
-        "{\"mode\":\"insert\",\"dir\":\"vue\",\"object\":\"bu1\","
-        "\"key\":\"k1\",\"value\":{\"category\":\"Plain\",\"tag\":\"x\"}}", &resp);
-    free(resp); resp = NULL;
-    tc_request(tc,
-        "{\"mode\":\"insert\",\"dir\":\"vue\",\"object\":\"bu1\","
-        "\"key\":\"k2\",\"value\":{\"category\":\"Plain\",\"tag\":\"x\"}}", &resp);
-    free(resp); resp = NULL;
-
-    tc_request(tc,
-        "{\"mode\":\"bulk-update\",\"dir\":\"vue\",\"object\":\"bu1\","
-        "\"criteria\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"x\"}],"
-        "\"value\":{\"category\":\"He said \\\"hi\\\"\"}}", &resp);
-    free(resp); resp = NULL;
-
-    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"vue\",\"object\":\"bu1\",\"key\":\"k1\"}", &resp);
-    ASSERT_CONTAINS(resp, "He said \\\"hi\\\"", "bulk-update k1: correctly single-escaped");
-    free(resp); resp = NULL;
-    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"vue\",\"object\":\"bu1\",\"key\":\"k2\"}", &resp);
-    ASSERT_CONTAINS(resp, "He said \\\"hi\\\"", "bulk-update k2: correctly single-escaped");
-    free(resp); resp = NULL;
-
-    tc_close(tc);
-    test_env_stop(&env);
-    return t_ctx->failed > 0 ? 1 : 0;
-}
-
 /* 1c2. bulk-update (records shape) record-corruption regression (site 8),
    covering both accepted top-level formats. */
 static int test_bulk_update_json_varchar_unescape(void) {
@@ -155,7 +112,7 @@ static int test_bulk_update_json_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"bj1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"bj1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
@@ -173,7 +130,7 @@ static int test_bulk_update_json_varchar_unescape(void) {
     free(resp); resp = NULL;
 
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"bj2\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"bj2\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
     tc_request(tc,
@@ -209,7 +166,7 @@ static int test_criteria_unindexed_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"un1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"un1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
 
@@ -247,7 +204,7 @@ static int test_criteria_in_list_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"in1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"in1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
 
@@ -286,7 +243,7 @@ static int test_criteria_between_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"bt1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"bt1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
 
@@ -323,14 +280,19 @@ static int test_varchar_embedded_nul_rejected(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"nul1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"nul1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
 
     tc_request(tc,
         "{\"mode\":\"insert\",\"dir\":\"vue\",\"object\":\"nul1\","
         "\"key\":\"k1\",\"value\":{\"category\":\"a\\u0000b\"}}", &resp);
-    ASSERT_CONTAINS(resp, "\"error\"", "insert with \\u0000 in a varchar value is rejected, not silently truncated");
+    ASSERT_CONTAINS(resp, "\"status\":\"inserted\"",
+                    "insert with \\u0000 in a packed varchar is accepted");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"vue\",\"object\":\"nul1\",\"key\":\"k1\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"category\":\"a\\u0000b\"",
+                    "embedded NUL is stored and rendered exactly");
     free(resp); resp = NULL;
 
     tc_close(tc);
@@ -351,7 +313,7 @@ static int test_varchar_trailing_backslash(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"trail1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"trail1\","
         "\"splits\":8,\"max_key\":16,\"fields\":[\"category:varchar:64\"],"
         "\"indexes\":[\"category\"]}", &resp);
     free(resp); resp = NULL;
@@ -395,7 +357,7 @@ static int test_upsert_json_index_routes_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"routes1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"routes1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"category:varchar:64\",\"region:varchar:64\","
         "\"kind:varchar:64\",\"bio:varchar:128\"],"
@@ -465,7 +427,7 @@ static int test_simple_criteria_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"simple1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"simple1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"category:varchar:64\",\"tag:varchar:16\"]}", &resp);
     free(resp); resp = NULL;
@@ -490,101 +452,6 @@ static int test_simple_criteria_varchar_unescape(void) {
     tc_request(tc,
         "{\"mode\":\"get\",\"dir\":\"vue\",\"object\":\"simple1\",\"key\":\"k1\"}", &resp);
     ASSERT_CONTAINS(resp, "\"tag\":\"new\"", "simple CAS update committed");
-    free(resp); resp = NULL;
-
-    tc_close(tc);
-    test_env_stop(&env);
-    return t_ctx->failed > 0 ? 1 : 0;
-}
-
-/* 1k. Malformed varchar escapes must be rejected at the documented
-   granularity: insert/update/criteria bulk-update are atomic, per-record
-   bulk-update skips only its bad record, and malformed IN/NOT_IN criteria
-   reject rather than broadening a NOT_IN result set. Covers Tasks 2e, 2f,
-   2h, 2i, and 2j. */
-static int test_varchar_malformed_escape_policies(void) {
-    TestEnv env = {0};
-    if (test_env_start(&env) != 0) return 1;
-    TestClientCfg cfg = { .port = env.port, .io_timeout_ms = 30000 };
-    TestClient *tc = tc_connect(&cfg);
-    ASSERT_NOT_NULL(tc, "connect");
-    if (!tc) { test_env_stop(&env); return 1; }
-    char *resp = NULL;
-
-    tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
-    tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"bad1\","
-        "\"splits\":8,\"max_key\":16,"
-        "\"fields\":[\"category:varchar:64\",\"tag:varchar:16\"]}", &resp);
-    free(resp); resp = NULL;
-
-    /* Site 9: insert must reject malformed JSON text instead of storing
-       literal backslash bytes and leaving its index/write-side callers out
-       of sync. The C literal's \\q produces the invalid JSON escape \q on
-       the wire. */
-    tc_request(tc,
-        "{\"mode\":\"insert\",\"dir\":\"vue\",\"object\":\"bad1\","
-        "\"key\":\"bad\",\"value\":{\"category\":\"bad\\q\"}}", &resp);
-    ASSERT_CONTAINS(resp, "\"error\"", "malformed varchar insert is rejected");
-    free(resp); resp = NULL;
-
-    tc_request(tc,
-        "{\"mode\":\"insert\",\"dir\":\"vue\",\"object\":\"bad1\","
-        "\"key\":\"k1\",\"value\":{\"category\":\"Old\",\"tag\":\"old\"}}", &resp);
-    free(resp); resp = NULL;
-
-    /* Site 4: malformed one field rejects the complete single-record
-       patch; the otherwise-valid tag field must not be changed. */
-    tc_request(tc,
-        "{\"mode\":\"update\",\"dir\":\"vue\",\"object\":\"bad1\",\"key\":\"k1\","
-        "\"value\":{\"category\":\"bad\\q\",\"tag\":\"changed\"}}", &resp);
-    ASSERT_CONTAINS(resp, "\"error\"", "single update rejects malformed varchar patch atomically");
-    free(resp); resp = NULL;
-    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"vue\",\"object\":\"bad1\",\"key\":\"k1\"}", &resp);
-    ASSERT_CONTAINS(resp, "\"category\":\"Old\"", "single update leaves malformed field unchanged");
-    ASSERT_CONTAINS(resp, "\"tag\":\"old\"", "single update leaves sibling field unchanged");
-    free(resp); resp = NULL;
-
-    /* Site 5: the shared criteria bulk-update patch is validated before
-       worker dispatch, so no selected record receives even its valid field. */
-    tc_request(tc,
-        "{\"mode\":\"bulk-update\",\"dir\":\"vue\",\"object\":\"bad1\","
-        "\"criteria\":[{\"field\":\"tag\",\"op\":\"eq\",\"value\":\"old\"}],"
-        "\"value\":{\"category\":\"bad\\q\",\"tag\":\"changed\"}}", &resp);
-    ASSERT_CONTAINS(resp, "\"error\"", "criteria bulk-update rejects malformed shared patch atomically");
-    free(resp); resp = NULL;
-    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"vue\",\"object\":\"bad1\",\"key\":\"k1\"}", &resp);
-    ASSERT_CONTAINS(resp, "\"tag\":\"old\"", "criteria bulk-update writes no partial update");
-    free(resp); resp = NULL;
-
-    tc_request(tc,
-        "{\"mode\":\"insert\",\"dir\":\"vue\",\"object\":\"bad1\","
-        "\"key\":\"k2\",\"value\":{\"category\":\"Old\",\"tag\":\"old\"}}", &resp);
-    free(resp); resp = NULL;
-
-    /* Site 8: records carry independent patches, so only the bad entry is
-       skipped while the valid peer still commits. */
-    tc_request(tc,
-        "{\"mode\":\"bulk-update\",\"dir\":\"vue\",\"object\":\"bad1\",\"records\":["
-        "{\"key\":\"k1\",\"value\":{\"category\":\"bad\\q\"}},"
-        "{\"key\":\"k2\",\"value\":{\"category\":\"Good\"}}]}", &resp);
-    ASSERT_CONTAINS(resp, "\"matched\":2", "records bulk-update sees both entries");
-    ASSERT_CONTAINS(resp, "\"updated\":1", "records bulk-update applies the valid entry");
-    ASSERT_CONTAINS(resp, "\"skipped\":1", "records bulk-update skips only the malformed entry");
-    free(resp); resp = NULL;
-    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"vue\",\"object\":\"bad1\",\"key\":\"k1\"}", &resp);
-    ASSERT_CONTAINS(resp, "\"category\":\"Old\"", "bad records entry leaves k1 unchanged");
-    free(resp); resp = NULL;
-    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"vue\",\"object\":\"bad1\",\"key\":\"k2\"}", &resp);
-    ASSERT_CONTAINS(resp, "\"category\":\"Good\"", "valid records entry updates k2");
-    free(resp); resp = NULL;
-
-    /* Site 7: malformed NOT_IN must reject the criterion, never drop the
-       bad element and broaden the result set. */
-    tc_request(tc,
-        "{\"mode\":\"find\",\"dir\":\"vue\",\"object\":\"bad1\","
-        "\"criteria\":[{\"field\":\"category\",\"op\":\"not_in\",\"value\":[\"bad\\q\"]}]}", &resp);
-    ASSERT_CONTAINS(resp, "\"error\"", "malformed NOT_IN element rejects the whole criterion");
     free(resp); resp = NULL;
 
     tc_close(tc);
@@ -630,7 +497,7 @@ static int test_cursor_order_by_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"curs1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"curs1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"tag:varchar:16\"],\"indexes\":[\"tag\"]}", &resp);
     free(resp); resp = NULL;
@@ -712,7 +579,7 @@ static int test_get_multi_csv_varchar_unescape(void) {
 
     tc_request(tc, "{\"mode\":\"add-dir\",\"dir\":\"vue\"}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"vue\",\"object\":\"csvm1\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"vue\",\"object\":\"csvm1\","
         "\"splits\":8,\"max_key\":16,"
         "\"fields\":[\"category:varchar:64\"]}", &resp);
     free(resp); resp = NULL;
@@ -738,7 +605,6 @@ static int test_get_multi_csv_varchar_unescape(void) {
 
 TEST_REGISTER("idx-varchar-find-eq",              test_idx_varchar_find_eq)
 TEST_REGISTER("update-varchar-unescape",          test_update_varchar_unescape)
-TEST_REGISTER("bulk-update-criteria-varchar-unescape", test_bulk_update_criteria_varchar_unescape)
 TEST_REGISTER("bulk-update-json-varchar-unescape",     test_bulk_update_json_varchar_unescape)
 TEST_REGISTER("criteria-unindexed-varchar-unescape",   test_criteria_unindexed_varchar_unescape)
 TEST_REGISTER("criteria-in-list-varchar-unescape",     test_criteria_in_list_varchar_unescape)
@@ -747,6 +613,5 @@ TEST_REGISTER("varchar-embedded-nul-rejected",         test_varchar_embedded_nul
 TEST_REGISTER("varchar-trailing-backslash",            test_varchar_trailing_backslash)
 TEST_REGISTER("upsert-json-index-routes-unescape",     test_upsert_json_index_routes_unescape)
 TEST_REGISTER("simple-criteria-varchar-unescape",      test_simple_criteria_varchar_unescape)
-TEST_REGISTER("varchar-malformed-escape-policies",     test_varchar_malformed_escape_policies)
 TEST_REGISTER("cursor-order-by-varchar-unescape",      test_cursor_order_by_varchar_unescape)
 TEST_REGISTER("get-multi-csv-varchar-unescape",        test_get_multi_csv_varchar_unescape)

@@ -38,12 +38,11 @@ record silently omitted from the index. An index build encountering such a
 live value fails before publishing that shard. The previous complete shard
 remains available, under the publication and durability rules above.
 
-Legacy index bytes retain their existing interpretation. Private packed numeric
-keys use exact canonical decimal ordering, independent of display scale. Public
-packed loading and migration remain inactive until authoritative layout metadata
-and rebuild eligibility are implemented. Ordinary legacy varchar-leading
-composite indexes remain creatable and filterable; fixed-width non-final
-components are an additional cursor eligibility rule, not a creation rule.
+Packed numeric keys use exact canonical decimal ordering, independent of
+display scale. Every object is packed (2026.11.3 removed the legacy layout and
+its index interpretation); composite varchar components escape embedded NULs
+when a component is non-final. Fixed-width non-final components are an
+additional cursor eligibility rule, not a creation rule.
 
 Add an index when:
 - You run `find` / `count` / `aggregate` filtered by that field, and

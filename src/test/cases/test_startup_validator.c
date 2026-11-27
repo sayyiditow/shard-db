@@ -188,7 +188,7 @@ static int test_startup_validator_run(void) {
         snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
         FILE *sf = fopen(schema_path, "a");
         if (sf) {
-            fputs(saved_line[0] ? saved_line : "default:v:16:16:2:1\n", sf);
+            fputs(saved_line[0] ? saved_line : "default:v:16:16:2:1:layout=packed\n", sf);
             fclose(sf);
         }
     }
@@ -217,7 +217,7 @@ static int test_startup_validator_run(void) {
         char schema_path[400];
         snprintf(schema_path, sizeof(schema_path), "%s/schema.conf", db_root);
         FILE *sf = fopen(schema_path, "a");
-        if (sf) { fputs("ghost_tenant:obj:16:16:2:1\n", sf); fclose(sf); }
+        if (sf) { fputs("ghost_tenant:obj:16:16:2:1:layout=packed\n", sf); fclose(sf); }
     }
     refused = spawn_expecting_failure(base, shard_db_abs, port, &env);
     ASSERT_TRUE(!refused, "stale schema.conf dir is warned, not refused");

@@ -98,7 +98,8 @@ int typed_schema_bind_packed(TypedSchema *ts,const char *const *types,
     ts->total_size=(int)next.maximum;return 0;
 }
 uint8_t typed_schema_hdr2(const TypedSchema *ts) {
-    return ts&&ts->packed.nfields?PKR_FLAGS:SREC_FLAG_NULLMAP;
+    (void)ts;
+    return PKR_FLAGS;
 }
 int typed_row_open(const TypedSchema *ts,const uint8_t *value,size_t len,
                     uint8_t hdr2,TypedRowView *out) {
@@ -106,54 +107,29 @@ int typed_row_open(const TypedSchema *ts,const uint8_t *value,size_t len,
     if(!ts||!ts->typed||ts->nfields<1||ts->nfields>MAX_FIELDS||!value){
         errno=EINVAL;return -1;}
     TypedRowView v={0};v.schema=ts;v.value=value;v.len=len;v.hdr2=hdr2;
-    if(ts->packed.nfields){
-        if(!packed_schema_ok(ts)){errno=EILSEQ;return -1;}
-        dec_status st=pkr_view(&ts->packed,value,len,hdr2,&v.packed);
-        if(st!=DEC_OK){errno=st==DEC_ERR_NOMEM?ENOMEM:EILSEQ;return -1;}
-        v.base=value+ts->packed.prefix;v.region=len-ts->packed.prefix;
-        v.bitmap=value+1;v.bitmap_bytes=(int)ts->packed.prefix-1;
-    }else{
-        if(typed_record_view(value,len,hdr2,&v.base,&v.bitmap,
-                              &v.bitmap_bytes,&v.region)!=0){
-            errno=EILSEQ;return -1;}
-    }
+    if(!packed_schema_ok(ts)){errno=EILSEQ;return -1;}
+    dec_status st=pkr_view(&ts->packed,value,len,hdr2,&v.packed);
+    if(st!=DEC_OK){errno=st==DEC_ERR_NOMEM?ENOMEM:EILSEQ;return -1;}
+    v.base=value+ts->packed.prefix;v.region=len-ts->packed.prefix;
+    v.bitmap=value+1;v.bitmap_bytes=(int)ts->packed.prefix-1;
     *out=v;return 0;
 }
 int typed_row_span(const TypedRowView *v,size_t index,TypedRowSpan *out) {
     if(!out){errno=EINVAL;return -1;}memset(out,0,sizeof(*out));
     if(!v||!v->schema||index>=(size_t)v->schema->nfields){errno=EINVAL;return -1;}
-    if(v->schema->packed.nfields){
+    {
         PkrSpan p;if(pkr_span(&v->packed,index,&p)!=DEC_OK){errno=EILSEQ;return -1;}
         out->data=p.data;out->len=p.len;out->is_null=p.state==PKR_NULL;
         out->complete=1;return 0;
     }
-    const TypedField *f=&v->schema->fields[index];
-    if(f->offset<0||f->size<1||f->size>65537){errno=EILSEQ;return -1;}
-    out->is_null=typed_field_null(v->bitmap,v->bitmap_bytes,(int)index);
-    size_t off=(size_t)f->offset,cap=(size_t)f->size;
-    if(off<v->region){
-        out->len=v->region-off;if(out->len>cap)out->len=cap;
-        out->data=v->base+off;
-    }
-    out->complete=out->len==cap;return 0;
 }
 int typed_span_read(const TypedSchema *ts,size_t index,const TypedRowSpan *s,
                       const uint8_t **out) {
-    static const uint8_t zero[65537];
     if(!out){errno=EINVAL;return -1;}*out=NULL;
     if(!ts||!s||index>=(size_t)ts->nfields||s->is_null){errno=EINVAL;return -1;}
-    if(ts->packed.nfields){if(!s->complete){errno=EILSEQ;return -1;}*out=s->data;}
-    else *out=s->complete?s->data:zero;
+    if(!s->complete){errno=EILSEQ;return -1;}
+    *out=s->data;
     return 0;
-}
-int typed_span_copy_legacy(const TypedSchema *ts,size_t index,
-                             const TypedRowSpan *s,uint8_t *out,size_t cap){
-    if(!ts||ts->packed.nfields||index>=(size_t)ts->nfields||!s||!out||
-       ts->fields[index].size<1||cap<(size_t)ts->fields[index].size){
-        errno=EINVAL;return -1;}
-    size_t width=(size_t)ts->fields[index].size;
-    if(s->len>width||(!s->data&&s->len)){errno=EILSEQ;return -1;}
-    memset(out,0,width);if(s->len)memcpy(out,s->data,s->len);return 0;
 }
 void typed_prepared_init(TypedPrepared *p){if(p)memset(p,0,sizeof(*p));}
 void typed_prepared_free(TypedPrepared *p){
@@ -664,14 +640,6 @@ int typed_encode_alloc(const TypedSchema *ts,const char *json,int defaults,
     *out=NULL;*len=0;if(!ts||!ts->typed||ts->total_size<1)
         return row_error(err,cap,EINVAL,"invalid typed schema");
     if(!json)return row_error(err,cap,EINVAL,"invalid record JSON");
-    if(!ts->packed.nfields){
-        uint8_t *b=malloc((size_t)ts->total_size);if(!b)return row_error(err,cap,ENOMEM,"oom");
-        errno=0;
-        int rc=defaults?typed_encode_defaults(ts,json,b,ts->total_size,root,object,err,cap):
-            typed_encode(ts,json,b,ts->total_size,err,cap);
-        if(rc<0){int cause=errno==ENOMEM?ENOMEM:EINVAL;free(b);errno=cause;return rc;}
-        *out=b;*len=(size_t)rc;return 0;
-    }
     TypedPrepared p;typed_prepared_init(&p);
     int rc=prepare_json(ts,json,defaults,root,object,&p,NULL,0,err,cap);
     if(!rc)rc=typed_prepared_alloc(&p,out,len,err,cap);
@@ -764,30 +732,6 @@ int typed_update_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
                          size_t *len,char *err,size_t cap){
     if(!out||!len)return row_error(err,cap,EINVAL,"invalid output");
     *out=NULL;*len=0;if(!ts||!old)return row_error(err,cap,EINVAL,"invalid update");
-    if(!ts->packed.nfields){
-        if(ts->total_size<1)return row_error(err,cap,EINVAL,"invalid schema");
-        uint8_t *b=malloc((size_t)ts->total_size);if(!b)return row_error(err,cap,ENOMEM,"oom");
-        if(update_compose_new_from_old(ts,old,b,NULL,NULL,err,cap)){
-            free(b);return row_error(err,cap,EILSEQ,"invalid OLD record");
-        }
-        if(inputs)for(int i=0;i<ts->nfields;i++){
-            const TypedField *f=&ts->fields[i];const TypedInput *in=&inputs[i];
-            if(f->removed||!in->supplied)continue;
-            uint8_t *dst=b+ts->nullmap_prefix+f->offset;
-            if(in->is_null){
-                if(f->not_null){fmt_not_null_err(f,err,cap);free(b);errno=EINVAL;return -1;}
-                memset(dst,0,(size_t)f->size);typed_set_null(b+1,ts->nullmap_prefix-1,i);
-            }else{
-                if(in->len&&!in->data){free(b);return row_error(err,cap,EINVAL,"invalid value span");}
-                if(row_encode_fixed(f,in->data?in->data:"",in->len,in->quoted,dst,err,cap)){
-                    int cause=errno;free(b);errno=cause;return -1;
-                }
-                typed_clear_null(b+1,ts->nullmap_prefix-1,i);
-            }
-        }
-        if(stamp)update_stamp_auto_update_fields(ts,b);
-        *out=b;*len=(size_t)ts->total_size;return 0;
-    }
     TypedPrepared p;typed_prepared_init(&p);
     int rc=typed_prepared_old(ts,old,&p,err,cap);
     if(!rc&&inputs)for(int i=0;i<ts->nfields;i++){

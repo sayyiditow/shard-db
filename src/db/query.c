@@ -3423,9 +3423,7 @@ static void bm_dict_match_clear(BmDictMatchCtx *m) {
 /* Numeric dictionary entries carry sortable index payloads, never packed
  * record descriptors or display text. Validate their canonical shape before
  * comparing. This does not decode or rewrite the engine's dictionary. */
-static int bm_numeric_payload_valid(const TypedSchema *ts,
-                                    const uint8_t *v, size_t n) {
-    if (!ts->packed.nfields) return n == 8;
+static int bm_numeric_payload_valid(const uint8_t *v, size_t n) {
     if (n == 1) return v[0] == 1;
     if (n < 9 || !(n & 1) || (v[0] != 0 && v[0] != 2)) return 0;
     unsigned mask = v[0] == 0 ? 255u : 0u;
@@ -3469,7 +3467,7 @@ static int bm_numeric_dict_match(BmDictMatchCtx *m, const uint8_t *v,
         valid=n==(size_t)m->tf->enum_width&&(n==1||n==2);
         if(valid){unsigned e=n==2?((unsigned)v[0]<<8)|v[1]:v[0];
             valid=e<(unsigned)m->tf->n_enum_values;}
-    }else if(valid)valid=bm_numeric_payload_valid(m->schema,v,n);
+    }else if(valid)valid=bm_numeric_payload_valid(v,n);
     if(!valid){errno=EILSEQ;return -1;}
     if (c->op == OP_EXISTS) { *matched = 1; return 0; }
     if (c->op == OP_IN || c->op == OP_NOT_IN) {

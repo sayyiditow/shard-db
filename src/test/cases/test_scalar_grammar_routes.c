@@ -181,8 +181,8 @@ static void sg_insert_matrix(void) {
     /* varchar. */
     sg_cell("s1", "s", "\"hi\"", NULL, "\"s\":\"hi\"", "varchar ok");
     sg_cell("s2", "s", "\"\"",   NULL, "\"s\":\"\"", "empty varchar stores empty (unchanged)");
-    sg_cell("s3", "s", "\"a\\u0000b\"", "malformed JSON escape", NULL,
-            "legacy varchar rejects decoded NUL (D7 unchanged)");
+    sg_cell("s3", "s", "\"a\\u0000b\"", NULL, "\"s\":\"a\\u0000b\"",
+            "packed varchar stores decoded NUL exactly (R4 D7)");
 }
 
 /* ---- update route (storage.c encode_field_checked path + brace gate) ---- */
@@ -404,7 +404,7 @@ static void sg_criteria(void) {
    Declaration-time validation of NEW definitions is Task 5. */
 static void sg_defaults(void) {
     char *r;
-    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sgd\","
+    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sgd\","
                "\"splits\":8,\"max_key\":32,\"fields\":["
                "\"b2:bool:default=yes\",\"t2:time:default=12:30:45\","
                "\"d2:date:default=2024-01-05\"]}");
@@ -424,16 +424,16 @@ static void sg_defaults(void) {
     /* Defaults that are not in the grammar fail at DECLARATION time (the
        create-object wire validates defaults through encode_field_checked).
        Pre-2024-R4 schemas carrying lenient defaults still fail at insert. */
-    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sgd2\","
+    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sgd2\","
                "\"splits\":8,\"max_key\":32,\"fields\":[\"d3:date:default=2024-1-5\"]}");
     ASSERT_TRUE(sg_is_err(r), "declaration rejects a lenient date default");
     sg_free(r);
-    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sgd3\","
+    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sgd3\","
                "\"splits\":8,\"max_key\":32,\"fields\":[\"u3:uuid:default=\"]}");
     ASSERT_TRUE(sg_is_err(r), "declaration rejects an empty uuid default");
     sg_free(r);
     /* Unknown enum default is already rejected at declaration time. */
-    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sgd4\","
+    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sgd4\","
                "\"splits\":8,\"max_key\":32,\"fields\":["
                "\"e2:enum(red,green,blue):default=purple\"]}");
     ASSERT_TRUE(sg_is_err(r) && strstr(r, "default value"),
@@ -467,7 +467,7 @@ static void sg_cursor_zero_date(void) {
    error (hunk 2f): the junk driver row joins nothing. */
 static void sg_join(void) {
     char *r;
-    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sgj\","
+    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sgj\","
                "\"splits\":8,\"max_key\":32,\"fields\":[\"s:varchar:40\"]}");
     ASSERT_TRUE(!sg_is_err(r), "join driver object");
     sg_free(r);
@@ -510,12 +510,12 @@ static void sg_join(void) {
    full-scan per-record path. */
 static void sg_indexed_vs_scan(void) {
     char *r;
-    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sgi\","
+    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sgi\","
                "\"splits\":8,\"max_key\":32,\"fields\":[\"b:bool\",\"e:enum(red,green,blue)\"],"
                "\"indexes\":[\"b\",\"e\"]}");
     ASSERT_TRUE(!sg_is_err(r), "indexed twin object");
     sg_free(r);
-    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sgu\","
+    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sgu\","
                "\"splits\":8,\"max_key\":32,\"fields\":[\"b:bool\",\"e:enum(red,green,blue)\"]}");
     ASSERT_TRUE(!sg_is_err(r), "unindexed twin object");
     sg_free(r);
@@ -554,7 +554,7 @@ static void sg_indexed_vs_scan(void) {
 /* ---- Task 5: server-generated values stay in-grammar; declaration gates ---- */
 static void sg_generated_defaults(void) {
     char *r;
-    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sgv\","
+    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sgv\","
                "\"splits\":8,\"max_key\":32,\"fields\":["
                "\"d_ac:date:auto_create\",\"dt_au:datetime:auto_update\","
                "\"ts_ac:timestamp:auto_create\",\"u_ud:uuid:default=uuid()\","
@@ -624,7 +624,7 @@ static void sg_generated_defaults(void) {
     ASSERT_TRUE(sg_is_err(r), "add-field rejects an invalid calendar default");
     if (r && !sg_is_err(r)) TAP_DIAG("add-field bad default resp: %s", r);
     sg_free(r);
-    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sgv2\","
+    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sgv2\","
                "\"splits\":8,\"max_key\":32,\"fields\":[\"d:date:default=2024-02-30\"]}");
     ASSERT_TRUE(sg_is_err(r), "create-object rejects an invalid calendar default");
     sg_free(r);
@@ -671,8 +671,8 @@ static const RtRow RT[] = {
     {"i4","ipv4","\"999.1.1.1\"","999.1.1.1","not a valid ipv4","\"10.0.0.1\"","10.0.0.1","\"i4\":\"10.0.0.1\"",1},
     {"i6","ipv6","\"::g\"","::g","not a valid ipv6","\"::1\"","::1","\"i6\":\"::1\"",1},
     {"e","enum(red,green,blue)","\"purple\"","purple","not a valid enum","\"green\"","green","\"e\":\"green\"",1},
-    {"s","varchar:8","\"123456789\"","123456789","exceeds max","\"hi\"","hi","\"s\":\"hi\"",0},
-    {"n","numeric:12,2","\"abc\"","abc","not a valid numeric","\"0\"","0","\"n\":0",1},
+    {"s","varchar:8","\"123456789\"","123456789","varchar content exceeds declaration","\"hi\"","hi","\"s\":\"hi\"",0},
+    {"n","numeric:12,2","\"abc\"","abc","expected a decimal number","\"0\"","0","\"n\":0",1},
 };
 static const char *const RT_CSV_FILLER[11] = {
     "true","20240105","20240105010203","20240105010203004","12:30:45",
@@ -681,7 +681,7 @@ static const char *const RT_CSV_FILLER[11] = {
 
 static void sg_route_matrix(void) {
     char req[1024], *r;
-    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sgm\","
+    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sgm\","
                "\"splits\":8,\"max_key\":32,\"fields\":["
                "\"b:bool\",\"d:date\",\"dt:datetime\",\"dm:datetimems\",\"t:time\","
                "\"u:uuid\",\"i4:ipv4\",\"i6:ipv6\",\"e:enum(red,green,blue)\","
@@ -758,7 +758,7 @@ static void sg_route_matrix(void) {
         }
         /* 5. default declaration rejects the same literal. */
         snprintf(req, sizeof req,
-                 "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sgm_x\","
+                 "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sgm_x\","
                  "\"splits\":8,\"max_key\":32,\"fields\":[\"f:%s:default=%s\"]}",
                  w->type, w->bad);
         r = sg_req(req);
@@ -918,7 +918,7 @@ static int test_scalar_grammar_routes_run(void) {
     if (!sg_db) return 1;
     char *r = sg_req("{\"mode\":\"add-dir\",\"dir\":\"default\"}");
     sg_free(r);
-    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"sg\","
+    r = sg_req("{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"sg\","
                "\"splits\":8,\"max_key\":32,\"fields\":["
                "\"b:bool\",\"d:date\",\"dt:datetime\",\"dm:datetimems\",\"t:time\","
                "\"u:uuid\",\"i4:ipv4\",\"i6:ipv6\",\"e:enum(red,green,blue)\",\"s:varchar:8\"],"

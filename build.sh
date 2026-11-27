@@ -187,12 +187,11 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/fixtures.c \
     src/test/cases/test_bool_literal_update_roundtrip.c \
     src/test/cases/test_trim_compact_oob_fields.c \
-    src/test/cases/test_or_logic.c \
+    src/test/cases/test_or_logic_packed.c \
     src/test/cases/test_crash_safety.c \
     src/test/cases/test_rename_field.c \
     src/test/cases/test_edit_field.c \
     src/test/cases/test_packed_recompose.c \
-    src/test/cases/test_legacy_recompose.c \
     src/test/cases/test_edit_field_polish.c \
     src/test/cases/test_add_field_computed_defaults.c \
     src/test/cases/test_auto_key.c \
@@ -204,12 +203,11 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_joins.c \
     src/test/cases/test_describe.c \
     src/test/cases/test_tenant_mgmt.c \
-    src/test/cases/test_regex.c \
+    src/test/cases/test_regex_packed.c \
     src/test/cases/test_bare_shapes.c \
     src/test/cases/test_list_files.c \
-    src/test/cases/test_bulk_update_json.c \
-    src/test/cases/test_bulk_update_json_oom.c \
-    src/test/cases/test_alloc_error_propagation.c \
+    src/test/cases/test_bulk_update_json_packed.c \
+    src/test/cases/test_alloc_error_propagation_packed.c \
     src/test/cases/test_indexed_zero_exists.c \
     src/test/cases/test_agg_exact_routes.c \
     src/test/cases/test_agg_empty_avg_order.c \
@@ -221,10 +219,10 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_failclosed_walkers.c \
     src/test/cases/test_audit_oracle_strictness.c \
     src/test/cases/test_remove_field.c \
-    src/test/cases/test_length_ops.c \
+    src/test/cases/test_length_ops_packed.c \
     src/test/cases/test_unknown_field_validation.c \
     src/test/cases/test_idx_cache_tenants.c \
-    src/test/cases/test_index_oversized_varchar.c \
+    src/test/cases/test_index_oversized_varchar_packed.c \
     src/test/cases/test_odirect_single_shot.c \
     src/test/cases/test_cursor_with_total.c \
     src/test/cases/test_small_prefilter_orderby.c \
@@ -233,7 +231,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_all_field_types.c \
     src/test/cases/test_case_sensitivity.c \
     src/test/cases/test_objlock.c \
-    src/test/cases/test_field_vs_field.c \
+    src/test/cases/test_field_vs_field_packed.c \
     src/test/cases/test_binary_index.c \
     src/test/cases/test_stats_prom.c \
     src/test/cases/test_parallel_index_integrity.c \
@@ -245,7 +243,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_agg_int_groupby_resize.c \
     src/test/cases/test_agg_leaf_only_walk.c \
     src/test/cases/test_agg_varchar_groupby_limit.c \
-    src/test/cases/test_agg_varchar_groupby_sum.c \
+    src/test/cases/test_agg_varchar_groupby_sum_packed.c \
     src/test/cases/test_aggregate_type_matrix.c \
     src/test/cases/test_igb_bitmap_group_fallback.c \
     src/test/cases/test_agg_or_subtree_full_tree.c \
@@ -269,12 +267,11 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_agg_walk_fetch_check.c \
     src/test/cases/test_regex_anchor_prefilter.c \
     src/test/cases/test_request_flush_batching.c \
-    src/test/cases/test_request_timeout.c \
     src/test/cases/test_and_intersection.c \
     src/test/cases/test_find_cursor.c \
     src/test/cases/test_multi_order_cursor.c \
     src/test/cases/test_schema_export.c \
-    src/test/cases/test_bulk_cas.c \
+    src/test/cases/test_bulk_cas_packed.c \
     src/test/cases/test_token_perms.c \
     src/test/cases/test_csv_export.c \
     src/test/cases/test_cursor_sparse_prefetch.c \
@@ -316,6 +313,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_restore_tokens.c \
     src/test/cases/test_shard_stats_hint.c \
     src/test/cases/test_startup_validator.c \
+    src/test/cases/test_legacy_root_refused.c \
     src/test/cases/test_index_splits_curve.c \
     src/test/cases/test_range_coalesce.c \
     src/test/cases/test_count_varchar_field.c \
@@ -326,7 +324,8 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_slotcask_cas.c \
     src/test/cases/test_slotcask_v2_wire.c \
     src/test/cases/test_slotcask_v2_query.c \
-    src/test/cases/test_slotcask_v2_bulk.c \
+    src/test/cases/test_packed_bulk_update_criteria_refused.c \
+    src/test/cases/test_slotcask_v2_bulk_packed.c \
     src/test/cases/test_bulk_delete_criteria_indexed.c \
     src/test/cases/test_slotcask_v2_parity.c \
     src/test/cases/test_slotcask_v2_schema.c \
@@ -351,6 +350,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_bt_cache_writer_starvation.c \
     src/test/cases/test_json_escape.c \
     src/test/cases/test_index_varchar_unescape.c \
+    src/test/cases/test_varchar_malformed_escape_policies_packed.c \
     src/test/cases/test_timestamp.c \
     src/test/cases/test_datetimems.c \
     src/test/cases/test_bitmap_index.c \
@@ -359,18 +359,15 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_enum.c \
     src/test/cases/test_null_bugs.c \
     src/test/cases/test_null_storage.c \
-    src/test/cases/test_null_migration.c \
     src/test/cases/test_null_criteria.c \
     src/test/cases/test_null_index.c \
     src/test/cases/test_null_bulk.c \
     src/test/cases/test_null_agg_order.c \
     src/test/cases/test_null_review_fixes.c \
-    src/test/cases/test_null_legacy_rebuild.c \
     src/test/cases/test_not_null_schema.c \
-    src/test/cases/test_not_null_compat.c \
-    src/test/cases/test_cas_tree_if.c \
+    src/test/cases/test_cas_tree_if_packed.c \
     src/test/cases/test_return_record.c \
-    src/test/cases/test_computed_update.c \
+    src/test/cases/test_computed_update_packed.c \
     src/test/cases/test_write_reservation.c \
     src/test/cases/test_cas_guards.c \
     src/test/cases/test_cas_guard_race.c \
@@ -379,7 +376,7 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_guard_condition_proof.c \
     src/test/cases/test_not_null_edit_modifiers.c \
     src/test/cases/test_not_null_writes.c \
-    src/test/cases/test_not_null_updates.c \
+    src/test/cases/test_not_null_updates_packed.c \
     src/test/cases/test_not_null_edit_gate.c \
     src/test/cases/test_long_field_def.c \
     src/test/cases/test_edit_long_default.c \
@@ -461,7 +458,6 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_planner_materialization_guard.c \
     src/test/cases/test_planner_op_capability.c \
     src/test/cases/test_d1_composite_executor.c \
-    src/test/cases/test_composite_varchar_bound.c \
     src/test/cases/test_composite_in_fold.c \
     src/test/cases/test_composite_typed.c \
     src/test/cases/test_composite_selectivity_guard.c \
@@ -531,7 +527,6 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_restore_swap_commit.c \
     src/test/cases/test_query_slot_all_grammars.c \
     src/test/cases/test_compact_donor_kf_sync.c \
-    src/test/cases/test_bulk_insert_arena_oom.c \
     src/test/audit/audit_crash_restart.c \
     src/test/audit/audit_planner_diff.c \
     src/test/audit/audit_fault_inject.c \
@@ -783,4 +778,4 @@ echo "Deploy: copy build/bin/ contents to your install dir (e.g. /opt/shard-db/b
 echo "First-time setup: cp db.env.example db.env, edit, then ./shard-db start."
 BUILD_VERSION=$(sed -n 's/^#define SHARD_DB_VERSION "\(.*\)"/\1/p' src/db/version.h)
 BUILD_REQUIRED_SOURCE_VERSION=$(sed -n 's/^#define SHARD_DB_REQUIRED_SOURCE_VERSION "\(.*\)"/\1/p' src/db/version.h)
-echo "Upgrades: this build is shard-db $BUILD_VERSION. A filesystem-empty DB_ROOT initializes directly; every non-empty root must have valid clean-open evidence at or after shard-db $BUILD_REQUIRED_SOURCE_VERSION and before this binary's version. This release does not migrate: roots must carry shard-db 2026.09.2 clean-open evidence — older roots must first be opened once by 2026.09.2, then upgraded. Run './shard-db version' to inspect a binary without starting it. Legacy v1 objects (pre-2026.05.5) still require the historical 2026.05.4 ./migrate upgrade path before this binary can open them."
+echo "Upgrades: this build is shard-db $BUILD_VERSION. A filesystem-empty DB_ROOT initializes directly; every non-empty root must have valid clean-open evidence at or after shard-db $BUILD_REQUIRED_SOURCE_VERSION (the minimum supported source). This release does not migrate: install 2026.11.2, start it once to completion against the DB_ROOT, stop it cleanly, then install this version. Startup also refuses any non-packed object, any token-less schema.conf line, and any unusable rebuild-txn metadata. Run './shard-db version' to inspect a binary without starting it. Legacy v1 objects (pre-2026.05.5) still require the historical 2026.05.4 ./migrate upgrade path before this binary can open them."

@@ -6,17 +6,17 @@
 
 static int test_version_gate_2026_11_run(void) {
     ASSERT_TRUE(strcmp(SHARD_DB_VERSION, "2026.11.2") == 0, "release is 2026.11.2");
-    ASSERT_TRUE(strcmp(SHARD_DB_REQUIRED_SOURCE_VERSION, "2026.10.2") == 0,
-                "minimum source is the previous release");
+    ASSERT_TRUE(strcmp(SHARD_DB_REQUIRED_SOURCE_VERSION, "2026.11.2") == 0,
+                "minimum source is 2026.11.2");
     ASSERT_EQ_INT(shard_db_version_decide("2026.10.2", 1, 0,
-        SHARD_DB_VERSION, SHARD_DB_REQUIRED_SOURCE_VERSION), SHARD_DB_VERSION_STAMP,
-        "previous release opens and re-stamps");
+        SHARD_DB_VERSION, SHARD_DB_REQUIRED_SOURCE_VERSION), SHARD_DB_VERSION_TOO_OLD,
+        "2026.10.2 is now too old");
     ASSERT_EQ_INT(shard_db_version_decide("2026.09.2", 1, 0,
         SHARD_DB_VERSION, SHARD_DB_REQUIRED_SOURCE_VERSION), SHARD_DB_VERSION_TOO_OLD,
         "pre-previous release refuses with the upgrade hint");
     ASSERT_EQ_INT(shard_db_version_decide("2026.11.1", 1, 0,
-        SHARD_DB_VERSION, SHARD_DB_REQUIRED_SOURCE_VERSION), SHARD_DB_VERSION_STAMP,
-        "previous release opens and re-stamps");
+        SHARD_DB_VERSION, SHARD_DB_REQUIRED_SOURCE_VERSION), SHARD_DB_VERSION_TOO_OLD,
+        "2026.11.1 is now too old");
     ASSERT_EQ_INT(shard_db_version_decide("2026.11.2", 1, 0,
         SHARD_DB_VERSION, SHARD_DB_REQUIRED_SOURCE_VERSION), SHARD_DB_VERSION_NOOP,
         "current release is noop");

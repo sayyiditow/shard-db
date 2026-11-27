@@ -246,33 +246,6 @@ static void w_concurrent(void){
     if(s){ASSERT_CONTAINS(s,"writer-a","disjoint varchar patch retained");ASSERT_CONTAINS(s,"\"f3\":123","disjoint fixed patch retained");free(s);}w_close(&f);
 }
 
-static void w_legacy_render(void){
-    WFixture f;if(w_open(&f,0)){w_close(&f);return;}
-    free(f.ts);f.ts=calloc(1,sizeof(*f.ts));ASSERT_NOT_NULL(f.ts,"private legacy render schema");
-    if(!f.ts){w_close(&f);return;}
-    TypedSchema *ts=f.ts;ts->typed=1;ts->nfields=2;ts->nullmap_prefix=2;ts->total_size=1029;
-    TypedField *v=&ts->fields[0],*e=&ts->fields[1];
-    v->type=FT_VARCHAR;v->size=1026;v->offset=0;strcpy(v->name,"f0");v->name_len=2;
-    e->type=FT_ENUM;e->size=1;e->offset=1026;e->enum_width=1;e->n_enum_values=1;
-    strcpy(e->name,"f1");e->name_len=2;e->enum_values=calloc(1,sizeof(char*));
-    ASSERT_NOT_NULL(e->enum_values,"legacy enum catalog");if(!e->enum_values){w_close(&f);return;}
-    e->enum_values[0]=malloc(1001);ASSERT_NOT_NULL(e->enum_values[0],"long enum value");
-    if(!e->enum_values[0]){w_close(&f);return;}
-    memset(e->enum_values[0],'z',1000);e->enum_values[0][1000]=0;
-    uint8_t bytes[1029]={1,0};bytes[2]=3;bytes[3]=232;memset(bytes+4,'v',1000);
-    char *decoded=typed_decode(ts,bytes,sizeof(bytes),SREC_FLAG_NULLMAP);
-    ASSERT_NOT_NULL(decoded,"legacy complete decode");
-    if(decoded){ASSERT_CONTAINS(decoded,e->enum_values[0],"long enum is not silently omitted");
-        ASSERT_TRUE(strlen(decoded)>2010&&decoded[strlen(decoded)-1]=='}',"complete legacy JSON");free(decoded);}
-    char json[2048];snprintf(json,sizeof(json),"{\"f0\":\"ok\",\"f1\":\"%s\"}",e->enum_values[0]);
-    f.sc.max_value=ts->total_size;char *out=NULL;
-    ASSERT_EQ_INT(w_call(&f,0,"legacy",json,NULL,0,1,&out),0,"legacy insert with long enum return_record");
-    if(out){ASSERT_CONTAINS(out,e->enum_values[0],"insert returns full enum");free(out);}
-    ASSERT_EQ_INT(w_call(&f,1,"legacy","{\"f0\":\"changed\"}",NULL,0,1,&out),0,"legacy update preserves long enum");
-    if(out){ASSERT_CONTAINS(out,e->enum_values[0],"update returns full enum");free(out);}
-    w_close(&f);
-}
-
 static void w_conditions(void){
     WFixture f;if(w_open(&f,0)){w_close(&f);return;}char *out=NULL;size_t n=0;
     const char *same="{\"field\":\"f0\",\"op\":\"eq\",\"value\":\"12345678901234561234567890e-10\"}";
@@ -296,7 +269,7 @@ static void w_conditions(void){
     w_close(&f);
 }
 static int test_single_write_integration_run(void){
-    w_legacy_render();w_transport();w_routes();w_conditions();w_mismatch();w_maximum();w_defaults_guards();w_large();w_concurrent();return t_ctx->failed?1:0;
+    w_transport();w_routes();w_conditions();w_mismatch();w_maximum();w_defaults_guards();w_large();w_concurrent();return t_ctx->failed?1:0;
 }
 TEST_REGISTER("test-single-write-integration",test_single_write_integration_run)
 

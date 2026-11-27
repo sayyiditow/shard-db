@@ -28,34 +28,38 @@
 #include "test_client.h"
 #include "fixtures.h"
 #include "types.h"
+#include "typed_row.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
 /* ==== F1: payload builder must not write before validating out_cap ==== */
 static int test_null_review_payload_cap(void) {
-    /* One varchar:N field; record is nullmap generation with the bit
-       clear and 200 content bytes. A 16-byte out_cap cannot hold the
-       payload — the pre-validation must return 0 without writing. */
+    /* One packed varchar field. A 16-byte out_cap cannot hold a 600-byte
+       payload — the pre-validation must return -1 without writing. */
     TypedSchema ts;
     memset(&ts, 0, sizeof(ts));
+    ts.typed = 1;
     ts.nfields = 1;
-    ts.nullmap_prefix = 1 + typed_nullmap_bytes(ts.nfields);
     TypedField *f = &ts.fields[0];
     snprintf(f->name, sizeof(f->name), "s");
+    f->name_len = 1;
     f->type = FT_VARCHAR;
-    f->size = 1024;             /* 2-byte length prefix + 1022 content */
-    f->offset = 0;
-    ts.total_size = ts.nullmap_prefix + f->size;
+    const char *types[] = {"varchar:1024"};
+    ASSERT_EQ_INT(typed_schema_bind_packed(&ts, types, 1, NULL, 0), 0,
+                  "bind packed payload schema");
 
-    size_t vlen = (size_t)ts.total_size;
-    uint8_t *rec = calloc(1, vlen);
+    char text[601];
+    memset(text, 'A', 600);
+    text[600] = '\0';
+    char json[700];
+    snprintf(json, sizeof(json), "{\"s\":\"%s\"}", text);
+    uint8_t *rec = NULL;
+    size_t vlen = 0;
+    ASSERT_EQ_INT(typed_encode_alloc(&ts, json, 0, NULL, NULL, &rec, &vlen,
+                                     NULL, 0), 0, "encode 600-byte record");
     ASSERT_NOT_NULL(rec, "alloc record");
     if (!rec) return 1;
-    rec[0] = (uint8_t)typed_nullmap_bytes(ts.nfields);
-    uint8_t *content = rec + ts.nullmap_prefix;
-    content[0] = 0; content[1] = 200;
-    memset(content + 2, 'A', 200);
 
     const size_t BUF_SZ = 16;
     const size_t CANARY_SZ = 128;
@@ -66,11 +70,7 @@ static int test_null_review_payload_cap(void) {
 
     size_t blen = 12345;
     int rc = build_index_payload_from_record_into(
-        &ts, rec, vlen, SREC_FLAG_NULLMAP, "s",
-        region, BUF_SZ, &blen);
-    /* Capacity is reported as -1 (ENOBUFS), never as 0 "no key" — a
-       600-byte trigram payload is a real key and must reach the index
-       through the allocating fallback. */
+        &ts, rec, vlen, PKR_FLAGS, "s", region, BUF_SZ, &blen);
     ASSERT_EQ_INT(rc, -1, "oversize payload reports capacity, not absence");
     ASSERT_EQ_INT((int)blen, 0, "no length reported on rejection");
 
@@ -80,37 +80,39 @@ static int test_null_review_payload_cap(void) {
     ASSERT_TRUE(canary_intact, "no byte written past out_cap");
 
     /* Heap wrapper: a payload larger than the old 512-byte staging
-       buffer builds successfully through the heap fallback — dropping
-       it here silently lost every trigram index update for values over
-       ~510 content bytes. */
-    uint8_t *big = calloc(1, vlen);
-    ASSERT_NOT_NULL(big, "alloc big record");
-    if (big) {
-        big[0] = rec[0];
-        big[ts.nullmap_prefix] = (uint8_t)(600 >> 8);   /* 600 content bytes */
-        big[ts.nullmap_prefix + 1] = (uint8_t)(600 & 0xFF);
-        memset(big + ts.nullmap_prefix + 2, 'B', 600);
+       buffer builds successfully through the heap fallback. */
+    {
         uint8_t *out = NULL;
         size_t out_len = 0;
         rc = build_index_payload_from_record(
-            &ts, big, vlen, SREC_FLAG_NULLMAP, "s", &out, &out_len);
+            &ts, rec, vlen, PKR_FLAGS, "s", &out, &out_len);
         ASSERT_EQ_INT(rc, 1, "600-byte payload builds via heap fallback");
         ASSERT_EQ_INT((int)out_len, 600, "full payload length reported");
-        ASSERT_TRUE(out != NULL && out[0] == 'B' && out[599] == 'B',
+        ASSERT_TRUE(out != NULL && out[0] == 'A' && out[599] == 'A',
                     "payload content intact");
         free(out);
-        free(big);
     }
 
     /* Fitting payload still builds (behavior unchanged for in-cap keys). */
     {
+        char small[201];
+        memset(small, 'A', 200);
+        small[200] = '\0';
+        char small_json[300];
+        snprintf(small_json, sizeof(small_json), "{\"s\":\"%s\"}", small);
+        uint8_t *small_rec = NULL;
+        size_t small_len = 0;
+        ASSERT_EQ_INT(typed_encode_alloc(&ts, small_json, 0, NULL, NULL,
+                                         &small_rec, &small_len, NULL, 0), 0,
+                      "encode 200-byte record");
         uint8_t wide[256];
         size_t wlen = 0;
         rc = build_index_payload_from_record_into(
-            &ts, rec, vlen, SREC_FLAG_NULLMAP, "s", wide, sizeof(wide), &wlen);
+            &ts, small_rec, small_len, PKR_FLAGS, "s", wide, sizeof(wide), &wlen);
         ASSERT_EQ_INT(rc, 1, "200-byte payload builds with room");
         ASSERT_EQ_INT((int)wlen, 200, "payload length is content length");
         ASSERT_EQ_INT(wide[0], 'A', "payload starts at content byte 0");
+        free(small_rec);
     }
 
     free(region);

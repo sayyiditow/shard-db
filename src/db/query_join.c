@@ -221,65 +221,6 @@ static int join_bt_first_cb(const char *val, size_t vlen, const uint8_t *hash16,
     return -1;  /* stop after first match */
 }
 
-typedef struct {
-    uint8_t (*hashes)[16];size_t cap;
-    _Atomic size_t count;
-} JoinCandidates;
-typedef struct {size_t field,offset,length;} JoinComponent;
-static int join_candidate_cb(const char *value,size_t length,const uint8_t *hash,void *arg){
-    (void)value;(void)length;JoinCandidates *c=arg;
-    size_t at=atomic_fetch_add_explicit(&c->count,1,memory_order_relaxed);
-    if(c->hashes&&at<c->cap)memcpy(c->hashes[at],hash,16);
-    return 0;
-}
-/* Legacy variable composite bytes can collide across component boundaries.
-   The shared codec stays unchanged. Validate components after all index
-   callbacks have returned, never fetching while a Btree lock is held. */
-static int join_candidate_components(const JoinSpec *j,const char *root,
-    const uint8_t *key,size_t keylen,const JoinComponent *parts,size_t count,
-    size_t budget,RecordRef *out){
-    JoinCandidates candidates={0};
-    if(btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
-                        (const char*)key+1,keylen-1,join_candidate_cb,&candidates)!=0){
-        errno=EIO;   /* a remote index shard could not be opened — never
-                        render as "invalid typed record" */
-        return -1;
-    }
-    size_t capacity=atomic_load_explicit(&candidates.count,memory_order_relaxed);
-    if(!capacity)return 0;
-    if(capacity>budget/sizeof(*candidates.hashes)){errno=ENOBUFS;return -1;}
-    candidates.hashes=malloc(capacity*sizeof(*candidates.hashes));
-    if(!candidates.hashes)return -1;
-    candidates.cap=capacity;atomic_store_explicit(&candidates.count,0,memory_order_relaxed);
-    if(btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
-                        (const char*)key+1,keylen-1,join_candidate_cb,&candidates)!=0){
-        int error=errno;free(candidates.hashes);errno=error?error:EIO;return -1;
-    }
-    size_t actual=atomic_load_explicit(&candidates.count,memory_order_relaxed);
-    if(actual>capacity){free(candidates.hashes);errno=ENOBUFS;return -1;}
-    int found=0;
-    for(size_t i=0;i<actual;i++){
-        if(read_record_ref(root,j->object,&j->remote_sch,candidates.hashes[i],out))continue;
-        int equal=1;
-        for(size_t p=0;p<count;p++){
-            size_t n=0;
-            int rc=typed_index_field_key_into(j->remote_fs.ts,parts[p].field,
-                out->val,out->vlen,out->hdr2,NULL,0,&n);
-            if(rc<0){found=-1;equal=0;break;}
-            if(!rc||n!=parts[p].length){equal=0;break;}
-            uint8_t component[544];size_t written=0;
-            rc=typed_index_field_key_into(j->remote_fs.ts,parts[p].field,
-                out->val,out->vlen,out->hdr2,component,sizeof(component),&written);
-            if(rc<0){found=-1;equal=0;break;}
-            if(rc!=1||written!=n||memcmp(component,key+parts[p].offset,n)){equal=0;break;}
-        }
-        if(equal){found=1;break;}
-        int error=errno;release_record_ref(out);memset(out,0,sizeof(*out));errno=error;
-        if(found<0)break;
-    }
-    int error=errno;free(candidates.hashes);errno=error;return found;
-}
-
 /* Look up the remote record for one join. Returns 1 if found, 0 otherwise.
    On success, *out_rr is populated; caller must release_record_ref(out_rr).
    Storage-version-agnostic: read_record_ref dispatches v1/v2 internally. */
@@ -317,8 +258,7 @@ int resolve_join_record(const JoinSpec *j,const char *root,
     memcpy(local,j->local_field,sizeof(local));local[255]=0;
     memcpy(remote,j->remote_field,sizeof(remote));remote[255]=0;
     char *ls=NULL,*rs=NULL,*l=strtok_r(local,"+",&ls),*r=strtok_r(remote,"+",&rs);
-    uint8_t key[544];size_t used=0,count=0;int ambiguous=0;
-    JoinComponent parts[MAX_FIELDS];
+    uint8_t key[544];size_t used=0;
     while(l&&r){
         int li=typed_field_index(driver_ts,l),ri=typed_field_index(j->remote_fs.ts,r);
         if(li<0||ri<0)return 0;
@@ -331,8 +271,7 @@ int resolve_join_record(const JoinSpec *j,const char *root,
         rc=typed_index_text_key_into(j->remote_fs.ts,(size_t)ri,text,n,NULL,0,&width);
         if(rc<=0){int error=errno;free(text);if(!rc||error==EDOM)return 0;errno=error;return -1;}
         char *next_l=strtok_r(NULL,"+",&ls),*next_r=strtok_r(NULL,"+",&rs);
-        int escape=next_r&&j->remote_fs.ts->packed.nfields&&
-                   j->remote_fs.ts->fields[ri].type==FT_VARCHAR;
+        int escape=next_r&&j->remote_fs.ts->fields[ri].type==FT_VARCHAR;
         size_t extra=escape?2:0;
         if(escape)for(size_t i=0;i<n;i++)extra+=text[i]==0;
         /* No admitted remote key can match a larger complete probe. */
@@ -341,9 +280,6 @@ int resolve_join_record(const JoinSpec *j,const char *root,
         /* The escape branch below writes 1 + n + extra bytes (separator,
            text, one 255 per NUL, two terminators); bound it by n itself. */
         if(escape&&(n>sizeof(key)-used-1||extra>sizeof(key)-used-1-n)){free(text);return 0;}
-        if(count==MAX_FIELDS){free(text);errno=EINVAL;return -1;}
-        parts[count++]=(JoinComponent){(size_t)ri,used,width+1};
-        if(next_r&&!j->remote_fs.ts->packed.nfields&&j->remote_fs.ts->fields[ri].type==FT_VARCHAR)ambiguous=1;
         key[used++]=0;
         if(escape){
             for(size_t i=0;i<n;i++){
@@ -364,7 +300,6 @@ int resolve_join_record(const JoinSpec *j,const char *root,
         free(text);l=next_l;r=next_r;
     }
     if(l||r||!used)return 0;
-    if(ambiguous)return join_candidate_components(j,root,key,used,parts,count,budget,out);
     JoinBtHit hit={{0},0};
     if(btree_idx_search(root,j->object,j->remote_field,j->remote_sch.splits,
                         (const char*)key+1,used-1,join_bt_first_cb,&hit)!=0){

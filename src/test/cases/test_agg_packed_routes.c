@@ -63,7 +63,7 @@ static void apr_object(const char *root, const char *obj, int splits, int indexe
     ASSERT_EQ_INT(mkdir(path, 0700), 0, "obj dir");
     snprintf(path, sizeof path, "%s/schema.conf", root);
     FILE *f = fopen(path, "a");                      /* one line per object */
-    fprintf(f, ":%s:%d:32:2:1\n", obj, splits); fclose(f);
+    fprintf(f, ":%s:%d:32:2:1:layout=packed\n", obj, splits); fclose(f);
     snprintf(path, sizeof path, "%s/%s/fields.conf", root, obj);
     f = fopen(path, "w"); fprintf(f, "f0:%s\nf1:int\n", f0_decl); fclose(f);
     *sch_out = load_schema(root, obj);

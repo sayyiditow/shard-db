@@ -66,12 +66,9 @@ uint8_t typed_schema_hdr2(const TypedSchema *ts);
 int typed_row_open(const TypedSchema *ts, const uint8_t *value, size_t len,
                     uint8_t hdr2, TypedRowView *out);
 int typed_row_span(const TypedRowView *view, size_t index, TypedRowSpan *out);
-/* Explicit legacy materialization contracts: read requires a complete field;
-   carry copies available bytes into an exact-width zeroed destination. */
+/* Read requires a complete field. */
 int typed_span_read(const TypedSchema *ts, size_t index,
                       const TypedRowSpan *span, const uint8_t **out);
-int typed_span_copy_legacy(const TypedSchema *ts, size_t index,
-                             const TypedRowSpan *span, uint8_t *out, size_t cap);
 
 void typed_prepared_init(TypedPrepared *p);
 void typed_prepared_free(TypedPrepared *p);

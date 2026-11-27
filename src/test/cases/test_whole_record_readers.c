@@ -69,28 +69,6 @@ static void r_packed(void){
     for(int i=0;i<ts->nfields;i++)ts->fields[i].removed=1;
     r_equal(ts,bytes,n,PKR_FLAGS,"{}");free(bytes);free(ts);
 }
-static void r_legacy(void){
-    TypedSchema *ts=calloc(1,sizeof(*ts));ASSERT_NOT_NULL(ts,"legacy schema");if(!ts)return;
-    ts->typed=1;ts->nfields=3;ts->nullmap_prefix=2;ts->total_size=1009;
-    for(int i=0;i<3;i++){snprintf(ts->fields[i].name,sizeof(ts->fields[i].name),"f%d",i);ts->fields[i].name_len=2;}
-    ts->fields[0].type=FT_INT;ts->fields[0].size=4;
-    ts->fields[1].type=FT_VARCHAR;ts->fields[1].offset=4;ts->fields[1].size=1002;
-    TypedField *e=&ts->fields[2];e->type=FT_ENUM;e->offset=1006;e->size=1;e->enum_width=1;e->n_enum_values=1;
-    e->enum_values=calloc(1,sizeof(char*));ASSERT_NOT_NULL(e->enum_values,"enum catalog");if(!e->enum_values){free(ts);return;}
-    e->enum_values[0]=malloc(1001);ASSERT_NOT_NULL(e->enum_values[0],"long enum");if(!e->enum_values[0]){free(e->enum_values);free(ts);return;}
-    memset(e->enum_values[0],'z',1000);e->enum_values[0][1000]=0;
-    uint8_t bytes[1009]={1,0};bytes[6]=3;bytes[7]=132;memset(bytes+8,'v',900);
-    char expected[2000];memcpy(expected,"{\"f0\":0,\"f1\":\"",14);memset(expected+14,'v',900);
-    size_t at=914;memcpy(expected+at,"\",\"f2\":\"",8);at+=8;memset(expected+at,'z',1000);at+=1000;
-    memcpy(expected+at,"\"}",3);
-    r_equal(ts,bytes,sizeof(bytes),SREC_FLAG_NULLMAP,expected);
-    r_invalid(ts,bytes,sizeof(bytes),PKR_FLAGS);
-    free_enum_values(e);ts->nfields=1;ts->total_size=6;
-    const uint8_t short_old[]={1};r_equal(ts,short_old,sizeof(short_old),0,"{\"f0\":0}");
-    const uint8_t short_flagged[]={1,0,9};r_equal(ts,short_flagged,sizeof(short_flagged),SREC_FLAG_NULLMAP,"{\"f0\":0}");
-    const uint8_t null[]={1,1};r_equal(ts,null,sizeof(null),SREC_FLAG_NULLMAP,"{\"f0\":null}");
-    ts->fields[0].size=70000;r_invalid(ts,short_flagged,sizeof(short_flagged),SREC_FLAG_NULLMAP);free(ts);
-}
 static int r_rm(const char *p,const struct stat *s,int kind,struct FTW *f){(void)s;(void)kind;(void)f;return remove(p);}
 static void r_physical(void){
     TypedSchema *ts=r_schema(0);if(!ts)return;uint8_t *bytes=NULL;size_t n=0;
@@ -147,5 +125,5 @@ static void r_limits(void){
         typed_prepared_free(&p);free(content);}
     free(ts);
 }
-static int test_whole_record_readers_run(void){r_packed();r_legacy();r_physical();r_limits();return t_ctx->failed?1:0;}
+static int test_whole_record_readers_run(void){r_packed();r_physical();r_limits();return t_ctx->failed?1:0;}
 TEST_REGISTER("test-whole-record-readers",test_whole_record_readers_run)

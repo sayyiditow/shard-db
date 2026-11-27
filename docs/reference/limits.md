@@ -30,7 +30,7 @@ Changing these requires recompiling. Most don't need to change.
 | Thing | Limit | Notes |
 |---|---|---|
 | Key length | `max_key` bytes (per-object, max 1024) | Set at `create-object`. Keys longer than this error on insert. |
-| varchar content | 4 194 304 bytes (4 MiB) | Packed layout (default). Bare `varchar` and `varchar:N` up to 4 MiB; ceiling+1 is rejected with no record written. Legacy-layout objects: 65 535 (uint16 length prefix). |
+| varchar content | 4 194 304 bytes (4 MiB) | Bare `varchar` and `varchar:N` up to 4 MiB; ceiling+1 is rejected with no record written. (The removed legacy layout capped content at 65 535 bytes via a uint16 length prefix.) |
 | numeric precision / scale | P ≤ 1000, S −1000..1000 | `numeric:P,S` on packed objects. Legacy: S ≤ 18, value must fit a scaled int64. |
 | bare numeric digits | 131 072 integer + 16 383 fractional | Bare `numeric` on packed objects; one more digit in either part is rejected. |
 | Total record payload | derived | Sum of typed-field sizes (`value_size` in `describe-object`). Not user-configurable. Stored in segment files; the 24-byte seg header + `klen` bytes of key precede it. |
@@ -90,7 +90,7 @@ Changing these requires recompiling. Most don't need to change.
 | Tenants (`dirs.conf`) | filesystem-limited | Validated via O(1) hash. |
 | Indexes per object | no hard cap | Each is a directory of `index_splits_for(splits)` B+ tree files. The caches cap *hot* mappings independently, not on-disk count: `kfcache` and `segcache` each use `FCACHE_MAX`; `bt_cache` and `bm_cache` each use `FCACHE_MAX / 4`. |
 | Tenant name length | 64 bytes | Validated by `add-dir` (rejects `/`, `\`, `..`, control chars). |
-| `edit-field` scope | same-type only | Allowed transforms: varchar grow/shrink, integer family widen/narrow (`short ↔ int ↔ long`), `numeric` scale change, `float → double` widen. Pre-flight refuses any record that wouldn't fit the new shape. Cross-type changes refused with a hint to use `add-field + remove-field + bulk-update`. Holds `objlock_wrlock` for the rebuild duration. See [schema-mutations → edit-field](../query-protocol/schema-mutations.md#edit-field). On packed-layout objects a numeric scale reduction rounds half away from zero (refused only if the integer part no longer fits), and bare↔bounded varchar/numeric edits are allowed. |
+| `edit-field` scope | same-type only | Allowed transforms: varchar grow/shrink, integer family widen/narrow (`short ↔ int ↔ long`), `numeric` scale change, `float → double` widen. Pre-flight refuses any record that wouldn't fit the new shape. Cross-type changes refused with a hint to use `add-field + remove-field + bulk-update`. Holds `objlock_wrlock` for the rebuild duration. See [schema-mutations → edit-field](../query-protocol/schema-mutations.md#edit-field). A numeric scale reduction rounds half away from zero (refused only if the integer part no longer fits), and bare↔bounded varchar/numeric edits are allowed. |
 | `auto_key` mode | `uuid` requires `max_key>=16`; `seq(<name>)` requires `max_key>=8` | Per-object opt-in at create-object; immutable thereafter. UUID stored as 16-byte binary, seq as 8-byte int64 BE. Rendered as dashed UUID / decimal on every read. See [schema-mutations → Auto-generated keys](../query-protocol/schema-mutations.md#auto-generated-keys). |
 
 ## Auth limits

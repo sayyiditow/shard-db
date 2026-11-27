@@ -30,19 +30,7 @@ static int check(const TypedSchema *ts, size_t i) {
    ts->typed. Preserve that wrapper contract; packed views stay strict. */
 static int index_row_open(const TypedSchema *ts, const uint8_t *value,
                           size_t len, uint8_t flags, TypedRowView *out) {
-  if (!ts || ts->typed || ts->packed.nfields)
-    return typed_row_open(ts, value, len, flags, out);
-  memset(out, 0, sizeof(*out));
-  if (!value || ts->nfields < 1 || ts->nfields > MAX_FIELDS)
-    return fail(EINVAL);
-  if (typed_record_view(value, len, flags, &out->base, &out->bitmap,
-                        &out->bitmap_bytes, &out->region))
-    return fail(EILSEQ);
-  out->schema = ts;
-  out->value = value;
-  out->len = len;
-  out->hdr2 = flags;
-  return 0;
+  return typed_row_open(ts, value, len, flags, out);
 }
 int typed_index_fixed_width(const TypedSchema *ts, size_t i, size_t *width) {
   if (!width)
@@ -51,7 +39,7 @@ int typed_index_fixed_width(const TypedSchema *ts, size_t i, size_t *width) {
   if (check(ts, i))
     return -1;
   const TypedField *f = &ts->fields[i];
-  if (f->type == FT_VARCHAR || (ts->packed.nfields && f->type == FT_NUMERIC))
+  if (f->type == FT_VARCHAR || f->type == FT_NUMERIC)
     return 0;
   size_t n = 0;
   switch (f->type) {
@@ -148,7 +136,7 @@ static int span_payload(const TypedSchema *ts, size_t i,
   if (typed_span_read(ts, i, span, &src))
     return -1;
   const TypedField *f = &ts->fields[i];
-  if (ts->packed.nfields && f->type == FT_NUMERIC) {
+  if (f->type == FT_NUMERIC) {
     dec_t d;
     dec_init(&d);
     dec_status st = dec_unpack(src, span->len, &d);
@@ -162,14 +150,6 @@ static int span_payload(const TypedSchema *ts, size_t i,
   }
   if (f->type == FT_VARCHAR) {
     size_t n = span->len;
-    if (!ts->packed.nfields) {
-      if (f->size < 2)
-        return fail(EILSEQ);
-      n = ((size_t)src[0] << 8) | src[1];
-      if (n > (size_t)f->size - 2)
-        n = (size_t)f->size - 2;
-      src += 2;
-    }
     if (out && n > cap)
       return fail(ENOBUFS);
     if (out && n)
@@ -201,14 +181,6 @@ static int field_view_key(const TypedRowView *view, size_t i, int nonfinal,
   if (span.is_null) {
     if (fixed)
       payload = width;
-    else if (!ts->packed.nfields) {
-      const TypedField *f = &ts->fields[i];
-      if (span.complete && f->size >= 2) {
-        payload = ((size_t)span.data[0] << 8) | span.data[1];
-        if (payload > (size_t)f->size - 2)
-          payload = (size_t)f->size - 2;
-      }
-    }
     if (out && 1 + payload > cap)
       return fail(ENOBUFS);
     if (out) {
@@ -221,8 +193,7 @@ static int field_view_key(const TypedRowView *view, size_t i, int nonfinal,
   }
   if (span_payload(ts, i, &span, NULL, 0, &payload))
     return -1;
-  int escape =
-      ts->packed.nfields && nonfinal && ts->fields[i].type == FT_VARCHAR;
+  int escape = nonfinal && ts->fields[i].type == FT_VARCHAR;
   size_t extra = 0;
   if (escape) {
     extra = 2;
@@ -310,36 +281,9 @@ int typed_index_text_key_into(const TypedSchema *ts, size_t i, const char *text,
       dec_free(&d);
       return fail(st == DEC_ERR_NOMEM ? ENOMEM : EINVAL);
     }
-    if (ts->packed.nfields) {
-      int rc = decimal_order_into(&d, out, cap, len);
-      dec_free(&d);
-      return rc < 0 ? -1 : 1;
-    }
-    int64_t scaled = 0;
-    if (conv_numeric_text(f, text, n, &scaled, NULL, 0)) {
-      dec_free(&d);
-      return fail(EDOM);
-    }
-    char assigned[96];
-    int an = snprintf(assigned, sizeof(assigned), "%" PRId64 "e-%d", scaled,
-                      f->numeric_scale);
-    dec_t exact;
-    dec_init(&exact);
-    st = dec_parse(assigned, (size_t)an, &exact, NULL, 0);
-    int equal = st == DEC_OK && !dec_cmp(&d, &exact);
+    int rc = decimal_order_into(&d, out, cap, len);
     dec_free(&d);
-    dec_free(&exact);
-    if (!equal)
-      return fail(st == DEC_ERR_NOMEM ? ENOMEM : EDOM);
-    if (out && cap < 8)
-      return fail(ENOBUFS);
-    if (out) {
-      uint64_t u = (uint64_t)scaled ^ UINT64_C(0x8000000000000000);
-      for (size_t j = 0; j < 8; j++)
-        out[j] = (uint8_t)(u >> (56 - 8 * j));
-    }
-    *len = 8;
-    return 1;
+    return rc < 0 ? -1 : 1;
   }
   if (f->type == FT_VARCHAR) {
     /* Query literals are not assignments: retain all bytes. Larger
@@ -581,7 +525,7 @@ int typed_index_text_component_key_into(const TypedSchema *ts, size_t field,
   int rc = typed_index_text_key_into(ts, field, text, n, NULL, 0, &raw);
   if (rc != 1)
     return rc;
-  if (!ts->packed.nfields || ts->fields[field].type != FT_VARCHAR || !nonfinal)
+  if (ts->fields[field].type != FT_VARCHAR || !nonfinal)
     return typed_index_text_key_into(ts, field, text, n, out, cap, len);
   size_t need = raw + 2;
   if (need < raw)

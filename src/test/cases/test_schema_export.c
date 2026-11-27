@@ -51,19 +51,19 @@ static int test_schema_export_run(void) {
 
     /* Three objects across two tenants, mixing types. */
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"mig_users\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"mig_users\","
         "\"splits\":16,\"max_key\":32,"
         "\"fields\":[\"name:varchar:40\",\"age:int\",\"active:bool\","
                     "\"created_at:datetime\"],"
         "\"indexes\":[\"age\",\"name\"]}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"default\",\"object\":\"mig_orders\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"mig_orders\","
         "\"splits\":16,\"max_key\":16,"
         "\"fields\":[\"status:varchar:16\",\"amount:numeric:18,2\","
                     "\"region:varchar:16\"],"
         "\"indexes\":[\"status\",\"status+region\"]}", &resp); free(resp); resp = NULL;
     tc_request(tc,
-        "{\"mode\":\"create-object\",\"declaration_layout\":\"legacy\",\"dir\":\"migtest\",\"object\":\"mig_events\","
+        "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"migtest\",\"object\":\"mig_events\","
         "\"splits\":16,\"max_key\":24,"
         "\"fields\":[\"kind:varchar:24\",\"ts:datetime\"],\"indexes\":[]}",
         &resp); free(resp); resp = NULL;
@@ -159,7 +159,8 @@ static int test_schema_export_run(void) {
     ASSERT_CONTAINS(resp, "\"splits\":16", "mig_users splits restored");
     ASSERT_CONTAINS(resp, "\"name\":\"name\"", "mig_users name field restored");
     ASSERT_CONTAINS(resp, "\"age\"", "mig_users age index restored");
-    ASSERT_CONTAINS(resp, "\"size\":42", "mig_users name varchar size=42 (on-disk)");
+    ASSERT_CONTAINS(resp, "\"size\":8", "mig_users name packed varchar descriptor size=8 (on-disk)");
+    ASSERT_CONTAINS(resp, "\"capacity\":40", "mig_users name varchar capacity=40");
     free(resp); resp = NULL;
 
     tc_request(tc,

@@ -84,10 +84,16 @@ later) upgrade with a binary swap:
 ./shard-db start
 ```
 
-2026.11.1 requires a **cleanly stopped 2026.10.2 root** (start 2026.10.2 against the
-DB_ROOT, stop it cleanly, then upgrade); it refuses an unclean root or one with pending
-commit markers. Its first start migrates every object to the packed record layout before
-serving, so back up first and leave the data directory untouched while it runs.
+2026.11.3 removes the legacy object layout and both startup migrations. The
+minimum supported source release is **2026.11.2**: install 2026.11.2, start it
+once to completion against the DB_ROOT (it converts legacy objects to the packed
+layout), stop it cleanly, then install this version. Startup refuses a root that
+still holds a non-packed object, a token-less `schema.conf` line, or an unusable
+rebuild-txn meta, naming the offending entry (see
+[error codes](../reference/error-codes.md)); stale `.layout-migrated` /
+`.btri-migrated` files are ignored. 2026.11.1 required a cleanly stopped
+2026.10.2 root and converted every object to the packed layout on its first
+start, so back up first and leave the data directory untouched while it runs.
 
 2026.09.2 performed the datetime-width migration automatically when opening a
 2026.09.1-compatible root; backup first, then start the new binary and verify

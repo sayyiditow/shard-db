@@ -397,6 +397,7 @@ typedef struct {
     char dir[PATH_MAX];
     char object[PATH_MAX];
     int streams;
+    int layout_packed;   /* the line carries exactly layout=packed */
 } StartupSchemaEntry;
 
 static int startup_schema_line(char *line, StartupSchemaEntry *out) {
@@ -433,6 +434,7 @@ static int startup_schema_line(char *line, StartupSchemaEntry *out) {
         *end != '\0' || streams <= 0 || streams > SLOTCASK_MAX_STREAMS)
         return -1;
     if (strcmp(parts[4], "2") != 0) return -1;
+    out->layout_packed = 0;
     {
         int layouts = 0;
         for (int i = 6; i < n; i++) {
@@ -440,6 +442,7 @@ static int startup_schema_line(char *line, StartupSchemaEntry *out) {
                 (parts[i][6] != '\0' && parts[i][6] != '='))
                 continue;
             if (layouts++ || strcmp(parts[i], "layout=packed") != 0) return -1;
+            out->layout_packed = 1;
         }
     }
 
@@ -501,61 +504,108 @@ static int startup_read_schema(const char *db_root,
     return 0;
 }
 
-int shard_db_not_null_upgrade_audit(const char *db_root) {
-    char disk_version[64] = {0};
-    int vrc = shard_db_version_file_read(db_root, disk_version,
-                                        sizeof(disk_version));
-    if (vrc == SHARD_DB_VERSION_FILE_ERROR) return -1;
-    if (vrc == SHARD_DB_VERSION_FILE_OK &&
-        shard_db_version_compare(disk_version, "2026.10.2") >= 0)
-        return 0;
-    StartupSchemaEntry *entries = NULL;
-    size_t count = 0;
-    if (startup_read_schema(db_root, &entries, &count) != 0) return -1;
-    int failed = 0;
-    for (size_t i = 0; i < count && !failed; i++) {
-        char object_dir[PATH_MAX], path[PATH_MAX];
-        int n = snprintf(object_dir, sizeof(object_dir), "%s/%s/%s",
-                         db_root, entries[i].dir, entries[i].object);
-        if (n < 0 || (size_t)n >= sizeof(object_dir)) { failed = 1; break; }
-        struct stat object_st;
-        if (stat(object_dir, &object_st) != 0) {
-            /* Same stale-entry exception as validate_before_stamp:
-               absent objects are inert; all other stat errors fail. */
-            if (errno == ENOENT) continue;
-            failed = 1;
+/* Refuse a root that is not entirely packed. Runs before
+   shard_db_open_internal, so it must not use g_db, LOG_* or any helper that
+   logs; it reports through `err` and the caller prints. */
+int shard_db_layout_gate(const char *db_root, char *err, size_t errsz) {
+    if (!db_root || !err || errsz == 0) return -1;
+    err[0] = '\0';
+
+    StartupSchemaEntry *ents = NULL;
+    size_t n = 0;
+    if (startup_read_schema(db_root, &ents, &n) != 0) {
+        snprintf(err, errsz,
+                 "schema.conf is unreadable or malformed; fix or restore it");
+        return -1;
+    }
+
+    int migrated = 0;
+    {
+        char stamp[PATH_MAX];
+        struct stat ss;
+        if (snprintf(stamp, sizeof(stamp), "%s/.layout-migrated", db_root) <
+                (int)sizeof(stamp) && lstat(stamp, &ss) == 0)
+            migrated = 1;
+    }
+
+    int rc = 0;
+    for (size_t i = 0; i < n && rc == 0; i++) {
+        char eff_root[PATH_MAX], obj_path[PATH_MAX];
+        if (snprintf(eff_root, sizeof(eff_root), "%s/%s", db_root,
+                     ents[i].dir) >= (int)sizeof(eff_root) ||
+            snprintf(obj_path, sizeof(obj_path), "%s/%s", eff_root,
+                     ents[i].object) >= (int)sizeof(obj_path)) {
+            snprintf(err, errsz, "object path too long for %s/%s",
+                     ents[i].dir, ents[i].object);
+            rc = -1;
             break;
         }
-        if (!S_ISDIR(object_st.st_mode)) { failed = 1; break; }
-        n = snprintf(path, sizeof(path), "%s/fields.conf", object_dir);
-        if (n < 0 || (size_t)n >= sizeof(path)) { failed = 1; break; }
-        /* A materialized object without readable fields.conf is fatal;
-           do not extend the absent-object exception to missing metadata. */
-        FILE *f = fopen(path, "r");
-        if (!f) { failed = 1; break; }
-        for (;;) {
-            int rderr = 0;
-            char *line = conf_read_line(f, MAX_FIELD_DEF, &rderr);
-            if (!line) { if (rderr) failed = 1; break; }
-            const char *q = line;
-            while (*q == ' ' || *q == '\t') q++;
-            if (*q && *q != '#' &&
-                (strstr(q, ":not_null") || strstr(q, ":nullable"))) {
-                fprintf(stderr,
-                        "shard-db: upgrade refused: ambiguous pre-2026.10.2 "
-                        "nullability spelling in %s; resolve the literal or "
-                        "enum name using the previous release's supported "
-                        "schema edits before upgrading\n", path);
-                failed = 1;
-            }
-            free(line);
-            if (failed) break;
+
+        struct stat ost;
+        int have = stat(obj_path, &ost) == 0;
+        if (!have && errno != ENOENT) {
+            snprintf(err, errsz, "cannot inspect object %s/%s: %s",
+                     ents[i].dir, ents[i].object, strerror(errno));
+            rc = -1;
+            break;
         }
-        if (ferror(f)) failed = 1;
-        if (fclose(f) != 0) failed = 1;
+
+        if (!have) {
+            if (!ents[i].layout_packed) {
+                snprintf(err, errsz,
+                         "stale schema.conf line for %s/%s lacks layout=packed; "
+                         "stop shard-db, delete the line from schema.conf, then "
+                         "start it", ents[i].dir, ents[i].object);
+                rc = -1;
+            }
+            continue;
+        }
+
+        if (!ents[i].layout_packed) {
+            if (migrated)
+                snprintf(err, errsz,
+                         "object %s/%s is not in the packed layout. To convert "
+                         "it: remove stale schema.conf lines (lines with no "
+                         "object directory) and %s/.layout-migrated, start "
+                         "shard-db %s once to completion, then upgrade",
+                         ents[i].dir, ents[i].object, db_root,
+                         SHARD_DB_REQUIRED_SOURCE_VERSION);
+            else
+                snprintf(err, errsz,
+                         "object %s/%s is not in the packed layout; install "
+                         "shard-db %s, start it once to completion, then upgrade",
+                         ents[i].dir, ents[i].object,
+                         SHARD_DB_REQUIRED_SOURCE_VERSION);
+            rc = -1;
+            break;
+        }
+
+        int txn = rebuild_txn_active_layout(eff_root, ents[i].object);
+        if (txn == -2) {
+            snprintf(err, errsz,
+                     "invalid rebuild metadata under %s/%s; preserving it",
+                     ents[i].dir, ents[i].object);
+            rc = -1;
+        } else if (txn == 0) {
+            if (migrated)
+                snprintf(err, errsz,
+                         "object %s/%s is not in the packed layout. To convert "
+                         "it: remove stale schema.conf lines (lines with no "
+                         "object directory) and %s/.layout-migrated, start "
+                         "shard-db %s once to completion, then upgrade",
+                         ents[i].dir, ents[i].object, db_root,
+                         SHARD_DB_REQUIRED_SOURCE_VERSION);
+            else
+                snprintf(err, errsz,
+                         "object %s/%s is not in the packed layout; install "
+                         "shard-db %s, start it once to completion, then upgrade",
+                         ents[i].dir, ents[i].object,
+                         SHARD_DB_REQUIRED_SOURCE_VERSION);
+            rc = -1;
+        }
     }
-    free(entries);
-    return failed ? -1 : 0;
+    free(ents);
+    return rc;
 }
 
 static int startup_find_schema(const StartupSchemaEntry *entries, size_t count,
@@ -714,234 +764,6 @@ int shard_db_validate_before_stamp(const char *db_root) {
     if (root_errno != 0 || root_close != 0) failed = 1;
     free(entries);
     return failed ? -1 : 0;
-}
-
-/* ── BTRI migration completion stamp (§2.4.3, 2026.10.2) ──
-   Lives alongside the other root evidence files. Written once, only
-   after every requested index shard was durably published (strict
-   reindex entry point) and the KFM2 replay succeeded; starts after
-   that skip the migration entirely. Durability: fsync the stamp file
-   before rename and its containing directory after rename — either
-   error fails startup. A directory-fsync failure can leave a renamed
-   stamp visible, but every index was already durable before it. */
-#define BTRI_MIGRATION_STAMP    ".btri-migrated"
-
-#ifdef TEST_BUILD
-/* Test-only injection for the stamp-write failure cases (db.env
-   BTRI_STAMP_TEST_FAIL): 1 = fail the stamp-file fsync, 2 = fail the
-   post-rename stamp-directory fsync. Startup must refuse to serve under
-   either; mode 2 leaves a visible-but-unconfirmed stamp behind. */
-static _Atomic int g_btri_stamp_test_fail;
-void btri_stamp_test_inject(int mode) {
-    atomic_store_explicit(&g_btri_stamp_test_fail, mode > 0 ? mode : 0,
-                          memory_order_release);
-}
-#endif
-
-static int btri_migration_stamp_exists(const char *db_root) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", db_root, BTRI_MIGRATION_STAMP);
-    return access(path, F_OK) == 0 ? 1 : 0;
-}
-
-static int btri_migration_stamp_write(const char *db_root) {
-    char tmp[PATH_MAX], final[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s/%s.tmp", db_root, BTRI_MIGRATION_STAMP);
-    snprintf(final, sizeof(final), "%s/%s", db_root, BTRI_MIGRATION_STAMP);
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
-    dprintf(fd, "btri-migration complete (binary %s)\n", SHARD_DB_VERSION);
-    int sync_rc = fsync(fd);
-    int close_rc = close(fd);
-#ifdef TEST_BUILD
-    if (atomic_load_explicit(&g_btri_stamp_test_fail,
-                             memory_order_acquire) == 1) {
-        sync_rc = -1;
-    }
-#endif
-    if (sync_rc != 0 || close_rc != 0) {
-        (void)unlink(tmp);
-        return -1;
-    }
-    if (rename(tmp, final) != 0) {
-        (void)unlink(tmp);
-        return -1;
-    }
-    int dfd = open(db_root, O_RDONLY | O_DIRECTORY);
-    if (dfd < 0) return -1;
-    sync_rc = fsync(dfd);
-    close_rc = close(dfd);
-#ifdef TEST_BUILD
-    if (atomic_load_explicit(&g_btri_stamp_test_fail,
-                             memory_order_acquire) == 2) {
-        sync_rc = -1;
-    }
-#endif
-    return (sync_rc == 0 && close_rc == 0) ? 0 : -1;
-}
-
-/* ── Layout migration (R5 Task 8) ──
-   Converts every legacy object to the packed layout. See the plan for the
-   ordering rationale: audit and preconditions first, version stamp second,
-   per-object RebuildTxn conversion third, completion stamp last. */
-#define LAYOUT_MIGRATION_STAMP  ".layout-migrated"
-#define LAYOUT_MIGRATION_REPORT ".layout-migration-report"
-
-static int layout_stamp_exists(const char *db_root) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", db_root, LAYOUT_MIGRATION_STAMP);
-    return access(path, F_OK) == 0;
-}
-
-static int layout_stamp_write(const char *db_root) {
-    char tmp[PATH_MAX], final[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s/%s.tmp", db_root, LAYOUT_MIGRATION_STAMP);
-    snprintf(final, sizeof(final), "%s/%s", db_root, LAYOUT_MIGRATION_STAMP);
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
-    int rc = dprintf(fd, "layout-migration complete (binary %s)\n", SHARD_DB_VERSION) > 0 ? 0 : -1;
-    if (close(fd) != 0) rc = -1;
-    if (rc != 0) { (void)unlink(tmp); return -1; }
-    int prc = durability_publish_replace(final, tmp, NULL, NULL);   /* fsync(tmp) → rename → fsync(dir) */
-    if (prc < 0) { (void)unlink(tmp); return -1; }
-    return prc == 0 ? 0 : -1;   /* renamed but unconfirmed durable: refuse; the next start re-checks */
-}
-
-static void layout_report_write(const char *db_root, const char *text) {
-    char tmp[PATH_MAX], final[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s/%s.tmp", db_root, LAYOUT_MIGRATION_REPORT);
-    snprintf(final, sizeof(final), "%s/%s", db_root, LAYOUT_MIGRATION_REPORT);
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
-    int ok = fputs(text, f) >= 0;
-    if (fclose(f) != 0) ok = 0;
-    if (!ok || rename(tmp, final) != 0) (void)unlink(tmp);
-}
-
-static void layout_report_remove(const char *db_root) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s", db_root, LAYOUT_MIGRATION_REPORT);
-    (void)unlink(path);
-}
-
-static int layout_migration_run(const char *db_root) {
-    if (layout_stamp_exists(db_root)) return 0;
-    layout_test_crash_point("after-recovery");
-
-    StartupSchemaEntry *ents = NULL;
-    size_t n = 0;
-    if (startup_read_schema(db_root, &ents, &n) != 0) return -1;
-
-    size_t nlegacy = 0;
-    for (size_t i = 0; i < n; i++) {
-        char eff[PATH_MAX];
-        snprintf(eff, sizeof(eff), "%s/%s", db_root, ents[i].dir);
-        int packed = 0;
-        if (schema_conf_layout(eff, ents[i].object, &packed) != 0) {
-            fprintf(stderr, "shard-db: refusing to start: unreadable layout token for %s/%s\n",
-                    ents[i].dir, ents[i].object);
-            free(ents);
-            return -1;
-        }
-        if (!packed) nlegacy++;
-    }
-    if (nlegacy == 0) {
-        free(ents);
-        if (layout_stamp_write(db_root) != 0) return -1;
-        layout_report_remove(db_root);
-        return 0;
-    }
-
-    char disk[64] = {0};
-    int decision = shard_db_version_check(db_root, disk, sizeof(disk));
-    if (decision != SHARD_DB_VERSION_STAMP && decision != SHARD_DB_VERSION_NOOP) {
-        free(ents);
-        return -1;
-    }
-    int first_start = decision == SHARD_DB_VERSION_STAMP;
-
-    /* D7: the previous version must have closed cleanly with no pending
-       markers. Nothing has been touched yet. */
-    if (first_start && !clean_flag_exists(db_root)) {
-        fprintf(stderr,
-                "shard-db: refusing to start: database was not closed cleanly by shard-db %s. "
-                "Start shard-db %s against this DB_ROOT, stop it cleanly, then upgrade to %s.\n",
-                disk, SHARD_DB_REQUIRED_SOURCE_VERSION, SHARD_DB_VERSION);
-        free(ents);
-        return -1;
-    }
-    for (size_t i = 0; i < n; i++) {
-        char data_dir[PATH_MAX];
-        snprintf(data_dir, sizeof(data_dir), "%s/%s/%s", db_root, ents[i].dir, ents[i].object);
-        if (object_has_pending_markers(data_dir) != 0) {
-            fprintf(stderr,
-                    "shard-db: refusing to start: %s/%s has pending commit markers. "
-                    "Start shard-db %s against this DB_ROOT, stop it cleanly, then upgrade to %s.\n",
-                    ents[i].dir, ents[i].object, SHARD_DB_REQUIRED_SOURCE_VERSION, SHARD_DB_VERSION);
-            free(ents);
-            return -1;
-        }
-    }
-
-    /* D5 audit: read-only, whole root, before the stamp. */
-    char report[2048];
-    size_t rl = 0;
-    int refused = 0;
-    report[0] = '\0';
-    for (size_t i = 0; i < n; i++) {
-        char eff[PATH_MAX], diag[1024];
-        int packed = 0;
-        snprintf(eff, sizeof(eff), "%s/%s", db_root, ents[i].dir);
-        (void)schema_conf_layout(eff, ents[i].object, &packed);
-        if (packed) continue;
-        if (objlock_wrlock(eff, ents[i].object) != 0) { free(ents); return -1; }
-        int rc = layout_migrate_object(eff, ents[i].object, 1, diag, sizeof(diag));
-        objlock_wrunlock(eff, ents[i].object);
-        if (rc != 0) {
-            refused = 1;
-            if (rl + 1 < sizeof(report))
-                rl += (size_t)snprintf(report + rl, sizeof(report) - rl,
-                                       "%s/%s: layout migration refused:\n%s%s",
-                                       ents[i].dir, ents[i].object, diag,
-                                       diag[0] && diag[strlen(diag) - 1] == '\n' ? "" : "\n");
-        }
-    }
-    if (refused) {
-        fputs(report, stderr);
-        layout_report_write(db_root, report);
-        free(ents);
-        return -1;
-    }
-    layout_test_crash_point("after-audit");
-
-    /* F16: the new version must be stamped BEFORE any packed layout is
-       published, otherwise a crash leaves a packed object under an old
-       stamp that 2026.10.2 would open as legacy. */
-    if (first_start && shard_db_version_stamp(db_root) != SHARD_DB_VERSION_STAMP_OK) {
-        free(ents);
-        return -1;
-    }
-
-    for (size_t i = 0; i < n; i++) {
-        char eff[PATH_MAX], diag[1024];
-        int packed = 0;
-        snprintf(eff, sizeof(eff), "%s/%s", db_root, ents[i].dir);
-        (void)schema_conf_layout(eff, ents[i].object, &packed);
-        if (packed) continue;
-        if (objlock_wrlock(eff, ents[i].object) != 0) { free(ents); return -1; }
-        int rc = layout_migrate_object(eff, ents[i].object, 0, diag, sizeof(diag));
-        objlock_wrunlock(eff, ents[i].object);
-        if (rc != 0) {
-            fprintf(stderr, "shard-db: refusing to start: layout migration failed for %s/%s: %s\n",
-                    ents[i].dir, ents[i].object, diag);
-            free(ents);
-            return -1;
-        }
-    }
-    free(ents);
-    if (layout_stamp_write(db_root) != 0) return -1;
-    layout_report_remove(db_root);
-    return 0;
 }
 
 /* A keyfile rebuild interrupted between its keyfile rename and its bitmap
@@ -1170,67 +992,15 @@ int shard_db_recover_before_stamp(const char *db_root,
         }
         free(rents);
     }
-    if (shard_db_not_null_upgrade_audit(db_root) != 0) return -1;
     if (rebuild_recovery(db_root) != 0) return -1;
-    /* Recovery may restore an older metadata file: re-audit before any
-       new grammar is parsed or a new version is stamped. */
-    if (shard_db_not_null_upgrade_audit(db_root) != 0) return -1;
-
-    /* ── BTRI reindex migration (five-step ordering, §2.4.3) ──
-       Runs after artifact recovery (rebuild_recovery above) and before
-       the clean-flag early-return: a cleanly-stopped pre-2026.10.2 root
-       has no artifacts and no markers but still carries 'BTRH' indexes.
-       Runs before the KFM2 sweeps below so replay applies its index
-       windows against 'BTRI'. The completion stamp is written only
-       after the strict rebuilds AND the replay both succeed. */
-    int btri_migration_ran = 0;
-    if (!btri_migration_stamp_exists(db_root)) {
-        StartupSchemaEntry *ments = NULL;
-        size_t mcount = 0;
-        if (startup_read_schema(db_root, &ments, &mcount) != 0) return -1;
-        for (size_t i = 0; i < mcount; i++) {
-            char eff_root[PATH_MAX];
-            snprintf(eff_root, sizeof(eff_root), "%s/%s",
-                     db_root, ments[i].dir);
-            if (objlock_wrlock(eff_root, ments[i].object) != 0) {
-                LOG_ERROR(LOG_SUB_REINDEX,
-                          "btri-migrate: objlock_wrlock failed for '%s/%s'",
-                          ments[i].dir, ments[i].object);
-                free(ments);
-                return -1;
-            }
-            int n = 0, eno = 0;
-            int rc = reindex_object_durable_checked_ex(eff_root,
-                                                       ments[i].object,
-                                                       0, &n, &eno);
-            objlock_wrunlock(eff_root, ments[i].object);
-            if (rc != 0) {
-                LOG_ERROR(LOG_SUB_REINDEX,
-                          "btri-migrate: strict reindex failed for %s/%s "
-                          "(errno=%d); startup refused — partially "
-                          "published shards are retried whole at next start",
-                          ments[i].dir, ments[i].object, eno);
-                free(ments);
-                return -1;
-            }
-        }
-        free(ments);
-        btri_migration_ran = 1;
-    }
-
-    /* Layout migration: after artifact recovery and the BTRI migration,
-       before the clean flag is consumed (its presence is a D7 precondition). */
-    if (layout_migration_run(db_root) != 0) return -1;
 
     int was_clean = clean_flag_exists(db_root);
     if (clean_flag_remove(db_root) != 0) return -1;
     if (was_clean) {
         /* Clean stop: no KFM2 markers can be pending, but a bitmap-remap
            marker can survive a logged commit failure: repair it before
-           serving. The migration (if it ran) is then the last recovery work. */
+           serving. */
         if (bmfix_recover_all(db_root) != 0) return -1;
-        if (btri_migration_ran &&
-            btri_migration_stamp_write(db_root) != 0) return -1;
         return 0;
     }
 
@@ -1260,14 +1030,6 @@ int shard_db_recover_before_stamp(const char *db_root,
             free(entries);
             return -1;
         }
-    }
-    /* Replay completed against 'BTRI' — only now is the migration stamp
-       durable (a replay failure above leaves no stamp, so the next start
-       re-runs the whole strict migration). */
-    if (btri_migration_ran &&
-        btri_migration_stamp_write(db_root) != 0) {
-        free(entries);
-        return -1;
     }
     free(entries);
     return 0;
@@ -1319,13 +1081,10 @@ ShardDb *shard_db_open(const char *db_root) {
         } else if (version_decision == SHARD_DB_VERSION_TOO_OLD) {
             fprintf(stderr,
                     "shard_db_open: refusing to open: database was last "
-                    "opened by shard-db %s; shard-db %s requires clean-open "
-                    "evidence from %s or newer — install shard-db %s, start "
-                    "it once against this DB_ROOT, then install shard-db %s "
-                    "again.\n",
-                    disk_version, SHARD_DB_VERSION,
-                    SHARD_DB_REQUIRED_SOURCE_VERSION,
-                    SHARD_DB_REQUIRED_SOURCE_VERSION, SHARD_DB_VERSION);
+                    "opened by shard-db %s; install shard-db %s, start it once "
+                    "to completion against this DB_ROOT, then install this "
+                    "version.\n",
+                    disk_version, SHARD_DB_REQUIRED_SOURCE_VERSION);
         } else {
             fprintf(stderr,
                     "shard_db_open: refusing to open: non-empty DB_ROOT "
@@ -1337,6 +1096,17 @@ ShardDb *shard_db_open(const char *db_root) {
         return NULL;
     }
     int stamp_required = version_decision == SHARD_DB_VERSION_STAMP;
+
+    {
+        char gate_err[1024];
+        if (shard_db_layout_gate(db_root, gate_err, sizeof(gate_err)) != 0) {
+            fprintf(stderr, "shard_db_open: refusing to open: %s\n",
+                    gate_err[0] ? gate_err : "layout gate failed");
+            db_root_lock_release(&lock_fd);
+            atomic_store(&g_instance_open, 0);
+            return NULL;
+        }
+    }
 
     ShardDb *db = shard_db_open_internal(db_root);
     if (!db) {
@@ -1471,7 +1241,7 @@ static void db_mutexes_destroy(void) {
 /* Process-global slot (see g_log_handler in config.c) — shard-db allows
    only one ShardDb instance per process (V1), and this is what lets an
    embedded caller register a handler before shard_db_open() returns, so
-   startup-migration diagnostics reach it too. */
+   startup diagnostics reach it too. */
 void shard_db_set_log_handler_global(
     void (*fn)(int type, const char *msg, void *userdata),
     void *userdata) {

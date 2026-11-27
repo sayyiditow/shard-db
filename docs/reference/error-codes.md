@@ -24,6 +24,25 @@ Clients should match on the `error` string, not on the full message.
 | `durability outcome pending; do not retry blindly` | The server durably published an indexed mutation marker but could not synchronously converge it. | Do not retry the mutation. The retained marker blocks later writes on that shard until synchronous replay or startup recovery completes. |
 | `object writes disabled: bitmap repair failed at startup; run reindex` | The object's bitmap repair failed at startup and the escape flag (`indexes/.bmfix-disabled`) is set: reads fall back to btree or scan, but every record mutation and every schema/maintenance mode (insert/update/delete/bulk-*, add-field, edit-field, rename-field, remove-field, add-index, remove-index, vacuum, truncate) is refused up front. | Run a full (non-composites-only) `reindex` — it repairs, clears the flag and re-enables writes. |
 
+### Layout and startup compatibility
+
+These refuse start (the daemon exits; an embedded `shard_db_open` returns NULL)
+or the request that triggers them. 2026.11.3 removed the legacy layout and both
+startup migrations, so a root must already be packed and carry 2026.11.2
+clean-open evidence.
+
+| `error` | Cause | Recovery |
+|---|---|---|
+| `object <dir>/<obj> is not in the packed layout; install shard-db 2026.11.2, start it once to completion, then upgrade` | The `schema.conf` line lacks `layout=packed` and the object exists (rule 1, no `.layout-migrated` stamp). | Install 2026.11.2, start it once to completion (it converts the object), stop, then install this version. |
+| `object <dir>/<obj> is not in the packed layout. To convert it: remove stale schema.conf lines (lines with no object directory) and <db_root>/.layout-migrated, start shard-db 2026.11.2 once to completion, then upgrade` | Same, on a root carrying a stale `.layout-migrated` stamp (an interrupted conversion). | Delete the stale lines and the stamp, then run the 2026.11.2 conversion start. |
+| `stale schema.conf line for <dir>/<obj> lacks layout=packed; stop shard-db, delete the line from schema.conf, then start it` | A token-less line whose object directory does not exist. | Delete the line (D10: the gate refuses every token-less line). |
+| `invalid rebuild metadata under <dir>/<obj>; preserving it` | An active rebuild transaction whose `meta` is unusable or whose `old_layout` is absent/0 (a pre-2026.11.1 artifact). | Preserve the directory for inspection; restore the object from backup, or run 2026.11.2's recovery against the root. |
+| `schema.conf is unreadable or malformed; fix or restore it` | `schema.conf` cannot be read or contains a malformed line/token. | Fix or restore the file. |
+| `database was last opened by shard-db <v>; install shard-db 2026.11.2, start it once to completion against this DB_ROOT, then install this version.` | Version floor: the root's evidence is older than 2026.11.2. | Run 2026.11.2 once to completion, then upgrade. |
+| `backup is not a packed v2 object; restore with shard-db 2026.11.2 first` | `restore` of a backup whose `object.json` lacks `"layout":"packed"` or whose `storage_version` is not 2. | Take the backup with 2026.11.2+ (it writes a packed v2 manifest). |
+| `legacy layout objects can no longer be created` | `create-object` with `declaration_layout:"legacy"` (every build). | Omit it; objects are always packed. |
+| `unknown declaration_layout; expected "packed"` | Any other `declaration_layout` value. | Use `"packed"` or omit the field. |
+
 ### Validation
 
 | `error` | Cause | Recovery |
