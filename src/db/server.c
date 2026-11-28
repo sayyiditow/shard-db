@@ -1846,9 +1846,10 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             const char *stored_key = gkey;
             size_t stored_klen = gkey ? strlen(gkey) : 0;
             int key_valid = !key_present || gkey;
+            int ak_err = 0;   /* auto_key_normalize already wrote the reply */
             if (key_valid && gkey && guard_sc.auto_key != AK_NONE) {
                 if (auto_key_normalize(&guard_sc, gkey, &gbin, &gbin_len)) {
-                    key_valid = 0; grc = -2;
+                    key_valid = 0; grc = -2; ak_err = 1;
                 } else { stored_key = gbin; stored_klen = gbin_len; }
             }
             if (key_valid) {
@@ -1864,7 +1865,9 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
             }
             free(gbin); free(gkey);
             int reject = 1;
-            if (grc == -2)
+            if (ak_err) {
+                /* already replied by auto_key_normalize: exactly one reply line */
+            } else if (grc == -2)
                 OUT("{\"error\":\"invalid guard criteria\"}\n");
             else if (grc == -3)
                 OUT("{\"error\":\"query_timeout\"}\n");
@@ -1932,6 +1935,7 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
         char *if_cond = json_obj_strdup_raw(&req, "if");
         int if_not_exists = json_obj_is_true(&req, "if_not_exists");
         int return_record = json_obj_is_true(&req, "return_record");
+        int dry = json_obj_is_true(&req, "dry_run");
         if (!value) {
             OUT("{\"error\":\"Missing value\"}\n");
         } else {
@@ -1941,6 +1945,9 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 if (!key) {
                     if (if_cond) {
                         OUT("{\"error\":\"if predicate not compatible with auto-generated key\"}\n");
+                    } else if (dry) {
+                        /* A dry run must not consume a sequence value: no key is generated. */
+                        cmd_insert_ex(db_root, object, NULL, 0, value, NULL, 1, 0, 2);
                     } else {
                         char *bin = NULL; size_t blen = 0;
                         if (auto_key_generate(&sc_chk, db_root, object, &bin, &blen) == 0) {
@@ -1956,13 +1963,13 @@ void dispatch_json_query(const char *raw_db_root, const char *json, const char *
                 } else {
                     char *bin = NULL; size_t blen = 0;
                     if (auto_key_normalize(&sc_chk, key, &bin, &blen) == 0) {
-                        cmd_insert(db_root, object, bin, blen, value, if_cond, if_not_exists, return_record);
+                        cmd_insert_ex(db_root, object, bin, blen, value, if_cond, if_not_exists, return_record, dry);
                         free(bin);
                     }
                 }
             } else {
                 if (key)
-                    cmd_insert(db_root, object, key, strlen(key), value, if_cond, if_not_exists, return_record);
+                    cmd_insert_ex(db_root, object, key, strlen(key), value, if_cond, if_not_exists, return_record, dry);
                 else
                     OUT("{\"error\":\"Missing key or value\"}\n");
             }

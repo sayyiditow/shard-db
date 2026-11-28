@@ -6,6 +6,25 @@ Versions follow `yyyy.mm.N` — year-month, with `N` as the counter within that 
 
 ## 2026.11.3 (unreleased — heading opened by the 2026-11-19 audit campaign's first fix; version bump lands with the release cut)
 
+**Breaking: single insert/update/delete validation (audit slice 1).**
+`insert`, `update` and `delete` now reject an empty `key` with
+`key must not be empty` (an empty-key insert used to succeed and make `keys` and
+`fetch` fail for the whole object). `insert` and `update` reject a `value`
+member that names no live field with `unknown field '<name>'` (typos used to
+write nothing and report success; a removed field's name is rejected too, and
+`bulk-insert`/`bulk-update` are unchanged). An oversize `insert` key now returns
+`{"error":"key exceeds max_key (N)"}` instead of an empty reply.
+`dry_run:true` is now a documented feature of single `insert`/`update`/`delete`:
+the update dry run runs the real constructor (so it returns the real write's
+validation errors instead of a bare `would_update`), and the insert dry run
+previews (`would_insert`/`would_update`) without advancing any sequence. This
+is a semantic change: `dry_run:true` on a single `insert` used to be ignored and
+the record was really inserted. Smaller fixes: a guarded write with an invalid
+auto-key now gets one error reply instead of two; `delete` with
+`return_record:true` renders the record before committing (a render failure
+rejects the delete instead of deleting and dropping the record); delete error
+text is JSON-escaped.
+
 **Breaking: the legacy object layout and both startup migrations are removed.**
 Every object is now packed. `create-object` refuses `declaration_layout:"legacy"`
 in every build (the TEST_BUILD fixture seam is gone too), `describe-object`

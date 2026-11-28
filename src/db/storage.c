@@ -13,6 +13,10 @@
  * escape to fail so tests can exercise the static-fallback emission.
  * _Atomic: control-thread writes, request-thread reads. */
 _Atomic int g_shard_test_json_escape_fail;
+/* One-shot: the next delete return_record render fails (AUD-P3-10 test seam).
+ * Defined here, not in test_control.c, because that file is not linked into
+ * shard-db-test; armed via the control channel's SET_GLOBALS phase 15. */
+_Atomic int g_shard_test_delete_render_fail;
 #endif
 
 
@@ -440,10 +444,37 @@ static int single_write_finish(const TypedSchema *ts,SlotcaskDb *db,size_t klen,
     return 0;
 }
 static void single_write_error(const char *message,const char *fallback){
+    /* Escape once, after any truncation: producers format raw client text
+       into err_buf. The stack buffer holds the mathematical worst case (6
+       escaped bytes per input byte + NUL), so no allocation and no overflow
+       is possible; on any escape failure emit a static message, because raw
+       client-controlled text must never reach the wire. */
     char esc[512*6+1];
-    int n=message?json_escape_into(esc,sizeof(esc),message,strlen(message)):-1;
-    if(n>=0){esc[n]='\0';OUT("{\"error\":\"%s\"}\n",esc);}
-    else OUT("{\"error\":\"%s\"}\n",fallback);
+    int n=message?json_escape_into(esc,sizeof(esc)-1,message,strlen(message)):-1;
+    if(n>=0)esc[n]='\0';  /* helper writes no terminator; one byte reserved above */
+#ifdef TEST_BUILD
+    if(atomic_load(&g_shard_test_json_escape_fail))n=-1;
+#endif
+    if(n>=0){OUT("{\"error\":\"%s\"}\n",esc);}
+    else{
+        if(message)LOG_ERROR(LOG_SUB_SLOTCASK,"single-write error escape failed; emitting static fallback");
+        OUT("{\"error\":\"%s\"}\n",fallback);
+    }
+}
+
+/* AUD-P3-2/3: shared single-write key validation. Empty key is an error
+   for every mode (it would create an unreadable record on insert and make
+   keys/fetch fail). An oversize key is an error for insert only; update
+   and delete keep their not-found answer. Returns 1 after printing the
+   error reply, else 0. */
+enum { SW_KEY_INSERT = 0, SW_KEY_UPDATE = 1, SW_KEY_DELETE = 2 };
+static int single_write_key_check(const Schema *sc,size_t klen,int mode){
+    if(klen==0){single_write_error("key must not be empty","key must not be empty");return 1;}
+    if(mode==SW_KEY_INSERT&&klen>(size_t)sc->max_key){
+        char m[64];snprintf(m,sizeof(m),"key exceeds max_key (%d)",sc->max_key);
+        single_write_error(m,"key too large");return 1;
+    }
+    return 0;
 }
 
 typedef struct {
@@ -488,6 +519,7 @@ typedef struct {
     SlotcaskDb       *db;
     int               return_record;
     char             *ret_json; /* rendered before commit, command-owned */
+    int               dry;      /* dry run: placeholder seq defaults */
 } V2InsertCtx;
 
 static void v2_insert_bm_owned_free(V2InsertCtx *c) {
@@ -509,8 +541,8 @@ static int v2_insert_owned(const SlotcaskOldRecord *old,uint8_t **out,
     if(old){TypedRowView view;
         if(typed_row_open(ts,old->value,old->vlen,old->hdr2,&view)){
             snprintf(c->err_buf,sizeof(c->err_buf),"invalid OLD generation or value");errno=EILSEQ;return -1;}}
-    if(typed_insert_alloc(ts,old,c->value_json,c->db_root,c->object,
-        out,n,c->err_buf,sizeof(c->err_buf)))return -1;
+    if(typed_insert_alloc_ex(ts,old,c->value_json,c->db_root,c->object,
+        TYPED_PREP_STRICT|(c->dry?TYPED_PREP_DRY_DEFAULTS:0),out,n,c->err_buf,sizeof(c->err_buf)))return -1;
     if(typed_index_validate_new(ts,*out,*n,typed_schema_hdr2(ts),
         c->fields,c->idx_types,c->nfields)){
         snprintf(c->err_buf,sizeof(c->err_buf),"invalid NEW index key: %s",strerror(errno));return -1;
@@ -991,19 +1023,19 @@ void auto_now_str(const TypedField *f, char *buf, size_t bufsz) {
     }
 }
 
+/* dry_mode: 0 = real insert, 1 = dry run, 2 = dry run with the key omitted
+   (auto-key objects; key == NULL, nothing is generated). */
 static int cmd_insert_v2_impl(const char *db_root, const char *object,
                          const char *key, size_t klen, const char *value,
                          const char *if_json, int if_not_exists,
-                         int return_record, const Schema *sc, TypedSchema *ts, SlotcaskDb *borrowed) {
+                         int return_record, int dry_mode,
+                         const Schema *sc, TypedSchema *ts, SlotcaskDb *borrowed) {
     if (!ts) {
         OUT("{\"error\":\"Object [%s] not found. Use create-object first.\"}\n", object);
         return 1;
     }
 
-    if ((int)klen > sc->max_key) {
-        fprintf(stderr, "Error: Key too large (%zu > %d)\n", klen, sc->max_key);
-        return 1;
-    }
+    if (dry_mode != 2 && single_write_key_check(sc, klen, SW_KEY_INSERT)) return 1;
 
     uint8_t *typed_buf=NULL;size_t vlen=0;
 
@@ -1053,6 +1085,51 @@ static int cmd_insert_v2_impl(const char *db_root, const char *object,
         .return_record=return_record,
         .cas_tree = cas_tree, .cas_fs = &cas_fs,
     };
+    if (dry_mode) {
+        /* AUD-P3-9: dry run through the real constructor over a local ctx;
+           reads OLD without the kf lock (race-tolerant, writes nothing). It
+           cannot see index-apply I/O errors, the bitmap distinct-value cap,
+           a return_record render failure, or a real sequence value that
+           overflows a narrow field (seq defaults use a placeholder). */
+        ctx.dry = 1; ctx.return_record = 0;
+        if (dry_mode == 2) ctx.key_len = sc->auto_key == AK_UUID ? 16 : 8;
+        void *old_val = NULL; size_t old_vlen = 0; uint8_t old_hdr2 = 0;
+        int exists = dry_mode != 2 &&
+            slotcask_get_ex(sdb, key, klen, &old_val, &old_vlen, &old_hdr2) == 0;
+        SlotcaskOldRecord orec = { .value = old_val, .vlen = old_vlen, .hdr2 = old_hdr2 };
+        const SlotcaskOldRecord *oldp = exists ? &orec : NULL;
+        int ok = !(if_not_exists && exists);
+        if (ok && cas_tree) ok = v2_insert_check_fn(oldp, &ctx);
+        if (!ok) {
+            if (ctx.err_buf[0]) {
+                single_write_error(ctx.err_buf, "upsert failed");
+            } else {
+                char *cur = exists
+                    ? single_write_decode(ts, old_val, old_vlen, old_hdr2) : NULL;
+                OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
+                    cur ? cur : "null");
+                free(cur);
+            }
+            free(old_val); free_criteria_tree(cas_tree);
+            return 1;
+        }
+        uint8_t *nout = NULL; size_t nlen = 0;
+        int drc = v2_insert_owned(oldp, &nout, &nlen, &ctx);
+        free(nout); free(ctx.ret_json); free(old_val); free_criteria_tree(cas_tree);
+        if (drc) {
+            single_write_error(ctx.err_buf[0] ? ctx.err_buf : NULL, "upsert failed");
+            return 1;
+        }
+        if (dry_mode == 2) {
+            OUT("{\"status\":\"would_insert\",\"key\":null}\n");
+        } else {
+            char wire_key[1100];
+            format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
+            OUT("{\"status\":\"%s\",\"key\":\"%s\"}\n",
+                exists ? "would_update" : "would_insert", wire_key);
+        }
+        return 0;
+    }
     compute_hash_raw(key, klen, ctx.hash);
     int durability_pending = 0;
 
@@ -1151,19 +1228,26 @@ static int cmd_insert_v2_impl(const char *db_root, const char *object,
 }
 static int cmd_insert_v2(const char *root,const char *object,const char *key,
     size_t klen,const char *json,const char *condition,int only_new,
-    int return_record,const Schema *sc){
+    int return_record,int dry_mode,const Schema *sc){
     return cmd_insert_v2_impl(root,object,key,klen,json,condition,only_new,
-        return_record,sc,load_typed_schema(root,object),NULL);
+        return_record,dry_mode,sc,load_typed_schema(root,object),NULL);
 }
 
 /* ========== INSERT (mmap + atomic flag flip) ========== */
 
+int cmd_insert_ex(const char *db_root, const char *object,
+               const char *key, size_t klen, const char *value,
+               const char *if_json, int if_not_exists, int return_record,
+               int dry_mode) {
+    Schema sc = load_schema(db_root, object);
+    return cmd_insert_v2(db_root, object, key, klen, value, if_json,
+                          if_not_exists, return_record, dry_mode, &sc);
+}
 int cmd_insert(const char *db_root, const char *object,
                const char *key, size_t klen, const char *value,
                const char *if_json, int if_not_exists, int return_record) {
-    Schema sc = load_schema(db_root, object);
-    return cmd_insert_v2(db_root, object, key, klen, value, if_json,
-                          if_not_exists, return_record, &sc);
+    return cmd_insert_ex(db_root, object, key, klen, value, if_json,
+                         if_not_exists, return_record, 0);
 }
 
 /* ========== PARTIAL UPDATE — v2 (slotcask) helper ==========
@@ -1213,6 +1297,7 @@ typedef struct {
     char             *ret_json; /* rendered before reservation; command-owned */
     SlotcaskDb       *db;
     size_t            key_len;
+    int               dry;      /* dry run: caller parks slotcask_test_after_old(0) itself */
 } V2UpdateCtx;
 
 /* Parsed computed-field spec for one update (conditional-writes F1).
@@ -1411,9 +1496,9 @@ static int v2_update_owned(const SlotcaskOldRecord *old,uint8_t **out,
     c->saved_old_value=old->value;c->saved_old_vlen=old->vlen;c->old_hdr2=old->hdr2;
     int rc;
 #ifdef TEST_BUILD
-    slotcask_test_after_old(1);
+    if(!c->dry)slotcask_test_after_old(1);
 #endif
-    rc=typed_update_computed_alloc(ts,old,c->partial_json,out,n,c->err_buf,sizeof(c->err_buf));
+    rc=typed_update_computed_alloc_ex(ts,old,c->partial_json,TYPED_PREP_STRICT,out,n,c->err_buf,sizeof(c->err_buf));
     if(rc)return -1;
     if(typed_index_validate_new(ts,*out,*n,typed_schema_hdr2(ts),
         c->idx_fields,c->idx_types,c->nidx)){
@@ -1682,12 +1767,21 @@ static int cmd_update_v2_impl(const char *db_root, const char *object,
     if (!sdb) { OUT("{\"error\":\"Not found\"}\n"); return 1; }
 
     if (!ts) { OUT("{\"error\":\"Object not found\"}\n"); return 1; }
+    if (single_write_key_check(sc, klen, SW_KEY_UPDATE)) return 1;
+
+    char idx_fields[MAX_FIELDS][256];
+    int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
+    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
+
+    enum IndexType idx_types[MAX_FIELDS];
+    load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
     /* dry_run validates criteria but doesn't write — race-tolerant. It is
        the only remaining user of the up-front slotcask_get snapshot: a
        normal update builds NEW from the lock-protected OLD inside
        v2_update_new_from_old instead, so no stale outside-lock snapshot
        exists for the race to be lost against. */
+
     if (dry_run) {
         void *old_val = NULL; size_t old_vlen = 0;
         uint8_t old_hdr2 = 0;
@@ -1733,7 +1827,26 @@ static int cmd_update_v2_impl(const char *db_root, const char *object,
                 return 1;
             }
         }
+        /* Build NEW with the real constructor over a local ctx, so the dry run
+           reports exactly the errors the real update would (AUD-P3-9). It
+           cannot see index-apply I/O errors, the bitmap distinct-value cap
+           or the marker/commit stages. */
+        V2UpdateCtx dctx = {
+            .db_root = db_root, .object = object, .splits = sc->splits,
+            .idx_fields = idx_fields, .nidx = nidx, .idx_types = idx_types,
+            .idx_ts = ts, .db = sdb, .key_len = klen,
+            .partial_json = partial_json, .return_record = 0, .dry = 1,
+        };
+        SlotcaskOldRecord orec = { .value = old_val, .vlen = old_vlen, .hdr2 = old_hdr2 };
+        uint8_t *nout = NULL; size_t nlen = 0;
+        int drc = v2_update_owned(&orec, &nout, &nlen, &dctx);
+        free(nout);
+        free(dctx.ret_json);
         free(old_val);
+        if (drc) {
+            single_write_error(dctx.err_buf[0] ? dctx.err_buf : NULL, "update failed");
+            return 1;
+        }
         char wire_key[1100];
         format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
         OUT("{\"status\":\"would_update\",\"key\":\"%s\"}\n", wire_key);
@@ -1760,13 +1873,6 @@ static int cmd_update_v2_impl(const char *db_root, const char *object,
         }
         /* cas_tree NULL with empty cas_err = vacuous pass ([]). */
     }
-
-    char idx_fields[MAX_FIELDS][256];
-    int nidx = load_index_fields(db_root, object, idx_fields, MAX_FIELDS);
-    for (int _i = 0; _i < nidx; _i++) idx_fields[_i][255] = '\0';
-
-    enum IndexType idx_types[MAX_FIELDS];
-    load_index_types(db_root, object, idx_types, MAX_FIELDS);
 
     V2UpdateCtx ctx = {
         .db_root = db_root, .object = object, .splits = sc->splits,
@@ -1826,30 +1932,7 @@ static int cmd_update_v2_impl(const char *db_root, const char *object,
         free(result.current_value);
         free(ctx.ret_json); ctx.ret_json = NULL;
         free_criteria_tree(cas_tree);
-        if (ctx.err_buf[0]) {
-            /* Escape once, after any truncation: producers format raw
-               client text into err_buf. The stack buffer holds the
-               mathematical worst case (6 escaped bytes per input byte +
-               NUL), so no allocation and no overflow is possible — on
-               any escape failure emit a static message, because raw
-               client-controlled text must never reach the wire. */
-            char esc[sizeof(ctx.err_buf) * 6 + 1];
-            int n = json_escape_into(esc, sizeof(esc),
-                                     ctx.err_buf, strlen(ctx.err_buf));
-            if (n >= 0) esc[n] = '\0';  /* helper writes no terminator */
-#ifdef TEST_BUILD
-            if (atomic_load(&g_shard_test_json_escape_fail)) n = -1;
-#endif
-            if (n >= 0) {
-                OUT("{\"error\":\"%s\"}\n", esc);
-            } else {
-                LOG_ERROR(LOG_SUB_SLOTCASK,
-                          "update error escape failed; emitting static fallback");
-                OUT("{\"error\":\"update failed\"}\n");
-            }
-        } else {
-            OUT("{\"error\":\"update failed\"}\n");
-        }
+        single_write_error(ctx.err_buf[0] ? ctx.err_buf : NULL, "update failed");
         return 1;
     }
     if (durability_pending) {
@@ -1905,31 +1988,36 @@ typedef struct {
     int               kf_shard;     /* populated by slotcask before pre_commit */
     uint32_t          kf_slot;
     char              err_buf[256];
-    /* F4 return_record: ret_buf holds a copy of the removed OLD record,
-       captured by v2_delete_check_fn (slotcask_delete_with_hooks does
-       NOT populate result.current_value on success). Zeroed by the ctx
-       initializer. */
+    /* F4 return_record: ret_json holds the removed OLD record rendered by
+       v2_delete_check_fn BEFORE the commit (slotcask_delete_with_hooks does
+       NOT populate result.current_value on success), so a render failure
+       rejects the delete instead of deleting and dropping the record.
+       Zeroed by the ctx initializer. */
     int               return_record;
-    uint8_t          *ret_buf;
-    size_t            ret_len;
-    uint8_t           ret_hdr2;
+    char             *ret_json;
 } V2DeleteCtx;
 
 static int v2_delete_check_fn(const SlotcaskOldRecord *old, void *ctx_ptr) {
     V2DeleteCtx *c = (V2DeleteCtx *)ctx_ptr;
-    if (old && c->return_record && !c->ret_buf) {
-        c->ret_buf = malloc(old->vlen);
-        if (c->ret_buf) {
-            memcpy(c->ret_buf, old->value, old->vlen);
-            c->ret_len = old->vlen;
-            c->ret_hdr2 = old->hdr2;
-        }
-    }
     if (c->cas_tree) {
         if (!old) return 0;
         int matched=cas_match_tree_checked(old->value,old->vlen,c->cas_tree,c->cas_fs,old->hdr2);
         if(matched<0)snprintf(c->err_buf,sizeof(c->err_buf),"invalid typed condition: %s",strerror(errno));
         if(matched<=0)return 0;
+    }
+    /* Render after the CAS check so a render failure never masks a
+       legitimate condition_not_met. */
+    if (old && c->return_record && !c->ret_json) {
+        c->ret_json = single_write_decode(c->idx_ts, old->value, old->vlen, old->hdr2);
+#ifdef TEST_BUILD
+        if (atomic_exchange(&g_shard_test_delete_render_fail, 0)) {
+            free(c->ret_json); c->ret_json = NULL;
+        }
+#endif
+        if (!c->ret_json) {
+            snprintf(c->err_buf, sizeof(c->err_buf), "cannot render record");
+            return 0;
+        }
     }
     return 1;
 }
@@ -2037,6 +2125,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
                          const char *key, size_t klen,
                          const char *if_json, int dry_run,
                          int return_record, const Schema *sc) {
+    if (single_write_key_check(sc, klen, SW_KEY_DELETE)) return 1;
     char wire_key[1100];
     format_wire_key(sc, key, klen, wire_key, sizeof(wire_key));
 
@@ -2171,7 +2260,7 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     if (result.not_found) {
         OUT("{\"status\":\"not_found\",\"key\":\"%s\"}\n", wire_key);
         free(result.current_value);
-        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free(ctx.ret_json); ctx.ret_json = NULL;
         free_criteria_tree(cas_tree);
         return 0;
     }
@@ -2183,18 +2272,15 @@ static int cmd_delete_v2(const char *db_root, const char *object,
         OUT("{\"error\":\"condition_not_met\",\"current\":%s}\n",
             cur ? cur : "null");
         free(cur); free(result.current_value);
-        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free(ctx.ret_json); ctx.ret_json = NULL;
         free_criteria_tree(cas_tree);
         return 1;
     }
     if (rc != 0) {
         free(result.current_value);
-        free(ctx.ret_buf); ctx.ret_buf = NULL;
+        free(ctx.ret_json); ctx.ret_json = NULL;
         free_criteria_tree(cas_tree);
-        if (ctx.err_buf[0])
-            OUT("{\"error\":\"%s\"}\n", ctx.err_buf);
-        else
-            OUT("{\"error\":\"delete failed\"}\n");
+        single_write_error(ctx.err_buf[0] ? ctx.err_buf : NULL, "delete failed");
         return 1;
     }
 
@@ -2203,24 +2289,19 @@ static int cmd_delete_v2(const char *db_root, const char *object,
     free(result.current_value);
     free_criteria_tree(cas_tree);
     if (durability_degraded) {
-        free(ctx.ret_buf);
+        free(ctx.ret_json);
         OUT("{\"error\":\"durability outcome pending; do not retry blindly\"}\n");
         return 1;
     }
-    if (return_record && ctx.ret_buf) {
-        char *rec = typed_decode(ts, ctx.ret_buf, (uint32_t)ctx.ret_len,
-                                 ctx.ret_hdr2);
-        free(ctx.ret_buf);
-        ctx.ret_buf = NULL;
-        if (rec) {
-            OUT("{\"status\":\"deleted\",\"key\":\"%s\",\"record\":%s}\n",
-                wire_key, rec);
-            free(rec);
-            return 0;
-        }
+    if (return_record && ctx.ret_json) {
+        OUT("{\"status\":\"deleted\",\"key\":\"%s\",\"record\":%s}\n",
+            wire_key, ctx.ret_json);
+        free(ctx.ret_json);
+        ctx.ret_json = NULL;
+        return 0;
     }
-    free(ctx.ret_buf);
-    ctx.ret_buf = NULL;
+    free(ctx.ret_json);
+    ctx.ret_json = NULL;
     OUT("{\"status\":\"deleted\",\"key\":\"%s\"}\n", wire_key);
     return 0;
 }
@@ -2267,7 +2348,7 @@ int cmd_get_multi(const char *db_root, const char *object, const char *keys_json
 int shard_test_single_insert(const char *root,const char *object,
     const char *key,size_t klen,const char *json,const char *condition,
     int only_new,int return_record,const Schema *sc,TypedSchema *ts,SlotcaskDb *db) {
-    return cmd_insert_v2_impl(root,object,key,klen,json,condition,only_new,return_record,sc,ts,db);
+    return cmd_insert_v2_impl(root,object,key,klen,json,condition,only_new,return_record,0,sc,ts,db);
 }
 int shard_test_single_update(const char *root,const char *object,
     const char *key,size_t klen,const char *json,const char *condition,

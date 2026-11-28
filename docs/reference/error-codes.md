@@ -61,6 +61,10 @@ clean-open evidence.
 | `compact refused: every field is tombstoned; …` | `vacuum compact` would leave no field. | Keep or re-add a field first. |
 | `Rebuild walk failed: field '<f>' key '<k>': <reason>` | Packed rebuild aborted mid-walk; original data restored. | Read the reason. |
 | `Invalid field name: <name>` | Same, from `remove-field`. | Fix the name. |
+| `key must not be empty` | `insert`, `update` or `delete` with `"key":""`. | Supply a non-empty key. |
+| `key exceeds max_key (N)` | `insert` key longer than the object's `max_key`. (`update`/`delete` of an oversize key report the key as not found.) | Use a shorter key. |
+| `unknown field '<name>'` | `insert`/`update` `value` has a member that matches no live field (typo, or a removed field). Nothing is written. `unknown field (name too long)` when the name exceeds 1530 encoded bytes. | Fix the name; drop members for removed fields. |
+| `cannot render record` | `delete` with `return_record:true` could not render the record before committing (memory limit). The delete did not happen. | Retry, or delete without `return_record`. |
 | `max_key N exceeds ceiling 1024` | `create-object` with a too-large `max_key`. | Use ≤ 1024 (UUIDs fit in 36B). |
 | `too many fields (max 256)` | Schema exceeded `MAX_FIELDS`. | Consolidate or drop unused fields. |
 
@@ -172,6 +176,7 @@ object if it cannot finish it (`RESTORE-RECOVER …: startup refused`).
 Some responses look error-ish but are normal:
 
 - `{"status":"not_found","key":"..."}` — `delete` on a missing key. Not an error; your delete is a no-op.
+- `{"status":"would_insert|would_update|would_delete",...}` — a `dry_run:true` single write ([CAS → Dry-run](../query-protocol/cas.md#dry-run)); nothing was written.
 - `{"status":"not_indexed","field":"..."}` — `remove-index` on a non-existent index. Idempotent no-op.
 - `{"status":"exists","field":"..."}` — `add-index` without `force:true` on an already-indexed field.
 - `{"count":0}` — a count/find with no matches. Normal.

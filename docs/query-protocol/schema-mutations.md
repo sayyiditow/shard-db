@@ -345,7 +345,7 @@ Tombstones one or more fields. Bytes stay reserved in every record's payload unt
 
 1. Appends `:removed` to each field's line in `fields.conf`.
 2. **Auto-drops** any index referencing a removed field (including composites).
-3. Queries treating those fields return empty values; writes silently ignore them.
+3. Queries treating those fields return empty values. Single `insert`/`update` reject a removed field's name as an unknown field (`unknown field '<name>'`); `bulk-insert` and `bulk-update` still ignore it. After `vacuum compact` purges the tombstone the name is unknown everywhere.
 
 ### Why tombstone vs delete
 

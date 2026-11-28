@@ -1287,6 +1287,13 @@ int cmd_insert(const char *db_root, const char *object,
                const char *key, size_t klen,
                const char *value,
                const char *if_json, int if_not_exists, int return_record);
+/* dry_mode: 0 = real insert, 1 = dry run, 2 = dry run with the key omitted on
+   an auto-key object (key NULL; nothing generated, reply key:null). */
+int cmd_insert_ex(const char *db_root, const char *object,
+                  const char *key, size_t klen,
+                  const char *value,
+                  const char *if_json, int if_not_exists, int return_record,
+                  int dry_mode);
 int cmd_update(const char *db_root, const char *object,
                const char *key, size_t klen,
                const char *partial_json,

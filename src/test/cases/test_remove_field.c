@@ -75,18 +75,33 @@ static int test_remove_field_run(void) {
     ASSERT_CONTAINS(resp, "\"score\":100", "GET still has score");
     free(resp); resp = NULL;
 
-    /* Insert ignores tombstoned */
+    /* Insert rejects a tombstoned field's name (AUD-P3-7), and still works without it */
     tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"leads\","
                    "\"key\":\"k3\",\"value\":{\"fullName\":\"Carol\",\"email\":\"c@x.com\",\"age\":40,\"score\":80}}",
+                   &resp);
+    ASSERT_CONTAINS(resp, "unknown field 'email'", "insert: removed email rejected");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"exists\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k3\"}", &resp);
+    ASSERT_CONTAINS(resp, "false", "insert: rejected insert wrote nothing");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"insert\",\"dir\":\"default\",\"object\":\"leads\","
+                   "\"key\":\"k3\",\"value\":{\"fullName\":\"Carol\",\"age\":40,\"score\":80}}",
                    &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k3\"}", &resp);
-    ASSERT_TRUE(SAFE_STRSTR(resp, "\"email\"") == NULL, "insert: email ignored");
+    ASSERT_TRUE(SAFE_STRSTR(resp, "\"email\"") == NULL, "insert: email absent");
     ASSERT_CONTAINS(resp, "\"fullName\":\"Carol\"", "insert: fullName saved");
     free(resp); resp = NULL;
 
-    /* Update ignores tombstoned */
+    /* Update rejects a tombstoned field's name, and still works without it */
     tc_request(tc, "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k1\","
-                   "\"value\":{\"email\":\"ignored@x.com\",\"score\":200}}", &resp); free(resp); resp = NULL;
+                   "\"value\":{\"email\":\"ignored@x.com\",\"score\":200}}", &resp);
+    ASSERT_CONTAINS(resp, "unknown field 'email'", "update: removed email rejected");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k1\"}", &resp);
+    ASSERT_CONTAINS(resp, "\"score\":100", "update: rejected update left score unchanged");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k1\","
+                   "\"value\":{\"score\":200}}", &resp); free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"get\",\"dir\":\"default\",\"object\":\"leads\",\"key\":\"k1\"}", &resp);
     ASSERT_TRUE(SAFE_STRSTR(resp, "\"email\"") == NULL, "update: email still absent");
     ASSERT_CONTAINS(resp, "\"score\":200", "update: score updated");

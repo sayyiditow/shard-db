@@ -89,6 +89,8 @@ enum {
 /* Restore fault seams: a = mask (SHARD_TEST_RF_*), b = swap-rename index.
    b is stored first so the armed index is visible before the mask. */
 #define TEST_HOOK_SET_GLOBALS_RESTORE_FAULT 14
+/* a = 1 arms the one-shot single-delete return_record render failure. */
+#define TEST_HOOK_SET_GLOBALS_DELETE_RENDER_FAIL 15
 /* Restore park sites (INSTALL .phase): SWAPPED = after the renames, before
    the commit fsyncs; COMMITTED = after the commit, before the stage delete. */
 #define TEST_HOOK_KIND_RESTORE_PARK_SWAPPED 5
@@ -448,6 +450,8 @@ static void *test_control_thread_main(void *arg) {
             } else if (msg.phase == TEST_HOOK_SET_GLOBALS_RESTORE_FAULT) {
                 atomic_store(&g_restore_test_swap_rename_at, (int)msg.b);
                 atomic_store(&g_restore_test_fault_mask, (int)msg.a);
+            } else if (msg.phase == TEST_HOOK_SET_GLOBALS_DELETE_RENDER_FAIL) {
+                atomic_store(&g_shard_test_delete_render_fail, (int)msg.a);
             }
             /* an unknown selector is ignored (still ACKed): it must never
                fall through into the kf seams */

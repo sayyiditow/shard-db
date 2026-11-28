@@ -412,6 +412,10 @@ gcc $MODE_CFLAGS -DTEST_BUILD -o shard-db-test \
     src/test/cases/test_typed_row_adapter.c \
     src/test/cases/test_owning_write_hooks.c \
     src/test/cases/test_single_write_integration.c \
+    src/test/cases/test_single_write_key_validation.c \
+    src/test/cases/test_single_write_unknown_field.c \
+    src/test/cases/test_single_write_dry_run.c \
+    src/test/cases/test_single_write_delete_guard.c \
     src/test/cases/test_typed_bulk_insert.c \
     src/test/cases/test_typed_bulk_update.c \
     src/test/cases/test_whole_record_readers.c \

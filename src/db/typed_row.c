@@ -282,7 +282,7 @@ int typed_prepared_old(const TypedSchema *ts,const SlotcaskOldRecord *old,
 fail:typed_prepared_free(p);return row_error(err,cap,EILSEQ,"invalid OLD field");
 }
 static int prepared_defaults_mode(TypedPrepared *p,const char *root,const char *object,
-    int defer_ac,char *err,size_t cap){
+    int defer_ac,unsigned flags,char *err,size_t cap){
     if(prepared_check(p,err,cap))return -1;
     for(int i=0;i<p->schema->nfields;i++){
         const TypedField *f=&p->schema->fields[i];
@@ -294,7 +294,8 @@ static int prepared_defaults_mode(TypedPrepared *p,const char *root,const char *
              * already retained owners before requesting either allocation. */
             size_t generator_budget=available>2048?(available-2048)/2:0;
             if(!generator_budget)return row_error(err,cap,ENOMEM,"query memory buffer exceeded");
-            owned=generate_default_owned(f,root,object,generator_budget);
+            owned=(f->default_kind==DK_SEQ&&(flags&TYPED_PREP_DRY_DEFAULTS))
+                ?strdup("1"):generate_default_owned(f,root,object,generator_budget);
             if(!owned)return row_error(err,cap,errno,errno==ENOMEM||errno==ENOBUFS?"query memory buffer exceeded":"default generator failed");
             in.data=owned;in.len=strlen(owned);in.is_null=0;
         }
@@ -305,7 +306,7 @@ static int prepared_defaults_mode(TypedPrepared *p,const char *root,const char *
 }
 int typed_prepared_defaults(TypedPrepared *p,const char *root,const char *object,
                              char *err,size_t cap){
-    return prepared_defaults_mode(p,root,object,0,err,cap);
+    return prepared_defaults_mode(p,root,object,0,0,err,cap);
 }
 int typed_prepared_stamp(TypedPrepared *p,enum DefaultKind kind,char *err,size_t cap){
     if(prepared_check(p,err,cap))return -1;
@@ -566,7 +567,7 @@ static int row_compute_apply(TypedPrepared *p,const SlotcaskOldRecord *old,
 
 static int prepare_json(const TypedSchema *ts,const char *json,int defaults,
                           const char *root,const char *object,TypedPrepared *out,const SlotcaskOldRecord *old,int computed,
-                          char *err,size_t cap){
+                          unsigned flags,char *err,size_t cap){
     if(!json)return row_error(err,cap,EINVAL,"invalid record JSON");
     size_t request_length=strnlen(json,g_query_buffer_max_bytes);
     if(request_length>=g_query_buffer_max_bytes/8)return row_error(err,cap,ENOMEM,"query memory buffer exceeded");
@@ -596,9 +597,11 @@ static int prepare_json(const TypedSchema *ts,const char *json,int defaults,
                 row_error(err,cap,errno==ENOMEM?ENOMEM:EINVAL,"invalid field name");goto fail;
             }
         }
+        int hit=0;
         for(int i=0;name&&i<ts->nfields;i++){
             const TypedField *f=&ts->fields[i];
             if(f->removed||name_len!=(size_t)f->name_len||memcmp(f->name,name,name_len))continue;
+            hit=1;
             int quoted=n>=2&&v[0]=='"'&&v[n-1]=='"';
             if(!quoted&&(v[0]=='{'||v[0]=='[')){
                 if(!computed||!old||v[0]!='{'){free(name);goto bad;}
@@ -612,6 +615,15 @@ static int prepare_json(const TypedSchema *ts,const char *json,int defaults,
                 (uint8_t)(!quoted&&json_span_is_null(v,n)),(uint8_t)quoted};
             if(typed_prepared_set(out,(size_t)i,&in,err,cap)){free(name);goto fail;}
             break;
+        }
+        if(!hit&&(flags&TYPED_PREP_STRICT)){
+            /* Single writes reject a member naming no live field (a typo, or
+             * a removed field). snprintf, not row_error: it is not printf-style. */
+            if(err&&cap){
+                if(name)snprintf(err,cap,"unknown field '%s'",name);
+                else snprintf(err,cap,"unknown field (name too long)");
+            }
+            errno=EINVAL;free(name);goto fail;
         }
         free(name);first=0;
     }
@@ -629,7 +641,7 @@ int typed_encode_packed_into(const TypedSchema *ts,const char *json,int defaults
                               size_t cap,size_t *used,char *err,size_t errsz){
     if(used)*used=0;
     TypedPrepared p;typed_prepared_init(&p);
-    int rc=prepare_json(ts,json,defaults,root,object,&p,NULL,0,err,errsz);
+    int rc=prepare_json(ts,json,defaults,root,object,&p,NULL,0,0,err,errsz);
     if(!rc)rc=typed_prepared_compose(&p,out,cap,used,err,errsz);
     typed_prepared_free(&p);return rc;
 }
@@ -641,7 +653,7 @@ int typed_encode_alloc(const TypedSchema *ts,const char *json,int defaults,
         return row_error(err,cap,EINVAL,"invalid typed schema");
     if(!json)return row_error(err,cap,EINVAL,"invalid record JSON");
     TypedPrepared p;typed_prepared_init(&p);
-    int rc=prepare_json(ts,json,defaults,root,object,&p,NULL,0,err,cap);
+    int rc=prepare_json(ts,json,defaults,root,object,&p,NULL,0,0,err,cap);
     if(!rc)rc=typed_prepared_alloc(&p,out,len,err,cap);
     typed_prepared_free(&p);return rc;
 }
@@ -674,17 +686,22 @@ static int prepared_insert_finish(TypedPrepared *p,const SlotcaskOldRecord *old,
 /* Complete packed insertion against locked OLD. Ordinary defaults run once;
    auto_create is stamped only when fresh, or copied with OLD nullness.
    Public encode/default APIs retain their existing independent contract. */
-int typed_insert_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
-    const char *json,const char *root,const char *object,uint8_t **out,size_t *len,
-    char *err,size_t cap){
+int typed_insert_alloc_ex(const TypedSchema *ts,const SlotcaskOldRecord *old,
+    const char *json,const char *root,const char *object,unsigned flags,
+    uint8_t **out,size_t *len,char *err,size_t cap){
     if(!out||!len)return row_error(err,cap,EINVAL,"invalid output");
     *out=NULL;*len=0;
     if(!packed_schema_ok(ts))return row_error(err,cap,EINVAL,"invalid packed schema");
     TypedPrepared p;typed_prepared_init(&p);
-    int rc=prepare_json(ts,json,0,root,object,&p,NULL,0,err,cap);
-    if(!rc)rc=prepared_defaults_mode(&p,root,object,1,err,cap);
+    int rc=prepare_json(ts,json,0,root,object,&p,NULL,0,flags,err,cap);
+    if(!rc)rc=prepared_defaults_mode(&p,root,object,1,flags,err,cap);
     if(!rc)rc=prepared_insert_finish(&p,old,out,len,err,cap);
     typed_prepared_free(&p);return rc;
+}
+int typed_insert_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
+    const char *json,const char *root,const char *object,uint8_t **out,size_t *len,
+    char *err,size_t cap){
+    return typed_insert_alloc_ex(ts,old,json,root,object,0,out,len,err,cap);
 }
 int typed_insert_inputs_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     const TypedInput *inputs,uint8_t **out,size_t *len,char *err,size_t cap){
@@ -709,7 +726,19 @@ int typed_update_json_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     *out=NULL;*len=0;
     if(!packed_schema_ok(ts)||!old)return row_error(err,cap,EINVAL,"invalid update");
     TypedPrepared p;typed_prepared_init(&p);
-    int rc=prepare_json(ts,json,0,NULL,NULL,&p,old,0,err,cap);
+    int rc=prepare_json(ts,json,0,NULL,NULL,&p,old,0,0,err,cap);
+    if(!rc)rc=typed_prepared_stamp(&p,DK_AUTO_UPDATE,err,cap);
+    if(!rc)rc=typed_prepared_alloc(&p,out,len,err,cap);
+    typed_prepared_free(&p);return rc;
+}
+
+int typed_update_computed_alloc_ex(const TypedSchema *ts,const SlotcaskOldRecord *old,
+    const char *json,unsigned flags,uint8_t **out,size_t *len,char *err,size_t cap){
+    if(!out||!len)return row_error(err,cap,EINVAL,"invalid output");
+    *out=NULL;*len=0;
+    if(!packed_schema_ok(ts)||!old)return row_error(err,cap,EINVAL,"invalid update");
+    TypedPrepared p;typed_prepared_init(&p);
+    int rc=prepare_json(ts,json,0,NULL,NULL,&p,old,1,flags,err,cap);
     if(!rc)rc=typed_prepared_stamp(&p,DK_AUTO_UPDATE,err,cap);
     if(!rc)rc=typed_prepared_alloc(&p,out,len,err,cap);
     typed_prepared_free(&p);return rc;
@@ -717,14 +746,7 @@ int typed_update_json_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
 
 int typed_update_computed_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     const char *json,uint8_t **out,size_t *len,char *err,size_t cap){
-    if(!out||!len)return row_error(err,cap,EINVAL,"invalid output");
-    *out=NULL;*len=0;
-    if(!packed_schema_ok(ts)||!old)return row_error(err,cap,EINVAL,"invalid update");
-    TypedPrepared p;typed_prepared_init(&p);
-    int rc=prepare_json(ts,json,0,NULL,NULL,&p,old,1,err,cap);
-    if(!rc)rc=typed_prepared_stamp(&p,DK_AUTO_UPDATE,err,cap);
-    if(!rc)rc=typed_prepared_alloc(&p,out,len,err,cap);
-    typed_prepared_free(&p);return rc;
+    return typed_update_computed_alloc_ex(ts,old,json,0,out,len,err,cap);
 }
 
 int typed_update_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,

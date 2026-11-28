@@ -66,6 +66,13 @@ Order matters — it determines the on-disk layout. Once set, fields can be [add
 | `enum` | `color:enum(red,green,blue)` | 1 or 2 | Declared closed value list. Stored as the value's 0-based byte index; **1 byte** for ≤256 values, **2 bytes BE** for 257–65535. Wire format is the display string (`"red"`); the engine validates against the list on insert. Commas inside enum values aren't supported in v1. Bitmap index is opt-in (declare `color:bitmap`, or the bare field name which promotes to bitmap). Available since 2026.05.7. Value lists share the 65,535-byte field-definition cap (see [limits](../reference/limits.md)) — ≈13k four-char values. |
 
 
+### Unknown members on single writes
+
+Single `insert` and `update` reject a `value` member whose name matches no live
+field with `unknown field '<name>'` and write nothing (an update does not stamp
+`auto_update` either). A removed (tombstoned) field counts as unknown. Bulk
+routes still skip unmatched members.
+
 ### Strict scalar grammars (R4)
 
 Typed scalars share one strict, length-aware grammar on **every** write route
