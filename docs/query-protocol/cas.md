@@ -206,7 +206,17 @@ Opt-in on `insert` / `update` / `delete`:
 
 ## Dry-run
 
-Only `bulk-update` and `bulk-delete` (criteria form) support `dry_run:true`. Single-record CAS writes always execute — the check is the atomic part, not a preview.
+`bulk-update` and `bulk-delete` (criteria form) support `dry_run:true`, and so do the single-record writes `insert`, `update` and `delete`. A dry run executes nothing and reports what the real write would do:
+
+| Mode | Dry-run response |
+|---|---|
+| `insert` | `{"status":"would_insert","key":"k"}`, or `would_update` when the key exists (insert is an upsert); `condition_not_met` / the real error when the real insert would fail |
+| `update` | `{"status":"would_update","key":"k"}` |
+| `delete` | `{"status":"would_delete","key":"k"}` |
+
+`insert` and `update` dry runs build the new record with the same code the real write uses, so the validation errors (bad value, NULL on a `not_null` field, unknown field, bad `$incr`/`$copy`, an index key that does not fit, record too large) come back with the exact text the real write would give. A dry run cannot see index-apply I/O errors, a bitmap index over its distinct-value cap, or a later `default=seq` value that overflows its field. It reads the current record without the write lock, so a concurrent write can change the answer before the real call. `would_*` responses never carry `record`.
+
+An insert dry run never advances a sequence: a `default=seq(...)` field is validated with a placeholder, and on an `auto_key` object with the key omitted the server generates no key and replies `{"status":"would_insert","key":null}`. `dry_run:true` on a single `insert` used to be ignored (the insert really happened); it now previews.
 
 ## `condition_not_met` response
 

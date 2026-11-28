@@ -1,0 +1,25 @@
+create: {"status":"created","object":"t","dir":"d","splits":8,"max_key":16,"value_size":50,"fields":3,"storage_version":2,"streams":8}
+ins a: {"status":"inserted","key":"a"}
+ins b: {"status":"inserted","key":"b"}
+ins c: {"status":"inserted","key":"c"}
+count: 3
+del missing: {"status":"not_found","key":"zz"}
+del missing + if: {"status":"not_found","key":"zz"}
+del if mismatch: {"error":"condition_not_met","current":{"n":1,"b":"x","tg":"hello1"}}
+del bad if: {"error":"invalid if condition"}
+del dry_run: {"status":"would_delete","key":"a"}
+count after dry: 3
+del return_record: {"status":"deleted","key":"a","record":{"n":1,"b":"x","tg":"hello1"}}
+del again: {"status":"not_found","key":"a"}
+count: 2
+find n=1 (btree): []
+find b=x (bitmap): [{"key":"b","value":{"n":2,"b":"x","tg":"hello2"}}]
+find tg contains (trigram): []
+get a: {"error":"Not found"}
+reinsert a: {"status":"inserted","key":"a"}
+find n=1: [{"key":"a","value":{"n":1,"b":"x","tg":"hello1"}}]
+del ok if: {"status":"deleted","key":"b"}
+count: 2
+orphaned: 1
+del bad object: {"error":"Object [nope] not found. Use create-object first."}
+del no key: {"error":"Missing key"}

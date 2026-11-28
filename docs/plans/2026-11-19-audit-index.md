@@ -816,9 +816,15 @@ listed. No code deleted.
   (704,000 bytes over 4000 parses), green fixed (0). Replaying
   `AUD-RES-1-leak-input.bin` through `fuzz_frame` is the original repro.
 - AGENTS.md bench note updated (12 registered benches).
-- **Phase 3 slice 1 findings (open, plans at slice end):** AUD-P3-1 (double reply
-  on guarded bad auto-key), AUD-P3-2 (empty key accepted, breaks keys/fetch),
-  AUD-P3-3 (oversize key: empty reply), AUD-P3-4 (find double-escapes keys).
+- **Phase 3 slice 1 findings:** FIXED on `fix/single-write-audit-slice1` (uncommitted,
+  plan `2026-11-28-audit-slice1-single-write-fixes.md`): AUD-P3-1 (double reply on
+  guarded bad auto-key), AUD-P3-2 (empty key accepted, breaks keys/fetch), AUD-P3-3
+  (oversize key: empty reply), AUD-P3-7 (unknown/removed field names ignored),
+  AUD-P3-9 (single-write `dry_run` contradicted the docs and under-validated),
+  AUD-P3-10 (delete error escaping and `return_record` drops). OPEN: AUD-P3-4 (find
+  double-escapes keys; slices 8/10), AUD-P3-8 (pending-durability reply unreachable;
+  needs a fault-injection repro and its own plan). Known unrelated bug noted:
+  `src/cli/main.c:419` builds the CLI single insert with `"data"` instead of `"value"`.
   Detail: `2026-11-25-audit-single-writes.md`.
 - **Pending findings from the legacy-removal plan reviews (for the schema slice, 5):**
   AUD-P3-5 (silent-damage, pre-existing): `cmd_drop_object` removes the object
@@ -913,3 +919,11 @@ listed. No code deleted.
     `test-bulk-update-json-oom`), nor for the criteria-timeout route (`test-request-timeout`);
   - `test_scalar_conversion_safety` k7: the packed "scale out of range" rejection is no longer
     exercised (input changed to hit `numeric field overflow`).
+
+## CI flakiness (noted 2026-11-28, after legacy-removal merge)
+
+- **AUD-CI-FLAKES (minor, pre-existing, also on `main`):** macOS `test-rebuild-txn-*` cases
+  miss their pause point intermittently, and TSan `test-rebuild-recovery` hangs
+  intermittently. Neither is caused by the legacy-removal refactor (T0.5 converted those
+  tests to packed without changing their pause/recovery logic). Root-cause or time-box and
+  escalate before the next release; do not rerun until green.

@@ -1,0 +1,5 @@
+create: {"status":"created","object":"t","dir":"d","splits":8,"max_key":16,"value_size":6,"fields":1,"storage_version":2,"streams":8}
+insert ok: {"status":"inserted","key":"a"}
+insert w/ bad marker: {"error":"upsert failed"}
+update w/ bad marker: {"error":"update failed"}
+delete w/ bad marker: {"error":"delete failed"}

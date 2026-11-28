@@ -140,8 +140,8 @@ static int test_not_null_updates_packed_run(void) {
     ASSERT_CONTAINS(resp, "\"amount\":4", "written cell materialized");
     free(resp); resp = NULL;
 
-    /* 5. a tombstoned field's :not_null spec is inert — every update
-          path ignores a null written to a removed field. */
+    /* 5. a tombstoned field's :not_null spec is inert — single update rejects the
+          removed name as unknown; per-record bulk-update still ignores it. */
     tc_request(tc,
         "{\"mode\":\"create-object\",\"declaration_layout\":\"packed\",\"dir\":\"default\",\"object\":\"u2p\","
         "\"splits\":8,\"max_key\":16,"
@@ -158,8 +158,13 @@ static int test_not_null_updates_packed_run(void) {
     free(resp); resp = NULL;
     tc_request(tc, "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"u2p\","
                    "\"key\":\"r1\",\"value\":{\"n\":3,\"x\":null}}", &resp);
+    ASSERT_CONTAINS(resp, "unknown field 'x'",
+                "single update rejects removed-field null (AUD-P3-7)");
+    free(resp); resp = NULL;
+    tc_request(tc, "{\"mode\":\"update\",\"dir\":\"default\",\"object\":\"u2p\","
+                   "\"key\":\"r1\",\"value\":{\"n\":3}}", &resp);
     ASSERT_TRUE(resp && SAFE_STRSTR(resp, "\"error\"") == NULL,
-                "single update ignores removed-field null");
+                "single update without the removed field succeeds");
     free(resp); resp = NULL;
     /* criteria-form bulk update dropped (packed refusal). */
     tc_request(tc, "{\"mode\":\"bulk-update\",\"dir\":\"default\","

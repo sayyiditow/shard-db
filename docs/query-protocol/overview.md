@@ -99,7 +99,7 @@ Applies to `find`, `count`, `aggregate`, `bulk-delete`, `bulk-update`, and objec
 - [`find` / `count` / `aggregate` via NQL](nql.md) — human-readable filter syntax; server auto-detects on the same port as JSON
 
 ### Data operations
-- [`get`](#get), `insert`, `update`, `delete`, `exists`, `not-exists`, `size` — per-record CRUD and existence checks
+- [`get`](#get), `insert`, `update`, `delete`, `exists`, `not-exists`, `size` — per-record CRUD and existence checks. `insert`/`update`/`delete` accept `dry_run:true` ([CAS → Dry-run](cas.md#dry-run)); an empty `key` is rejected (`key must not be empty`), and `insert`/`update` reject a `value` member that names no live field (`unknown field '<name>'`, which includes a removed field)
 - [`find`](find.md), [`count`](count.md), `keys`, `fetch` — queries
 - [`explain`](explain.md) — return the query plan for `find`, `count`, or `aggregate` without executing
 

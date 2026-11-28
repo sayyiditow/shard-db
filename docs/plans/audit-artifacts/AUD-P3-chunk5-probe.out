@@ -1,0 +1,39 @@
+create: {"status":"created","object":"t","dir":"d","splits":8,"max_key":16,"value_size":79,"fields":6,"storage_version":2,"streams":8}
+ins: {"status":"inserted","key":"a"}
+get a: {"name":"x","n":1,"m":5,"req":"r","upd":1795816988355,"bal":1.50}
+upd missing key: {"error":"Not found"}
+upd typo field: {"status":"updated","key":"a"}
+get a (upd stamped?): {"name":"x","n":1,"m":5,"req":"r","upd":1795816988356,"bal":1.50}
+upd bad int: {"error":"value for field 'n' is not a valid int: expected a whole decimal number"}
+upd null req: {"error":"field 'req' is not nullable"}
+upd null n: {"status":"updated","key":"a"}
+get a: {"name":"x","n":null,"m":5,"req":"r","upd":1795816988357,"bal":1.50}
+upd empty {}: {"status":"updated","key":"a"}
+dry_run valid: {"status":"would_update","key":"a"}
+dry_run bad int: {"status":"would_update","key":"a"}
+dry_run null req: {"status":"would_update","key":"a"}
+dry_run bad json: {"status":"would_update","key":"a"}
+dry_run missing: {"error":"Not found"}
+get a unchanged: {"name":"x","n":null,"m":5,"req":"r","upd":1795816988357,"bal":1.50}
+if fail: {"error":"condition_not_met","current":{"name":"x","n":null,"m":5,"req":"r","upd":1795816988357,"bal":1.50}}
+if ok: {"status":"updated","key":"a"}
+incr: {"status":"updated","key":"a"}
+incr neg: {"status":"updated","key":"a"}
+incr overflow: {"status":"updated","key":"a"}
+incr on null n: {"status":"updated","key":"a"}
+incr numeric: {"status":"updated","key":"a"}
+incr varchar: {"error":"unsupported computed target"}
+copy: {"status":"updated","key":"a"}
+copy from null: {"status":"updated","key":"a"}
+copy self: {"error":"copy source is computed"}
+copy+incr same field: {"error":"malformed or incompatible computed value"}
+get a: {"name":"x","n":4,"m":4,"req":"r","upd":1795816988358,"bal":2.25}
+find n=3 via index: []
+set n NULL: {"status":"updated","key":"a"}
+incr on NULL n: {"error":"NULL computed target"}
+get a: {"name":"x","n":null,"m":4,"req":"r","upd":1795816988359,"bal":2.25}
+copy from NULL n: {"error":"NULL copy source"}
+set m max: {"status":"updated","key":"a"}
+incr m overflow: {"error":"value for field 'm' is not a valid int: out of int range (-2147483648..2147483647)"}
+get a: {"name":"x","n":null,"m":2147483647,"req":"r","upd":1795816988359,"bal":2.25}
+return_record: {"status":"updated","key":"a","record":{"name":"x","n":7,"m":2147483647,"req":"r","upd":1795816988359,"bal":2.25}}

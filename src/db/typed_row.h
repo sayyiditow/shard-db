@@ -102,10 +102,23 @@ int typed_insert_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     const char *json,
     const char *root,const char *object,uint8_t **out,size_t *len,
     char *err,size_t cap);
+/* Single-write flags. STRICT: a JSON member naming no live field fails with
+ * "unknown field '<name>'" (removed fields count as unknown). The plain
+ * entry points above and below stay lenient (flags 0): bulk and encode
+ * helpers are unchanged. */
+#define TYPED_PREP_STRICT 0x1u
+/* DRY_DEFAULTS: a default=seq(...) field gets the placeholder "1" instead of
+ * consuming a sequence value (insert dry run must not advance sequences). */
+#define TYPED_PREP_DRY_DEFAULTS 0x2u
+int typed_insert_alloc_ex(const TypedSchema *ts,const SlotcaskOldRecord *old,
+    const char *json,const char *root,const char *object,unsigned flags,
+    uint8_t **out,size_t *len,char *err,size_t cap);
 /* Single-update computed operations read immutable locked OLD. Bulk retains
  * its literal-only contract through typed_update_json_alloc. */
 int typed_update_computed_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     const char *json,uint8_t **out,size_t *len,char *err,size_t cap);
+int typed_update_computed_alloc_ex(const TypedSchema *ts,const SlotcaskOldRecord *old,
+    const char *json,unsigned flags,uint8_t **out,size_t *len,char *err,size_t cap);
 int typed_update_json_alloc(const TypedSchema *ts,const SlotcaskOldRecord *old,
     const char *json,uint8_t **out,size_t *len,char *err,size_t cap);
 int typed_encode_packed_into(const TypedSchema *ts, const char *json, int defaults,

@@ -1201,6 +1201,11 @@ int test_env_ctl_set_json_escape_fail(TestEnv *env, int fail) {
     return ctl_set_globals(env, 1, (uint64_t)(fail ? 1 : 0), 0);
 }
 
+int test_env_ctl_set_delete_render_fail(TestEnv *env, int fail) {
+    /* phase 15 = TEST_HOOK_SET_GLOBALS_DELETE_RENDER_FAIL (test_control.c). */
+    return ctl_set_globals(env, 15, (uint64_t)(fail ? 1 : 0), 0);
+}
+
 int test_env_ctl_set_restore_fault(TestEnv *env, int mask, int swap_index) {
     /* phase 14 = TEST_HOOK_SET_GLOBALS_RESTORE_FAULT (test_control.c).
        a = mask (SHARD_TEST_RF_*), b = 0-based swap-name index. */

@@ -166,6 +166,9 @@ extern _Atomic int g_shard_test_bmlock_log;
  * can exercise the static-fallback emission (defined in storage.c under
  * TEST_BUILD, set via the control channel's SET_GLOBALS phase 1). */
 extern _Atomic int g_shard_test_json_escape_fail;
+/* One-shot: the next single delete return_record render fails (storage.c;
+ * SET_GLOBALS phase 15). */
+extern _Atomic int g_shard_test_delete_render_fail;
 typedef void (*shard_db_test_gate_fn)(void *ctx);
 void shard_db_test_set_find_flush_gate_hook(shard_db_test_gate_fn fn, void *ctx);
 
@@ -208,6 +211,7 @@ static inline void shard_test_ctl_reset(void) {
     atomic_store(&g_shard_test_bmfix_backoff_ms, 0);
     atomic_store(&g_shard_test_bmlock_log, 0);
     atomic_store(&g_shard_test_json_escape_fail, 0);
+    atomic_store(&g_shard_test_delete_render_fail, 0);
     atomic_store(&g_restore_test_fault_mask, 0);
     atomic_store(&g_restore_test_swap_rename_at, 0);
     atomic_store(&g_shard_test_gate_held_max, 0);
