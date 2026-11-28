@@ -54,7 +54,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install gdb (hang diagnostics)
-        run: sudo apt-get install -y --no-install-recommends gdb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb
 
       - name: Build (BUILD_MODE=tsan)
         run: SKIP_TESTS=1 ./build.sh && cp build/bin/shard-db ./shard-db
