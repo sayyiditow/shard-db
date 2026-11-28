@@ -1,0 +1,20 @@
+create: {"status":"created","object":"t","dir":"d","splits":8,"max_key":16,"value_size":74,"fields":5,"storage_version":2,"streams":8}
+ins typo-field: {"status":"inserted","key":"k1"}
+get k1: {"name":null,"age":7,"req":"r","created":1795816724172,"note":null}
+ins missing req: {"error":"field 'req' is not nullable"}
+ins null req: {"error":"field 'req' is not nullable"}
+ins oversize name: {"error":"varchar content exceeds declaration"}
+ins dup field: {"error":"field 'req' is not nullable"}
+dup field: {"status":"inserted","key":"k5"}
+get k5: {"name":null,"age":7,"req":"b","created":1795816724173,"note":null}
+ins nested obj: {"error":"invalid record JSON"}
+ins age str: {"error":"value for field 'age' is not a valid int: expected a whole decimal number"}
+ins age null: {"status":"inserted","key":"k8"}
+get k8: {"name":null,"age":null,"req":"r","created":1795816724174,"note":null}
+ins created explicit: {"status":"inserted","key":"k9"}
+get k9: {"name":null,"age":7,"req":"r","created":1795816724174,"note":null}
+upsert k9 again: {"status":"updated","key":"k9"}
+get k9 after: {"name":null,"age":7,"req":"r2","created":1795816724174,"note":null}
+value as string: {"error":"invalid record JSON"}
+value as array: {"error":"invalid record JSON"}
+value empty obj: {"error":"field 'req' is not nullable"}
